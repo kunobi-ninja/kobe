@@ -1,0 +1,22 @@
+apiVersion: kunobi.ninja/v1alpha1
+kind: AuthPolicy
+metadata:
+  name: github-actions
+  namespace: kunobi-pool
+spec:
+  name: github-actions
+  issuer: https://token.actions.githubusercontent.com
+  jwksUrl: https://token.actions.githubusercontent.com/.well-known/jwks
+  audience: ["kunobi-pool"]
+  algorithms: ["RS256"]
+  identityTemplate: "repo:{repository}:ref:{ref}"
+  roleExtraction:
+    method: static
+    role: ci
+  policies:
+    ci:
+      allowedProfiles: ["e2e-*"]
+      maxTtl: "1h"
+      maxConcurrentClaims: 5
+      defaultPriority: 100
+      maxExtensions: 2

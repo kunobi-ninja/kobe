@@ -1,0 +1,38 @@
+apiVersion: kunobi.ninja/v1alpha1
+kind: ClusterPoolProfile
+metadata:
+  name: e2e-full
+  namespace: kunobi-pool
+spec:
+  poolSize: 2
+  ttl: "2h"
+  cluster:
+    mode: shared
+    version: "v1.31.3+k3s1"
+    servers: 1
+  addons:
+    - name: metrics-server
+      url: https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  readinessGates:
+    - type: DeploymentReady
+      name: metrics-server
+      namespace: kube-system
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 1
+    maxClusters: 4
+    scaleUpThreshold: 0
+    scaleDownAfter: "1h"
+    queueTimeout: "5m"
+  diagnostics:
+    enabled: true
+    storage: "s3://kunobi-diagnostics/"
+    retentionDays: 7
+    logLines: 1000
+    includeSecrets: false
+  resources:
+    limits:
+      cpu: "2"
+      memory: "2Gi"

@@ -1,0 +1,38 @@
+apiVersion: kunobi.ninja/v1alpha1
+kind: ClusterPoolProfile
+metadata:
+  name: e2e-snapshot
+  namespace: kunobi-pool
+spec:
+  poolSize: 3
+  ttl: "2h"
+  cluster:
+    mode: "virtual"
+    version: "v1.31.3+k3s1"
+    servers: 1
+    persistence:
+      storageType: "dynamic"
+      storageRequestSize: "5Gi"
+  snapshot:
+    enabled: true
+    veleroNamespace: "velero"
+    storageLocation: "default"
+    goldenPrefix: "golden"
+    ttl: "720h"
+    refreshOn: ProfileChange
+  addons:
+    - name: metrics-server
+      url: https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+  readinessGates:
+    - type: DeploymentReady
+      name: metrics-server
+      namespace: kube-system
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 2
+    maxClusters: 8
+    scaleUpThreshold: 1
+    scaleDownAfter: "30m"
+    queueTimeout: "5m"

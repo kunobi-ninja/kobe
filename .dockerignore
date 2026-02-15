@@ -1,0 +1,9 @@
+.git
+target
+tarpaulin-report.*
+docs
+*.md
+.env
+.env.*
+.github
+.claude

@@ -1,0 +1,27 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kunobi-pool-operator
+  namespace: kunobi-pool
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: ./deploy/helm
+      sourceRef:
+        kind: GitRepository
+        name: kunobi-k8se2e
+      interval: 1m
+  values:
+    image:
+      repository: ghcr.io/zondax/kunobi-pool-operator
+      tag: latest
+    auth:
+      githubOidcAudience: kunobi-pool
+      clerkIssuer: https://clerk.kunobi.ninja
+    ingress:
+      enabled: true
+      host: pool.kunobi.ninja
+      tls:
+        enabled: true
+        secretName: pool-kunobi-tls

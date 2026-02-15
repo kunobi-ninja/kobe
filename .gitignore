@@ -1,0 +1,7 @@
+
+target/
+
+docs/plans/
+.worktrees/
+
+tarpaulin-report.json

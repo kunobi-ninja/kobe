@@ -1,0 +1,25 @@
+apiVersion: kunobi.ninja/v1alpha1
+kind: ClusterPoolProfile
+metadata:
+  name: e2e-basic
+  namespace: kunobi-pool
+spec:
+  poolSize: 3
+  ttl: "1h"
+  cluster:
+    mode: shared
+    version: "v1.31.3+k3s1"
+    servers: 1
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 1
+    maxClusters: 6
+    scaleUpThreshold: 0
+    scaleDownAfter: "30m"
+    queueTimeout: "5m"
+  resources:
+    limits:
+      cpu: "1"
+      memory: "1Gi"
