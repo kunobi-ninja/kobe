@@ -145,15 +145,16 @@ impl BackendFactory {
                 self.pg_base_url.clone(),
             ))),
             BackendType::Capi => {
-                let capi_config = profile
-                    .spec
-                    .capi
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!(
+                let capi_config = profile.spec.capi.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
                         "Profile {} has backend=capi but no capi config",
                         profile.metadata.name.as_deref().unwrap_or("unknown")
-                    ))?;
-                Ok(BackendDispatch::Capi(CapiBackend::new(self.client.clone(), capi_config)))
+                    )
+                })?;
+                Ok(BackendDispatch::Capi(CapiBackend::new(
+                    self.client.clone(),
+                    capi_config,
+                )))
             }
         }
     }
@@ -389,6 +390,16 @@ pub async fn apply_addon_impl(vc_client: &Client, addon: &Addon) -> Result<()> {
             return Ok(());
         }
     };
+
+    const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+    if manifest.len() > MAX_MANIFEST_SIZE {
+        anyhow::bail!(
+            "Addon {} manifest exceeds maximum size of {} bytes (actual: {} bytes)",
+            addon.name,
+            MAX_MANIFEST_SIZE,
+            manifest.len()
+        );
+    }
 
     info!(addon = addon.name, "Applying addon via kube-rs SSA");
 

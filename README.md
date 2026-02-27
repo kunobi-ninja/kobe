@@ -17,7 +17,7 @@ Wagyu is a Kubernetes operator that manages fleets of virtual clusters. It pre-w
 
 ```bash
 # Claim a cluster
-curl -X POST https://wagyu.ninja/v1/claims \
+curl -X POST https://pool.kunobi.ninja/v1/claims \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"profile": "e2e-basic"}'
 
@@ -33,7 +33,7 @@ echo "$KUBECONFIG" > /tmp/kube.yaml
 KUBECONFIG=/tmp/kube.yaml kubectl get nodes
 
 # Release when done
-curl -X DELETE https://wagyu.ninja/v1/claims/claim-a1b2c3 \
+curl -X DELETE https://pool.kunobi.ninja/v1/claims/claim-a1b2c3 \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -82,7 +82,7 @@ Wagyu uses two Custom Resource Definitions internally to manage pool state:
 Defines a pool of virtual clusters with a specific configuration:
 
 ```yaml
-apiVersion: wagyu.ninja/v1alpha1
+apiVersion: kunobi.ninja/v1alpha1
 kind: ClusterPoolProfile
 metadata:
   name: e2e-basic
@@ -115,7 +115,7 @@ status:
 Represents a claimed cluster (created internally by the HTTP API, not by users directly):
 
 ```yaml
-apiVersion: wagyu.ninja/v1alpha1
+apiVersion: kunobi.ninja/v1alpha1
 kind: ClusterClaim
 metadata:
   name: claim-a1b2c3
@@ -147,8 +147,11 @@ status:
 
 ## Documentation
 
-- [Design & Architecture](docs/plans/2026-02-15-cluster-pool-operator-design.md)
+- [K3k + Velero Backend](docs/plans/2026-02-25-k3k-velero-backend.md)
+- [Direct K0s & CAPI Backends](docs/plans/2026-02-27-direct-k0s-and-capi-backends.md)
+- [OpenTelemetry Traces](docs/plans/2026-02-26-otel-traces-design.md)
+- [Docker CI Maturity](docs/plans/2026-02-26-docker-ci-maturity-design.md)
 
 ## License
 
-TBD
+Apache-2.0

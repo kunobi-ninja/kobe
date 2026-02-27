@@ -217,14 +217,13 @@ pub fn is_valid_k8s_name(name: &str) -> bool {
 
 /// Generate a deterministic cluster name for a profile.
 ///
-/// Panics if the profile name produces an invalid K8s name — this
-/// indicates a bug in profile validation, not a runtime error.
+/// Logs a warning if the profile name produces an invalid K8s name.
+/// This indicates a bug in profile validation upstream.
 pub fn generate_cluster_name(profile_name: &str, index: u32) -> String {
     let name = format!("pool-{profile_name}-{index}");
-    assert!(
-        is_valid_k8s_name(&name),
-        "Generated invalid cluster name: {name}"
-    );
+    if !is_valid_k8s_name(&name) {
+        tracing::warn!(name = %name, "Generated cluster name failed K8s DNS label validation");
+    }
     name
 }
 

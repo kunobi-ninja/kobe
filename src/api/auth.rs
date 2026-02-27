@@ -159,8 +159,8 @@ impl JwtAuthenticator {
 
     /// Validate a JWT and return the authenticated identity.
     ///
-    /// Decodes the JWT header to peek at the issuer (without signature validation),
-    /// then validates against the matching provider's JWKS with full verification.
+    /// Peeks at the unverified `iss` claim to select the correct provider(s),
+    /// then validates the token signature and claims against that provider's JWKS.
     pub async fn validate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
         let header = decode_header(token).map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
@@ -172,9 +172,20 @@ impl JwtAuthenticator {
             ));
         }
 
-        // Try each provider — fail fast on kid mismatch
+        // Peek at the unverified issuer to pre-select the correct provider(s),
+        // avoiding cross-provider token acceptance.
+        let issuer = peek_issuer(token, &header)?;
+
+        let matching: Vec<_> = providers.iter().filter(|p| p.issuer == issuer).collect();
+
+        if matching.is_empty() {
+            return Err(AuthError::InvalidToken(format!(
+                "No provider configured for issuer: {issuer}"
+            )));
+        }
+
         let mut last_error = String::new();
-        for provider in providers.iter() {
+        for provider in matching {
             match self.validate_with_provider(token, &header, provider).await {
                 Ok(identity) => return Ok(identity),
                 Err(e) => {
@@ -185,7 +196,7 @@ impl JwtAuthenticator {
         }
 
         Err(AuthError::InvalidToken(format!(
-            "Token not accepted by any configured provider: {last_error}"
+            "Token not accepted by provider for issuer {issuer}: {last_error}"
         )))
     }
 
@@ -334,6 +345,23 @@ impl JwtAuthenticator {
                 DecodingKey::from_rsa_components(n, e)
                     .map_err(|e| AuthError::InvalidToken(e.to_string()))
             }
+            "EC" => {
+                let x = key.x.as_ref().ok_or_else(|| {
+                    AuthError::InvalidToken("EC key missing 'x' component".into())
+                })?;
+                let y = key.y.as_ref().ok_or_else(|| {
+                    AuthError::InvalidToken("EC key missing 'y' component".into())
+                })?;
+                DecodingKey::from_ec_components(x, y)
+                    .map_err(|e| AuthError::InvalidToken(e.to_string()))
+            }
+            "OKP" => {
+                let x = key.x.as_ref().ok_or_else(|| {
+                    AuthError::InvalidToken("OKP key missing 'x' component".into())
+                })?;
+                DecodingKey::from_ed_components(x)
+                    .map_err(|e| AuthError::InvalidToken(e.to_string()))
+            }
             other => Err(AuthError::InvalidToken(format!(
                 "Unsupported key type: {other}"
             ))),
@@ -474,6 +502,30 @@ fn policy_spec_to_policy(spec: &PolicySpec) -> crate::api::policy::Policy {
         default_priority: spec.default_priority,
         max_extensions: spec.max_extensions,
     }
+}
+
+/// Peek at the unverified `iss` claim from a JWT without signature validation.
+///
+/// Used to pre-select the correct provider before full token verification,
+/// preventing cross-provider token acceptance.
+fn peek_issuer(token: &str, header: &jsonwebtoken::Header) -> Result<String, AuthError> {
+    let mut validation = Validation::new(header.alg);
+    validation.insecure_disable_signature_validation();
+    validation.validate_aud = false;
+    validation.validate_exp = false;
+    validation.required_spec_claims = std::collections::HashSet::new();
+
+    let dummy_key = DecodingKey::from_secret(b"");
+
+    #[derive(Deserialize)]
+    struct IssClaim {
+        iss: String,
+    }
+
+    let data = decode::<IssClaim>(token, &dummy_key, &validation)
+        .map_err(|e| AuthError::InvalidToken(format!("Failed to peek at JWT issuer: {e}")))?;
+
+    Ok(data.claims.iss)
 }
 
 /// Parse an algorithm string into a jsonwebtoken Algorithm.
@@ -869,6 +921,90 @@ mod tests {
         }];
         let result = JwtAuthenticator::find_key(&keys, Some("kid-B"));
         assert!(matches!(result, Err(AuthError::KeyNotFound(_))));
+    }
+
+    #[test]
+    fn test_find_key_ec_unsupported_before_was_now_supported() {
+        let keys = vec![Jwk {
+            kid: Some("ec-kid".to_string()),
+            kty: "EC".to_string(),
+            n: None,
+            e: None,
+            x: Some("test-x".to_string()),
+            y: Some("test-y".to_string()),
+            crv: Some("P-256".to_string()),
+        }];
+        // EC keys are now supported — should not return "Unsupported key type"
+        let result = JwtAuthenticator::find_key(&keys, Some("ec-kid"));
+        // May fail due to invalid key data, but should NOT be "Unsupported key type"
+        match result {
+            Ok(_) => {} // valid key was constructed
+            Err(AuthError::InvalidToken(msg)) => {
+                assert!(
+                    !msg.contains("Unsupported key type"),
+                    "EC should be supported, got: {msg}"
+                );
+            }
+            Err(e) => panic!("Unexpected error type: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_find_key_ec_missing_components() {
+        let keys = vec![Jwk {
+            kid: Some("ec-kid".to_string()),
+            kty: "EC".to_string(),
+            n: None,
+            e: None,
+            x: Some("test-x".to_string()),
+            y: None, // missing y
+            crv: Some("P-256".to_string()),
+        }];
+        let result = JwtAuthenticator::find_key(&keys, Some("ec-kid"));
+        assert!(
+            matches!(result, Err(AuthError::InvalidToken(msg)) if msg.contains("EC key missing 'y'"))
+        );
+    }
+
+    #[test]
+    fn test_find_key_okp_supported() {
+        let keys = vec![Jwk {
+            kid: Some("okp-kid".to_string()),
+            kty: "OKP".to_string(),
+            n: None,
+            e: None,
+            x: Some("test-x".to_string()),
+            y: None,
+            crv: Some("Ed25519".to_string()),
+        }];
+        let result = JwtAuthenticator::find_key(&keys, Some("okp-kid"));
+        match result {
+            Ok(_) => {}
+            Err(AuthError::InvalidToken(msg)) => {
+                assert!(
+                    !msg.contains("Unsupported key type"),
+                    "OKP should be supported, got: {msg}"
+                );
+            }
+            Err(e) => panic!("Unexpected error type: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_find_key_okp_missing_x() {
+        let keys = vec![Jwk {
+            kid: Some("okp-kid".to_string()),
+            kty: "OKP".to_string(),
+            n: None,
+            e: None,
+            x: None, // missing x
+            y: None,
+            crv: Some("Ed25519".to_string()),
+        }];
+        let result = JwtAuthenticator::find_key(&keys, Some("okp-kid"));
+        assert!(
+            matches!(result, Err(AuthError::InvalidToken(msg)) if msg.contains("OKP key missing 'x'"))
+        );
     }
 
     #[test]

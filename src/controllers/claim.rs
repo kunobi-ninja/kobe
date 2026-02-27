@@ -593,7 +593,9 @@ pub async fn extend_claim_ttl(
         .as_ref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now);
+        .ok_or_else(|| {
+            ClaimError::Lifecycle(anyhow::anyhow!("Claim has no valid bound_at timestamp"))
+        })?;
 
     let policy = authenticator
         .policy_for_requester_type(&claim.spec.requester.requester_type)

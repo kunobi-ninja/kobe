@@ -154,12 +154,18 @@ mod tests {
 
     #[test]
     fn test_sanitize_basic() {
-        assert_eq!(sanitize_db_name("my-cluster", "k3s_").unwrap(), "k3s_my_cluster");
+        assert_eq!(
+            sanitize_db_name("my-cluster", "k3s_").unwrap(),
+            "k3s_my_cluster"
+        );
     }
 
     #[test]
     fn test_sanitize_strips_special_chars() {
-        assert_eq!(sanitize_db_name("pool.test/0", "k3s_").unwrap(), "k3s_pooltest0");
+        assert_eq!(
+            sanitize_db_name("pool.test/0", "k3s_").unwrap(),
+            "k3s_pooltest0"
+        );
     }
 
     #[test]
@@ -193,21 +199,29 @@ mod tests {
 
     #[test]
     fn test_sanitize_with_k0s_prefix() {
-        assert_eq!(sanitize_db_name("my-cluster", "k0s_").unwrap(), "k0s_my_cluster");
+        assert_eq!(
+            sanitize_db_name("my-cluster", "k0s_").unwrap(),
+            "k0s_my_cluster"
+        );
     }
 
     // -- cluster_endpoint tests --
 
     #[test]
     fn test_cluster_endpoint_basic() {
-        let result =
-            cluster_endpoint("postgres://user:pass@pghost:5432/admin", "my-cluster", "k3s_").unwrap();
+        let result = cluster_endpoint(
+            "postgres://user:pass@pghost:5432/admin",
+            "my-cluster",
+            "k3s_",
+        )
+        .unwrap();
         assert_eq!(result, "postgres://user:pass@pghost:5432/k3s_my_cluster");
     }
 
     #[test]
     fn test_cluster_endpoint_no_path() {
-        let result = cluster_endpoint("postgres://user:pass@pghost:5432", "test-01", "k3s_").unwrap();
+        let result =
+            cluster_endpoint("postgres://user:pass@pghost:5432", "test-01", "k3s_").unwrap();
         assert_eq!(result, "postgres://user:pass@pghost:5432/k3s_test_01");
     }
 

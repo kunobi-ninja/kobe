@@ -29,9 +29,19 @@ pub struct AppState<B: ClusterBackend> {
     pub backend: B,
 }
 
+/// Maximum concurrent API requests. Provides application-level DoS protection.
+/// For per-client rate limiting, configure at the ingress controller level.
+const MAX_CONCURRENT_API_REQUESTS: usize = 200;
+
+static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
 /// Build the axum router with all API routes.
+///
+/// API routes have a concurrency limit for DoS protection.
+/// Infrastructure routes (/healthz, /metrics) are exempt.
 pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> Router {
-    Router::new()
+    // Concurrency-limited API routes
+    let api_routes = Router::new()
         .route("/v1/claims", post(create_claim::<B>))
         .route("/v1/claims", get(list_claims::<B>))
         .route("/v1/claims/{id}", get(get_claim::<B>))
@@ -40,9 +50,36 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .route("/v1/claims/{id}/diagnostics", get(get_diagnostics::<B>))
         .route("/v1/profiles", get(list_profiles::<B>))
         .route("/v1/profiles/{name}", get(get_profile::<B>))
+        .layer(axum::middleware::from_fn(concurrency_limit));
+
+    // Non-limited infrastructure routes
+    Router::new()
+        .merge(api_routes)
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler::<B>))
         .with_state(state)
+}
+
+async fn concurrency_limit(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let sem =
+        API_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_API_REQUESTS));
+    let _permit = match sem.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: "Server is under heavy load".to_string(),
+                    detail: Some("Too many concurrent requests, please retry".to_string()),
+                }),
+            )
+                .into_response();
+        }
+    };
+    next.run(request).await
 }
 
 // --- Request/Response types ---
@@ -151,7 +188,22 @@ async fn create_claim<B: ClusterBackend>(
     }
 
     let ttl_str = req.ttl.as_deref().unwrap_or("1h");
-    let requested_ttl = parse_duration(ttl_str).unwrap_or(chrono::Duration::hours(1));
+    let requested_ttl = match parse_duration(ttl_str) {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid TTL format".to_string(),
+                    detail: Some(format!(
+                        "Could not parse '{}'. Use format like '30m', '1h', '2h30m'",
+                        ttl_str
+                    )),
+                }),
+            )
+                .into_response();
+        }
+    };
     let effective_ttl = policy::clamp_ttl(ttl_str, &policy);
     let was_clamped = effective_ttl < requested_ttl;
     let ttl_formatted = format_duration(&effective_ttl);
@@ -184,7 +236,10 @@ async fn create_claim<B: ClusterBackend>(
             .into_response();
     }
 
-    let claim_id = format!("claim-{}", &uuid::Uuid::new_v4().to_string()[..6]);
+    let claim_id = format!(
+        "claim-{}",
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+    );
 
     let claim = build_claim_crd(
         &claim_id,

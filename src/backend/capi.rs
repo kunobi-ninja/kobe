@@ -66,11 +66,7 @@ impl CapiBackend {
     ///
     /// Creates a `cluster.x-k8s.io/v1beta1/Cluster` resource with an
     /// `infrastructureRef` pointing to the provider-specific infrastructure resource.
-    pub fn build_cluster_object(
-        name: &str,
-        namespace: &str,
-        capi: &CapiConfig,
-    ) -> DynamicObject {
+    pub fn build_cluster_object(name: &str, namespace: &str, capi: &CapiConfig) -> DynamicObject {
         let data = serde_json::json!({
             "spec": {
                 "infrastructureRef": {
@@ -91,9 +87,12 @@ impl CapiBackend {
                 name: Some(name.to_string()),
                 namespace: Some(namespace.to_string()),
                 labels: Some(
-                    [("app.kubernetes.io/managed-by".to_string(), MANAGED_BY.to_string())]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "app.kubernetes.io/managed-by".to_string(),
+                        MANAGED_BY.to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
                 ..Default::default()
             },
@@ -125,9 +124,12 @@ impl CapiBackend {
                 name: Some(name.to_string()),
                 namespace: Some(namespace.to_string()),
                 labels: Some(
-                    [("app.kubernetes.io/managed-by".to_string(), MANAGED_BY.to_string())]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "app.kubernetes.io/managed-by".to_string(),
+                        MANAGED_BY.to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
                 ..Default::default()
             },
@@ -152,7 +154,9 @@ impl CapiBackend {
     /// and derives the plural form by lowercasing the kind and appending "s".
     fn infra_api_resource(capi: &CapiConfig) -> ApiResource {
         let (group, version) = parse_api_version(&capi.infrastructure_api_version);
-        let plural = capi.infrastructure_plural.clone()
+        let plural = capi
+            .infrastructure_plural
+            .clone()
             .unwrap_or_else(|| pluralize_kind(&capi.infrastructure_kind));
 
         ApiResource {
@@ -195,8 +199,7 @@ impl CapiBackend {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    return Err(e)
-                        .context(format!("Error checking CAPI cluster {name} readiness"));
+                    return Err(e).context(format!("Error checking CAPI cluster {name} readiness"));
                 }
             }
         }
@@ -350,10 +353,7 @@ impl ClusterBackend for CapiBackend {
     }
 
     async fn extract_kubeconfig(&self, name: &str, namespace: &str) -> Result<String> {
-        info!(
-            cluster = name,
-            "Extracting kubeconfig from CAPI secret"
-        );
+        info!(cluster = name, "Extracting kubeconfig from CAPI secret");
         read_kubeconfig_secret(&self.client, name, namespace).await
     }
 
@@ -435,7 +435,10 @@ mod tests {
 
         // Check managed-by label
         let labels = obj.metadata.labels.as_ref().unwrap();
-        assert_eq!(labels.get("app.kubernetes.io/managed-by").unwrap(), MANAGED_BY);
+        assert_eq!(
+            labels.get("app.kubernetes.io/managed-by").unwrap(),
+            MANAGED_BY
+        );
 
         // Check infrastructureRef is set
         let spec = obj.data.get("spec").unwrap();
@@ -465,10 +468,7 @@ mod tests {
         // Check spec is embedded from CapiConfig
         let spec = obj.data.get("spec").unwrap();
         assert!(spec.get("helmRelease").is_some());
-        assert_eq!(
-            spec["helmRelease"]["chart"]["version"],
-            "0.24.1"
-        );
+        assert_eq!(spec["helmRelease"]["chart"]["version"], "0.24.1");
     }
 
     #[test]
@@ -538,8 +538,7 @@ mod tests {
 
     #[test]
     fn test_parse_api_version_with_group() {
-        let (group, version) =
-            parse_api_version("infrastructure.cluster.x-k8s.io/v1alpha1");
+        let (group, version) = parse_api_version("infrastructure.cluster.x-k8s.io/v1alpha1");
         assert_eq!(group, "infrastructure.cluster.x-k8s.io");
         assert_eq!(version, "v1alpha1");
     }
@@ -614,9 +613,7 @@ mod tests {
 
         // GET kubeconfig secret — available immediately
         Mock::given(method("GET"))
-            .and(path(
-                "/api/v1/namespaces/test-ns/secrets/my-vc-kubeconfig",
-            ))
+            .and(path("/api/v1/namespaces/test-ns/secrets/my-vc-kubeconfig"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Secret",
@@ -678,9 +675,7 @@ mod tests {
 
         // DELETE kubeconfig secret
         Mock::given(method("DELETE"))
-            .and(path(
-                "/api/v1/namespaces/test-ns/secrets/my-vc-kubeconfig",
-            ))
+            .and(path("/api/v1/namespaces/test-ns/secrets/my-vc-kubeconfig"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Secret",
@@ -728,9 +723,7 @@ mod tests {
 
         // DELETE kubeconfig secret returns 404
         Mock::given(method("DELETE"))
-            .and(path(
-                "/api/v1/namespaces/test-ns/secrets/gone-kubeconfig",
-            ))
+            .and(path("/api/v1/namespaces/test-ns/secrets/gone-kubeconfig"))
             .respond_with(
                 ResponseTemplate::new(404)
                     .set_body_json(crate::testutil::k8s_not_found("secrets", "gone-kubeconfig")),
@@ -755,9 +748,7 @@ mod tests {
 
         // GET returns 404 — kubeconfig secret doesn't exist yet
         Mock::given(method("GET"))
-            .and(path(
-                "/api/v1/namespaces/test-ns/secrets/new-vc-kubeconfig",
-            ))
+            .and(path("/api/v1/namespaces/test-ns/secrets/new-vc-kubeconfig"))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
                     "secrets",
@@ -785,9 +776,7 @@ mod tests {
         let kubeconfig_content = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://10.0.0.1:6443\n  name: default\n";
 
         Mock::given(method("GET"))
-            .and(path(
-                "/api/v1/namespaces/test-ns/secrets/my-vc-kubeconfig",
-            ))
+            .and(path("/api/v1/namespaces/test-ns/secrets/my-vc-kubeconfig"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Secret",

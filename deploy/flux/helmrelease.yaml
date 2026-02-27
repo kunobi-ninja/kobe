@@ -15,7 +15,7 @@ spec:
   values:
     image:
       repository: ghcr.io/zondax/kunobi-pool-operator
-      tag: latest
+      tag: "0.1.0"  # Pin to explicit version; update via CI on release
     auth:
       githubOidcAudience: kunobi-pool
       clerkIssuer: https://clerk.kunobi.ninja

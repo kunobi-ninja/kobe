@@ -176,11 +176,7 @@ spec:
     }
 
     /// Build the ConfigMap containing the k0s.yaml configuration.
-    fn build_k0s_config_configmap(
-        name: &str,
-        namespace: &str,
-        config_yaml: &str,
-    ) -> ConfigMap {
+    fn build_k0s_config_configmap(name: &str, namespace: &str, config_yaml: &str) -> ConfigMap {
         ConfigMap {
             metadata: ObjectMeta {
                 name: Some(format!("{name}-k0s-config")),
@@ -279,11 +275,7 @@ spec:
     }
 
     /// Build the k0s controller container.
-    fn build_server_container(
-        name: &str,
-        namespace: &str,
-        config: &ClusterConfig,
-    ) -> Container {
+    fn build_server_container(name: &str, namespace: &str, config: &ClusterConfig) -> Container {
         let image = format!("k0sproject/k0s:{}", config.version);
 
         let args = vec![
@@ -472,8 +464,7 @@ spec:
         // actual ConfigMap is created separately. The StatefulSet just mounts it.
         let _ = datastore_endpoint; // used to select kine vs etcd in the config
 
-        let server_container =
-            Self::build_server_container(name, namespace, config);
+        let server_container = Self::build_server_container(name, namespace, config);
         let publisher_sidecar = Self::build_publisher_sidecar(name, namespace, &k0s_image);
         let volumes = Self::build_server_volumes(name, config);
 
@@ -857,8 +848,14 @@ mod tests {
     #[test]
     fn test_build_k0s_config_yaml_no_pg() {
         let yaml = DirectK0sBackend::build_k0s_config_yaml(None, &[]);
-        assert!(yaml.contains("type: etcd"), "Should use etcd when no PG: {yaml}");
-        assert!(!yaml.contains("kine"), "Should not contain kine section: {yaml}");
+        assert!(
+            yaml.contains("type: etcd"),
+            "Should use etcd when no PG: {yaml}"
+        );
+        assert!(
+            !yaml.contains("kine"),
+            "Should not contain kine section: {yaml}"
+        );
         assert!(yaml.contains("apiVersion: k0s.k0sproject.io/v1beta1"));
         assert!(yaml.contains("kind: ClusterConfig"));
         assert!(yaml.contains("provider: kube-router"));
@@ -870,7 +867,10 @@ mod tests {
             Some("postgres://user:pass@pg:5432/k0s_my_cluster"),
             &[],
         );
-        assert!(yaml.contains("type: kine"), "Should use kine when PG is set: {yaml}");
+        assert!(
+            yaml.contains("type: kine"),
+            "Should use kine when PG is set: {yaml}"
+        );
         assert!(
             yaml.contains("dataSource: \"postgres://user:pass@pg:5432/k0s_my_cluster\""),
             "Should contain PG endpoint: {yaml}"
@@ -880,11 +880,12 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_with_extra_args() {
-        let yaml = DirectK0sBackend::build_k0s_config_yaml(
-            None,
-            &["--tls-san=example.com".to_string()],
+        let yaml =
+            DirectK0sBackend::build_k0s_config_yaml(None, &["--tls-san=example.com".to_string()]);
+        assert!(
+            yaml.contains("tls-san: \"example.com\""),
+            "Should include extra args: {yaml}"
         );
-        assert!(yaml.contains("tls-san: \"example.com\""), "Should include extra args: {yaml}");
     }
 
     #[test]
@@ -900,10 +901,7 @@ mod tests {
             server.image.as_deref(),
             Some("k0sproject/k0s:v1.30.1+k0s.0")
         );
-        assert_eq!(
-            server.command.as_ref().unwrap(),
-            &vec!["k0s".to_string()]
-        );
+        assert_eq!(server.command.as_ref().unwrap(), &vec!["k0s".to_string()]);
 
         let args = server.args.as_ref().unwrap();
         assert!(args.contains(&"controller".to_string()));
@@ -925,11 +923,7 @@ mod tests {
         assert!(config_vol.is_some(), "Should have k0s-config volume");
         let config_vol = config_vol.unwrap();
         assert_eq!(
-            config_vol
-                .config_map
-                .as_ref()
-                .unwrap()
-                .name,
+            config_vol.config_map.as_ref().unwrap().name,
             "test-cluster-k0s-config"
         );
 
@@ -1019,10 +1013,7 @@ mod tests {
         assert_eq!(pod_spec.containers.len(), 1);
         let agent = &pod_spec.containers[0];
         assert_eq!(agent.name, "k0s-worker");
-        assert_eq!(
-            agent.command.as_ref().unwrap(),
-            &vec!["k0s".to_string()]
-        );
+        assert_eq!(agent.command.as_ref().unwrap(), &vec!["k0s".to_string()]);
 
         let args = agent.args.as_ref().unwrap();
         assert!(args.contains(&"worker".to_string()));
@@ -1046,11 +1037,8 @@ mod tests {
 
     #[test]
     fn test_publisher_sidecar_mounts() {
-        let sidecar = DirectK0sBackend::build_publisher_sidecar(
-            "c",
-            "ns",
-            "k0sproject/k0s:v1.30.1+k0s.0",
-        );
+        let sidecar =
+            DirectK0sBackend::build_publisher_sidecar("c", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
         let mounts = sidecar.volume_mounts.as_ref().unwrap();
         assert!(mounts.iter().any(|m| m.name == "k0s-data"));
         assert!(mounts.iter().any(|m| m.name == "publisher-script"));
