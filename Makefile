@@ -1,6 +1,6 @@
 .PHONY: build test check lint fmt fmt-check coverage coverage-open docker clean help
 
-IMAGE_NAME ?= zondax/wagyu
+IMAGE_NAME ?= zondax/kobe
 IMAGE_TAG  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 help: ## Show this help

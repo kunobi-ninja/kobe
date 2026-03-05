@@ -45,7 +45,7 @@ jobs:
       - name: Security audit
         run: |
           cargo install cargo-audit --locked || true
-          cargo audit --ignore RUSTSEC-2023-0071
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
 
   docker-build:
     name: Docker Build

@@ -1,4 +1,4 @@
-# Docker Bake configuration for wagyu
+# Docker Bake configuration for kobe
 # Build:     docker buildx bake -f docker-bake.hcl
 # Dry run:   docker buildx bake -f docker-bake.hcl --print
 # Push (CI): docker buildx bake -f docker-bake.hcl push
@@ -74,8 +74,8 @@ target "_common" {
 # =============================================================================
 target "operator" {
   inherits   = ["_common"]
-  tags       = tags("wagyu")
-  cache-from = ["type=registry,ref=${REGISTRY}/wagyu:buildcache"]
+  tags       = tags("kobe")
+  cache-from = ["type=registry,ref=${REGISTRY}/kobe:buildcache"]
 }
 
 # =============================================================================
@@ -83,8 +83,8 @@ target "operator" {
 # =============================================================================
 target "operator-push" {
   inherits   = ["_common"]
-  tags       = tags("wagyu")
-  cache-from = ["type=registry,ref=${REGISTRY}/wagyu:buildcache"]
+  tags       = tags("kobe")
+  cache-from = ["type=registry,ref=${REGISTRY}/kobe:buildcache"]
   output     = ["type=registry"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/wagyu:buildcache,mode=max"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/kobe:buildcache,mode=max"]
 }

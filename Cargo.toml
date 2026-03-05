@@ -9,6 +9,10 @@ description = "Cluster pool operator for instant CI/dev cluster provisioning (k3
 name = "kunobi-pool-operator"
 path = "src/main.rs"
 
+[[bin]]
+name = "kobe-sync"
+path = "src/kobe_sync_bin.rs"
+
 [dependencies]
 # Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
 kube = { version = "3.0", features = ["runtime", "derive", "client"] }
@@ -49,6 +53,24 @@ tracing-opentelemetry = "0.32"
 # PostgreSQL for direct-k3s shared datastore
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 
+# kobe-sync: reverse proxy
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# kobe-sync: TLS and certificates
+rcgen = { version = "0.13", features = ["x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Base64 encoding (used for kubeconfig generation)
+base64 = "0.22"
+
+# Async trait (dyn dispatch for async traits)
+async-trait = "0.1"
+
 # Utilities
 anyhow = "1"
 thiserror = "2"
@@ -63,5 +85,4 @@ http = "1"
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-base64 = "0.22"
+x509-parser = "0.16"

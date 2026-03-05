@@ -43,7 +43,7 @@ is completely skipped.
 - **CSI snapshot support** if your profile uses `persistence.storageType: dynamic`.
   The Velero CSI plugin must be installed and your StorageClass must have a
   matching VolumeSnapshotClass.
-- **RBAC:** The wagyu operator's ServiceAccount needs permission to create
+- **RBAC:** The kobe operator's ServiceAccount needs permission to create
   `Backup` and `Restore` resources in the Velero namespace.
 
 ### Minimal Velero Setup

@@ -1037,6 +1037,7 @@ mod tests {
             scaling: None,
             diagnostics: None,
             snapshot: Some(snapshot.clone()),
+            kobe_sync: None,
         };
 
         // 1. ensure_namespace: GET returns 200 (already exists)

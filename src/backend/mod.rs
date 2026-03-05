@@ -3,6 +3,7 @@ pub mod datastore;
 pub mod direct_k0s;
 pub mod direct_k3s;
 pub mod k3k;
+pub mod kobe_sync;
 
 use std::net::{IpAddr, ToSocketAddrs};
 
@@ -18,6 +19,7 @@ pub use capi::CapiBackend;
 pub use direct_k0s::DirectK0sBackend;
 pub use direct_k3s::DirectK3sBackend;
 pub use k3k::K3kBackend;
+pub use kobe_sync::KobeSyncBackend;
 
 /// Allowed URL schemes for addon manifests and readiness probes.
 const ALLOWED_SCHEMES: &[&str] = &["https"];
@@ -36,6 +38,7 @@ pub enum BackendDispatch {
     DirectK3s(DirectK3sBackend),
     DirectK0s(DirectK0sBackend),
     Capi(CapiBackend),
+    KobeSync(KobeSyncBackend),
 }
 
 impl ClusterBackend for BackendDispatch {
@@ -51,6 +54,7 @@ impl ClusterBackend for BackendDispatch {
             Self::DirectK3s(b) => b.create(name, namespace, config, addons).await,
             Self::DirectK0s(b) => b.create(name, namespace, config, addons).await,
             Self::Capi(b) => b.create(name, namespace, config, addons).await,
+            Self::KobeSync(b) => b.create(name, namespace, config, addons).await,
         }
     }
 
@@ -60,6 +64,7 @@ impl ClusterBackend for BackendDispatch {
             Self::DirectK3s(b) => b.delete(name, namespace).await,
             Self::DirectK0s(b) => b.delete(name, namespace).await,
             Self::Capi(b) => b.delete(name, namespace).await,
+            Self::KobeSync(b) => b.delete(name, namespace).await,
         }
     }
 
@@ -69,6 +74,7 @@ impl ClusterBackend for BackendDispatch {
             Self::DirectK3s(b) => b.check_health(name, namespace).await,
             Self::DirectK0s(b) => b.check_health(name, namespace).await,
             Self::Capi(b) => b.check_health(name, namespace).await,
+            Self::KobeSync(b) => b.check_health(name, namespace).await,
         }
     }
 
@@ -78,6 +84,7 @@ impl ClusterBackend for BackendDispatch {
             Self::DirectK3s(b) => b.extract_kubeconfig(name, namespace).await,
             Self::DirectK0s(b) => b.extract_kubeconfig(name, namespace).await,
             Self::Capi(b) => b.extract_kubeconfig(name, namespace).await,
+            Self::KobeSync(b) => b.extract_kubeconfig(name, namespace).await,
         }
     }
 
@@ -92,6 +99,7 @@ impl ClusterBackend for BackendDispatch {
             Self::DirectK3s(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::DirectK0s(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::Capi(b) => b.check_readiness_gate(name, namespace, gate).await,
+            Self::KobeSync(b) => b.check_readiness_gate(name, namespace, gate).await,
         }
     }
 
@@ -101,6 +109,7 @@ impl ClusterBackend for BackendDispatch {
             Self::DirectK3s(b) => b.apply_addon(name, namespace, addon).await,
             Self::DirectK0s(b) => b.apply_addon(name, namespace, addon).await,
             Self::Capi(b) => b.apply_addon(name, namespace, addon).await,
+            Self::KobeSync(b) => b.apply_addon(name, namespace, addon).await,
         }
     }
 }
@@ -156,6 +165,9 @@ impl BackendFactory {
                     capi_config,
                 )))
             }
+            BackendType::KobeSync => Ok(BackendDispatch::KobeSync(KobeSyncBackend::new(
+                self.client.clone(),
+            ))),
         }
     }
 

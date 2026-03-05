@@ -5,6 +5,7 @@ mod crd;
 mod diagnostics;
 mod leader;
 mod metrics;
+pub mod pki;
 mod pool;
 mod telemetry;
 mod velero;
@@ -34,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!(namespace = %namespace, "Connected to Kubernetes");
 
-    info!("Available backends: k3k, direct-k3s, direct-k0s, capi");
+    info!("Available backends: k3k, direct-k3s, direct-k0s, capi, kobe-sync");
 
     // Optional shared PostgreSQL datastore for direct-k3s and direct-k0s backends.
     let pg_base_url = std::env::var("POSTGRES_URL").ok();

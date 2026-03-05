@@ -1,9 +1,13 @@
 pub mod auth_policy;
 pub mod claim;
+#[allow(dead_code)]
+pub mod datastore;
 pub mod profile;
 
 pub use auth_policy::*;
 pub use claim::*;
+#[allow(unused_imports)]
+pub use datastore::*;
 pub use profile::*;
 
 #[cfg(test)]
@@ -356,5 +360,149 @@ mod tests {
 
         // max_extensions defaults to 2
         assert_eq!(policy.max_extensions, 2);
+    }
+
+    // ── DataStore CRD tests ──────────────────────────────────────────
+
+    /// Deserialize an etcd DataStore with TLS and capacity.
+    #[test]
+    fn test_deserialize_etcd_datastore() {
+        let json = serde_json::json!({
+            "driver": "etcd",
+            "endpoints": [
+                "https://etcd-0.etcd:2379",
+                "https://etcd-1.etcd:2379",
+                "https://etcd-2.etcd:2379"
+            ],
+            "tls": {
+                "secretRef": "etcd-client-tls"
+            },
+            "capacity": {
+                "maxClusters": 50
+            },
+            "replicas": 3
+        });
+
+        let spec: DataStoreSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.driver, DataStoreDriver::Etcd);
+        assert_eq!(spec.endpoints.len(), 3);
+        assert_eq!(spec.endpoints[0], "https://etcd-0.etcd:2379");
+
+        let tls = spec.tls.expect("tls should be Some");
+        assert_eq!(tls.secret_ref, "etcd-client-tls");
+
+        assert_eq!(spec.capacity.max_clusters, 50);
+        assert_eq!(spec.replicas, Some(3));
+    }
+
+    /// Deserialize a kine-sqlite DataStore without TLS.
+    #[test]
+    fn test_deserialize_kine_sqlite_datastore() {
+        let json = serde_json::json!({
+            "driver": "kine-sqlite",
+            "endpoints": ["unix:///data/kine.sock"],
+            "capacity": {
+                "maxClusters": 10
+            }
+        });
+
+        let spec: DataStoreSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.driver, DataStoreDriver::KineSqlite);
+        assert_eq!(spec.endpoints, vec!["unix:///data/kine.sock"]);
+        assert!(spec.tls.is_none());
+        assert_eq!(spec.capacity.max_clusters, 10);
+        assert!(spec.replicas.is_none());
+    }
+
+    /// DataStoreStatus serialization with usedBy list.
+    #[test]
+    fn test_datastore_status_serialization() {
+        let status = DataStoreStatus {
+            ready: true,
+            current_clusters: 2,
+            used_by: vec![
+                DataStoreUser {
+                    namespace: "team-a".into(),
+                    name: "vc-001".into(),
+                },
+                DataStoreUser {
+                    namespace: "team-b".into(),
+                    name: "vc-042".into(),
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["ready"], true);
+        assert_eq!(json["currentClusters"], 2);
+        assert_eq!(json["usedBy"][0]["namespace"], "team-a");
+        assert_eq!(json["usedBy"][0]["name"], "vc-001");
+        assert_eq!(json["usedBy"][1]["namespace"], "team-b");
+        assert_eq!(json["usedBy"][1]["name"], "vc-042");
+
+        // Round-trip
+        let deserialized: DataStoreStatus = serde_json::from_value(json).unwrap();
+        assert!(deserialized.ready);
+        assert_eq!(deserialized.current_clusters, 2);
+        assert_eq!(deserialized.used_by.len(), 2);
+        assert_eq!(deserialized.used_by[0], DataStoreUser { namespace: "team-a".into(), name: "vc-001".into() });
+    }
+
+    // ── KobeSyncConfig v2 tests ─────────────────────────────────────
+
+    /// Deserialize a KobeSyncConfig with the new dataStoreRef, version, and kcm fields.
+    #[test]
+    fn test_deserialize_kobe_sync_v2_config() {
+        let json = serde_json::json!({
+            "dataStoreRef": {
+                "name": "shared-etcd"
+            },
+            "version": "1.31",
+            "kcm": {
+                "controllers": ["deployment", "replicaset", "namespace"]
+            },
+            "syncers": ["pods", "services"],
+            "proxyPort": 6443,
+            "metricsPort": 9090
+        });
+
+        let config: KobeSyncConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.data_store_ref.name, "shared-etcd");
+        assert_eq!(config.version, "1.31");
+
+        let kcm = config.kcm.expect("kcm should be Some");
+        assert_eq!(kcm.controllers, vec!["deployment", "replicaset", "namespace"]);
+
+        assert_eq!(config.syncers, vec!["pods", "services"]);
+        assert_eq!(config.proxy_port, 6443); // explicitly set in JSON fixture
+        assert_eq!(config.metrics_port, 9090);
+    }
+
+    /// KobeSyncConfig with defaults: version defaults to "1.32", kcm is None.
+    #[test]
+    fn test_kobe_sync_config_defaults() {
+        let json = serde_json::json!({
+            "dataStoreRef": {
+                "name": "my-store"
+            }
+        });
+
+        let config: KobeSyncConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.data_store_ref.name, "my-store");
+        assert_eq!(config.version, "1.32");
+        assert!(config.kcm.is_none());
+        assert_eq!(config.syncers, default_kobe_sync_syncers());
+        assert_eq!(config.proxy_port, 8443);
+        assert_eq!(config.metrics_port, 9090);
+    }
+
+    /// KcmConfig controller defaults include the full set.
+    #[test]
+    fn test_kcm_config_default_controllers() {
+        let json = serde_json::json!({});
+        let kcm: KcmConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(kcm.controllers, default_kcm_controllers());
+        assert_eq!(kcm.controllers.len(), 9);
+        assert!(kcm.controllers.contains(&"garbagecollector".to_string()));
     }
 }

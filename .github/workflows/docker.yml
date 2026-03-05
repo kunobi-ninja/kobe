@@ -49,5 +49,5 @@ jobs:
 
       # - name: Trigger deploy
       #   run: |
-      #     curl -sf -X POST https://wagyu-watcher.an internal cluster.zondax.io/trigger \
+      #     curl -sf -X POST https://kobe-watcher.an internal cluster.zondax.io/trigger \
       #       || echo "Deploy trigger failed — watcher will poll within 5 min"

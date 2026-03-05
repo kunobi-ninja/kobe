@@ -21,6 +21,91 @@ pub enum BackendType {
     /// Use Cluster API (CAPI) with a pluggable infrastructure provider.
     #[serde(rename = "capi")]
     Capi,
+    /// Use kobe-sync virtual cluster runtime (lightweight proxy-based).
+    #[serde(rename = "kobe-sync")]
+    KobeSync,
+}
+
+/// Reference to a DataStore CRD by name (same namespace).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DataStoreRef {
+    /// Name of the DataStore resource in the same namespace.
+    pub name: String,
+}
+
+/// Kube-controller-manager configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KcmConfig {
+    /// Which controllers to enable in the virtual KCM.
+    #[serde(default = "default_kcm_controllers")]
+    pub controllers: Vec<String>,
+}
+
+/// kobe-sync backend configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KobeSyncConfig {
+    /// Reference to the DataStore CRD that this cluster connects to.
+    pub data_store_ref: DataStoreRef,
+
+    /// Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
+    #[serde(default = "default_k8s_version")]
+    pub version: String,
+
+    /// Optional KCM (kube-controller-manager) configuration.
+    #[serde(default)]
+    pub kcm: Option<KcmConfig>,
+
+    /// Which resource syncers to enable. Defaults to core set.
+    #[serde(default = "default_kobe_sync_syncers")]
+    pub syncers: Vec<String>,
+
+    /// Port for the virtual API server proxy (default: 8443).
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
+
+    /// Port for health/metrics endpoints (default: 9090).
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+}
+
+pub fn default_k8s_version() -> String {
+    "1.32".to_string()
+}
+
+pub fn default_kcm_controllers() -> Vec<String> {
+    vec![
+        "deployment".into(),
+        "replicaset".into(),
+        "statefulset".into(),
+        "daemonset".into(),
+        "job".into(),
+        "cronjob".into(),
+        "namespace".into(),
+        "serviceaccount".into(),
+        "garbagecollector".into(),
+    ]
+}
+
+pub fn default_kobe_sync_syncers() -> Vec<String> {
+    vec![
+        "pods".into(),
+        "services".into(),
+        "configmaps".into(),
+        "secrets".into(),
+        "endpoints".into(),
+        "ingresses".into(),
+    ]
+}
+
+fn default_proxy_port() -> u16 {
+    8443
+}
+
+fn default_metrics_port() -> u16 {
+    9090
 }
 
 /// Configuration for a shared PostgreSQL datastore (direct-k3s backend only).
@@ -101,6 +186,10 @@ pub struct ClusterPoolProfileSpec {
     /// CAPI backend configuration (capi backend only).
     #[serde(default)]
     pub capi: Option<CapiConfig>,
+
+    /// kobe-sync backend configuration (kobe-sync backend only).
+    #[serde(default)]
+    pub kobe_sync: Option<KobeSyncConfig>,
 
     /// Cluster configuration.
     pub cluster: ClusterConfig,

@@ -1,12 +1,12 @@
-# Wagyu
+# Kobe
 
 **Premium cattle, managed by ninjas.**
 
-Wagyu is a Kubernetes operator that manages fleets of virtual clusters. It pre-warms pools of [vclusters](https://www.vcluster.com/) so your CI pipelines and developers get fully functional Kubernetes clusters instantly — via a simple HTTP API.
+Kobe is a Kubernetes operator that manages fleets of virtual clusters. It pre-warms pools of [vclusters](https://www.vcluster.com/) so your CI pipelines and developers get fully functional Kubernetes clusters instantly — via a simple HTTP API.
 
 ## Why
 
-| Without Wagyu | With Wagyu |
+| Without Kobe | With Kobe |
 |---------------|-----------|
 | Spin up Kind/vcluster on demand (~30-360s) | Claim a pre-warmed cluster (<5s) |
 | Distribute kubeconfigs or K8s API access | Simple `curl` with a JWT |
@@ -39,16 +39,16 @@ curl -X DELETE https://pool.kunobi.ninja/v1/claims/claim-a1b2c3 \
 
 ## How It Works
 
-Wagyu runs as an operator in a host Kubernetes cluster. It maintains pools of virtual clusters organized by **profiles** (cluster templates with specific configurations, addons, and resource limits).
+Kobe runs as an operator in a host Kubernetes cluster. It maintains pools of virtual clusters organized by **profiles** (cluster templates with specific configurations, addons, and resource limits).
 
-When a client claims a cluster, Wagyu assigns one from the warm pool instantly. When released, the vcluster is destroyed and a fresh replacement is created in the background — ensuring every claim gets a clean, isolated environment.
+When a client claims a cluster, Kobe assigns one from the warm pool instantly. When released, the vcluster is destroyed and a fresh replacement is created in the background — ensuring every claim gets a clean, isolated environment.
 
 ```
 ┌──────────────────────────────────┐
 │  Host K8s Cluster                │
 │                                  │
 │  ┌────────────────────────────┐  │
-│  │  wagyu-operator            │  │
+│  │  kobe-operator            │  │
 │  │  - Pool management         │  │
 │  │  - HTTP API + JWT auth     │  │
 │  │  - TTL enforcement         │  │
@@ -75,7 +75,7 @@ When a client claims a cluster, Wagyu assigns one from the warm pool instantly. 
 
 ## CRDs
 
-Wagyu uses two Custom Resource Definitions internally to manage pool state:
+Kobe uses two Custom Resource Definitions internally to manage pool state:
 
 ### ClusterPoolProfile
 

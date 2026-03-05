@@ -23,7 +23,7 @@ ARG BUILD_VERSION=dev
 ARG BUILD_COMMIT=unknown
 ARG BUILD_DATE=unknown
 
-LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/wagyu"
+LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 LABEL org.opencontainers.image.version="${BUILD_VERSION}"
 LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 

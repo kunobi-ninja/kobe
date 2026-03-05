@@ -1,6 +1,6 @@
 # Cross-Host Migration
 
-When multiple wagyu hosts share the same Velero `BackupStorageLocation`, golden
+When multiple kobe hosts share the same Velero `BackupStorageLocation`, golden
 image backups become portable. This enables live migration, cloud bursting, and
 disaster recovery across independent Kubernetes clusters.
 
@@ -16,7 +16,7 @@ disaster recovery across independent Kubernetes clusters.
                  |                           |
           +------v------+            +------v------+
           |   Host A    |            |   Host B    |
-          | (wagyu +    |            | (wagyu +    |
+          | (kobe +    |            | (kobe +    |
           |  k3k +      |            |  k3k +      |
           |  Velero)    |            |  Velero)    |
           +------+------+            +------+------+
@@ -29,7 +29,7 @@ disaster recovery across independent Kubernetes clusters.
                       +------------------+
 ```
 
-Both hosts run wagyu, k3k, and Velero. Both point their Velero
+Both hosts run kobe, k3k, and Velero. Both point their Velero
 `BackupStorageLocation` at the same S3 bucket (or compatible store). Golden
 backups created on Host A are visible to Host B and vice versa.
 
@@ -93,13 +93,13 @@ from Host B's pool.
 
 ### 5. Update DNS / Load Balancer
 
-Point the wagyu API endpoint to Host B. If you use a load balancer in front of
+Point the kobe API endpoint to Host B. If you use a load balancer in front of
 both hosts, remove Host A from the backend pool.
 
 ### 6. Decommission Host A
 
 Once all active leases on Host A have expired (check with
-`kubectl get clusterlease -n kunobi-pool`), tear down Host A's wagyu
+`kubectl get clusterlease -n kunobi-pool`), tear down Host A's kobe
 deployment.
 
 ## Cloud Bursting Pattern
@@ -121,7 +121,7 @@ needs to be built once.
 
 Protect against host failure with a standby:
 
-1. Host A is the primary. Host B runs wagyu but with `minReady: 0` (standby).
+1. Host A is the primary. Host B runs kobe but with `minReady: 0` (standby).
 2. Both share the same Velero `BackupStorageLocation`.
 3. Monitoring detects Host A is down.
 4. Automation (or manual action) sets Host B's `minReady` to the desired

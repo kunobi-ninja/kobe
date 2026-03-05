@@ -447,6 +447,7 @@ mod tests {
                 scaling,
                 diagnostics: None,
                 snapshot: None,
+                kobe_sync: None,
             },
             status: None,
         }
