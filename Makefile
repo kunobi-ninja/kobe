@@ -1,7 +1,6 @@
-.PHONY: build test check lint fmt fmt-check coverage coverage-open docker clean help
+.PHONY: build test check lint fmt fmt-check coverage coverage-open docker docker-print docker-push docker-clean clean help
 
-IMAGE_NAME ?= zondax/kobe
-IMAGE_TAG  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+NATIVE_PLATFORM := linux/$(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -30,12 +29,17 @@ coverage-open: ## Run coverage and open HTML report
 	cargo tarpaulin --engine llvm --all-features --workspace --out Html && \
 		(open tarpaulin-report.html || xdg-open tarpaulin-report.html || true)
 
-docker: ## Build Docker image
-	docker build \
-		--build-arg BUILD_VERSION=$(IMAGE_TAG) \
-		--build-arg BUILD_COMMIT=$(shell git rev-parse HEAD 2>/dev/null || echo unknown) \
-		--build-arg BUILD_DATE=$(shell date -u +%Y-%m-%dT%H:%M:%SZ) \
-		-t $(IMAGE_NAME):$(IMAGE_TAG) .
+docker: ## Build Docker images locally (both operator + kobe-sync)
+	PLATFORM=$(NATIVE_PLATFORM) docker buildx bake -f docker-bake.hcl --load
+
+docker-print: ## Show Docker bake plan (dry run)
+	docker buildx bake -f docker-bake.hcl --print
+
+docker-push: ## Build and push both Docker images
+	docker buildx bake -f docker-bake.hcl push
+
+docker-clean: ## Remove Docker build cache
+	docker builder prune -f
 
 clean: ## Remove build artifacts
 	cargo clean

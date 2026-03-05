@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "kobe-sync"
 path = "src/kobe_sync_bin.rs"
 
+[[bin]]
+name = "crdgen"
+path = "src/crdgen.rs"
+
 [dependencies]
 # Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
 kube = { version = "3.0", features = ["runtime", "derive", "client"] }

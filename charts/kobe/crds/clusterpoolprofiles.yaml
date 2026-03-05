@@ -1,0 +1,467 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterpoolprofiles.kunobi.ninja
+spec:
+  group: kunobi.ninja
+  names:
+    categories: []
+    kind: ClusterPoolProfile
+    plural: clusterpoolprofiles
+    shortNames:
+    - cpp
+    singular: clusterpoolprofile
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClusterPoolProfileSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              ClusterPoolProfile defines a pool of pre-warmed virtual clusters.
+
+              Each profile specifies cluster configuration, addons to install,
+              resource limits, health checks, readiness gates, scaling behavior,
+              and optional diagnostic capture settings.
+            properties:
+              addons:
+                default: []
+                description: Addons to install after cluster is running.
+                items:
+                  properties:
+                    manifest:
+                      description: Inline Kubernetes manifest YAML to apply after vcluster is ready.
+                      nullable: true
+                      type: string
+                    name:
+                      description: Human-readable name for the addon.
+                      type: string
+                    url:
+                      description: URL to fetch manifest from (alternative to inline).
+                      nullable: true
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              backend:
+                default: k3k
+                description: Backend to use for provisioning clusters.
+                enum:
+                - k3k
+                - direct-k3s
+                - direct-k0s
+                - capi
+                - kobe-sync
+                type: string
+              capi:
+                description: CAPI backend configuration (capi backend only).
+                nullable: true
+                properties:
+                  infrastructureApiVersion:
+                    description: API version of the infrastructure CRD (e.g. "infrastructure.cluster.x-k8s.io/v1alpha1").
+                    type: string
+                  infrastructureKind:
+                    description: Kind of the infrastructure CRD (e.g. "VCluster", "K0smotronCluster").
+                    type: string
+                  infrastructurePlural:
+                    description: |-
+                      Optional explicit plural form for the infrastructure CRD resource name.
+                      If not set, derived automatically by lowercasing the kind and appending "s".
+                      Use this for kinds with irregular plurals (e.g. "ingresses" for "Ingress").
+                    nullable: true
+                    type: string
+                  infrastructureSpec:
+                    description: |-
+                      Raw JSON/YAML spec to embed in the infrastructure resource.
+                      This is provider-specific and passed through as-is.
+                required:
+                - infrastructureApiVersion
+                - infrastructureKind
+                type: object
+              cluster:
+                description: Cluster configuration.
+                properties:
+                  agents:
+                    description: |-
+                      Number of k3s agent replicas (direct-k3s backend only).
+                      When set, creates a separate agent Deployment that joins the server.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  expose:
+                    description: Expose config (ingress/LoadBalancer/NodePort).
+                    nullable: true
+                    properties:
+                      exposeType:
+                        description: 'Expose type: "ingress", "NodePort", "LoadBalancer".'
+                        type: string
+                      ingressClassName:
+                        description: Ingress class name (when expose_type="ingress").
+                        nullable: true
+                        type: string
+                      nodePort:
+                        description: NodePort number (when expose_type="NodePort").
+                        format: int32
+                        nullable: true
+                        type: integer
+                    required:
+                    - exposeType
+                    type: object
+                  mode:
+                    default: shared
+                    description: 'k3k mode: "shared" or "virtual".'
+                    type: string
+                  persistence:
+                    description: Persistence config.
+                    nullable: true
+                    properties:
+                      storageClassName:
+                        description: Storage class name for dynamic provisioning.
+                        nullable: true
+                        type: string
+                      storageRequestSize:
+                        description: Storage request size (e.g., "10Gi").
+                        nullable: true
+                        type: string
+                      storageType:
+                        description: 'Storage type: "emptyDir", "dynamic", etc.'
+                        nullable: true
+                        type: string
+                    type: object
+                  serverArgs:
+                    default: []
+                    description: Extra k3s server args.
+                    items:
+                      type: string
+                    type: array
+                  servers:
+                    default: 1
+                    description: Number of control plane servers.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  version:
+                    description: k3s version (e.g., "v1.31.3+k3s1").
+                    type: string
+                required:
+                - version
+                type: object
+              datastore:
+                description: Shared PostgreSQL datastore configuration (direct-k3s backend only).
+                nullable: true
+                properties:
+                  goldenTemplates:
+                    default: false
+                    description: Enable golden images via PostgreSQL template databases.
+                    type: boolean
+                  secretKey:
+                    default: connection-url
+                    description: 'Key in the Secret (default: "connection-url").'
+                    type: string
+                  secretRef:
+                    description: Name of the Secret containing the PostgreSQL connection URL.
+                    type: string
+                required:
+                - secretRef
+                type: object
+              diagnostics:
+                description: Diagnostic bundle capture on claim release/expiry.
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: Enable diagnostic capture on claim release/expiry.
+                    type: boolean
+                  includeSecrets:
+                    default: false
+                    description: Never capture secrets by default.
+                    type: boolean
+                  logLines:
+                    default: 1000
+                    description: Number of log lines to capture per container.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  retentionDays:
+                    default: 7
+                    description: How long to keep diagnostic bundles.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  storage:
+                    description: S3 bucket URI (e.g. "s3://kunobi-diagnostics/").
+                    type: string
+                required:
+                - storage
+                type: object
+              healthCheck:
+                description: |-
+                  Health check configuration for warm clusters.
+                  Unhealthy clusters are automatically recycled.
+                nullable: true
+                properties:
+                  failureThreshold:
+                    default: 3
+                    description: Consecutive failures before recycling a cluster.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  intervalSeconds:
+                    default: 30
+                    description: How often to probe warm clusters, in seconds.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              poolSize:
+                default: 3
+                description: |-
+                  Desired number of warm (idle + creating) clusters in the pool.
+                  Ignored when `scaling` is set — use `scaling.min_ready` instead.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              readinessGates:
+                default: []
+                description: |-
+                  Readiness gates that must pass before a cluster enters the warm pool.
+                  Clusters stay in Creating phase until all gates are satisfied.
+                items:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    type:
+                      enum:
+                      - CRDExists
+                      - DeploymentReady
+                      - DaemonSetReady
+                      - URLHealthy
+                      type: string
+                    url:
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              resources:
+                description: Resource limits per cluster.
+                nullable: true
+                properties:
+                  limits:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                  requests:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                type: object
+              scaling:
+                description: Autoscaling configuration. When set, overrides fixed `pool_size`.
+                nullable: true
+                properties:
+                  maxClusters:
+                    default: 8
+                    description: Hard ceiling on total clusters (warm + claimed + creating).
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  minReady:
+                    default: 1
+                    description: Minimum number of warm (ready) clusters to maintain.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  queueTimeout:
+                    default: 5m
+                    description: |-
+                      Queue timeout for claims waiting when at max capacity.
+                      Claims pending longer than this get 503. Format: "5m".
+                    type: string
+                  scaleDownAfter:
+                    default: 30m
+                    description: |-
+                      Delete idle clusters after this duration if above `min_ready`.
+                      Format: "30m", "1h", etc.
+                    type: string
+                  scaleUpThreshold:
+                    default: 0
+                    description: Scale up when ready clusters fall to this threshold.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              snapshot:
+                description: |-
+                  Velero golden image snapshot configuration.
+                  When enabled, the operator maintains a Velero backup of a golden cluster
+                  and restores new pool members from it for faster provisioning.
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: Enable golden image snapshotting via Velero.
+                    type: boolean
+                  goldenPrefix:
+                    default: golden
+                    description: Prefix for the golden backup name (e.g. "golden-<profile>").
+                    type: string
+                  refreshOn:
+                    default: ProfileChange
+                    description: When to refresh the golden image.
+                    enum:
+                    - ProfileChange
+                    - Manual
+                    type: string
+                  storageLocation:
+                    default: default
+                    description: Velero BackupStorageLocation name to use.
+                    type: string
+                  ttl:
+                    default: 720h
+                    description: How long the Velero backup should be retained (e.g. "720h").
+                    type: string
+                  veleroNamespace:
+                    default: velero
+                    description: Namespace where the Velero server is installed.
+                    type: string
+                type: object
+              ttl:
+                default: 2h
+                description: Default TTL for claims against this profile (e.g. "2h", "30m").
+                type: string
+              kobeSync:
+                description: kobe-sync backend configuration (kobe-sync backend only).
+                nullable: true
+                properties:
+                  dataStoreRef:
+                    description: Reference to the DataStore CRD that this cluster connects to.
+                    properties:
+                      name:
+                        description: Name of the DataStore resource in the same namespace.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  kcm:
+                    description: Optional KCM (kube-controller-manager) configuration.
+                    nullable: true
+                    properties:
+                      controllers:
+                        default:
+                        - deployment
+                        - replicaset
+                        - statefulset
+                        - daemonset
+                        - job
+                        - cronjob
+                        - namespace
+                        - serviceaccount
+                        - garbagecollector
+                        description: Which controllers to enable in the virtual KCM.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  metricsPort:
+                    default: 9090
+                    description: 'Port for health/metrics endpoints (default: 9090).'
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                  proxyPort:
+                    default: 8443
+                    description: 'Port for the virtual API server proxy (default: 8443).'
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                  syncers:
+                    default:
+                    - pods
+                    - services
+                    - configmaps
+                    - secrets
+                    - endpoints
+                    - ingresses
+                    description: Which resource syncers to enable. Defaults to core set.
+                    items:
+                      type: string
+                    type: array
+                  version:
+                    default: '1.32'
+                    description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
+                    type: string
+                required:
+                - dataStoreRef
+                type: object
+            required:
+            - cluster
+            type: object
+          status:
+            nullable: true
+            properties:
+              claimed:
+                default: 0
+                description: Number of clusters currently bound to claims.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              creating:
+                default: 0
+                description: Number of clusters being created or recycled.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              goldenBackup:
+                description: Name of the current golden Velero backup (e.g. "golden-myprofile-3").
+                nullable: true
+                type: string
+              goldenGeneration:
+                description: |-
+                  The profile generation that the golden backup was created from.
+                  Used to detect when a new snapshot is needed after spec changes.
+                format: int64
+                nullable: true
+                type: integer
+              goldenTemplateDb:
+                description: Name of the PostgreSQL template database for golden images (direct-k3s backend).
+                nullable: true
+                type: string
+              queueDepth:
+                default: 0
+                description: Current queue depth (claims waiting for clusters).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              ready:
+                default: 0
+                description: Number of idle clusters ready for claims.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              unhealthy:
+                default: 0
+                description: Number of clusters currently unhealthy and being recycled.
+                format: uint32
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: ClusterPoolProfile
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

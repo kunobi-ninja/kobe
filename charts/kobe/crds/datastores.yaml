@@ -1,0 +1,121 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: datastores.kunobi.ninja
+spec:
+  group: kunobi.ninja
+  names:
+    categories: []
+    kind: DataStore
+    plural: datastores
+    shortNames:
+    - ds
+    singular: datastore
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.driver
+      name: Driver
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .status.currentClusters
+      name: Clusters
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for DataStoreSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              DataStore represents an external storage backend (etcd or kine-sqlite)
+              that virtual cluster kube-apiservers connect to via `--etcd-servers`
+              and `--etcd-prefix`.
+            properties:
+              capacity:
+                description: Capacity limits.
+                properties:
+                  maxClusters:
+                    description: Maximum number of virtual clusters this DataStore can serve.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                required:
+                - maxClusters
+                type: object
+              driver:
+                description: Storage driver type.
+                enum:
+                - etcd
+                - kine-sqlite
+                type: string
+              endpoints:
+                description: Endpoints to connect to (e.g. ["https://etcd-0:2379"]).
+                items:
+                  type: string
+                type: array
+              replicas:
+                description: Number of replicas for the storage backend (relevant for etcd).
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              tls:
+                description: Optional TLS configuration for the connection.
+                nullable: true
+                properties:
+                  secretRef:
+                    description: |-
+                      Name of the Kubernetes Secret containing TLS credentials
+                      (ca.crt, tls.crt, tls.key).
+                    type: string
+                required:
+                - secretRef
+                type: object
+            required:
+            - capacity
+            - driver
+            - endpoints
+            type: object
+          status:
+            description: Runtime status of a DataStore.
+            nullable: true
+            properties:
+              currentClusters:
+                default: 0
+                description: Number of virtual clusters currently using this DataStore.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              ready:
+                default: false
+                description: Whether the DataStore is reachable and healthy.
+                type: boolean
+              usedBy:
+                default: []
+                description: List of virtual clusters using this DataStore.
+                items:
+                  description: Identifies a virtual cluster using this DataStore.
+                  properties:
+                    name:
+                      description: Name of the virtual cluster.
+                      type: string
+                    namespace:
+                      description: Namespace of the virtual cluster.
+                      type: string
+                  required:
+                  - name
+                  - namespace
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        title: DataStore
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

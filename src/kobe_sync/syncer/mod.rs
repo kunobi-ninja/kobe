@@ -112,19 +112,15 @@ mod tests {
             ..Default::default()
         };
 
-        let config =
-            kube::Config::from_custom_kubeconfig(kubeconfig.clone(), &Default::default())
-                .await
-                .expect("kubeconfig should parse");
-        let virtual_client =
-            kube::Client::try_from(config).expect("should create client");
+        let config = kube::Config::from_custom_kubeconfig(kubeconfig.clone(), &Default::default())
+            .await
+            .expect("kubeconfig should parse");
+        let virtual_client = kube::Client::try_from(config).expect("should create client");
 
-        let config2 =
-            kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
-                .await
-                .expect("kubeconfig should parse");
-        let host_client =
-            kube::Client::try_from(config2).expect("should create client");
+        let config2 = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default())
+            .await
+            .expect("kubeconfig should parse");
+        let host_client = kube::Client::try_from(config2).expect("should create client");
 
         let translator = Arc::new(NameTranslator::new("test-ns".to_string()));
 

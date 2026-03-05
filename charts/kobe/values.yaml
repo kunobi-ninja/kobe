@@ -1,0 +1,89 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: zondax/kobe-operator
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicas: 1
+
+logLevel: "kunobi_pool_operator=info"
+
+# Namespace the operator manages (OPERATOR_NAMESPACE env var)
+operatorNamespace: "kunobi-pool"
+
+# Optional PostgreSQL connection for direct-k3s/k0s backends
+postgres:
+  url: ""
+
+# kobe-sync sidecar image (used when operator creates virtual clusters)
+kobeSync:
+  image:
+    repository: zondax/kobe-sync
+    tag: ""  # defaults to same appVersion as operator
+
+serviceAccount:
+  name: ""
+  annotations: {}
+
+annotations: {}
+podAnnotations: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  port: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+podDisruptionBudget:
+  enabled: false
+  # minAvailable: 1
+  # maxUnavailable: 1
+
+networkPolicy:
+  enabled: false
+  apiServerCIDR: 0.0.0.0/0
+  egressCIDRs:
+    - 0.0.0.0/0
+
+# Optional bitnami/etcd subchart
+etcd:
+  enabled: false
+  replicaCount: 3
+  auth:
+    rbac:
+      create: false
+  persistence:
+    size: 8Gi

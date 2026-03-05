@@ -52,12 +52,10 @@ impl ResourceSyncer for SecretSyncerV2 {
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
         let virtual_api: Api<Secret> = Api::all(ctx.virtual_client.clone());
-        let host_api: Api<Secret> =
-            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let host_api: Api<Secret> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("SecretSyncerV2: starting watch on virtual apiserver");
 
@@ -115,16 +113,14 @@ async fn handle_secret_event(
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_secret);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "SecretSyncerV2: patched host secret");
                 }
                 None => {
-                    host_api.create(&PostParams::default(), &host_secret).await?;
+                    host_api
+                        .create(&PostParams::default(), &host_secret)
+                        .await?;
                     debug!(name = %host_name, "SecretSyncerV2: created host secret");
                 }
             }
@@ -170,8 +166,8 @@ async fn handle_secret_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::core::v1::Secret;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
@@ -205,12 +201,15 @@ mod tests_v2 {
             host_secret.metadata.name,
             Some("db-creds-x-default-x-vc".into())
         );
+        assert_eq!(host_secret.metadata.namespace, Some("pool-test".into()));
         assert_eq!(
-            host_secret.metadata.namespace,
-            Some("pool-test".into())
-        );
-        assert_eq!(
-            host_secret.data.as_ref().unwrap().get("password").unwrap().0,
+            host_secret
+                .data
+                .as_ref()
+                .unwrap()
+                .get("password")
+                .unwrap()
+                .0,
             b"s3cret"
         );
         assert_eq!(host_secret.type_, Some("Opaque".into()));
@@ -234,11 +233,7 @@ mod tests_v2 {
         };
         let host_secret = translate_secret_to_host(&secret, &t, "staging").unwrap();
         assert_eq!(
-            host_secret
-                .string_data
-                .as_ref()
-                .unwrap()
-                .get("token"),
+            host_secret.string_data.as_ref().unwrap().get("token"),
             Some(&"abc123".to_string())
         );
     }

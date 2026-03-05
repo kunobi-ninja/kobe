@@ -14,8 +14,8 @@
 //! TTLs, or pools. It receives its configuration from environment variables
 //! and/or a ConfigMap, and runs until terminated.
 
-mod pki;
 mod kobe_sync;
+mod pki;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -127,10 +127,7 @@ async fn main() -> Result<()> {
     //    of the enabled_syncers config since they are essential for cluster health.
     let always_on = vec!["fake_nodes".to_string(), "status".to_string()];
     let always_on_handles = syncer::start_syncers_v2(ctx.clone(), &always_on, shutdown.clone());
-    info!(
-        count = always_on_handles.len(),
-        "Always-on syncers started"
-    );
+    info!(count = always_on_handles.len(), "Always-on syncers started");
 
     // 10. Start TLS proxy
     //     For now we use the v1 VirtualClusterProxy infrastructure which does
@@ -159,8 +156,7 @@ async fn main() -> Result<()> {
         metrics_port: config.metrics_port,
     };
 
-    let proxy =
-        Arc::new(VirtualClusterProxy::new(proxy_config).context("Failed to create proxy")?);
+    let proxy = Arc::new(VirtualClusterProxy::new(proxy_config).context("Failed to create proxy")?);
 
     let proxy_handle = tokio::spawn({
         let proxy = proxy.clone();
@@ -291,8 +287,7 @@ async fn build_virtual_client(
     )?;
 
     let kubeconfig = kube::config::Kubeconfig::from_yaml(&kubeconfig_yaml)?;
-    let config =
-        kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default()).await?;
+    let config = kube::Config::from_custom_kubeconfig(kubeconfig, &Default::default()).await?;
     Ok(kube::Client::try_from(config)?)
 }
 

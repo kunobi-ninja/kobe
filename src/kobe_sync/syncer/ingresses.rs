@@ -47,11 +47,8 @@ pub fn translate_ingress_to_host(
                 if let Some(ref mut http) = rule.http {
                     for path in &mut http.paths {
                         if let Some(ref mut svc) = path.backend.service {
-                            if !svc.name.is_empty()
-                                && translator.to_virtual(&svc.name).is_none()
-                            {
-                                svc.name =
-                                    translator.to_host_name(&svc.name, virtual_ns);
+                            if !svc.name.is_empty() && translator.to_virtual(&svc.name).is_none() {
+                                svc.name = translator.to_host_name(&svc.name, virtual_ns);
                             }
                         }
                     }
@@ -63,11 +60,8 @@ pub fn translate_ingress_to_host(
         if let Some(ref mut tls_list) = new_spec.tls {
             for tls in tls_list.iter_mut() {
                 if let Some(ref secret_name) = tls.secret_name.clone() {
-                    if !secret_name.is_empty()
-                        && translator.to_virtual(secret_name).is_none()
-                    {
-                        tls.secret_name =
-                            Some(translator.to_host_name(secret_name, virtual_ns));
+                    if !secret_name.is_empty() && translator.to_virtual(secret_name).is_none() {
+                        tls.secret_name = Some(translator.to_host_name(secret_name, virtual_ns));
                     }
                 }
             }
@@ -99,12 +93,10 @@ impl ResourceSyncer for IngressSyncerV2 {
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
         let virtual_api: Api<Ingress> = Api::all(ctx.virtual_client.clone());
-        let host_api: Api<Ingress> =
-            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let host_api: Api<Ingress> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("IngressSyncerV2: starting watch on virtual apiserver");
 
@@ -162,11 +154,7 @@ async fn handle_ingress_event(
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_ing);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "IngressSyncerV2: patched host ingress");
                 }
@@ -217,8 +205,8 @@ async fn handle_ingress_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::networking::v1::{
         HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
         IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
@@ -246,10 +234,7 @@ mod tests_v2 {
             host_ing.metadata.name,
             Some("my-ingress-x-default-x-vc".into())
         );
-        assert_eq!(
-            host_ing.metadata.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(host_ing.metadata.namespace, Some("pool-test".into()));
     }
 
     #[test]
@@ -386,10 +371,7 @@ mod tests_v2 {
         };
         let host_ing = translate_ingress_to_host(&ing, &t, "default").unwrap();
         let tls = host_ing.spec.as_ref().unwrap().tls.as_ref().unwrap();
-        assert_eq!(
-            tls[0].secret_name,
-            Some("tls-cert-x-default-x-vc".into())
-        );
+        assert_eq!(tls[0].secret_name, Some("tls-cert-x-default-x-vc".into()));
         // Hosts should be preserved.
         assert_eq!(tls[0].hosts, Some(vec!["example.com".into()]));
     }

@@ -419,10 +419,22 @@ mod tests {
         .unwrap();
 
         // All fields must be non-empty and contain expected PEM markers.
-        assert!(pki.ca_cert.contains("BEGIN CERTIFICATE"), "ca_cert missing PEM header");
-        assert!(pki.ca_key.contains("BEGIN PRIVATE KEY"), "ca_key missing PEM header");
-        assert!(pki.apiserver_cert.contains("BEGIN CERTIFICATE"), "apiserver_cert missing PEM header");
-        assert!(pki.apiserver_key.contains("BEGIN PRIVATE KEY"), "apiserver_key missing PEM header");
+        assert!(
+            pki.ca_cert.contains("BEGIN CERTIFICATE"),
+            "ca_cert missing PEM header"
+        );
+        assert!(
+            pki.ca_key.contains("BEGIN PRIVATE KEY"),
+            "ca_key missing PEM header"
+        );
+        assert!(
+            pki.apiserver_cert.contains("BEGIN CERTIFICATE"),
+            "apiserver_cert missing PEM header"
+        );
+        assert!(
+            pki.apiserver_key.contains("BEGIN PRIVATE KEY"),
+            "apiserver_key missing PEM header"
+        );
         assert!(
             pki.front_proxy_ca_cert.contains("BEGIN CERTIFICATE"),
             "front_proxy_ca_cert missing PEM header"
@@ -439,8 +451,14 @@ mod tests {
             pki.front_proxy_client_key.contains("BEGIN PRIVATE KEY"),
             "front_proxy_client_key missing PEM header"
         );
-        assert!(pki.sa_key.contains("BEGIN PRIVATE KEY"), "sa_key missing PEM header");
-        assert!(pki.sa_pub.contains("BEGIN PUBLIC KEY"), "sa_pub missing PEM header");
+        assert!(
+            pki.sa_key.contains("BEGIN PRIVATE KEY"),
+            "sa_key missing PEM header"
+        );
+        assert!(
+            pki.sa_pub.contains("BEGIN PUBLIC KEY"),
+            "sa_pub missing PEM header"
+        );
 
         // No field should be empty.
         assert!(!pki.ca_cert.is_empty());
@@ -459,12 +477,9 @@ mod tests {
     fn test_generate_kcm_kubeconfig() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (ca_cert, ca_key) = CertificateManager::generate_ca().unwrap();
-        let kubeconfig = CertificateManager::generate_kcm_kubeconfig(
-            &ca_cert,
-            &ca_key,
-            "https://10.0.0.1:6443",
-        )
-        .unwrap();
+        let kubeconfig =
+            CertificateManager::generate_kcm_kubeconfig(&ca_cert, &ca_key, "https://10.0.0.1:6443")
+                .unwrap();
 
         assert!(
             kubeconfig.contains("certificate-authority-data:"),
@@ -495,11 +510,8 @@ mod tests {
     #[test]
     fn test_pki_secrets_map() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pki = CertificateManager::generate_pki(
-            "test-cluster",
-            &["kubernetes", "localhost"],
-        )
-        .unwrap();
+        let pki =
+            CertificateManager::generate_pki("test-cluster", &["kubernetes", "localhost"]).unwrap();
 
         let secrets = pki.to_secret_data();
 
@@ -591,11 +603,8 @@ mod tests {
     #[test]
     fn test_front_proxy_separate_chain() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pki = CertificateManager::generate_pki(
-            "test-cluster",
-            &["kubernetes", "localhost"],
-        )
-        .unwrap();
+        let pki =
+            CertificateManager::generate_pki("test-cluster", &["kubernetes", "localhost"]).unwrap();
 
         // The front-proxy CA must be different from the kubernetes CA.
         assert_ne!(

@@ -445,7 +445,13 @@ mod tests {
         assert!(deserialized.ready);
         assert_eq!(deserialized.current_clusters, 2);
         assert_eq!(deserialized.used_by.len(), 2);
-        assert_eq!(deserialized.used_by[0], DataStoreUser { namespace: "team-a".into(), name: "vc-001".into() });
+        assert_eq!(
+            deserialized.used_by[0],
+            DataStoreUser {
+                namespace: "team-a".into(),
+                name: "vc-001".into()
+            }
+        );
     }
 
     // ── KobeSyncConfig v2 tests ─────────────────────────────────────
@@ -471,7 +477,10 @@ mod tests {
         assert_eq!(config.version, "1.31");
 
         let kcm = config.kcm.expect("kcm should be Some");
-        assert_eq!(kcm.controllers, vec!["deployment", "replicaset", "namespace"]);
+        assert_eq!(
+            kcm.controllers,
+            vec!["deployment", "replicaset", "namespace"]
+        );
 
         assert_eq!(config.syncers, vec!["pods", "services"]);
         assert_eq!(config.proxy_port, 6443); // explicitly set in JSON fixture

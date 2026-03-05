@@ -75,8 +75,13 @@ impl VirtualClusterPki {
 
         // 2. API server serving cert signed by Kubernetes CA
         let apiserver_sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
-        let (apiserver_cert, apiserver_key) =
-            generate_signed_cert(&ca_cert, &ca_key, "kube-apiserver", cluster_name, apiserver_sans)?;
+        let (apiserver_cert, apiserver_key) = generate_signed_cert(
+            &ca_cert,
+            &ca_key,
+            "kube-apiserver",
+            cluster_name,
+            apiserver_sans,
+        )?;
 
         // 3. Front-proxy CA (separate chain)
         let (front_proxy_ca_cert, front_proxy_ca_key) = generate_named_ca(
@@ -156,11 +161,7 @@ impl VirtualClusterPki {
 /// Creates a client certificate with CN=system:kube-controller-manager
 /// signed by the provided CA, and builds a kubeconfig YAML with embedded
 /// base64-encoded certificates.
-pub fn generate_kcm_kubeconfig(
-    ca_cert: &str,
-    ca_key: &str,
-    server_url: &str,
-) -> Result<String> {
+pub fn generate_kcm_kubeconfig(ca_cert: &str, ca_key: &str, server_url: &str) -> Result<String> {
     let (client_cert, client_key) = generate_signed_cert(
         ca_cert,
         ca_key,
@@ -244,10 +245,7 @@ pub async fn create_pki_secret(
         "app.kubernetes.io/managed-by".to_string(),
         "kunobi-pool-operator".to_string(),
     );
-    labels.insert(
-        "kunobi.ninja/cluster".to_string(),
-        name.to_string(),
-    );
+    labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
 
     let secret = Secret {
         metadata: ObjectMeta {
@@ -372,10 +370,22 @@ mod tests {
         .unwrap();
 
         // All fields must be non-empty and contain expected PEM markers.
-        assert!(pki.ca_cert.contains("BEGIN CERTIFICATE"), "ca_cert missing PEM header");
-        assert!(pki.ca_key.contains("BEGIN PRIVATE KEY"), "ca_key missing PEM header");
-        assert!(pki.apiserver_cert.contains("BEGIN CERTIFICATE"), "apiserver_cert missing PEM header");
-        assert!(pki.apiserver_key.contains("BEGIN PRIVATE KEY"), "apiserver_key missing PEM header");
+        assert!(
+            pki.ca_cert.contains("BEGIN CERTIFICATE"),
+            "ca_cert missing PEM header"
+        );
+        assert!(
+            pki.ca_key.contains("BEGIN PRIVATE KEY"),
+            "ca_key missing PEM header"
+        );
+        assert!(
+            pki.apiserver_cert.contains("BEGIN CERTIFICATE"),
+            "apiserver_cert missing PEM header"
+        );
+        assert!(
+            pki.apiserver_key.contains("BEGIN PRIVATE KEY"),
+            "apiserver_key missing PEM header"
+        );
         assert!(
             pki.front_proxy_ca_cert.contains("BEGIN CERTIFICATE"),
             "front_proxy_ca_cert missing PEM header"
@@ -392,8 +402,14 @@ mod tests {
             pki.front_proxy_client_key.contains("BEGIN PRIVATE KEY"),
             "front_proxy_client_key missing PEM header"
         );
-        assert!(pki.sa_key.contains("BEGIN PRIVATE KEY"), "sa_key missing PEM header");
-        assert!(pki.sa_pub.contains("BEGIN PUBLIC KEY"), "sa_pub missing PEM header");
+        assert!(
+            pki.sa_key.contains("BEGIN PRIVATE KEY"),
+            "sa_key missing PEM header"
+        );
+        assert!(
+            pki.sa_pub.contains("BEGIN PUBLIC KEY"),
+            "sa_pub missing PEM header"
+        );
     }
 
     #[test]
@@ -428,7 +444,8 @@ mod tests {
     #[test]
     fn test_pki_secrets_map() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pki = VirtualClusterPki::generate("test-cluster", &["kubernetes", "localhost"]).unwrap();
+        let pki =
+            VirtualClusterPki::generate("test-cluster", &["kubernetes", "localhost"]).unwrap();
 
         let secrets = pki.to_secret_data();
 

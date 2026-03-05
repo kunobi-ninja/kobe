@@ -5,3 +5,6 @@ docs/plans/
 .worktrees/
 
 tarpaulin-report.json
+
+# Helm dependency tarballs (downloaded by helm dependency build)
+charts/*/charts/

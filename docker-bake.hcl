@@ -27,8 +27,8 @@ variable "BUILD_DATE" {
   default = "unknown"
 }
 
-variable "RUST_VERSION" {
-  default = "1.93"
+variable "PLATFORM" {
+  default = "linux/amd64"
 }
 
 # Generate tag array: latest, IMAGE_TAG, and rolling semver tags (v0.1.0, v0.1, v0)
@@ -47,44 +47,68 @@ function "tags" {
 # Groups
 # =============================================================================
 group "default" {
-  targets = ["operator"]
+  targets = ["operator", "kobe-sync"]
 }
 
 group "push" {
-  targets = ["operator-push"]
+  targets = ["operator-push", "kobe-sync-push"]
 }
 
 # =============================================================================
-# Shared base config
+# Shared build stage (built once, reused via context)
 # =============================================================================
-target "_common" {
-  dockerfile = "Dockerfile"
+target "builder" {
+  dockerfile = "docker/builder.Dockerfile"
   context    = "."
-  platforms  = ["linux/amd64"]
+  platforms  = [PLATFORM]
+}
+
+# =============================================================================
+# Operator image
+# =============================================================================
+target "operator" {
+  dockerfile = "docker/operator.Dockerfile"
+  context    = "."
+  contexts = {
+    builder = "target:builder"
+  }
+  platforms = ["linux/amd64"]
+  tags      = tags("kobe-operator")
   args = {
-    RUST_VERSION  = RUST_VERSION
     BUILD_VERSION = BUILD_VERSION
     BUILD_COMMIT  = BUILD_COMMIT
     BUILD_DATE    = BUILD_DATE
   }
+  cache-from = ["type=registry,ref=${REGISTRY}/kobe-operator:buildcache"]
 }
 
-# =============================================================================
-# Local build (no push)
-# =============================================================================
-target "operator" {
-  inherits   = ["_common"]
-  tags       = tags("kobe")
-  cache-from = ["type=registry,ref=${REGISTRY}/kobe:buildcache"]
-}
-
-# =============================================================================
-# CI build + push + cache export
-# =============================================================================
 target "operator-push" {
-  inherits   = ["_common"]
-  tags       = tags("kobe")
-  cache-from = ["type=registry,ref=${REGISTRY}/kobe:buildcache"]
-  output     = ["type=registry"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/kobe:buildcache,mode=max"]
+  inherits = ["operator"]
+  output   = ["type=registry"]
+  cache-to = ["type=registry,ref=${REGISTRY}/kobe-operator:buildcache,mode=max"]
+}
+
+# =============================================================================
+# Kobe-sync image
+# =============================================================================
+target "kobe-sync" {
+  dockerfile = "docker/kobe-sync.Dockerfile"
+  context    = "."
+  contexts = {
+    builder = "target:builder"
+  }
+  platforms = ["linux/amd64"]
+  tags      = tags("kobe-sync")
+  args = {
+    BUILD_VERSION = BUILD_VERSION
+    BUILD_COMMIT  = BUILD_COMMIT
+    BUILD_DATE    = BUILD_DATE
+  }
+  cache-from = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache"]
+}
+
+target "kobe-sync-push" {
+  inherits = ["kobe-sync"]
+  output   = ["type=registry"]
+  cache-to = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache,mode=max"]
 }

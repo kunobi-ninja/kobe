@@ -67,12 +67,10 @@ impl ResourceSyncer for ServiceSyncerV2 {
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
         let virtual_api: Api<Service> = Api::all(ctx.virtual_client.clone());
-        let host_api: Api<Service> =
-            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let host_api: Api<Service> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("ServiceSyncerV2: starting watch on virtual apiserver");
 
@@ -130,11 +128,7 @@ async fn handle_service_event(
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_svc);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "ServiceSyncerV2: patched host service");
                 }
@@ -185,8 +179,8 @@ async fn handle_service_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -211,14 +205,8 @@ mod tests_v2 {
             ..Default::default()
         };
         let host_svc = translate_service_to_host(&svc, &t, "default").unwrap();
-        assert_eq!(
-            host_svc.metadata.name,
-            Some("my-svc-x-default-x-vc".into())
-        );
-        assert_eq!(
-            host_svc.metadata.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(host_svc.metadata.name, Some("my-svc-x-default-x-vc".into()));
+        assert_eq!(host_svc.metadata.namespace, Some("pool-test".into()));
     }
 
     #[test]

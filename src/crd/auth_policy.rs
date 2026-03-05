@@ -60,7 +60,7 @@ pub struct AuthPolicySpec {
 ///
 /// The extracted role is combined with the provider name to form
 /// the `requester_type` string: `"{provider_name}:{role}"`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "camelCase")]
 pub enum RoleExtractionConfig {
     /// All tokens from this provider get the same role.
@@ -105,6 +105,38 @@ pub enum RoleExtractionConfig {
         #[serde(default)]
         default: Option<String>,
     },
+}
+
+// Manual JsonSchema impl — same CRD structural schema workaround as ReadinessGate.
+impl JsonSchema for RoleExtractionConfig {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RoleExtractionConfig".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "required": ["method"],
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "enum": ["static", "claim", "mapping", "conditional"]
+                },
+                "role": { "type": "string" },
+                "claim": { "type": "string" },
+                "default": { "type": "string" },
+                "values": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                },
+                "rules": {
+                    "type": "array",
+                    "items": generator.subschema_for::<ConditionalRule>()
+                }
+            }
+        }))
+        .unwrap()
+    }
 }
 
 /// A conditional rule for role extraction.

@@ -44,22 +44,20 @@ fn build_host_client_with_ca_path(ca_cert_path: &str) -> anyhow::Result<reqwest:
     let mut builder = reqwest::Client::builder();
 
     match std::fs::read(ca_cert_path) {
-        Ok(ca_pem) if !ca_pem.is_empty() => {
-            match reqwest::Certificate::from_pem(&ca_pem) {
-                Ok(cert) => {
-                    builder = builder.add_root_certificate(cert);
-                }
-                Err(e) => {
-                    warn!(
-                        path = ca_cert_path,
-                        error = %e,
-                        "Failed to parse in-cluster CA certificate; \
-                         falling back to danger_accept_invalid_certs for development"
-                    );
-                    builder = builder.danger_accept_invalid_certs(true);
-                }
+        Ok(ca_pem) if !ca_pem.is_empty() => match reqwest::Certificate::from_pem(&ca_pem) {
+            Ok(cert) => {
+                builder = builder.add_root_certificate(cert);
             }
-        }
+            Err(e) => {
+                warn!(
+                    path = ca_cert_path,
+                    error = %e,
+                    "Failed to parse in-cluster CA certificate; \
+                     falling back to danger_accept_invalid_certs for development"
+                );
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+        },
         Ok(_) => {
             // File exists but is empty.
             warn!(
@@ -314,8 +312,8 @@ pub struct VirtualClusterProxy {
 impl VirtualClusterProxy {
     /// Create a new proxy from the given configuration.
     pub fn new(config: ProxyConfig) -> Result<Self> {
-        let http_client = build_host_client()
-            .context("Failed to build HTTP client for host API forwarding")?;
+        let http_client =
+            build_host_client().context("Failed to build HTTP client for host API forwarding")?;
 
         let tls_acceptor = TlsAcceptor::from(config.tls_config);
 
@@ -754,8 +752,7 @@ impl VirtualClusterProxy {
                 if let Some(name_val) = meta_map.get("name") {
                     if let Some(name_str) = name_val.as_str() {
                         let host_name = self.translator.to_host_name(name_str, virtual_ns);
-                        meta_map
-                            .insert("name".to_string(), serde_json::Value::String(host_name));
+                        meta_map.insert("name".to_string(), serde_json::Value::String(host_name));
                     }
                 }
                 // Replace namespace with host namespace.
@@ -1702,7 +1699,11 @@ impl VirtualClusterProxyV2 {
         sub: SubresourceRequest,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
         let (host_path, _host_ns) = translate_subresource_to_host(&sub, &self.translator);
-        let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+        let query = req
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
         let method = req.method().clone();
 
         info!(
@@ -1749,7 +1750,9 @@ impl VirtualClusterProxyV2 {
                 PROXY_ERRORS_TOTAL.with_label_values(&["subresource"]).inc();
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!("Subresource proxy error: {e}"))))
+                    .body(Full::new(Bytes::from(format!(
+                        "Subresource proxy error: {e}"
+                    ))))
                     .unwrap());
             }
         };

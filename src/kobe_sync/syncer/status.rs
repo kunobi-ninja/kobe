@@ -206,13 +206,10 @@ impl ResourceSyncer for StatusSyncerV2 {
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
         // Watch host Pods that are managed by kobe-sync.
-        let host_pod_api: Api<Pod> =
-            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let host_pod_api: Api<Pod> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
-        let watcher_config = watcher::Config::default()
-            .labels(&format!("{}=true", LABEL_MANAGED));
-        let mut stream =
-            std::pin::pin!(watcher::watcher(host_pod_api, watcher_config));
+        let watcher_config = watcher::Config::default().labels(&format!("{}=true", LABEL_MANAGED));
+        let mut stream = std::pin::pin!(watcher::watcher(host_pod_api, watcher_config));
 
         info!("StatusSyncerV2: starting watch on host pods");
 
@@ -244,10 +241,7 @@ impl ResourceSyncer for StatusSyncerV2 {
 }
 
 /// Handle a single watcher event for the status syncer.
-async fn handle_status_event(
-    event: &Event<Pod>,
-    ctx: &SyncerContextV2,
-) -> anyhow::Result<()> {
+async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyhow::Result<()> {
     match event {
         Event::Apply(pod) | Event::InitApply(pod) => {
             let host_name = pod.name_any();
@@ -317,13 +311,9 @@ async fn handle_status_event(
                     .is_some();
 
                 if !already_bound {
-                    if let Err(e) = bind_virtual_pod(
-                        &ctx.virtual_client,
-                        &virtual_name,
-                        &virtual_ns,
-                        host_node,
-                    )
-                    .await
+                    if let Err(e) =
+                        bind_virtual_pod(&ctx.virtual_client, &virtual_name, &virtual_ns, host_node)
+                            .await
                     {
                         warn!(
                             error = %e,
@@ -362,7 +352,9 @@ async fn handle_status_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{Binding, ContainerStatus, ObjectReference, PodCondition, PodStatus};
+    use k8s_openapi::api::core::v1::{
+        Binding, ContainerStatus, ObjectReference, PodCondition, PodStatus,
+    };
 
     #[test]
     fn test_build_status_patch() {
@@ -530,9 +522,7 @@ mod tests {
         };
 
         let patch = build_status_patch(&status);
-        let ics = patch["status"]["initContainerStatuses"]
-            .as_array()
-            .unwrap();
+        let ics = patch["status"]["initContainerStatuses"].as_array().unwrap();
         assert_eq!(ics.len(), 1);
         assert_eq!(ics[0]["name"], "init-db");
     }

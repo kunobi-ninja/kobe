@@ -1,0 +1,119 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterclaims.kunobi.ninja
+spec:
+  group: kunobi.ninja
+  names:
+    categories: []
+    kind: ClusterClaim
+    plural: clusterclaims
+    shortNames:
+    - cc
+    singular: clusterclaim
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClusterClaimSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              ClusterClaim is the internal representation of a cluster lease.
+
+              Created when a user/CI claims a cluster via the HTTP API.
+              The claim controller binds it to a warm cluster, tracks TTL,
+              and handles release/expiry/recycling.
+            properties:
+              priority:
+                default: 50
+                description: |-
+                  Claim priority for queue ordering.
+                  Higher values are served first.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              profileRef:
+                description: Which profile's pool to claim from.
+                type: string
+              requester:
+                description: Identity of the requester.
+                properties:
+                  identity:
+                    description: |-
+                      Identity string (e.g. "repo:org/repo:ref:refs/heads/main" for GitHub,
+                      or user ID for Clerk).
+                    type: string
+                  type:
+                    description: 'Type of requester: "{provider}:{role}" (e.g. "github-actions:ci", "clerk:admin").'
+                    type: string
+                required:
+                - identity
+                - type
+                type: object
+              ttl:
+                description: Requested TTL (e.g. "1h", "30m").
+                type: string
+            required:
+            - profileRef
+            - requester
+            - ttl
+            type: object
+          status:
+            nullable: true
+            properties:
+              boundAt:
+                description: When the claim was bound to a vcluster.
+                nullable: true
+                type: string
+              clusterName:
+                description: Name of the bound cluster (set when phase=Bound).
+                nullable: true
+                type: string
+              diagnosticsUrl:
+                description: URL to the diagnostic bundle captured on release.
+                nullable: true
+                type: string
+              expiresAt:
+                description: When the claim expires (TTL deadline).
+                nullable: true
+                type: string
+              extensionsCount:
+                default: 0
+                description: Number of TTL extensions granted for this claim.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              maxExtensions:
+                default: 0
+                description: Maximum number of extensions allowed (from policy).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              phase:
+                default: Pending
+                description: Current phase of the claim lifecycle.
+                enum:
+                - Pending
+                - Bound
+                - Released
+                - Expired
+                - Recycling
+                type: string
+              queuePosition:
+                default: 0
+                description: Position in the priority queue (0 = not queued, 1 = next).
+                format: uint32
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: ClusterClaim
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

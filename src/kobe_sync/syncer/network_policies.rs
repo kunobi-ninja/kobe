@@ -54,8 +54,7 @@ impl ResourceSyncer for NetworkPolicySyncerV2 {
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("NetworkPolicySyncerV2: starting watch on virtual apiserver");
 
@@ -106,19 +105,14 @@ async fn handle_network_policy_event(
                 "NetworkPolicySyncerV2: translating network policy"
             );
 
-            let host_np =
-                translate_network_policy_to_host(np, &ctx.translator, &virtual_ns)?;
+            let host_np = translate_network_policy_to_host(np, &ctx.translator, &virtual_ns)?;
             let host_name = host_np.metadata.name.as_deref().unwrap_or_default();
 
             match host_api.get_opt(host_name).await? {
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_np);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "NetworkPolicySyncerV2: patched host network policy");
                 }
@@ -169,8 +163,8 @@ async fn handle_network_policy_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::networking::v1::{
         NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPort, NetworkPolicySpec,
     };
@@ -201,10 +195,7 @@ mod tests_v2 {
             host_np.metadata.name,
             Some("deny-all-x-default-x-vc".into())
         );
-        assert_eq!(
-            host_np.metadata.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(host_np.metadata.namespace, Some("pool-test".into()));
     }
 
     #[test]
@@ -240,18 +231,23 @@ mod tests_v2 {
         let host_np = translate_network_policy_to_host(&np, &t, "default").unwrap();
         let spec = host_np.spec.as_ref().unwrap();
         assert_eq!(
-            spec.pod_selector.as_ref().unwrap().match_labels.as_ref().unwrap().get("app"),
+            spec.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get("app"),
             Some(&"web".to_string())
         );
-        assert_eq!(spec.policy_types.as_ref().unwrap(), &vec!["Ingress".to_string()]);
+        assert_eq!(
+            spec.policy_types.as_ref().unwrap(),
+            &vec!["Ingress".to_string()]
+        );
         let ingress_rules = spec.ingress.as_ref().unwrap();
         assert_eq!(ingress_rules.len(), 1);
         assert_eq!(
-            ingress_rules[0]
-                .ports
-                .as_ref()
-                .unwrap()[0]
-                .port,
+            ingress_rules[0].ports.as_ref().unwrap()[0].port,
             Some(IntOrString::Int(80))
         );
     }

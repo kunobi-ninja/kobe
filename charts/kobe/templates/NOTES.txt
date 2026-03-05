@@ -1,0 +1,26 @@
+Waygu (kunobi-pool-operator) has been installed in namespace {{ .Release.Namespace }}.
+
+To verify the operator is running:
+
+  kubectl get pods -n {{ .Release.Namespace }}
+
+To check the health endpoint:
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "kobe.fullname" . }} {{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/healthz
+
+To create a cluster pool profile:
+
+  cat <<EOF | kubectl apply -f -
+  apiVersion: kunobi.ninja/v1alpha1
+  kind: ClusterPoolProfile
+  metadata:
+    name: my-pool
+    namespace: {{ .Values.operatorNamespace }}
+  spec:
+    poolSize: 3
+    backend:
+      type: wagyu-sync
+    clusterConfig:
+      version: "1.32"
+  EOF

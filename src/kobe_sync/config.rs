@@ -325,7 +325,10 @@ mod tests {
         std::env::remove_var("KOBE_SYNC_SYNCERS");
 
         let result = KobeSyncRuntimeConfig::load_from_env();
-        assert!(result.is_err(), "should fail when required vars are missing");
+        assert!(
+            result.is_err(),
+            "should fail when required vars are missing"
+        );
 
         // --- Scenario 2: explicit v2 fields ---
         std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-ns");

@@ -45,9 +45,8 @@ pub fn translate_endpoints_to_host(
                                     if let Some(ref pod_name) = target_ref.name {
                                         if translator.to_virtual(pod_name).is_none() {
                                             let mut new_ref = target_ref.clone();
-                                            new_ref.name = Some(
-                                                translator.to_host_name(pod_name, virtual_ns),
-                                            );
+                                            new_ref.name =
+                                                Some(translator.to_host_name(pod_name, virtual_ns));
                                             new_ref.namespace =
                                                 Some(translator.host_namespace().to_string());
                                             new_addr.target_ref = Some(new_ref);
@@ -71,9 +70,8 @@ pub fn translate_endpoints_to_host(
                                     if let Some(ref pod_name) = target_ref.name {
                                         if translator.to_virtual(pod_name).is_none() {
                                             let mut new_ref = target_ref.clone();
-                                            new_ref.name = Some(
-                                                translator.to_host_name(pod_name, virtual_ns),
-                                            );
+                                            new_ref.name =
+                                                Some(translator.to_host_name(pod_name, virtual_ns));
                                             new_ref.namespace =
                                                 Some(translator.host_namespace().to_string());
                                             new_addr.target_ref = Some(new_ref);
@@ -117,8 +115,7 @@ impl ResourceSyncer for EndpointSyncerV2 {
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("EndpointSyncerV2: starting watch on virtual apiserver");
 
@@ -176,11 +173,7 @@ async fn handle_endpoints_event(
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_ep);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "EndpointSyncerV2: patched host endpoints");
                 }
@@ -231,8 +224,8 @@ async fn handle_endpoints_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::core::v1::{
         EndpointAddress, EndpointPort, EndpointSubset, Endpoints, ObjectReference,
     };
@@ -255,14 +248,8 @@ mod tests_v2 {
             subsets: None,
         };
         let host_ep = translate_endpoints_to_host(&ep, &t, "default").unwrap();
-        assert_eq!(
-            host_ep.metadata.name,
-            Some("my-svc-x-default-x-vc".into())
-        );
-        assert_eq!(
-            host_ep.metadata.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(host_ep.metadata.name, Some("my-svc-x-default-x-vc".into()));
+        assert_eq!(host_ep.metadata.namespace, Some("pool-test".into()));
     }
 
     #[test]
@@ -298,14 +285,8 @@ mod tests_v2 {
 
         let addr = &subsets[0].addresses.as_ref().unwrap()[0];
         let target_ref = addr.target_ref.as_ref().unwrap();
-        assert_eq!(
-            target_ref.name,
-            Some("my-pod-x-default-x-vc".into())
-        );
-        assert_eq!(
-            target_ref.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(target_ref.name, Some("my-pod-x-default-x-vc".into()));
+        assert_eq!(target_ref.namespace, Some("pool-test".into()));
         // IP should be preserved.
         assert_eq!(addr.ip, "10.0.0.1");
     }
@@ -373,10 +354,7 @@ mod tests_v2 {
             }]),
         };
         let host_ep = translate_endpoints_to_host(&ep, &t, "default").unwrap();
-        let ports = host_ep.subsets.as_ref().unwrap()[0]
-            .ports
-            .as_ref()
-            .unwrap();
+        let ports = host_ep.subsets.as_ref().unwrap()[0].ports.as_ref().unwrap();
         assert_eq!(ports.len(), 2);
         assert_eq!(ports[0].port, 8080);
         assert_eq!(ports[1].port, 443);

@@ -26,7 +26,7 @@ use kube::Client;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, ClusterConfig, DataStoreRef, ReadinessGate, KobeSyncConfig};
+use crate::crd::{Addon, ClusterConfig, DataStoreRef, KobeSyncConfig, ReadinessGate};
 use crate::pki;
 
 use super::{
@@ -38,7 +38,7 @@ use super::{
 const MANAGED_BY: &str = "kunobi-pool-operator";
 
 /// Default kobe-sync container image.
-const DEFAULT_IMAGE: &str = "ghcr.io/zondax/kobe-sync:latest";
+const DEFAULT_IMAGE: &str = "zondax/kobe-sync:latest";
 
 /// KobeSync backend — manages kobe-sync virtual clusters.
 #[derive(Clone)]
@@ -228,23 +228,24 @@ impl ClusterBackend for KobeSyncBackend {
 
         // The namespace should already exist (Kobe creates it).
         // We need to find the kobe_sync config from server_args or default.
-        let kobe_sync_config = parse_kobe_sync_args(&config.server_args).unwrap_or(KobeSyncConfig {
-            data_store_ref: DataStoreRef {
-                name: "default".into(),
-            },
-            version: crate::crd::default_k8s_version(),
-            kcm: None,
-            syncers: vec![
-                "pods".into(),
-                "services".into(),
-                "configmaps".into(),
-                "secrets".into(),
-                "endpoints".into(),
-                "ingresses".into(),
-            ],
-            proxy_port: 8443,
-            metrics_port: 9090,
-        });
+        let kobe_sync_config =
+            parse_kobe_sync_args(&config.server_args).unwrap_or(KobeSyncConfig {
+                data_store_ref: DataStoreRef {
+                    name: "default".into(),
+                },
+                version: crate::crd::default_k8s_version(),
+                kcm: None,
+                syncers: vec![
+                    "pods".into(),
+                    "services".into(),
+                    "configmaps".into(),
+                    "secrets".into(),
+                    "endpoints".into(),
+                    "ingresses".into(),
+                ],
+                proxy_port: 8443,
+                metrics_port: 9090,
+            });
 
         let kobe_sync_image =
             std::env::var("KOBE_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
@@ -310,9 +311,15 @@ impl ClusterBackend for KobeSyncBackend {
         .context("Failed to generate KCM kubeconfig")?;
 
         // Create the PKI Secret containing all certs + KCM kubeconfig.
-        pki::create_pki_secret(&self.client, name, namespace, &pki_material, &kcm_kubeconfig)
-            .await
-            .context("Failed to create PKI secret")?;
+        pki::create_pki_secret(
+            &self.client,
+            name,
+            namespace,
+            &pki_material,
+            &kcm_kubeconfig,
+        )
+        .await
+        .context("Failed to create PKI secret")?;
 
         info!(cluster = name, "PKI secret created before Deployment");
 
@@ -495,10 +502,7 @@ impl ClusterBackend for KobeSyncBackend {
 
         // RoleBinding (namespaced)
         let rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), namespace);
-        match rb_api
-            .delete(&rbac_name, &DeleteParams::default())
-            .await
-        {
+        match rb_api.delete(&rbac_name, &DeleteParams::default()).await {
             Ok(_) => debug!(cluster = name, "RoleBinding deleted"),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 debug!(cluster = name, "RoleBinding already gone");
@@ -508,10 +512,7 @@ impl ClusterBackend for KobeSyncBackend {
 
         // Role (namespaced)
         let role_api: Api<Role> = Api::namespaced(self.client.clone(), namespace);
-        match role_api
-            .delete(&rbac_name, &DeleteParams::default())
-            .await
-        {
+        match role_api.delete(&rbac_name, &DeleteParams::default()).await {
             Ok(_) => debug!(cluster = name, "Role deleted"),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 debug!(cluster = name, "Role already gone");
@@ -521,10 +522,7 @@ impl ClusterBackend for KobeSyncBackend {
 
         // ServiceAccount (namespaced)
         let sa_api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
-        match sa_api
-            .delete(&rbac_name, &DeleteParams::default())
-            .await
-        {
+        match sa_api.delete(&rbac_name, &DeleteParams::default()).await {
             Ok(_) => debug!(cluster = name, "ServiceAccount deleted"),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 debug!(cluster = name, "ServiceAccount already gone");
@@ -917,7 +915,8 @@ pub fn build_deployment(
         command: Some(vec!["kube-controller-manager".to_string()]),
         args: Some(vec![
             "--kubeconfig=/etc/kubernetes/controller-manager.conf".to_string(),
-            "--controllers=*,-nodelifecycle,-persistentvolume-binder,-attachdetach,-ttl".to_string(),
+            "--controllers=*,-nodelifecycle,-persistentvolume-binder,-attachdetach,-ttl"
+                .to_string(),
             "--service-account-private-key-file=/pki/sa.key".to_string(),
             "--root-ca-file=/pki/ca.crt".to_string(),
             "--use-service-account-credentials=true".to_string(),
@@ -1035,10 +1034,7 @@ pub fn build_deployment(
                     annotations: Some({
                         let mut ann = BTreeMap::new();
                         ann.insert("prometheus.io/scrape".to_string(), "true".to_string());
-                        ann.insert(
-                            "prometheus.io/port".to_string(),
-                            metrics_port.to_string(),
-                        );
+                        ann.insert("prometheus.io/port".to_string(), metrics_port.to_string());
                         ann.insert("prometheus.io/path".to_string(), "/metrics".to_string());
                         ann
                     }),
@@ -1212,32 +1208,18 @@ mod tests {
     fn test_deployment_is_stateless() {
         let config = test_kobe_sync_config();
         let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
-        let template = &dep
-            .spec
-            .as_ref()
-            .unwrap()
-            .template
-            .spec
-            .as_ref()
-            .unwrap();
+        let template = &dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         // No PVCs — stateless pod
         assert!(template
             .volumes
             .as_ref()
-            .is_none_or(|vols| {
-                !vols.iter().any(|v| v.persistent_volume_claim.is_some())
-            }));
+            .is_none_or(|vols| { !vols.iter().any(|v| v.persistent_volume_claim.is_some()) }));
     }
 
     #[test]
     fn test_build_config_map_v2_has_etcd_info() {
         let config = test_kobe_sync_config();
-        let cm = build_config_map_v2(
-            "cluster-1",
-            "pool-prod",
-            &config,
-            "https://etcd-0:2379",
-        );
+        let cm = build_config_map_v2("cluster-1", "pool-prod", &config, "https://etcd-0:2379");
         assert_eq!(cm.metadata.name.as_deref(), Some("cluster-1-config"));
         let data = cm.data.unwrap();
         let config_json = data.get("config.json").unwrap();
@@ -1298,22 +1280,13 @@ mod tests {
     fn test_build_rbac_creates_correct_names() {
         let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns");
 
-        assert_eq!(
-            sa.metadata.name.as_deref(),
-            Some("test-cluster-kobe-sync")
-        );
-        assert_eq!(
-            sa.metadata.namespace.as_deref(),
-            Some("test-ns")
-        );
+        assert_eq!(sa.metadata.name.as_deref(), Some("test-cluster-kobe-sync"));
+        assert_eq!(sa.metadata.namespace.as_deref(), Some("test-ns"));
         assert_eq!(
             role.metadata.name.as_deref(),
             Some("test-cluster-kobe-sync")
         );
-        assert_eq!(
-            rb.metadata.name.as_deref(),
-            Some("test-cluster-kobe-sync")
-        );
+        assert_eq!(rb.metadata.name.as_deref(), Some("test-cluster-kobe-sync"));
         assert_eq!(
             cr.metadata.name.as_deref(),
             Some("test-cluster-kobe-sync-nodes")
@@ -1353,14 +1326,18 @@ mod tests {
         let core_rule = rules
             .iter()
             .find(|r| {
-                r.api_groups.as_ref().map_or(false, |g| g.contains(&"".to_string()))
+                r.api_groups
+                    .as_ref()
+                    .map_or(false, |g| g.contains(&"".to_string()))
                     && r.resources
                         .as_ref()
                         .map_or(false, |res| res.contains(&"pods".to_string()))
             })
             .expect("Should have a core API group rule for pods");
 
-        let expected_verbs = ["get", "list", "watch", "create", "update", "patch", "delete"];
+        let expected_verbs = [
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ];
         for verb in &expected_verbs {
             assert!(
                 core_rule.verbs.contains(&verb.to_string()),

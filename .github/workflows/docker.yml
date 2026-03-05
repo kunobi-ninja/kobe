@@ -7,7 +7,7 @@ on:
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'Dockerfile'
+      - 'docker/**'
       - 'docker-bake.hcl'
       - '.github/workflows/docker.yml'
       - 'VERSION'

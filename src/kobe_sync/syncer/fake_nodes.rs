@@ -9,9 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{
-    Node, NodeCondition, NodeSpec, NodeStatus, Pod,
-};
+use k8s_openapi::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, PostParams};
 use kube::runtime::watcher;
@@ -43,11 +41,7 @@ pub fn synthesize_fake_node(host_node: &Node) -> Node {
     let name = host_node.metadata.name.clone();
 
     // Copy labels and add our managed marker.
-    let mut labels = host_node
-        .metadata
-        .labels
-        .clone()
-        .unwrap_or_default();
+    let mut labels = host_node.metadata.labels.clone().unwrap_or_default();
     labels.insert(LABEL_MANAGED.to_string(), "true".to_string());
 
     // Build status: copy capacity, allocatable, conditions.
@@ -55,8 +49,7 @@ pub fn synthesize_fake_node(host_node: &Node) -> Node {
 
     let capacity = host_status.and_then(|s| s.capacity.clone());
     let allocatable = host_status.and_then(|s| s.allocatable.clone());
-    let conditions: Option<Vec<NodeCondition>> =
-        host_status.and_then(|s| s.conditions.clone());
+    let conditions: Option<Vec<NodeCondition>> = host_status.and_then(|s| s.conditions.clone());
     let addresses = host_status.and_then(|s| s.addresses.clone());
 
     let status = Some(NodeStatus {
@@ -128,15 +121,12 @@ impl ResourceSyncer for FakeNodeSyncerV2 {
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
         // Watch host Pods that are managed by kobe-sync.
-        let host_pod_api: Api<Pod> =
-            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let host_pod_api: Api<Pod> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
         let host_node_api: Api<Node> = Api::all(ctx.host_client.clone());
         let virtual_node_api: Api<Node> = Api::all(ctx.virtual_client.clone());
 
-        let watcher_config = watcher::Config::default()
-            .labels(&format!("{}=true", LABEL_MANAGED));
-        let mut stream =
-            std::pin::pin!(watcher::watcher(host_pod_api, watcher_config));
+        let watcher_config = watcher::Config::default().labels(&format!("{}=true", LABEL_MANAGED));
+        let mut stream = std::pin::pin!(watcher::watcher(host_pod_api, watcher_config));
 
         info!("FakeNodeSyncerV2: starting watch on host pods");
 
@@ -186,10 +176,7 @@ impl FakeNodeSyncerV2 {
         match event {
             Event::Apply(pod) | Event::InitApply(pod) => {
                 // Extract spec.nodeName from the host pod.
-                let node_name = pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.node_name.clone());
+                let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
 
                 if let Some(node_name) = node_name {
                     // Increment reference count.
@@ -247,10 +234,7 @@ impl FakeNodeSyncerV2 {
                 }
             }
             Event::Delete(pod) => {
-                let node_name = pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.node_name.clone());
+                let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
 
                 if let Some(node_name) = node_name {
                     let should_delete = {
@@ -271,7 +255,10 @@ impl FakeNodeSyncerV2 {
 
                     if should_delete {
                         // Delete the virtual node.
-                        match virtual_node_api.delete(&node_name, &DeleteParams::default()).await {
+                        match virtual_node_api
+                            .delete(&node_name, &DeleteParams::default())
+                            .await
+                        {
                             Ok(_) => {
                                 info!(
                                     node = %node_name,
@@ -396,13 +383,7 @@ mod tests {
         };
 
         let fake = synthesize_fake_node(&host_node);
-        let conds = fake
-            .status
-            .as_ref()
-            .unwrap()
-            .conditions
-            .as_ref()
-            .unwrap();
+        let conds = fake.status.as_ref().unwrap().conditions.as_ref().unwrap();
         assert!(conds
             .iter()
             .any(|c| c.type_ == "Ready" && c.status == "True"));
@@ -464,13 +445,7 @@ mod tests {
         };
 
         let fake = synthesize_fake_node(&host_node);
-        let addrs = fake
-            .status
-            .as_ref()
-            .unwrap()
-            .addresses
-            .as_ref()
-            .unwrap();
+        let addrs = fake.status.as_ref().unwrap().addresses.as_ref().unwrap();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].type_, "InternalIP");
         assert_eq!(addrs[0].address, "10.0.1.5");
@@ -541,13 +516,7 @@ mod tests {
         };
 
         let fake = synthesize_fake_node(&host_node);
-        let conds = fake
-            .status
-            .as_ref()
-            .unwrap()
-            .conditions
-            .as_ref()
-            .unwrap();
+        let conds = fake.status.as_ref().unwrap().conditions.as_ref().unwrap();
         assert_eq!(conds.len(), 3);
         assert!(conds
             .iter()

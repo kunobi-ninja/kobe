@@ -334,7 +334,7 @@ pub struct HealthCheckConfig {
 
 // --- Enhancement: Readiness Gates ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ReadinessGate {
     /// Check that a CRD is registered in the cluster.
@@ -352,6 +352,32 @@ pub enum ReadinessGate {
     /// HTTP GET returns 2xx.
     #[serde(rename = "URLHealthy")]
     UrlHealthy { url: String },
+}
+
+// Manual JsonSchema impl — Kubernetes CRD structural schemas require that
+// properties appearing in multiple oneOf branches have identical schemas.
+// Internally-tagged enums violate this, so we flatten to a single object.
+impl JsonSchema for ReadinessGate {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ReadinessGate".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["CRDExists", "DeploymentReady", "DaemonSetReady", "URLHealthy"]
+                },
+                "name": { "type": "string" },
+                "namespace": { "type": "string" },
+                "url": { "type": "string" }
+            }
+        }))
+        .unwrap()
+    }
 }
 
 // --- Enhancement: Autoscaling ---

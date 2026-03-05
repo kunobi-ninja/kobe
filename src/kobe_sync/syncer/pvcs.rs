@@ -50,14 +50,12 @@ impl ResourceSyncer for PvcSyncerV2 {
     }
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
-        let virtual_api: Api<PersistentVolumeClaim> =
-            Api::all(ctx.virtual_client.clone());
+        let virtual_api: Api<PersistentVolumeClaim> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<PersistentVolumeClaim> =
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("PvcSyncerV2: starting watch on virtual apiserver");
 
@@ -115,11 +113,7 @@ async fn handle_pvc_event(
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_pvc);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "PvcSyncerV2: patched host pvc");
                 }
@@ -170,8 +164,8 @@ async fn handle_pvc_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::core::v1::{
         PersistentVolumeClaim, PersistentVolumeClaimSpec, VolumeResourceRequirements,
     };
@@ -211,10 +205,7 @@ mod tests_v2 {
             host_pvc.metadata.name,
             Some("my-data-x-default-x-vc".into())
         );
-        assert_eq!(
-            host_pvc.metadata.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(host_pvc.metadata.namespace, Some("pool-test".into()));
     }
 
     #[test]

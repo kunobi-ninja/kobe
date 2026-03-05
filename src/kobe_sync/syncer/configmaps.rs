@@ -55,8 +55,7 @@ impl ResourceSyncer for ConfigMapSyncerV2 {
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("ConfigMapSyncerV2: starting watch on virtual apiserver");
 
@@ -114,11 +113,7 @@ async fn handle_configmap_event(
                 Some(_existing) => {
                     let patch = Patch::Apply(&host_cm);
                     host_api
-                        .patch(
-                            host_name,
-                            &PatchParams::apply("kobe-sync").force(),
-                            &patch,
-                        )
+                        .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
                     debug!(name = %host_name, "ConfigMapSyncerV2: patched host configmap");
                 }
@@ -169,8 +164,8 @@ async fn handle_configmap_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::*;
     use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::*;
     use k8s_openapi::api::core::v1::ConfigMap;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use std::collections::BTreeMap;
@@ -200,10 +195,7 @@ mod tests_v2 {
             host_cm.metadata.name,
             Some("app-config-x-default-x-vc".into())
         );
-        assert_eq!(
-            host_cm.metadata.namespace,
-            Some("pool-test".into())
-        );
+        assert_eq!(host_cm.metadata.namespace, Some("pool-test".into()));
         assert_eq!(
             host_cm.data.as_ref().unwrap().get("key"),
             Some(&"value".into())
@@ -221,10 +213,7 @@ mod tests_v2 {
             },
             binary_data: Some({
                 let mut m = BTreeMap::new();
-                m.insert(
-                    "cert".into(),
-                    k8s_openapi::ByteString(vec![1, 2, 3, 4]),
-                );
+                m.insert("cert".into(), k8s_openapi::ByteString(vec![1, 2, 3, 4]));
                 m
             }),
             ..Default::default()
@@ -272,9 +261,6 @@ mod tests_v2 {
         };
         let host_cm = translate_configmap_to_host(&cm, &t, "default").unwrap();
         assert!(host_cm.data.is_none());
-        assert_eq!(
-            host_cm.metadata.name,
-            Some("empty-x-default-x-vc".into())
-        );
+        assert_eq!(host_cm.metadata.name, Some("empty-x-default-x-vc".into()));
     }
 }

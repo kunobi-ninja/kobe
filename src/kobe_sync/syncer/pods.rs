@@ -61,10 +61,15 @@ pub fn translate_pod_to_host(
     translated_spec.service_account_name = None;
 
     // 4. Translate containers (env vars, envFrom, volume mounts).
-    translated_spec.containers = translate_containers_v2(&spec.containers, translator, virtual_ns, &dropped_volumes);
+    translated_spec.containers =
+        translate_containers_v2(&spec.containers, translator, virtual_ns, &dropped_volumes);
     if let Some(ref init_containers) = spec.init_containers {
-        translated_spec.init_containers =
-            Some(translate_containers_v2(init_containers, translator, virtual_ns, &dropped_volumes));
+        translated_spec.init_containers = Some(translate_containers_v2(
+            init_containers,
+            translator,
+            virtual_ns,
+            &dropped_volumes,
+        ));
     }
 
     // 5. Translate imagePullSecrets.
@@ -120,9 +125,7 @@ fn translate_volumes_v2(
         // mounting and should not exist on the host Pod.
         if let Some(ref projected) = vol.projected {
             if let Some(ref sources) = projected.sources {
-                let has_sa_token = sources
-                    .iter()
-                    .any(|s| s.service_account_token.is_some());
+                let has_sa_token = sources.iter().any(|s| s.service_account_token.is_some());
                 if has_sa_token {
                     dropped_names.insert(vol.name.clone());
                     continue;
@@ -148,9 +151,7 @@ fn translate_volumes_v2(
             if let Some(ref secret_name) = secret.secret_name {
                 if translator.to_virtual(secret_name).is_none() {
                     translated.secret = Some(SecretVolumeSource {
-                        secret_name: Some(
-                            translator.to_host_name(secret_name, virtual_ns),
-                        ),
+                        secret_name: Some(translator.to_host_name(secret_name, virtual_ns)),
                         ..secret.clone()
                     });
                 }
@@ -161,11 +162,10 @@ fn translate_volumes_v2(
         if let Some(ref pvc) = vol.persistent_volume_claim {
             let claim_name = &pvc.claim_name;
             if translator.to_virtual(claim_name).is_none() {
-                translated.persistent_volume_claim =
-                    Some(PersistentVolumeClaimVolumeSource {
-                        claim_name: translator.to_host_name(claim_name, virtual_ns),
-                        ..pvc.clone()
-                    });
+                translated.persistent_volume_claim = Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: translator.to_host_name(claim_name, virtual_ns),
+                    ..pvc.clone()
+                });
             }
         }
 
@@ -249,9 +249,7 @@ fn translate_containers_v2(
 
                             if let Some(ref cm_ref) = ef.config_map_ref {
                                 let cm_name = &cm_ref.name;
-                                if !cm_name.is_empty()
-                                    && translator.to_virtual(cm_name).is_none()
-                                {
+                                if !cm_name.is_empty() && translator.to_virtual(cm_name).is_none() {
                                     translated_ef.config_map_ref = Some(ConfigMapEnvSource {
                                         name: translator.to_host_name(cm_name, virtual_ns),
                                         ..cm_ref.clone()
@@ -311,12 +309,10 @@ impl ResourceSyncer for PodSyncerV2 {
 
     async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
         let virtual_api: Api<Pod> = Api::all(ctx.virtual_client.clone());
-        let host_api: Api<Pod> =
-            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let host_api: Api<Pod> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
-        let mut stream =
-            std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
+        let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
         info!("PodSyncerV2: starting watch on virtual apiserver");
 
@@ -473,10 +469,7 @@ mod tests_v2 {
             result.metadata.name,
             Some("my-app-x-default-x-vc".to_string())
         );
-        assert_eq!(
-            result.metadata.namespace,
-            Some("host-ns".to_string())
-        );
+        assert_eq!(result.metadata.namespace, Some("host-ns".to_string()));
     }
 
     #[test]
@@ -616,14 +609,8 @@ mod tests_v2 {
         let pull_secrets = result.spec.unwrap().image_pull_secrets.unwrap();
 
         assert_eq!(pull_secrets.len(), 2);
-        assert_eq!(
-            pull_secrets[0].name,
-            "my-registry-creds-x-default-x-vc"
-        );
-        assert_eq!(
-            pull_secrets[1].name,
-            "other-creds-x-default-x-vc"
-        );
+        assert_eq!(pull_secrets[0].name, "my-registry-creds-x-default-x-vc");
+        assert_eq!(pull_secrets[1].name, "other-creds-x-default-x-vc");
     }
 
     #[test]
