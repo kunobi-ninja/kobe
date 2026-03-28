@@ -25,12 +25,23 @@ use backend::{BackendDispatch, BackendFactory, K3kBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Print to stderr immediately so we know the binary started, even before
+    // tracing is initialized. This is visible in `kubectl logs` on distroless.
+    eprintln!("kobe-operator starting");
+
     let _otel_provider = telemetry::init()?;
 
     metrics::init();
     info!("Starting kunobi-pool-operator");
 
-    let client = Client::try_default().await?;
+    let client = match Client::try_default().await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to create Kubernetes client: {e}");
+            eprintln!("FATAL: Failed to create Kubernetes client: {e}");
+            return Err(e.into());
+        }
+    };
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
 
     info!(namespace = %namespace, "Connected to Kubernetes");
