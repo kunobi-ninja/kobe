@@ -1,27 +1,46 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "charts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker/**"
+      - "docker-bake.hcl"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "charts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker/**"
+      - "docker-bake.hcl"
+      - ".github/workflows/ci.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  rust-checks:
+  checks:
     name: Rust Checks
     runs-on: kunobi-runners
     container:
       image: rust:1.93-bookworm
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@v4
 
       - name: Cache cargo registry & build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -47,15 +66,45 @@ jobs:
           cargo install cargo-audit --locked || true
           cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
 
-  docker-build:
-    name: Docker Build
+  docker-dry-run:
+    if: github.event_name == 'pull_request'
+    needs: checks
     runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build (no push, no cache)
+      - name: Build all images (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from='
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: checks
+    runs-on: kunobi-runners
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract version from release
+        if: github.event_name == 'release'
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          VERSION: ${{ steps.version.outputs.version || '0.0.0' }}
+          BUILD_COMMIT: ${{ github.sha }}
+        run: docker buildx bake -f docker-bake.hcl push
