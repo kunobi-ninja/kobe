@@ -54,10 +54,10 @@ Service account name.
 {{- end }}
 
 {{/*
-Wagyu-sync sidecar image reference.
+kobe-sync sidecar image reference.
 */}}
 {{- define "kobe.syncImage" -}}
-{{- $repo := .Values.wagyuSync.image.repository -}}
-{{- $tag := .Values.wagyuSync.image.tag | default (printf "v%s" .Chart.AppVersion) -}}
+{{- $repo := .Values.kobeSync.image.repository -}}
+{{- $tag := .Values.kobeSync.image.tag | default (printf "v%s" .Chart.AppVersion) -}}
 {{- printf "%s:%s" $repo $tag -}}
 {{- end }}

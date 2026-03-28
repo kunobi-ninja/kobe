@@ -20,7 +20,7 @@ To create a cluster pool profile:
   spec:
     poolSize: 3
     backend:
-      type: wagyu-sync
+      type: kobe-sync
     clusterConfig:
       version: "1.32"
   EOF
