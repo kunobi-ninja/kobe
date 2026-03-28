@@ -1036,7 +1036,7 @@ mod tests {
         let auth = JwtAuthenticator::new();
 
         let policy: AuthPolicy = serde_json::from_value(serde_json::json!({
-            "apiVersion": "kunobi.ninja/v1alpha1",
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "AuthPolicy",
             "metadata": { "name": "test-policy" },
             "spec": {
@@ -1071,7 +1071,7 @@ mod tests {
         let auth = JwtAuthenticator::new();
 
         let policy: AuthPolicy = serde_json::from_value(serde_json::json!({
-            "apiVersion": "kunobi.ninja/v1alpha1",
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "AuthPolicy",
             "metadata": { "name": "fmt-test" },
             "spec": {

@@ -100,7 +100,7 @@ impl DirectK0sBackend {
     /// Standard labels for resources belonging to a cluster.
     fn cluster_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
-        labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
+        labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
         labels.insert(
             "app.kubernetes.io/managed-by".to_string(),
             MANAGED_BY.to_string(),
@@ -111,14 +111,14 @@ impl DirectK0sBackend {
     /// Labels for server pods specifically.
     fn server_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = Self::cluster_labels(name);
-        labels.insert("kunobi.ninja/role".to_string(), "server".to_string());
+        labels.insert("kobe.kunobi.ninja/role".to_string(), "server".to_string());
         labels
     }
 
     /// Labels for agent pods specifically.
     fn agent_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = Self::cluster_labels(name);
-        labels.insert("kunobi.ninja/role".to_string(), "agent".to_string());
+        labels.insert("kobe.kunobi.ninja/role".to_string(), "agent".to_string());
         labels
     }
 
@@ -980,7 +980,7 @@ mod tests {
     #[test]
     fn test_cluster_labels() {
         let labels = DirectK0sBackend::cluster_labels("my-cluster");
-        assert_eq!(labels.get("kunobi.ninja/cluster").unwrap(), "my-cluster");
+        assert_eq!(labels.get("kobe.kunobi.ninja/cluster").unwrap(), "my-cluster");
         assert_eq!(
             labels.get("app.kubernetes.io/managed-by").unwrap(),
             MANAGED_BY
@@ -990,14 +990,14 @@ mod tests {
     #[test]
     fn test_server_labels_include_role() {
         let labels = DirectK0sBackend::server_labels("c1");
-        assert_eq!(labels.get("kunobi.ninja/role").unwrap(), "server");
-        assert!(labels.contains_key("kunobi.ninja/cluster"));
+        assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "server");
+        assert!(labels.contains_key("kobe.kunobi.ninja/cluster"));
     }
 
     #[test]
     fn test_agent_labels_include_role() {
         let labels = DirectK0sBackend::agent_labels("c1");
-        assert_eq!(labels.get("kunobi.ninja/role").unwrap(), "agent");
+        assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "agent");
     }
 
     #[test]

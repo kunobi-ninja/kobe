@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// The operator watches all AuthPolicy CRDs and compiles them into a lookup table keyed by issuer.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
-    group = "kunobi.ninja",
+    group = "kobe.kunobi.ninja",
     version = "v1alpha1",
     kind = "AuthPolicy",
     plural = "authpolicies",

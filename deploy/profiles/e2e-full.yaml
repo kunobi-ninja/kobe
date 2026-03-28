@@ -1,4 +1,4 @@
-apiVersion: kunobi.ninja/v1alpha1
+apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPoolProfile
 metadata:
   name: e2e-full

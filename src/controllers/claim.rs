@@ -813,7 +813,7 @@ mod tests {
 
         Arc::new(
             serde_json::from_value(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": {
                     "name": name,
@@ -841,7 +841,7 @@ mod tests {
     /// Build a minimal `ClusterPoolProfile` JSON value for K8s API responses.
     fn make_test_profile() -> serde_json::Value {
         serde_json::json!({
-            "apiVersion": "kunobi.ninja/v1alpha1",
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "ClusterPoolProfile",
             "metadata": {
                 "name": "test-profile",
@@ -924,10 +924,10 @@ mod tests {
         // Mock the status PATCH that the reconciler issues to update queue position.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/pending-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/pending-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "pending-1", "namespace": "test-ns" },
                 "spec": { "profileRef": "test-profile", "ttl": "1h",
@@ -940,7 +940,7 @@ mod tests {
         // Mock GET for profile (return 404 — no profile, so no queue timeout logic).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
             ))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
@@ -984,10 +984,10 @@ mod tests {
         // Mock PATCH for queue-position status update.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/bind-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/bind-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "bind-1", "namespace": "test-ns" },
                 "spec": { "profileRef": "test-profile", "ttl": "1h",
@@ -1000,7 +1000,7 @@ mod tests {
         // Mock GET for profile (404 — no profile, no queue timeout).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
             ))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
@@ -1049,7 +1049,7 @@ mod tests {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let claim: Arc<ClusterClaim> = Arc::new(
             serde_json::from_value(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "expired-1", "namespace": "test-ns" },
                 "spec": {
@@ -1072,10 +1072,10 @@ mod tests {
         // Mock PATCH for status update to Expired.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/expired-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/expired-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "expired-1", "namespace": "test-ns" },
                 "spec": { "profileRef": "test-profile", "ttl": "1h",
@@ -1117,10 +1117,10 @@ mod tests {
         // Mock PATCH for status update to Recycling.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/released-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/released-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "released-1", "namespace": "test-ns" },
                 "spec": { "profileRef": "test-profile", "ttl": "1h",
@@ -1133,7 +1133,7 @@ mod tests {
         // Mock GET for profile (for diagnostics check — return profile with no diagnostics).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(make_test_profile()))
             .mount(&server)
@@ -1165,10 +1165,10 @@ mod tests {
         // Mock DELETE for the claim CRD.
         Mock::given(method("DELETE"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/recycling-1",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/recycling-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "recycling-1", "namespace": "test-ns" },
                 "spec": { "profileRef": "test-profile", "ttl": "1h",
@@ -1226,10 +1226,10 @@ mod tests {
         // Mock GET for the claim.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/extend-1",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/extend-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "extend-1", "namespace": "test-ns" },
                 "spec": {
@@ -1253,10 +1253,10 @@ mod tests {
         // Mock PATCH for extending the TTL.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/extend-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/extend-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "extend-1", "namespace": "test-ns" },
                 "spec": { "profileRef": "test-profile", "ttl": "1h",
@@ -1294,10 +1294,10 @@ mod tests {
         // Mock GET returning a claim in Pending phase.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/pending-ext",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/pending-ext",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "pending-ext", "namespace": "test-ns" },
                 "spec": {
@@ -1344,10 +1344,10 @@ mod tests {
         // Mock GET returning a Bound claim with extensions_count == max_extensions.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/maxext-1",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/maxext-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "maxext-1", "namespace": "test-ns" },
                 "spec": {

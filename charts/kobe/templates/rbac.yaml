@@ -18,7 +18,7 @@ metadata:
     {{- include "kobe.labels" . | nindent 4 }}
 rules:
   # CRD management
-  - apiGroups: ["kunobi.ninja"]
+  - apiGroups: ["kobe.kunobi.ninja"]
     resources:
       - clusterpoolprofiles
       - clusterpoolprofiles/status

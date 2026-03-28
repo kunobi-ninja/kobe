@@ -38,6 +38,15 @@ use super::{
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kunobi-pool-operator";
 
+/// Convert a k3s semver version to a valid Docker image reference.
+///
+/// k3s releases use `+` for build metadata (e.g. `v1.31.3+k3s1`), but `+` is
+/// illegal in OCI image tags. Docker Hub publishes the same images with `-`
+/// instead (e.g. `rancher/k3s:v1.31.3-k3s1`).
+fn k3s_image(version: &str) -> String {
+    format!("rancher/k3s:{}", version.replace('+', "-"))
+}
+
 /// The kubeconfig publisher sidecar script, mounted from a ConfigMap.
 ///
 /// Waits for k3s to write the kubeconfig, rewrites the server URL to the
@@ -94,7 +103,7 @@ impl DirectK3sBackend {
     /// Standard labels for resources belonging to a cluster.
     fn cluster_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
-        labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
+        labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
         labels.insert(
             "app.kubernetes.io/managed-by".to_string(),
             MANAGED_BY.to_string(),
@@ -105,14 +114,14 @@ impl DirectK3sBackend {
     /// Labels for server pods specifically.
     fn server_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = Self::cluster_labels(name);
-        labels.insert("kunobi.ninja/role".to_string(), "server".to_string());
+        labels.insert("kobe.kunobi.ninja/role".to_string(), "server".to_string());
         labels
     }
 
     /// Labels for agent pods specifically.
     fn agent_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = Self::cluster_labels(name);
-        labels.insert("kunobi.ninja/role".to_string(), "agent".to_string());
+        labels.insert("kobe.kunobi.ninja/role".to_string(), "agent".to_string());
         labels
     }
 
@@ -184,7 +193,7 @@ impl DirectK3sBackend {
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
     ) -> Container {
-        let image = format!("rancher/k3s:{}", config.version);
+        let image = k3s_image(&config.version);
 
         let mut args = vec![
             "server".to_string(),
@@ -247,7 +256,7 @@ impl DirectK3sBackend {
             }),
             liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
                 http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                    path: Some("/healthz".to_string()),
+                    path: Some("/cacerts".to_string()),
                     port: IntOrString::Int(6443),
                     scheme: Some("HTTPS".to_string()),
                     ..Default::default()
@@ -356,12 +365,12 @@ impl DirectK3sBackend {
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
     ) -> StatefulSet {
-        let k3s_image = format!("rancher/k3s:{}", config.version);
+        let image = k3s_image(&config.version);
         let labels = Self::server_labels(name);
 
         let server_container =
             Self::build_server_container(name, namespace, config, datastore_endpoint);
-        let publisher_sidecar = Self::build_publisher_sidecar(name, namespace, &k3s_image);
+        let publisher_sidecar = Self::build_publisher_sidecar(name, namespace, &image);
         let volumes = Self::build_server_volumes(name, config);
 
         StatefulSet {
@@ -439,12 +448,12 @@ impl DirectK3sBackend {
         config: &ClusterConfig,
         replicas: u32,
     ) -> Deployment {
-        let k3s_image = format!("rancher/k3s:{}", config.version);
+        let image = k3s_image(&config.version);
         let labels = Self::agent_labels(name);
 
         let container = Container {
             name: "k3s-agent".to_string(),
-            image: Some(k3s_image),
+            image: Some(image),
             command: Some(vec!["k3s".to_string()]),
             args: Some(vec![
                 "agent".to_string(),
@@ -747,7 +756,7 @@ mod tests {
 
         let server = &pod_spec.containers[0];
         assert_eq!(server.name, "k3s-server");
-        assert_eq!(server.image.as_deref(), Some("rancher/k3s:v1.31.3+k3s1"));
+        assert_eq!(server.image.as_deref(), Some("rancher/k3s:v1.31.3-k3s1"));
 
         // Verify no datastore-endpoint arg
         let args = server.args.as_ref().unwrap();
@@ -858,7 +867,7 @@ mod tests {
     #[test]
     fn test_cluster_labels() {
         let labels = DirectK3sBackend::cluster_labels("my-cluster");
-        assert_eq!(labels.get("kunobi.ninja/cluster").unwrap(), "my-cluster");
+        assert_eq!(labels.get("kobe.kunobi.ninja/cluster").unwrap(), "my-cluster");
         assert_eq!(
             labels.get("app.kubernetes.io/managed-by").unwrap(),
             MANAGED_BY
@@ -868,14 +877,14 @@ mod tests {
     #[test]
     fn test_server_labels_include_role() {
         let labels = DirectK3sBackend::server_labels("c1");
-        assert_eq!(labels.get("kunobi.ninja/role").unwrap(), "server");
-        assert!(labels.contains_key("kunobi.ninja/cluster"));
+        assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "server");
+        assert!(labels.contains_key("kobe.kunobi.ninja/cluster"));
     }
 
     #[test]
     fn test_agent_labels_include_role() {
         let labels = DirectK3sBackend::agent_labels("c1");
-        assert_eq!(labels.get("kunobi.ninja/role").unwrap(), "agent");
+        assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "agent");
     }
 
     #[test]
@@ -901,6 +910,27 @@ mod tests {
         let mounts = sidecar.volume_mounts.as_ref().unwrap();
         assert!(mounts.iter().any(|m| m.name == "output"));
         assert!(mounts.iter().any(|m| m.name == "publisher-script"));
+    }
+
+    #[test]
+    fn test_k3s_image_replaces_plus_with_hyphen() {
+        assert_eq!(k3s_image("v1.31.3+k3s1"), "rancher/k3s:v1.31.3-k3s1");
+    }
+
+    #[test]
+    fn test_k3s_image_preserves_hyphen_tags() {
+        assert_eq!(k3s_image("v1.31.3-k3s1"), "rancher/k3s:v1.31.3-k3s1");
+    }
+
+    #[test]
+    fn test_liveness_probe_uses_cacerts() {
+        let config = base_config();
+        let container =
+            DirectK3sBackend::build_server_container("test", "ns", &config, None);
+        let probe = container.liveness_probe.as_ref().unwrap();
+        let http = probe.http_get.as_ref().unwrap();
+        assert_eq!(http.path.as_deref(), Some("/cacerts"));
+        assert_eq!(http.scheme.as_deref(), Some("HTTPS"));
     }
 
     // =================================================================

@@ -12,7 +12,7 @@ To check the health endpoint:
 To create a cluster pool profile:
 
   cat <<EOF | kubectl apply -f -
-  apiVersion: kunobi.ninja/v1alpha1
+  apiVersion: kobe.kunobi.ninja/v1alpha1
   kind: ClusterPoolProfile
   metadata:
     name: my-pool

@@ -45,7 +45,7 @@ pub struct DataStoreUser {
 /// and `--etcd-prefix`.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
-    group = "kunobi.ninja",
+    group = "kobe.kunobi.ninja",
     version = "v1alpha1",
     kind = "DataStore",
     plural = "datastores",

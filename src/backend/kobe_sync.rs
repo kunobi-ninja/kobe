@@ -60,7 +60,7 @@ impl KobeSyncBackend {
     /// Standard labels for resources belonging to a cluster.
     fn cluster_labels(name: &str) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
-        labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
+        labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
         labels.insert(
             "app.kubernetes.io/managed-by".to_string(),
             MANAGED_BY.to_string(),
@@ -797,7 +797,7 @@ pub fn build_config_map_v2(
     });
 
     let mut labels = BTreeMap::new();
-    labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
+    labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
         MANAGED_BY.to_string(),
@@ -851,7 +851,7 @@ pub fn build_deployment(
     let etcd_endpoints = "https://etcd-0:2379";
 
     let mut labels = BTreeMap::new();
-    labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
+    labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
         MANAGED_BY.to_string(),
@@ -1061,7 +1061,7 @@ mod tests {
     fn test_cluster_labels() {
         let labels = KobeSyncBackend::cluster_labels("my-cluster");
         assert_eq!(
-            labels.get("kunobi.ninja/cluster"),
+            labels.get("kobe.kunobi.ninja/cluster"),
             Some(&"my-cluster".to_string())
         );
         assert_eq!(

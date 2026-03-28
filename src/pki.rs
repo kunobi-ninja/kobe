@@ -245,7 +245,7 @@ pub async fn create_pki_secret(
         "app.kubernetes.io/managed-by".to_string(),
         "kunobi-pool-operator".to_string(),
     );
-    labels.insert("kunobi.ninja/cluster".to_string(), name.to_string());
+    labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
 
     let secret = Secret {
         metadata: ObjectMeta {

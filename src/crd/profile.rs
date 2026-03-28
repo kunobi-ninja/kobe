@@ -156,7 +156,7 @@ pub struct CapiConfig {
 /// and optional diagnostic capture settings.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
-    group = "kunobi.ninja",
+    group = "kobe.kunobi.ninja",
     version = "v1alpha1",
     kind = "ClusterPoolProfile",
     plural = "clusterpoolprofiles",

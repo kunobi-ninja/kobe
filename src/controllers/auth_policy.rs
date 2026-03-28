@@ -85,7 +85,7 @@ mod tests {
 
     fn auth_policy_item(name: &str, provider_name: &str, issuer: &str) -> serde_json::Value {
         serde_json::json!({
-            "apiVersion": "kunobi.ninja/v1alpha1",
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "AuthPolicy",
             "metadata": { "name": name },
             "spec": {
@@ -120,7 +120,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(crate::testutil::k8s_list_response(items)),
@@ -162,7 +162,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response::<serde_json::Value>(vec![]),
@@ -203,7 +203,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
             ))
             .respond_with(ResponseTemplate::new(500).set_body_json(error_response))
             .expect(1)

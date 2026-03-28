@@ -298,7 +298,7 @@ async fn list_claims<B: ClusterBackend>(
 ) -> Response {
     let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
     let label_hash = hash_identity(&identity.identity);
-    let lp = ListParams::default().labels(&format!("kunobi.ninja/requester-hash={label_hash}"));
+    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
 
     match claims_api.list(&lp).await {
         Ok(claims) => {
@@ -747,7 +747,7 @@ async fn count_active_claims(
     identity: &str,
 ) -> Result<u32, kube::Error> {
     let label_hash = hash_identity(identity);
-    let lp = ListParams::default().labels(&format!("kunobi.ninja/requester-hash={label_hash}"));
+    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
     let claims = claims_api.list(&lp).await?;
     Ok(claims
         .iter()
@@ -768,9 +768,9 @@ fn build_claim_crd(
     priority: u32,
 ) -> ClusterClaim {
     let mut labels = std::collections::BTreeMap::new();
-    labels.insert("kunobi.ninja/profile".to_string(), profile.to_string());
+    labels.insert("kobe.kunobi.ninja/profile".to_string(), profile.to_string());
     labels.insert(
-        "kunobi.ninja/requester-hash".to_string(),
+        "kobe.kunobi.ninja/requester-hash".to_string(),
         hash_identity(&identity.identity),
     );
 
@@ -884,13 +884,13 @@ mod tests {
             .as_ref()
             .expect("labels should be set");
         assert_eq!(
-            labels.get("kunobi.ninja/profile"),
+            labels.get("kobe.kunobi.ninja/profile"),
             Some(&"e2e-full".to_string())
         );
         // The requester-hash label should match hash_identity of the identity string
         let expected_hash = hash_identity(&identity.identity);
         assert_eq!(
-            labels.get("kunobi.ninja/requester-hash"),
+            labels.get("kobe.kunobi.ninja/requester-hash"),
             Some(&expected_hash)
         );
     }
@@ -1177,7 +1177,7 @@ mod tests {
         let empty_list = crate::testutil::k8s_list_response::<serde_json::Value>(vec![]);
         Mock::given(method("GET"))
             .and(path_regex(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/.*/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterclaims",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(&empty_list))
             .mount(&server)
@@ -1203,7 +1203,7 @@ mod tests {
         let claims = vec![
             // Pending — should count
             serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "c1", "namespace": "test-ns" },
                 "spec": {
@@ -1216,7 +1216,7 @@ mod tests {
             }),
             // Bound — should count
             serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "c2", "namespace": "test-ns" },
                 "spec": {
@@ -1229,7 +1229,7 @@ mod tests {
             }),
             // Released — should NOT count
             serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "c3", "namespace": "test-ns" },
                 "spec": {
@@ -1242,7 +1242,7 @@ mod tests {
             }),
             // Expired — should NOT count
             serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "c4", "namespace": "test-ns" },
                 "spec": {
@@ -1255,7 +1255,7 @@ mod tests {
             }),
             // Different identity — should NOT count
             serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterClaim",
                 "metadata": { "name": "c5", "namespace": "test-ns" },
                 "spec": {
@@ -1273,7 +1273,7 @@ mod tests {
         let list_resp = crate::testutil::k8s_list_response(claims);
         Mock::given(method("GET"))
             .and(path_regex(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/.*/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterclaims",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(&list_resp))
             .mount(&server)

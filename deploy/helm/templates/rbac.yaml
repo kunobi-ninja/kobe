@@ -4,13 +4,13 @@ metadata:
   name: {{ .Release.Name }}-role
 rules:
   # CRD management
-  - apiGroups: ["kunobi.ninja"]
+  - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["clusterpoolprofiles", "clusterpoolprofiles/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["kunobi.ninja"]
+  - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["clusterclaims", "clusterclaims/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["kunobi.ninja"]
+  - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["authpolicies"]
     verbs: ["get", "list", "watch"]
 

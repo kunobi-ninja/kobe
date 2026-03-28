@@ -542,7 +542,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
     let queue_depth = {
         let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("kunobi.ninja/profile={name}"));
+        let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={name}"));
         match claims_api.list(&lp).await {
             Ok(claims) => claims
                 .iter()
@@ -629,7 +629,7 @@ async fn build_pool_state<B: ClusterBackend>(
     // List all bound claims for this profile once
     let claimed_clusters = {
         let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), ns);
-        let lp = ListParams::default().labels(&format!("kunobi.ninja/profile={profile_name}"));
+        let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={profile_name}"));
         match claims_api.list(&lp).await {
             Ok(claims) => claims
                 .iter()
@@ -955,7 +955,7 @@ mod tests {
     fn make_test_profile(name: &str, min_size: u32, max_size: u32) -> Arc<ClusterPoolProfile> {
         Arc::new(
             serde_json::from_value(serde_json::json!({
-                "apiVersion": "kunobi.ninja/v1alpha1",
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterPoolProfile",
                 "metadata": {
                     "name": name,
@@ -980,7 +980,7 @@ mod tests {
     /// Build a minimal `ClusterPoolProfile` JSON value for K8s API responses.
     fn profile_response_json(name: &str) -> serde_json::Value {
         serde_json::json!({
-            "apiVersion": "kunobi.ninja/v1alpha1",
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "ClusterPoolProfile",
             "metadata": {
                 "name": name,
@@ -1193,11 +1193,11 @@ mod tests {
         // Mock LIST claims: return empty list.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
             ))
             .and(query_param(
                 "labelSelector",
-                "kunobi.ninja/profile=test-profile",
+                "kobe.kunobi.ninja/profile=test-profile",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
@@ -1285,11 +1285,11 @@ mod tests {
         // Mock LIST claims for build_pool_state (building pool state).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
             ))
             .and(query_param(
                 "labelSelector",
-                "kunobi.ninja/profile=scale-up",
+                "kobe.kunobi.ninja/profile=scale-up",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
@@ -1300,7 +1300,7 @@ mod tests {
         // Mock PATCH profile status.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/scale-up/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/scale-up/status",
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(profile_response_json("scale-up")),
@@ -1363,9 +1363,9 @@ mod tests {
         // Mock LIST claims for queue_depth calculation in reconcile.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
             ))
-            .and(query_param("labelSelector", "kunobi.ninja/profile=at-cap"))
+            .and(query_param("labelSelector", "kobe.kunobi.ninja/profile=at-cap"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
             ))
@@ -1375,7 +1375,7 @@ mod tests {
         // Mock PATCH profile status.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/at-cap/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/at-cap/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(profile_response_json("at-cap")))
             .mount(&server)
@@ -1456,15 +1456,15 @@ mod tests {
         // Mock LIST claims: 1 pending claim.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
             ))
             .and(query_param(
                 "labelSelector",
-                "kunobi.ninja/profile=status-test",
+                "kobe.kunobi.ninja/profile=status-test",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![serde_json::json!({
-                    "apiVersion": "kunobi.ninja/v1alpha1",
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                     "kind": "ClusterClaim",
                     "metadata": { "name": "pending-claim-1", "namespace": "test-ns" },
                     "spec": {
@@ -1483,7 +1483,7 @@ mod tests {
         // We set up the mock to just return success with the profile JSON.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/status-test/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/status-test/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json({
                 let mut resp = profile_response_json("status-test");
