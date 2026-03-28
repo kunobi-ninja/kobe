@@ -141,6 +141,7 @@ pub struct CapiConfig {
     /// Raw JSON/YAML spec to embed in the infrastructure resource.
     /// This is provider-specific and passed through as-is.
     #[serde(default)]
+    #[schemars(schema_with = "crate::crd::json_object_schema")]
     pub infrastructure_spec: Option<serde_json::Value>,
     /// Optional explicit plural form for the infrastructure CRD resource name.
     /// If not set, derived automatically by lowercasing the kind and appending "s".

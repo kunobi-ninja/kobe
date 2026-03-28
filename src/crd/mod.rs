@@ -10,6 +10,15 @@ pub use claim::*;
 pub use datastore::*;
 pub use profile::*;
 
+/// Schema helper for `serde_json::Value` fields that need an explicit `type: object`
+/// in the OpenAPI spec. Without this, schemars emits `{}` which K8s rejects.
+pub fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "x-kubernetes-preserve-unknown-fields": true
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

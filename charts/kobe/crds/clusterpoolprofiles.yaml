@@ -78,6 +78,8 @@ spec:
                     description: |-
                       Raw JSON/YAML spec to embed in the infrastructure resource.
                       This is provider-specific and passed through as-is.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                 required:
                 - infrastructureApiVersion
                 - infrastructureKind
@@ -218,6 +220,72 @@ spec:
                     minimum: 0.0
                     type: integer
                 type: object
+              kobeSync:
+                description: kobe-sync backend configuration (kobe-sync backend only).
+                nullable: true
+                properties:
+                  dataStoreRef:
+                    description: Reference to the DataStore CRD that this cluster connects to.
+                    properties:
+                      name:
+                        description: Name of the DataStore resource in the same namespace.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  kcm:
+                    description: Optional KCM (kube-controller-manager) configuration.
+                    nullable: true
+                    properties:
+                      controllers:
+                        default:
+                        - deployment
+                        - replicaset
+                        - statefulset
+                        - daemonset
+                        - job
+                        - cronjob
+                        - namespace
+                        - serviceaccount
+                        - garbagecollector
+                        description: Which controllers to enable in the virtual KCM.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  metricsPort:
+                    default: 9090
+                    description: 'Port for health/metrics endpoints (default: 9090).'
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                  proxyPort:
+                    default: 8443
+                    description: 'Port for the virtual API server proxy (default: 8443).'
+                    format: uint16
+                    maximum: 65535.0
+                    minimum: 0.0
+                    type: integer
+                  syncers:
+                    default:
+                    - pods
+                    - services
+                    - configmaps
+                    - secrets
+                    - endpoints
+                    - ingresses
+                    description: Which resource syncers to enable. Defaults to core set.
+                    items:
+                      type: string
+                    type: array
+                  version:
+                    default: '1.32'
+                    description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
+                    type: string
+                required:
+                - dataStoreRef
+                type: object
               poolSize:
                 default: 3
                 description: |-
@@ -339,72 +407,6 @@ spec:
                 default: 2h
                 description: Default TTL for claims against this profile (e.g. "2h", "30m").
                 type: string
-              kobeSync:
-                description: kobe-sync backend configuration (kobe-sync backend only).
-                nullable: true
-                properties:
-                  dataStoreRef:
-                    description: Reference to the DataStore CRD that this cluster connects to.
-                    properties:
-                      name:
-                        description: Name of the DataStore resource in the same namespace.
-                        type: string
-                    required:
-                    - name
-                    type: object
-                  kcm:
-                    description: Optional KCM (kube-controller-manager) configuration.
-                    nullable: true
-                    properties:
-                      controllers:
-                        default:
-                        - deployment
-                        - replicaset
-                        - statefulset
-                        - daemonset
-                        - job
-                        - cronjob
-                        - namespace
-                        - serviceaccount
-                        - garbagecollector
-                        description: Which controllers to enable in the virtual KCM.
-                        items:
-                          type: string
-                        type: array
-                    type: object
-                  metricsPort:
-                    default: 9090
-                    description: 'Port for health/metrics endpoints (default: 9090).'
-                    format: uint16
-                    maximum: 65535.0
-                    minimum: 0.0
-                    type: integer
-                  proxyPort:
-                    default: 8443
-                    description: 'Port for the virtual API server proxy (default: 8443).'
-                    format: uint16
-                    maximum: 65535.0
-                    minimum: 0.0
-                    type: integer
-                  syncers:
-                    default:
-                    - pods
-                    - services
-                    - configmaps
-                    - secrets
-                    - endpoints
-                    - ingresses
-                    description: Which resource syncers to enable. Defaults to core set.
-                    items:
-                      type: string
-                    type: array
-                  version:
-                    default: '1.32'
-                    description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
-                    type: string
-                required:
-                - dataStoreRef
-                type: object
             required:
             - cluster
             type: object
