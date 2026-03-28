@@ -30,10 +30,10 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
-    resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods"]
+    resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "events", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # RBAC for kobe-sync sidecars
   - apiGroups: ["rbac.authorization.k8s.io"]
