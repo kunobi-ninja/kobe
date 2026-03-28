@@ -867,7 +867,10 @@ mod tests {
     #[test]
     fn test_cluster_labels() {
         let labels = DirectK3sBackend::cluster_labels("my-cluster");
-        assert_eq!(labels.get("kobe.kunobi.ninja/cluster").unwrap(), "my-cluster");
+        assert_eq!(
+            labels.get("kobe.kunobi.ninja/cluster").unwrap(),
+            "my-cluster"
+        );
         assert_eq!(
             labels.get("app.kubernetes.io/managed-by").unwrap(),
             MANAGED_BY
@@ -925,8 +928,7 @@ mod tests {
     #[test]
     fn test_liveness_probe_uses_cacerts() {
         let config = base_config();
-        let container =
-            DirectK3sBackend::build_server_container("test", "ns", &config, None);
+        let container = DirectK3sBackend::build_server_container("test", "ns", &config, None);
         let probe = container.liveness_probe.as_ref().unwrap();
         let http = probe.http_get.as_ref().unwrap();
         assert_eq!(http.path.as_deref(), Some("/cacerts"));

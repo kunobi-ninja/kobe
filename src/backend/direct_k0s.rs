@@ -980,7 +980,10 @@ mod tests {
     #[test]
     fn test_cluster_labels() {
         let labels = DirectK0sBackend::cluster_labels("my-cluster");
-        assert_eq!(labels.get("kobe.kunobi.ninja/cluster").unwrap(), "my-cluster");
+        assert_eq!(
+            labels.get("kobe.kunobi.ninja/cluster").unwrap(),
+            "my-cluster"
+        );
         assert_eq!(
             labels.get("app.kubernetes.io/managed-by").unwrap(),
             MANAGED_BY

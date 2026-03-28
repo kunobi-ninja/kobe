@@ -37,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Available backends: k3k, direct-k3s, direct-k0s, capi, kobe-sync");
 
+    // Wait for our CRDs to be established before starting controllers.
+    // This prevents a crash-loop when the operator starts before the Helm chart
+    // has finished installing CRDs (e.g. during initial rollout or CRD migration).
+    wait_for_crds(&client).await?;
+
     // Optional shared PostgreSQL datastore for direct-k3s and direct-k0s backends.
     let pg_base_url = std::env::var("POSTGRES_URL").ok();
     let pg_pool = if let Some(ref url) = pg_base_url {
@@ -180,6 +185,71 @@ async fn main() -> anyhow::Result<()> {
 
     telemetry::shutdown(_otel_provider);
     Ok(())
+}
+
+/// Wait for required CRDs to be established, retrying with backoff.
+///
+/// The operator depends on `ClusterPoolProfile`, `ClusterClaim`, `AuthPolicy`,
+/// and `DataStore` CRDs. If these are not yet installed (e.g. Helm CRD
+/// installation is still in progress), we retry rather than crash.
+async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+
+    let required_crds = [
+        "clusterpoolprofiles.kobe.kunobi.ninja",
+        "clusterclaims.kobe.kunobi.ninja",
+        "authpolicies.kobe.kunobi.ninja",
+        "datastores.kobe.kunobi.ninja",
+    ];
+
+    let crd_api: kube::api::Api<CustomResourceDefinition> = kube::api::Api::all(client.clone());
+    let mut delay = std::time::Duration::from_secs(2);
+    let max_delay = std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+
+    loop {
+        let mut missing = Vec::new();
+        for crd_name in &required_crds {
+            match crd_api.get(crd_name).await {
+                Ok(crd) => {
+                    let established = crd
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_ref())
+                        .map(|conditions| {
+                            conditions
+                                .iter()
+                                .any(|c| c.type_ == "Established" && c.status == "True")
+                        })
+                        .unwrap_or(false);
+                    if !established {
+                        missing.push(*crd_name);
+                    }
+                }
+                Err(_) => missing.push(*crd_name),
+            }
+        }
+
+        if missing.is_empty() {
+            info!("All required CRDs are established");
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "Timed out waiting for CRDs after 5 minutes. Missing: {}",
+                missing.join(", ")
+            );
+        }
+
+        warn!(
+            missing = %missing.join(", "),
+            retry_in = ?delay,
+            "Required CRDs not yet established, waiting..."
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(max_delay);
+    }
 }
 
 /// Detect whether Velero CRDs are installed in the cluster.

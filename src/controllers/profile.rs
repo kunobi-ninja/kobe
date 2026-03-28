@@ -1365,7 +1365,10 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
             ))
-            .and(query_param("labelSelector", "kobe.kunobi.ninja/profile=at-cap"))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/profile=at-cap",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
             ))

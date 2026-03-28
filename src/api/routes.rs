@@ -298,7 +298,8 @@ async fn list_claims<B: ClusterBackend>(
 ) -> Response {
     let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
     let label_hash = hash_identity(&identity.identity);
-    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
+    let lp =
+        ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
 
     match claims_api.list(&lp).await {
         Ok(claims) => {
@@ -747,7 +748,8 @@ async fn count_active_claims(
     identity: &str,
 ) -> Result<u32, kube::Error> {
     let label_hash = hash_identity(identity);
-    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
+    let lp =
+        ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
     let claims = claims_api.list(&lp).await?;
     Ok(claims
         .iter()
