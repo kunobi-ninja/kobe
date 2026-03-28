@@ -25,9 +25,10 @@ use backend::{BackendDispatch, BackendFactory, K3kBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Print to stderr immediately so we know the binary started, even before
-    // tracing is initialized. This is visible in `kubectl logs` on distroless.
-    eprintln!("kobe-operator starting");
+    // Install the rustls crypto provider before any TLS usage.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
 
     let _otel_provider = telemetry::init()?;
 
