@@ -35,14 +35,7 @@ async fn main() -> anyhow::Result<()> {
     metrics::init();
     info!("Starting kunobi-pool-operator");
 
-    let client = match Client::try_default().await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to create Kubernetes client: {e}");
-            eprintln!("FATAL: Failed to create Kubernetes client: {e}");
-            return Err(e.into());
-        }
-    };
+    let client = Client::try_default().await?;
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
 
     info!(namespace = %namespace, "Connected to Kubernetes");

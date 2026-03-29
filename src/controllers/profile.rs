@@ -479,7 +479,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                             }
                         }
                         Err(e) => {
-                            error!(cluster = %c_name, "Failed to create cluster: {e}");
+                            error!(cluster = %c_name, "Failed to create cluster: {e:?}");
                             // Remove the failed entry so the next reconciliation can retry
                             if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
                                 pool.clusters.remove(&c_name);
@@ -517,7 +517,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                             }
                         }
                         Err(e) => {
-                            error!(cluster = %c_name, "Failed to delete cluster: {e}");
+                            error!(cluster = %c_name, "Failed to delete cluster: {e:?}");
                         }
                     }
                 });
@@ -554,7 +554,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                 })
                 .count() as u32,
             Err(e) => {
-                warn!(profile = %name, "Failed to list claims for queue depth: {e}");
+                warn!(profile = %name, "Failed to list claims for queue depth: {e:?}");
                 0
             }
         }

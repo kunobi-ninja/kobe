@@ -22,7 +22,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::Client;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
@@ -215,11 +215,15 @@ spec:
         };
 
         secrets
-            .create(&PostParams::default(), &secret)
+            .patch(
+                &secret_name,
+                &PatchParams::apply("kobe-operator").force(),
+                &Patch::Apply(&secret),
+            )
             .await
-            .with_context(|| format!("Failed to create token secret {secret_name}"))?;
+            .with_context(|| format!("Failed to apply token secret {secret_name}"))?;
 
-        debug!(cluster = name, "Token secret created");
+        debug!(cluster = name, "Token secret applied");
         Ok(())
     }
 
@@ -246,11 +250,15 @@ spec:
             ..Default::default()
         };
 
-        cms.create(&PostParams::default(), &cm)
-            .await
-            .with_context(|| format!("Failed to create publisher ConfigMap {cm_name}"))?;
+        cms.patch(
+            &cm_name,
+            &PatchParams::apply("kobe-operator").force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+        .with_context(|| format!("Failed to apply publisher ConfigMap {cm_name}"))?;
 
-        debug!(cluster = name, "Publisher ConfigMap created");
+        debug!(cluster = name, "Publisher ConfigMap applied");
         Ok(())
     }
 
@@ -266,11 +274,16 @@ spec:
         let cm = Self::build_k0s_config_configmap(name, namespace, &config_yaml);
 
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
-        cms.create(&PostParams::default(), &cm)
-            .await
-            .with_context(|| format!("Failed to create k0s config ConfigMap for {name}"))?;
+        let cm_name = format!("{name}-k0s-config");
+        cms.patch(
+            &cm_name,
+            &PatchParams::apply("kobe-operator").force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+        .with_context(|| format!("Failed to apply k0s config ConfigMap for {name}"))?;
 
-        debug!(cluster = name, "k0s config ConfigMap created");
+        debug!(cluster = name, "k0s config ConfigMap applied");
         Ok(())
     }
 
@@ -490,7 +503,10 @@ spec:
                     spec: Some(PodSpec {
                         containers: vec![server_container, publisher_sidecar],
                         volumes: Some(volumes),
-                        service_account_name: Some("kunobi-pool-operator".to_string()),
+                        service_account_name: Some(
+                            std::env::var("POOL_SERVICE_ACCOUNT")
+                                .unwrap_or_else(|_| "kunobi-pool-operator".to_string()),
+                        ),
                         ..Default::default()
                     }),
                 },
@@ -706,20 +722,30 @@ impl ClusterBackend for DirectK0sBackend {
         let sts =
             Self::build_server_statefulset(name, namespace, config, datastore_endpoint.as_deref());
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+        let sts_name = format!("{name}-server");
         sts_api
-            .create(&PostParams::default(), &sts)
+            .patch(
+                &sts_name,
+                &PatchParams::apply("kobe-operator").force(),
+                &Patch::Apply(&sts),
+            )
             .await
-            .with_context(|| format!("Failed to create server StatefulSet for {name}"))?;
-        info!(cluster = name, "Server StatefulSet created");
+            .with_context(|| format!("Failed to apply server StatefulSet for {name}"))?;
+        info!(cluster = name, "Server StatefulSet applied");
 
         // 6. Create Service
         let svc = Self::build_service(name, namespace, config);
         let svc_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let svc_name = format!("{name}-server");
         svc_api
-            .create(&PostParams::default(), &svc)
+            .patch(
+                &svc_name,
+                &PatchParams::apply("kobe-operator").force(),
+                &Patch::Apply(&svc),
+            )
             .await
-            .with_context(|| format!("Failed to create Service for {name}"))?;
-        info!(cluster = name, "Service created");
+            .with_context(|| format!("Failed to apply Service for {name}"))?;
+        info!(cluster = name, "Service applied");
 
         // 7. Wait for kubeconfig Secret (created by sidecar)
         self.wait_ready(name, namespace).await?;
@@ -729,11 +755,16 @@ impl ClusterBackend for DirectK0sBackend {
             if agents > 0 {
                 let deploy = Self::build_agent_deployment(name, namespace, config, agents);
                 let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+                let deploy_name = format!("{name}-agent");
                 deploy_api
-                    .create(&PostParams::default(), &deploy)
+                    .patch(
+                        &deploy_name,
+                        &PatchParams::apply("kobe-operator").force(),
+                        &Patch::Apply(&deploy),
+                    )
                     .await
-                    .with_context(|| format!("Failed to create agent Deployment for {name}"))?;
-                info!(cluster = name, agents = agents, "Agent Deployment created");
+                    .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
+                info!(cluster = name, agents = agents, "Agent Deployment applied");
             }
         }
 
@@ -1126,20 +1157,24 @@ mod tests {
         let client = mock_client(&server);
         let backend = DirectK0sBackend::new(client, None, None);
 
-        // Mock: POST token secret
-        Mock::given(method("POST"))
-            .and(path("/api/v1/namespaces/test-ns/secrets"))
+        // Mock: PATCH token secret (server-side apply)
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
             .respond_with(
-                ResponseTemplate::new(201)
+                ResponseTemplate::new(200)
                     .set_body_json(secret_response("test-cluster-token", "test-ns")),
             )
             .mount(&server)
             .await;
 
-        // Mock: POST ConfigMaps (publisher + k0s-config)
-        Mock::given(method("POST"))
-            .and(path("/api/v1/namespaces/test-ns/configmaps"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(generic_response(
+        // Mock: PATCH ConfigMaps (publisher + k0s-config, server-side apply)
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                "/api/v1/namespaces/test-ns/configmaps/test-cluster-.*",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(generic_response(
                 "v1",
                 "ConfigMap",
                 "test-cluster-k0s-config",
@@ -1148,10 +1183,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Mock: POST StatefulSet
-        Mock::given(method("POST"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(generic_response(
+        // Mock: PATCH StatefulSet (server-side apply)
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/test-cluster-server",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(generic_response(
                 "apps/v1",
                 "StatefulSet",
                 "test-cluster-server",
@@ -1160,10 +1197,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Mock: POST Service
-        Mock::given(method("POST"))
-            .and(path("/api/v1/namespaces/test-ns/services"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(generic_response(
+        // Mock: PATCH Service (server-side apply)
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/services/test-cluster-server",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(generic_response(
                 "v1",
                 "Service",
                 "test-cluster-server",
