@@ -267,6 +267,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         idle_since: None,
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
+                        spec_hash: Some(crate::pool::profile_spec_hash(&profile)),
                     },
                 );
 
@@ -707,6 +708,7 @@ async fn build_pool_state<B: ClusterBackend>(
                 },
                 health_failures: 0,
                 state_since: Some(chrono::Utc::now()),
+                spec_hash: None, // unknown after rebuild — won't trigger recreation
             },
         );
     }
@@ -1038,6 +1040,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             )]),
         };
@@ -1069,6 +1072,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             )]),
         };
@@ -1100,6 +1104,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             )]),
         };
@@ -1129,6 +1134,7 @@ mod tests {
                         idle_since: Some(chrono::Utc::now()),
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
+                        spec_hash: None,
                     },
                 ),
                 (
@@ -1138,6 +1144,7 @@ mod tests {
                         idle_since: None,
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
+                        spec_hash: None,
                     },
                 ),
             ]),
@@ -1246,6 +1253,7 @@ mod tests {
                     idle_since: Some(chrono::Utc::now()),
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             pools.insert("cached-profile".to_string(), PoolState { clusters });
@@ -1354,6 +1362,7 @@ mod tests {
                         idle_since: Some(chrono::Utc::now()),
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
+                        spec_hash: None,
                     },
                 );
             }
@@ -1415,6 +1424,7 @@ mod tests {
                     idle_since: Some(chrono::Utc::now()),
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             clusters.insert(
@@ -1424,6 +1434,7 @@ mod tests {
                     idle_since: Some(chrono::Utc::now()),
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             clusters.insert(
@@ -1433,6 +1444,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             clusters.insert(
@@ -1442,6 +1454,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             clusters.insert(
@@ -1451,6 +1464,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 3,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             pools.insert("status-test".to_string(), PoolState { clusters });

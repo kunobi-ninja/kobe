@@ -2,6 +2,22 @@ use std::collections::HashMap;
 
 use crate::crd::ClusterPoolProfile;
 
+/// Hash of the cluster spec at creation time, used to detect drift.
+pub type SpecHash = u64;
+
+/// Compute a hash of the profile's cluster-relevant fields.
+pub fn profile_spec_hash(profile: &ClusterPoolProfile) -> SpecHash {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Hash the fields that affect how a cluster is created
+    profile.spec.cluster.version.hash(&mut hasher);
+    profile.spec.cluster.servers.hash(&mut hasher);
+    profile.spec.cluster.agents.hash(&mut hasher);
+    profile.spec.cluster.server_args.hash(&mut hasher);
+    format!("{:?}", profile.spec.backend).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Tracks the state of each cluster in a profile's pool.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClusterState {
@@ -35,6 +51,9 @@ pub struct ClusterEntry {
     pub health_failures: u32,
     /// When this entry was created/entered current state (for stuck-Creating timeout).
     pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Hash of the profile spec when this cluster was created.
+    /// Used to detect spec drift and trigger recreation of unclaimed clusters.
+    pub spec_hash: Option<SpecHash>,
 }
 
 /// Decisions the pool manager emits after evaluating state.
@@ -68,6 +87,22 @@ pub fn compute_pool_actions(
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Unhealthy {
             actions.push(PoolAction::Delete(name.clone()));
+        }
+    }
+
+    // --- Recycle unclaimed clusters with stale spec ---
+    let current_hash = profile_spec_hash(profile);
+    for (name, entry) in &state.clusters {
+        if entry.state == ClusterState::Ready {
+            if let Some(hash) = entry.spec_hash {
+                if hash != current_hash {
+                    tracing::info!(
+                        cluster = %name,
+                        "Cluster spec differs from profile, scheduling recreation"
+                    );
+                    actions.push(PoolAction::Delete(name.clone()));
+                }
+            }
         }
     }
 
@@ -337,6 +372,7 @@ mod tests {
                 idle_since: None,
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
         clusters.insert(
@@ -346,6 +382,7 @@ mod tests {
                 idle_since: None,
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
         clusters.insert(
@@ -355,6 +392,7 @@ mod tests {
                 idle_since: None,
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
 
@@ -459,6 +497,7 @@ mod tests {
             idle_since: None,
             health_failures: 0,
             state_since: None,
+            spec_hash: None,
         }
     }
 
@@ -560,6 +599,7 @@ mod tests {
                 idle_since: Some(long_ago),
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
         clusters.insert(
@@ -569,6 +609,7 @@ mod tests {
                 idle_since: Some(long_ago),
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
         let state = PoolState { clusters };
@@ -605,6 +646,7 @@ mod tests {
                 idle_since: Some(just_now),
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
         clusters.insert(
@@ -614,6 +656,7 @@ mod tests {
                 idle_since: Some(just_now),
                 health_failures: 0,
                 state_since: None,
+                spec_hash: None,
             },
         );
         let state = PoolState { clusters };
@@ -621,6 +664,77 @@ mod tests {
         let actions = compute_pool_actions(&profile, &state, now);
 
         // Both idle only 5m, threshold is 30m — no deletes
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .collect();
+        assert_eq!(deletes.len(), 0);
+    }
+
+    #[test]
+    fn test_spec_drift_triggers_recreation_of_unclaimed_clusters() {
+        let profile = make_profile(2, None);
+        let current_hash = profile_spec_hash(&profile);
+        let stale_hash = current_hash.wrapping_add(1); // different hash
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            ClusterEntry {
+                state: ClusterState::Ready,
+                idle_since: Some(chrono::Utc::now()),
+                health_failures: 0,
+                state_since: None,
+                spec_hash: Some(stale_hash), // stale
+            },
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            ClusterEntry {
+                state: ClusterState::Claimed,
+                idle_since: None,
+                health_failures: 0,
+                state_since: None,
+                spec_hash: Some(stale_hash), // stale but claimed
+            },
+        );
+        let state = PoolState { clusters };
+        let now = chrono::Utc::now();
+
+        let actions = compute_pool_actions(&profile, &state, now);
+
+        // Only the Ready (unclaimed) cluster should be deleted
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .collect();
+        assert_eq!(deletes.len(), 1);
+        if let PoolAction::Delete(name) = &deletes[0] {
+            assert_eq!(name, "pool-test-profile-1");
+        }
+    }
+
+    #[test]
+    fn test_no_drift_when_spec_hash_matches() {
+        let profile = make_profile(2, None);
+        let current_hash = profile_spec_hash(&profile);
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            ClusterEntry {
+                state: ClusterState::Ready,
+                idle_since: Some(chrono::Utc::now()),
+                health_failures: 0,
+                state_since: None,
+                spec_hash: Some(current_hash),
+            },
+        );
+        let state = PoolState { clusters };
+        let now = chrono::Utc::now();
+
+        let actions = compute_pool_actions(&profile, &state, now);
+
         let deletes: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, PoolAction::Delete(_)))

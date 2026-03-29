@@ -976,6 +976,7 @@ mod tests {
                     idle_since: Some(chrono::Utc::now()),
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             pools.insert("test-profile".to_string(), PoolState { clusters });
@@ -1109,6 +1110,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             pools.insert("test-profile".to_string(), PoolState { clusters });
@@ -1202,6 +1204,7 @@ mod tests {
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
                 },
             );
             pools.insert("test-profile".to_string(), PoolState { clusters });
