@@ -33,32 +33,30 @@ async fn main() -> anyhow::Result<()> {
     let _otel_provider = telemetry::init()?;
 
     metrics::init();
-    info!("Starting kunobi-pool-operator");
+    info!("Starting kobe-operator");
 
     let client = Client::try_default().await?;
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
 
     info!(namespace = %namespace, "Connected to Kubernetes");
 
-    info!("Available backends: k3k, direct-k3s, direct-k0s, capi, kobe-sync");
-
     // Wait for our CRDs to be established before starting controllers.
-    // This prevents a crash-loop when the operator starts before the Helm chart
-    // has finished installing CRDs (e.g. during initial rollout or CRD migration).
     wait_for_crds(&client).await?;
 
-    // Optional shared PostgreSQL datastore for direct-k3s and direct-k0s backends.
+    info!("Available backends: k3s, k0s, vkobe, capi");
+
+    // Optional shared PostgreSQL datastore for k3s and k0s backends.
     let pg_base_url = std::env::var("POSTGRES_URL").ok();
     let pg_pool = if let Some(ref url) = pg_base_url {
         match sqlx::PgPool::connect(url).await {
             Ok(pool) => {
-                info!("PostgreSQL connected — direct-k3s and direct-k0s golden templates enabled");
+                info!("PostgreSQL connected — golden templates enabled");
                 Some(pool)
             }
             Err(e) => {
                 warn!(
                     error = %e,
-                    "Failed to connect to PostgreSQL, direct backends will use embedded datastore"
+                    "Failed to connect to PostgreSQL, backends will use embedded datastore"
                 );
                 None
             }
@@ -67,20 +65,36 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // BackendFactory produces the right backend per profile.
     let factory = BackendFactory::new(client.clone(), pg_pool, pg_base_url);
-
-    // Default backend for API routes and backward compatibility.
     let backend = BackendDispatch::K3k(K3kBackend::new(client.clone()));
+    let shutdown = CancellationToken::new();
+    let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let authenticator = Arc::new(JwtAuthenticator::new());
 
+    // ── Start HTTP server immediately (all replicas serve API + health) ──
+    let state = AppState {
+        client: client.clone(),
+        authenticator: authenticator.clone(),
+        namespace: namespace.clone(),
+        pools: pools.clone(),
+        backend: backend.clone(),
+    };
+
+    let app = build_router(state);
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!(addr = %bind_addr, "HTTP server listening");
+
+    let http_shutdown = shutdown.clone();
+    let http_handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { http_shutdown.cancelled().await })
+            .await
+    });
+
+    // ── Wait for leader election before starting controllers ──
     let leader_rx =
         leader::run_leader_election(client.clone(), &namespace, "kunobi-pool-operator").await?;
-
-    let shutdown = CancellationToken::new();
-
-    let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
-
-    let authenticator = Arc::new(JwtAuthenticator::new());
 
     // Start AuthPolicy watcher
     let auth_client = client.clone();
@@ -142,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Monitor controller tasks — if any panics or exits, trigger shutdown
+    // Monitor all tasks — if any dies, trigger shutdown
     let controller_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -169,34 +183,19 @@ async fn main() -> anyhow::Result<()> {
         controller_shutdown.cancel();
     });
 
-    // Build HTTP server
-    let state = AppState {
-        client,
-        authenticator,
-        namespace,
-        pools: pools.clone(),
-        backend,
-    };
+    // Wait for shutdown signal, then stop everything
+    shutdown_signal(leader_rx, shutdown).await;
 
-    let app = build_router(state);
-
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!(addr = %bind_addr, "HTTP server listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(leader_rx, shutdown))
-        .await?;
+    // Wait for HTTP server to drain
+    if let Err(e) = http_handle.await {
+        error!("HTTP server error: {e}");
+    }
 
     telemetry::shutdown(_otel_provider);
     Ok(())
 }
 
 /// Wait for required CRDs to be established, retrying with backoff.
-///
-/// The operator depends on `ClusterPoolProfile`, `ClusterClaim`, `AuthPolicy`,
-/// and `DataStore` CRDs. If these are not yet installed (e.g. Helm CRD
-/// installation is still in progress), we retry rather than crash.
 async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
@@ -258,9 +257,6 @@ async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
 }
 
 /// Detect whether Velero CRDs are installed in the cluster.
-///
-/// Returns `Some(VeleroCoordinator)` if the `backups.velero.io` CRD exists,
-/// `None` otherwise. This enables graceful degradation when Velero is not installed.
 async fn detect_velero(client: &Client) -> Option<VeleroCoordinator> {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     let crd_api: kube::api::Api<CustomResourceDefinition> = kube::api::Api::all(client.clone());
@@ -323,8 +319,6 @@ async fn shutdown_signal(
 mod testutil;
 
 /// Force the `controllers` module to be compiled for tests.
-/// Without this, the test harness eliminates the module as dead code
-/// because it is only used inside `main()`.
 #[cfg(test)]
 mod controllers_test_anchor {
     #[allow(unused_imports)]

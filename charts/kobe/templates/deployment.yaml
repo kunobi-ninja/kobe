@@ -12,7 +12,11 @@ metadata:
 spec:
   replicas: {{ .Values.replicas }}
   strategy:
+    {{- if le (int .Values.replicas) 1 }}
     type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    {{- end }}
   selector:
     matchLabels:
       {{- include "kobe.selectorLabels" . | nindent 6 }}

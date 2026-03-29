@@ -8,7 +8,7 @@ image:
 
 imagePullSecrets: []
 
-replicas: 1
+replicas: 2
 
 logLevel: "kunobi_pool_operator=info"
 
