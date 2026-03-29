@@ -11,6 +11,8 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.replicas }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "kobe.selectorLabels" . | nindent 6 }}
