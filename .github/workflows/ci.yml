@@ -77,7 +77,7 @@ jobs:
 
       - name: Verify CRDs match generated output
         run: |
-          for crd in clusterpoolprofiles clusterclaims authpolicies datastores; do
+          for crd in clusterpools clusterleases accesspolicies kobestores; do
             cargo run --quiet --bin crdgen -- "$crd" > "/tmp/${crd}-generated.yaml"
             diff -u "/tmp/${crd}-generated.yaml" "charts/kobe/crds/${crd}.yaml" || {
               echo "::error::CRD '${crd}' is out of date. Run 'cargo run --bin crdgen -- ${crd} > charts/kobe/crds/${crd}.yaml' to update."

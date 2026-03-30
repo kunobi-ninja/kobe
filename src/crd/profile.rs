@@ -10,24 +10,24 @@ use std::collections::BTreeMap;
 pub enum BackendType {
     /// Manage k3s StatefulSets directly, optionally with a shared PostgreSQL datastore.
     #[default]
-    #[serde(rename = "direct-k3s")]
-    DirectK3s,
+    #[serde(rename = "k3s")]
+    K3s,
     /// Manage k0s clusters directly.
-    #[serde(rename = "direct-k0s")]
-    DirectK0s,
+    #[serde(rename = "k0s")]
+    K0s,
     /// Use Cluster API (CAPI) with a pluggable infrastructure provider.
     #[serde(rename = "capi")]
     Capi,
-    /// Use kobe-sync virtual cluster runtime (lightweight proxy-based).
-    #[serde(rename = "kobe-sync")]
-    KobeSync,
+    /// Use vkobe virtual cluster runtime (lightweight proxy-based).
+    #[serde(rename = "vkobe")]
+    Vkobe,
 }
 
-/// Reference to a DataStore CRD by name (same namespace).
+/// Reference to a KobeStore CRD by name (same namespace).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct DataStoreRef {
-    /// Name of the DataStore resource in the same namespace.
+pub struct KobeStoreRef {
+    /// Name of the KobeStore resource in the same namespace.
     pub name: String,
 }
 
@@ -40,12 +40,12 @@ pub struct KcmConfig {
     pub controllers: Vec<String>,
 }
 
-/// kobe-sync backend configuration.
+/// vkobe backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct KobeSyncConfig {
-    /// Reference to the DataStore CRD that this cluster connects to.
-    pub data_store_ref: DataStoreRef,
+pub struct VkobeConfig {
+    /// Reference to the KobeStore CRD that this cluster connects to.
+    pub data_store_ref: KobeStoreRef,
 
     /// Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
     #[serde(default = "default_k8s_version")]
@@ -56,7 +56,7 @@ pub struct KobeSyncConfig {
     pub kcm: Option<KcmConfig>,
 
     /// Which resource syncers to enable. Defaults to core set.
-    #[serde(default = "default_kobe_sync_syncers")]
+    #[serde(default = "default_vkobe_syncers")]
     pub syncers: Vec<String>,
 
     /// Port for the virtual API server proxy (default: 8443).
@@ -86,7 +86,7 @@ pub fn default_kcm_controllers() -> Vec<String> {
     ]
 }
 
-pub fn default_kobe_sync_syncers() -> Vec<String> {
+pub fn default_vkobe_syncers() -> Vec<String> {
     vec![
         "pods".into(),
         "services".into(),
@@ -105,7 +105,7 @@ fn default_metrics_port() -> u16 {
     9090
 }
 
-/// Configuration for a shared PostgreSQL datastore (direct-k3s backend only).
+/// Configuration for a shared PostgreSQL datastore (k3s backend only).
 ///
 /// When configured, k3s clusters use `--datastore-endpoint=postgres://...` instead
 /// of the embedded SQLite, enabling golden image creation via `CREATE DATABASE ... TEMPLATE`.
@@ -147,47 +147,35 @@ pub struct CapiConfig {
     pub infrastructure_plural: Option<String>,
 }
 
-/// ClusterPoolProfile defines a pool of pre-warmed virtual clusters.
+/// ClusterPool defines a pool of pre-warmed virtual clusters.
 ///
-/// Each profile specifies cluster configuration, addons to install,
+/// Each pool specifies cluster configuration, addons to install,
 /// resource limits, health checks, readiness gates, scaling behavior,
 /// and optional diagnostic capture settings.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "kobe.kunobi.ninja",
     version = "v1alpha1",
-    kind = "ClusterPoolProfile",
-    plural = "clusterpoolprofiles",
-    shortname = "cpp",
-    status = "ClusterPoolProfileStatus",
+    kind = "ClusterPool",
+    plural = "clusterpools",
+    shortname = "cp",
+    status = "ClusterPoolStatus",
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-pub struct ClusterPoolProfileSpec {
+pub struct ClusterPoolSpec {
     /// Desired number of warm (idle + creating) clusters in the pool.
     /// Ignored when `scaling` is set — use `scaling.min_ready` instead.
-    #[serde(default = "default_pool_size")]
-    pub pool_size: u32,
+    #[serde(default = "default_size")]
+    pub size: u32,
 
-    /// Default TTL for claims against this profile (e.g. "2h", "30m").
+    /// Default TTL for claims against this pool (e.g. "2h", "30m").
     #[serde(default = "default_ttl")]
     pub ttl: String,
 
-    /// Backend to use for provisioning clusters.
+    /// Backend configuration for provisioning clusters.
     #[serde(default)]
-    pub backend: BackendType,
-
-    /// Shared PostgreSQL datastore configuration (direct-k3s backend only).
-    #[serde(default)]
-    pub datastore: Option<DatastoreConfig>,
-
-    /// CAPI backend configuration (capi backend only).
-    #[serde(default)]
-    pub capi: Option<CapiConfig>,
-
-    /// kobe-sync backend configuration (kobe-sync backend only).
-    #[serde(default)]
-    pub kobe_sync: Option<KobeSyncConfig>,
+    pub backend: BackendConfig,
 
     /// Cluster configuration.
     pub cluster: ClusterConfig,
@@ -210,7 +198,7 @@ pub struct ClusterPoolProfileSpec {
     #[serde(default)]
     pub readiness_gates: Vec<ReadinessGate>,
 
-    /// Autoscaling configuration. When set, overrides fixed `pool_size`.
+    /// Autoscaling configuration. When set, overrides fixed `size`.
     #[serde(default)]
     pub scaling: Option<ScalingConfig>,
 
@@ -225,6 +213,30 @@ pub struct ClusterPoolProfileSpec {
     pub snapshot: Option<SnapshotConfig>,
 }
 
+/// Nested backend configuration.
+///
+/// Groups the backend type selector and all backend-specific config
+/// into a single struct, replacing the previous flat fields on the spec.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendConfig {
+    /// Backend type.
+    #[serde(rename = "type", default)]
+    pub backend_type: BackendType,
+
+    /// Shared PostgreSQL datastore configuration (k3s/k0s backends only).
+    #[serde(default)]
+    pub datastore: Option<DatastoreConfig>,
+
+    /// CAPI backend configuration (capi backend only).
+    #[serde(default)]
+    pub capi: Option<CapiConfig>,
+
+    /// vkobe backend configuration (vkobe backend only).
+    #[serde(default)]
+    pub vkobe: Option<VkobeConfig>,
+}
+
 /// Backend-agnostic cluster configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -236,7 +248,7 @@ pub struct ClusterConfig {
     #[serde(default = "default_servers")]
     pub servers: u32,
 
-    /// Number of k3s agent replicas (direct-k3s backend only).
+    /// Number of k3s agent replicas (k3s backend only).
     /// When set, creates a separate agent Deployment that joins the server.
     #[serde(default)]
     pub agents: Option<u32>,
@@ -427,7 +439,7 @@ pub struct DiagnosticsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ClusterPoolProfileStatus {
+pub struct ClusterPoolStatus {
     /// Number of idle clusters ready for claims.
     #[serde(default)]
     pub ready: u32,
@@ -457,14 +469,14 @@ pub struct ClusterPoolProfileStatus {
     #[serde(default)]
     pub golden_generation: Option<i64>,
 
-    /// Name of the PostgreSQL template database for golden images (direct-k3s backend).
+    /// Name of the PostgreSQL template database for golden images (k3s backend).
     #[serde(default)]
     pub golden_template_db: Option<String>,
 }
 
 // --- Defaults ---
 
-fn default_pool_size() -> u32 {
+fn default_size() -> u32 {
     3
 }
 fn default_ttl() -> String {

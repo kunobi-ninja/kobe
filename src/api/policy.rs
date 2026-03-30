@@ -4,13 +4,13 @@ use crate::pool::parse_duration;
 /// Authorization policy — what each identity type is allowed to do.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Profile name patterns this identity can claim.
-    pub allowed_profiles: Vec<String>,
-    /// Maximum TTL for claims.
+    /// Pool name patterns this identity can access.
+    pub allowed_pools: Vec<String>,
+    /// Maximum TTL for leases.
     pub max_ttl: chrono::Duration,
-    /// Maximum concurrent active claims.
-    pub max_concurrent_claims: u32,
-    /// Default priority for claims.
+    /// Maximum concurrent active leases.
+    pub max_concurrent_leases: u32,
+    /// Default priority for leases.
     pub default_priority: u32,
     /// Maximum number of TTL extensions.
     pub max_extensions: u32,
@@ -22,16 +22,16 @@ pub fn policy_for(identity: &AuthIdentity) -> Policy {
     identity.policy.clone()
 }
 
-/// Check if a profile name matches the allowed patterns for an identity.
-pub fn is_profile_allowed(profile: &str, policy: &Policy) -> bool {
-    policy.allowed_profiles.iter().any(|pattern| {
+/// Check if a pool name matches the allowed patterns for an identity.
+pub fn is_pool_allowed(pool: &str, policy: &Policy) -> bool {
+    policy.allowed_pools.iter().any(|pattern| {
         if pattern == "*" {
             return true;
         }
         if let Some(prefix) = pattern.strip_suffix('*') {
-            profile.starts_with(prefix)
+            pool.starts_with(prefix)
         } else {
-            profile == pattern
+            pool == pattern
         }
     })
 }
@@ -68,38 +68,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_profile_matching() {
+    fn test_pool_matching() {
         let ci_policy = Policy {
-            allowed_profiles: vec!["e2e-*".to_string()],
+            allowed_pools: vec!["e2e-*".to_string()],
             max_ttl: chrono::Duration::hours(1),
-            max_concurrent_claims: 5,
+            max_concurrent_leases: 5,
             default_priority: 100,
             max_extensions: 2,
         };
 
-        assert!(is_profile_allowed("e2e-basic", &ci_policy));
-        assert!(is_profile_allowed("e2e-full", &ci_policy));
-        assert!(!is_profile_allowed("dev-basic", &ci_policy));
+        assert!(is_pool_allowed("e2e-basic", &ci_policy));
+        assert!(is_pool_allowed("e2e-full", &ci_policy));
+        assert!(!is_pool_allowed("dev-basic", &ci_policy));
 
         let admin_policy = Policy {
-            allowed_profiles: vec!["*".to_string()],
+            allowed_pools: vec!["*".to_string()],
             max_ttl: chrono::Duration::hours(8),
-            max_concurrent_claims: 10,
+            max_concurrent_leases: 10,
             default_priority: 100,
             max_extensions: 10,
         };
 
-        assert!(is_profile_allowed("e2e-basic", &admin_policy));
-        assert!(is_profile_allowed("dev-basic", &admin_policy));
-        assert!(is_profile_allowed("anything", &admin_policy));
+        assert!(is_pool_allowed("e2e-basic", &admin_policy));
+        assert!(is_pool_allowed("dev-basic", &admin_policy));
+        assert!(is_pool_allowed("anything", &admin_policy));
     }
 
     #[test]
     fn test_clamp_ttl() {
         let policy = Policy {
-            allowed_profiles: vec![],
+            allowed_pools: vec![],
             max_ttl: chrono::Duration::hours(1),
-            max_concurrent_claims: 5,
+            max_concurrent_leases: 5,
             default_priority: 100,
             max_extensions: 2,
         };

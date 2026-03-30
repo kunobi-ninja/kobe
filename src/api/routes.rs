@@ -12,10 +12,10 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
-use crate::api::policy::{self, format_duration, is_profile_allowed, policy_for};
+use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::ClusterBackend;
-use crate::controllers::claim::extend_claim_ttl;
-use crate::crd::{ClaimPhase, ClusterClaim, ClusterClaimSpec, ClusterPoolProfile, Requester};
+use crate::controllers::claim::extend_lease_ttl;
+use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
 use crate::metrics;
 use crate::pool::{count_states, is_valid_k8s_name, parse_duration, PoolState};
 
@@ -42,14 +42,14 @@ static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::O
 pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> Router {
     // Concurrency-limited API routes
     let api_routes = Router::new()
-        .route("/v1/claims", post(create_claim::<B>))
-        .route("/v1/claims", get(list_claims::<B>))
-        .route("/v1/claims/{id}", get(get_claim::<B>))
-        .route("/v1/claims/{id}", delete(release_claim::<B>))
-        .route("/v1/claims/{id}", patch(extend_claim::<B>))
-        .route("/v1/claims/{id}/diagnostics", get(get_diagnostics::<B>))
-        .route("/v1/profiles", get(list_profiles::<B>))
-        .route("/v1/profiles/{name}", get(get_profile::<B>))
+        .route("/v1/leases", post(create_lease::<B>))
+        .route("/v1/leases", get(list_leases::<B>))
+        .route("/v1/leases/{id}", get(get_lease::<B>))
+        .route("/v1/leases/{id}", delete(release_lease::<B>))
+        .route("/v1/leases/{id}", patch(extend_lease::<B>))
+        .route("/v1/leases/{id}/diagnostics", get(get_diagnostics::<B>))
+        .route("/v1/pools", get(list_pools::<B>))
+        .route("/v1/pools/{name}", get(get_pool::<B>))
         .layer(axum::middleware::from_fn(concurrency_limit));
 
     // Non-limited infrastructure routes
@@ -85,14 +85,14 @@ async fn concurrency_limit(
 // --- Request/Response types ---
 
 #[derive(Deserialize)]
-struct CreateClaimRequest {
+struct CreateLeaseRequest {
     profile: String,
     #[serde(default)]
     ttl: Option<String>,
 }
 
 #[derive(Serialize)]
-struct ClaimResponse {
+struct LeaseResponse {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     kubeconfig: Option<String>,
@@ -113,7 +113,7 @@ fn is_zero(v: &u32) -> bool {
 }
 
 #[derive(Serialize)]
-struct ClaimSummary {
+struct LeaseSummary {
     id: String,
     phase: String,
     profile: String,
@@ -126,12 +126,12 @@ struct ClaimSummary {
 }
 
 #[derive(Deserialize)]
-struct ExtendClaimRequest {
+struct ExtendLeaseRequest {
     extend_ttl: String,
 }
 
 #[derive(Serialize)]
-struct ExtendClaimResponse {
+struct ExtendLeaseResponse {
     expires_at: String,
 }
 
@@ -152,10 +152,10 @@ struct ErrorResponse {
 // --- Route handlers ---
 
 #[tracing::instrument(skip_all)]
-async fn create_claim<B: ClusterBackend>(
+async fn create_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
-    Json(req): Json<CreateClaimRequest>,
+    Json(req): Json<CreateLeaseRequest>,
 ) -> Response {
     let policy = policy_for(&identity);
 
@@ -173,7 +173,7 @@ async fn create_claim<B: ClusterBackend>(
             .into_response();
     }
 
-    if !is_profile_allowed(&req.profile, &policy) {
+    if !is_pool_allowed(&req.profile, &policy) {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -208,41 +208,41 @@ async fn create_claim<B: ClusterBackend>(
     let was_clamped = effective_ttl < requested_ttl;
     let ttl_formatted = format_duration(&effective_ttl);
 
-    let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
-    let active_count = match count_active_claims(&claims_api, &identity.identity).await {
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let active_count = match count_active_leases(&leases_api, &identity.identity).await {
         Ok(count) => count,
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {
-                    error: "Unable to verify claim quota".to_string(),
+                    error: "Unable to verify lease quota".to_string(),
                     detail: Some(e.to_string()),
                 }),
             )
                 .into_response();
         }
     };
-    if active_count >= policy.max_concurrent_claims {
+    if active_count >= policy.max_concurrent_leases {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorResponse {
                 error: format!(
-                    "Concurrent claim limit ({}) reached",
-                    policy.max_concurrent_claims
+                    "Concurrent lease limit ({}) reached",
+                    policy.max_concurrent_leases
                 ),
-                detail: Some(format!("You have {} active claims", active_count)),
+                detail: Some(format!("You have {} active leases", active_count)),
             }),
         )
             .into_response();
     }
 
-    let claim_id = format!(
-        "claim-{}",
+    let lease_id = format!(
+        "lease-{}",
         &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
     );
 
-    let claim = build_claim_crd(
-        &claim_id,
+    let claim = build_lease_crd(
+        &lease_id,
         &state.namespace,
         &req.profile,
         &ttl_formatted,
@@ -250,11 +250,11 @@ async fn create_claim<B: ClusterBackend>(
         policy.default_priority,
     );
 
-    if let Err(e) = claims_api.create(&PostParams::default(), &claim).await {
+    if let Err(e) = leases_api.create(&PostParams::default(), &claim).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to create claim".to_string(),
+                error: "Failed to create lease".to_string(),
                 detail: Some(e.to_string()),
             }),
         )
@@ -266,15 +266,15 @@ async fn create_claim<B: ClusterBackend>(
         .inc();
 
     info!(
-        claim_id = %claim_id,
+        lease_id = %lease_id,
         profile = %req.profile,
         identity = %identity.identity,
         priority = policy.default_priority,
-        "Claim created, queued for binding"
+        "Lease created, queued for binding"
     );
 
-    let mut resp = ClaimResponse {
-        id: claim_id,
+    let mut resp = LeaseResponse {
+        id: lease_id,
         kubeconfig: None,
         expires_at: None,
         phase: "Pending".to_string(),
@@ -292,26 +292,26 @@ async fn create_claim<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn list_claims<B: ClusterBackend>(
+async fn list_leases<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
 ) -> Response {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let label_hash = hash_identity(&identity.identity);
     let lp =
         ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
 
-    match claims_api.list(&lp).await {
+    match leases_api.list(&lp).await {
         Ok(claims) => {
-            let my_claims: Vec<ClaimSummary> = claims
+            let my_claims: Vec<LeaseSummary> = claims
                 .iter()
                 .filter(|c| c.spec.requester.identity == identity.identity)
                 .map(|c| {
                     let status = c.status.clone().unwrap_or_default();
-                    ClaimSummary {
+                    LeaseSummary {
                         id: c.name_any(),
                         phase: status.phase.to_string(),
-                        profile: c.spec.profile_ref.clone(),
+                        profile: c.spec.pool_ref.clone(),
                         expires_at: status.expires_at,
                         queue_position: status.queue_position,
                         diagnostics_url: status.diagnostics_url,
@@ -324,7 +324,7 @@ async fn list_claims<B: ClusterBackend>(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to list claims".to_string(),
+                error: "Failed to list leases".to_string(),
                 detail: Some(e.to_string()),
             }),
         )
@@ -333,20 +333,20 @@ async fn list_claims<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn get_claim<B: ClusterBackend>(
+async fn get_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
 ) -> Response {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
-    match claims_api.get(&id).await {
+    match leases_api.get(&id).await {
         Ok(claim) => {
             if claim.spec.requester.identity != identity.identity {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
-                        error: "Claim not found".to_string(),
+                        error: "Lease not found".to_string(),
                         detail: None,
                     }),
                 )
@@ -355,7 +355,7 @@ async fn get_claim<B: ClusterBackend>(
 
             let status = claim.status.clone().unwrap_or_default();
 
-            let kubeconfig = if status.phase == ClaimPhase::Bound {
+            let kubeconfig = if status.phase == LeasePhase::Bound {
                 if let Some(ref cluster_name) = status.cluster_name {
                     match state
                         .backend
@@ -383,12 +383,12 @@ async fn get_claim<B: ClusterBackend>(
 
             (
                 StatusCode::OK,
-                Json(ClaimResponse {
+                Json(LeaseResponse {
                     id,
                     kubeconfig,
                     expires_at: status.expires_at,
                     phase: status.phase.to_string(),
-                    profile: claim.spec.profile_ref,
+                    profile: claim.spec.pool_ref,
                     queue_position: status.queue_position,
                     diagnostics_url: status.diagnostics_url,
                     effective_ttl: None,
@@ -399,7 +399,7 @@ async fn get_claim<B: ClusterBackend>(
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: "Claim not found".to_string(),
+                error: "Lease not found".to_string(),
                 detail: None,
             }),
         )
@@ -407,7 +407,7 @@ async fn get_claim<B: ClusterBackend>(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to get claim".to_string(),
+                error: "Failed to get lease".to_string(),
                 detail: Some(e.to_string()),
             }),
         )
@@ -416,14 +416,14 @@ async fn get_claim<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn release_claim<B: ClusterBackend>(
+async fn release_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
 ) -> Response {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
-    let claim = match claims_api.get(&id).await {
+    let claim = match leases_api.get(&id).await {
         Ok(c) => c,
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
             return StatusCode::NOT_FOUND.into_response();
@@ -432,7 +432,7 @@ async fn release_claim<B: ClusterBackend>(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Failed to get claim".to_string(),
+                    error: "Failed to get lease".to_string(),
                     detail: Some(e.to_string()),
                 }),
             )
@@ -448,7 +448,7 @@ async fn release_claim<B: ClusterBackend>(
 
     if matches!(
         status.phase,
-        ClaimPhase::Released | ClaimPhase::Expired | ClaimPhase::Recycling
+        LeasePhase::Released | LeasePhase::Expired | LeasePhase::Recycling
     ) {
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -456,7 +456,7 @@ async fn release_claim<B: ClusterBackend>(
     let patch = serde_json::json!({
         "status": { "phase": "Released" }
     });
-    if let Err(e) = claims_api
+    if let Err(e) = leases_api
         .patch_status(
             &id,
             &PatchParams::apply("kobe-operator"),
@@ -467,7 +467,7 @@ async fn release_claim<B: ClusterBackend>(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to release claim".to_string(),
+                error: "Failed to release lease".to_string(),
                 detail: Some(e.to_string()),
             }),
         )
@@ -475,33 +475,33 @@ async fn release_claim<B: ClusterBackend>(
     }
 
     metrics::CLAIMS_TOTAL
-        .with_label_values(&[claim.spec.profile_ref.as_str(), "released"])
+        .with_label_values(&[claim.spec.pool_ref.as_str(), "released"])
         .inc();
 
-    if status.phase == ClaimPhase::Pending {
-        info!(claim_id = %id, "Pending claim cancelled");
+    if status.phase == LeasePhase::Pending {
+        info!(lease_id = %id, "Pending lease cancelled");
     } else {
-        info!(claim_id = %id, "Bound claim released");
+        info!(lease_id = %id, "Bound lease released");
     }
 
     StatusCode::NO_CONTENT.into_response()
 }
 
 #[tracing::instrument(skip_all)]
-async fn extend_claim<B: ClusterBackend>(
+async fn extend_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
-    Json(req): Json<ExtendClaimRequest>,
+    Json(req): Json<ExtendLeaseRequest>,
 ) -> Response {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
-    match claims_api.get(&id).await {
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    match leases_api.get(&id).await {
         Ok(claim) => {
             if claim.spec.requester.identity != identity.identity {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
-                        error: "Claim not found".to_string(),
+                        error: "Lease not found".to_string(),
                         detail: None,
                     }),
                 )
@@ -512,7 +512,7 @@ async fn extend_claim<B: ClusterBackend>(
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: "Claim not found".to_string(),
+                    error: "Lease not found".to_string(),
                     detail: None,
                 }),
             )
@@ -522,7 +522,7 @@ async fn extend_claim<B: ClusterBackend>(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Failed to get claim".to_string(),
+                    error: "Failed to get lease".to_string(),
                     detail: Some(e.to_string()),
                 }),
             )
@@ -530,7 +530,7 @@ async fn extend_claim<B: ClusterBackend>(
         }
     }
 
-    match extend_claim_ttl(
+    match extend_lease_ttl(
         &state.client,
         &state.namespace,
         &id,
@@ -541,12 +541,12 @@ async fn extend_claim<B: ClusterBackend>(
     {
         Ok(new_expiry) => (
             StatusCode::OK,
-            Json(ExtendClaimResponse {
+            Json(ExtendLeaseResponse {
                 expires_at: new_expiry,
             }),
         )
             .into_response(),
-        Err(crate::controllers::claim::ClaimError::Lifecycle(e)) => (
+        Err(crate::controllers::claim::LeaseError::Lifecycle(e)) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: e.to_string(),
@@ -554,10 +554,10 @@ async fn extend_claim<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(crate::controllers::claim::ClaimError::Kube(e)) => (
+        Err(crate::controllers::claim::LeaseError::Kube(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to extend claim".to_string(),
+                error: "Failed to extend lease".to_string(),
                 detail: Some(e.to_string()),
             }),
         )
@@ -571,9 +571,9 @@ async fn get_diagnostics<B: ClusterBackend>(
     identity: AuthIdentity,
     Path(id): Path<String>,
 ) -> Response {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(state.client.clone(), &state.namespace);
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
-    match claims_api.get(&id).await {
+    match leases_api.get(&id).await {
         Ok(claim) => {
             if claim.spec.requester.identity != identity.identity {
                 return StatusCode::NOT_FOUND.into_response();
@@ -585,18 +585,18 @@ async fn get_diagnostics<B: ClusterBackend>(
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "url": url,
-                        "claim_id": id,
+                        "lease_id": id,
                     })),
                 )
                     .into_response()
             } else {
                 let message = if matches!(
                     status.phase,
-                    ClaimPhase::Released | ClaimPhase::Expired | ClaimPhase::Recycling
+                    LeasePhase::Released | LeasePhase::Expired | LeasePhase::Recycling
                 ) {
                     "Diagnostics are being captured, try again shortly"
                 } else {
-                    "No diagnostics available for this claim"
+                    "No diagnostics available for this lease"
                 };
                 (
                     StatusCode::NOT_FOUND,
@@ -612,7 +612,7 @@ async fn get_diagnostics<B: ClusterBackend>(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: "Failed to look up claim".to_string(),
+                error: "Failed to look up lease".to_string(),
                 detail: Some(e.to_string()),
             }),
         )
@@ -621,19 +621,18 @@ async fn get_diagnostics<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn list_profiles<B: ClusterBackend>(
+async fn list_pools<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
 ) -> Response {
-    let profiles_api: Api<ClusterPoolProfile> =
-        Api::namespaced(state.client.clone(), &state.namespace);
+    let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match profiles_api.list(&ListParams::default()).await {
         Ok(profiles) => {
             let policy = policy_for(&identity);
             let response: Vec<ProfileResponse> = profiles
                 .iter()
-                .filter(|p| is_profile_allowed(&p.name_any(), &policy))
+                .filter(|p| is_pool_allowed(&p.name_any(), &policy))
                 .map(|p| {
                     let status = p.status.clone().unwrap_or_default();
                     ProfileResponse {
@@ -658,18 +657,17 @@ async fn list_profiles<B: ClusterBackend>(
 }
 
 #[tracing::instrument(skip_all)]
-async fn get_profile<B: ClusterBackend>(
+async fn get_pool<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(name): Path<String>,
 ) -> Response {
     let policy = policy_for(&identity);
-    if !is_profile_allowed(&name, &policy) {
+    if !is_pool_allowed(&name, &policy) {
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let profiles_api: Api<ClusterPoolProfile> =
-        Api::namespaced(state.client.clone(), &state.namespace);
+    let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match profiles_api.get(&name).await {
         Ok(profile) => {
@@ -743,32 +741,32 @@ async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) ->
 
 // --- Helpers ---
 
-async fn count_active_claims(
-    claims_api: &Api<ClusterClaim>,
+async fn count_active_leases(
+    leases_api: &Api<ClusterLease>,
     identity: &str,
 ) -> Result<u32, kube::Error> {
     let label_hash = hash_identity(identity);
     let lp =
         ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
-    let claims = claims_api.list(&lp).await?;
+    let claims = leases_api.list(&lp).await?;
     Ok(claims
         .iter()
         .filter(|c| c.spec.requester.identity == identity)
         .filter(|c| {
             let status = c.status.clone().unwrap_or_default();
-            matches!(status.phase, ClaimPhase::Pending | ClaimPhase::Bound)
+            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
         })
         .count() as u32)
 }
 
-fn build_claim_crd(
-    claim_id: &str,
+fn build_lease_crd(
+    lease_id: &str,
     namespace: &str,
     profile: &str,
     ttl: &str,
     identity: &AuthIdentity,
     priority: u32,
-) -> ClusterClaim {
+) -> ClusterLease {
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/profile".to_string(), profile.to_string());
     labels.insert(
@@ -776,15 +774,15 @@ fn build_claim_crd(
         hash_identity(&identity.identity),
     );
 
-    ClusterClaim {
+    ClusterLease {
         metadata: ObjectMeta {
-            name: Some(claim_id.to_string()),
+            name: Some(lease_id.to_string()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels),
             ..Default::default()
         },
-        spec: ClusterClaimSpec {
-            profile_ref: profile.to_string(),
+        spec: ClusterLeaseSpec {
+            pool_ref: profile.to_string(),
             ttl: ttl.to_string(),
             requester: Requester {
                 requester_type: identity.requester_type.clone(),
@@ -839,7 +837,7 @@ mod tests {
         assert_ne!(hash_identity("a"), hash_identity("b"));
     }
 
-    // --- build_claim_crd tests ---
+    // --- build_lease_crd tests ---
 
     fn test_identity() -> AuthIdentity {
         AuthIdentity {
@@ -847,9 +845,9 @@ mod tests {
             identity: "repo:org/repo:ref:refs/heads/main".to_string(),
             issuer: "https://token.actions.githubusercontent.com".to_string(),
             policy: crate::api::policy::Policy {
-                allowed_profiles: vec!["e2e-*".to_string()],
+                allowed_pools: vec!["e2e-*".to_string()],
                 max_ttl: chrono::Duration::hours(2),
-                max_concurrent_claims: 5,
+                max_concurrent_leases: 5,
                 default_priority: 100,
                 max_extensions: 2,
             },
@@ -857,11 +855,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_claim_crd_basic() {
+    fn test_build_lease_crd_basic() {
         let identity = test_identity();
-        let claim = build_claim_crd("claim-abc123", "test-ns", "e2e-basic", "1h", &identity, 80);
+        let claim = build_lease_crd("lease-abc123", "test-ns", "e2e-basic", "1h", &identity, 80);
 
-        assert_eq!(claim.spec.profile_ref, "e2e-basic");
+        assert_eq!(claim.spec.pool_ref, "e2e-basic");
         assert_eq!(claim.spec.ttl, "1h");
         assert_eq!(claim.spec.priority, 80);
         assert_eq!(
@@ -871,14 +869,14 @@ mod tests {
         assert_eq!(claim.spec.requester.requester_type, "github-actions:ci");
 
         // Metadata
-        assert_eq!(claim.metadata.name.as_deref(), Some("claim-abc123"));
+        assert_eq!(claim.metadata.name.as_deref(), Some("lease-abc123"));
         assert_eq!(claim.metadata.namespace.as_deref(), Some("test-ns"));
     }
 
     #[test]
-    fn test_build_claim_crd_labels() {
+    fn test_build_lease_crd_labels() {
         let identity = test_identity();
-        let claim = build_claim_crd("claim-xyz", "ns1", "e2e-full", "30m", &identity, 50);
+        let claim = build_lease_crd("lease-xyz", "ns1", "e2e-full", "30m", &identity, 50);
 
         let labels = claim
             .metadata
@@ -898,22 +896,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_claim_crd_status_is_none() {
+    fn test_build_lease_crd_status_is_none() {
         let identity = test_identity();
-        let claim = build_claim_crd("claim-001", "ns", "dev", "2h", &identity, 100);
+        let claim = build_lease_crd("lease-001", "ns", "dev", "2h", &identity, 100);
 
         // The CRD is created without status; the controller sets it later
         assert!(
             claim.status.is_none(),
-            "Initial claim CRD should have no status"
+            "Initial lease CRD should have no status"
         );
     }
 
     #[test]
-    fn test_build_claim_crd_different_priority() {
+    fn test_build_lease_crd_different_priority() {
         let identity = test_identity();
-        let claim_low = build_claim_crd("c1", "ns", "p", "1h", &identity, 10);
-        let claim_high = build_claim_crd("c2", "ns", "p", "1h", &identity, 200);
+        let claim_low = build_lease_crd("c1", "ns", "p", "1h", &identity, 10);
+        let claim_high = build_lease_crd("c2", "ns", "p", "1h", &identity, 200);
 
         assert_eq!(claim_low.spec.priority, 10);
         assert_eq!(claim_high.spec.priority, 200);
@@ -985,12 +983,12 @@ mod tests {
     // --- Auth-protected endpoints return 401 without Authorization header ---
 
     #[tokio::test]
-    async fn test_create_claim_requires_auth() {
+    async fn test_create_lease_requires_auth() {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
             .method("POST")
-            .uri("/v1/claims")
+            .uri("/v1/leases")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(r#"{"profile":"e2e-basic"}"#))
             .unwrap();
@@ -999,16 +997,16 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "POST /v1/claims without auth should return 401"
+            "POST /v1/leases without auth should return 401"
         );
     }
 
     #[tokio::test]
-    async fn test_list_claims_requires_auth() {
+    async fn test_list_leases_requires_auth() {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/claims")
+            .uri("/v1/leases")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1016,16 +1014,16 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "GET /v1/claims without auth should return 401"
+            "GET /v1/leases without auth should return 401"
         );
     }
 
     #[tokio::test]
-    async fn test_list_profiles_requires_auth() {
+    async fn test_list_pools_requires_auth() {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/profiles")
+            .uri("/v1/pools")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1033,16 +1031,16 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "GET /v1/profiles without auth should return 401"
+            "GET /v1/pools without auth should return 401"
         );
     }
 
     #[tokio::test]
-    async fn test_get_claim_requires_auth() {
+    async fn test_get_lease_requires_auth() {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/claims/claim-123")
+            .uri("/v1/leases/lease-123")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1050,7 +1048,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "GET /v1/claims/:id without auth should return 401"
+            "GET /v1/leases/:id without auth should return 401"
         );
     }
 
@@ -1060,7 +1058,7 @@ mod tests {
 
         let req = http::Request::builder()
             .method("DELETE")
-            .uri("/v1/claims/claim-123")
+            .uri("/v1/leases/lease-123")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1068,17 +1066,17 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "DELETE /v1/claims/:id without auth should return 401"
+            "DELETE /v1/leases/:id without auth should return 401"
         );
     }
 
     #[tokio::test]
-    async fn test_extend_claim_requires_auth() {
+    async fn test_extend_lease_requires_auth() {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
             .method("PATCH")
-            .uri("/v1/claims/claim-123")
+            .uri("/v1/leases/lease-123")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(r#"{"extend_ttl":"30m"}"#))
             .unwrap();
@@ -1087,16 +1085,16 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "PATCH /v1/claims/:id without auth should return 401"
+            "PATCH /v1/leases/:id without auth should return 401"
         );
     }
 
     #[tokio::test]
-    async fn test_get_profile_requires_auth() {
+    async fn test_get_pool_requires_auth() {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/profiles/e2e-basic")
+            .uri("/v1/pools/e2e-basic")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1104,7 +1102,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "GET /v1/profiles/:name without auth should return 401"
+            "GET /v1/pools/:name without auth should return 401"
         );
     }
 
@@ -1113,7 +1111,7 @@ mod tests {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/claims/claim-123/diagnostics")
+            .uri("/v1/leases/lease-123/diagnostics")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1121,7 +1119,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "GET /v1/claims/:id/diagnostics without auth should return 401"
+            "GET /v1/leases/:id/diagnostics without auth should return 401"
         );
     }
 
@@ -1132,7 +1130,7 @@ mod tests {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/claims")
+            .uri("/v1/leases")
             .header("Authorization", "Bearer invalid-token")
             .body(axum::body::Body::empty())
             .unwrap();
@@ -1152,7 +1150,7 @@ mod tests {
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
-            .uri("/v1/claims")
+            .uri("/v1/leases")
             .header("Authorization", "Basic dXNlcjpwYXNz")
             .body(axum::body::Body::empty())
             .unwrap();
@@ -1165,10 +1163,10 @@ mod tests {
         );
     }
 
-    // --- count_active_claims tests ---
+    // --- count_active_leases tests ---
 
     #[tokio::test]
-    async fn test_count_active_claims_empty() {
+    async fn test_count_active_leases_empty() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
@@ -1179,22 +1177,22 @@ mod tests {
         let empty_list = crate::testutil::k8s_list_response::<serde_json::Value>(vec![]);
         Mock::given(method("GET"))
             .and(path_regex(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(&empty_list))
             .mount(&server)
             .await;
 
-        let claims_api: kube::api::Api<ClusterClaim> =
+        let leases_api: kube::api::Api<ClusterLease> =
             kube::api::Api::namespaced(client, "test-ns");
-        let count = count_active_claims(&claims_api, "test-identity")
+        let count = count_active_leases(&leases_api, "test-identity")
             .await
             .unwrap();
         assert_eq!(count, 0);
     }
 
     #[tokio::test]
-    async fn test_count_active_claims_filters_correctly() {
+    async fn test_count_active_leases_filters_correctly() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
@@ -1206,10 +1204,10 @@ mod tests {
             // Pending — should count
             serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "c1", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "e2e-basic",
+                    "poolRef": "e2e-basic",
                     "ttl": "1h",
                     "requester": { "type": "github-actions:ci", "identity": identity },
                     "priority": 50
@@ -1219,10 +1217,10 @@ mod tests {
             // Bound — should count
             serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "c2", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "e2e-basic",
+                    "poolRef": "e2e-basic",
                     "ttl": "1h",
                     "requester": { "type": "github-actions:ci", "identity": identity },
                     "priority": 50
@@ -1232,10 +1230,10 @@ mod tests {
             // Released — should NOT count
             serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "c3", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "e2e-basic",
+                    "poolRef": "e2e-basic",
                     "ttl": "1h",
                     "requester": { "type": "github-actions:ci", "identity": identity },
                     "priority": 50
@@ -1245,10 +1243,10 @@ mod tests {
             // Expired — should NOT count
             serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "c4", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "e2e-basic",
+                    "poolRef": "e2e-basic",
                     "ttl": "1h",
                     "requester": { "type": "github-actions:ci", "identity": identity },
                     "priority": 50
@@ -1258,10 +1256,10 @@ mod tests {
             // Different identity — should NOT count
             serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "c5", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "e2e-basic",
+                    "poolRef": "e2e-basic",
                     "ttl": "1h",
                     "requester": { "type": "github-actions:ci", "identity": "repo:other/repo:ref:refs/heads/main" },
                     "priority": 50
@@ -1275,15 +1273,15 @@ mod tests {
         let list_resp = crate::testutil::k8s_list_response(claims);
         Mock::given(method("GET"))
             .and(path_regex(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(&list_resp))
             .mount(&server)
             .await;
 
-        let claims_api: kube::api::Api<ClusterClaim> =
+        let leases_api: kube::api::Api<ClusterLease> =
             kube::api::Api::namespaced(client, "test-ns");
-        let count = count_active_claims(&claims_api, identity).await.unwrap();
+        let count = count_active_leases(&leases_api, identity).await.unwrap();
         // Only c1 (Pending) and c2 (Bound) for the matching identity
         assert_eq!(count, 2);
     }

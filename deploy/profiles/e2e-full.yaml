@@ -1,12 +1,13 @@
 apiVersion: kobe.kunobi.ninja/v1alpha1
-kind: ClusterPoolProfile
+kind: ClusterPool
 metadata:
   name: e2e-full
   namespace: kunobi-pool
 spec:
-  poolSize: 2
+  size: 2
   ttl: "2h"
-  backend: direct-k3s
+  backend:
+    type: k3s
   cluster:
     version: "v1.31.3+k3s1"
     servers: 1

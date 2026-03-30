@@ -1,29 +1,29 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: clusterpoolprofiles.kobe.kunobi.ninja
+  name: clusterpools.kobe.kunobi.ninja
 spec:
   group: kobe.kunobi.ninja
   names:
     categories: []
-    kind: ClusterPoolProfile
-    plural: clusterpoolprofiles
+    kind: ClusterPool
+    plural: clusterpools
     shortNames:
-    - cpp
-    singular: clusterpoolprofile
+    - cp
+    singular: clusterpool
   scope: Namespaced
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for ClusterPoolProfileSpec via `CustomResource`
+        description: Auto-generated derived type for ClusterPoolSpec via `CustomResource`
         properties:
           spec:
             description: |-
-              ClusterPoolProfile defines a pool of pre-warmed virtual clusters.
+              ClusterPool defines a pool of pre-warmed virtual clusters.
 
-              Each profile specifies cluster configuration, addons to install,
+              Each pool specifies cluster configuration, addons to install,
               resource limits, health checks, readiness gates, scaling behavior,
               and optional diagnostic capture settings.
             properties:
@@ -48,47 +48,140 @@ spec:
                   type: object
                 type: array
               backend:
-                default: direct-k3s
-                description: Backend to use for provisioning clusters.
-                enum:
-                - direct-k3s
-                - direct-k0s
-                - capi
-                - kobe-sync
-                type: string
-              capi:
-                description: CAPI backend configuration (capi backend only).
-                nullable: true
+                default:
+                  capi: null
+                  datastore: null
+                  type: k3s
+                  vkobe: null
+                description: Backend configuration for provisioning clusters.
                 properties:
-                  infrastructureApiVersion:
-                    description: API version of the infrastructure CRD (e.g. "infrastructure.cluster.x-k8s.io/v1alpha1").
-                    type: string
-                  infrastructureKind:
-                    description: Kind of the infrastructure CRD (e.g. "VCluster", "K0smotronCluster").
-                    type: string
-                  infrastructurePlural:
-                    description: |-
-                      Optional explicit plural form for the infrastructure CRD resource name.
-                      If not set, derived automatically by lowercasing the kind and appending "s".
-                      Use this for kinds with irregular plurals (e.g. "ingresses" for "Ingress").
+                  capi:
+                    description: CAPI backend configuration (capi backend only).
                     nullable: true
-                    type: string
-                  infrastructureSpec:
-                    description: |-
-                      Raw JSON/YAML spec to embed in the infrastructure resource.
-                      This is provider-specific and passed through as-is.
+                    properties:
+                      infrastructureApiVersion:
+                        description: API version of the infrastructure CRD (e.g. "infrastructure.cluster.x-k8s.io/v1alpha1").
+                        type: string
+                      infrastructureKind:
+                        description: Kind of the infrastructure CRD (e.g. "VCluster", "K0smotronCluster").
+                        type: string
+                      infrastructurePlural:
+                        description: |-
+                          Optional explicit plural form for the infrastructure CRD resource name.
+                          If not set, derived automatically by lowercasing the kind and appending "s".
+                          Use this for kinds with irregular plurals (e.g. "ingresses" for "Ingress").
+                        nullable: true
+                        type: string
+                      infrastructureSpec:
+                        description: |-
+                          Raw JSON/YAML spec to embed in the infrastructure resource.
+                          This is provider-specific and passed through as-is.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    required:
+                    - infrastructureApiVersion
+                    - infrastructureKind
                     type: object
-                    x-kubernetes-preserve-unknown-fields: true
-                required:
-                - infrastructureApiVersion
-                - infrastructureKind
+                  datastore:
+                    description: Shared PostgreSQL datastore configuration (k3s/k0s backends only).
+                    nullable: true
+                    properties:
+                      goldenTemplates:
+                        default: false
+                        description: Enable golden images via PostgreSQL template databases.
+                        type: boolean
+                      secretKey:
+                        default: connection-url
+                        description: 'Key in the Secret (default: "connection-url").'
+                        type: string
+                      secretRef:
+                        description: Name of the Secret containing the PostgreSQL connection URL.
+                        type: string
+                    required:
+                    - secretRef
+                    type: object
+                  type:
+                    default: k3s
+                    description: Backend type.
+                    enum:
+                    - k3s
+                    - k0s
+                    - capi
+                    - vkobe
+                    type: string
+                  vkobe:
+                    description: vkobe backend configuration (vkobe backend only).
+                    nullable: true
+                    properties:
+                      dataStoreRef:
+                        description: Reference to the KobeStore CRD that this cluster connects to.
+                        properties:
+                          name:
+                            description: Name of the KobeStore resource in the same namespace.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      kcm:
+                        description: Optional KCM (kube-controller-manager) configuration.
+                        nullable: true
+                        properties:
+                          controllers:
+                            default:
+                            - deployment
+                            - replicaset
+                            - statefulset
+                            - daemonset
+                            - job
+                            - cronjob
+                            - namespace
+                            - serviceaccount
+                            - garbagecollector
+                            description: Which controllers to enable in the virtual KCM.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      metricsPort:
+                        default: 9090
+                        description: 'Port for health/metrics endpoints (default: 9090).'
+                        format: uint16
+                        maximum: 65535.0
+                        minimum: 0.0
+                        type: integer
+                      proxyPort:
+                        default: 8443
+                        description: 'Port for the virtual API server proxy (default: 8443).'
+                        format: uint16
+                        maximum: 65535.0
+                        minimum: 0.0
+                        type: integer
+                      syncers:
+                        default:
+                        - pods
+                        - services
+                        - configmaps
+                        - secrets
+                        - endpoints
+                        - ingresses
+                        description: Which resource syncers to enable. Defaults to core set.
+                        items:
+                          type: string
+                        type: array
+                      version:
+                        default: '1.32'
+                        description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
+                        type: string
+                    required:
+                    - dataStoreRef
+                    type: object
                 type: object
               cluster:
                 description: Cluster configuration.
                 properties:
                   agents:
                     description: |-
-                      Number of k3s agent replicas (direct-k3s backend only).
+                      Number of k3s agent replicas (k3s backend only).
                       When set, creates a separate agent Deployment that joins the server.
                     format: uint32
                     minimum: 0.0
@@ -148,24 +241,6 @@ spec:
                 required:
                 - version
                 type: object
-              datastore:
-                description: Shared PostgreSQL datastore configuration (direct-k3s backend only).
-                nullable: true
-                properties:
-                  goldenTemplates:
-                    default: false
-                    description: Enable golden images via PostgreSQL template databases.
-                    type: boolean
-                  secretKey:
-                    default: connection-url
-                    description: 'Key in the Secret (default: "connection-url").'
-                    type: string
-                  secretRef:
-                    description: Name of the Secret containing the PostgreSQL connection URL.
-                    type: string
-                required:
-                - secretRef
-                type: object
               diagnostics:
                 description: Diagnostic bundle capture on claim release/expiry.
                 nullable: true
@@ -215,80 +290,6 @@ spec:
                     minimum: 0.0
                     type: integer
                 type: object
-              kobeSync:
-                description: kobe-sync backend configuration (kobe-sync backend only).
-                nullable: true
-                properties:
-                  dataStoreRef:
-                    description: Reference to the DataStore CRD that this cluster connects to.
-                    properties:
-                      name:
-                        description: Name of the DataStore resource in the same namespace.
-                        type: string
-                    required:
-                    - name
-                    type: object
-                  kcm:
-                    description: Optional KCM (kube-controller-manager) configuration.
-                    nullable: true
-                    properties:
-                      controllers:
-                        default:
-                        - deployment
-                        - replicaset
-                        - statefulset
-                        - daemonset
-                        - job
-                        - cronjob
-                        - namespace
-                        - serviceaccount
-                        - garbagecollector
-                        description: Which controllers to enable in the virtual KCM.
-                        items:
-                          type: string
-                        type: array
-                    type: object
-                  metricsPort:
-                    default: 9090
-                    description: 'Port for health/metrics endpoints (default: 9090).'
-                    format: uint16
-                    maximum: 65535.0
-                    minimum: 0.0
-                    type: integer
-                  proxyPort:
-                    default: 8443
-                    description: 'Port for the virtual API server proxy (default: 8443).'
-                    format: uint16
-                    maximum: 65535.0
-                    minimum: 0.0
-                    type: integer
-                  syncers:
-                    default:
-                    - pods
-                    - services
-                    - configmaps
-                    - secrets
-                    - endpoints
-                    - ingresses
-                    description: Which resource syncers to enable. Defaults to core set.
-                    items:
-                      type: string
-                    type: array
-                  version:
-                    default: '1.32'
-                    description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
-                    type: string
-                required:
-                - dataStoreRef
-                type: object
-              poolSize:
-                default: 3
-                description: |-
-                  Desired number of warm (idle + creating) clusters in the pool.
-                  Ignored when `scaling` is set — use `scaling.min_ready` instead.
-                format: uint32
-                minimum: 0.0
-                type: integer
               readinessGates:
                 default: []
                 description: |-
@@ -329,7 +330,7 @@ spec:
                     type: object
                 type: object
               scaling:
-                description: Autoscaling configuration. When set, overrides fixed `pool_size`.
+                description: Autoscaling configuration. When set, overrides fixed `size`.
                 nullable: true
                 properties:
                   maxClusters:
@@ -363,6 +364,14 @@ spec:
                     minimum: 0.0
                     type: integer
                 type: object
+              size:
+                default: 3
+                description: |-
+                  Desired number of warm (idle + creating) clusters in the pool.
+                  Ignored when `scaling` is set — use `scaling.min_ready` instead.
+                format: uint32
+                minimum: 0.0
+                type: integer
               snapshot:
                 description: |-
                   Velero golden image snapshot configuration.
@@ -400,7 +409,7 @@ spec:
                 type: object
               ttl:
                 default: 2h
-                description: Default TTL for claims against this profile (e.g. "2h", "30m").
+                description: Default TTL for claims against this pool (e.g. "2h", "30m").
                 type: string
             required:
             - cluster
@@ -432,7 +441,7 @@ spec:
                 nullable: true
                 type: integer
               goldenTemplateDb:
-                description: Name of the PostgreSQL template database for golden images (direct-k3s backend).
+                description: Name of the PostgreSQL template database for golden images (k3s backend).
                 nullable: true
                 type: string
               queueDepth:
@@ -456,7 +465,7 @@ spec:
             type: object
         required:
         - spec
-        title: ClusterPoolProfile
+        title: ClusterPool
         type: object
     served: true
     storage: true

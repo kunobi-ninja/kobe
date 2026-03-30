@@ -8,11 +8,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 const MAX_K8S_NAME_LEN: usize = 253;
 
 /// Label key indicating a resource is managed by kobe-sync.
-pub const LABEL_MANAGED: &str = "sync.kobe.kunobi.ninja/managed";
+pub const LABEL_MANAGED: &str = "vkobe.kunobi.ninja/managed";
 /// Label key carrying the virtual namespace of a managed resource.
-pub const LABEL_VNS: &str = "sync.kobe.kunobi.ninja/vns";
+pub const LABEL_VNS: &str = "vkobe.kunobi.ninja/vns";
 /// Annotation key recording the translation scheme version.
-pub const ANNOTATION_SCHEME_VERSION: &str = "sync.kobe.kunobi.ninja/scheme-version";
+pub const ANNOTATION_SCHEME_VERSION: &str = "vkobe.kunobi.ninja/scheme-version";
 /// Current scheme version.
 pub const SCHEME_VERSION: &str = "1";
 

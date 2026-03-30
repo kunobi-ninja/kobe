@@ -7,41 +7,41 @@ fn main() {
     let name = args.get(1).map(|s| s.as_str()).unwrap_or("all");
 
     match name {
-        "clusterpoolprofiles" => print!(
+        "clusterpools" => print!(
             "{}",
-            serde_yaml_ng::to_string(&crd::ClusterPoolProfile::crd()).unwrap()
+            serde_yaml_ng::to_string(&crd::ClusterPool::crd()).unwrap()
         ),
-        "clusterclaims" => print!(
+        "clusterleases" => print!(
             "{}",
-            serde_yaml_ng::to_string(&crd::ClusterClaim::crd()).unwrap()
+            serde_yaml_ng::to_string(&crd::ClusterLease::crd()).unwrap()
         ),
-        "authpolicies" => print!(
+        "accesspolicies" => print!(
             "{}",
-            serde_yaml_ng::to_string(&crd::AuthPolicy::crd()).unwrap()
+            serde_yaml_ng::to_string(&crd::AccessPolicy::crd()).unwrap()
         ),
-        "datastores" => print!(
+        "kobestores" => print!(
             "{}",
-            serde_yaml_ng::to_string(&crd::DataStore::crd()).unwrap()
+            serde_yaml_ng::to_string(&crd::KobeStore::crd()).unwrap()
         ),
         _ => {
             print!(
                 "{}",
-                serde_yaml_ng::to_string(&crd::ClusterPoolProfile::crd()).unwrap()
+                serde_yaml_ng::to_string(&crd::ClusterPool::crd()).unwrap()
             );
             println!("---");
             print!(
                 "{}",
-                serde_yaml_ng::to_string(&crd::ClusterClaim::crd()).unwrap()
+                serde_yaml_ng::to_string(&crd::ClusterLease::crd()).unwrap()
             );
             println!("---");
             print!(
                 "{}",
-                serde_yaml_ng::to_string(&crd::AuthPolicy::crd()).unwrap()
+                serde_yaml_ng::to_string(&crd::AccessPolicy::crd()).unwrap()
             );
             println!("---");
             print!(
                 "{}",
-                serde_yaml_ng::to_string(&crd::DataStore::crd()).unwrap()
+                serde_yaml_ng::to_string(&crd::KobeStore::crd()).unwrap()
             );
         }
     }

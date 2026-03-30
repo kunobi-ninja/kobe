@@ -13,7 +13,7 @@ use kube::{Client, ResourceExt};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::ClusterBackend;
-use crate::crd::{ClusterPoolProfileSpec, SnapshotConfig};
+use crate::crd::{ClusterPoolSpec, SnapshotConfig};
 use crate::velero::types::{
     backup_api_resource, build_backup_object, build_restore_object, golden_backup_name,
     golden_namespace, restore_api_resource, restore_name,
@@ -46,7 +46,7 @@ impl VeleroCoordinator {
     pub async fn create_golden_backup<B: ClusterBackend>(
         &self,
         profile_name: &str,
-        spec: &ClusterPoolProfileSpec,
+        spec: &ClusterPoolSpec,
         backend: &B,
         snapshot: &SnapshotConfig,
         generation: i64,
@@ -115,7 +115,7 @@ impl VeleroCoordinator {
     async fn do_golden_backup<B: ClusterBackend>(
         &self,
         profile_name: &str,
-        spec: &ClusterPoolProfileSpec,
+        spec: &ClusterPoolSpec,
         backend: &B,
         snapshot: &SnapshotConfig,
         backup_name: &str,
@@ -1015,12 +1015,10 @@ mod tests {
         let snapshot = test_snapshot_config();
         let backend = crate::testutil::MockBackend::new();
 
-        let spec = ClusterPoolProfileSpec {
-            pool_size: 1,
+        let spec = ClusterPoolSpec {
+            size: 1,
             ttl: "2h".to_string(),
             backend: Default::default(),
-            datastore: None,
-            capi: None,
             cluster: crate::crd::ClusterConfig {
                 version: "v1.31.3+k3s1".to_string(),
                 servers: 1,
@@ -1036,7 +1034,6 @@ mod tests {
             scaling: None,
             diagnostics: None,
             snapshot: Some(snapshot.clone()),
-            kobe_sync: None,
         };
 
         // 1. ensure_namespace: GET returns 200 (already exists)

@@ -1,16 +1,16 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: datastores.kobe.kunobi.ninja
+  name: kobestores.kobe.kunobi.ninja
 spec:
   group: kobe.kunobi.ninja
   names:
     categories: []
-    kind: DataStore
-    plural: datastores
+    kind: KobeStore
+    plural: kobestores
     shortNames:
-    - ds
-    singular: datastore
+    - ks
+    singular: kobestore
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -26,11 +26,11 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for DataStoreSpec via `CustomResource`
+        description: Auto-generated derived type for KobeStoreSpec via `CustomResource`
         properties:
           spec:
             description: |-
-              DataStore represents an external storage backend (etcd or kine-sqlite)
+              KobeStore represents an external storage backend (etcd or kine-sqlite)
               that virtual cluster kube-apiservers connect to via `--etcd-servers`
               and `--etcd-prefix`.
             properties:
@@ -38,7 +38,7 @@ spec:
                 description: Capacity limits.
                 properties:
                   maxClusters:
-                    description: Maximum number of virtual clusters this DataStore can serve.
+                    description: Maximum number of virtual clusters this KobeStore can serve.
                     format: uint32
                     minimum: 0.0
                     type: integer
@@ -80,24 +80,24 @@ spec:
             - endpoints
             type: object
           status:
-            description: Runtime status of a DataStore.
+            description: Runtime status of a KobeStore.
             nullable: true
             properties:
               currentClusters:
                 default: 0
-                description: Number of virtual clusters currently using this DataStore.
+                description: Number of virtual clusters currently using this KobeStore.
                 format: uint32
                 minimum: 0.0
                 type: integer
               ready:
                 default: false
-                description: Whether the DataStore is reachable and healthy.
+                description: Whether the KobeStore is reachable and healthy.
                 type: boolean
               usedBy:
                 default: []
-                description: List of virtual clusters using this DataStore.
+                description: List of virtual clusters using this KobeStore.
                 items:
-                  description: Identifies a virtual cluster using this DataStore.
+                  description: Identifies a virtual cluster using this KobeStore.
                   properties:
                     name:
                       description: Name of the virtual cluster.
@@ -113,7 +113,7 @@ spec:
             type: object
         required:
         - spec
-        title: DataStore
+        title: KobeStore
         type: object
     served: true
     storage: true

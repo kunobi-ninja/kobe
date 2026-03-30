@@ -58,7 +58,7 @@ clean:
 
 # Regenerate CRD YAML files from Rust types
 crdgen:
-    cargo run --bin crdgen -- clusterpoolprofiles > charts/kobe/crds/clusterpoolprofiles.yaml
-    cargo run --bin crdgen -- clusterclaims > charts/kobe/crds/clusterclaims.yaml
-    cargo run --bin crdgen -- authpolicies > charts/kobe/crds/authpolicies.yaml
-    cargo run --bin crdgen -- datastores > charts/kobe/crds/datastores.yaml
+    cargo run --bin crdgen -- clusterpools > charts/kobe/crds/clusterpools.yaml
+    cargo run --bin crdgen -- clusterleases > charts/kobe/crds/clusterleases.yaml
+    cargo run --bin crdgen -- accesspolicies > charts/kobe/crds/accesspolicies.yaml
+    cargo run --bin crdgen -- kobestores > charts/kobe/crds/kobestores.yaml

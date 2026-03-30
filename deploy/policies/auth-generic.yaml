@@ -1,48 +1,42 @@
 apiVersion: kobe.kunobi.ninja/v1alpha1
-kind: AuthPolicy
+kind: AccessPolicy
 metadata:
   name: corporate-sso
   namespace: kunobi-pool
 spec:
-  name: corporate-sso
   # Works with Auth0, Okta, Google, Azure AD, Keycloak, etc.
   # Replace with your OIDC provider's issuer URL.
-  issuer: https://login.example.com
-  # Optional: defaults to {issuer}/.well-known/jwks.json
-  # jwksUrl: https://login.example.com/.well-known/jwks.json
-  audience: ["kunobi-pool"]
-  algorithms: ["RS256"]
-  identityTemplate: "{email}"
-  roleExtraction:
-    method: mapping
-    claim: groups
-    values:
-      platform-admins: admin
-      developers: developer
-      qa-team: qa
-    default: viewer
-  policies:
-    admin:
-      allowedProfiles: ["*"]
+  auth:
+    oidc:
+      issuer: https://login.example.com
+      # Optional: defaults to {issuer}/.well-known/jwks.json
+      # jwksUrl: https://login.example.com/.well-known/jwks.json
+      audience: ["kunobi-pool"]
+      algorithms: ["RS256"]
+  identity: "{email}"
+  rules:
+    - match:
+        claim: groups
+        value: platform-admins
+      pools: ["*"]
       maxTtl: "8h"
-      maxConcurrentClaims: 10
-      defaultPriority: 100
+      maxConcurrentLeases: 10
       maxExtensions: 10
-    developer:
-      allowedProfiles: ["dev-*"]
+    - match:
+        claim: groups
+        value: developers
+      pools: ["dev-*"]
       maxTtl: "4h"
-      maxConcurrentClaims: 3
-      defaultPriority: 50
+      maxConcurrentLeases: 3
       maxExtensions: 5
-    qa:
-      allowedProfiles: ["e2e-*", "staging-*"]
+    - match:
+        claim: groups
+        value: qa-team
+      pools: ["e2e-*", "staging-*"]
       maxTtl: "2h"
-      maxConcurrentClaims: 5
-      defaultPriority: 75
+      maxConcurrentLeases: 5
       maxExtensions: 3
-    viewer:
-      allowedProfiles: ["sandbox-*"]
+    - pools: ["sandbox-*"]
       maxTtl: "1h"
-      maxConcurrentClaims: 1
-      defaultPriority: 25
+      maxConcurrentLeases: 1
       maxExtensions: 1

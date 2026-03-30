@@ -1,0 +1,158 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: accesspolicies.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: AccessPolicy
+    plural: accesspolicies
+    shortNames:
+    - ap
+    singular: accesspolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for AccessPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              AccessPolicy configures authentication and authorization for cluster lease requests.
+
+              Each AccessPolicy represents one authentication method (OIDC provider, static token,
+              or Kubernetes ServiceAccount) with associated authorization rules.
+            properties:
+              auth:
+                description: Authentication method configuration.
+                properties:
+                  oidc:
+                    description: OIDC provider (JWT-based) authentication.
+                    nullable: true
+                    properties:
+                      algorithms:
+                        default:
+                        - RS256
+                        description: Allowed JWT signing algorithms. Defaults to `["RS256"]`.
+                        items:
+                          type: string
+                        type: array
+                      audience:
+                        default: []
+                        description: Expected audience (`aud` claim). Empty = skip validation.
+                        items:
+                          type: string
+                        type: array
+                      authorizedParties:
+                        default: []
+                        description: Expected authorized parties (`azp` claim). Empty = skip validation.
+                        items:
+                          type: string
+                        type: array
+                      issuer:
+                        description: OIDC issuer URL (must match `iss` claim).
+                        type: string
+                      jwksUrl:
+                        description: JWKS URL for key fetching. Defaults to `{issuer}/.well-known/jwks.json`.
+                        nullable: true
+                        type: string
+                    required:
+                    - issuer
+                    type: object
+                  serviceAccount:
+                    description: Kubernetes ServiceAccount authentication.
+                    nullable: true
+                    properties:
+                      name:
+                        description: ServiceAccount name.
+                        type: string
+                      namespace:
+                        description: ServiceAccount namespace.
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  token:
+                    description: Static bearer token authentication.
+                    nullable: true
+                    properties:
+                      secretRef:
+                        description: 'Name of the Secret containing the token (key: "token").'
+                        type: string
+                    required:
+                    - secretRef
+                    type: object
+                type: object
+              identity:
+                default: '{sub}'
+                description: |-
+                  Identity template for OIDC providers.
+                  Uses `{claim_name}` syntax to interpolate JWT claims.
+                  Supports dot-path traversal (e.g., `{private_metadata.role}`).
+                  Defaults to `"{sub}"`. Ignored for token and serviceAccount auth.
+                type: string
+              rules:
+                description: |-
+                  Authorization rules. First matching rule wins for OIDC with match clauses.
+                  For token and serviceAccount auth, rules without match clauses apply directly.
+                items:
+                  description: Authorization rule — what an authenticated caller can do.
+                  properties:
+                    match:
+                      description: |-
+                        Optional claim-based match for multi-role OIDC policies.
+                        When set, this rule only applies if the JWT claim matches.
+                      nullable: true
+                      properties:
+                        claim:
+                          description: JWT claim path (supports dot-path like `private_metadata.role`).
+                          type: string
+                        value:
+                          description: Value to match.
+                          type: string
+                      required:
+                      - claim
+                      - value
+                      type: object
+                    maxConcurrentLeases:
+                      description: Maximum concurrent active leases for this identity.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    maxExtensions:
+                      default: 2
+                      description: Maximum TTL extensions per lease.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    maxTtl:
+                      description: Maximum TTL for leases (e.g., "1h", "30m").
+                      type: string
+                    pools:
+                      description: |-
+                        Pool name patterns this rule allows (e.g., `["ci-*"]`).
+                        Supports `*` suffix wildcard and literal `*` for all pools.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - maxConcurrentLeases
+                  - maxTtl
+                  - pools
+                  type: object
+                type: array
+            required:
+            - auth
+            - rules
+            type: object
+        required:
+        - spec
+        title: AccessPolicy
+        type: object
+    served: true
+    storage: true
+    subresources: {}

@@ -20,13 +20,13 @@ rules:
   # CRD management
   - apiGroups: ["kobe.kunobi.ninja"]
     resources:
-      - clusterpoolprofiles
-      - clusterpoolprofiles/status
-      - clusterclaims
-      - clusterclaims/status
-      - authpolicies
-      - datastores
-      - datastores/status
+      - clusterpools
+      - clusterpools/status
+      - clusterleases
+      - clusterleases/status
+      - accesspolicies
+      - kobestores
+      - kobestores/status
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use crate::crd::auth_policy::{AuthPolicy, PolicySpec, RoleExtractionConfig};
+use crate::crd::access_policy::{AccessPolicy, AccessRule, ClaimMatch};
 use crate::pool::parse_duration;
 
 /// JWKS cache entry.
@@ -60,9 +60,10 @@ pub struct AuthIdentity {
     pub policy: crate::api::policy::Policy,
 }
 
-/// A compiled provider entry, built from an AuthPolicy CRD.
+/// A compiled provider entry, built from an AccessPolicy CRD.
 #[derive(Debug, Clone)]
 struct CompiledProvider {
+    /// The policy name (from metadata.name).
     name: String,
     issuer: String,
     jwks_url: String,
@@ -70,14 +71,14 @@ struct CompiledProvider {
     authorized_parties: Vec<String>,
     algorithms: Vec<Algorithm>,
     identity_template: String,
-    role_extraction: RoleExtractionConfig,
-    policies: HashMap<String, PolicySpec>,
+    /// Flat rules list — first matching rule wins.
+    rules: Vec<AccessRule>,
 }
 
-/// JWT authenticator supporting any OIDC provider via AuthPolicy CRDs.
+/// JWT authenticator supporting any OIDC provider via AccessPolicy CRDs.
 pub struct JwtAuthenticator {
     http: HttpClient,
-    /// Compiled providers from AuthPolicy CRDs, keyed by issuer.
+    /// Compiled providers from AccessPolicy CRDs.
     providers: RwLock<Vec<CompiledProvider>>,
     /// Cached JWKS per URL.
     jwks_cache: RwLock<HashMap<String, JwkSet>>,
@@ -100,18 +101,23 @@ impl JwtAuthenticator {
         }
     }
 
-    /// Recompile the provider lookup table from AuthPolicy CRDs.
-    /// Called by the AuthPolicy watcher whenever CRDs change.
-    pub async fn update_policies(&self, policies: Vec<AuthPolicy>) {
+    /// Recompile the provider lookup table from AccessPolicy CRDs.
+    /// Called by the AccessPolicy watcher whenever CRDs change.
+    pub async fn update_policies(&self, policies: Vec<AccessPolicy>) {
         let compiled: Vec<CompiledProvider> = policies
             .into_iter()
             .filter_map(|ap| {
+                let policy_name = ap.metadata.name.unwrap_or_default();
                 let spec = ap.spec;
-                let jwks_url = spec
-                    .jwks_url
-                    .unwrap_or_else(|| format!("{}/.well-known/jwks.json", spec.issuer));
 
-                let algorithms: Vec<Algorithm> = spec
+                // Only OIDC auth is supported for JWT validation currently
+                let oidc = spec.auth.oidc?;
+
+                let jwks_url = oidc
+                    .jwks_url
+                    .unwrap_or_else(|| format!("{}/.well-known/jwks.json", oidc.issuer));
+
+                let algorithms: Vec<Algorithm> = oidc
                     .algorithms
                     .iter()
                     .filter_map(|a| parse_algorithm(a))
@@ -119,42 +125,46 @@ impl JwtAuthenticator {
 
                 if algorithms.is_empty() {
                     warn!(
-                        provider = %spec.name,
+                        provider = %policy_name,
                         "No valid algorithms configured, skipping provider"
                     );
                     return None;
                 }
 
                 Some(CompiledProvider {
-                    name: spec.name,
-                    issuer: spec.issuer,
+                    name: policy_name,
+                    issuer: oidc.issuer,
                     jwks_url,
-                    audience: spec.audience,
-                    authorized_parties: spec.authorized_parties,
+                    audience: oidc.audience,
+                    authorized_parties: oidc.authorized_parties,
                     algorithms,
-                    identity_template: spec.identity_template,
-                    role_extraction: spec.role_extraction,
-                    policies: spec.policies,
+                    identity_template: spec.identity,
+                    rules: spec.rules,
                 })
             })
             .collect();
 
         let count = compiled.len();
         *self.providers.write().await = compiled;
-        debug!(providers = count, "Auth policies updated");
+        debug!(providers = count, "Access policies updated");
     }
 
-    /// Look up a policy by requester_type string ("{provider}:{role}").
+    /// Look up a policy by requester_type string.
+    ///
+    /// Format: `"{policy_name}"` (no match clause) or `"{policy_name}:{claim_value}"`.
     /// Used by the claim controller when it doesn't have an AuthIdentity.
     pub async fn policy_for_requester_type(
         &self,
         requester_type: &str,
     ) -> Option<crate::api::policy::Policy> {
-        let (provider_name, role) = requester_type.split_once(':')?;
+        let (policy_name, matched_value) = match requester_type.split_once(':') {
+            Some((name, val)) => (name, Some(val)),
+            None => (requester_type, None),
+        };
         let providers = self.providers.read().await;
-        let provider = providers.iter().find(|p| p.name == provider_name)?;
-        let policy_spec = provider.policies.get(role)?;
-        Some(policy_spec_to_policy(policy_spec))
+        let provider = providers.iter().find(|p| p.name == policy_name)?;
+        let rule = find_matching_rule(&provider.rules, matched_value)?;
+        Some(access_rule_to_policy(rule))
     }
 
     /// Validate a JWT and return the authenticated identity.
@@ -240,21 +250,17 @@ impl JwtAuthenticator {
             }
         }
 
-        // Extract role from claims
-        let role = extract_role(&provider.role_extraction, &data.claims)?;
-
-        // Look up policy for this role
-        let policy_spec = provider.policies.get(&role).ok_or_else(|| {
-            AuthError::InvalidToken(format!(
-                "No policy defined for role '{}' in provider '{}'",
-                role, provider.name
-            ))
-        })?;
+        // Find matching rule — iterate rules, check match clauses against claims
+        let (rule, matched_value) = find_matching_rule_with_claims(&provider.rules, &data.claims)?;
 
         // Format identity from template
         let identity = format_identity(&provider.identity_template, &data.claims);
 
-        let requester_type = format!("{}:{}", provider.name, role);
+        // Build requester_type: "{policy_name}" or "{policy_name}:{matched_value}"
+        let requester_type = match &matched_value {
+            Some(val) => format!("{}:{}", provider.name, val),
+            None => provider.name.clone(),
+        };
 
         debug!(
             identity = %identity,
@@ -267,7 +273,7 @@ impl JwtAuthenticator {
             requester_type,
             identity,
             issuer: data.claims.iss,
-            policy: policy_spec_to_policy(policy_spec),
+            policy: access_rule_to_policy(rule),
         })
     }
 
@@ -369,51 +375,44 @@ impl JwtAuthenticator {
     }
 }
 
-/// Extract a role from JWT claims using the configured extraction method.
-fn extract_role(
-    config: &RoleExtractionConfig,
+/// Find the first matching rule from a rules list, checking match clauses against JWT claims.
+/// Returns the matched rule and the optional matched claim value (used for requester_type).
+fn find_matching_rule_with_claims<'a>(
+    rules: &'a [AccessRule],
     claims: &GenericClaims,
-) -> Result<String, AuthError> {
-    match config {
-        RoleExtractionConfig::Static { role } => Ok(role.clone()),
-
-        RoleExtractionConfig::Claim { claim, default } => {
-            match get_claim_value(&claims.extra, &claims.sub, claim) {
-                Some(val) => Ok(val),
-                None => default.clone().ok_or_else(|| {
-                    AuthError::InvalidToken(format!("Missing required claim: {claim}"))
-                }),
-            }
-        }
-
-        RoleExtractionConfig::Mapping {
-            claim,
-            values,
-            default,
-        } => {
-            let claim_val = get_claim_value(&claims.extra, &claims.sub, claim);
-            if let Some(val) = claim_val {
-                if let Some(role) = values.get(&val) {
-                    return Ok(role.clone());
-                }
-            }
-            default.clone().ok_or_else(|| {
-                AuthError::InvalidToken(format!("No mapping for claim '{claim}' value"))
-            })
-        }
-
-        RoleExtractionConfig::Conditional { rules, default } => {
-            for rule in rules {
-                if let Some(val) = get_claim_value(&claims.extra, &claims.sub, &rule.claim) {
-                    if val == rule.value {
-                        return Ok(rule.role.clone());
+) -> Result<(&'a AccessRule, Option<String>), AuthError> {
+    for rule in rules {
+        match &rule.match_clause {
+            Some(ClaimMatch { claim, value }) => {
+                if let Some(actual) = get_claim_value(&claims.extra, &claims.sub, claim) {
+                    if actual == *value {
+                        return Ok((rule, Some(value.clone())));
                     }
                 }
             }
-            default
-                .clone()
-                .ok_or_else(|| AuthError::InvalidToken("No conditional rule matched".into()))
+            None => {
+                // No match clause — this rule applies unconditionally
+                return Ok((rule, None));
+            }
         }
+    }
+    Err(AuthError::InvalidToken(
+        "No access rule matched for this token".into(),
+    ))
+}
+
+/// Find the first matching rule by optional matched_value (for policy_for_requester_type lookups).
+/// If matched_value is Some, find a rule whose match_clause.value matches.
+/// If matched_value is None, find a rule without a match_clause.
+fn find_matching_rule<'a>(
+    rules: &'a [AccessRule],
+    matched_value: Option<&str>,
+) -> Option<&'a AccessRule> {
+    match matched_value {
+        Some(val) => rules
+            .iter()
+            .find(|r| r.match_clause.as_ref().is_some_and(|m| m.value == val)),
+        None => rules.iter().find(|r| r.match_clause.is_none()),
     }
 }
 
@@ -486,21 +485,21 @@ fn format_identity(template: &str, claims: &GenericClaims) -> String {
     result
 }
 
-/// Convert a PolicySpec from the CRD into the runtime Policy struct.
-fn policy_spec_to_policy(spec: &PolicySpec) -> crate::api::policy::Policy {
-    let max_ttl = parse_duration(&spec.max_ttl).unwrap_or_else(|| {
+/// Convert an AccessRule from the CRD into the runtime Policy struct.
+fn access_rule_to_policy(rule: &AccessRule) -> crate::api::policy::Policy {
+    let max_ttl = parse_duration(&rule.max_ttl).unwrap_or_else(|| {
         warn!(
-            raw_value = %spec.max_ttl,
+            raw_value = %rule.max_ttl,
             "Failed to parse max_ttl, defaulting to 1h"
         );
         chrono::Duration::hours(1)
     });
     crate::api::policy::Policy {
-        allowed_profiles: spec.allowed_profiles.clone(),
+        allowed_pools: rule.pools.clone(),
         max_ttl,
-        max_concurrent_claims: spec.max_concurrent_claims,
-        default_priority: spec.default_priority,
-        max_extensions: spec.max_extensions,
+        max_concurrent_leases: rule.max_concurrent_leases,
+        default_priority: 50,
+        max_extensions: rule.max_extensions,
     }
 }
 
@@ -601,104 +600,44 @@ mod tests {
         }
     }
 
-    // --- extract_role tests ---
+    // --- find_matching_rule_with_claims tests ---
 
     #[test]
-    fn test_extract_role_static() {
-        let config = RoleExtractionConfig::Static {
-            role: "ci".to_string(),
-        };
+    fn test_find_rule_no_match_clause() {
+        let rules = vec![AccessRule {
+            match_clause: None,
+            pools: vec!["*".to_string()],
+            max_ttl: "1h".to_string(),
+            max_concurrent_leases: 5,
+            max_extensions: 2,
+        }];
         let claims = make_claims("test-sub", HashMap::new());
-        assert_eq!(extract_role(&config, &claims).unwrap(), "ci");
+        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        assert_eq!(rule.pools, vec!["*"]);
+        assert!(matched.is_none());
     }
 
     #[test]
-    fn test_extract_role_claim() {
-        let config = RoleExtractionConfig::Claim {
-            claim: "role".to_string(),
-            default: None,
-        };
-        let mut extra = HashMap::new();
-        extra.insert(
-            "role".to_string(),
-            serde_json::Value::String("admin".to_string()),
-        );
-        let claims = make_claims("test-sub", extra);
-        assert_eq!(extract_role(&config, &claims).unwrap(), "admin");
-    }
-
-    #[test]
-    fn test_extract_role_claim_missing_with_default() {
-        let config = RoleExtractionConfig::Claim {
-            claim: "role".to_string(),
-            default: Some("user".to_string()),
-        };
-        let claims = make_claims("test-sub", HashMap::new());
-        assert_eq!(extract_role(&config, &claims).unwrap(), "user");
-    }
-
-    #[test]
-    fn test_extract_role_claim_missing_no_default() {
-        let config = RoleExtractionConfig::Claim {
-            claim: "role".to_string(),
-            default: None,
-        };
-        let claims = make_claims("test-sub", HashMap::new());
-        assert!(extract_role(&config, &claims).is_err());
-    }
-
-    #[test]
-    fn test_extract_role_mapping() {
-        let config = RoleExtractionConfig::Mapping {
-            claim: "org_role".to_string(),
-            values: HashMap::from([
-                ("org:admin".to_string(), "admin".to_string()),
-                ("org:member".to_string(), "user".to_string()),
-            ]),
-            default: None,
-        };
-        let mut extra = HashMap::new();
-        extra.insert(
-            "org_role".to_string(),
-            serde_json::Value::String("org:admin".to_string()),
-        );
-        let claims = make_claims("test-sub", extra);
-        assert_eq!(extract_role(&config, &claims).unwrap(), "admin");
-    }
-
-    #[test]
-    fn test_extract_role_mapping_with_default() {
-        let config = RoleExtractionConfig::Mapping {
-            claim: "org_role".to_string(),
-            values: HashMap::from([("org:admin".to_string(), "admin".to_string())]),
-            default: Some("user".to_string()),
-        };
-        let mut extra = HashMap::new();
-        extra.insert(
-            "org_role".to_string(),
-            serde_json::Value::String("org:viewer".to_string()),
-        );
-        let claims = make_claims("test-sub", extra);
-        assert_eq!(extract_role(&config, &claims).unwrap(), "user");
-    }
-
-    #[test]
-    fn test_extract_role_conditional() {
-        let config = RoleExtractionConfig::Conditional {
-            rules: vec![
-                crate::crd::auth_policy::ConditionalRule {
+    fn test_find_rule_with_match_clause() {
+        let rules = vec![
+            AccessRule {
+                match_clause: Some(ClaimMatch {
                     claim: "org_role".to_string(),
                     value: "org:admin".to_string(),
-                    role: "admin".to_string(),
-                },
-                crate::crd::auth_policy::ConditionalRule {
-                    claim: "private_metadata.role".to_string(),
-                    value: "admin".to_string(),
-                    role: "admin".to_string(),
-                },
-            ],
-            default: Some("user".to_string()),
-        };
+                }),
+                pools: vec!["*".to_string()],
+                max_ttl: "8h".to_string(),
+                max_concurrent_leases: 10,
+                max_extensions: 5,
+            },
+            AccessRule {
+                match_clause: None,
+                pools: vec!["dev-*".to_string()],
+                max_ttl: "1h".to_string(),
+                max_concurrent_leases: 3,
+                max_extensions: 1,
+            },
+        ];
 
         // First rule matches
         let mut extra = HashMap::new();
@@ -707,20 +646,55 @@ mod tests {
             serde_json::Value::String("org:admin".to_string()),
         );
         let claims = make_claims("test-sub", extra);
-        assert_eq!(extract_role(&config, &claims).unwrap(), "admin");
+        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        assert_eq!(rule.max_ttl, "8h");
+        assert_eq!(matched, Some("org:admin".to_string()));
 
-        // Second rule matches (nested claim)
+        // No claim match — falls through to unconditional rule
+        let claims = make_claims("test-sub", HashMap::new());
+        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        assert_eq!(rule.max_ttl, "1h");
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_find_rule_nested_claim_match() {
+        let rules = vec![AccessRule {
+            match_clause: Some(ClaimMatch {
+                claim: "private_metadata.role".to_string(),
+                value: "admin".to_string(),
+            }),
+            pools: vec!["*".to_string()],
+            max_ttl: "4h".to_string(),
+            max_concurrent_leases: 10,
+            max_extensions: 5,
+        }];
+
         let mut extra = HashMap::new();
         extra.insert(
             "private_metadata".to_string(),
             serde_json::json!({"role": "admin"}),
         );
         let claims = make_claims("test-sub", extra);
-        assert_eq!(extract_role(&config, &claims).unwrap(), "admin");
+        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        assert_eq!(rule.max_ttl, "4h");
+        assert_eq!(matched, Some("admin".to_string()));
+    }
 
-        // No rule matches, falls back to default
+    #[test]
+    fn test_find_rule_no_match() {
+        let rules = vec![AccessRule {
+            match_clause: Some(ClaimMatch {
+                claim: "role".to_string(),
+                value: "admin".to_string(),
+            }),
+            pools: vec!["*".to_string()],
+            max_ttl: "1h".to_string(),
+            max_concurrent_leases: 5,
+            max_extensions: 2,
+        }];
         let claims = make_claims("test-sub", HashMap::new());
-        assert_eq!(extract_role(&config, &claims).unwrap(), "user");
+        assert!(find_matching_rule_with_claims(&rules, &claims).is_err());
     }
 
     // --- format_identity tests ---
@@ -852,50 +826,49 @@ mod tests {
         assert_eq!(parse_algorithm(""), None);
     }
 
-    // --- policy_spec_to_policy tests ---
+    // --- access_rule_to_policy tests ---
 
     #[test]
-    fn test_policy_spec_to_policy_valid() {
-        let spec = PolicySpec {
-            allowed_profiles: vec!["e2e-*".to_string()],
+    fn test_access_rule_to_policy_valid() {
+        let rule = AccessRule {
+            match_clause: None,
+            pools: vec!["e2e-*".to_string()],
             max_ttl: "2h".to_string(),
-            max_concurrent_claims: 5,
-            default_priority: 100,
+            max_concurrent_leases: 5,
             max_extensions: 3,
         };
-        let policy = policy_spec_to_policy(&spec);
+        let policy = access_rule_to_policy(&rule);
         assert_eq!(policy.max_ttl, chrono::Duration::hours(2));
-        assert_eq!(policy.allowed_profiles, vec!["e2e-*"]);
-        assert_eq!(policy.max_concurrent_claims, 5);
-        assert_eq!(policy.default_priority, 100);
+        assert_eq!(policy.allowed_pools, vec!["e2e-*"]);
+        assert_eq!(policy.max_concurrent_leases, 5);
         assert_eq!(policy.max_extensions, 3);
     }
 
     #[test]
-    fn test_policy_spec_to_policy_invalid_duration() {
-        let spec = PolicySpec {
-            allowed_profiles: vec!["dev-*".to_string()],
+    fn test_access_rule_to_policy_invalid_duration() {
+        let rule = AccessRule {
+            match_clause: None,
+            pools: vec!["dev-*".to_string()],
             max_ttl: "invalid".to_string(),
-            max_concurrent_claims: 1,
-            default_priority: 50,
+            max_concurrent_leases: 1,
             max_extensions: 0,
         };
-        let policy = policy_spec_to_policy(&spec);
+        let policy = access_rule_to_policy(&rule);
         // Should default to 1h (3600s) when parsing fails
         assert_eq!(policy.max_ttl, chrono::Duration::hours(1));
     }
 
     #[test]
-    fn test_policy_spec_to_policy_wildcard_profiles() {
-        let spec = PolicySpec {
-            allowed_profiles: vec!["*".to_string()],
+    fn test_access_rule_to_policy_wildcard_pools() {
+        let rule = AccessRule {
+            match_clause: None,
+            pools: vec!["*".to_string()],
             max_ttl: "30m".to_string(),
-            max_concurrent_claims: 10,
-            default_priority: 50,
+            max_concurrent_leases: 10,
             max_extensions: 2,
         };
-        let policy = policy_spec_to_policy(&spec);
-        assert_eq!(policy.allowed_profiles, vec!["*"]);
+        let policy = access_rule_to_policy(&rule);
+        assert_eq!(policy.allowed_pools, vec!["*"]);
         assert_eq!(policy.max_ttl, chrono::Duration::minutes(30));
     }
 
@@ -1035,85 +1008,77 @@ mod tests {
     async fn test_update_policies_compiles_providers() {
         let auth = JwtAuthenticator::new();
 
-        let policy: AuthPolicy = serde_json::from_value(serde_json::json!({
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "AuthPolicy",
+            "kind": "AccessPolicy",
             "metadata": { "name": "test-policy" },
             "spec": {
-                "name": "test-provider",
-                "issuer": "https://example.com",
-                "audience": ["test-aud"],
-                "algorithms": ["RS256"],
-                "roleExtraction": { "method": "static", "role": "admin" },
-                "policies": {
-                    "admin": {
-                        "allowedProfiles": ["*"],
-                        "maxTtl": "1h",
-                        "maxConcurrentClaims": 10
+                "auth": {
+                    "oidc": {
+                        "issuer": "https://example.com",
+                        "audience": ["test-aud"],
+                        "algorithms": ["RS256"]
                     }
-                }
+                },
+                "rules": [{
+                    "pools": ["*"],
+                    "maxTtl": "1h",
+                    "maxConcurrentLeases": 10
+                }]
             }
         }))
         .unwrap();
 
         auth.update_policies(vec![policy]).await;
 
-        let result = auth.policy_for_requester_type("test-provider:admin").await;
+        // No match clause — look up by policy name alone
+        let result = auth.policy_for_requester_type("test-policy").await;
         assert!(result.is_some());
         let policy = result.unwrap();
-        assert_eq!(policy.allowed_profiles, vec!["*"]);
+        assert_eq!(policy.allowed_pools, vec!["*"]);
         assert_eq!(policy.max_ttl, chrono::Duration::hours(1));
-        assert_eq!(policy.max_concurrent_claims, 10);
+        assert_eq!(policy.max_concurrent_leases, 10);
     }
 
     #[tokio::test]
     async fn test_policy_for_requester_type_format() {
         let auth = JwtAuthenticator::new();
 
-        let policy: AuthPolicy = serde_json::from_value(serde_json::json!({
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "AuthPolicy",
-            "metadata": { "name": "fmt-test" },
+            "kind": "AccessPolicy",
+            "metadata": { "name": "my-policy" },
             "spec": {
-                "name": "my-provider",
-                "issuer": "https://issuer.example.com",
-                "audience": [],
-                "algorithms": ["RS256"],
-                "roleExtraction": { "method": "static", "role": "ci" },
-                "policies": {
-                    "ci": {
-                        "allowedProfiles": ["e2e-*"],
-                        "maxTtl": "2h",
-                        "maxConcurrentClaims": 3
+                "auth": {
+                    "oidc": {
+                        "issuer": "https://issuer.example.com",
+                        "audience": [],
+                        "algorithms": ["RS256"]
                     }
-                }
+                },
+                "rules": [{
+                    "pools": ["e2e-*"],
+                    "maxTtl": "2h",
+                    "maxConcurrentLeases": 3
+                }]
             }
         }))
         .unwrap();
 
         auth.update_policies(vec![policy]).await;
 
-        // Correct format "provider_name:role" should find the policy
-        assert!(auth
-            .policy_for_requester_type("my-provider:ci")
-            .await
-            .is_some());
+        // Policy name alone should find the rule (no match clause)
+        assert!(auth.policy_for_requester_type("my-policy").await.is_some());
 
-        // Wrong provider name should not find
+        // Wrong policy name should not find
         assert!(auth
-            .policy_for_requester_type("other-provider:ci")
+            .policy_for_requester_type("other-policy")
             .await
             .is_none());
 
-        // Wrong role should not find
+        // With a match value but no match clause rules — should not find
         assert!(auth
-            .policy_for_requester_type("my-provider:admin")
-            .await
-            .is_none());
-
-        // Missing colon separator should not find
-        assert!(auth
-            .policy_for_requester_type("my-provider-ci")
+            .policy_for_requester_type("my-policy:admin")
             .await
             .is_none());
     }

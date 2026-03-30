@@ -11,18 +11,18 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
-use crate::crd::{ClaimPhase, ClusterClaim, ClusterClaimStatus, ClusterPoolProfile};
+use crate::crd::{ClusterLease, ClusterLeaseStatus, ClusterPool, LeasePhase};
 use crate::diagnostics;
 use crate::pool::{parse_duration, ClusterState, PoolState};
 
 /// Shared state for the claim controller.
-pub struct ClaimContext<B: ClusterBackend> {
+pub struct LeaseContext<B: ClusterBackend> {
     pub client: Client,
     pub backend: B,
     /// Reference to pool state shared with profile controller.
     pub pools: Arc<RwLock<std::collections::HashMap<String, PoolState>>>,
     /// Priority queue of pending claims per profile.
-    pub queues: RwLock<std::collections::HashMap<String, Vec<PendingClaim>>>,
+    pub queues: RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
     /// Operator namespace.
     pub namespace: String,
     /// Authenticator for policy lookups by requester_type.
@@ -33,7 +33,7 @@ pub struct ClaimContext<B: ClusterBackend> {
 
 /// A pending claim in the priority queue.
 #[derive(Debug, Clone)]
-pub struct PendingClaim {
+pub struct PendingLease {
     pub claim_name: String,
     pub priority: u32,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -41,7 +41,7 @@ pub struct PendingClaim {
 
 /// Error type for the claim controller.
 #[derive(Debug, thiserror::Error)]
-pub enum ClaimError {
+pub enum LeaseError {
     #[error("Kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
     #[error("Lifecycle error: {0}")]
@@ -58,9 +58,9 @@ pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
     factory: Option<BackendFactory>,
     shutdown: CancellationToken,
 ) {
-    let claims: Api<ClusterClaim> = Api::namespaced(client.clone(), namespace);
+    let claims: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
 
-    let ctx = Arc::new(ClaimContext {
+    let ctx = Arc::new(LeaseContext {
         client: client.clone(),
         backend,
         pools,
@@ -108,11 +108,11 @@ pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
     }
 }
 
-/// Rebuild priority queues from existing Pending ClusterClaim CRDs.
-async fn rebuild_queues<B: ClusterBackend>(ctx: &ClaimContext<B>) {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+/// Rebuild priority queues from existing Pending ClusterLease CRDs.
+async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
+    let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
 
-    let claims = match claims_api.list(&ListParams::default()).await {
+    let claims = match leases_api.list(&ListParams::default()).await {
         Ok(list) => list,
         Err(e) => {
             error!("Failed to list claims for queue rebuild: {e}");
@@ -124,7 +124,7 @@ async fn rebuild_queues<B: ClusterBackend>(ctx: &ClaimContext<B>) {
 
     for claim in &claims {
         let status = claim.status.clone().unwrap_or_default();
-        if status.phase != ClaimPhase::Pending {
+        if status.phase != LeasePhase::Pending {
             continue;
         }
 
@@ -141,11 +141,11 @@ async fn rebuild_queues<B: ClusterBackend>(ctx: &ClaimContext<B>) {
             .unwrap_or_else(chrono::Utc::now);
 
         let queue = queues
-            .entry(claim.spec.profile_ref.clone())
+            .entry(claim.spec.pool_ref.clone())
             .or_insert_with(Vec::new);
 
         if !queue.iter().any(|p| p.claim_name == name) {
-            queue.push(PendingClaim {
+            queue.push(PendingLease {
                 claim_name: name,
                 priority: claim.spec.priority,
                 created_at,
@@ -171,22 +171,22 @@ async fn rebuild_queues<B: ClusterBackend>(ctx: &ClaimContext<B>) {
     }
 }
 
-/// Main reconciliation logic for a ClusterClaim.
+/// Main reconciliation logic for a ClusterLease.
 #[tracing::instrument(skip_all, fields(claim = %claim.name_any()))]
 async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
-    claim: Arc<ClusterClaim>,
-    ctx: Arc<ClaimContext<B>>,
-) -> Result<Action, ClaimError> {
+    claim: Arc<ClusterLease>,
+    ctx: Arc<LeaseContext<B>>,
+) -> Result<Action, LeaseError> {
     let name = claim.name_any();
     let ns = claim.namespace().unwrap_or_else(|| ctx.namespace.clone());
-    let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), &ns);
+    let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
 
     let status = claim.status.clone().unwrap_or_default();
     let phase = &status.phase;
 
     match phase {
-        ClaimPhase::Pending => {
-            info!(claim = %name, profile = %claim.spec.profile_ref, "Reconciling pending claim");
+        LeasePhase::Pending => {
+            info!(claim = %name, profile = %claim.spec.pool_ref, "Reconciling pending claim");
 
             let created_at = claim
                 .metadata
@@ -202,11 +202,11 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             let (is_head, position) = {
                 let mut queues = ctx.queues.write().await;
                 let queue = queues
-                    .entry(claim.spec.profile_ref.clone())
+                    .entry(claim.spec.pool_ref.clone())
                     .or_insert_with(Vec::new);
 
                 if !queue.iter().any(|p| p.claim_name == name) {
-                    queue.push(PendingClaim {
+                    queue.push(PendingLease {
                         claim_name: name.clone(),
                         priority: claim.spec.priority,
                         created_at,
@@ -233,7 +233,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     "queuePosition": position
                 }
             });
-            claims_api
+            leases_api
                 .patch_status(
                     &name,
                     &PatchParams::apply("kobe-operator"),
@@ -241,17 +241,17 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 )
                 .await?;
 
-            if let Some(profile) = get_profile(&ctx.client, &claim.spec.profile_ref, &ns).await {
+            if let Some(profile) = get_profile(&ctx.client, &claim.spec.pool_ref, &ns).await {
                 if let Some(scaling) = &profile.spec.scaling {
                     if let Some(timeout) = parse_duration(&scaling.queue_timeout) {
                         let age = chrono::Utc::now() - created_at;
                         if age > timeout {
                             warn!(claim = %name, "Claim exceeded queue timeout, expiring");
-                            remove_from_queue(&ctx.queues, &claim.spec.profile_ref, &name).await;
+                            remove_from_queue(&ctx.queues, &claim.spec.pool_ref, &name).await;
                             let patch = serde_json::json!({
                                 "status": { "phase": "Expired" }
                             });
-                            claims_api
+                            leases_api
                                 .patch_status(
                                     &name,
                                     &PatchParams::apply("kobe-operator"),
@@ -272,7 +272,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             let reserved_cluster = {
                 let mut pools = ctx.pools.write().await;
                 let pool = pools
-                    .entry(claim.spec.profile_ref.clone())
+                    .entry(claim.spec.pool_ref.clone())
                     .or_insert_with(|| PoolState {
                         clusters: std::collections::HashMap::new(),
                     });
@@ -304,8 +304,8 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     .policy_for_requester_type(&claim.spec.requester.requester_type)
                     .await;
                 let max_extensions = policy.map(|p| p.max_extensions).unwrap_or(2);
-                let new_status = ClusterClaimStatus {
-                    phase: ClaimPhase::Bound,
+                let new_status = ClusterLeaseStatus {
+                    phase: LeasePhase::Bound,
                     cluster_name: Some(cluster_name.clone()),
                     bound_at: Some(now.to_rfc3339()),
                     expires_at: Some(expires_at.to_rfc3339()),
@@ -316,7 +316,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 };
 
                 let patch = serde_json::json!({ "status": new_status });
-                match claims_api
+                match leases_api
                     .patch_status(
                         &name,
                         &PatchParams::apply("kobe-operator"),
@@ -325,16 +325,16 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     .await
                 {
                     Ok(_) => {
-                        remove_from_queue(&ctx.queues, &claim.spec.profile_ref, &name).await;
+                        remove_from_queue(&ctx.queues, &claim.spec.pool_ref, &name).await;
 
                         let bind_duration =
                             (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
                         crate::metrics::CLAIM_BIND_DURATION
-                            .with_label_values(&[&claim.spec.profile_ref])
+                            .with_label_values(&[&claim.spec.pool_ref])
                             .observe(bind_duration);
 
                         crate::metrics::CLAIMS_TOTAL
-                            .with_label_values(&[claim.spec.profile_ref.as_str(), "bound"])
+                            .with_label_values(&[claim.spec.pool_ref.as_str(), "bound"])
                             .inc();
 
                         info!(
@@ -350,19 +350,19 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     Err(e) => {
                         warn!(claim = %name, cluster = %cluster_name, "Bind patch failed, rolling back reservation");
                         let mut pools = ctx.pools.write().await;
-                        if let Some(pool) = pools.get_mut(&claim.spec.profile_ref) {
+                        if let Some(pool) = pools.get_mut(&claim.spec.pool_ref) {
                             if let Some(entry) = pool.clusters.get_mut(&cluster_name) {
                                 entry.state = ClusterState::Ready;
                                 entry.idle_since = Some(chrono::Utc::now());
                             }
                         }
-                        Err(ClaimError::Kube(e))
+                        Err(LeaseError::Kube(e))
                     }
                 }
             } else {
                 info!(
                     claim = %name,
-                    profile = %claim.spec.profile_ref,
+                    profile = %claim.spec.pool_ref,
                     priority = claim.spec.priority,
                     "No ready cluster, claim queued at position {position}"
                 );
@@ -371,19 +371,19 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             }
         }
 
-        ClaimPhase::Bound => {
+        LeasePhase::Bound => {
             if let Some(expires_at_str) = &status.expires_at {
                 match chrono::DateTime::parse_from_rfc3339(expires_at_str) {
                     Ok(expires_at) => {
                         if chrono::Utc::now() > expires_at.with_timezone(&chrono::Utc) {
                             crate::metrics::CLAIMS_TOTAL
-                                .with_label_values(&[claim.spec.profile_ref.as_str(), "expired"])
+                                .with_label_values(&[claim.spec.pool_ref.as_str(), "expired"])
                                 .inc();
                             info!(claim = %name, "Claim TTL expired");
                             let patch = serde_json::json!({
                                 "status": { "phase": "Expired" }
                             });
-                            claims_api
+                            leases_api
                                 .patch_status(
                                     &name,
                                     &PatchParams::apply("kobe-operator"),
@@ -402,7 +402,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                         let patch = serde_json::json!({
                             "status": { "phase": "Expired" }
                         });
-                        claims_api
+                        leases_api
                             .patch_status(
                                 &name,
                                 &PatchParams::apply("kobe-operator"),
@@ -417,15 +417,15 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             Ok(Action::requeue(std::time::Duration::from_secs(30)))
         }
 
-        ClaimPhase::Released | ClaimPhase::Expired => {
+        LeasePhase::Released | LeasePhase::Expired => {
             info!(claim = %name, phase = %phase, "Processing claim termination");
 
-            remove_from_queue(&ctx.queues, &claim.spec.profile_ref, &name).await;
+            remove_from_queue(&ctx.queues, &claim.spec.pool_ref, &name).await;
 
             let patch = serde_json::json!({
                 "status": { "phase": "Recycling" }
             });
-            claims_api
+            leases_api
                 .patch_status(
                     &name,
                     &PatchParams::apply("kobe-operator"),
@@ -434,7 +434,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 .await?;
 
             if let Some(cluster_name) = &status.cluster_name {
-                let profile = get_profile(&ctx.client, &claim.spec.profile_ref, &ns).await;
+                let profile = get_profile(&ctx.client, &claim.spec.pool_ref, &ns).await;
                 if let Some(ref profile) = profile {
                     if let Some(ref diag_config) = profile.spec.diagnostics {
                         if diag_config.enabled {
@@ -463,7 +463,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                                 let patch = serde_json::json!({
                                     "status": { "diagnosticsUrl": url }
                                 });
-                                if let Err(e) = claims_api
+                                if let Err(e) = leases_api
                                     .patch_status(
                                         &name,
                                         &PatchParams::apply("kobe-operator"),
@@ -484,7 +484,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
 
                 let c_name = cluster_name.clone();
                 let c_ns = ns.clone();
-                let profile_ref = claim.spec.profile_ref.clone();
+                let pool_ref = claim.spec.pool_ref.clone();
                 let pools = ctx.pools.clone();
                 let factory = ctx.factory.clone();
                 let profile_for_dispatch = profile.clone();
@@ -503,7 +503,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     };
                     match delete_result {
                         Ok(_) => {
-                            if let Some(pool) = pools.write().await.get_mut(&profile_ref) {
+                            if let Some(pool) = pools.write().await.get_mut(&pool_ref) {
                                 pool.clusters.remove(&c_name);
                             }
                         }
@@ -519,11 +519,11 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             Ok(Action::requeue(std::time::Duration::from_secs(10)))
         }
 
-        ClaimPhase::Recycling => {
+        LeasePhase::Recycling => {
             let cluster_gone = if let Some(cluster_name) = &status.cluster_name {
                 let pools = ctx.pools.read().await;
                 pools
-                    .get(&claim.spec.profile_ref)
+                    .get(&claim.spec.pool_ref)
                     .map(|p| !p.clusters.contains_key(cluster_name))
                     .unwrap_or(true)
             } else {
@@ -532,7 +532,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
 
             if cluster_gone {
                 info!(claim = %name, "Recycling complete, deleting claim CRD");
-                match claims_api.delete(&name, &Default::default()).await {
+                match leases_api.delete(&name, &Default::default()).await {
                     Ok(_) => {}
                     Err(kube::Error::Api(ae)) if ae.code == 404 => {
                         // Already deleted, that's fine
@@ -551,33 +551,33 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
 }
 
 /// Extend a claim's TTL.
-pub async fn extend_claim_ttl(
+pub async fn extend_lease_ttl(
     client: &Client,
     namespace: &str,
     claim_name: &str,
     extend_by: &str,
     authenticator: &JwtAuthenticator,
-) -> Result<String, ClaimError> {
-    let claims_api: Api<ClusterClaim> = Api::namespaced(client.clone(), namespace);
-    let claim = claims_api.get(claim_name).await?;
+) -> Result<String, LeaseError> {
+    let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let claim = leases_api.get(claim_name).await?;
     let status = claim.status.clone().unwrap_or_default();
 
-    if status.phase != ClaimPhase::Bound {
-        return Err(ClaimError::Lifecycle(anyhow::anyhow!(
+    if status.phase != LeasePhase::Bound {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
             "Cannot extend TTL: claim is not in Bound phase (current: {})",
             status.phase
         )));
     }
 
     if status.extensions_count >= status.max_extensions {
-        return Err(ClaimError::Lifecycle(anyhow::anyhow!(
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
             "Maximum extensions ({}) reached",
             status.max_extensions
         )));
     }
 
     let extension = parse_duration(extend_by)
-        .ok_or_else(|| ClaimError::Lifecycle(anyhow::anyhow!("Invalid duration: {extend_by}")))?;
+        .ok_or_else(|| LeaseError::Lifecycle(anyhow::anyhow!("Invalid duration: {extend_by}")))?;
 
     let current_expiry = status
         .expires_at
@@ -594,7 +594,7 @@ pub async fn extend_claim_ttl(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok_or_else(|| {
-            ClaimError::Lifecycle(anyhow::anyhow!("Claim has no valid bound_at timestamp"))
+            LeaseError::Lifecycle(anyhow::anyhow!("Claim has no valid bound_at timestamp"))
         })?;
 
     let policy = authenticator
@@ -603,7 +603,7 @@ pub async fn extend_claim_ttl(
     if let Some(policy) = &policy {
         let max_expiry = bound_at + policy.max_ttl;
         if new_expiry > max_expiry {
-            return Err(ClaimError::Lifecycle(anyhow::anyhow!(
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
                 "Extension would exceed maximum TTL ({}). Max expiry: {}",
                 crate::api::policy::format_duration(&policy.max_ttl),
                 max_expiry.to_rfc3339()
@@ -617,7 +617,7 @@ pub async fn extend_claim_ttl(
             "extensionsCount": status.extensions_count + 1
         }
     });
-    claims_api
+    leases_api
         .patch_status(
             claim_name,
             &PatchParams::apply("kobe-operator"),
@@ -626,7 +626,7 @@ pub async fn extend_claim_ttl(
         .await?;
 
     crate::metrics::CLAIMS_TOTAL
-        .with_label_values(&[claim.spec.profile_ref.as_str(), "extended"])
+        .with_label_values(&[claim.spec.pool_ref.as_str(), "extended"])
         .inc();
 
     info!(
@@ -641,7 +641,7 @@ pub async fn extend_claim_ttl(
 
 /// Background reaper that force-expires overdue Bound claims.
 async fn run_reaper<B: ClusterBackend>(
-    ctx: Arc<ClaimContext<B>>,
+    ctx: Arc<LeaseContext<B>>,
     namespace: &str,
     shutdown: CancellationToken,
 ) {
@@ -656,8 +656,8 @@ async fn run_reaper<B: ClusterBackend>(
             },
         }
 
-        let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), namespace);
-        let claims = match claims_api.list(&ListParams::default()).await {
+        let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+        let claims = match leases_api.list(&ListParams::default()).await {
             Ok(list) => list,
             Err(e) => {
                 error!("Reaper: failed to list claims: {e}");
@@ -671,7 +671,7 @@ async fn run_reaper<B: ClusterBackend>(
             let name = claim.name_any();
             let status = claim.status.clone().unwrap_or_default();
 
-            if status.phase != ClaimPhase::Bound {
+            if status.phase != LeasePhase::Bound {
                 continue;
             }
 
@@ -683,7 +683,7 @@ async fn run_reaper<B: ClusterBackend>(
                             let patch = serde_json::json!({
                                 "status": { "phase": "Expired" }
                             });
-                            if let Err(e) = claims_api
+                            if let Err(e) = leases_api
                                 .patch_status(
                                     &name,
                                     &PatchParams::apply("kobe-operator"),
@@ -707,7 +707,7 @@ async fn run_reaper<B: ClusterBackend>(
                         let patch = serde_json::json!({
                             "status": { "phase": "Expired" }
                         });
-                        if let Err(e) = claims_api
+                        if let Err(e) = leases_api
                             .patch_status(
                                 &name,
                                 &PatchParams::apply("kobe-operator"),
@@ -728,7 +728,7 @@ async fn run_reaper<B: ClusterBackend>(
 }
 
 async fn remove_from_queue(
-    queues: &RwLock<std::collections::HashMap<String, Vec<PendingClaim>>>,
+    queues: &RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
     profile: &str,
     claim_name: &str,
 ) {
@@ -738,8 +738,8 @@ async fn remove_from_queue(
     }
 }
 
-async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<ClusterPoolProfile> {
-    let profiles_api: Api<ClusterPoolProfile> = Api::namespaced(client.clone(), namespace);
+async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<ClusterPool> {
+    let profiles_api: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
     match profiles_api.get(name).await {
         Ok(profile) => Some(profile),
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -754,9 +754,9 @@ async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<Clu
 }
 
 fn error_policy<B: ClusterBackend>(
-    _claim: Arc<ClusterClaim>,
-    error: &ClaimError,
-    _ctx: Arc<ClaimContext<B>>,
+    _claim: Arc<ClusterLease>,
+    error: &LeaseError,
+    _ctx: Arc<LeaseContext<B>>,
 ) -> Action {
     error!("Claim reconciliation error: {error}");
     Action::requeue(std::time::Duration::from_secs(30))
@@ -774,8 +774,8 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Build a `ClaimContext<MockBackend>` wired to a local wiremock server.
-    async fn test_claim_context() -> (Arc<ClaimContext<MockBackend>>, MockServer) {
+    /// Build a `LeaseContext<MockBackend>` wired to a local wiremock server.
+    async fn test_claim_context() -> (Arc<LeaseContext<MockBackend>>, MockServer) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
@@ -783,7 +783,7 @@ mod tests {
         let pools = Arc::new(RwLock::new(HashMap::new()));
         let authenticator = Arc::new(JwtAuthenticator::new());
 
-        let ctx = Arc::new(ClaimContext {
+        let ctx = Arc::new(LeaseContext {
             client,
             backend,
             pools,
@@ -795,8 +795,8 @@ mod tests {
         (ctx, server)
     }
 
-    /// Build a `ClusterClaim` CRD object in the given phase.
-    fn make_test_claim(name: &str, phase: &str) -> Arc<ClusterClaim> {
+    /// Build a `ClusterLease` CRD object in the given phase.
+    fn make_test_claim(name: &str, phase: &str) -> Arc<ClusterLease> {
         let cluster_name: serde_json::Value =
             if phase == "Bound" || phase == "Released" || phase == "Recycling" {
                 serde_json::json!("pool-test-1")
@@ -814,13 +814,13 @@ mod tests {
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": {
                     "name": name,
                     "namespace": "test-ns"
                 },
                 "spec": {
-                    "profileRef": "test-profile",
+                    "poolRef": "test-profile",
                     "ttl": "1h",
                     "requester": { "type": "test:admin", "identity": "user@test.com" },
                     "priority": 50
@@ -838,17 +838,17 @@ mod tests {
         )
     }
 
-    /// Build a minimal `ClusterPoolProfile` JSON value for K8s API responses.
+    /// Build a minimal `ClusterPool` JSON value for K8s API responses.
     fn make_test_profile() -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "ClusterPoolProfile",
+            "kind": "ClusterPool",
             "metadata": {
                 "name": "test-profile",
                 "namespace": "test-ns"
             },
             "spec": {
-                "poolSize": 3,
+                "size": 3,
                 "ttl": "2h",
                 "cluster": {
                     "version": "v1.31.3+k3s1"
@@ -865,7 +865,7 @@ mod tests {
     async fn test_error_policy_returns_requeue() {
         let (ctx, _server) = test_claim_context().await;
         let claim = make_test_claim("err-claim", "Pending");
-        let error = ClaimError::Lifecycle(anyhow::anyhow!("test error"));
+        let error = LeaseError::Lifecycle(anyhow::anyhow!("test error"));
         let action = error_policy(claim, &error, ctx);
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
     }
@@ -882,12 +882,12 @@ mod tests {
             q.insert(
                 "test-profile".to_string(),
                 vec![
-                    PendingClaim {
+                    PendingLease {
                         claim_name: "claim-a".to_string(),
                         priority: 100,
                         created_at: chrono::Utc::now(),
                     },
-                    PendingClaim {
+                    PendingLease {
                         claim_name: "claim-b".to_string(),
                         priority: 50,
                         created_at: chrono::Utc::now(),
@@ -924,13 +924,13 @@ mod tests {
         // Mock the status PATCH that the reconciler issues to update queue position.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/pending-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/pending-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "pending-1", "namespace": "test-ns" },
-                "spec": { "profileRef": "test-profile", "ttl": "1h",
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Pending", "queuePosition": 1 }
             })))
@@ -940,11 +940,11 @@ mod tests {
         // Mock GET for profile (return 404 — no profile, so no queue timeout logic).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
             ))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
-                    "clusterpoolprofiles",
+                    "clusterpools",
                     "test-profile",
                 )),
             )
@@ -985,13 +985,13 @@ mod tests {
         // Mock PATCH for queue-position status update.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/bind-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "bind-1", "namespace": "test-ns" },
-                "spec": { "profileRef": "test-profile", "ttl": "1h",
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Bound", "clusterName": "pool-test-1" }
             })))
@@ -1001,11 +1001,11 @@ mod tests {
         // Mock GET for profile (404 — no profile, no queue timeout).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
             ))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
-                    "clusterpoolprofiles",
+                    "clusterpools",
                     "test-profile",
                 )),
             )
@@ -1048,13 +1048,13 @@ mod tests {
 
         // Build a Bound claim with expires_at in the past.
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
-        let claim: Arc<ClusterClaim> = Arc::new(
+        let claim: Arc<ClusterLease> = Arc::new(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "expired-1", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "test-profile",
+                    "poolRef": "test-profile",
                     "ttl": "1h",
                     "requester": { "type": "test:admin", "identity": "u" },
                     "priority": 50
@@ -1073,13 +1073,13 @@ mod tests {
         // Mock PATCH for status update to Expired.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/expired-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/expired-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "expired-1", "namespace": "test-ns" },
-                "spec": { "profileRef": "test-profile", "ttl": "1h",
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Expired" }
             })))
@@ -1119,13 +1119,13 @@ mod tests {
         // Mock PATCH for status update to Recycling.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/released-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/released-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "released-1", "namespace": "test-ns" },
-                "spec": { "profileRef": "test-profile", "ttl": "1h",
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Recycling", "clusterName": "pool-test-1" }
             })))
@@ -1135,7 +1135,7 @@ mod tests {
         // Mock GET for profile (for diagnostics check — return profile with no diagnostics).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/test-profile",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(make_test_profile()))
             .mount(&server)
@@ -1167,13 +1167,13 @@ mod tests {
         // Mock DELETE for the claim CRD.
         Mock::given(method("DELETE"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/recycling-1",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/recycling-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "recycling-1", "namespace": "test-ns" },
-                "spec": { "profileRef": "test-profile", "ttl": "1h",
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Recycling" }
             })))
@@ -1216,11 +1216,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extend_claim_ttl: success
+    // extend_lease_ttl: success
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_extend_claim_ttl_success() {
+    async fn test_extend_lease_ttl_success() {
         let (ctx, server) = test_claim_context().await;
 
         let future_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -1229,14 +1229,14 @@ mod tests {
         // Mock GET for the claim.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/extend-1",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/extend-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "extend-1", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "test-profile",
+                    "poolRef": "test-profile",
                     "ttl": "1h",
                     "requester": { "type": "test:admin", "identity": "u" },
                     "priority": 50
@@ -1256,13 +1256,13 @@ mod tests {
         // Mock PATCH for extending the TTL.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/extend-1/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/extend-1/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "extend-1", "namespace": "test-ns" },
-                "spec": { "profileRef": "test-profile", "ttl": "1h",
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": {
                     "phase": "Bound",
@@ -1272,7 +1272,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = extend_claim_ttl(
+        let result = extend_lease_ttl(
             &ctx.client,
             "test-ns",
             "extend-1",
@@ -1287,24 +1287,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extend_claim_ttl: wrong phase
+    // extend_lease_ttl: wrong phase
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_extend_claim_ttl_wrong_phase() {
+    async fn test_extend_lease_ttl_wrong_phase() {
         let (ctx, server) = test_claim_context().await;
 
         // Mock GET returning a claim in Pending phase.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/pending-ext",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/pending-ext",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "pending-ext", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "test-profile",
+                    "poolRef": "test-profile",
                     "ttl": "1h",
                     "requester": { "type": "test:admin", "identity": "u" },
                     "priority": 50
@@ -1318,7 +1318,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = extend_claim_ttl(
+        let result = extend_lease_ttl(
             &ctx.client,
             "test-ns",
             "pending-ext",
@@ -1335,11 +1335,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extend_claim_ttl: max extensions reached
+    // extend_lease_ttl: max extensions reached
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_extend_claim_ttl_max_extensions_reached() {
+    async fn test_extend_lease_ttl_max_extensions_reached() {
         let (ctx, server) = test_claim_context().await;
 
         let future_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -1347,14 +1347,14 @@ mod tests {
         // Mock GET returning a Bound claim with extensions_count == max_extensions.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims/maxext-1",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/maxext-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterClaim",
+                "kind": "ClusterLease",
                 "metadata": { "name": "maxext-1", "namespace": "test-ns" },
                 "spec": {
-                    "profileRef": "test-profile",
+                    "poolRef": "test-profile",
                     "ttl": "1h",
                     "requester": { "type": "test:admin", "identity": "u" },
                     "priority": 50
@@ -1370,7 +1370,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = extend_claim_ttl(
+        let result = extend_lease_ttl(
             &ctx.client,
             "test-ns",
             "maxext-1",

@@ -1,4 +1,4 @@
-//! Direct k0s backend -- manages k0s clusters via StatefulSets, without external operators.
+//! K0s backend — manages k0s clusters via StatefulSets, without external operators.
 //!
 //! Instead of relying on any third-party operator, this backend directly creates
 //! the Kubernetes resources needed to run k0s:
@@ -65,7 +65,7 @@ sleep infinity
 
 /// Direct k0s backend -- manages k0s clusters via raw Kubernetes resources.
 #[derive(Clone)]
-pub struct DirectK0sBackend {
+pub struct K0sBackend {
     /// Kubernetes client for the host cluster.
     client: Client,
     /// Optional PostgreSQL connection pool for shared datastore.
@@ -74,7 +74,7 @@ pub struct DirectK0sBackend {
     pg_base_url: Option<String>,
 }
 
-impl DirectK0sBackend {
+impl K0sBackend {
     pub fn new(client: Client, pg_pool: Option<PgPool>, pg_base_url: Option<String>) -> Self {
         Self {
             client,
@@ -627,10 +627,7 @@ spec:
 
     /// Wait for the kubeconfig Secret to appear (created by the sidecar).
     async fn wait_ready(&self, name: &str, namespace: &str) -> Result<()> {
-        debug!(
-            cluster = name,
-            "Waiting for direct-k0s cluster to become ready"
-        );
+        debug!(cluster = name, "Waiting for k0s cluster to become ready");
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-kubeconfig");
@@ -642,7 +639,7 @@ spec:
                     info!(
                         cluster = name,
                         attempts = attempt + 1,
-                        "direct-k0s cluster kubeconfig secret found"
+                        "k0s cluster kubeconfig secret found"
                     );
                     return Ok(());
                 }
@@ -651,20 +648,18 @@ spec:
                         debug!(
                             cluster = name,
                             attempt = attempt + 1,
-                            "Waiting for direct-k0s cluster kubeconfig..."
+                            "Waiting for k0s cluster kubeconfig..."
                         );
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    return Err(e).context(format!(
-                        "Error checking direct-k0s cluster {name} readiness"
-                    ));
+                    return Err(e).context(format!("Error checking k0s cluster {name} readiness"));
                 }
             }
         }
 
-        anyhow::bail!("direct-k0s cluster {name} not ready after 10 minutes");
+        anyhow::bail!("k0s cluster {name} not ready after 10 minutes");
     }
 
     /// Delete a resource, ignoring 404 (already deleted).
@@ -687,7 +682,7 @@ spec:
     }
 }
 
-impl ClusterBackend for DirectK0sBackend {
+impl ClusterBackend for K0sBackend {
     #[tracing::instrument(skip(self, config, addons), fields(cluster = name, namespace))]
     async fn create(
         &self,
@@ -696,7 +691,7 @@ impl ClusterBackend for DirectK0sBackend {
         config: &ClusterConfig,
         addons: &[Addon],
     ) -> Result<()> {
-        info!(cluster = name, "Creating direct-k0s cluster");
+        info!(cluster = name, "Creating k0s cluster");
 
         // 1. Create token secret
         self.create_token_secret(name, namespace).await?;
@@ -773,13 +768,13 @@ impl ClusterBackend for DirectK0sBackend {
             self.apply_addon(name, namespace, addon).await?;
         }
 
-        info!(cluster = name, "direct-k0s cluster fully ready with addons");
+        info!(cluster = name, "k0s cluster fully ready with addons");
         Ok(())
     }
 
     #[tracing::instrument(skip(self), fields(cluster = name, namespace))]
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
-        info!(cluster = name, "Deleting direct-k0s cluster");
+        info!(cluster = name, "Deleting k0s cluster");
 
         // Delete agent Deployment
         let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
@@ -812,7 +807,7 @@ impl ClusterBackend for DirectK0sBackend {
             }
         }
 
-        info!(cluster = name, "direct-k0s cluster deleted");
+        info!(cluster = name, "k0s cluster deleted");
         Ok(())
     }
 
@@ -822,10 +817,7 @@ impl ClusterBackend for DirectK0sBackend {
     }
 
     async fn extract_kubeconfig(&self, name: &str, namespace: &str) -> Result<String> {
-        info!(
-            cluster = name,
-            "Extracting kubeconfig from direct-k0s secret"
-        );
+        info!(cluster = name, "Extracting kubeconfig from k0s secret");
         read_kubeconfig_secret(&self.client, name, namespace).await
     }
 
@@ -877,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_no_pg() {
-        let yaml = DirectK0sBackend::build_k0s_config_yaml(None, &[]);
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &[]);
         assert!(
             yaml.contains("type: etcd"),
             "Should use etcd when no PG: {yaml}"
@@ -893,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_with_pg() {
-        let yaml = DirectK0sBackend::build_k0s_config_yaml(
+        let yaml = K0sBackend::build_k0s_config_yaml(
             Some("postgres://user:pass@pg:5432/k0s_my_cluster"),
             &[],
         );
@@ -910,8 +902,7 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_with_extra_args() {
-        let yaml =
-            DirectK0sBackend::build_k0s_config_yaml(None, &["--tls-san=example.com".to_string()]);
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &["--tls-san=example.com".to_string()]);
         assert!(
             yaml.contains("tls-san: \"example.com\""),
             "Should include extra args: {yaml}"
@@ -921,8 +912,7 @@ mod tests {
     #[test]
     fn test_build_server_statefulset_uses_k0s_image() {
         let config = base_config();
-        let sts =
-            DirectK0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
 
         let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         let server = &pod_spec.containers[0];
@@ -942,8 +932,7 @@ mod tests {
     #[test]
     fn test_build_server_statefulset_mounts_config() {
         let config = base_config();
-        let sts =
-            DirectK0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
 
         let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
 
@@ -968,8 +957,7 @@ mod tests {
     #[test]
     fn test_build_server_statefulset_basic() {
         let config = base_config();
-        let sts =
-            DirectK0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
 
         assert_eq!(sts.metadata.name.as_deref(), Some("test-cluster-server"));
         assert_eq!(sts.metadata.namespace.as_deref(), Some("test-ns"));
@@ -984,7 +972,7 @@ mod tests {
     #[test]
     fn test_build_service() {
         let config = base_config();
-        let svc = DirectK0sBackend::build_service("my-cluster", "ns", &config);
+        let svc = K0sBackend::build_service("my-cluster", "ns", &config);
 
         assert_eq!(svc.metadata.name.as_deref(), Some("my-cluster-server"));
         let spec = svc.spec.as_ref().unwrap();
@@ -1001,7 +989,7 @@ mod tests {
             node_port: Some(31234),
         });
 
-        let svc = DirectK0sBackend::build_service("np-cluster", "ns", &config);
+        let svc = K0sBackend::build_service("np-cluster", "ns", &config);
         let spec = svc.spec.as_ref().unwrap();
         assert_eq!(spec.type_.as_deref(), Some("NodePort"));
         assert_eq!(spec.ports.as_ref().unwrap()[0].node_port, Some(31234));
@@ -1009,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_cluster_labels() {
-        let labels = DirectK0sBackend::cluster_labels("my-cluster");
+        let labels = K0sBackend::cluster_labels("my-cluster");
         assert_eq!(
             labels.get("kobe.kunobi.ninja/cluster").unwrap(),
             "my-cluster"
@@ -1022,21 +1010,21 @@ mod tests {
 
     #[test]
     fn test_server_labels_include_role() {
-        let labels = DirectK0sBackend::server_labels("c1");
+        let labels = K0sBackend::server_labels("c1");
         assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "server");
         assert!(labels.contains_key("kobe.kunobi.ninja/cluster"));
     }
 
     #[test]
     fn test_agent_labels_include_role() {
-        let labels = DirectK0sBackend::agent_labels("c1");
+        let labels = K0sBackend::agent_labels("c1");
         assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "agent");
     }
 
     #[test]
     fn test_build_agent_deployment() {
         let config = base_config();
-        let deploy = DirectK0sBackend::build_agent_deployment("my-cluster", "ns", &config, 3);
+        let deploy = K0sBackend::build_agent_deployment("my-cluster", "ns", &config, 3);
 
         assert_eq!(deploy.metadata.name.as_deref(), Some("my-cluster-agent"));
         let spec = deploy.spec.as_ref().unwrap();
@@ -1054,11 +1042,8 @@ mod tests {
 
     #[test]
     fn test_publisher_sidecar_has_correct_env() {
-        let sidecar = DirectK0sBackend::build_publisher_sidecar(
-            "my-cluster",
-            "ns",
-            "k0sproject/k0s:v1.30.1+k0s.0",
-        );
+        let sidecar =
+            K0sBackend::build_publisher_sidecar("my-cluster", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
         let env = sidecar.env.as_ref().unwrap();
         assert!(env
             .iter()
@@ -1071,7 +1056,7 @@ mod tests {
     #[test]
     fn test_publisher_sidecar_mounts() {
         let sidecar =
-            DirectK0sBackend::build_publisher_sidecar("c", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
+            K0sBackend::build_publisher_sidecar("c", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
         let mounts = sidecar.volume_mounts.as_ref().unwrap();
         assert!(mounts.iter().any(|m| m.name == "k0s-data"));
         assert!(mounts.iter().any(|m| m.name == "publisher-script"));
@@ -1086,7 +1071,7 @@ mod tests {
             storage_request_size: Some("10Gi".to_string()),
         });
 
-        let sts = DirectK0sBackend::build_server_statefulset("p-cluster", "ns", &config, None);
+        let sts = K0sBackend::build_server_statefulset("p-cluster", "ns", &config, None);
 
         let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         let volumes = pod_spec.volumes.as_ref().unwrap();
@@ -1096,7 +1081,7 @@ mod tests {
     #[test]
     fn test_build_k0s_config_configmap() {
         let yaml = "apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n";
-        let cm = DirectK0sBackend::build_k0s_config_configmap("test-cl", "test-ns", yaml);
+        let cm = K0sBackend::build_k0s_config_configmap("test-cl", "test-ns", yaml);
 
         assert_eq!(cm.metadata.name.as_deref(), Some("test-cl-k0s-config"));
         assert_eq!(cm.metadata.namespace.as_deref(), Some("test-ns"));
@@ -1154,7 +1139,7 @@ mod tests {
     async fn test_create_cluster_basic() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = DirectK0sBackend::new(client, None, None);
+        let backend = K0sBackend::new(client, None, None);
 
         // Mock: PATCH token secret (server-side apply)
         Mock::given(method("PATCH"))
@@ -1233,7 +1218,7 @@ mod tests {
     async fn test_delete_cluster_basic() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = DirectK0sBackend::new(client, None, None);
+        let backend = K0sBackend::new(client, None, None);
 
         // Mock: DELETE agent deployment (404 -- doesn't exist, that's fine)
         Mock::given(method("DELETE"))
@@ -1311,7 +1296,7 @@ mod tests {
     async fn test_check_health_not_ready() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = DirectK0sBackend::new(client, None, None);
+        let backend = K0sBackend::new(client, None, None);
 
         Mock::given(method("GET"))
             .and(path(

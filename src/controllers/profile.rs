@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
-    BackendType, ClaimPhase, ClusterClaim, ClusterPoolProfile, ClusterPoolProfileStatus,
-    ReadinessGate, SnapshotRefreshTrigger,
+    BackendType, ClusterLease, ClusterPool, ClusterPoolStatus, LeasePhase, ReadinessGate,
+    SnapshotRefreshTrigger,
 };
 use crate::pool::{
     compute_pool_actions, count_states, ClusterEntry, ClusterState, PoolAction, PoolState,
@@ -56,8 +56,8 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
     factory: Option<BackendFactory>,
     shutdown: CancellationToken,
 ) {
-    let profiles: Api<ClusterPoolProfile> = Api::namespaced(client.clone(), namespace);
-    let claims: Api<ClusterClaim> = Api::namespaced(client.clone(), namespace);
+    let profiles: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
 
     let ctx = Arc::new(ProfileContext {
         client: client.clone(),
@@ -80,7 +80,7 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
     info!("Starting profile controller");
 
     let controller = Controller::new(profiles, Config::default())
-        .owns(claims, Config::default())
+        .owns(leases, Config::default())
         .run(reconcile_profile, error_policy, ctx)
         .for_each(|result| async move {
             match result {
@@ -107,7 +107,7 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
     }
 }
 
-/// Main reconciliation logic for a ClusterPoolProfile.
+/// Main reconciliation logic for a ClusterPool.
 ///
 /// 1. Build current pool state from cluster observations
 /// 2. Evaluate readiness gates for Creating clusters
@@ -116,7 +116,7 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
 /// 5. Update profile status
 #[tracing::instrument(skip_all, fields(profile = %profile.name_any()))]
 async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
-    profile: Arc<ClusterPoolProfile>,
+    profile: Arc<ClusterPool>,
     ctx: Arc<ProfileContext<B>>,
 ) -> Result<Action, ProfileError> {
     let name = profile.name_any();
@@ -154,9 +154,11 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         f.backend_for(&profile)?
                     } else {
                         // Fallback: in tests, wrap the clone in a no-op dispatch.
-                        crate::backend::BackendDispatch::DirectK3s(
-                            crate::backend::DirectK3sBackend::new(ctx.client.clone(), None, None),
-                        )
+                        crate::backend::BackendDispatch::K3s(crate::backend::K3sBackend::new(
+                            ctx.client.clone(),
+                            None,
+                            None,
+                        ))
                     };
                     let client = ctx.client.clone();
                     let ns = ns.clone();
@@ -186,7 +188,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                                     .inc();
 
                                 // Patch profile status with new golden backup info.
-                                let profiles_api: Api<ClusterPoolProfile> =
+                                let profiles_api: Api<ClusterPool> =
                                     Api::namespaced(client.clone(), &ns);
                                 let status_patch = serde_json::json!({
                                     "status": {
@@ -288,11 +290,13 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
                 tokio::spawn(async move {
                     // Determine whether to restore from golden backup or create fresh.
-                    // DirectK3s uses PG template databases for golden images,
-                    // so Velero restore only applies to non-DirectK3s backends.
-                    let is_direct_k3s =
-                        matches!(profile_for_dispatch.spec.backend, BackendType::DirectK3s);
-                    let use_restore = if !is_direct_k3s {
+                    // K3s uses PG template databases for golden images,
+                    // so Velero restore only applies to non-K3s backends.
+                    let is_k3s = matches!(
+                        profile_for_dispatch.spec.backend.backend_type,
+                        BackendType::K3s
+                    );
+                    let use_restore = if !is_k3s {
                         if let (Some(ref velero), Some(ref snapshot)) = (&velero, &snapshot) {
                             if snapshot.enabled {
                                 match velero
@@ -377,8 +381,8 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
                             // If snapshot is enabled but no golden backup exists yet,
                             // trigger golden backup creation in the background.
-                            // (DirectK3s uses PG templates instead of Velero snapshots.)
-                            if !is_direct_k3s {
+                            // (K3s uses PG templates instead of Velero snapshots.)
+                            if !is_k3s {
                                 if let (Some(ref velero), Some(ref snapshot)) = (&velero, &snapshot)
                                 {
                                     if snapshot.enabled {
@@ -421,7 +425,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
                                                     // Patch profile status so subsequent reconciles
                                                     // know the golden backup exists and skip rebuilding.
-                                                    let profiles_api: Api<ClusterPoolProfile> =
+                                                    let profiles_api: Api<ClusterPool> =
                                                         Api::namespaced(client, &status_ns);
                                                     let status_patch = serde_json::json!({
                                                         "status": {
@@ -461,7 +465,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                                         });
                                     }
                                 }
-                            } // if !is_direct_k3s
+                            } // if !is_k3s
                         }
                         create_result
                     };
@@ -539,20 +543,20 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
     let counts = count_states(&pool_state);
 
     let queue_depth = {
-        let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), &ns);
+        let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
         let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={name}"));
-        match claims_api.list(&lp).await {
-            Ok(claims) => claims
+        match leases_api.list(&lp).await {
+            Ok(leases) => leases
                 .iter()
                 .filter(|c| {
                     c.status
                         .as_ref()
-                        .map(|s| s.phase == ClaimPhase::Pending)
+                        .map(|s| s.phase == LeasePhase::Pending)
                         .unwrap_or(true)
                 })
                 .count() as u32,
             Err(e) => {
-                warn!(profile = %name, "Failed to list claims for queue depth: {e:?}");
+                warn!(profile = %name, "Failed to list leases for queue depth: {e:?}");
                 0
             }
         }
@@ -562,7 +566,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
         .with_label_values(&[&name])
         .set(queue_depth as i64);
 
-    let profiles_api: Api<ClusterPoolProfile> = Api::namespaced(ctx.client.clone(), &ns);
+    let profiles_api: Api<ClusterPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     // Preserve existing golden backup/generation status values so they are
     // not overwritten with None on every reconcile loop.
@@ -577,7 +581,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
         .as_ref()
         .and_then(|s| s.golden_template_db.clone());
 
-    let status = ClusterPoolProfileStatus {
+    let status = ClusterPoolStatus {
         ready: counts.ready,
         claimed: counts.claimed,
         creating: counts.creating,
@@ -603,7 +607,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 /// Build pool state by observing actual K8s resources.
 ///
 /// On first call (empty cache), scans StatefulSets matching the profile
-/// naming pattern and cross-references with active ClusterClaim resources.
+/// naming pattern and cross-references with active ClusterLease resources.
 /// On subsequent calls, returns the cached state which the controllers
 /// keep up-to-date incrementally.
 async fn build_pool_state<B: ClusterBackend>(
@@ -624,16 +628,16 @@ async fn build_pool_state<B: ClusterBackend>(
     let ns = &ctx.namespace;
     let mut clusters = HashMap::new();
 
-    // List all bound claims for this profile once
+    // List all bound leases for this profile once
     let claimed_clusters = {
-        let claims_api: Api<ClusterClaim> = Api::namespaced(ctx.client.clone(), ns);
+        let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), ns);
         let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={profile_name}"));
-        match claims_api.list(&lp).await {
-            Ok(claims) => claims
+        match leases_api.list(&lp).await {
+            Ok(leases) => leases
                 .iter()
                 .filter_map(|c| {
                     let status = c.status.clone().unwrap_or_default();
-                    if matches!(status.phase, ClaimPhase::Bound) {
+                    if matches!(status.phase, LeasePhase::Bound) {
                         status.cluster_name
                     } else {
                         None
@@ -643,7 +647,7 @@ async fn build_pool_state<B: ClusterBackend>(
             Err(e) => {
                 warn!(
                     profile = profile_name,
-                    "Failed to list claims during pool rebuild: {e}, using empty set"
+                    "Failed to list leases during pool rebuild: {e}, using empty set"
                 );
                 std::collections::HashSet::new()
             }
@@ -808,7 +812,7 @@ async fn run_health_checks<B: ClusterBackend>(
         }
 
         let pools = ctx.pools.read().await.clone();
-        let profiles_api: Api<ClusterPoolProfile> = Api::namespaced(ctx.client.clone(), namespace);
+        let profiles_api: Api<ClusterPool> = Api::namespaced(ctx.client.clone(), namespace);
 
         for (profile_name, pool_state) in &pools {
             let (check_interval_secs, threshold) = match profiles_api.get(profile_name).await {
@@ -909,7 +913,7 @@ async fn run_health_checks<B: ClusterBackend>(
 
 /// Error policy: requeue with backoff on failure.
 fn error_policy<B: ClusterBackend>(
-    _profile: Arc<ClusterPoolProfile>,
+    _profile: Arc<ClusterPool>,
     error: &ProfileError,
     _ctx: Arc<ProfileContext<B>>,
 ) -> Action {
@@ -950,12 +954,12 @@ mod tests {
         (ctx, server)
     }
 
-    /// Build a `ClusterPoolProfile` CRD object for testing.
-    fn make_test_profile(name: &str, min_size: u32, max_size: u32) -> Arc<ClusterPoolProfile> {
+    /// Build a `ClusterPool` CRD object for testing.
+    fn make_test_profile(name: &str, min_size: u32, max_size: u32) -> Arc<ClusterPool> {
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterPoolProfile",
+                "kind": "ClusterPool",
                 "metadata": {
                     "name": name,
                     "namespace": "test-ns",
@@ -976,18 +980,18 @@ mod tests {
         )
     }
 
-    /// Build a minimal `ClusterPoolProfile` JSON value for K8s API responses.
+    /// Build a minimal `ClusterPool` JSON value for K8s API responses.
     fn profile_response_json(name: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "ClusterPoolProfile",
+            "kind": "ClusterPool",
             "metadata": {
                 "name": name,
                 "namespace": "test-ns",
                 "generation": 1
             },
             "spec": {
-                "poolSize": 3,
+                "size": 3,
                 "ttl": "2h",
                 "cluster": {
                     "version": "v1.28.0"
@@ -1197,7 +1201,7 @@ mod tests {
         // Mock LIST claims: return empty list.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
             ))
             .and(query_param(
                 "labelSelector",
@@ -1290,7 +1294,7 @@ mod tests {
         // Mock LIST claims for build_pool_state (building pool state).
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
             ))
             .and(query_param(
                 "labelSelector",
@@ -1305,7 +1309,7 @@ mod tests {
         // Mock PATCH profile status.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/scale-up/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/scale-up/status",
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(profile_response_json("scale-up")),
@@ -1321,7 +1325,7 @@ mod tests {
         // Give spawned create tasks time to run.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Backend.create should have been called (pool_size=3 default, MAX_BURST=2).
+        // Backend.create should have been called (size=3 default, MAX_BURST=2).
         let calls = ctx.backend.call_count();
         assert!(calls.create > 0, "Expected at least one create call");
 
@@ -1344,9 +1348,9 @@ mod tests {
 
         let profile = make_test_profile("at-cap", 2, 5);
 
-        // Pre-populate pool state with 2 Ready clusters (matching pool_size default of 3,
-        // but the profile uses default pool_size since minSize/maxSize are not spec fields).
-        // With default pool_size=3, 2 Ready and 0 Creating is below target, so we need 3.
+        // Pre-populate pool state with 2 Ready clusters (matching size default of 3,
+        // but the profile uses default size since minSize/maxSize are not spec fields).
+        // With default size=3, 2 Ready and 0 Creating is below target, so we need 3.
         // Let's put 3 Ready clusters.
         {
             let mut pools = ctx.pools.write().await;
@@ -1369,7 +1373,7 @@ mod tests {
         // Mock LIST claims for queue_depth calculation in reconcile.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
             ))
             .and(query_param(
                 "labelSelector",
@@ -1384,7 +1388,7 @@ mod tests {
         // Mock PATCH profile status.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/at-cap/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/at-cap/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(profile_response_json("at-cap")))
             .mount(&server)
@@ -1470,7 +1474,7 @@ mod tests {
         // Mock LIST claims: 1 pending claim.
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterclaims",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
             ))
             .and(query_param(
                 "labelSelector",
@@ -1479,10 +1483,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![serde_json::json!({
                     "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                    "kind": "ClusterClaim",
+                    "kind": "ClusterLease",
                     "metadata": { "name": "pending-claim-1", "namespace": "test-ns" },
                     "spec": {
-                        "profileRef": "status-test",
+                        "poolRef": "status-test",
                         "ttl": "1h",
                         "requester": { "type": "test:ci", "identity": "u" },
                         "priority": 50
@@ -1497,7 +1501,7 @@ mod tests {
         // We set up the mock to just return success with the profile JSON.
         Mock::given(method("PATCH"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpoolprofiles/status-test/status",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/status-test/status",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json({
                 let mut resp = profile_response_json("status-test");

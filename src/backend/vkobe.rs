@@ -1,13 +1,13 @@
-//! KobeSync backend — manages kobe-sync virtual clusters.
+//! Vkobe backend — manages vkobe virtual clusters.
 //!
-//! This backend creates lightweight virtual clusters using the kobe-sync
+//! This backend creates lightweight virtual clusters using the vkobe
 //! runtime. Each virtual cluster runs as a 3-container Deployment
-//! (kube-apiserver + kube-controller-manager + kobe-sync) in its own
-//! namespace, backed by an external etcd DataStore.
+//! (kube-apiserver + kube-controller-manager + vkobe) in its own
+//! namespace, backed by an external etcd KobeStore.
 //!
-//! Unlike the direct-k3s/k0s backends, kobe-sync doesn't run a full
+//! Unlike the k3s/k0s backends, vkobe doesn't run a full
 //! Kubernetes distribution — it runs a minimal kube-apiserver + KCM and
-//! uses kobe-sync to synchronise resources to the host cluster.
+//! uses vkobe to synchronise resources to the host cluster.
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
@@ -26,7 +26,7 @@ use kube::Client;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, ClusterConfig, DataStoreRef, KobeSyncConfig, ReadinessGate};
+use crate::crd::{Addon, ClusterConfig, KobeStoreRef, ReadinessGate, VkobeConfig};
 use crate::pki;
 
 use super::{
@@ -37,16 +37,16 @@ use super::{
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kobe-operator";
 
-/// Default kobe-sync container image.
-const DEFAULT_IMAGE: &str = "zondax/kobe-sync:latest";
+/// Default vkobe container image.
+const DEFAULT_IMAGE: &str = "zondax/vkobe:latest";
 
-/// KobeSync backend — manages kobe-sync virtual clusters.
+/// Vkobe backend — manages vkobe virtual clusters.
 #[derive(Clone)]
-pub struct KobeSyncBackend {
+pub struct VkobeBackend {
     client: Client,
 }
 
-impl KobeSyncBackend {
+impl VkobeBackend {
     pub fn new(client: Client) -> Self {
         Self { client }
     }
@@ -67,16 +67,16 @@ impl KobeSyncBackend {
         );
         labels.insert(
             "app.kubernetes.io/component".to_string(),
-            "kobe-sync".to_string(),
+            "vkobe".to_string(),
         );
         labels
     }
 
-    /// Build the API Service for the kobe-sync proxy.
+    /// Build the API Service for the vkobe proxy.
     fn build_service(
         name: &str,
         namespace: &str,
-        kobe_sync_config: Option<&KobeSyncConfig>,
+        kobe_sync_config: Option<&VkobeConfig>,
     ) -> Service {
         let proxy_port = kobe_sync_config.map(|c| c.proxy_port).unwrap_or(8443);
 
@@ -103,7 +103,7 @@ impl KobeSyncBackend {
         }
     }
 
-    /// Build a kubeconfig YAML for connecting to the kobe-sync virtual cluster.
+    /// Build a kubeconfig YAML for connecting to the vkobe virtual cluster.
     async fn build_kubeconfig(&self, name: &str, namespace: &str) -> Result<String> {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-certs");
@@ -213,7 +213,7 @@ users:
     }
 }
 
-impl ClusterBackend for KobeSyncBackend {
+impl ClusterBackend for VkobeBackend {
     async fn create(
         &self,
         name: &str,
@@ -221,36 +221,32 @@ impl ClusterBackend for KobeSyncBackend {
         config: &ClusterConfig,
         addons: &[Addon],
     ) -> Result<()> {
-        info!(
-            cluster = name,
-            namespace, "Creating kobe-sync virtual cluster"
-        );
+        info!(cluster = name, namespace, "Creating vkobe virtual cluster");
 
         // The namespace should already exist (Kobe creates it).
         // We need to find the kobe_sync config from server_args or default.
-        let kobe_sync_config =
-            parse_kobe_sync_args(&config.server_args).unwrap_or(KobeSyncConfig {
-                data_store_ref: DataStoreRef {
-                    name: "default".into(),
-                },
-                version: crate::crd::default_k8s_version(),
-                kcm: None,
-                syncers: vec![
-                    "pods".into(),
-                    "services".into(),
-                    "configmaps".into(),
-                    "secrets".into(),
-                    "endpoints".into(),
-                    "ingresses".into(),
-                ],
-                proxy_port: 8443,
-                metrics_port: 9090,
-            });
+        let kobe_sync_config = parse_kobe_sync_args(&config.server_args).unwrap_or(VkobeConfig {
+            data_store_ref: KobeStoreRef {
+                name: "default".into(),
+            },
+            version: crate::crd::default_k8s_version(),
+            kcm: None,
+            syncers: vec![
+                "pods".into(),
+                "services".into(),
+                "configmaps".into(),
+                "secrets".into(),
+                "endpoints".into(),
+                "ingresses".into(),
+            ],
+            proxy_port: 8443,
+            metrics_port: 9090,
+        });
 
         let kobe_sync_image =
             std::env::var("KOBE_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
 
-        // TODO: resolve DataStore CRD to get actual etcd endpoints.
+        // TODO: resolve KobeStore CRD to get actual etcd endpoints.
         let etcd_endpoints = "https://etcd-0:2379";
 
         // 1. Create ConfigMap (v2 — includes etcd connection info)
@@ -323,7 +319,7 @@ impl ClusterBackend for KobeSyncBackend {
 
         info!(cluster = name, "PKI secret created before Deployment");
 
-        // 4. Create RBAC resources for kobe-sync sidecar
+        // 4. Create RBAC resources for vkobe sidecar
         let (sa, role, rb, cr, crb) = build_rbac(name, namespace);
 
         // ServiceAccount
@@ -376,9 +372,9 @@ impl ClusterBackend for KobeSyncBackend {
             Err(e) => return Err(e).context("Failed to create ClusterRoleBinding"),
         }
 
-        info!(cluster = name, "RBAC resources created for kobe-sync");
+        info!(cluster = name, "RBAC resources created for vkobe");
 
-        // 5. Create Deployment (v2 -- 3-container pod: apiserver + KCM + kobe-sync)
+        // 5. Create Deployment (v2 -- 3-container pod: apiserver + KCM + vkobe)
         let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
         let dep = build_deployment(name, namespace, &kobe_sync_config, &kobe_sync_image);
         match deployments.create(&PostParams::default(), &dep).await {
@@ -408,19 +404,16 @@ impl ClusterBackend for KobeSyncBackend {
             }
         }
 
-        info!(cluster = name, "kobe-sync virtual cluster ready");
+        info!(cluster = name, "vkobe virtual cluster ready");
         Ok(())
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
-        info!(
-            cluster = name,
-            namespace, "Deleting kobe-sync virtual cluster"
-        );
+        info!(cluster = name, namespace, "Deleting vkobe virtual cluster");
 
         // Delete Deployment
         let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-        let dep_name = format!("{name}-kobe-sync");
+        let dep_name = format!("{name}-vkobe");
         match dep_api.delete(&dep_name, &DeleteParams::default()).await {
             Ok(_) => debug!(cluster = name, "Deployment deleted"),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -471,8 +464,8 @@ impl ClusterBackend for KobeSyncBackend {
         }
 
         // Delete RBAC — cluster-scoped first, then namespaced
-        let rbac_name = format!("{name}-kobe-sync");
-        let cluster_role_name = format!("{name}-kobe-sync-nodes");
+        let rbac_name = format!("{name}-vkobe");
+        let cluster_role_name = format!("{name}-vkobe-nodes");
 
         // ClusterRoleBinding (cluster-scoped)
         let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
@@ -530,7 +523,7 @@ impl ClusterBackend for KobeSyncBackend {
             Err(e) => warn!(cluster = name, error = %e, "Failed to delete ServiceAccount"),
         }
 
-        info!(cluster = name, "kobe-sync virtual cluster deleted");
+        info!(cluster = name, "vkobe virtual cluster deleted");
         Ok(())
     }
 
@@ -558,11 +551,11 @@ impl ClusterBackend for KobeSyncBackend {
     }
 }
 
-/// Parse kobe-sync specific config from server_args.
+/// Parse vkobe specific config from server_args.
 ///
 /// server_args may contain `--syncers=pods,services,...` which we parse
-/// into a KobeSyncConfig.
-fn parse_kobe_sync_args(server_args: &[String]) -> Option<KobeSyncConfig> {
+/// into a VkobeConfig.
+fn parse_kobe_sync_args(server_args: &[String]) -> Option<VkobeConfig> {
     let mut syncers = None;
 
     for arg in server_args {
@@ -572,11 +565,11 @@ fn parse_kobe_sync_args(server_args: &[String]) -> Option<KobeSyncConfig> {
     }
 
     // parse_kobe_sync_args is a legacy helper for v1 server_args.
-    // In v2, KobeSyncConfig comes from the pool profile's kobe_sync field
+    // In v2, VkobeConfig comes from the pool's backend.vkobe field
     // which includes data_store_ref. This path is only used as a fallback
     // and the data_store_ref will be overridden by the profile config.
-    syncers.map(|s| KobeSyncConfig {
-        data_store_ref: crate::crd::DataStoreRef {
+    syncers.map(|s| VkobeConfig {
+        data_store_ref: crate::crd::KobeStoreRef {
             name: "unset".into(),
         },
         version: crate::crd::default_k8s_version(),
@@ -624,9 +617,9 @@ fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-// ── RBAC for kobe-sync sidecar ─────────────────────────────────────────
+// ── RBAC for vkobe sidecar ─────────────────────────────────────────
 
-/// Build RBAC resources for the kobe-sync sidecar.
+/// Build RBAC resources for the vkobe sidecar.
 ///
 /// Returns (ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding).
 ///
@@ -644,8 +637,8 @@ fn build_rbac(
     ClusterRole,
     ClusterRoleBinding,
 ) {
-    let sa_name = format!("{name}-kobe-sync");
-    let labels = KobeSyncBackend::cluster_labels(name);
+    let sa_name = format!("{name}-vkobe");
+    let labels = VkobeBackend::cluster_labels(name);
 
     // ServiceAccount
     let sa = ServiceAccount {
@@ -734,7 +727,7 @@ fn build_rbac(
     };
 
     // ClusterRole — cluster-scoped node read/watch for fake node syncer
-    let cluster_role_name = format!("{name}-kobe-sync-nodes");
+    let cluster_role_name = format!("{name}-vkobe-nodes");
     let cluster_role = ClusterRole {
         metadata: ObjectMeta {
             name: Some(cluster_role_name.clone()),
@@ -773,16 +766,16 @@ fn build_rbac(
     (sa, role, role_binding, cluster_role, cluster_role_binding)
 }
 
-// ── v2: 3-container Deployment (kube-apiserver + KCM + kobe-sync) ──────
+// ── v2: 3-container Deployment (kube-apiserver + KCM + vkobe) ──────
 
 /// Build the ConfigMap with etcd connection info for the virtual cluster.
 ///
-/// Includes the DataStore endpoints so the kube-apiserver can connect to
+/// Includes the KobeStore endpoints so the kube-apiserver can connect to
 /// the external etcd.
 pub fn build_config_map_v2(
     name: &str,
     namespace: &str,
-    kobe_sync_config: &KobeSyncConfig,
+    kobe_sync_config: &VkobeConfig,
     etcd_endpoints: &str,
 ) -> ConfigMap {
     let config_data = serde_json::json!({
@@ -804,7 +797,7 @@ pub fn build_config_map_v2(
     );
     labels.insert(
         "app.kubernetes.io/component".to_string(),
-        "kobe-sync".to_string(),
+        "vkobe".to_string(),
     );
 
     ConfigMap {
@@ -823,30 +816,30 @@ pub fn build_config_map_v2(
     }
 }
 
-/// Build the Deployment with 3 containers: kube-apiserver, kube-controller-manager, and kobe-sync.
+/// Build the Deployment with 3 containers: kube-apiserver, kube-controller-manager, and vkobe.
 ///
 /// The Deployment is stateless — all
-/// persistent state lives in the external DataStore (etcd). PKI material is
+/// persistent state lives in the external KobeStore (etcd). PKI material is
 /// mounted from Kubernetes Secrets.
 ///
 /// # Arguments
 ///
 /// * `name` — Virtual cluster name (used for etcd prefix, labels, Secret references).
 /// * `namespace` — Namespace to deploy into.
-/// * `kobe_sync_config` — Configuration from the pool profile's `kobeSync` field.
-/// * `kobe_sync_image` — Container image for the kobe-sync sidecar.
+/// * `kobe_sync_config` — Configuration from the pool's `backend.vkobe` field.
+/// * `kobe_sync_image` — Container image for the vkobe sidecar.
 pub fn build_deployment(
     name: &str,
     namespace: &str,
-    kobe_sync_config: &KobeSyncConfig,
+    kobe_sync_config: &VkobeConfig,
     kobe_sync_image: &str,
 ) -> Deployment {
     let version = &kobe_sync_config.version;
     let proxy_port = kobe_sync_config.proxy_port;
     let metrics_port = kobe_sync_config.metrics_port;
 
-    // Derive etcd endpoints from the DataStore ref. In production, the
-    // reconciler resolves the DataStore CRD and passes the endpoints.
+    // Derive etcd endpoints from the KobeStore ref. In production, the
+    // reconciler resolves the KobeStore CRD and passes the endpoints.
     // For the build function, we use a placeholder that gets overridden.
     let etcd_endpoints = "https://etcd-0:2379";
 
@@ -858,7 +851,7 @@ pub fn build_deployment(
     );
     labels.insert(
         "app.kubernetes.io/component".to_string(),
-        "kobe-sync".to_string(),
+        "vkobe".to_string(),
     );
 
     // ── Container 1: kube-apiserver ──────────────────────────────────
@@ -938,9 +931,9 @@ pub fn build_deployment(
         ..Default::default()
     };
 
-    // ── Container 3: kobe-sync ──────────────────────────────────────
+    // ── Container 3: vkobe ──────────────────────────────────────
     let kobe_sync = Container {
-        name: "kobe-sync".to_string(),
+        name: "vkobe".to_string(),
         image: Some(kobe_sync_image.to_string()),
         env: Some(vec![
             EnvVar {
@@ -1017,7 +1010,7 @@ pub fn build_deployment(
     // ── Assemble the Deployment ──────────────────────────────────────
     Deployment {
         metadata: ObjectMeta {
-            name: Some(format!("{name}-kobe-sync")),
+            name: Some(format!("{name}-vkobe")),
             namespace: Some(namespace.to_string()),
             labels: Some(labels.clone()),
             ..Default::default()
@@ -1041,7 +1034,7 @@ pub fn build_deployment(
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
-                    service_account_name: Some(format!("{name}-kobe-sync")),
+                    service_account_name: Some(format!("{name}-vkobe")),
                     containers: vec![apiserver, kcm, kobe_sync],
                     volumes: Some(volumes),
                     ..Default::default()
@@ -1059,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_cluster_labels() {
-        let labels = KobeSyncBackend::cluster_labels("my-cluster");
+        let labels = VkobeBackend::cluster_labels("my-cluster");
         assert_eq!(
             labels.get("kobe.kunobi.ninja/cluster"),
             Some(&"my-cluster".to_string())
@@ -1070,7 +1063,7 @@ mod tests {
         );
         assert_eq!(
             labels.get("app.kubernetes.io/component"),
-            Some(&"kobe-sync".to_string())
+            Some(&"vkobe".to_string())
         );
     }
 
@@ -1104,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_build_service() {
-        let svc = KobeSyncBackend::build_service("test-cluster", "test-ns", None);
+        let svc = VkobeBackend::build_service("test-cluster", "test-ns", None);
         assert_eq!(svc.metadata.name.as_deref(), Some("test-cluster-api"));
         let ports = svc.spec.unwrap().ports.unwrap();
         assert_eq!(ports[0].port, 443);
@@ -1112,10 +1105,10 @@ mod tests {
 
     // ── v2 Deployment tests ─────────────────────────────────────────
 
-    /// Helper: build a KobeSyncConfig for v2 tests.
-    fn test_kobe_sync_config() -> KobeSyncConfig {
-        KobeSyncConfig {
-            data_store_ref: DataStoreRef {
+    /// Helper: build a VkobeConfig for v2 tests.
+    fn test_kobe_sync_config() -> VkobeConfig {
+        VkobeConfig {
+            data_store_ref: KobeStoreRef {
                 name: "dev-store".into(),
             },
             version: "1.32".into(),
@@ -1143,7 +1136,7 @@ mod tests {
         let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"kube-apiserver"));
         assert!(names.contains(&"kube-controller-manager"));
-        assert!(names.contains(&"kobe-sync"));
+        assert!(names.contains(&"vkobe"));
     }
 
     #[test]
@@ -1280,20 +1273,17 @@ mod tests {
     fn test_build_rbac_creates_correct_names() {
         let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns");
 
-        assert_eq!(sa.metadata.name.as_deref(), Some("test-cluster-kobe-sync"));
+        assert_eq!(sa.metadata.name.as_deref(), Some("test-cluster-vkobe"));
         assert_eq!(sa.metadata.namespace.as_deref(), Some("test-ns"));
-        assert_eq!(
-            role.metadata.name.as_deref(),
-            Some("test-cluster-kobe-sync")
-        );
-        assert_eq!(rb.metadata.name.as_deref(), Some("test-cluster-kobe-sync"));
+        assert_eq!(role.metadata.name.as_deref(), Some("test-cluster-vkobe"));
+        assert_eq!(rb.metadata.name.as_deref(), Some("test-cluster-vkobe"));
         assert_eq!(
             cr.metadata.name.as_deref(),
-            Some("test-cluster-kobe-sync-nodes")
+            Some("test-cluster-vkobe-nodes")
         );
         assert_eq!(
             crb.metadata.name.as_deref(),
-            Some("test-cluster-kobe-sync-nodes")
+            Some("test-cluster-vkobe-nodes")
         );
     }
 
@@ -1418,7 +1408,7 @@ mod tests {
     #[test]
     fn test_rbac_resources_have_correct_labels() {
         let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns");
-        let expected_labels = KobeSyncBackend::cluster_labels("test-cluster");
+        let expected_labels = VkobeBackend::cluster_labels("test-cluster");
 
         assert_eq!(sa.metadata.labels.as_ref().unwrap(), &expected_labels);
         assert_eq!(role.metadata.labels.as_ref().unwrap(), &expected_labels);
@@ -1432,12 +1422,12 @@ mod tests {
         let (_, _, rb, ..) = build_rbac("test-cluster", "test-ns");
 
         assert_eq!(rb.role_ref.kind, "Role");
-        assert_eq!(rb.role_ref.name, "test-cluster-kobe-sync");
+        assert_eq!(rb.role_ref.name, "test-cluster-vkobe");
         assert_eq!(rb.role_ref.api_group, "rbac.authorization.k8s.io");
 
         let subject = &rb.subjects.as_ref().unwrap()[0];
         assert_eq!(subject.kind, "ServiceAccount");
-        assert_eq!(subject.name, "test-cluster-kobe-sync");
+        assert_eq!(subject.name, "test-cluster-vkobe");
         assert_eq!(subject.namespace.as_deref(), Some("test-ns"));
     }
 
@@ -1446,12 +1436,12 @@ mod tests {
         let (.., crb) = build_rbac("test-cluster", "test-ns");
 
         assert_eq!(crb.role_ref.kind, "ClusterRole");
-        assert_eq!(crb.role_ref.name, "test-cluster-kobe-sync-nodes");
+        assert_eq!(crb.role_ref.name, "test-cluster-vkobe-nodes");
         assert_eq!(crb.role_ref.api_group, "rbac.authorization.k8s.io");
 
         let subject = &crb.subjects.as_ref().unwrap()[0];
         assert_eq!(subject.kind, "ServiceAccount");
-        assert_eq!(subject.name, "test-cluster-kobe-sync");
+        assert_eq!(subject.name, "test-cluster-vkobe");
         assert_eq!(subject.namespace.as_deref(), Some("test-ns"));
     }
 }

@@ -1,10 +1,10 @@
-pub mod auth_policy;
+pub mod access_policy;
 pub mod claim;
 #[allow(dead_code)]
 pub mod datastore;
 pub mod profile;
 
-pub use auth_policy::*;
+pub use access_policy::*;
 pub use claim::*;
 #[allow(unused_imports)]
 pub use datastore::*;
@@ -27,7 +27,7 @@ mod tests {
     #[test]
     fn test_deserialize_profile_spec_with_snapshot() {
         let json = serde_json::json!({
-            "poolSize": 5,
+            "size": 5,
             "ttl": "1h",
             "cluster": {
                 "version": "v1.31.3+k3s1"
@@ -42,7 +42,7 @@ mod tests {
             }
         });
 
-        let spec: ClusterPoolProfileSpec = serde_json::from_value(json).unwrap();
+        let spec: ClusterPoolSpec = serde_json::from_value(json).unwrap();
         let snap = spec.snapshot.expect("snapshot should be Some");
 
         assert!(snap.enabled);
@@ -57,16 +57,16 @@ mod tests {
     #[test]
     fn test_deserialize_profile_spec_without_snapshot() {
         let json = serde_json::json!({
-            "poolSize": 3,
+            "size": 3,
             "ttl": "2h",
             "cluster": {
                 "version": "v1.31.3+k3s1"
             }
         });
 
-        let spec: ClusterPoolProfileSpec = serde_json::from_value(json).unwrap();
+        let spec: ClusterPoolSpec = serde_json::from_value(json).unwrap();
         assert!(spec.snapshot.is_none());
-        assert_eq!(spec.pool_size, 3);
+        assert_eq!(spec.size, 3);
     }
 
     /// Test that SnapshotConfig defaults are applied correctly.
@@ -90,7 +90,7 @@ mod tests {
     /// Test that status golden tracking fields default correctly.
     #[test]
     fn test_status_golden_fields_default() {
-        let status = ClusterPoolProfileStatus::default();
+        let status = ClusterPoolStatus::default();
         assert!(status.golden_backup.is_none());
         assert!(status.golden_generation.is_none());
     }
@@ -108,7 +108,7 @@ mod tests {
             "goldenGeneration": 7
         });
 
-        let status: ClusterPoolProfileStatus = serde_json::from_value(json).unwrap();
+        let status: ClusterPoolStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status.golden_backup.as_deref(), Some("golden-myprofile-3"));
         assert_eq!(status.golden_generation, Some(7));
     }
@@ -120,11 +120,11 @@ mod tests {
         assert!(matches!(trigger, SnapshotRefreshTrigger::ProfileChange));
     }
 
-    /// Deserialize a ClusterClaimSpec from JSON and verify all fields round-trip.
+    /// Deserialize a ClusterLeaseSpec from JSON and verify all fields round-trip.
     #[test]
     fn test_claim_spec_roundtrip() {
         let json = serde_json::json!({
-            "profileRef": "e2e-basic",
+            "poolRef": "e2e-basic",
             "ttl": "1h",
             "requester": {
                 "type": "github-actions:ci",
@@ -133,8 +133,8 @@ mod tests {
             "priority": 80
         });
 
-        let spec: ClusterClaimSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.profile_ref, "e2e-basic");
+        let spec: ClusterLeaseSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.pool_ref, "e2e-basic");
         assert_eq!(spec.ttl, "1h");
         assert_eq!(spec.requester.requester_type, "github-actions:ci");
         assert_eq!(spec.requester.identity, "repo:org/repo:ref:refs/heads/main");
@@ -142,17 +142,17 @@ mod tests {
 
         // Serialize back and verify round-trip
         let serialized = serde_json::to_value(&spec).unwrap();
-        let deserialized: ClusterClaimSpec = serde_json::from_value(serialized).unwrap();
-        assert_eq!(deserialized.profile_ref, spec.profile_ref);
+        let deserialized: ClusterLeaseSpec = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.pool_ref, spec.pool_ref);
         assert_eq!(deserialized.ttl, spec.ttl);
         assert_eq!(deserialized.priority, spec.priority);
     }
 
-    /// ClusterClaimStatus::default() should produce Pending phase, zero counts, and None options.
+    /// ClusterLeaseStatus::default() should produce Pending phase, zero counts, and None options.
     #[test]
     fn test_claim_status_defaults() {
-        let status = ClusterClaimStatus::default();
-        assert_eq!(status.phase, ClaimPhase::Pending);
+        let status = ClusterLeaseStatus::default();
+        assert_eq!(status.phase, LeasePhase::Pending);
         assert!(status.cluster_name.is_none());
         assert!(status.bound_at.is_none());
         assert!(status.expires_at.is_none());
@@ -162,142 +162,120 @@ mod tests {
         assert_eq!(status.max_extensions, 0);
     }
 
-    /// Display impl for ClaimPhase should produce the expected string for each variant.
+    /// Display impl for LeasePhase should produce the expected string for each variant.
     #[test]
     fn test_claim_phase_display() {
-        assert_eq!(ClaimPhase::Pending.to_string(), "Pending");
-        assert_eq!(ClaimPhase::Bound.to_string(), "Bound");
-        assert_eq!(ClaimPhase::Released.to_string(), "Released");
-        assert_eq!(ClaimPhase::Expired.to_string(), "Expired");
-        assert_eq!(ClaimPhase::Recycling.to_string(), "Recycling");
+        assert_eq!(LeasePhase::Pending.to_string(), "Pending");
+        assert_eq!(LeasePhase::Bound.to_string(), "Bound");
+        assert_eq!(LeasePhase::Released.to_string(), "Released");
+        assert_eq!(LeasePhase::Expired.to_string(), "Expired");
+        assert_eq!(LeasePhase::Recycling.to_string(), "Recycling");
     }
 
-    /// Deserialize an AuthPolicySpec from a full JSON payload including
-    /// issuer, audience, role extraction, and policies.
+    /// Deserialize an AccessPolicySpec from a full JSON payload including
+    /// auth method, identity, and rules.
     #[test]
-    fn test_auth_policy_spec_roundtrip() {
+    fn test_access_policy_spec_roundtrip() {
         let json = serde_json::json!({
-            "name": "github-actions",
-            "issuer": "https://token.actions.githubusercontent.com",
-            "audience": ["kunobi"],
-            "authorizedParties": [],
-            "algorithms": ["RS256"],
-            "identityTemplate": "repo:{repository}:ref:{ref}",
-            "roleExtraction": {
-                "method": "static",
-                "role": "ci"
+            "auth": {
+                "oidc": {
+                    "issuer": "https://token.actions.githubusercontent.com",
+                    "audience": ["kunobi"],
+                    "authorizedParties": [],
+                    "algorithms": ["RS256"]
+                }
             },
-            "policies": {
-                "ci": {
-                    "allowedProfiles": ["e2e-*"],
+            "identity": "repo:{repository}:ref:{ref}",
+            "rules": [
+                {
+                    "pools": ["e2e-*"],
                     "maxTtl": "1h",
-                    "maxConcurrentClaims": 5,
-                    "defaultPriority": 50,
+                    "maxConcurrentLeases": 5,
                     "maxExtensions": 1
                 }
-            }
+            ]
         });
 
-        let spec: AuthPolicySpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.name, "github-actions");
-        assert_eq!(spec.issuer, "https://token.actions.githubusercontent.com");
-        assert_eq!(spec.audience, vec!["kunobi"]);
-        assert!(spec.authorized_parties.is_empty());
-        assert_eq!(spec.algorithms, vec!["RS256"]);
-        assert_eq!(spec.identity_template, "repo:{repository}:ref:{ref}");
+        let spec: AccessPolicySpec = serde_json::from_value(json).unwrap();
+        let oidc = spec.auth.oidc.as_ref().expect("oidc should be Some");
+        assert_eq!(oidc.issuer, "https://token.actions.githubusercontent.com");
+        assert_eq!(oidc.audience, vec!["kunobi"]);
+        assert!(oidc.authorized_parties.is_empty());
+        assert_eq!(oidc.algorithms, vec!["RS256"]);
+        assert_eq!(spec.identity, "repo:{repository}:ref:{ref}");
 
-        // Verify role extraction
-        assert!(matches!(
-            spec.role_extraction,
-            RoleExtractionConfig::Static { ref role } if role == "ci"
-        ));
-
-        // Verify policy
-        let ci_policy = spec.policies.get("ci").expect("ci policy should exist");
-        assert_eq!(ci_policy.allowed_profiles, vec!["e2e-*"]);
-        assert_eq!(ci_policy.max_ttl, "1h");
-        assert_eq!(ci_policy.max_concurrent_claims, 5);
-        assert_eq!(ci_policy.default_priority, 50);
-        assert_eq!(ci_policy.max_extensions, 1);
+        // Verify rule
+        assert_eq!(spec.rules.len(), 1);
+        let rule = &spec.rules[0];
+        assert_eq!(rule.pools, vec!["e2e-*"]);
+        assert_eq!(rule.max_ttl, "1h");
+        assert_eq!(rule.max_concurrent_leases, 5);
+        assert_eq!(rule.max_extensions, 1);
 
         // Serialize back and verify round-trip
         let serialized = serde_json::to_value(&spec).unwrap();
-        let deserialized: AuthPolicySpec = serde_json::from_value(serialized).unwrap();
-        assert_eq!(deserialized.name, spec.name);
-        assert_eq!(deserialized.issuer, spec.issuer);
+        let deserialized: AccessPolicySpec = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.identity, spec.identity);
+        assert_eq!(deserialized.rules.len(), spec.rules.len());
     }
 
-    /// Test deserialization of all four RoleExtractionConfig variants.
+    /// Test AccessPolicy with match clauses for multi-role OIDC.
     #[test]
-    fn test_auth_policy_role_extraction_variants() {
-        // Static variant
-        let json = serde_json::json!({"method": "static", "role": "ci"});
-        let config: RoleExtractionConfig = serde_json::from_value(json).unwrap();
-        assert!(matches!(config, RoleExtractionConfig::Static { ref role } if role == "ci"));
-
-        // Claim variant
+    fn test_access_policy_with_match_clauses() {
         let json = serde_json::json!({
-            "method": "claim",
-            "claim": "private_metadata.role",
-            "default": "viewer"
-        });
-        let config: RoleExtractionConfig = serde_json::from_value(json).unwrap();
-        assert!(matches!(
-            config,
-            RoleExtractionConfig::Claim { ref claim, ref default }
-                if claim == "private_metadata.role" && default.as_deref() == Some("viewer")
-        ));
-
-        // Mapping variant
-        let json = serde_json::json!({
-            "method": "mapping",
-            "claim": "org_role",
-            "values": {"org:admin": "admin", "org:member": "user"},
-            "default": "guest"
-        });
-        let config: RoleExtractionConfig = serde_json::from_value(json).unwrap();
-        match &config {
-            RoleExtractionConfig::Mapping {
-                claim,
-                values,
-                default,
-            } => {
-                assert_eq!(claim, "org_role");
-                assert_eq!(values.get("org:admin").unwrap(), "admin");
-                assert_eq!(values.get("org:member").unwrap(), "user");
-                assert_eq!(default.as_deref(), Some("guest"));
-            }
-            _ => panic!("Expected Mapping variant"),
-        }
-
-        // Conditional variant
-        let json = serde_json::json!({
-            "method": "conditional",
+            "auth": {
+                "oidc": {
+                    "issuer": "https://clerk.example.com",
+                    "audience": ["kunobi"]
+                }
+            },
+            "identity": "{sub}",
             "rules": [
-                {"claim": "org_role", "value": "org:admin", "role": "admin"},
-                {"claim": "org_role", "value": "org:member", "role": "user"}
-            ],
-            "default": "viewer"
+                {
+                    "match": { "claim": "org_role", "value": "org:admin" },
+                    "pools": ["*"],
+                    "maxTtl": "8h",
+                    "maxConcurrentLeases": 10,
+                    "maxExtensions": 5
+                },
+                {
+                    "match": { "claim": "org_role", "value": "org:member" },
+                    "pools": ["dev-*"],
+                    "maxTtl": "2h",
+                    "maxConcurrentLeases": 3,
+                    "maxExtensions": 1
+                }
+            ]
         });
-        let config: RoleExtractionConfig = serde_json::from_value(json).unwrap();
-        match &config {
-            RoleExtractionConfig::Conditional { rules, default } => {
-                assert_eq!(rules.len(), 2);
-                assert_eq!(rules[0].claim, "org_role");
-                assert_eq!(rules[0].value, "org:admin");
-                assert_eq!(rules[0].role, "admin");
-                assert_eq!(rules[1].role, "user");
-                assert_eq!(default.as_deref(), Some("viewer"));
-            }
-            _ => panic!("Expected Conditional variant"),
-        }
+
+        let spec: AccessPolicySpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.rules.len(), 2);
+
+        let admin_rule = &spec.rules[0];
+        let m = admin_rule
+            .match_clause
+            .as_ref()
+            .expect("match should exist");
+        assert_eq!(m.claim, "org_role");
+        assert_eq!(m.value, "org:admin");
+        assert_eq!(admin_rule.pools, vec!["*"]);
+        assert_eq!(admin_rule.max_concurrent_leases, 10);
+
+        let member_rule = &spec.rules[1];
+        let m = member_rule
+            .match_clause
+            .as_ref()
+            .expect("match should exist");
+        assert_eq!(m.claim, "org_role");
+        assert_eq!(m.value, "org:member");
+        assert_eq!(member_rule.pools, vec!["dev-*"]);
     }
 
     #[test]
-    fn test_backend_type_direct_k0s_deserialize() {
-        let json = r#""direct-k0s""#;
+    fn test_backend_type_k0s_deserialize() {
+        let json = r#""k0s""#;
         let bt: BackendType = serde_json::from_str(json).unwrap();
-        assert_eq!(bt, BackendType::DirectK0s);
+        assert_eq!(bt, BackendType::K0s);
     }
 
     #[test]
@@ -331,49 +309,46 @@ mod tests {
         assert!(cfg.infrastructure_plural.is_none());
     }
 
-    /// Test default functions used by AuthPolicySpec and PolicySpec.
+    /// Test default functions used by AccessPolicySpec and AccessRule.
     #[test]
-    fn test_auth_policy_defaults() {
+    fn test_access_policy_defaults() {
         // Minimal JSON to test defaults
         let json = serde_json::json!({
-            "name": "test-provider",
-            "issuer": "https://example.com",
-            "roleExtraction": {
-                "method": "static",
-                "role": "default"
+            "auth": {
+                "oidc": {
+                    "issuer": "https://example.com"
+                }
             },
-            "policies": {}
+            "rules": [{
+                "pools": ["*"],
+                "maxTtl": "2h",
+                "maxConcurrentLeases": 3
+            }]
         });
 
-        let spec: AuthPolicySpec = serde_json::from_value(json).unwrap();
+        let spec: AccessPolicySpec = serde_json::from_value(json).unwrap();
+        let oidc = spec.auth.oidc.as_ref().expect("oidc should be Some");
 
         // algorithms defaults to ["RS256"]
-        assert_eq!(spec.algorithms, vec!["RS256"]);
+        assert_eq!(oidc.algorithms, vec!["RS256"]);
 
-        // identity_template defaults to "{sub}"
-        assert_eq!(spec.identity_template, "{sub}");
+        // identity defaults to "{sub}"
+        assert_eq!(spec.identity, "{sub}");
 
         // audience defaults to empty vec
-        assert!(spec.audience.is_empty());
+        assert!(oidc.audience.is_empty());
 
-        // Verify policy defaults via a minimal policy
-        let policy_json = serde_json::json!({
-            "allowedProfiles": ["*"],
-            "maxTtl": "2h",
-            "maxConcurrentClaims": 3
-        });
-        let policy: PolicySpec = serde_json::from_value(policy_json).unwrap();
-
-        // default_priority defaults to 50
-        assert_eq!(policy.default_priority, 50);
+        // Verify rule defaults
+        assert_eq!(spec.rules.len(), 1);
+        let rule = &spec.rules[0];
 
         // max_extensions defaults to 2
-        assert_eq!(policy.max_extensions, 2);
+        assert_eq!(rule.max_extensions, 2);
     }
 
-    // ── DataStore CRD tests ──────────────────────────────────────────
+    // ── KobeStore CRD tests ──────────────────────────────────────────
 
-    /// Deserialize an etcd DataStore with TLS and capacity.
+    /// Deserialize an etcd KobeStore with TLS and capacity.
     #[test]
     fn test_deserialize_etcd_datastore() {
         let json = serde_json::json!({
@@ -392,8 +367,8 @@ mod tests {
             "replicas": 3
         });
 
-        let spec: DataStoreSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.driver, DataStoreDriver::Etcd);
+        let spec: KobeStoreSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.driver, KobeStoreDriver::Etcd);
         assert_eq!(spec.endpoints.len(), 3);
         assert_eq!(spec.endpoints[0], "https://etcd-0.etcd:2379");
 
@@ -404,7 +379,7 @@ mod tests {
         assert_eq!(spec.replicas, Some(3));
     }
 
-    /// Deserialize a kine-sqlite DataStore without TLS.
+    /// Deserialize a kine-sqlite KobeStore without TLS.
     #[test]
     fn test_deserialize_kine_sqlite_datastore() {
         let json = serde_json::json!({
@@ -415,26 +390,26 @@ mod tests {
             }
         });
 
-        let spec: DataStoreSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.driver, DataStoreDriver::KineSqlite);
+        let spec: KobeStoreSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.driver, KobeStoreDriver::KineSqlite);
         assert_eq!(spec.endpoints, vec!["unix:///data/kine.sock"]);
         assert!(spec.tls.is_none());
         assert_eq!(spec.capacity.max_clusters, 10);
         assert!(spec.replicas.is_none());
     }
 
-    /// DataStoreStatus serialization with usedBy list.
+    /// KobeStoreStatus serialization with usedBy list.
     #[test]
     fn test_datastore_status_serialization() {
-        let status = DataStoreStatus {
+        let status = KobeStoreStatus {
             ready: true,
             current_clusters: 2,
             used_by: vec![
-                DataStoreUser {
+                KobeStoreUser {
                     namespace: "team-a".into(),
                     name: "vc-001".into(),
                 },
-                DataStoreUser {
+                KobeStoreUser {
                     namespace: "team-b".into(),
                     name: "vc-042".into(),
                 },
@@ -450,24 +425,24 @@ mod tests {
         assert_eq!(json["usedBy"][1]["name"], "vc-042");
 
         // Round-trip
-        let deserialized: DataStoreStatus = serde_json::from_value(json).unwrap();
+        let deserialized: KobeStoreStatus = serde_json::from_value(json).unwrap();
         assert!(deserialized.ready);
         assert_eq!(deserialized.current_clusters, 2);
         assert_eq!(deserialized.used_by.len(), 2);
         assert_eq!(
             deserialized.used_by[0],
-            DataStoreUser {
+            KobeStoreUser {
                 namespace: "team-a".into(),
                 name: "vc-001".into()
             }
         );
     }
 
-    // ── KobeSyncConfig v2 tests ─────────────────────────────────────
+    // ── VkobeConfig tests ────────────────────────────────────────
 
-    /// Deserialize a KobeSyncConfig with the new dataStoreRef, version, and kcm fields.
+    /// Deserialize a VkobeConfig with dataStoreRef, version, and kcm fields.
     #[test]
-    fn test_deserialize_kobe_sync_v2_config() {
+    fn test_deserialize_vkobe_config() {
         let json = serde_json::json!({
             "dataStoreRef": {
                 "name": "shared-etcd"
@@ -481,7 +456,7 @@ mod tests {
             "metricsPort": 9090
         });
 
-        let config: KobeSyncConfig = serde_json::from_value(json).unwrap();
+        let config: VkobeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.data_store_ref.name, "shared-etcd");
         assert_eq!(config.version, "1.31");
 
@@ -496,20 +471,20 @@ mod tests {
         assert_eq!(config.metrics_port, 9090);
     }
 
-    /// KobeSyncConfig with defaults: version defaults to "1.32", kcm is None.
+    /// VkobeConfig with defaults: version defaults to "1.32", kcm is None.
     #[test]
-    fn test_kobe_sync_config_defaults() {
+    fn test_vkobe_config_defaults() {
         let json = serde_json::json!({
             "dataStoreRef": {
                 "name": "my-store"
             }
         });
 
-        let config: KobeSyncConfig = serde_json::from_value(json).unwrap();
+        let config: VkobeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.data_store_ref.name, "my-store");
         assert_eq!(config.version, "1.32");
         assert!(config.kcm.is_none());
-        assert_eq!(config.syncers, default_kobe_sync_syncers());
+        assert_eq!(config.syncers, default_vkobe_syncers());
         assert_eq!(config.proxy_port, 8443);
         assert_eq!(config.metrics_port, 9090);
     }

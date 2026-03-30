@@ -1,8 +1,8 @@
 pub mod capi;
 pub mod datastore;
-pub mod direct_k0s;
-pub mod direct_k3s;
-pub mod kobe_sync;
+pub mod k0s;
+pub mod k3s;
+pub mod vkobe;
 
 use std::net::{IpAddr, ToSocketAddrs};
 
@@ -12,12 +12,12 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, BackendType, ClusterConfig, ClusterPoolProfile, ReadinessGate};
+use crate::crd::{Addon, BackendType, ClusterConfig, ClusterPool, ReadinessGate};
 
 pub use capi::CapiBackend;
-pub use direct_k0s::DirectK0sBackend;
-pub use direct_k3s::DirectK3sBackend;
-pub use kobe_sync::KobeSyncBackend;
+pub use k0s::K0sBackend;
+pub use k3s::K3sBackend;
+pub use vkobe::VkobeBackend;
 
 /// Allowed URL schemes for addon manifests and readiness probes.
 const ALLOWED_SCHEMES: &[&str] = &["https"];
@@ -32,10 +32,10 @@ const ALLOWED_SCHEMES: &[&str] = &["https"];
 /// which is not object-safe. This enum provides dispatch without `dyn`.
 #[derive(Clone)]
 pub enum BackendDispatch {
-    DirectK3s(DirectK3sBackend),
-    DirectK0s(DirectK0sBackend),
+    K3s(K3sBackend),
+    K0s(K0sBackend),
     Capi(CapiBackend),
-    KobeSync(KobeSyncBackend),
+    Vkobe(VkobeBackend),
 }
 
 impl ClusterBackend for BackendDispatch {
@@ -47,37 +47,37 @@ impl ClusterBackend for BackendDispatch {
         addons: &[Addon],
     ) -> Result<()> {
         match self {
-            Self::DirectK3s(b) => b.create(name, namespace, config, addons).await,
-            Self::DirectK0s(b) => b.create(name, namespace, config, addons).await,
+            Self::K3s(b) => b.create(name, namespace, config, addons).await,
+            Self::K0s(b) => b.create(name, namespace, config, addons).await,
             Self::Capi(b) => b.create(name, namespace, config, addons).await,
-            Self::KobeSync(b) => b.create(name, namespace, config, addons).await,
+            Self::Vkobe(b) => b.create(name, namespace, config, addons).await,
         }
     }
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
         match self {
-            Self::DirectK3s(b) => b.delete(name, namespace).await,
-            Self::DirectK0s(b) => b.delete(name, namespace).await,
+            Self::K3s(b) => b.delete(name, namespace).await,
+            Self::K0s(b) => b.delete(name, namespace).await,
             Self::Capi(b) => b.delete(name, namespace).await,
-            Self::KobeSync(b) => b.delete(name, namespace).await,
+            Self::Vkobe(b) => b.delete(name, namespace).await,
         }
     }
 
     async fn check_health(&self, name: &str, namespace: &str) -> Result<bool> {
         match self {
-            Self::DirectK3s(b) => b.check_health(name, namespace).await,
-            Self::DirectK0s(b) => b.check_health(name, namespace).await,
+            Self::K3s(b) => b.check_health(name, namespace).await,
+            Self::K0s(b) => b.check_health(name, namespace).await,
             Self::Capi(b) => b.check_health(name, namespace).await,
-            Self::KobeSync(b) => b.check_health(name, namespace).await,
+            Self::Vkobe(b) => b.check_health(name, namespace).await,
         }
     }
 
     async fn extract_kubeconfig(&self, name: &str, namespace: &str) -> Result<String> {
         match self {
-            Self::DirectK3s(b) => b.extract_kubeconfig(name, namespace).await,
-            Self::DirectK0s(b) => b.extract_kubeconfig(name, namespace).await,
+            Self::K3s(b) => b.extract_kubeconfig(name, namespace).await,
+            Self::K0s(b) => b.extract_kubeconfig(name, namespace).await,
             Self::Capi(b) => b.extract_kubeconfig(name, namespace).await,
-            Self::KobeSync(b) => b.extract_kubeconfig(name, namespace).await,
+            Self::Vkobe(b) => b.extract_kubeconfig(name, namespace).await,
         }
     }
 
@@ -88,19 +88,19 @@ impl ClusterBackend for BackendDispatch {
         gate: &ReadinessGate,
     ) -> Result<bool> {
         match self {
-            Self::DirectK3s(b) => b.check_readiness_gate(name, namespace, gate).await,
-            Self::DirectK0s(b) => b.check_readiness_gate(name, namespace, gate).await,
+            Self::K3s(b) => b.check_readiness_gate(name, namespace, gate).await,
+            Self::K0s(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::Capi(b) => b.check_readiness_gate(name, namespace, gate).await,
-            Self::KobeSync(b) => b.check_readiness_gate(name, namespace, gate).await,
+            Self::Vkobe(b) => b.check_readiness_gate(name, namespace, gate).await,
         }
     }
 
     async fn apply_addon(&self, name: &str, namespace: &str, addon: &Addon) -> Result<()> {
         match self {
-            Self::DirectK3s(b) => b.apply_addon(name, namespace, addon).await,
-            Self::DirectK0s(b) => b.apply_addon(name, namespace, addon).await,
+            Self::K3s(b) => b.apply_addon(name, namespace, addon).await,
+            Self::K0s(b) => b.apply_addon(name, namespace, addon).await,
             Self::Capi(b) => b.apply_addon(name, namespace, addon).await,
-            Self::KobeSync(b) => b.apply_addon(name, namespace, addon).await,
+            Self::Vkobe(b) => b.apply_addon(name, namespace, addon).await,
         }
     }
 }
@@ -130,23 +130,23 @@ impl BackendFactory {
         }
     }
 
-    /// Produce the right backend for a profile based on its `spec.backend`.
-    pub fn backend_for(&self, profile: &ClusterPoolProfile) -> Result<BackendDispatch> {
-        match profile.spec.backend {
-            BackendType::DirectK3s => Ok(BackendDispatch::DirectK3s(DirectK3sBackend::new(
+    /// Produce the right backend for a pool based on its `spec.backend.backend_type`.
+    pub fn backend_for(&self, profile: &ClusterPool) -> Result<BackendDispatch> {
+        match profile.spec.backend.backend_type {
+            BackendType::K3s => Ok(BackendDispatch::K3s(K3sBackend::new(
                 self.client.clone(),
                 self.pg_pool.clone(),
                 self.pg_base_url.clone(),
             ))),
-            BackendType::DirectK0s => Ok(BackendDispatch::DirectK0s(DirectK0sBackend::new(
+            BackendType::K0s => Ok(BackendDispatch::K0s(K0sBackend::new(
                 self.client.clone(),
                 self.pg_pool.clone(),
                 self.pg_base_url.clone(),
             ))),
             BackendType::Capi => {
-                let capi_config = profile.spec.capi.clone().ok_or_else(|| {
+                let capi_config = profile.spec.backend.capi.clone().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Profile {} has backend=capi but no capi config",
+                        "Pool {} has backend type=capi but no capi config",
                         profile.metadata.name.as_deref().unwrap_or("unknown")
                     )
                 })?;
@@ -155,7 +155,7 @@ impl BackendFactory {
                     capi_config,
                 )))
             }
-            BackendType::KobeSync => Ok(BackendDispatch::KobeSync(KobeSyncBackend::new(
+            BackendType::Vkobe => Ok(BackendDispatch::Vkobe(VkobeBackend::new(
                 self.client.clone(),
             ))),
         }

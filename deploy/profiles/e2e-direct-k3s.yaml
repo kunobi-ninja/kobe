@@ -1,22 +1,23 @@
 apiVersion: kobe.kunobi.ninja/v1alpha1
-kind: ClusterPoolProfile
+kind: ClusterPool
 metadata:
   name: e2e-direct-k3s
   namespace: kunobi-pool
 spec:
-  backend: direct-k3s
-  poolSize: 2
+  size: 2
   ttl: "1h"
+  backend:
+    type: k3s
+    # Shared PostgreSQL datastore (requires postgres.enabled=true in Helm values).
+    # When not configured, each k3s cluster uses embedded SQLite.
+    datastore:
+      secretRef: kunobi-postgres
+      secretKey: connection-url
+      goldenTemplates: false
   cluster:
     version: "v1.31.3+k3s1"
     servers: 1
     agents: 0
-  # Shared PostgreSQL datastore (requires postgres.enabled=true in Helm values).
-  # When not configured, each k3s cluster uses embedded SQLite.
-  datastore:
-    secretRef: kunobi-postgres
-    secretKey: connection-url
-    goldenTemplates: false
   healthCheck:
     intervalSeconds: 30
     failureThreshold: 3

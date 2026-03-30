@@ -2,25 +2,25 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// ClusterClaim is the internal representation of a cluster lease.
+/// ClusterLease is the internal representation of a cluster lease.
 ///
-/// Created when a user/CI claims a cluster via the HTTP API.
-/// The claim controller binds it to a warm cluster, tracks TTL,
+/// Created when a user/CI leases a cluster via the HTTP API.
+/// The lease controller binds it to a warm cluster, tracks TTL,
 /// and handles release/expiry/recycling.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "kobe.kunobi.ninja",
     version = "v1alpha1",
-    kind = "ClusterClaim",
-    plural = "clusterclaims",
-    shortname = "cc",
-    status = "ClusterClaimStatus",
+    kind = "ClusterLease",
+    plural = "clusterleases",
+    shortname = "cl",
+    status = "ClusterLeaseStatus",
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-pub struct ClusterClaimSpec {
-    /// Which profile's pool to claim from.
-    pub profile_ref: String,
+pub struct ClusterLeaseSpec {
+    /// Which profile's pool to lease from.
+    pub pool_ref: String,
 
     /// Requested TTL (e.g. "1h", "30m").
     pub ttl: String,
@@ -48,13 +48,13 @@ pub struct Requester {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ClusterClaimStatus {
-    /// Current phase of the claim lifecycle.
+pub struct ClusterLeaseStatus {
+    /// Current phase of the lease lifecycle.
     #[serde(default)]
-    pub phase: ClaimPhase,
+    pub phase: LeasePhase,
 
     /// Name of the bound cluster (set when phase=Bound).
-    #[serde(default, alias = "vclusterName")]
+    #[serde(default)]
     pub cluster_name: Option<String>,
 
     /// When the claim was bound to a vcluster.
@@ -82,9 +82,9 @@ pub struct ClusterClaimStatus {
     pub max_extensions: u32,
 }
 
-/// Claim lifecycle phases.
+/// Lease lifecycle phases.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
-pub enum ClaimPhase {
+pub enum LeasePhase {
     /// Waiting for a warm cluster to become available.
     #[default]
     Pending,
@@ -98,14 +98,14 @@ pub enum ClaimPhase {
     Recycling,
 }
 
-impl std::fmt::Display for ClaimPhase {
+impl std::fmt::Display for LeasePhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClaimPhase::Pending => write!(f, "Pending"),
-            ClaimPhase::Bound => write!(f, "Bound"),
-            ClaimPhase::Released => write!(f, "Released"),
-            ClaimPhase::Expired => write!(f, "Expired"),
-            ClaimPhase::Recycling => write!(f, "Recycling"),
+            LeasePhase::Pending => write!(f, "Pending"),
+            LeasePhase::Bound => write!(f, "Bound"),
+            LeasePhase::Released => write!(f, "Released"),
+            LeasePhase::Expired => write!(f, "Expired"),
+            LeasePhase::Recycling => write!(f, "Recycling"),
         }
     }
 }

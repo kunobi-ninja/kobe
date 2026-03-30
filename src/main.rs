@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 
 use api::auth::JwtAuthenticator;
 use api::routes::{build_router, AppState};
-use backend::{BackendDispatch, BackendFactory, DirectK3sBackend};
+use backend::{BackendDispatch, BackendFactory, K3sBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -66,8 +66,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let factory = BackendFactory::new(client.clone(), pg_pool.clone(), pg_base_url.clone());
-    let backend =
-        BackendDispatch::DirectK3s(DirectK3sBackend::new(client.clone(), pg_pool, pg_base_url));
+    let backend = BackendDispatch::K3s(K3sBackend::new(client.clone(), pg_pool, pg_base_url));
     let shutdown = CancellationToken::new();
     let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let authenticator = Arc::new(JwtAuthenticator::new());
@@ -97,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     let leader_rx =
         leader::run_leader_election(client.clone(), &namespace, "kobe-operator").await?;
 
-    // Start AuthPolicy watcher
+    // Start AccessPolicy watcher
     let auth_client = client.clone();
     let auth_ns = namespace.clone();
     let auth_authenticator = authenticator.clone();
@@ -201,10 +200,10 @@ async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 
     let required_crds = [
-        "clusterpoolprofiles.kobe.kunobi.ninja",
-        "clusterclaims.kobe.kunobi.ninja",
-        "authpolicies.kobe.kunobi.ninja",
-        "datastores.kobe.kunobi.ninja",
+        "clusterpools.kobe.kunobi.ninja",
+        "clusterleases.kobe.kunobi.ninja",
+        "accesspolicies.kobe.kunobi.ninja",
+        "kobestores.kobe.kunobi.ninja",
     ];
 
     let crd_api: kube::api::Api<CustomResourceDefinition> = kube::api::Api::all(client.clone());

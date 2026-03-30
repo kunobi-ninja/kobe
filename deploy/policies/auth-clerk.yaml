@@ -1,35 +1,31 @@
 apiVersion: kobe.kunobi.ninja/v1alpha1
-kind: AuthPolicy
+kind: AccessPolicy
 metadata:
   name: clerk
   namespace: kunobi-pool
 spec:
-  name: clerk
-  issuer: https://clerk.kunobi.ninja
-  audience: []
-  authorizedParties: ["https://app.kunobi.ninja"]
-  algorithms: ["RS256"]
-  identityTemplate: "{sub}"
-  roleExtraction:
-    method: conditional
-    rules:
-      - claim: org_role
+  auth:
+    oidc:
+      issuer: https://clerk.kunobi.ninja
+      authorizedParties: ["https://app.kunobi.ninja"]
+      algorithms: ["RS256"]
+  identity: "{sub}"
+  rules:
+    - match:
+        claim: org_role
         value: "org:admin"
-        role: admin
-      - claim: private_metadata.role
-        value: admin
-        role: admin
-    default: user
-  policies:
-    admin:
-      allowedProfiles: ["*"]
+      pools: ["*"]
       maxTtl: "8h"
-      maxConcurrentClaims: 10
-      defaultPriority: 100
+      maxConcurrentLeases: 10
       maxExtensions: 10
-    user:
-      allowedProfiles: ["dev-*"]
+    - match:
+        claim: private_metadata.role
+        value: admin
+      pools: ["*"]
+      maxTtl: "8h"
+      maxConcurrentLeases: 10
+      maxExtensions: 10
+    - pools: ["dev-*"]
       maxTtl: "4h"
-      maxConcurrentClaims: 2
-      defaultPriority: 50
+      maxConcurrentLeases: 2
       maxExtensions: 5

@@ -9,18 +9,19 @@ To check the health endpoint:
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "kobe.fullname" . }} {{ .Values.service.port }}
   curl http://localhost:{{ .Values.service.port }}/healthz
 
-To create a cluster pool profile:
+To create a cluster pool:
 
   cat <<EOF | kubectl apply -f -
   apiVersion: kobe.kunobi.ninja/v1alpha1
-  kind: ClusterPoolProfile
+  kind: ClusterPool
   metadata:
     name: my-pool
-    namespace: {{ .Values.operatorNamespace }}
   spec:
-    poolSize: 3
+    size: 3
+    ttl: "2h"
     backend:
-      type: kobe-sync
-    clusterConfig:
-      version: "1.32"
+      type: k3s
+    cluster:
+      version: "v1.31.3+k3s1"
+      servers: 1
   EOF

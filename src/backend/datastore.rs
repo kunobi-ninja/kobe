@@ -1,4 +1,4 @@
-//! PostgreSQL datastore management for direct-k3s and direct-k0s backends.
+//! PostgreSQL datastore management for k3s and k0s backends.
 //!
 //! Each cluster gets its own database in a shared PostgreSQL instance.
 //! This module handles creating, dropping, and templating databases, as well as

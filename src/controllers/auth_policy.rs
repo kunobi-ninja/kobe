@@ -8,11 +8,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::api::auth::JwtAuthenticator;
-use crate::crd::AuthPolicy;
+use crate::crd::AccessPolicy;
 
-/// Watch AuthPolicy CRDs and update the authenticator whenever they change.
+/// Watch AccessPolicy CRDs and update the authenticator whenever they change.
 ///
-/// On any change (create, update, delete), re-lists all AuthPolicies and
+/// On any change (create, update, delete), re-lists all AccessPolicies and
 /// compiles them into the authenticator's provider lookup table.
 pub async fn run_auth_policy_watcher(
     client: Client,
@@ -20,12 +20,12 @@ pub async fn run_auth_policy_watcher(
     authenticator: Arc<JwtAuthenticator>,
     shutdown: CancellationToken,
 ) {
-    let policies_api: Api<AuthPolicy> = Api::namespaced(client.clone(), namespace);
+    let policies_api: Api<AccessPolicy> = Api::namespaced(client.clone(), namespace);
 
     // Initial load — populate before the HTTP server starts accepting requests
     load_policies(&policies_api, &authenticator).await;
 
-    info!("Starting AuthPolicy watcher");
+    info!("Starting AccessPolicy watcher");
 
     let watcher = watcher::watcher(policies_api.clone(), Config::default());
     let mut stream = Box::pin(watcher);
@@ -42,32 +42,32 @@ pub async fn run_auth_policy_watcher(
                         load_policies(&policies_api, &authenticator).await;
                     }
                     Some(Err(e)) => {
-                        error!("AuthPolicy watcher error: {e}");
+                        error!("AccessPolicy watcher error: {e}");
                     }
                     None => {
-                        info!("AuthPolicy watcher stream ended");
+                        info!("AccessPolicy watcher stream ended");
                         break;
                     }
                 }
             }
             _ = shutdown.cancelled() => {
-                info!("AuthPolicy watcher shutting down");
+                info!("AccessPolicy watcher shutting down");
                 break;
             }
         }
     }
 }
 
-/// List all AuthPolicy CRDs and update the authenticator.
-async fn load_policies(api: &Api<AuthPolicy>, authenticator: &JwtAuthenticator) {
+/// List all AccessPolicy CRDs and update the authenticator.
+async fn load_policies(api: &Api<AccessPolicy>, authenticator: &JwtAuthenticator) {
     match api.list(&ListParams::default()).await {
         Ok(list) => {
             let count = list.items.len();
             authenticator.update_policies(list.items).await;
-            info!(count, "Loaded AuthPolicy CRDs");
+            info!(count, "Loaded AccessPolicy CRDs");
         }
         Err(e) => {
-            error!("Failed to list AuthPolicy CRDs: {e}");
+            error!("Failed to list AccessPolicy CRDs: {e}");
         }
     }
 }
@@ -83,23 +83,23 @@ mod tests {
         crate::testutil::mock_k8s_client(server)
     }
 
-    fn auth_policy_item(name: &str, provider_name: &str, issuer: &str) -> serde_json::Value {
+    fn access_policy_item(name: &str, issuer: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "AuthPolicy",
+            "kind": "AccessPolicy",
             "metadata": { "name": name },
             "spec": {
-                "name": provider_name,
-                "issuer": issuer,
-                "audience": ["https://github.com/my-org"],
-                "roleExtraction": { "method": "static", "role": "ci" },
-                "policies": {
-                    "ci": {
-                        "allowedProfiles": ["*"],
-                        "maxTtl": "1h",
-                        "maxConcurrentClaims": 10
+                "auth": {
+                    "oidc": {
+                        "issuer": issuer,
+                        "audience": ["https://github.com/my-org"]
                     }
-                }
+                },
+                "rules": [{
+                    "pools": ["*"],
+                    "maxTtl": "1h",
+                    "maxConcurrentLeases": 10
+                }]
             }
         })
     }
@@ -110,17 +110,16 @@ mod tests {
         let client = mock_client(&server);
 
         let items = vec![
-            auth_policy_item(
+            access_policy_item(
                 "github-policy",
-                "github-actions",
                 "https://token.actions.githubusercontent.com",
             ),
-            auth_policy_item("clerk-policy", "clerk-prod", "https://clerk.example.com"),
+            access_policy_item("clerk-policy", "https://clerk.example.com"),
         ];
 
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/accesspolicies",
             ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(crate::testutil::k8s_list_response(items)),
@@ -130,28 +129,29 @@ mod tests {
             .await;
 
         let authenticator = JwtAuthenticator::new();
-        let policies_api: Api<AuthPolicy> = Api::namespaced(client, "test-ns");
+        let policies_api: Api<AccessPolicy> = Api::namespaced(client, "test-ns");
 
         load_policies(&policies_api, &authenticator).await;
 
         // Verify the authenticator has both providers compiled
+        // No match clause — look up by policy name alone
         let github_policy = authenticator
-            .policy_for_requester_type("github-actions:ci")
+            .policy_for_requester_type("github-policy")
             .await;
         assert!(
             github_policy.is_some(),
-            "github-actions:ci policy should be present after load_policies"
+            "github-policy should be present after load_policies"
         );
         let policy = github_policy.unwrap();
-        assert_eq!(policy.allowed_profiles, vec!["*"]);
-        assert_eq!(policy.max_concurrent_claims, 10);
+        assert_eq!(policy.allowed_pools, vec!["*"]);
+        assert_eq!(policy.max_concurrent_leases, 10);
 
         let clerk_policy = authenticator
-            .policy_for_requester_type("clerk-prod:ci")
+            .policy_for_requester_type("clerk-policy")
             .await;
         assert!(
             clerk_policy.is_some(),
-            "clerk-prod:ci policy should be present after load_policies"
+            "clerk-policy should be present after load_policies"
         );
     }
 
@@ -162,7 +162,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/accesspolicies",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response::<serde_json::Value>(vec![]),
@@ -172,14 +172,12 @@ mod tests {
             .await;
 
         let authenticator = JwtAuthenticator::new();
-        let policies_api: Api<AuthPolicy> = Api::namespaced(client, "test-ns");
+        let policies_api: Api<AccessPolicy> = Api::namespaced(client, "test-ns");
 
         load_policies(&policies_api, &authenticator).await;
 
         // Authenticator should have no providers
-        let result = authenticator
-            .policy_for_requester_type("anything:role")
-            .await;
+        let result = authenticator.policy_for_requester_type("anything").await;
         assert!(
             result.is_none(),
             "policy_for_requester_type should return None with empty policies"
@@ -203,7 +201,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/authpolicies",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/accesspolicies",
             ))
             .respond_with(ResponseTemplate::new(500).set_body_json(error_response))
             .expect(1)
@@ -211,15 +209,13 @@ mod tests {
             .await;
 
         let authenticator = JwtAuthenticator::new();
-        let policies_api: Api<AuthPolicy> = Api::namespaced(client, "test-ns");
+        let policies_api: Api<AccessPolicy> = Api::namespaced(client, "test-ns");
 
         // Should complete without panic — logs the error and returns early
         load_policies(&policies_api, &authenticator).await;
 
         // Authenticator should remain empty (no policies loaded)
-        let result = authenticator
-            .policy_for_requester_type("anything:role")
-            .await;
+        let result = authenticator.policy_for_requester_type("anything").await;
         assert!(
             result.is_none(),
             "policy_for_requester_type should return None after API error"

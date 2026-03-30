@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use crate::crd::ClusterPoolProfile;
+use crate::crd::ClusterPool;
 
 /// Hash of the cluster spec at creation time, used to detect drift.
 pub type SpecHash = u64;
 
 /// Compute a hash of the profile's cluster-relevant fields.
-pub fn profile_spec_hash(profile: &ClusterPoolProfile) -> SpecHash {
+pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // Hash the fields that affect how a cluster is created
@@ -76,7 +76,7 @@ pub enum PoolAction {
 /// - Respect max_clusters ceiling
 /// - Cap creation burst to avoid thundering herd
 pub fn compute_pool_actions(
-    profile: &ClusterPoolProfile,
+    profile: &ClusterPool,
     state: &PoolState,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<PoolAction> {
@@ -122,7 +122,7 @@ pub fn compute_pool_actions(
     let total =
         counts.creating + counts.ready + counts.claimed + counts.unhealthy + counts.recycling;
 
-    // Determine target from scaling config or fixed pool_size
+    // Determine target from scaling config or fixed size
     let (min_ready, max_clusters, scale_up_threshold, scale_down_after) =
         if let Some(scaling) = &spec.scaling {
             (
@@ -132,8 +132,8 @@ pub fn compute_pool_actions(
                 parse_duration(&scaling.scale_down_after),
             )
         } else {
-            // Fixed pool: pool_size is both min and max ready
-            (spec.pool_size, spec.pool_size + 10, 0, None) // no scale-down for fixed pools
+            // Fixed pool: size is both min and max ready
+            (spec.size, spec.size + 10, 0, None) // no scale-down for fixed pools
         };
 
     // --- Scale Up ---
@@ -454,21 +454,19 @@ mod tests {
     // --- Autoscaling: compute_pool_actions ---
 
     fn make_profile(
-        pool_size: u32,
+        size: u32,
         scaling: Option<crate::crd::ScalingConfig>,
-    ) -> crate::crd::ClusterPoolProfile {
+    ) -> crate::crd::ClusterPool {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-        crate::crd::ClusterPoolProfile {
+        crate::crd::ClusterPool {
             metadata: ObjectMeta {
                 name: Some("test-profile".to_string()),
                 ..Default::default()
             },
-            spec: crate::crd::ClusterPoolProfileSpec {
-                pool_size,
+            spec: crate::crd::ClusterPoolSpec {
+                size,
                 ttl: "1h".to_string(),
                 backend: Default::default(),
-                datastore: None,
-                capi: None,
                 cluster: crate::crd::ClusterConfig {
                     version: "v1.31.3+k3s1".to_string(),
                     servers: 1,
@@ -484,7 +482,6 @@ mod tests {
                 scaling,
                 diagnostics: None,
                 snapshot: None,
-                kobe_sync: None,
             },
             status: None,
         }

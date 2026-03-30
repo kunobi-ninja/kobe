@@ -1,32 +1,35 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: clusterclaims.kobe.kunobi.ninja
+  name: clusterleases.kobe.kunobi.ninja
 spec:
   group: kobe.kunobi.ninja
   names:
     categories: []
-    kind: ClusterClaim
-    plural: clusterclaims
+    kind: ClusterLease
+    plural: clusterleases
     shortNames:
-    - cc
-    singular: clusterclaim
+    - cl
+    singular: clusterlease
   scope: Namespaced
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for ClusterClaimSpec via `CustomResource`
+        description: Auto-generated derived type for ClusterLeaseSpec via `CustomResource`
         properties:
           spec:
             description: |-
-              ClusterClaim is the internal representation of a cluster lease.
+              ClusterLease is the internal representation of a cluster lease.
 
-              Created when a user/CI claims a cluster via the HTTP API.
-              The claim controller binds it to a warm cluster, tracks TTL,
+              Created when a user/CI leases a cluster via the HTTP API.
+              The lease controller binds it to a warm cluster, tracks TTL,
               and handles release/expiry/recycling.
             properties:
+              poolRef:
+                description: Which profile's pool to lease from.
+                type: string
               priority:
                 default: 50
                 description: |-
@@ -35,9 +38,6 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
-              profileRef:
-                description: Which profile's pool to claim from.
-                type: string
               requester:
                 description: Identity of the requester.
                 properties:
@@ -57,7 +57,7 @@ spec:
                 description: Requested TTL (e.g. "1h", "30m").
                 type: string
             required:
-            - profileRef
+            - poolRef
             - requester
             - ttl
             type: object
@@ -94,7 +94,7 @@ spec:
                 type: integer
               phase:
                 default: Pending
-                description: Current phase of the claim lifecycle.
+                description: Current phase of the lease lifecycle.
                 enum:
                 - Pending
                 - Bound
@@ -111,7 +111,7 @@ spec:
             type: object
         required:
         - spec
-        title: ClusterClaim
+        title: ClusterLease
         type: object
     served: true
     storage: true
