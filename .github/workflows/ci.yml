@@ -73,7 +73,9 @@ jobs:
         uses: azure/setup-helm@v4
 
       - name: Verify Helm chart renders
-        run: helm template kobe charts/kobe/ --debug > /dev/null
+        run: |
+          helm dependency build charts/kobe/
+          helm template kobe charts/kobe/ --debug > /dev/null
 
       - name: Verify CRDs match generated output
         run: |
