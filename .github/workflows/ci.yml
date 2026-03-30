@@ -74,6 +74,7 @@ jobs:
 
       - name: Verify Helm chart renders
         run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
           helm dependency build charts/kobe/
           helm template kobe charts/kobe/ --debug > /dev/null
 
