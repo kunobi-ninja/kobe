@@ -20,4 +20,4 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 FROM deps AS build
 
 COPY . .
-RUN cargo build --release --bin kunobi-pool-operator --bin kobe-sync
+RUN cargo build --release --bin kobe-operator --bin kobe-sync

@@ -35,7 +35,7 @@ use super::{
 };
 
 /// Labels applied to all resources managed by this backend.
-const MANAGED_BY: &str = "kunobi-pool-operator";
+const MANAGED_BY: &str = "kobe-operator";
 
 /// Default kobe-sync container image.
 const DEFAULT_IMAGE: &str = "zondax/kobe-sync:latest";

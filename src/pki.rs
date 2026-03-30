@@ -243,7 +243,7 @@ pub async fn create_pki_secret(
     let mut labels = BTreeMap::new();
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
-        "kunobi-pool-operator".to_string(),
+        "kobe-operator".to_string(),
     );
     labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
 

@@ -236,7 +236,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             claims_api
                 .patch_status(
                     &name,
-                    &PatchParams::apply("kunobi-pool-operator"),
+                    &PatchParams::apply("kobe-operator"),
                     &Patch::Merge(&patch),
                 )
                 .await?;
@@ -254,7 +254,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                             claims_api
                                 .patch_status(
                                     &name,
-                                    &PatchParams::apply("kunobi-pool-operator"),
+                                    &PatchParams::apply("kobe-operator"),
                                     &Patch::Merge(&patch),
                                 )
                                 .await?;
@@ -319,7 +319,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 match claims_api
                     .patch_status(
                         &name,
-                        &PatchParams::apply("kunobi-pool-operator"),
+                        &PatchParams::apply("kobe-operator"),
                         &Patch::Merge(&patch),
                     )
                     .await
@@ -386,7 +386,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                             claims_api
                                 .patch_status(
                                     &name,
-                                    &PatchParams::apply("kunobi-pool-operator"),
+                                    &PatchParams::apply("kobe-operator"),
                                     &Patch::Merge(&patch),
                                 )
                                 .await?;
@@ -405,7 +405,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                         claims_api
                             .patch_status(
                                 &name,
-                                &PatchParams::apply("kunobi-pool-operator"),
+                                &PatchParams::apply("kobe-operator"),
                                 &Patch::Merge(&patch),
                             )
                             .await?;
@@ -428,7 +428,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             claims_api
                 .patch_status(
                     &name,
-                    &PatchParams::apply("kunobi-pool-operator"),
+                    &PatchParams::apply("kobe-operator"),
                     &Patch::Merge(&patch),
                 )
                 .await?;
@@ -466,7 +466,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                                 if let Err(e) = claims_api
                                     .patch_status(
                                         &name,
-                                        &PatchParams::apply("kunobi-pool-operator"),
+                                        &PatchParams::apply("kobe-operator"),
                                         &Patch::Merge(&patch),
                                     )
                                     .await
@@ -620,7 +620,7 @@ pub async fn extend_claim_ttl(
     claims_api
         .patch_status(
             claim_name,
-            &PatchParams::apply("kunobi-pool-operator"),
+            &PatchParams::apply("kobe-operator"),
             &Patch::Merge(&patch),
         )
         .await?;
@@ -686,7 +686,7 @@ async fn run_reaper<B: ClusterBackend>(
                             if let Err(e) = claims_api
                                 .patch_status(
                                     &name,
-                                    &PatchParams::apply("kunobi-pool-operator"),
+                                    &PatchParams::apply("kobe-operator"),
                                     &Patch::Merge(&patch),
                                 )
                                 .await
@@ -710,7 +710,7 @@ async fn run_reaper<B: ClusterBackend>(
                         if let Err(e) = claims_api
                             .patch_status(
                                 &name,
-                                &PatchParams::apply("kunobi-pool-operator"),
+                                &PatchParams::apply("kobe-operator"),
                                 &Patch::Merge(&patch),
                             )
                             .await

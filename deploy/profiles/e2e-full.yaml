@@ -6,8 +6,8 @@ metadata:
 spec:
   poolSize: 2
   ttl: "2h"
+  backend: direct-k3s
   cluster:
-    mode: shared
     version: "v1.31.3+k3s1"
     servers: 1
   addons:

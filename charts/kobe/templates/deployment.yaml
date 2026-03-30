@@ -56,7 +56,7 @@ spec:
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
             - name: POOL_SERVICE_ACCOUNT
-              value: {{ .Values.poolServiceAccount | default "kunobi-pool-operator" | quote }}
+              value: {{ .Values.poolServiceAccount | default "kobe-operator" | quote }}
             {{- if .Values.postgres.url }}
             - name: POSTGRES_URL
               value: {{ .Values.postgres.url | quote }}

@@ -29,7 +29,7 @@ const CAPI_CLUSTER_KIND: &str = "Cluster";
 const CAPI_CLUSTER_PLURAL: &str = "clusters";
 
 /// Label applied to all operator-managed resources.
-const MANAGED_BY: &str = "kunobi-pool-operator";
+const MANAGED_BY: &str = "kobe-operator";
 
 /// CAPI backend — manages virtual clusters via Cluster API CRDs.
 ///
@@ -626,7 +626,6 @@ mod tests {
             .await;
 
         let config = ClusterConfig {
-            mode: "shared".to_string(),
             version: "v1.31.3+k3s1".to_string(),
             servers: 1,
             agents: None,

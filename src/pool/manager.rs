@@ -470,7 +470,6 @@ mod tests {
                 datastore: None,
                 capi: None,
                 cluster: crate::crd::ClusterConfig {
-                    mode: "shared".to_string(),
                     version: "v1.31.3+k3s1".to_string(),
                     servers: 1,
                     agents: None,

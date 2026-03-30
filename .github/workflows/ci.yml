@@ -69,6 +69,22 @@ jobs:
             --ignore RUSTSEC-2025-0134 \
             --ignore RUSTSEC-2026-0002
 
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Verify Helm chart renders
+        run: helm template kobe charts/kobe/ --debug > /dev/null
+
+      - name: Verify CRDs match generated output
+        run: |
+          for crd in clusterpoolprofiles clusterclaims authpolicies datastores; do
+            cargo run --quiet --bin crdgen -- "$crd" > "/tmp/${crd}-generated.yaml"
+            diff -u "/tmp/${crd}-generated.yaml" "charts/kobe/crds/${crd}.yaml" || {
+              echo "::error::CRD '${crd}' is out of date. Run 'cargo run --bin crdgen -- ${crd} > charts/kobe/crds/${crd}.yaml' to update."
+              exit 1
+            }
+          done
+
   docker-dry-run:
     if: github.event_name == 'pull_request'
     needs: checks

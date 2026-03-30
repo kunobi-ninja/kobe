@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 
 use api::auth::JwtAuthenticator;
 use api::routes::{build_router, AppState};
-use backend::{BackendDispatch, BackendFactory, K3kBackend};
+use backend::{BackendDispatch, BackendFactory, DirectK3sBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -65,8 +65,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let factory = BackendFactory::new(client.clone(), pg_pool, pg_base_url);
-    let backend = BackendDispatch::K3k(K3kBackend::new(client.clone()));
+    let factory = BackendFactory::new(client.clone(), pg_pool.clone(), pg_base_url.clone());
+    let backend =
+        BackendDispatch::DirectK3s(DirectK3sBackend::new(client.clone(), pg_pool, pg_base_url));
     let shutdown = CancellationToken::new();
     let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let authenticator = Arc::new(JwtAuthenticator::new());
@@ -94,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Wait for leader election before starting controllers ──
     let leader_rx =
-        leader::run_leader_election(client.clone(), &namespace, "kunobi-pool-operator").await?;
+        leader::run_leader_election(client.clone(), &namespace, "kobe-operator").await?;
 
     // Start AuthPolicy watcher
     let auth_client = client.clone();

@@ -8,7 +8,6 @@ spec:
   poolSize: 2
   ttl: "1h"
   cluster:
-    mode: shared
     version: "v1.31.3+k3s1"
     servers: 1
     agents: 0

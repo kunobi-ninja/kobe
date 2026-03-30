@@ -285,7 +285,6 @@ mod tests {
 
     fn sample_config() -> ClusterConfig {
         ClusterConfig {
-            mode: "shared".to_string(),
             version: "v1.31.3+k3s1".to_string(),
             servers: 1,
             agents: None,

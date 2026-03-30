@@ -1,4 +1,4 @@
-Waygu (kunobi-pool-operator) has been installed in namespace {{ .Release.Namespace }}.
+Kobe has been installed in namespace {{ .Release.Namespace }}.
 
 To verify the operator is running:
 

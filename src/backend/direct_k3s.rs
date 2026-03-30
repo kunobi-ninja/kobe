@@ -1,8 +1,6 @@
-//! Direct k3s backend — manages k3s clusters via StatefulSets, without k3k.
+//! Direct k3s backend — manages k3s clusters via StatefulSets.
 //!
-//! Instead of creating `k3k.io/v1beta1/Cluster` CRDs and relying on the k3k
-//! operator, this backend directly creates the Kubernetes resources needed to
-//! run k3s:
+//! This backend directly creates the Kubernetes resources needed to run k3s:
 //!
 //! - A **token Secret** for inter-node authentication
 //! - A **server StatefulSet** running `k3s server`
@@ -36,7 +34,7 @@ use super::{
 };
 
 /// Labels applied to all resources managed by this backend.
-const MANAGED_BY: &str = "kunobi-pool-operator";
+const MANAGED_BY: &str = "kobe-operator";
 
 /// Convert a k3s semver version to a valid Docker image reference.
 ///
@@ -405,7 +403,7 @@ impl DirectK3sBackend {
                         volumes: Some(volumes),
                         service_account_name: Some(
                             std::env::var("POOL_SERVICE_ACCOUNT")
-                                .unwrap_or_else(|_| "kunobi-pool-operator".to_string()),
+                                .unwrap_or_else(|_| "kobe-operator".to_string()),
                         ),
                         ..Default::default()
                     }),
@@ -751,7 +749,6 @@ mod tests {
 
     fn base_config() -> ClusterConfig {
         ClusterConfig {
-            mode: "shared".to_string(),
             version: "v1.31.3+k3s1".to_string(),
             servers: 1,
             agents: None,

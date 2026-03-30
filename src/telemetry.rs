@@ -11,7 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Returns the tracer provider handle for graceful shutdown (flush on drop).
 pub fn init() -> Result<Option<SdkTracerProvider>> {
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "kunobi_pool_operator=info,tower_http=info".into());
+        .unwrap_or_else(|_| "kobe_operator=info,tower_http=info".into());
 
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
@@ -28,13 +28,13 @@ pub fn init() -> Result<Option<SdkTracerProvider>> {
                 opentelemetry_sdk::Resource::builder()
                     .with_service_name(
                         std::env::var("OTEL_SERVICE_NAME")
-                            .unwrap_or_else(|_| "kunobi-pool-operator".into()),
+                            .unwrap_or_else(|_| "kobe-operator".into()),
                     )
                     .build(),
             )
             .build();
 
-        let tracer = provider.tracer("kunobi-pool-operator");
+        let tracer = provider.tracer("kobe-operator");
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
         tracing_subscriber::registry()

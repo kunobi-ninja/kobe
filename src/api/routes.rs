@@ -459,7 +459,7 @@ async fn release_claim<B: ClusterBackend>(
     if let Err(e) = claims_api
         .patch_status(
             &id,
-            &PatchParams::apply("kunobi-pool-operator"),
+            &PatchParams::apply("kobe-operator"),
             &KubePatch::Merge(&patch),
         )
         .await

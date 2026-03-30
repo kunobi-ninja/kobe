@@ -1,7 +1,6 @@
 //! Velero Backup/Restore object builders, ApiResource helpers, and naming conventions.
 //!
-//! All objects are built as `serde_json::Value` using `serde_json::json!`, following
-//! the same pattern as the k3k backend (`K3kBackend::build_cluster_object`).
+//! All objects are built as `serde_json::Value` using `serde_json::json!`.
 //! Objects are consumed via `kube::api::DynamicObject` + `kube::discovery::ApiResource`.
 
 use kube::discovery::ApiResource;
@@ -12,7 +11,7 @@ const VELERO_VERSION: &str = "v1";
 const VELERO_API_VERSION: &str = "velero.io/v1";
 
 /// Label applied to all operator-managed resources.
-const MANAGED_BY_LABEL: &str = "kunobi-pool-operator";
+const MANAGED_BY_LABEL: &str = "kobe-operator";
 
 // ---------------------------------------------------------------------------
 // ApiResource helpers
@@ -206,7 +205,7 @@ mod tests {
         assert_eq!(obj["metadata"]["namespace"], "velero");
         assert_eq!(
             obj["metadata"]["labels"]["app.kubernetes.io/managed-by"],
-            "kunobi-pool-operator"
+            "kobe-operator"
         );
         assert_eq!(obj["spec"]["includedNamespaces"][0], "ns-golden-e2e");
         assert_eq!(obj["spec"]["storageLocation"], "default");
@@ -252,7 +251,7 @@ mod tests {
 
         assert_eq!(
             obj["metadata"]["labels"]["app.kubernetes.io/managed-by"],
-            "kunobi-pool-operator"
+            "kobe-operator"
         );
     }
 
@@ -276,7 +275,7 @@ mod tests {
         assert_eq!(obj["metadata"]["namespace"], "velero");
         assert_eq!(
             obj["metadata"]["labels"]["app.kubernetes.io/managed-by"],
-            "kunobi-pool-operator"
+            "kobe-operator"
         );
         assert_eq!(obj["spec"]["backupName"], "golden-e2e-full-gen5");
         assert_eq!(obj["spec"]["includedNamespaces"][0], "golden-e2e-full");
@@ -325,7 +324,7 @@ mod tests {
 
         assert_eq!(
             obj["metadata"]["labels"]["app.kubernetes.io/managed-by"],
-            "kunobi-pool-operator"
+            "kobe-operator"
         );
     }
 

@@ -10,7 +10,7 @@ imagePullSecrets: []
 
 replicas: 2
 
-logLevel: "kunobi_pool_operator=info"
+logLevel: "kobe_operator=info"
 
 # Namespace the operator manages (OPERATOR_NAMESPACE env var)
 operatorNamespace: "kunobi-pool"

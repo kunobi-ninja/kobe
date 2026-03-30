@@ -2,7 +2,6 @@ pub mod capi;
 pub mod datastore;
 pub mod direct_k0s;
 pub mod direct_k3s;
-pub mod k3k;
 pub mod kobe_sync;
 
 use std::net::{IpAddr, ToSocketAddrs};
@@ -18,7 +17,6 @@ use crate::crd::{Addon, BackendType, ClusterConfig, ClusterPoolProfile, Readines
 pub use capi::CapiBackend;
 pub use direct_k0s::DirectK0sBackend;
 pub use direct_k3s::DirectK3sBackend;
-pub use k3k::K3kBackend;
 pub use kobe_sync::KobeSyncBackend;
 
 /// Allowed URL schemes for addon manifests and readiness probes.
@@ -34,7 +32,6 @@ const ALLOWED_SCHEMES: &[&str] = &["https"];
 /// which is not object-safe. This enum provides dispatch without `dyn`.
 #[derive(Clone)]
 pub enum BackendDispatch {
-    K3k(K3kBackend),
     DirectK3s(DirectK3sBackend),
     DirectK0s(DirectK0sBackend),
     Capi(CapiBackend),
@@ -50,7 +47,6 @@ impl ClusterBackend for BackendDispatch {
         addons: &[Addon],
     ) -> Result<()> {
         match self {
-            Self::K3k(b) => b.create(name, namespace, config, addons).await,
             Self::DirectK3s(b) => b.create(name, namespace, config, addons).await,
             Self::DirectK0s(b) => b.create(name, namespace, config, addons).await,
             Self::Capi(b) => b.create(name, namespace, config, addons).await,
@@ -60,7 +56,6 @@ impl ClusterBackend for BackendDispatch {
 
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
         match self {
-            Self::K3k(b) => b.delete(name, namespace).await,
             Self::DirectK3s(b) => b.delete(name, namespace).await,
             Self::DirectK0s(b) => b.delete(name, namespace).await,
             Self::Capi(b) => b.delete(name, namespace).await,
@@ -70,7 +65,6 @@ impl ClusterBackend for BackendDispatch {
 
     async fn check_health(&self, name: &str, namespace: &str) -> Result<bool> {
         match self {
-            Self::K3k(b) => b.check_health(name, namespace).await,
             Self::DirectK3s(b) => b.check_health(name, namespace).await,
             Self::DirectK0s(b) => b.check_health(name, namespace).await,
             Self::Capi(b) => b.check_health(name, namespace).await,
@@ -80,7 +74,6 @@ impl ClusterBackend for BackendDispatch {
 
     async fn extract_kubeconfig(&self, name: &str, namespace: &str) -> Result<String> {
         match self {
-            Self::K3k(b) => b.extract_kubeconfig(name, namespace).await,
             Self::DirectK3s(b) => b.extract_kubeconfig(name, namespace).await,
             Self::DirectK0s(b) => b.extract_kubeconfig(name, namespace).await,
             Self::Capi(b) => b.extract_kubeconfig(name, namespace).await,
@@ -95,7 +88,6 @@ impl ClusterBackend for BackendDispatch {
         gate: &ReadinessGate,
     ) -> Result<bool> {
         match self {
-            Self::K3k(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::DirectK3s(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::DirectK0s(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::Capi(b) => b.check_readiness_gate(name, namespace, gate).await,
@@ -105,7 +97,6 @@ impl ClusterBackend for BackendDispatch {
 
     async fn apply_addon(&self, name: &str, namespace: &str, addon: &Addon) -> Result<()> {
         match self {
-            Self::K3k(b) => b.apply_addon(name, namespace, addon).await,
             Self::DirectK3s(b) => b.apply_addon(name, namespace, addon).await,
             Self::DirectK0s(b) => b.apply_addon(name, namespace, addon).await,
             Self::Capi(b) => b.apply_addon(name, namespace, addon).await,
@@ -142,7 +133,6 @@ impl BackendFactory {
     /// Produce the right backend for a profile based on its `spec.backend`.
     pub fn backend_for(&self, profile: &ClusterPoolProfile) -> Result<BackendDispatch> {
         match profile.spec.backend {
-            BackendType::K3k => Ok(BackendDispatch::K3k(K3kBackend::new(self.client.clone()))),
             BackendType::DirectK3s => Ok(BackendDispatch::DirectK3s(DirectK3sBackend::new(
                 self.client.clone(),
                 self.pg_pool.clone(),
@@ -180,9 +170,9 @@ impl BackendFactory {
 
 /// Backend-agnostic interface for managing virtual cluster lifecycles.
 ///
-/// Implementations handle the actual cluster provisioning (k3k, or future
-/// alternatives). The profile and claim controllers interact only through
-/// this trait, keeping them decoupled from the underlying technology.
+/// Implementations handle the actual cluster provisioning. The profile and
+/// claim controllers interact only through this trait, keeping them decoupled
+/// from the underlying technology.
 pub trait ClusterBackend: Send + Sync {
     /// Create a virtual cluster with the given name and config.
     fn create(
@@ -278,9 +268,12 @@ pub async fn read_kubeconfig_secret(
 /// Build a `kube::Client` targeting a virtual cluster from its kubeconfig YAML.
 pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Client> {
     let kubeconfig = kube::config::Kubeconfig::from_yaml(kubeconfig_yaml)?;
-    let config = Config::from_custom_kubeconfig(kubeconfig, &Default::default())
+    let mut config = Config::from_custom_kubeconfig(kubeconfig, &Default::default())
         .await
         .context("Failed to build config from kubeconfig")?;
+    // Virtual clusters use self-signed CAs; we trust them because we created them
+    // and we're connecting cluster-internal (pod-to-service DNS).
+    config.accept_invalid_certs = true;
     Client::try_from(config).context("Failed to create client from kubeconfig")
 }
 
@@ -315,11 +308,22 @@ pub async fn check_virtual_health(client: &Client, name: &str, namespace: &str) 
         .uri("/healthz")
         .body(vec![])
         .unwrap();
-    let body: String = vc_client
-        .request_text(req)
-        .await
-        .context("Health probe request failed")?;
-    Ok(body.trim() == "ok")
+
+    // 5 second timeout — virtual cluster health checks should be fast
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        vc_client.request_text(req),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(body)) => Ok(body.trim() == "ok"),
+        Ok(Err(e)) => Err(e).context("Health probe request failed"),
+        Err(_) => {
+            debug!(cluster = name, "Health probe timed out after 5s");
+            Ok(false)
+        }
+    }
 }
 
 /// Evaluate a readiness gate against a virtual cluster.
@@ -454,7 +458,7 @@ pub async fn apply_addon_impl(vc_client: &Client, addon: &Addon) -> Result<()> {
         let obj_name = obj.name_any();
         api.patch(
             &obj_name,
-            &PatchParams::apply("kunobi-pool-operator"),
+            &PatchParams::apply("kobe-operator"),
             &Patch::Apply(&obj),
         )
         .await

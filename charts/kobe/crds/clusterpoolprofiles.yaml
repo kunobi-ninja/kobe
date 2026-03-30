@@ -48,10 +48,9 @@ spec:
                   type: object
                 type: array
               backend:
-                default: k3k
+                default: direct-k3s
                 description: Backend to use for provisioning clusters.
                 enum:
-                - k3k
                 - direct-k3s
                 - direct-k0s
                 - capi
@@ -114,10 +113,6 @@ spec:
                     required:
                     - exposeType
                     type: object
-                  mode:
-                    default: shared
-                    description: 'k3k mode: "shared" or "virtual".'
-                    type: string
                   persistence:
                     description: Persistence config.
                     nullable: true

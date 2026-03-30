@@ -1,12 +1,12 @@
 [package]
-name = "kunobi-pool-operator"
+name = "kobe-operator"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Cluster pool operator for instant CI/dev cluster provisioning (k3k, k3s, k0s, CAPI)"
 
 [[bin]]
-name = "kunobi-pool-operator"
+name = "kobe-operator"
 path = "src/main.rs"
 
 [[bin]]

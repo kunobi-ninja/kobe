@@ -39,7 +39,7 @@ use super::{
 pub const DB_PREFIX: &str = "k0s_";
 
 /// Labels applied to all resources managed by this backend.
-const MANAGED_BY: &str = "kunobi-pool-operator";
+const MANAGED_BY: &str = "kobe-operator";
 
 /// The kubeconfig publisher sidecar script, mounted from a ConfigMap.
 ///
@@ -505,7 +505,7 @@ spec:
                         volumes: Some(volumes),
                         service_account_name: Some(
                             std::env::var("POOL_SERVICE_ACCOUNT")
-                                .unwrap_or_else(|_| "kunobi-pool-operator".to_string()),
+                                .unwrap_or_else(|_| "kobe-operator".to_string()),
                         ),
                         ..Default::default()
                     }),
@@ -857,7 +857,6 @@ mod tests {
 
     fn base_config() -> ClusterConfig {
         ClusterConfig {
-            mode: "shared".to_string(),
             version: "v1.30.1+k0s.0".to_string(),
             servers: 1,
             agents: None,

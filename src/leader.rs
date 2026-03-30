@@ -119,7 +119,7 @@ async fn try_acquire(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow:
                 leases
                     .patch(
                         name,
-                        &PatchParams::apply("kunobi-pool-operator"),
+                        &PatchParams::apply("kobe-operator"),
                         &Patch::Merge(&patch),
                     )
                     .await?;
@@ -161,7 +161,7 @@ async fn renew_lease(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow:
     leases
         .patch(
             name,
-            &PatchParams::apply("kunobi-pool-operator"),
+            &PatchParams::apply("kobe-operator"),
             &Patch::Merge(&patch),
         )
         .await?;

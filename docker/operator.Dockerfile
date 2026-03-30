@@ -1,5 +1,5 @@
 # =============================================================================
-# kunobi-pool-operator — minimal runtime image
+# kobe-operator — minimal runtime image
 # =============================================================================
 FROM gcr.io/distroless/cc-debian12
 
@@ -14,8 +14,8 @@ LABEL org.opencontainers.image.revision="${BUILD_COMMIT}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
-COPY --from=builder /app/target/release/kunobi-pool-operator /kunobi-pool-operator
+COPY --from=builder /app/target/release/kobe-operator /kobe-operator
 
 EXPOSE 8080
 
-ENTRYPOINT ["/kunobi-pool-operator"]
+ENTRYPOINT ["/kobe-operator"]

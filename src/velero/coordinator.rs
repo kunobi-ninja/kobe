@@ -2,7 +2,7 @@
 //!
 //! Orchestrates golden-image backup creation and restore-from-backup flows
 //! for pool clusters. Uses `DynamicObject` + `ApiResource` to interact with
-//! Velero CRDs, following the same pattern as `K3kBackend`.
+//! Velero CRDs.
 
 use std::time::Duration;
 
@@ -286,7 +286,7 @@ impl VeleroCoordinator {
 
     /// Delete old golden backups whose generation is less than `current_generation`.
     ///
-    /// Lists backups with the `app.kubernetes.io/managed-by=kunobi-pool-operator`
+    /// Lists backups with the `app.kubernetes.io/managed-by=kobe-operator`
     /// label and deletes any whose name indicates a generation older than current.
     #[tracing::instrument(skip_all, fields(profile))]
     pub async fn cleanup_old_backups(
@@ -301,7 +301,7 @@ impl VeleroCoordinator {
             &backup_api_resource(),
         );
 
-        let lp = ListParams::default().labels("app.kubernetes.io/managed-by=kunobi-pool-operator");
+        let lp = ListParams::default().labels("app.kubernetes.io/managed-by=kobe-operator");
 
         let list = backups
             .list(&lp)
@@ -370,7 +370,7 @@ impl VeleroCoordinator {
                     "metadata": {
                         "name": namespace,
                         "labels": {
-                            "app.kubernetes.io/managed-by": "kunobi-pool-operator"
+                            "app.kubernetes.io/managed-by": "kobe-operator"
                         }
                     }
                 }))?;
@@ -788,7 +788,7 @@ mod tests {
             .and(path("/apis/velero.io/v1/namespaces/velero/backups"))
             .and(query_param(
                 "labelSelector",
-                "app.kubernetes.io/managed-by=kunobi-pool-operator",
+                "app.kubernetes.io/managed-by=kobe-operator",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![
@@ -799,7 +799,7 @@ mod tests {
                             "name": "golden-test-gen1",
                             "namespace": "velero",
                             "labels": {
-                                "app.kubernetes.io/managed-by": "kunobi-pool-operator"
+                                "app.kubernetes.io/managed-by": "kobe-operator"
                             }
                         },
                         "status": { "phase": "Completed" }
@@ -811,7 +811,7 @@ mod tests {
                             "name": "golden-test-gen3",
                             "namespace": "velero",
                             "labels": {
-                                "app.kubernetes.io/managed-by": "kunobi-pool-operator"
+                                "app.kubernetes.io/managed-by": "kobe-operator"
                             }
                         },
                         "status": { "phase": "Completed" }
@@ -856,7 +856,7 @@ mod tests {
             .and(path("/apis/velero.io/v1/namespaces/velero/backups"))
             .and(query_param(
                 "labelSelector",
-                "app.kubernetes.io/managed-by=kunobi-pool-operator",
+                "app.kubernetes.io/managed-by=kobe-operator",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![serde_json::json!({
@@ -866,7 +866,7 @@ mod tests {
                         "name": "golden-test-genabc",
                         "namespace": "velero",
                         "labels": {
-                            "app.kubernetes.io/managed-by": "kunobi-pool-operator"
+                            "app.kubernetes.io/managed-by": "kobe-operator"
                         }
                     },
                     "status": { "phase": "Completed" }
@@ -940,7 +940,7 @@ mod tests {
                 "metadata": {
                     "name": "golden-test",
                     "labels": {
-                        "app.kubernetes.io/managed-by": "kunobi-pool-operator"
+                        "app.kubernetes.io/managed-by": "kobe-operator"
                     }
                 }
             })))
@@ -1022,7 +1022,6 @@ mod tests {
             datastore: None,
             capi: None,
             cluster: crate::crd::ClusterConfig {
-                mode: "shared".to_string(),
                 version: "v1.31.3+k3s1".to_string(),
                 servers: 1,
                 agents: None,

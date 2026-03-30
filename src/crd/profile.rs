@@ -8,11 +8,8 @@ use std::collections::BTreeMap;
 /// Which backend to use for cluster provisioning.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub enum BackendType {
-    /// Use the k3k operator (k3k.io CRDs) — the original backend.
-    #[default]
-    #[serde(rename = "k3k")]
-    K3k,
     /// Manage k3s StatefulSets directly, optionally with a shared PostgreSQL datastore.
+    #[default]
     #[serde(rename = "direct-k3s")]
     DirectK3s,
     /// Manage k0s clusters directly.
@@ -232,10 +229,6 @@ pub struct ClusterPoolProfileSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterConfig {
-    /// k3k mode: "shared" or "virtual".
-    #[serde(default = "default_cluster_mode")]
-    pub mode: String,
-
     /// k3s version (e.g., "v1.31.3+k3s1").
     pub version: String,
 
@@ -286,10 +279,6 @@ pub struct ExposeConfig {
     /// NodePort number (when expose_type="NodePort").
     #[serde(default)]
     pub node_port: Option<i32>,
-}
-
-fn default_cluster_mode() -> String {
-    "shared".to_string()
 }
 
 fn default_servers() -> u32 {

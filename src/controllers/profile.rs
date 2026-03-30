@@ -33,7 +33,7 @@ pub struct ProfileContext<B: ClusterBackend> {
     pub velero: Option<VeleroCoordinator>,
     /// Optional backend factory for per-profile backend dispatch.
     /// When set, `backend_for(profile)` is used instead of `self.backend`
-    /// for create/delete operations, enabling DirectK3s alongside K3k.
+    /// for create/delete operations.
     pub factory: Option<BackendFactory>,
 }
 
@@ -154,10 +154,9 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         f.backend_for(&profile)?
                     } else {
                         // Fallback: in tests, wrap the clone in a no-op dispatch.
-                        // This path is only reached for k3k profiles (Velero golden backup).
-                        crate::backend::BackendDispatch::K3k(crate::backend::K3kBackend::new(
-                            ctx.client.clone(),
-                        ))
+                        crate::backend::BackendDispatch::DirectK3s(
+                            crate::backend::DirectK3sBackend::new(ctx.client.clone(), None, None),
+                        )
                     };
                     let client = ctx.client.clone();
                     let ns = ns.clone();
@@ -198,7 +197,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                                 if let Err(e) = profiles_api
                                     .patch_status(
                                         &profile_name,
-                                        &PatchParams::apply("kunobi-pool-operator"),
+                                        &PatchParams::apply("kobe-operator"),
                                         &Patch::Merge(&status_patch),
                                     )
                                     .await
@@ -289,8 +288,8 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
                 tokio::spawn(async move {
                     // Determine whether to restore from golden backup or create fresh.
-                    // Velero restore only applies to K3k backends; DirectK3s uses PG
-                    // template databases for golden images instead.
+                    // DirectK3s uses PG template databases for golden images,
+                    // so Velero restore only applies to non-DirectK3s backends.
                     let is_direct_k3s =
                         matches!(profile_for_dispatch.spec.backend, BackendType::DirectK3s);
                     let use_restore = if !is_direct_k3s {
@@ -347,7 +346,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                                     error = %e,
                                     "Failed to restore from golden backup, falling back to fresh create"
                                 );
-                                // Fall back to fresh create (K3k path — use fallback backend).
+                                // Fall back to fresh create using fallback backend.
                                 fallback_backend
                                     .create(&c_name, &c_ns, &config, &addons)
                                     .await
@@ -378,7 +377,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
                             // If snapshot is enabled but no golden backup exists yet,
                             // trigger golden backup creation in the background.
-                            // (Only for K3k backends — DirectK3s uses PG templates.)
+                            // (DirectK3s uses PG templates instead of Velero snapshots.)
                             if !is_direct_k3s {
                                 if let (Some(ref velero), Some(ref snapshot)) = (&velero, &snapshot)
                                 {
@@ -433,9 +432,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                                                     if let Err(e) = profiles_api
                                                         .patch_status(
                                                             &profile_name,
-                                                            &PatchParams::apply(
-                                                                "kunobi-pool-operator",
-                                                            ),
+                                                            &PatchParams::apply("kobe-operator"),
                                                             &Patch::Merge(&status_patch),
                                                         )
                                                         .await
@@ -595,7 +592,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
     profiles_api
         .patch_status(
             &name,
-            &PatchParams::apply("kunobi-pool-operator"),
+            &PatchParams::apply("kobe-operator"),
             &Patch::Merge(&patch),
         )
         .await?;
@@ -654,7 +651,7 @@ async fn build_pool_state<B: ClusterBackend>(
     };
 
     // Find StatefulSets matching this profile's naming pattern
-    // (k3k creates StatefulSets for virtual cluster control planes)
+    // (backends create StatefulSets for virtual cluster control planes)
     let sts_api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
         Api::namespaced(ctx.client.clone(), ns);
     let prefix = format!("pool-{profile_name}-");
