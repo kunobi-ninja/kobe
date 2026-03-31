@@ -129,4 +129,4 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version || '0.0.0' }}
           BUILD_COMMIT: ${{ github.sha }}
-        run: docker buildx bake -f docker-bake.hcl push
+        run: docker buildx bake -f docker-bake.hcl --set '*.cache-from=' push
