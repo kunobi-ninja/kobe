@@ -1,14 +1,7 @@
 # =============================================================================
 # kobe-operator — minimal runtime image
 # =============================================================================
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r operator && useradd -r -g operator operator
-
-USER operator
+FROM gcr.io/distroless/base-debian12
 
 ARG BUILD_VERSION=dev
 ARG BUILD_COMMIT=unknown
