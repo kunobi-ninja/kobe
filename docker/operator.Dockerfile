@@ -1,7 +1,7 @@
 # =============================================================================
 # kobe-operator — minimal runtime image
 # =============================================================================
-FROM gcr.io/distroless/base-debian12
+FROM gcr.io/distroless/cc-debian12
 
 ARG BUILD_VERSION=dev
 ARG BUILD_COMMIT=unknown
