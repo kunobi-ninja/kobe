@@ -79,13 +79,14 @@ target "operator" {
     BUILD_COMMIT  = BUILD_COMMIT
     BUILD_DATE    = BUILD_DATE
   }
-  cache-from = ["type=registry,ref=${REGISTRY}/kobe-operator:buildcache"]
+  # cache-from disabled during binary rename transition
+  # cache-from = ["type=registry,ref=${REGISTRY}/kobe-operator:buildcache"]
 }
 
 target "operator-push" {
   inherits = ["operator"]
   output   = ["type=registry"]
-  cache-to = ["type=registry,ref=${REGISTRY}/kobe-operator:buildcache,mode=max"]
+  # cache-to = ["type=registry,ref=${REGISTRY}/kobe-operator:buildcache,mode=max"]
 }
 
 # =============================================================================
@@ -104,11 +105,11 @@ target "kobe-sync" {
     BUILD_COMMIT  = BUILD_COMMIT
     BUILD_DATE    = BUILD_DATE
   }
-  cache-from = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache"]
+  # cache-from = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache"]
 }
 
 target "kobe-sync-push" {
   inherits = ["kobe-sync"]
   output   = ["type=registry"]
-  cache-to = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache,mode=max"]
+  # cache-to = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache,mode=max"]
 }
