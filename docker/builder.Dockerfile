@@ -21,4 +21,10 @@ FROM deps AS build
 
 COPY . .
 RUN rm -f target/release/kobe-operator target/release/kobe-sync && \
-    cargo build --release --bin kobe-operator --bin kobe-sync
+    cargo build --release --bin kobe-operator --bin kobe-sync && \
+    echo "=== Binary check ===" && \
+    file target/release/kobe-operator && \
+    ldd target/release/kobe-operator && \
+    ls -la target/release/kobe-operator && \
+    echo "=== Smoke test ===" && \
+    timeout 2 target/release/kobe-operator 2>&1 || true
