@@ -20,11 +20,12 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 FROM deps AS build
 
 COPY . .
-RUN rm -f target/release/kobe-operator target/release/kobe-sync && \
+RUN rm -rf target/release/kobe-operator target/release/kobe-sync \
+           target/release/deps/kobe_operator* \
+           target/release/deps/kobe_sync* \
+           target/release/.fingerprint/kobe-operator* \
+           target/release/.fingerprint/kobe-sync* \
+           target/release/incremental/kobe_operator* \
+           target/release/incremental/kobe_sync* && \
     cargo build --release --bin kobe-operator --bin kobe-sync && \
-    echo "=== Binary check ===" && \
-    ls -la target/release/kobe-operator && \
-    ldd target/release/kobe-operator && \
-    echo "=== Smoke test ===" && \
-    timeout 2 target/release/kobe-operator 2>&1; \
-    echo "=== Smoke exit code: $? ==="
+    ls -la target/release/kobe-operator target/release/kobe-sync
