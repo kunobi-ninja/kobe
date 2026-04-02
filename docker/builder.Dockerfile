@@ -20,4 +20,5 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 FROM deps AS build
 
 COPY . .
-RUN cargo build --release --bin kobe-operator --bin kobe-sync
+RUN rm -f target/release/kobe-operator target/release/kobe-sync && \
+    cargo build --release --bin kobe-operator --bin kobe-sync
