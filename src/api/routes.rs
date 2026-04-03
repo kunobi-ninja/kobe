@@ -55,6 +55,7 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
     // Non-limited infrastructure routes
     Router::new()
         .merge(api_routes)
+        .route("/v1/status", get(status::<B>))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler::<B>))
         .with_state(state)
@@ -699,6 +700,135 @@ async fn get_pool<B: ClusterBackend>(
         )
             .into_response(),
     }
+}
+
+/// GET /v1/status — public endpoint, no auth required.
+/// Returns version, auth methods, active sessions (if token provided), and accessible pools.
+async fn status<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let methods = state.authenticator.auth_methods().await;
+
+    // Try to authenticate if a token is provided (optional)
+    let session = if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(header_str) = auth_header.to_str() {
+            if let Some(token) = header_str.strip_prefix("Bearer ") {
+                match state.authenticator.validate(token).await {
+                    Ok(identity) => {
+                        let pools = accessible_pools(&state, &identity).await;
+                        Some(StatusSession {
+                            method: "oidc".to_string(),
+                            identity: identity.identity,
+                            pools,
+                            expires_at: None,
+                        })
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let sessions = session.into_iter().collect::<Vec<_>>();
+
+    // Pools — only show pools the caller can access
+    let pool_infos = if sessions.is_empty() {
+        vec![]
+    } else {
+        let pools = state.pools.read().await;
+        pools
+            .iter()
+            .map(|(name, pool_state)| {
+                let counts = count_states(pool_state);
+                StatusPool {
+                    name: name.clone(),
+                    ready: counts.ready,
+                    claimed: counts.claimed,
+                    total: counts.ready + counts.claimed + counts.creating,
+                }
+            })
+            .filter(|p| {
+                sessions
+                    .iter()
+                    .any(|s| s.pools.iter().any(|pattern| pool_matches(&p.name, pattern)))
+            })
+            .collect()
+    };
+
+    Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        auth: AuthStatusBlock { methods, sessions },
+        pools: pool_infos,
+    })
+    .into_response()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusResponse {
+    version: String,
+    auth: AuthStatusBlock,
+    pools: Vec<StatusPool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthStatusBlock {
+    methods: Vec<crate::api::auth::AuthMethodInfo>,
+    sessions: Vec<StatusSession>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusSession {
+    method: String,
+    identity: String,
+    pools: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusPool {
+    name: String,
+    ready: u32,
+    claimed: u32,
+    total: u32,
+}
+
+/// Get the list of pool name patterns this identity can access.
+async fn accessible_pools<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+) -> Vec<String> {
+    if let Some(policy) = state
+        .authenticator
+        .policy_for_requester_type(&identity.requester_type)
+        .await
+    {
+        policy.allowed_pools
+    } else {
+        vec![]
+    }
+}
+
+/// Check if a pool name matches a pattern.
+fn pool_matches(pool: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return pool.starts_with(prefix);
+    }
+    pool == pattern
 }
 
 async fn healthz() -> StatusCode {

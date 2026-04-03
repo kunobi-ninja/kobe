@@ -4,7 +4,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::Client as HttpClient;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -58,6 +58,20 @@ pub struct AuthIdentity {
     pub issuer: String,
     /// Resolved authorization policy for this identity.
     pub policy: crate::api::policy::Policy,
+}
+
+/// Auth method info for the /v1/status endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthMethodInfo {
+    #[serde(rename = "type")]
+    pub method_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A compiled provider entry, built from an AccessPolicy CRD.
@@ -147,6 +161,20 @@ impl JwtAuthenticator {
         let count = compiled.len();
         *self.providers.write().await = compiled;
         debug!(providers = count, "Access policies updated");
+    }
+
+    /// Return the list of supported auth methods for the /v1/status endpoint.
+    pub async fn auth_methods(&self) -> Vec<AuthMethodInfo> {
+        let providers = self.providers.read().await;
+        providers
+            .iter()
+            .map(|p| AuthMethodInfo {
+                method_type: "oidc".to_string(),
+                issuer: Some(p.issuer.clone()),
+                client_id: None, // TODO: expose client_id for CLI discovery
+                description: Some(p.name.clone()),
+            })
+            .collect()
     }
 
     /// Look up a policy by requester_type string.
