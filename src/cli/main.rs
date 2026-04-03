@@ -11,6 +11,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show endpoint status, auth methods, sessions, and pools
+    Status,
     /// Authenticate with the Kobe service
     Login,
     /// Remove stored credentials
@@ -60,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Status => commands::status().await,
         Commands::Login => commands::login().await,
         Commands::Logout => commands::logout().await,
         Commands::Pools => commands::pools().await,

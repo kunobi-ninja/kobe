@@ -5,6 +5,7 @@ mod leases;
 mod login;
 mod pools;
 mod release;
+mod status;
 
 pub use claim::claim;
 pub use config::{config_set, config_show};
@@ -13,6 +14,7 @@ pub use leases::leases;
 pub use login::{login, logout};
 pub use pools::pools;
 pub use release::release;
+pub use status::status;
 
 use config::{AuthMode, CliConfig};
 
