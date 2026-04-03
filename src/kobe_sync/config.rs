@@ -262,9 +262,11 @@ mod tests {
         assert_eq!(config.metrics_port, 9090);
         assert!(!config.enabled_syncers.is_empty());
         assert!(config.default_namespaces.contains(&"default".to_string()));
-        assert!(config
-            .default_namespaces
-            .contains(&"kube-system".to_string()));
+        assert!(
+            config
+                .default_namespaces
+                .contains(&"kube-system".to_string())
+        );
     }
 
     #[test]
@@ -315,14 +317,17 @@ mod tests {
     /// to avoid races from `set_var`/`remove_var` on process-global state.
     #[test]
     fn test_load_from_env_all_scenarios() {
-        // --- Scenario 1: missing required vars → error ---
-        std::env::remove_var("KOBE_SYNC_HOST_NAMESPACE");
-        std::env::remove_var("KOBE_SYNC_CLUSTER_NAME");
-        std::env::remove_var("KOBE_SYNC_VIRTUAL_API_URL");
-        std::env::remove_var("KOBE_SYNC_ETCD_PREFIX");
-        std::env::remove_var("KOBE_SYNC_PROXY_PORT");
-        std::env::remove_var("KOBE_SYNC_METRICS_PORT");
-        std::env::remove_var("KOBE_SYNC_SYNCERS");
+        // SAFETY: test-only, single-threaded
+        unsafe {
+            // --- Scenario 1: missing required vars → error ---
+            std::env::remove_var("KOBE_SYNC_HOST_NAMESPACE");
+            std::env::remove_var("KOBE_SYNC_CLUSTER_NAME");
+            std::env::remove_var("KOBE_SYNC_VIRTUAL_API_URL");
+            std::env::remove_var("KOBE_SYNC_ETCD_PREFIX");
+            std::env::remove_var("KOBE_SYNC_PROXY_PORT");
+            std::env::remove_var("KOBE_SYNC_METRICS_PORT");
+            std::env::remove_var("KOBE_SYNC_SYNCERS");
+        }
 
         let result = KobeSyncRuntimeConfig::load_from_env();
         assert!(
@@ -330,21 +335,27 @@ mod tests {
             "should fail when required vars are missing"
         );
 
-        // --- Scenario 2: explicit v2 fields ---
-        std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-ns");
-        std::env::set_var("KOBE_SYNC_CLUSTER_NAME", "cluster-1");
-        std::env::set_var("KOBE_SYNC_VIRTUAL_API_URL", "https://10.0.0.1:6443");
-        std::env::set_var("KOBE_SYNC_ETCD_PREFIX", "/kobe/cluster-1/");
+        // SAFETY: test-only, single-threaded
+        unsafe {
+            // --- Scenario 2: explicit v2 fields ---
+            std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-ns");
+            std::env::set_var("KOBE_SYNC_CLUSTER_NAME", "cluster-1");
+            std::env::set_var("KOBE_SYNC_VIRTUAL_API_URL", "https://10.0.0.1:6443");
+            std::env::set_var("KOBE_SYNC_ETCD_PREFIX", "/kobe/cluster-1/");
+        }
 
         let config = KobeSyncRuntimeConfig::load_from_env().unwrap();
         assert_eq!(config.virtual_api_url, "https://10.0.0.1:6443");
         assert_eq!(config.etcd_prefix, "/kobe/cluster-1/");
 
-        // --- Scenario 3: defaults for v2 fields ---
-        std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-defaults");
-        std::env::set_var("KOBE_SYNC_CLUSTER_NAME", "defaults-test-cluster");
-        std::env::remove_var("KOBE_SYNC_VIRTUAL_API_URL");
-        std::env::remove_var("KOBE_SYNC_ETCD_PREFIX");
+        // SAFETY: test-only, single-threaded
+        unsafe {
+            // --- Scenario 3: defaults for v2 fields ---
+            std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-defaults");
+            std::env::set_var("KOBE_SYNC_CLUSTER_NAME", "defaults-test-cluster");
+            std::env::remove_var("KOBE_SYNC_VIRTUAL_API_URL");
+            std::env::remove_var("KOBE_SYNC_ETCD_PREFIX");
+        }
 
         let config = KobeSyncRuntimeConfig::load_from_env().unwrap();
         assert_eq!(config.virtual_api_url, "https://localhost:6443");
@@ -358,8 +369,11 @@ mod tests {
         assert_eq!(default_config.virtual_api_url, "https://localhost:6443");
         assert_eq!(default_config.etcd_prefix, "");
 
-        // --- Clean up ---
-        std::env::remove_var("KOBE_SYNC_HOST_NAMESPACE");
-        std::env::remove_var("KOBE_SYNC_CLUSTER_NAME");
+        // SAFETY: test-only, single-threaded
+        unsafe {
+            // --- Clean up ---
+            std::env::remove_var("KOBE_SYNC_HOST_NAMESPACE");
+            std::env::remove_var("KOBE_SYNC_CLUSTER_NAME");
+        }
     }
 }

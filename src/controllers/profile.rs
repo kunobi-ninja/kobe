@@ -16,7 +16,7 @@ use crate::crd::{
     SnapshotRefreshTrigger,
 };
 use crate::pool::{
-    compute_pool_actions, count_states, ClusterEntry, ClusterState, PoolAction, PoolState,
+    ClusterEntry, ClusterState, PoolAction, PoolState, compute_pool_actions, count_states,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -297,7 +297,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         BackendType::K3s
                     );
                     let use_restore = if !is_k3s {
-                        if let (Some(ref velero), Some(ref snapshot)) = (&velero, &snapshot) {
+                        if let (Some(velero), Some(snapshot)) = (&velero, &snapshot) {
                             if snapshot.enabled {
                                 match velero
                                     .get_golden_backup(&profile_name, snapshot, profile_gen)
@@ -383,8 +383,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                             // trigger golden backup creation in the background.
                             // (K3s uses PG templates instead of Velero snapshots.)
                             if !is_k3s {
-                                if let (Some(ref velero), Some(ref snapshot)) = (&velero, &snapshot)
-                                {
+                                if let (Some(velero), Some(snapshot)) = (&velero, &snapshot) {
                                     if snapshot.enabled {
                                         let velero = velero.clone();
                                         let snapshot = snapshot.clone();

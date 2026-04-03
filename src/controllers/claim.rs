@@ -13,7 +13,7 @@ use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{ClusterLease, ClusterLeaseStatus, ClusterPool, LeasePhase};
 use crate::diagnostics;
-use crate::pool::{parse_duration, ClusterState, PoolState};
+use crate::pool::{ClusterState, PoolState, parse_duration};
 
 /// Shared state for the claim controller.
 pub struct LeaseContext<B: ClusterBackend> {
@@ -491,16 +491,15 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 let fallback_backend = ctx.backend.clone();
                 tokio::spawn(async move {
                     // Use per-profile backend dispatch when factory is available.
-                    let delete_result = if let (Some(ref factory), Some(ref p)) =
-                        (&factory, &profile_for_dispatch)
-                    {
-                        match factory.backend_for(p) {
-                            Ok(b) => b.delete(&c_name, &c_ns).await,
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        fallback_backend.delete(&c_name, &c_ns).await
-                    };
+                    let delete_result =
+                        if let (Some(factory), Some(p)) = (&factory, &profile_for_dispatch) {
+                            match factory.backend_for(p) {
+                                Ok(b) => b.delete(&c_name, &c_ns).await,
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            fallback_backend.delete(&c_name, &c_ns).await
+                        };
                     match delete_result {
                         Ok(_) => {
                             if let Some(pool) = pools.write().await.get_mut(&pool_ref) {

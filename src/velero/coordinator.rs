@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::Namespace;
 use kube::api::{Api, DeleteParams, DynamicObject, ListParams, PostParams};
 use kube::{Client, ResourceExt};
@@ -318,7 +318,7 @@ impl VeleroCoordinator {
 
             // Extract the generation number from the name.
             let gen_str = &obj_name[prefix.len()..];
-            let gen: i64 = match gen_str.parse() {
+            let generation: i64 = match gen_str.parse() {
                 Ok(g) => g,
                 Err(_) => {
                     debug!(
@@ -329,10 +329,10 @@ impl VeleroCoordinator {
                 }
             };
 
-            if gen < current_generation {
+            if generation < current_generation {
                 info!(
                     backup = %obj_name,
-                    generation = gen,
+                    generation = generation,
                     current = current_generation,
                     "Deleting old golden backup"
                 );
