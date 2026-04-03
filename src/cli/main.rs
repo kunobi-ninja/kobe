@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config { action } => match action {
             Some(ConfigAction::Set { key, value }) => commands::config_set(&key, &value).await,
             Some(ConfigAction::Show) => commands::config_show().await,
-            None => commands::config_interactive().await,
+            None => commands::config_interactive(),
         },
     }
 }

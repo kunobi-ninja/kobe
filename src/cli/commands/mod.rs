@@ -1,12 +1,14 @@
 mod claim;
 mod config;
+mod config_tui;
 mod leases;
 mod login;
 mod pools;
 mod release;
 
 pub use claim::claim;
-pub use config::{config_interactive, config_set, config_show};
+pub use config::{config_set, config_show};
+pub use config_tui::run_config_tui as config_interactive;
 pub use leases::leases;
 pub use login::{login, logout};
 pub use pools::pools;

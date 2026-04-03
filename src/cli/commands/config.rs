@@ -78,61 +78,6 @@ fn config_path() -> Result<PathBuf> {
     Ok(dir.join("kobe").join("config.json"))
 }
 
-/// Interactive TUI config editor.
-pub async fn config_interactive() -> Result<()> {
-    let mut config = CliConfig::load()?;
-
-    // Endpoint
-    let endpoint = inquire::Text::new("Endpoint")
-        .with_default(config.endpoint())
-        .with_help_message("Kobe API URL")
-        .prompt()?;
-    config.endpoint = Some(endpoint);
-
-    // Auth mode
-    let auth_options = vec!["none", "token", "oidc"];
-    let default_idx = match config.auth {
-        AuthMode::None => 0,
-        AuthMode::Token => 1,
-        AuthMode::Oidc => 2,
-    };
-    let auth = inquire::Select::new("Authentication", auth_options)
-        .with_starting_cursor(default_idx)
-        .with_help_message("How to authenticate with the Kobe API")
-        .prompt()?;
-
-    config.auth = match auth {
-        "none" => AuthMode::None,
-        "token" => AuthMode::Token,
-        "oidc" => AuthMode::Oidc,
-        _ => AuthMode::Oidc,
-    };
-
-    // Token (only if token auth)
-    if config.auth == AuthMode::Token {
-        let current = config.token.as_deref().unwrap_or("");
-        let token = inquire::Password::new("Token")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .with_help_message("Static bearer token")
-            .without_confirmation()
-            .prompt()?;
-        if !token.is_empty() {
-            config.token = Some(token);
-        } else if !current.is_empty() {
-            // Keep existing token
-        } else {
-            config.token = None;
-        }
-    } else {
-        config.token = None;
-    }
-
-    config.save()?;
-    println!();
-    print_config(&config);
-    Ok(())
-}
-
 /// Set a config value via CLI.
 pub async fn config_set(key: &str, value: &str) -> Result<()> {
     let mut config = CliConfig::load()?;
