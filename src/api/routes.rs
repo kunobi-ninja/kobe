@@ -763,7 +763,9 @@ async fn status<B: ClusterBackend>(
     };
 
     Json(StatusResponse {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: option_env!("BUILD_VERSION")
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .to_string(),
         auth: AuthStatusBlock { methods, sessions },
         pools: pool_infos,
     })
