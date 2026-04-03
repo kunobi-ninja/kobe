@@ -38,6 +38,11 @@ build:
 cli:
     cargo build --release --bin kobe
 
+# Run the CLI (pass args after --)
+[group('dev')]
+run *args:
+    cargo run --bin kobe -- {{ args }}
+
 # Regenerate CRD YAML files from Rust types
 [group('build')]
 crdgen:
