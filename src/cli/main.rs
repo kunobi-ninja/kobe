@@ -35,10 +35,10 @@ enum Commands {
         /// Lease ID
         lease_id: String,
     },
-    /// Manage CLI configuration
+    /// Manage CLI configuration (interactive if no subcommand)
     Config {
         #[command(subcommand)]
-        action: ConfigAction,
+        action: Option<ConfigAction>,
     },
 }
 
@@ -46,7 +46,7 @@ enum Commands {
 enum ConfigAction {
     /// Set a configuration value
     Set {
-        /// Key (e.g. "endpoint")
+        /// Key (endpoint, auth, token)
         key: String,
         /// Value
         value: String,
@@ -69,8 +69,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Leases => commands::leases().await,
         Commands::Release { lease_id } => commands::release(&lease_id).await,
         Commands::Config { action } => match action {
-            ConfigAction::Set { key, value } => commands::config_set(&key, &value).await,
-            ConfigAction::Show => commands::config_show().await,
+            Some(ConfigAction::Set { key, value }) => commands::config_set(&key, &value).await,
+            Some(ConfigAction::Show) => commands::config_show().await,
+            None => commands::config_interactive().await,
         },
     }
 }

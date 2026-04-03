@@ -2,16 +2,15 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use super::config::CliConfig;
+use super::{authed_client, get_auth_header, with_auth};
 
 pub async fn claim(pool: &str, ttl: &str, output: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
     let endpoint = config.endpoint();
-    let token = crate::commands::get_token(endpoint).await?;
+    let token = get_auth_header(endpoint).await?;
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{endpoint}/v1/leases"))
-        .bearer_auth(&token)
+    let client = authed_client();
+    let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
         .json(&serde_json::json!({
             "pool": pool,
             "ttl": ttl,
