@@ -30,8 +30,8 @@ pub(crate) async fn get_auth_header(endpoint: &str) -> anyhow::Result<Option<Str
             ),
         },
         AuthMode::Oidc => {
-            let service_config = kunobi_oidc::ServiceConfig::discover(endpoint).await?;
-            let client = kunobi_oidc::AuthClient::new(service_config)?;
+            let service_config = kunobi_auth::client::ServiceConfig::discover(endpoint).await?;
+            let client = kunobi_auth::client::AuthClient::new(service_config)?;
             Ok(Some(client.token().await?))
         }
     }

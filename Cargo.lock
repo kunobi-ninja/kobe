@@ -2465,7 +2465,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
- "kunobi-oidc",
+ "kunobi-auth",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2606,23 +2606,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "kunobi-oidc"
-version = "0.1.0"
-source = "git+https://github.com/kunobi-ninja/kunobi-oidc.git?tag=v0.1.0#b0313fad330b744855bff856068f55e442986d84"
+name = "kunobi-auth"
+version = "0.2.0"
+source = "git+https://github.com/kunobi-ninja/kunobi-auth.git?branch=main#91107d81d0b0b8e93df044af1a88de4b5ce5247b"
 dependencies = [
  "anyhow",
  "axum",
  "chrono",
  "dirs",
+ "http 1.4.0",
+ "jsonwebtoken",
  "oauth2",
  "open",
  "openidconnect",
- "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 

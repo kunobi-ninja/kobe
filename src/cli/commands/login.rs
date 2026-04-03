@@ -1,5 +1,5 @@
 use anyhow::Result;
-use kunobi_oidc::{AuthClient, ServiceConfig};
+use kunobi_auth::client::{AuthClient, ServiceConfig};
 
 use super::config::CliConfig;
 
