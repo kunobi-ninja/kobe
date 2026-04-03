@@ -28,6 +28,8 @@ struct FormField {
     options: Vec<&'static str>,
     default_hint: &'static str,
     is_password: bool,
+    /// (field_index, required_value) — only show when fields[index].value == required_value
+    visible_when: Option<(usize, &'static str)>,
 }
 
 impl FormField {
@@ -43,6 +45,13 @@ impl FormField {
 
     fn is_placeholder(&self) -> bool {
         self.value.is_empty()
+    }
+
+    fn visible(&self, fields: &[FormField]) -> bool {
+        match self.visible_when {
+            Some((idx, val)) => fields.get(idx).map(|f| f.value == val).unwrap_or(true),
+            None => true,
+        }
     }
 }
 
@@ -82,6 +91,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             options: vec![],
             default_hint: "(default: https://kobe.kunobi.ninja)",
             is_password: false,
+            visible_when: None,
         },
         FormField {
             label: "Auth mode",
@@ -90,6 +100,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             options: vec!["none", "token", "oidc"],
             default_hint: "oidc",
             is_password: false,
+            visible_when: None,
         },
         FormField {
             label: "Token",
@@ -98,6 +109,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             options: vec![],
             default_hint: "(not set)",
             is_password: true,
+            visible_when: Some((1, "token")), // only visible when auth mode == "token"
         },
     ]
 }
@@ -170,13 +182,34 @@ pub fn run_config_tui() -> Result<()> {
                             break;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            if state.cursor > 0 {
-                                state.cursor -= 1;
+                            // Skip hidden fields
+                            let mut next = state.cursor;
+                            loop {
+                                if next == 0 {
+                                    break;
+                                }
+                                next -= 1;
+                                if state.fields[next].visible(&state.fields) {
+                                    break;
+                                }
+                            }
+                            if state.fields[next].visible(&state.fields) {
+                                state.cursor = next;
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            if state.cursor < state.fields.len() - 1 {
-                                state.cursor += 1;
+                            let mut next = state.cursor;
+                            loop {
+                                if next >= state.fields.len() - 1 {
+                                    break;
+                                }
+                                next += 1;
+                                if state.fields[next].visible(&state.fields) {
+                                    break;
+                                }
+                            }
+                            if state.fields[next].visible(&state.fields) {
+                                state.cursor = next;
                             }
                         }
                         KeyCode::Enter => {
@@ -297,15 +330,22 @@ fn draw(f: &mut Frame, state: &EditorState) {
     let inner = form_block.inner(chunks[1]);
     f.render_widget(form_block, chunks[1]);
 
+    let visible_fields: Vec<(usize, &FormField)> = state
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.visible(&state.fields))
+        .collect();
+
     let field_height = 2u16;
-    for (i, field) in state.fields.iter().enumerate() {
-        let y = inner.y + (i as u16) * field_height;
+    for (vi, (i, field)) in visible_fields.iter().enumerate() {
+        let y = inner.y + (vi as u16) * field_height;
         if y + field_height > inner.y + inner.height {
             break;
         }
 
         let field_area = Rect::new(inner.x, y, inner.width, field_height);
-        let is_selected = i == state.cursor;
+        let is_selected = *i == state.cursor;
         let is_editing = is_selected && state.mode == Mode::Editing;
 
         // Label
