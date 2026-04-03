@@ -17,6 +17,10 @@ path = "src/kobe_sync_bin.rs"
 name = "crdgen"
 path = "src/crdgen.rs"
 
+[[bin]]
+name = "kobe"
+path = "src/cli/main.rs"
+
 [dependencies]
 # Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
 kube = { version = "3.0", features = ["runtime", "derive", "client"] }
@@ -74,6 +78,11 @@ base64 = "0.22"
 
 # Async trait (dyn dispatch for async traits)
 async-trait = "0.1"
+
+# CLI
+kunobi-oidc = { git = "https://github.com/kunobi-ninja/kunobi-oidc.git", tag = "v0.1.0" }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
 
 # Utilities
 anyhow = "1"

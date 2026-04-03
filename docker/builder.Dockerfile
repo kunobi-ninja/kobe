@@ -20,12 +20,15 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 FROM deps AS build
 
 COPY . .
-RUN rm -rf target/release/kobe-operator target/release/kobe-sync \
+RUN rm -rf target/release/kobe-operator target/release/kobe-sync target/release/kobe \
            target/release/deps/kobe_operator* \
            target/release/deps/kobe_sync* \
+           target/release/deps/kobe-* \
            target/release/.fingerprint/kobe-operator* \
            target/release/.fingerprint/kobe-sync* \
+           target/release/.fingerprint/kobe-* \
            target/release/incremental/kobe_operator* \
-           target/release/incremental/kobe_sync* && \
-    cargo build --release --bin kobe-operator --bin kobe-sync && \
-    ls -la target/release/kobe-operator target/release/kobe-sync
+           target/release/incremental/kobe_sync* \
+           target/release/incremental/kobe-* && \
+    cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe && \
+    ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe

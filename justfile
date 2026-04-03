@@ -52,6 +52,10 @@ docker-push:
 docker-clean:
     docker builder prune -f
 
+# Build the CLI
+cli:
+    cargo build --release --bin kobe
+
 # Remove build artifacts
 clean:
     cargo clean
