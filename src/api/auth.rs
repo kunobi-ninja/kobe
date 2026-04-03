@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -1071,16 +1071,18 @@ mod tests {
         assert!(auth.policy_for_requester_type("my-policy").await.is_some());
 
         // Wrong policy name should not find
-        assert!(auth
-            .policy_for_requester_type("other-policy")
-            .await
-            .is_none());
+        assert!(
+            auth.policy_for_requester_type("other-policy")
+                .await
+                .is_none()
+        );
 
         // With a match value but no match clause rules — should not find
-        assert!(auth
-            .policy_for_requester_type("my-policy:admin")
-            .await
-            .is_none());
+        assert!(
+            auth.policy_for_requester_type("my-policy:admin")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

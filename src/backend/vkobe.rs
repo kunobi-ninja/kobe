@@ -21,8 +21,8 @@ use k8s_openapi::api::rbac::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use kube::Client;
+use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -30,8 +30,8 @@ use crate::crd::{Addon, ClusterConfig, KobeStoreRef, ReadinessGate, VkobeConfig}
 use crate::pki;
 
 use super::{
-    apply_addon_impl, check_readiness_gate_impl, check_virtual_health, read_kubeconfig_secret,
-    virtual_client_from_kubeconfig, ClusterBackend,
+    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health,
+    read_kubeconfig_secret, virtual_client_from_kubeconfig,
 };
 
 /// Labels applied to all resources managed by this backend.
@@ -1164,9 +1164,10 @@ mod tests {
             .map(|s| s.as_str())
             .collect();
         assert!(args.iter().any(|a| a.starts_with("--etcd-servers=")));
-        assert!(args
-            .iter()
-            .any(|a| a.starts_with("--etcd-prefix=/kobe/cluster-1/")));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--etcd-prefix=/kobe/cluster-1/"))
+        );
     }
 
     #[test]
@@ -1203,10 +1204,12 @@ mod tests {
         let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
         let template = &dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         // No PVCs — stateless pod
-        assert!(template
-            .volumes
-            .as_ref()
-            .is_none_or(|vols| { !vols.iter().any(|v| v.persistent_volume_claim.is_some()) }));
+        assert!(
+            template
+                .volumes
+                .as_ref()
+                .is_none_or(|vols| { !vols.iter().any(|v| v.persistent_volume_claim.is_some()) })
+        );
     }
 
     #[test]

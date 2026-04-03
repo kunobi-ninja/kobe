@@ -222,9 +222,9 @@ pub async fn create_pki_secret(
     pki: &VirtualClusterPki,
     kcm_kubeconfig: &str,
 ) -> Result<()> {
+    use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::Secret;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use k8s_openapi::ByteString;
     use kube::api::{Api, PostParams};
 
     let secret_name = format!("{name}-certs");

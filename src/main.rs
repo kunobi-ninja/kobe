@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use api::auth::JwtAuthenticator;
-use api::routes::{build_router, AppState};
+use api::routes::{AppState, build_router};
 use backend::{BackendDispatch, BackendFactory, K3sBackend};
 
 #[tokio::main]

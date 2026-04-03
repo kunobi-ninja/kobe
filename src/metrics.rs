@@ -1,8 +1,8 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec, Encoder,
-    HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder,
+    Encoder, HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder, register_histogram_vec,
+    register_int_counter_vec, register_int_gauge_vec,
 };
 
 /// Pool state gauges — set at scrape time from shared pool state.

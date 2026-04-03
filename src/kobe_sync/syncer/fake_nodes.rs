@@ -11,10 +11,10 @@ use std::sync::Arc;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Node, NodeCondition, NodeSpec, NodeStatus, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, PostParams};
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
-use kube::ResourceExt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -384,9 +384,11 @@ mod tests {
 
         let fake = synthesize_fake_node(&host_node);
         let conds = fake.status.as_ref().unwrap().conditions.as_ref().unwrap();
-        assert!(conds
-            .iter()
-            .any(|c| c.type_ == "Ready" && c.status == "True"));
+        assert!(
+            conds
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
+        );
     }
 
     #[test]
@@ -518,14 +520,20 @@ mod tests {
         let fake = synthesize_fake_node(&host_node);
         let conds = fake.status.as_ref().unwrap().conditions.as_ref().unwrap();
         assert_eq!(conds.len(), 3);
-        assert!(conds
-            .iter()
-            .any(|c| c.type_ == "Ready" && c.status == "True"));
-        assert!(conds
-            .iter()
-            .any(|c| c.type_ == "MemoryPressure" && c.status == "False"));
-        assert!(conds
-            .iter()
-            .any(|c| c.type_ == "DiskPressure" && c.status == "False"));
+        assert!(
+            conds
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
+        );
+        assert!(
+            conds
+                .iter()
+                .any(|c| c.type_ == "MemoryPressure" && c.status == "False")
+        );
+        assert!(
+            conds
+                .iter()
+                .any(|c| c.type_ == "DiskPressure" && c.status == "False")
+        );
     }
 }

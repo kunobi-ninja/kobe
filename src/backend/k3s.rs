@@ -20,8 +20,8 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
@@ -29,8 +29,8 @@ use tracing::{debug, info, warn};
 use crate::crd::{Addon, ClusterConfig, ReadinessGate};
 
 use super::{
-    apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
-    read_kubeconfig_secret, virtual_client_from_kubeconfig, ClusterBackend,
+    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
+    read_kubeconfig_secret, virtual_client_from_kubeconfig,
 };
 
 /// Labels applied to all resources managed by this backend.
@@ -790,9 +790,10 @@ mod tests {
         let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         let server = &pod_spec.containers[0];
         let args = server.args.as_ref().unwrap();
-        assert!(args
-            .iter()
-            .any(|a| a == "--datastore-endpoint=postgres://user:pass@pg:5432/k3s_pg_cluster"));
+        assert!(
+            args.iter()
+                .any(|a| a == "--datastore-endpoint=postgres://user:pass@pg:5432/k3s_pg_cluster")
+        );
     }
 
     #[test]
@@ -873,9 +874,10 @@ mod tests {
         assert_eq!(agent.name, "k3s-agent");
 
         let args = agent.args.as_ref().unwrap();
-        assert!(args
-            .iter()
-            .any(|a| a == "--server=https://my-cluster-server.ns.svc:6443"));
+        assert!(
+            args.iter()
+                .any(|a| a == "--server=https://my-cluster-server.ns.svc:6443")
+        );
     }
 
     #[test]
@@ -909,12 +911,14 @@ mod tests {
         let sidecar =
             K3sBackend::build_publisher_sidecar("my-cluster", "ns", "rancher/k3s:v1.31.3+k3s1");
         let env = sidecar.env.as_ref().unwrap();
-        assert!(env
-            .iter()
-            .any(|e| e.name == "CLUSTER_NAME" && e.value.as_deref() == Some("my-cluster")));
-        assert!(env
-            .iter()
-            .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns")));
+        assert!(
+            env.iter()
+                .any(|e| e.name == "CLUSTER_NAME" && e.value.as_deref() == Some("my-cluster"))
+        );
+        assert!(
+            env.iter()
+                .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns"))
+        );
     }
 
     #[test]

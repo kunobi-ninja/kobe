@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
+use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
-use kube::ResourceExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -166,7 +166,7 @@ async fn handle_secret_event(
 
 #[cfg(test)]
 mod tests_v2 {
-    use super::super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+    use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::core::v1::Secret;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Binding, ObjectReference, Pod, PodStatus};
+use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
-use kube::ResourceExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 

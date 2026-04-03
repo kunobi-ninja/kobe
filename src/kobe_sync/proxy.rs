@@ -11,8 +11,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
-    TextEncoder,
+    Encoder, HistogramVec, IntCounterVec, TextEncoder, register_histogram_vec,
+    register_int_counter_vec,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -110,7 +110,9 @@ static PROXY_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         "kobe_sync_proxy_request_duration_seconds",
         "Request duration in seconds",
         &["method"],
-        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+        vec![
+            0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+        ]
     )
     .unwrap()
 });

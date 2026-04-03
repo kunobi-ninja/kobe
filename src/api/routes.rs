@@ -17,7 +17,7 @@ use crate::backend::ClusterBackend;
 use crate::controllers::claim::extend_lease_ttl;
 use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
 use crate::metrics;
-use crate::pool::{count_states, is_valid_k8s_name, parse_duration, PoolState};
+use crate::pool::{PoolState, count_states, is_valid_k8s_name, parse_duration};
 
 /// Shared application state for axum routes.
 #[derive(Clone)]

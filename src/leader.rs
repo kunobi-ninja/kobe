@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
-use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::Client;
+use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
 use tracing::{info, warn};
 
 const LEASE_DURATION_SECS: i32 = 15;

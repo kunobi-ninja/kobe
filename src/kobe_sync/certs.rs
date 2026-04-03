@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::server::WebPkiClientVerifier;
-use rustls::RootCertStore;
 use tracing::{debug, info};
 
 // Re-export VirtualClusterPki from the shared PKI module so existing callers
@@ -175,9 +175,9 @@ impl CertificateManager {
         ca_cert: &str,
         ca_key: &str,
     ) -> Result<()> {
+        use k8s_openapi::ByteString;
         use k8s_openapi::api::core::v1::Secret;
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-        use k8s_openapi::ByteString;
         use kube::api::{Api, PostParams};
         use std::collections::BTreeMap;
 

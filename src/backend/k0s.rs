@@ -22,8 +22,8 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams};
 use kube::Client;
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
@@ -31,8 +31,8 @@ use tracing::{debug, info, warn};
 use crate::crd::{Addon, ClusterConfig, ReadinessGate};
 
 use super::{
-    apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
-    read_kubeconfig_secret, virtual_client_from_kubeconfig, ClusterBackend,
+    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
+    read_kubeconfig_secret, virtual_client_from_kubeconfig,
 };
 
 /// Database name prefix for k0s clusters.
@@ -1045,12 +1045,14 @@ mod tests {
         let sidecar =
             K0sBackend::build_publisher_sidecar("my-cluster", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
         let env = sidecar.env.as_ref().unwrap();
-        assert!(env
-            .iter()
-            .any(|e| e.name == "CLUSTER_NAME" && e.value.as_deref() == Some("my-cluster")));
-        assert!(env
-            .iter()
-            .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns")));
+        assert!(
+            env.iter()
+                .any(|e| e.name == "CLUSTER_NAME" && e.value.as_deref() == Some("my-cluster"))
+        );
+        assert!(
+            env.iter()
+                .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns"))
+        );
     }
 
     #[test]

@@ -10,25 +10,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache dependencies: copy manifests first, build a dummy to populate cargo cache
+# Cache dependencies only — compile a lib stub, never a binary.
+# This populates the cargo registry + dep artifacts without creating
+# any kobe binaries that could be confused with real ones.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
-    cargo build --release 2>/dev/null || true && \
+RUN mkdir -p src/cli/commands && \
+    echo "pub fn stub() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/cli/main.rs && \
+    cargo build --release --lib 2>/dev/null || true && \
     rm -rf src
 
-# Build the real binaries
+# Build the real binaries — clean slate for kobe crates
 FROM deps AS build
 
 COPY . .
-RUN rm -rf target/release/kobe-operator target/release/kobe-sync target/release/kobe \
-           target/release/deps/kobe_operator* \
-           target/release/deps/kobe_sync* \
-           target/release/deps/kobe-* \
-           target/release/.fingerprint/kobe-operator* \
-           target/release/.fingerprint/kobe-sync* \
-           target/release/.fingerprint/kobe-* \
-           target/release/incremental/kobe_operator* \
-           target/release/incremental/kobe_sync* \
-           target/release/incremental/kobe-* && \
-    cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe && \
+RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe && \
     ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe

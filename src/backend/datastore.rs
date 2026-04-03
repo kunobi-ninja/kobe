@@ -11,7 +11,7 @@
 //! statements. We enforce a strict allowlist (`[a-zA-Z0-9_]`) and wrap names
 //! in double quotes.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
@@ -32,7 +32,9 @@ pub fn sanitize_db_name(cluster_name: &str, prefix: &str) -> Result<String> {
         .collect();
 
     if cleaned.is_empty() {
-        bail!("Cluster name '{cluster_name}' produces an empty database identifier after sanitization");
+        bail!(
+            "Cluster name '{cluster_name}' produces an empty database identifier after sanitization"
+        );
     }
 
     let mut db_name = format!("{prefix}{cleaned}");

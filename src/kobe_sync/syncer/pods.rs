@@ -7,15 +7,15 @@ use k8s_openapi::api::core::v1::{
     LocalObjectReference, PersistentVolumeClaimVolumeSource, Pod, PodSpec, SecretEnvSource,
     SecretKeySelector, SecretVolumeSource, Volume,
 };
+use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, PostParams};
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
-use kube::ResourceExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::traits::{ResourceSyncer, SyncerContextV2};
-use super::translator::{NameTranslator, LABEL_MANAGED, LABEL_VNS};
+use super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
 
 // ===========================================================================
 // v2: Pod syncer (virtual -> host)

@@ -9,16 +9,16 @@
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Secret;
+use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, ObjectMeta, Patch, PatchParams, TypeMeta};
 use kube::discovery::ApiResource;
-use kube::Client;
 use tracing::{debug, info, warn};
 
 use crate::crd::{Addon, CapiConfig, ClusterConfig, ReadinessGate};
 
 use super::{
-    apply_addon_impl, check_readiness_gate_impl, check_virtual_health, read_kubeconfig_secret,
-    virtual_client_from_kubeconfig, ClusterBackend,
+    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health,
+    read_kubeconfig_secret, virtual_client_from_kubeconfig,
 };
 
 /// CAPI Cluster API group/version constants.

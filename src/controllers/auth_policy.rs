@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use kube::Client;
 use kube::api::{Api, ListParams};
 use kube::runtime::watcher::{self, Config, Event};
-use kube::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 

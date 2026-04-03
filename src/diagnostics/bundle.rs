@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::primitives::ByteStream;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ListParams};
 use kube::{Client, Config, ResourceExt};
@@ -355,10 +355,12 @@ mod tests {
         assert_eq!(v["pod_logs"][0]["namespace"], "default");
         assert_eq!(v["pod_logs"][0]["pod"], "nginx-0");
         assert_eq!(v["pod_logs"][0]["container"], "nginx");
-        assert!(v["pod_logs"][0]["logs"]
-            .as_str()
-            .unwrap()
-            .contains("log line 1"));
+        assert!(
+            v["pod_logs"][0]["logs"]
+                .as_str()
+                .unwrap()
+                .contains("log line 1")
+        );
         // secrets_dump should be omitted when None
         assert!(v.get("secrets_dump").is_none());
     }
