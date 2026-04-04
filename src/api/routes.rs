@@ -18,6 +18,7 @@ use crate::controllers::claim::extend_lease_ttl;
 use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
 use crate::metrics;
 use crate::pool::{PoolState, count_states, is_valid_k8s_name, parse_duration};
+use kunobi_auth::server::{AuthnProvider, OptionalAuth};
 
 /// Shared application state for axum routes.
 #[derive(Clone)]
@@ -27,6 +28,30 @@ pub struct AppState<B: ClusterBackend> {
     pub namespace: String,
     pub pools: Arc<RwLock<std::collections::HashMap<String, PoolState>>>,
     pub backend: B,
+}
+
+/// Implement kunobi-auth's AuthnProvider so that RequiredAuth/OptionalAuth extractors work.
+///
+/// This bridges kobe's multi-provider JwtAuthenticator into kunobi-auth's generic auth model.
+/// Kobe-specific policy resolution is NOT included here — it stays in kobe's own AuthIdentity extractor.
+impl<B: ClusterBackend + Clone + Send + Sync + 'static> AuthnProvider for AppState<B> {
+    async fn authenticate(
+        &self,
+        token: &str,
+    ) -> Result<kunobi_auth::AuthIdentity, kunobi_auth::AuthError> {
+        let kobe_identity = self
+            .authenticator
+            .validate(token)
+            .await
+            .map_err(|e| kunobi_auth::AuthError::Unauthorized(e.to_string()))?;
+
+        Ok(kunobi_auth::AuthIdentity {
+            provider: kobe_identity.requester_type,
+            identity: kobe_identity.identity,
+            method: "oidc".to_string(),
+            claims: std::collections::HashMap::new(),
+        })
+    }
 }
 
 /// Maximum concurrent API requests. Provides application-level DoS protection.
@@ -706,32 +731,19 @@ async fn get_pool<B: ClusterBackend>(
 /// Returns version, auth methods, active sessions (if token provided), and accessible pools.
 async fn status<B: ClusterBackend>(
     State(state): State<AppState<B>>,
-    headers: axum::http::HeaderMap,
+    OptionalAuth(maybe_identity): OptionalAuth,
 ) -> Response {
     let methods = state.authenticator.auth_methods().await;
 
-    // Try to authenticate if a token is provided (optional)
-    let session = if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(header_str) = auth_header.to_str() {
-            if let Some(token) = header_str.strip_prefix("Bearer ") {
-                match state.authenticator.validate(token).await {
-                    Ok(identity) => {
-                        let pools = accessible_pools(&state, &identity).await;
-                        Some(StatusSession {
-                            method: "oidc".to_string(),
-                            identity: identity.identity,
-                            pools,
-                            expires_at: None,
-                        })
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+    // If a valid token was provided, build a session with accessible pools
+    let session = if let Some(identity) = maybe_identity {
+        let pools = accessible_pools_for_provider(&state, &identity.provider).await;
+        Some(StatusSession {
+            method: identity.method,
+            identity: identity.identity,
+            pools,
+            expires_at: None,
+        })
     } else {
         None
     };
@@ -805,14 +817,14 @@ struct StatusPool {
     total: u32,
 }
 
-/// Get the list of pool name patterns this identity can access.
-async fn accessible_pools<B: ClusterBackend>(
+/// Get accessible pools by provider/requester_type string.
+async fn accessible_pools_for_provider<B: ClusterBackend>(
     state: &AppState<B>,
-    identity: &AuthIdentity,
+    provider: &str,
 ) -> Vec<String> {
     if let Some(policy) = state
         .authenticator
-        .policy_for_requester_type(&identity.requester_type)
+        .policy_for_requester_type(provider)
         .await
     {
         policy.allowed_pools
