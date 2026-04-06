@@ -780,7 +780,7 @@ mod tests {
         let client = crate::testutil::mock_k8s_client(&server);
         let backend = MockBackend::new();
         let pools = Arc::new(RwLock::new(HashMap::new()));
-        let authenticator = Arc::new(JwtAuthenticator::new());
+        let authenticator = Arc::new(JwtAuthenticator::new("test".to_string()));
 
         let ctx = Arc::new(LeaseContext {
             client,

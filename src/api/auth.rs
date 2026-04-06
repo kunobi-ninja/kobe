@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use kunobi_auth::server::ssh::{CompiledSshProvider, NonceTracker, ParsedAuthorizedKey};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -89,20 +90,33 @@ struct CompiledProvider {
     rules: Vec<AccessRule>,
 }
 
+/// A compiled SSH policy provider, pairing kunobi-auth's CompiledSshProvider
+/// with kobe-specific authorization rules.
+struct CompiledSshPolicyProvider {
+    provider: CompiledSshProvider,
+    rules: Vec<AccessRule>,
+}
+
 /// JWT authenticator supporting any OIDC provider via AccessPolicy CRDs.
 pub struct JwtAuthenticator {
     http: HttpClient,
-    /// Compiled providers from AccessPolicy CRDs.
+    /// Compiled OIDC providers from AccessPolicy CRDs.
     providers: RwLock<Vec<CompiledProvider>>,
+    /// Compiled SSH providers from AccessPolicy CRDs.
+    ssh_providers: RwLock<Vec<CompiledSshPolicyProvider>>,
+    /// Nonce tracker for SSH replay protection.
+    nonce_tracker: NonceTracker,
     /// Cached JWKS per URL.
     jwks_cache: RwLock<HashMap<String, JwkSet>>,
+    /// SSHSIG namespace (e.g. "kobe-system").
+    ssh_namespace: String,
 }
 
 /// Cache TTL for JWKS keys.
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl JwtAuthenticator {
-    pub fn new() -> Self {
+    pub fn new(ssh_namespace: String) -> Self {
         let http = HttpClient::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
@@ -111,14 +125,28 @@ impl JwtAuthenticator {
         Self {
             http,
             providers: RwLock::new(Vec::new()),
+            ssh_providers: RwLock::new(Vec::new()),
+            nonce_tracker: NonceTracker::new(std::time::Duration::from_secs(60)),
             jwks_cache: RwLock::new(HashMap::new()),
+            ssh_namespace,
         }
     }
 
     /// Recompile the provider lookup table from AccessPolicy CRDs.
     /// Called by the AccessPolicy watcher whenever CRDs change.
     pub async fn update_policies(&self, policies: Vec<AccessPolicy>) {
-        let compiled: Vec<CompiledProvider> = policies
+        let mut oidc_policies = Vec::new();
+        let mut ssh_policies = Vec::new();
+        for policy in policies {
+            if policy.spec.auth.ssh.is_some() {
+                ssh_policies.push(policy);
+            } else {
+                oidc_policies.push(policy);
+            }
+        }
+
+        // Compile OIDC providers
+        let compiled: Vec<CompiledProvider> = oidc_policies
             .into_iter()
             .filter_map(|ap| {
                 let policy_name = ap.metadata.name.unwrap_or_default();
@@ -160,13 +188,59 @@ impl JwtAuthenticator {
 
         let count = compiled.len();
         *self.providers.write().await = compiled;
-        debug!(providers = count, "Access policies updated");
+        debug!(providers = count, "OIDC access policies updated");
+
+        // Compile SSH providers
+        let ssh_compiled: Vec<CompiledSshPolicyProvider> = ssh_policies
+            .into_iter()
+            .filter_map(|ap| {
+                let policy_name = ap.metadata.name.unwrap_or_default();
+                let spec = ap.spec;
+                let ssh = spec.auth.ssh?;
+
+                let mut keys: Vec<ParsedAuthorizedKey> = Vec::new();
+                for key_str in &ssh.authorized_keys {
+                    match kunobi_auth::server::ssh::parse_authorized_key(key_str) {
+                        Ok(parsed) => keys.push(parsed),
+                        Err(e) => warn!(provider = %policy_name, key = %key_str, "Skipping SSH key: {e}"),
+                    }
+                }
+
+                if keys.is_empty() {
+                    warn!(provider = %policy_name, "No valid SSH keys, skipping");
+                    return None;
+                }
+
+                let mut revoked_fingerprints = std::collections::HashSet::new();
+                for key_str in &ssh.revoked_keys {
+                    if let Ok(parsed) = kunobi_auth::server::ssh::parse_authorized_key(key_str) {
+                        revoked_fingerprints.insert(parsed.fingerprint);
+                    }
+                }
+
+                Some(CompiledSshPolicyProvider {
+                    provider: CompiledSshProvider {
+                        name: policy_name,
+                        keys,
+                        revoked_fingerprints,
+                        identity_template: spec.identity,
+                    },
+                    rules: spec.rules,
+                })
+            })
+            .collect();
+
+        let ssh_count = ssh_compiled.len();
+        *self.ssh_providers.write().await = ssh_compiled;
+        debug!(ssh_providers = ssh_count, "SSH policies updated");
     }
 
     /// Return the list of supported auth methods for the /v1/status endpoint.
     pub async fn auth_methods(&self) -> Vec<AuthMethodInfo> {
         let providers = self.providers.read().await;
-        providers
+        let ssh_providers = self.ssh_providers.read().await;
+
+        let mut methods: Vec<AuthMethodInfo> = providers
             .iter()
             .map(|p| AuthMethodInfo {
                 method_type: "oidc".to_string(),
@@ -174,7 +248,18 @@ impl JwtAuthenticator {
                 client_id: None, // TODO: expose client_id for CLI discovery
                 description: Some(p.name.clone()),
             })
-            .collect()
+            .collect();
+
+        for sp in ssh_providers.iter() {
+            methods.push(AuthMethodInfo {
+                method_type: "ssh".to_string(),
+                issuer: None,
+                client_id: None,
+                description: Some(sp.provider.name.clone()),
+            });
+        }
+
+        methods
     }
 
     /// Look up a policy by requester_type string.
@@ -193,6 +278,57 @@ impl JwtAuthenticator {
         let provider = providers.iter().find(|p| p.name == policy_name)?;
         let rule = find_matching_rule(&provider.rules, matched_value)?;
         Some(access_rule_to_policy(rule))
+    }
+
+    /// Validate an SSH-signed request and return the authenticated identity.
+    pub async fn validate_ssh(
+        &self,
+        ssh_header: &str,
+        method: &str,
+        path_with_query: &str,
+        body: Option<&[u8]>,
+    ) -> Result<AuthIdentity, AuthError> {
+        let parsed = kunobi_auth::server::ssh::parse_ssh_auth_header(ssh_header)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+
+        if self.nonce_tracker.check_and_insert(&parsed.nonce).await {
+            return Err(AuthError::InvalidToken("Replayed nonce".into()));
+        }
+
+        let ssh_providers = self.ssh_providers.read().await;
+        let body = body.unwrap_or(b"");
+
+        // Build a slice of CompiledSshProvider for the kunobi-auth verify function.
+        let raw_providers: Vec<CompiledSshProvider> =
+            ssh_providers.iter().map(|p| p.provider.clone()).collect();
+
+        let verified = kunobi_auth::server::ssh::verify_ssh_signature(
+            &parsed,
+            &self.ssh_namespace,
+            method,
+            path_with_query,
+            body,
+            &raw_providers,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+
+        // Find the matching kobe policy provider.
+        let policy_provider = ssh_providers
+            .iter()
+            .find(|p| p.provider.name == verified.provider_name)
+            .ok_or_else(|| AuthError::InvalidToken("Provider not found after verification".into()))?;
+
+        // SSH policies use a single unconditional rule (no claim matching).
+        let rule = find_matching_rule(&policy_provider.rules, None)
+            .ok_or_else(|| AuthError::InvalidToken("No access rule configured for SSH provider".into()))?;
+
+        Ok(AuthIdentity {
+            requester_type: verified.provider_name,
+            identity: verified.identity,
+            issuer: "ssh".to_string(),
+            policy: access_rule_to_policy(rule),
+        })
     }
 
     /// Validate a JWT and return the authenticated identity.
@@ -1027,14 +1163,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticator_new_has_no_providers() {
-        let auth = JwtAuthenticator::new();
+        let auth = JwtAuthenticator::new("test".to_string());
         let result = auth.policy_for_requester_type("anything:role").await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_update_policies_compiles_providers() {
-        let auth = JwtAuthenticator::new();
+        let auth = JwtAuthenticator::new("test".to_string());
 
         let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
@@ -1070,7 +1206,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_policy_for_requester_type_format() {
-        let auth = JwtAuthenticator::new();
+        let auth = JwtAuthenticator::new("test".to_string());
 
         let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
@@ -1115,7 +1251,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_no_providers_returns_error() {
-        let auth = JwtAuthenticator::new();
+        let auth = JwtAuthenticator::new("test".to_string());
         // Use a structurally valid JWT (header.payload.signature) so header
         // decoding succeeds and we exercise the "no providers" branch.
         let fake_token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.\

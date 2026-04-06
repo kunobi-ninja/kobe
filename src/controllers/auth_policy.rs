@@ -128,7 +128,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let authenticator = JwtAuthenticator::new();
+        let authenticator = JwtAuthenticator::new("test".to_string());
         let policies_api: Api<AccessPolicy> = Api::namespaced(client, "test-ns");
 
         load_policies(&policies_api, &authenticator).await;
@@ -171,7 +171,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let authenticator = JwtAuthenticator::new();
+        let authenticator = JwtAuthenticator::new("test".to_string());
         let policies_api: Api<AccessPolicy> = Api::namespaced(client, "test-ns");
 
         load_policies(&policies_api, &authenticator).await;
@@ -208,7 +208,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let authenticator = JwtAuthenticator::new();
+        let authenticator = JwtAuthenticator::new("test".to_string());
         let policies_api: Api<AccessPolicy> = Api::namespaced(client, "test-ns");
 
         // Should complete without panic — logs the error and returns early
