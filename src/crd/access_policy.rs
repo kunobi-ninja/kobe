@@ -47,6 +47,10 @@ pub struct AuthMethod {
     /// Kubernetes ServiceAccount authentication.
     #[serde(default)]
     pub service_account: Option<ServiceAccountAuth>,
+
+    /// SSH Ed25519 public key authentication.
+    #[serde(default)]
+    pub ssh: Option<SshAuth>,
 }
 
 /// OIDC provider configuration for JWT validation.
@@ -79,6 +83,21 @@ pub struct OidcAuth {
 pub struct TokenAuth {
     /// Name of the Secret containing the token (key: "token").
     pub secret_ref: String,
+}
+
+/// SSH Ed25519 public key authentication.
+///
+/// Public keys stored in OpenSSH authorized_keys format.
+/// Only Ed25519 keys are supported.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SshAuth {
+    /// Public keys in OpenSSH authorized_keys format.
+    pub authorized_keys: Vec<String>,
+
+    /// Revoked public keys (same format). Takes precedence over authorized_keys.
+    #[serde(default)]
+    pub revoked_keys: Vec<String>,
 }
 
 /// Kubernetes ServiceAccount-based authentication.
