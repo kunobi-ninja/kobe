@@ -740,6 +740,26 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
             .and_then(|v| v.to_str().ok())
             .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
 
+        // SSH-Signature path
+        if let Some(ssh_header) = auth_header.strip_prefix("SSH-Signature ") {
+            let method = parts.method.as_str();
+            let path_with_query = parts
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or(parts.uri.path());
+
+            return state
+                .authenticator
+                .validate_ssh(ssh_header, method, path_with_query, None)
+                .await
+                .map_err(|e| {
+                    warn!("SSH authentication failed: {e}");
+                    axum::http::StatusCode::UNAUTHORIZED
+                });
+        }
+
+        // Bearer token path (existing OIDC/JWT)
         let token = auth_header
             .strip_prefix("Bearer ")
             .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
