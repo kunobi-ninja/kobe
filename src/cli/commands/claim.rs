@@ -7,14 +7,17 @@ use super::{authed_client, get_auth_header, with_auth};
 pub async fn claim(pool: &str, ttl: &str, output: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
     let endpoint = config.endpoint();
-    let token = get_auth_header(endpoint).await?;
+    let body_json = serde_json::json!({
+        "pool": pool,
+        "ttl": ttl,
+    });
+    let body_bytes = serde_json::to_vec(&body_json)?;
+    let token = get_auth_header(endpoint, "POST", "/v1/leases", &body_bytes).await?;
 
     let client = authed_client();
     let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
-        .json(&serde_json::json!({
-            "pool": pool,
-            "ttl": ttl,
-        }))
+        .header("Content-Type", "application/json")
+        .body(body_bytes)
         .send()
         .await?;
 

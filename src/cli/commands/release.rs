@@ -6,7 +6,8 @@ use super::{authed_client, get_auth_header, with_auth};
 pub async fn release(lease_id: &str) -> Result<()> {
     let config = CliConfig::load()?;
     let endpoint = config.endpoint();
-    let token = get_auth_header(endpoint).await?;
+    let path = format!("/v1/leases/{lease_id}");
+    let token = get_auth_header(endpoint, "DELETE", &path, b"").await?;
 
     let client = authed_client();
     let response = with_auth(

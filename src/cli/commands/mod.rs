@@ -18,15 +18,20 @@ pub use status::status;
 
 use config::{AuthMode, CliConfig};
 
-/// Get a valid auth token based on the configured auth mode.
-/// Returns None for no-auth mode, Some(token) for token/oidc.
-pub(crate) async fn get_auth_header(endpoint: &str) -> anyhow::Result<Option<String>> {
+/// Get a valid auth header value based on the configured auth mode.
+/// Returns None for no-auth mode, Some(header) for token/oidc/ssh.
+pub(crate) async fn get_auth_header(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> anyhow::Result<Option<String>> {
     let config = CliConfig::load()?;
 
     match config.auth {
         AuthMode::None => Ok(None),
         AuthMode::Token => match &config.token {
-            Some(t) => Ok(Some(t.clone())),
+            Some(t) => Ok(Some(format!("Bearer {t}"))),
             None => anyhow::bail!(
                 "Auth mode is 'token' but no token configured. Run: kobe config set token <value>"
             ),
@@ -34,7 +39,82 @@ pub(crate) async fn get_auth_header(endpoint: &str) -> anyhow::Result<Option<Str
         AuthMode::Oidc => {
             let service_config = kunobi_auth::client::ServiceConfig::discover(endpoint).await?;
             let client = kunobi_auth::client::AuthClient::new(service_config)?;
-            Ok(Some(client.token().await?))
+            Ok(Some(format!("Bearer {}", client.token().await?)))
+        }
+        AuthMode::Ssh => {
+            let client = kunobi_auth::client::AuthClient::with_ssh(
+                config.ssh_fingerprint.clone(),
+            )?;
+            // Discover audience from /v1/status for TOFU + namespace
+            let audience = discover_ssh_audience(endpoint)
+                .await
+                .unwrap_or_else(|_| endpoint.to_string());
+            tofu_check(endpoint, &audience).await?;
+            let header = client.authorize(&audience, method, path, body).await?;
+            Ok(Some(header))
+        }
+    }
+}
+
+async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
+    let resp: serde_json::Value = reqwest::get(format!("{endpoint}/v1/status"))
+        .await?
+        .json()
+        .await?;
+    if let Some(methods) = resp["auth"]["methods"].as_array() {
+        for method in methods {
+            if method["type"].as_str() == Some("ssh") {
+                if let Some(audience) = method["audience"].as_str() {
+                    return Ok(audience.to_string());
+                }
+            }
+        }
+    }
+    Ok(endpoint.to_string())
+}
+
+async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
+    let store = kunobi_auth::client::TofuStore::new()?;
+    match store.verify(endpoint, audience)? {
+        kunobi_auth::client::TofuResult::Trusted => Ok(()),
+        kunobi_auth::client::TofuResult::FirstConnect { endpoint, audience } => {
+            eprintln!();
+            eprintln!("Connecting to {endpoint}");
+            eprintln!("  Audience: {audience}");
+            eprintln!();
+            eprint!("Trust this service? [y/N] ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            if input.trim().eq_ignore_ascii_case("y") {
+                store.trust(&endpoint, &audience)?;
+                Ok(())
+            } else {
+                anyhow::bail!("Connection refused by user")
+            }
+        }
+        kunobi_auth::client::TofuResult::AudienceChanged {
+            endpoint,
+            previous,
+            current,
+        } => {
+            eprintln!();
+            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+            eprintln!("@    WARNING: SERVICE AUDIENCE HAS CHANGED!       @");
+            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+            eprintln!("The audience for {endpoint} changed:");
+            eprintln!("  Previous: {previous}");
+            eprintln!("  Current:  {current}");
+            eprintln!("This could mean the service was reconfigured, or it");
+            eprintln!("could indicate a man-in-the-middle attack.");
+            eprint!("Continue? [y/N] ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            if input.trim().eq_ignore_ascii_case("y") {
+                store.trust(&endpoint, &current)?;
+                Ok(())
+            } else {
+                anyhow::bail!("Connection refused by user")
+            }
         }
     }
 }
@@ -47,10 +127,10 @@ pub(crate) fn authed_client() -> reqwest::Client {
 /// Add auth header to a request builder if available.
 pub(crate) fn with_auth(
     builder: reqwest::RequestBuilder,
-    token: &Option<String>,
+    auth_header: &Option<String>,
 ) -> reqwest::RequestBuilder {
-    match token {
-        Some(t) => builder.bearer_auth(t),
+    match auth_header {
+        Some(h) => builder.header("Authorization", h),
         None => builder,
     }
 }

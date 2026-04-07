@@ -6,7 +6,7 @@ use super::{authed_client, get_auth_header, with_auth};
 pub async fn leases() -> Result<()> {
     let config = CliConfig::load()?;
     let endpoint = config.endpoint();
-    let token = get_auth_header(endpoint).await?;
+    let token = get_auth_header(endpoint, "GET", "/v1/leases", b"").await?;
 
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}/v1/leases")), &token)
