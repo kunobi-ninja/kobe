@@ -202,7 +202,9 @@ impl JwtAuthenticator {
                 for key_str in &ssh.authorized_keys {
                     match kunobi_auth::server::ssh::parse_authorized_key(key_str) {
                         Ok(parsed) => keys.push(parsed),
-                        Err(e) => warn!(provider = %policy_name, key = %key_str, "Skipping SSH key: {e}"),
+                        Err(e) => {
+                            warn!(provider = %policy_name, key = %key_str, "Skipping SSH key: {e}")
+                        }
                     }
                 }
 
@@ -317,11 +319,14 @@ impl JwtAuthenticator {
         let policy_provider = ssh_providers
             .iter()
             .find(|p| p.provider.name == verified.provider_name)
-            .ok_or_else(|| AuthError::InvalidToken("Provider not found after verification".into()))?;
+            .ok_or_else(|| {
+                AuthError::InvalidToken("Provider not found after verification".into())
+            })?;
 
         // SSH policies use a single unconditional rule (no claim matching).
-        let rule = find_matching_rule(&policy_provider.rules, None)
-            .ok_or_else(|| AuthError::InvalidToken("No access rule configured for SSH provider".into()))?;
+        let rule = find_matching_rule(&policy_provider.rules, None).ok_or_else(|| {
+            AuthError::InvalidToken("No access rule configured for SSH provider".into())
+        })?;
 
         Ok(AuthIdentity {
             requester_type: verified.provider_name,

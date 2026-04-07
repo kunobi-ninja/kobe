@@ -69,8 +69,8 @@ async fn main() -> anyhow::Result<()> {
     let backend = BackendDispatch::K3s(K3sBackend::new(client.clone(), pg_pool, pg_base_url));
     let shutdown = CancellationToken::new();
     let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
-    let ssh_namespace = std::env::var("KOBE_SSH_NAMESPACE")
-        .unwrap_or_else(|_| "kobe-system".to_string());
+    let ssh_namespace =
+        std::env::var("KOBE_SSH_NAMESPACE").unwrap_or_else(|_| "kobe-system".to_string());
     let authenticator = Arc::new(JwtAuthenticator::new(ssh_namespace));
 
     // ── Start HTTP server immediately (all replicas serve API + health) ──
