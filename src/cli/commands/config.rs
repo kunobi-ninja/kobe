@@ -13,6 +13,8 @@ pub enum AuthMode {
     /// OIDC browser login (default)
     #[default]
     Oidc,
+    /// SSH key signing (SSHSIG)
+    Ssh,
 }
 
 impl std::fmt::Display for AuthMode {
@@ -21,6 +23,7 @@ impl std::fmt::Display for AuthMode {
             AuthMode::None => write!(f, "none"),
             AuthMode::Token => write!(f, "token"),
             AuthMode::Oidc => write!(f, "oidc"),
+            AuthMode::Ssh => write!(f, "ssh"),
         }
     }
 }
@@ -38,6 +41,10 @@ pub struct CliConfig {
     /// Static bearer token (when auth = token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+
+    /// SSH key fingerprint (when auth = ssh). If None, ~/.ssh/id_ed25519 is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_fingerprint: Option<String>,
 }
 
 const DEFAULT_ENDPOINT: &str = "https://kobe.kunobi.ninja";
@@ -88,14 +95,18 @@ pub async fn config_set(key: &str, value: &str) -> Result<()> {
                 "none" => AuthMode::None,
                 "token" => AuthMode::Token,
                 "oidc" => AuthMode::Oidc,
-                _ => anyhow::bail!("Invalid auth mode: {value}. Valid: none, token, oidc"),
+                "ssh" => AuthMode::Ssh,
+                _ => anyhow::bail!("Invalid auth mode: {value}. Valid: none, token, oidc, ssh"),
             }
         }
         "token" => {
             config.token = Some(value.to_string());
             config.auth = AuthMode::Token;
         }
-        _ => anyhow::bail!("Unknown key: {key}. Valid: endpoint, auth, token"),
+        "ssh-fingerprint" => {
+            config.ssh_fingerprint = Some(value.to_string());
+        }
+        _ => anyhow::bail!("Unknown key: {key}. Valid: endpoint, auth, token, ssh-fingerprint"),
     }
     config.save()?;
     println!("Set {key} = {value}");
@@ -125,5 +136,12 @@ fn print_config(config: &CliConfig) {
             })
             .unwrap_or_else(|| "(not set)".to_string());
         println!("token:    {masked}");
+    }
+    if config.auth == AuthMode::Ssh {
+        let fp = config
+            .ssh_fingerprint
+            .as_deref()
+            .unwrap_or("(not set — will use ~/.ssh/id_ed25519)");
+        println!("ssh-fingerprint: {fp}");
     }
 }

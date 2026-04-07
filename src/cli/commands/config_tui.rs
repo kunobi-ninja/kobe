@@ -81,6 +81,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
         AuthMode::None => "none",
         AuthMode::Token => "token",
         AuthMode::Oidc => "oidc",
+        AuthMode::Ssh => "ssh",
     };
 
     vec![
@@ -97,7 +98,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             label: "Auth mode",
             kind: FieldKind::Select,
             value: auth_str.to_string(),
-            options: vec!["none", "token", "oidc"],
+            options: vec!["none", "token", "oidc", "ssh"],
             default_hint: "oidc",
             is_password: false,
             visible_when: None,
@@ -110,6 +111,15 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             default_hint: "(not set)",
             is_password: true,
             visible_when: Some((1, "token")), // only visible when auth mode == "token"
+        },
+        FormField {
+            label: "SSH fingerprint",
+            kind: FieldKind::Text,
+            value: config.ssh_fingerprint.clone().unwrap_or_default(),
+            options: vec![],
+            default_hint: "(optional — uses ~/.ssh/id_ed25519)",
+            is_password: false,
+            visible_when: Some((1, "ssh")), // only visible when auth mode == "ssh"
         },
     ]
 }
@@ -124,6 +134,7 @@ fn fields_to_config(fields: &[FormField]) -> CliConfig {
     let auth = match fields[1].value.as_str() {
         "none" => AuthMode::None,
         "token" => AuthMode::Token,
+        "ssh" => AuthMode::Ssh,
         _ => AuthMode::Oidc,
     };
 
@@ -133,10 +144,17 @@ fn fields_to_config(fields: &[FormField]) -> CliConfig {
         Some(fields[2].value.clone())
     };
 
+    let ssh_fingerprint = if fields[3].value.is_empty() {
+        None
+    } else {
+        Some(fields[3].value.clone())
+    };
+
     CliConfig {
         endpoint,
         auth,
         token,
+        ssh_fingerprint,
     }
 }
 
