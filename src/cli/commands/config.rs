@@ -42,7 +42,7 @@ pub struct CliConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
-    /// SSH key fingerprint (when auth = ssh). If None, ~/.ssh/id_ed25519 is used.
+    /// SSH key fingerprint (when auth = ssh). If None, first Ed25519 key is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_fingerprint: Option<String>,
 }
