@@ -73,6 +73,9 @@ pub struct AuthMethodInfo {
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Service audience for SSH signature namespace binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
 }
 
 /// A compiled provider entry, built from an AccessPolicy CRD.
@@ -249,6 +252,7 @@ impl JwtAuthenticator {
                 issuer: Some(p.issuer.clone()),
                 client_id: None, // TODO: expose client_id for CLI discovery
                 description: Some(p.name.clone()),
+                audience: None,
             })
             .collect();
 
@@ -258,6 +262,7 @@ impl JwtAuthenticator {
                 issuer: None,
                 client_id: None,
                 description: Some(sp.provider.name.clone()),
+                audience: Some(self.ssh_namespace.clone()),
             });
         }
 
