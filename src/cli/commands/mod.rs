@@ -42,8 +42,7 @@ pub(crate) async fn get_auth_header(
             Ok(Some(format!("Bearer {}", client.token().await?)))
         }
         AuthMode::Ssh => {
-            let client =
-                kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
+            let client = kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
             // Discover audience from /v1/status — retry once if server hasn't loaded policies yet
             let audience = discover_ssh_audience(endpoint).await?;
             tofu_check(endpoint, &audience).await?;
