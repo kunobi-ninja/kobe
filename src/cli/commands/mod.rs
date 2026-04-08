@@ -42,11 +42,10 @@ pub(crate) async fn get_auth_header(
             Ok(Some(format!("Bearer {}", client.token().await?)))
         }
         AuthMode::Ssh => {
-            let client = kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
-            // Discover audience from /v1/status for TOFU + namespace
-            let audience = discover_ssh_audience(endpoint)
-                .await
-                .unwrap_or_else(|_| endpoint.to_string());
+            let client =
+                kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
+            // Discover audience from /v1/status — retry once if server hasn't loaded policies yet
+            let audience = discover_ssh_audience(endpoint).await?;
             tofu_check(endpoint, &audience).await?;
             let header = client.authorize(&audience, method, path, body).await?;
             Ok(Some(header))
@@ -55,20 +54,29 @@ pub(crate) async fn get_auth_header(
 }
 
 async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
-    let resp: serde_json::Value = reqwest::get(format!("{endpoint}/v1/status"))
-        .await?
-        .json()
-        .await?;
-    if let Some(methods) = resp["auth"]["methods"].as_array() {
-        for method in methods {
-            if method["type"].as_str() == Some("ssh") {
-                if let Some(audience) = method["audience"].as_str() {
-                    return Ok(audience.to_string());
+    // Try twice — the server may not have loaded policies on first attempt
+    for attempt in 0..2 {
+        let resp: serde_json::Value = reqwest::get(format!("{endpoint}/v1/status"))
+            .await?
+            .json()
+            .await?;
+        if let Some(methods) = resp["auth"]["methods"].as_array() {
+            for method in methods {
+                if method["type"].as_str() == Some("ssh") {
+                    if let Some(audience) = method["audience"].as_str() {
+                        return Ok(audience.to_string());
+                    }
                 }
             }
         }
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
-    Ok(endpoint.to_string())
+    anyhow::bail!(
+        "Server at {endpoint} has no SSH auth method configured. \
+         Check that an AccessPolicy with ssh auth exists in the cluster."
+    )
 }
 
 async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
