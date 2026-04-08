@@ -94,11 +94,7 @@ async fn main() -> anyhow::Result<()> {
             .await
     });
 
-    // ── Wait for leader election before starting controllers ──
-    let leader_rx =
-        leader::run_leader_election(client.clone(), &namespace, "kobe-operator").await?;
-
-    // Start AccessPolicy watcher
+    // ── Start AccessPolicy watcher on ALL replicas (auth is needed everywhere) ──
     let auth_client = client.clone();
     let auth_ns = namespace.clone();
     let auth_authenticator = authenticator.clone();
@@ -112,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     });
+
+    // ── Wait for leader election before starting controllers ──
+    let leader_rx =
+        leader::run_leader_election(client.clone(), &namespace, "kobe-operator").await?;
 
     // Detect Velero CRDs for snapshot support
     let velero = detect_velero(&client).await;
