@@ -144,6 +144,8 @@ struct LeaseSummary {
     phase: String,
     profile: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
     #[serde(skip_serializing_if = "is_zero")]
     queue_position: u32,
@@ -338,6 +340,7 @@ async fn list_leases<B: ClusterBackend>(
                         id: c.name_any(),
                         phase: status.phase.to_string(),
                         profile: c.spec.pool_ref.clone(),
+                        cluster_name: status.cluster_name,
                         expires_at: status.expires_at,
                         queue_position: status.queue_position,
                         diagnostics_url: status.diagnostics_url,

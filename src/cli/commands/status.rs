@@ -109,14 +109,10 @@ pub async fn status() -> Result<()> {
                 .collect();
             for l in &pool_leases {
                 let id = l["id"].as_str().unwrap_or("?");
-                let cluster = l["clusterName"]
-                    .as_str()
-                    .or(l["cluster_name"].as_str())
-                    .unwrap_or("-");
+                let cluster = l["cluster_name"].as_str().unwrap_or("-");
                 let phase = l["phase"].as_str().unwrap_or("?");
-                let expires = l["expiresAt"]
+                let expires = l["expires_at"]
                     .as_str()
-                    .or(l["expires_at"].as_str())
                     .map(format_relative_time)
                     .unwrap_or_else(|| phase.to_string());
                 println!("    \x1b[2m{id}\x1b[0m  {cluster}  \x1b[2m{expires}\x1b[0m");
