@@ -3,7 +3,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "kobe", about = "Claim Kubernetes clusters from Kobe pools")]
+#[command(name = "kobe", about = "Kubernetes cluster pool manager")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -11,7 +11,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show endpoint status, auth methods, sessions, and pools
+    /// Show status overview (server, pools, leases)
     Status,
     /// Authenticate with the Kobe service
     Login,
@@ -19,8 +19,22 @@ enum Commands {
     Logout,
     /// List available cluster pools
     Pools,
-    /// Claim a cluster from a pool
-    Claim {
+    /// Manage cluster leases
+    Lease {
+        #[command(subcommand)]
+        action: LeaseAction,
+    },
+    /// Manage CLI configuration (interactive if no subcommand)
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LeaseAction {
+    /// Create a new lease (claim a cluster from a pool)
+    Create {
         /// Pool name (e.g. ci-small)
         pool: String,
         /// Lease TTL
@@ -31,16 +45,11 @@ enum Commands {
         output: Option<String>,
     },
     /// List your active leases
-    Leases,
+    List,
     /// Release a cluster lease
     Release {
         /// Lease ID
         lease_id: String,
-    },
-    /// Manage CLI configuration (interactive if no subcommand)
-    Config {
-        #[command(subcommand)]
-        action: Option<ConfigAction>,
     },
 }
 
@@ -48,7 +57,7 @@ enum Commands {
 enum ConfigAction {
     /// Set a configuration value
     Set {
-        /// Key (endpoint, auth, token)
+        /// Key (endpoint, auth, token, ssh-fingerprint)
         key: String,
         /// Value
         value: String,
@@ -66,11 +75,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Login => commands::login().await,
         Commands::Logout => commands::logout().await,
         Commands::Pools => commands::pools().await,
-        Commands::Claim { pool, ttl, output } => {
-            commands::claim(&pool, &ttl, output.as_deref()).await
-        }
-        Commands::Leases => commands::leases().await,
-        Commands::Release { lease_id } => commands::release(&lease_id).await,
+        Commands::Lease { action } => match action {
+            LeaseAction::Create { pool, ttl, output } => {
+                commands::claim(&pool, &ttl, output.as_deref()).await
+            }
+            LeaseAction::List => commands::leases().await,
+            LeaseAction::Release { lease_id } => commands::release(&lease_id).await,
+        },
         Commands::Config { action } => match action {
             Some(ConfigAction::Set { key, value }) => commands::config_set(&key, &value).await,
             Some(ConfigAction::Show) => commands::config_show().await,
