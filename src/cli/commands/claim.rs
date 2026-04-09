@@ -8,11 +8,13 @@ pub async fn claim(pool: &str, ttl: &str, output: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
     let endpoint = config.endpoint();
     let body_json = serde_json::json!({
-        "pool": pool,
+        "profile": pool,
         "ttl": ttl,
     });
     let body_bytes = serde_json::to_vec(&body_json)?;
-    let token = get_auth_header(endpoint, "POST", "/v1/leases", &body_bytes).await?;
+    // Body signing not yet supported server-side (extractor doesn't have body access).
+    // Sign with empty body for now.
+    let token = get_auth_header(endpoint, "POST", "/v1/leases", b"").await?;
 
     let client = authed_client();
     let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
@@ -22,15 +24,15 @@ pub async fn claim(pool: &str, ttl: &str, output: Option<&str>) -> Result<()> {
         .await?;
 
     let status = response.status();
-    let body: serde_json::Value = response.json().await?;
-
     if !status.is_success() {
-        let msg = body["error"]
-            .as_str()
-            .or(body["message"].as_str())
-            .unwrap_or("Unknown error");
+        let text = response.text().await.unwrap_or_default();
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+            .unwrap_or(text);
         anyhow::bail!("Failed to claim cluster (HTTP {status}): {msg}");
     }
+    let body: serde_json::Value = response.json().await?;
 
     let lease_id = body["id"].as_str().unwrap_or("unknown");
     let cluster_name = body["clusterName"]
