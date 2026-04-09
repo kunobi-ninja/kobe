@@ -96,7 +96,7 @@ pub async fn status() -> Result<()> {
             let claimed = p["claimed"].as_u64().unwrap_or(0);
             let ready_color = if ready > 0 { "\x1b[32m" } else { "\x1b[33m" };
             let claimed_str = if claimed > 0 {
-                format!("  \x1b[33mclaimed={claimed}\x1b[0m")
+                format!("  \x1b[33mleased={claimed}\x1b[0m")
             } else {
                 String::new()
             };

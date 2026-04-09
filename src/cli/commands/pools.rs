@@ -26,7 +26,7 @@ pub async fn pools() -> Result<()> {
                 let name = pool["name"].as_str().unwrap_or("?");
                 let ready = pool["ready"].as_u64().unwrap_or(0);
                 let claimed = pool["claimed"].as_u64().unwrap_or(0);
-                println!("{name}  ready={ready}  claimed={claimed}");
+                println!("{name}  ready={ready}  leased={claimed}");
             }
         }
     }
