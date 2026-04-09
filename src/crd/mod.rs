@@ -1,11 +1,11 @@
 pub mod access_policy;
-pub mod claim;
+pub mod lease;
 #[allow(dead_code)]
 pub mod datastore;
 pub mod profile;
 
 pub use access_policy::*;
-pub use claim::*;
+pub use lease::*;
 #[allow(unused_imports)]
 pub use datastore::*;
 pub use profile::*;

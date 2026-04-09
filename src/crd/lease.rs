@@ -28,7 +28,7 @@ pub struct ClusterLeaseSpec {
     /// Identity of the requester.
     pub requester: Requester,
 
-    /// Claim priority for queue ordering.
+    /// Lease priority for queue ordering.
     /// Higher values are served first.
     #[serde(default = "default_priority")]
     pub priority: u32,
@@ -57,11 +57,11 @@ pub struct ClusterLeaseStatus {
     #[serde(default)]
     pub cluster_name: Option<String>,
 
-    /// When the claim was bound to a vcluster.
+    /// When the lease was bound to a vcluster.
     #[serde(default)]
     pub bound_at: Option<String>,
 
-    /// When the claim expires (TTL deadline).
+    /// When the lease expires (TTL deadline).
     #[serde(default)]
     pub expires_at: Option<String>,
 
@@ -73,7 +73,7 @@ pub struct ClusterLeaseStatus {
     #[serde(default)]
     pub diagnostics_url: Option<String>,
 
-    /// Number of TTL extensions granted for this claim.
+    /// Number of TTL extensions granted for this lease.
     #[serde(default)]
     pub extensions_count: u32,
 

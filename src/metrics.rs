@@ -17,7 +17,7 @@ pub static POOL_CLUSTERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Claim lifecycle counters.
+/// Lease lifecycle counters.
 ///
 /// Labels: `profile`, `event` (created_fast, created_queued, released, expired, extended).
 pub static CLAIMS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -29,7 +29,7 @@ pub static CLAIMS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Time to bind a claim (fast path only — slow path is asynchronous).
+/// Time to bind a lease (fast path only — slow path is asynchronous).
 ///
 /// Labels: `profile`.
 pub static CLAIM_BIND_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -42,7 +42,7 @@ pub static CLAIM_BIND_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Pending claims per profile.
+/// Pending leases per profile.
 pub static QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "kunobi_queue_depth",
@@ -66,7 +66,7 @@ pub static HEALTH_CHECKS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Reconciliation counters.
 ///
-/// Labels: `controller` (profile, claim), `result` (ok, error).
+/// Labels: `controller` (profile, lease), `result` (ok, error).
 pub static RECONCILIATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "kunobi_reconciliations_total",

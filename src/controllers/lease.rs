@@ -15,13 +15,13 @@ use crate::crd::{ClusterLease, ClusterLeaseStatus, ClusterPool, LeasePhase};
 use crate::diagnostics;
 use crate::pool::{ClusterState, PoolState, parse_duration};
 
-/// Shared state for the claim controller.
+/// Shared state for the lease controller.
 pub struct LeaseContext<B: ClusterBackend> {
     pub client: Client,
     pub backend: B,
     /// Reference to pool state shared with profile controller.
     pub pools: Arc<RwLock<std::collections::HashMap<String, PoolState>>>,
-    /// Priority queue of pending claims per profile.
+    /// Priority queue of pending leases per profile.
     pub queues: RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
     /// Operator namespace.
     pub namespace: String,
@@ -31,15 +31,15 @@ pub struct LeaseContext<B: ClusterBackend> {
     pub factory: Option<BackendFactory>,
 }
 
-/// A pending claim in the priority queue.
+/// A pending lease in the priority queue.
 #[derive(Debug, Clone)]
 pub struct PendingLease {
-    pub claim_name: String,
+    pub lease_name: String,
     pub priority: u32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Error type for the claim controller.
+/// Error type for the lease controller.
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
     #[error("Kubernetes API error: {0}")]
@@ -48,8 +48,8 @@ pub enum LeaseError {
     Lifecycle(#[from] anyhow::Error),
 }
 
-/// Start the claim reconciler controller.
-pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
+/// Start the lease reconciler controller.
+pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     client: Client,
     namespace: &str,
     backend: B,
@@ -58,7 +58,7 @@ pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
     factory: Option<BackendFactory>,
     shutdown: CancellationToken,
 ) {
-    let claims: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
 
     let ctx = Arc::new(LeaseContext {
         client: client.clone(),
@@ -79,23 +79,23 @@ pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
         run_reaper(reaper_ctx, &reaper_ns, reaper_shutdown).await;
     });
 
-    info!("Starting claim controller");
+    info!("Starting lease controller");
 
-    let controller = Controller::new(claims, Config::default())
-        .run(reconcile_claim, error_policy, ctx)
+    let controller = Controller::new(leases, Config::default())
+        .run(reconcile_lease, error_policy, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _action)) => {
                     crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["claim", "ok"])
+                        .with_label_values(&["lease", "ok"])
                         .inc();
-                    debug!(claim = %obj.name, "Claim reconciled");
+                    debug!(lease = %obj.name, "Lease reconciled");
                 }
                 Err(e) => {
                     crate::metrics::RECONCILIATIONS_TOTAL
-                        .with_label_values(&["claim", "error"])
+                        .with_label_values(&["lease", "error"])
                         .inc();
-                    error!("Claim reconciliation error: {e:?}");
+                    error!("Lease reconciliation error: {e:?}");
                 }
             }
         });
@@ -103,7 +103,7 @@ pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
     tokio::select! {
         _ = controller => {},
         _ = shutdown.cancelled() => {
-            info!("Claim controller shutting down");
+            info!("Lease controller shutting down");
         },
     }
 }
@@ -112,24 +112,24 @@ pub async fn run_claim_controller<B: ClusterBackend + Clone + 'static>(
 async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
 
-    let claims = match leases_api.list(&ListParams::default()).await {
+    let leases = match leases_api.list(&ListParams::default()).await {
         Ok(list) => list,
         Err(e) => {
-            error!("Failed to list claims for queue rebuild: {e}");
+            error!("Failed to list leases for queue rebuild: {e}");
             return;
         }
     };
 
     let mut queues = ctx.queues.write().await;
 
-    for claim in &claims {
-        let status = claim.status.clone().unwrap_or_default();
+    for lease in &leases {
+        let status = lease.status.clone().unwrap_or_default();
         if status.phase != LeasePhase::Pending {
             continue;
         }
 
-        let name = claim.name_any();
-        let created_at = claim
+        let name = lease.name_any();
+        let created_at = lease
             .metadata
             .creation_timestamp
             .as_ref()
@@ -141,13 +141,13 @@ async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
             .unwrap_or_else(chrono::Utc::now);
 
         let queue = queues
-            .entry(claim.spec.pool_ref.clone())
+            .entry(lease.spec.pool_ref.clone())
             .or_insert_with(Vec::new);
 
-        if !queue.iter().any(|p| p.claim_name == name) {
+        if !queue.iter().any(|p| p.lease_name == name) {
             queue.push(PendingLease {
-                claim_name: name,
-                priority: claim.spec.priority,
+                lease_name: name,
+                priority: lease.spec.priority,
                 created_at,
             });
         }
@@ -164,7 +164,7 @@ async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
     let total: usize = queues.values().map(|q| q.len()).sum();
     if total > 0 {
         info!(
-            pending_claims = total,
+            pending_leases = total,
             profiles = queues.len(),
             "Rebuilt priority queues from existing CRDs"
         );
@@ -172,23 +172,23 @@ async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
 }
 
 /// Main reconciliation logic for a ClusterLease.
-#[tracing::instrument(skip_all, fields(claim = %claim.name_any()))]
-async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
-    claim: Arc<ClusterLease>,
+#[tracing::instrument(skip_all, fields(lease = %lease.name_any()))]
+async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
+    lease: Arc<ClusterLease>,
     ctx: Arc<LeaseContext<B>>,
 ) -> Result<Action, LeaseError> {
-    let name = claim.name_any();
-    let ns = claim.namespace().unwrap_or_else(|| ctx.namespace.clone());
+    let name = lease.name_any();
+    let ns = lease.namespace().unwrap_or_else(|| ctx.namespace.clone());
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
 
-    let status = claim.status.clone().unwrap_or_default();
+    let status = lease.status.clone().unwrap_or_default();
     let phase = &status.phase;
 
     match phase {
         LeasePhase::Pending => {
-            info!(claim = %name, profile = %claim.spec.pool_ref, "Reconciling pending claim");
+            info!(lease = %name, profile = %lease.spec.pool_ref, "Reconciling pending lease");
 
-            let created_at = claim
+            let created_at = lease
                 .metadata
                 .creation_timestamp
                 .as_ref()
@@ -202,13 +202,13 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             let (is_head, position) = {
                 let mut queues = ctx.queues.write().await;
                 let queue = queues
-                    .entry(claim.spec.pool_ref.clone())
+                    .entry(lease.spec.pool_ref.clone())
                     .or_insert_with(Vec::new);
 
-                if !queue.iter().any(|p| p.claim_name == name) {
+                if !queue.iter().any(|p| p.lease_name == name) {
                     queue.push(PendingLease {
-                        claim_name: name.clone(),
-                        priority: claim.spec.priority,
+                        lease_name: name.clone(),
+                        priority: lease.spec.priority,
                         created_at,
                     });
                     queue.sort_by(|a, b| {
@@ -220,10 +220,10 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
 
                 let pos = queue
                     .iter()
-                    .position(|p| p.claim_name == name)
+                    .position(|p| p.lease_name == name)
                     .map(|p| p as u32 + 1)
                     .unwrap_or(0);
-                let head = queue.first().map(|h| h.claim_name == name).unwrap_or(false);
+                let head = queue.first().map(|h| h.lease_name == name).unwrap_or(false);
                 (head, pos)
             };
 
@@ -241,13 +241,13 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 )
                 .await?;
 
-            if let Some(profile) = get_profile(&ctx.client, &claim.spec.pool_ref, &ns).await {
+            if let Some(profile) = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await {
                 if let Some(scaling) = &profile.spec.scaling {
                     if let Some(timeout) = parse_duration(&scaling.queue_timeout) {
                         let age = chrono::Utc::now() - created_at;
                         if age > timeout {
-                            warn!(claim = %name, "Claim exceeded queue timeout, expiring");
-                            remove_from_queue(&ctx.queues, &claim.spec.pool_ref, &name).await;
+                            warn!(lease = %name, "Lease exceeded queue timeout, expiring");
+                            remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                             let patch = serde_json::json!({
                                 "status": { "phase": "Expired" }
                             });
@@ -265,14 +265,14 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             }
 
             if !is_head {
-                debug!(claim = %name, position, "Not queue head, waiting for higher-priority claims");
+                debug!(lease = %name, position, "Not queue head, waiting for higher-priority leases");
                 return Ok(Action::requeue(std::time::Duration::from_secs(5)));
             }
 
             let reserved_cluster = {
                 let mut pools = ctx.pools.write().await;
                 let pool = pools
-                    .entry(claim.spec.pool_ref.clone())
+                    .entry(lease.spec.pool_ref.clone())
                     .or_insert_with(|| PoolState {
                         clusters: std::collections::HashMap::new(),
                     });
@@ -295,13 +295,13 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
 
             if let Some(cluster_name) = reserved_cluster {
                 let ttl =
-                    parse_duration(&claim.spec.ttl).unwrap_or_else(|| chrono::Duration::hours(1));
+                    parse_duration(&lease.spec.ttl).unwrap_or_else(|| chrono::Duration::hours(1));
                 let now = chrono::Utc::now();
                 let expires_at = now + ttl;
 
                 let policy = ctx
                     .authenticator
-                    .policy_for_requester_type(&claim.spec.requester.requester_type)
+                    .policy_for_requester_type(&lease.spec.requester.requester_type)
                     .await;
                 let max_extensions = policy.map(|p| p.max_extensions).unwrap_or(2);
                 let new_status = ClusterLeaseStatus {
@@ -325,32 +325,32 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     .await
                 {
                     Ok(_) => {
-                        remove_from_queue(&ctx.queues, &claim.spec.pool_ref, &name).await;
+                        remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
                         let bind_duration =
                             (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
                         crate::metrics::CLAIM_BIND_DURATION
-                            .with_label_values(&[&claim.spec.pool_ref])
+                            .with_label_values(&[&lease.spec.pool_ref])
                             .observe(bind_duration);
 
                         crate::metrics::CLAIMS_TOTAL
-                            .with_label_values(&[claim.spec.pool_ref.as_str(), "bound"])
+                            .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
                             .inc();
 
                         info!(
-                            claim = %name,
+                            lease = %name,
                             cluster = %cluster_name,
                             expires_at = %expires_at,
                             bind_seconds = bind_duration,
-                            "Claim bound to cluster"
+                            "Lease bound to cluster"
                         );
 
                         Ok(Action::requeue(std::time::Duration::from_secs(60)))
                     }
                     Err(e) => {
-                        warn!(claim = %name, cluster = %cluster_name, "Bind patch failed, rolling back reservation");
+                        warn!(lease = %name, cluster = %cluster_name, "Bind patch failed, rolling back reservation");
                         let mut pools = ctx.pools.write().await;
-                        if let Some(pool) = pools.get_mut(&claim.spec.pool_ref) {
+                        if let Some(pool) = pools.get_mut(&lease.spec.pool_ref) {
                             if let Some(entry) = pool.clusters.get_mut(&cluster_name) {
                                 entry.state = ClusterState::Ready;
                                 entry.idle_since = Some(chrono::Utc::now());
@@ -361,10 +361,10 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 }
             } else {
                 info!(
-                    claim = %name,
-                    profile = %claim.spec.pool_ref,
-                    priority = claim.spec.priority,
-                    "No ready cluster, claim queued at position {position}"
+                    lease = %name,
+                    profile = %lease.spec.pool_ref,
+                    priority = lease.spec.priority,
+                    "No ready cluster, lease queued at position {position}"
                 );
 
                 Ok(Action::requeue(std::time::Duration::from_secs(5)))
@@ -377,9 +377,9 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     Ok(expires_at) => {
                         if chrono::Utc::now() > expires_at.with_timezone(&chrono::Utc) {
                             crate::metrics::CLAIMS_TOTAL
-                                .with_label_values(&[claim.spec.pool_ref.as_str(), "expired"])
+                                .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
                                 .inc();
-                            info!(claim = %name, "Claim TTL expired");
+                            info!(lease = %name, "Lease TTL expired");
                             let patch = serde_json::json!({
                                 "status": { "phase": "Expired" }
                             });
@@ -395,9 +395,9 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     }
                     Err(e) => {
                         error!(
-                            claim = %name,
+                            lease = %name,
                             expires_at = %expires_at_str,
-                            "Failed to parse expires_at, force-expiring claim: {e}"
+                            "Failed to parse expires_at, force-expiring lease: {e}"
                         );
                         let patch = serde_json::json!({
                             "status": { "phase": "Expired" }
@@ -418,9 +418,9 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
         }
 
         LeasePhase::Released | LeasePhase::Expired => {
-            info!(claim = %name, phase = %phase, "Processing claim termination");
+            info!(lease = %name, phase = %phase, "Processing lease termination");
 
-            remove_from_queue(&ctx.queues, &claim.spec.pool_ref, &name).await;
+            remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
             let patch = serde_json::json!({
                 "status": { "phase": "Recycling" }
@@ -434,11 +434,11 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                 .await?;
 
             if let Some(cluster_name) = &status.cluster_name {
-                let profile = get_profile(&ctx.client, &claim.spec.pool_ref, &ns).await;
+                let profile = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await;
                 if let Some(ref profile) = profile {
                     if let Some(ref diag_config) = profile.spec.diagnostics {
                         if diag_config.enabled {
-                            info!(claim = %name, "Capturing diagnostic bundle");
+                            info!(lease = %name, "Capturing diagnostic bundle");
                             let diag_url = match diagnostics::capture_bundle(
                                 cluster_name,
                                 &ns,
@@ -451,7 +451,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                                 Ok(url) => Some(url),
                                 Err(e) => {
                                     warn!(
-                                        claim = %name,
+                                        lease = %name,
                                         cluster = %cluster_name,
                                         "Failed to capture diagnostic bundle: {e:#}"
                                     );
@@ -472,9 +472,9 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                                     .await
                                 {
                                     error!(
-                                        claim = %name,
+                                        lease = %name,
                                         diagnostics_url = %url,
-                                        "Failed to record diagnostics URL on claim status: {e}"
+                                        "Failed to record diagnostics URL on lease status: {e}"
                                     );
                                 }
                             }
@@ -484,7 +484,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
 
                 let c_name = cluster_name.clone();
                 let c_ns = ns.clone();
-                let pool_ref = claim.spec.pool_ref.clone();
+                let pool_ref = lease.spec.pool_ref.clone();
                 let pools = ctx.pools.clone();
                 let factory = ctx.factory.clone();
                 let profile_for_dispatch = profile.clone();
@@ -512,7 +512,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
                     }
                 });
             } else {
-                info!(claim = %name, "No cluster to recycle, claim will be cleaned up");
+                info!(lease = %name, "No cluster to recycle, lease will be cleaned up");
             }
 
             Ok(Action::requeue(std::time::Duration::from_secs(10)))
@@ -522,7 +522,7 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             let cluster_gone = if let Some(cluster_name) = &status.cluster_name {
                 let pools = ctx.pools.read().await;
                 pools
-                    .get(&claim.spec.pool_ref)
+                    .get(&lease.spec.pool_ref)
                     .map(|p| !p.clusters.contains_key(cluster_name))
                     .unwrap_or(true)
             } else {
@@ -530,40 +530,40 @@ async fn reconcile_claim<B: ClusterBackend + Clone + 'static>(
             };
 
             if cluster_gone {
-                info!(claim = %name, "Recycling complete, deleting claim CRD");
+                info!(lease = %name, "Recycling complete, deleting lease CRD");
                 match leases_api.delete(&name, &Default::default()).await {
                     Ok(_) => {}
                     Err(kube::Error::Api(ae)) if ae.code == 404 => {
                         // Already deleted, that's fine
                     }
                     Err(e) => {
-                        warn!(claim = %name, "Failed to delete recycled claim CRD: {e}");
+                        warn!(lease = %name, "Failed to delete recycled lease CRD: {e}");
                     }
                 }
                 Ok(Action::await_change())
             } else {
-                debug!(claim = %name, "Claim in recycling phase, waiting for cluster cleanup");
+                debug!(lease = %name, "Lease in recycling phase, waiting for cluster cleanup");
                 Ok(Action::requeue(std::time::Duration::from_secs(15)))
             }
         }
     }
 }
 
-/// Extend a claim's TTL.
+/// Extend a lease's TTL.
 pub async fn extend_lease_ttl(
     client: &Client,
     namespace: &str,
-    claim_name: &str,
+    lease_name: &str,
     extend_by: &str,
     authenticator: &JwtAuthenticator,
 ) -> Result<String, LeaseError> {
     let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
-    let claim = leases_api.get(claim_name).await?;
-    let status = claim.status.clone().unwrap_or_default();
+    let lease = leases_api.get(lease_name).await?;
+    let status = lease.status.clone().unwrap_or_default();
 
     if status.phase != LeasePhase::Bound {
         return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-            "Cannot extend TTL: claim is not in Bound phase (current: {})",
+            "Cannot extend TTL: lease is not in Bound phase (current: {})",
             status.phase
         )));
     }
@@ -593,11 +593,11 @@ pub async fn extend_lease_ttl(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok_or_else(|| {
-            LeaseError::Lifecycle(anyhow::anyhow!("Claim has no valid bound_at timestamp"))
+            LeaseError::Lifecycle(anyhow::anyhow!("Lease has no valid bound_at timestamp"))
         })?;
 
     let policy = authenticator
-        .policy_for_requester_type(&claim.spec.requester.requester_type)
+        .policy_for_requester_type(&lease.spec.requester.requester_type)
         .await;
     if let Some(policy) = &policy {
         let max_expiry = bound_at + policy.max_ttl;
@@ -618,27 +618,27 @@ pub async fn extend_lease_ttl(
     });
     leases_api
         .patch_status(
-            claim_name,
+            lease_name,
             &PatchParams::apply("kobe-operator"),
             &Patch::Merge(&patch),
         )
         .await?;
 
     crate::metrics::CLAIMS_TOTAL
-        .with_label_values(&[claim.spec.pool_ref.as_str(), "extended"])
+        .with_label_values(&[lease.spec.pool_ref.as_str(), "extended"])
         .inc();
 
     info!(
-        claim = claim_name,
+        lease = lease_name,
         new_expiry = %new_expiry,
         extension_number = status.extensions_count + 1,
-        "Claim TTL extended"
+        "Lease TTL extended"
     );
 
     Ok(new_expiry.to_rfc3339())
 }
 
-/// Background reaper that force-expires overdue Bound claims.
+/// Background reaper that force-expires overdue Bound leases.
 async fn run_reaper<B: ClusterBackend>(
     ctx: Arc<LeaseContext<B>>,
     namespace: &str,
@@ -656,19 +656,19 @@ async fn run_reaper<B: ClusterBackend>(
         }
 
         let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
-        let claims = match leases_api.list(&ListParams::default()).await {
+        let leases = match leases_api.list(&ListParams::default()).await {
             Ok(list) => list,
             Err(e) => {
-                error!("Reaper: failed to list claims: {e}");
+                error!("Reaper: failed to list leases: {e}");
                 continue;
             }
         };
 
         let now = chrono::Utc::now();
 
-        for claim in claims {
-            let name = claim.name_any();
-            let status = claim.status.clone().unwrap_or_default();
+        for lease in leases {
+            let name = lease.name_any();
+            let status = lease.status.clone().unwrap_or_default();
 
             if status.phase != LeasePhase::Bound {
                 continue;
@@ -678,7 +678,7 @@ async fn run_reaper<B: ClusterBackend>(
                 match chrono::DateTime::parse_from_rfc3339(expires_at_str) {
                     Ok(expires_at) => {
                         if now > expires_at.with_timezone(&chrono::Utc) {
-                            warn!(claim = %name, "Reaper: force-expiring overdue claim");
+                            warn!(lease = %name, "Reaper: force-expiring overdue lease");
                             let patch = serde_json::json!({
                                 "status": { "phase": "Expired" }
                             });
@@ -691,17 +691,17 @@ async fn run_reaper<B: ClusterBackend>(
                                 .await
                             {
                                 error!(
-                                    claim = %name,
-                                    "Reaper: failed to force-expire overdue claim: {e}"
+                                    lease = %name,
+                                    "Reaper: failed to force-expire overdue lease: {e}"
                                 );
                             }
                         }
                     }
                     Err(e) => {
                         error!(
-                            claim = %name,
+                            lease = %name,
                             expires_at = %expires_at_str,
-                            "Reaper: failed to parse expires_at, force-expiring claim: {e}"
+                            "Reaper: failed to parse expires_at, force-expiring lease: {e}"
                         );
                         let patch = serde_json::json!({
                             "status": { "phase": "Expired" }
@@ -715,8 +715,8 @@ async fn run_reaper<B: ClusterBackend>(
                             .await
                         {
                             error!(
-                                claim = %name,
-                                "Reaper: failed to expire claim with corrupt timestamp: {e}"
+                                lease = %name,
+                                "Reaper: failed to expire lease with corrupt timestamp: {e}"
                             );
                         }
                     }
@@ -729,11 +729,11 @@ async fn run_reaper<B: ClusterBackend>(
 async fn remove_from_queue(
     queues: &RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
     profile: &str,
-    claim_name: &str,
+    lease_name: &str,
 ) {
     let mut queues = queues.write().await;
     if let Some(queue) = queues.get_mut(profile) {
-        queue.retain(|p| p.claim_name != claim_name);
+        queue.retain(|p| p.lease_name != lease_name);
     }
 }
 
@@ -753,11 +753,11 @@ async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<Clu
 }
 
 fn error_policy<B: ClusterBackend>(
-    _claim: Arc<ClusterLease>,
+    _lease: Arc<ClusterLease>,
     error: &LeaseError,
     _ctx: Arc<LeaseContext<B>>,
 ) -> Action {
-    error!("Claim reconciliation error: {error}");
+    error!("Lease reconciliation error: {error}");
     Action::requeue(std::time::Duration::from_secs(30))
 }
 
@@ -774,7 +774,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Build a `LeaseContext<MockBackend>` wired to a local wiremock server.
-    async fn test_claim_context() -> (Arc<LeaseContext<MockBackend>>, MockServer) {
+    async fn test_lease_context() -> (Arc<LeaseContext<MockBackend>>, MockServer) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
@@ -795,7 +795,7 @@ mod tests {
     }
 
     /// Build a `ClusterLease` CRD object in the given phase.
-    fn make_test_claim(name: &str, phase: &str) -> Arc<ClusterLease> {
+    fn make_test_lease(name: &str, phase: &str) -> Arc<ClusterLease> {
         let cluster_name: serde_json::Value =
             if phase == "Bound" || phase == "Released" || phase == "Recycling" {
                 serde_json::json!("pool-test-1")
@@ -862,10 +862,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_policy_returns_requeue() {
-        let (ctx, _server) = test_claim_context().await;
-        let claim = make_test_claim("err-claim", "Pending");
+        let (ctx, _server) = test_lease_context().await;
+        let lease = make_test_lease("err-lease", "Pending");
         let error = LeaseError::Lifecycle(anyhow::anyhow!("test error"));
-        let action = error_policy(claim, &error, ctx);
+        let action = error_policy(lease, &error, ctx);
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
     }
 
@@ -882,12 +882,12 @@ mod tests {
                 "test-profile".to_string(),
                 vec![
                     PendingLease {
-                        claim_name: "claim-a".to_string(),
+                        lease_name: "lease-a".to_string(),
                         priority: 100,
                         created_at: chrono::Utc::now(),
                     },
                     PendingLease {
-                        claim_name: "claim-b".to_string(),
+                        lease_name: "lease-b".to_string(),
                         priority: 50,
                         created_at: chrono::Utc::now(),
                     },
@@ -895,30 +895,30 @@ mod tests {
             );
         }
 
-        remove_from_queue(&queues, "test-profile", "claim-a").await;
+        remove_from_queue(&queues, "test-profile", "lease-a").await;
 
         let q = queues.read().await;
         let queue = q.get("test-profile").unwrap();
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].claim_name, "claim-b");
+        assert_eq!(queue[0].lease_name, "lease-b");
     }
 
     #[tokio::test]
     async fn test_remove_from_queue_nonexistent_profile() {
         let queues = RwLock::new(HashMap::new());
         // Should not panic when profile does not exist.
-        remove_from_queue(&queues, "no-such-profile", "claim-x").await;
+        remove_from_queue(&queues, "no-such-profile", "lease-x").await;
         assert!(queues.read().await.is_empty());
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Pending — no ready clusters
+    // reconcile_lease: Pending — no ready clusters
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_pending_claim_no_ready_clusters() {
-        let (ctx, server) = test_claim_context().await;
-        let claim = make_test_claim("pending-1", "Pending");
+    async fn test_reconcile_pending_lease_no_ready_clusters() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = make_test_lease("pending-1", "Pending");
 
         // Mock the status PATCH that the reconciler issues to update queue position.
         Mock::given(method("PATCH"))
@@ -950,19 +950,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let action = reconcile_claim(claim, ctx).await.unwrap();
+        let action = reconcile_lease(lease, ctx).await.unwrap();
         // No ready cluster → requeue at 5s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Pending — binds to a ready cluster
+    // reconcile_lease: Pending — binds to a ready cluster
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_pending_claim_binds_to_ready_cluster() {
-        let (ctx, server) = test_claim_context().await;
-        let claim = make_test_claim("bind-1", "Pending");
+    async fn test_reconcile_pending_lease_binds_to_ready_cluster() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = make_test_lease("bind-1", "Pending");
 
         // Pre-populate pool state with a ready cluster.
         {
@@ -1011,7 +1011,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let action = reconcile_claim(claim, ctx.clone()).await.unwrap();
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
         // Successful bind → requeue at 60s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
 
@@ -1023,31 +1023,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Bound — not expired
+    // reconcile_lease: Bound — not expired
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_bound_claim_not_expired() {
-        let (ctx, _server) = test_claim_context().await;
-        let claim = make_test_claim("bound-1", "Bound");
+    async fn test_reconcile_bound_lease_not_expired() {
+        let (ctx, _server) = test_lease_context().await;
+        let lease = make_test_lease("bound-1", "Bound");
         // The helper already sets expires_at to now + 1h.
 
-        let action = reconcile_claim(claim, ctx).await.unwrap();
+        let action = reconcile_lease(lease, ctx).await.unwrap();
         // Not expired → requeue at 30s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Bound — expired
+    // reconcile_lease: Bound — expired
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_bound_claim_expired() {
-        let (ctx, server) = test_claim_context().await;
+    async fn test_reconcile_bound_lease_expired() {
+        let (ctx, server) = test_lease_context().await;
 
-        // Build a Bound claim with expires_at in the past.
+        // Build a Bound lease with expires_at in the past.
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
-        let claim: Arc<ClusterLease> = Arc::new(
+        let lease: Arc<ClusterLease> = Arc::new(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
@@ -1085,18 +1085,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        let action = reconcile_claim(claim, ctx).await.unwrap();
+        let action = reconcile_lease(lease, ctx).await.unwrap();
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Released — transitions to Recycling
+    // reconcile_lease: Released — transitions to Recycling
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_released_claim() {
-        let (ctx, server) = test_claim_context().await;
-        let claim = make_test_claim("released-1", "Released");
+    async fn test_reconcile_released_lease() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = make_test_lease("released-1", "Released");
 
         // Pre-populate pool state with the cluster.
         {
@@ -1140,7 +1140,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let action = reconcile_claim(claim, ctx.clone()).await.unwrap();
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
 
         // Give the spawned deletion task time to run.
@@ -1152,18 +1152,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Recycling — cluster gone, claim deleted
+    // reconcile_lease: Recycling — cluster gone, lease deleted
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_recycling_claim_cluster_gone() {
-        let (ctx, server) = test_claim_context().await;
-        let claim = make_test_claim("recycling-1", "Recycling");
+    async fn test_reconcile_recycling_lease_cluster_gone() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = make_test_lease("recycling-1", "Recycling");
 
         // Pool state has NO entry for the cluster (it's gone).
         // (pools is already empty by default.)
 
-        // Mock DELETE for the claim CRD.
+        // Mock DELETE for the lease CRD.
         Mock::given(method("DELETE"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/recycling-1",
@@ -1179,18 +1179,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        let action = reconcile_claim(claim, ctx).await.unwrap();
+        let action = reconcile_lease(lease, ctx).await.unwrap();
         assert_eq!(action, Action::await_change());
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_claim: Recycling — cluster NOT gone, requeue
+    // reconcile_lease: Recycling — cluster NOT gone, requeue
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_recycling_claim_cluster_still_present() {
-        let (ctx, _server) = test_claim_context().await;
-        let claim = make_test_claim("recycling-2", "Recycling");
+    async fn test_reconcile_recycling_lease_cluster_still_present() {
+        let (ctx, _server) = test_lease_context().await;
+        let lease = make_test_lease("recycling-2", "Recycling");
 
         // Pre-populate pool state so the cluster is still present.
         {
@@ -1209,7 +1209,7 @@ mod tests {
             pools.insert("test-profile".to_string(), PoolState { clusters });
         }
 
-        let action = reconcile_claim(claim, ctx).await.unwrap();
+        let action = reconcile_lease(lease, ctx).await.unwrap();
         // Cluster still present → requeue at 15s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(15)));
     }
@@ -1220,12 +1220,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_extend_lease_ttl_success() {
-        let (ctx, server) = test_claim_context().await;
+        let (ctx, server) = test_lease_context().await;
 
         let future_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         let bound_at = chrono::Utc::now() - chrono::Duration::minutes(30);
 
-        // Mock GET for the claim.
+        // Mock GET for the lease.
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/extend-1",
@@ -1291,9 +1291,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_extend_lease_ttl_wrong_phase() {
-        let (ctx, server) = test_claim_context().await;
+        let (ctx, server) = test_lease_context().await;
 
-        // Mock GET returning a claim in Pending phase.
+        // Mock GET returning a lease in Pending phase.
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/pending-ext",
@@ -1339,11 +1339,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_extend_lease_ttl_max_extensions_reached() {
-        let (ctx, server) = test_claim_context().await;
+        let (ctx, server) = test_lease_context().await;
 
         let future_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
 
-        // Mock GET returning a Bound claim with extensions_count == max_extensions.
+        // Mock GET returning a Bound lease with extensions_count == max_extensions.
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/maxext-1",

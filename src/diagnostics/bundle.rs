@@ -17,12 +17,12 @@ pub async fn capture_bundle<B: ClusterBackend>(
     cluster_name: &str,
     namespace: &str,
     config: &DiagnosticsConfig,
-    claim_id: &str,
+    lease_id: &str,
     backend: &B,
 ) -> Result<String> {
     info!(
         cluster = cluster_name,
-        claim = claim_id,
+        lease = lease_id,
         include_secrets = config.include_secrets,
         "Capturing diagnostic bundle"
     );
@@ -38,7 +38,7 @@ pub async fn capture_bundle<B: ClusterBackend>(
     let vc_client =
         Client::try_from(kube_config).context("Failed to create client for diagnostics")?;
 
-    let mut bundle = DiagnosticBundle::new(claim_id, cluster_name);
+    let mut bundle = DiagnosticBundle::new(lease_id, cluster_name);
 
     bundle.pod_logs = capture_pod_logs(&vc_client, config.log_lines).await;
     bundle.events = capture_events(&vc_client).await;
@@ -47,7 +47,7 @@ pub async fn capture_bundle<B: ClusterBackend>(
     if config.include_secrets {
         warn!(
             cluster = cluster_name,
-            claim = claim_id,
+            lease = lease_id,
             "Including secrets in diagnostic bundle (include_secrets=true)"
         );
         bundle.secrets_dump = Some(capture_secrets(&vc_client).await);
@@ -58,10 +58,10 @@ pub async fn capture_bundle<B: ClusterBackend>(
     let bundle_json =
         serde_json::to_string_pretty(&bundle).context("Failed to serialize diagnostic bundle")?;
 
-    let url = upload_to_s3(&config.storage, claim_id, &bundle_json).await?;
+    let url = upload_to_s3(&config.storage, lease_id, &bundle_json).await?;
 
     info!(
-        claim = claim_id,
+        lease = lease_id,
         url = %url,
         "Diagnostic bundle uploaded"
     );
@@ -71,7 +71,7 @@ pub async fn capture_bundle<B: ClusterBackend>(
 
 #[derive(Debug, serde::Serialize)]
 struct DiagnosticBundle {
-    claim_id: String,
+    lease_id: String,
     cluster_name: String,
     captured_at: String,
     pod_logs: Vec<PodLog>,
@@ -83,9 +83,9 @@ struct DiagnosticBundle {
 }
 
 impl DiagnosticBundle {
-    fn new(claim_id: &str, cluster_name: &str) -> Self {
+    fn new(lease_id: &str, cluster_name: &str) -> Self {
         Self {
-            claim_id: claim_id.to_string(),
+            lease_id: lease_id.to_string(),
             cluster_name: cluster_name.to_string(),
             captured_at: chrono::Utc::now().to_rfc3339(),
             pod_logs: Vec::new(),
@@ -254,17 +254,17 @@ async fn capture_node_info(vc_client: &Client) -> String {
 }
 
 /// Upload diagnostic bundle to S3 and return a presigned URL.
-async fn upload_to_s3(storage_uri: &str, claim_id: &str, content: &str) -> Result<String> {
+async fn upload_to_s3(storage_uri: &str, lease_id: &str, content: &str) -> Result<String> {
     let uri = storage_uri
         .strip_prefix("s3://")
         .context("Storage URI must start with s3://")?;
     let (bucket, prefix) = uri.split_once('/').unwrap_or((uri, ""));
 
     let key = if prefix.is_empty() {
-        format!("{claim_id}/diagnostics.json")
+        format!("{lease_id}/diagnostics.json")
     } else {
         let prefix = prefix.trim_end_matches('/');
-        format!("{prefix}/{claim_id}/diagnostics.json")
+        format!("{prefix}/{lease_id}/diagnostics.json")
     };
 
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -316,8 +316,8 @@ mod tests {
 
     #[test]
     fn bundle_new_sets_fields_correctly() {
-        let bundle = DiagnosticBundle::new("claim-42", "my-cluster");
-        assert_eq!(bundle.claim_id, "claim-42");
+        let bundle = DiagnosticBundle::new("lease-42", "my-cluster");
+        assert_eq!(bundle.lease_id, "lease-42");
         assert_eq!(bundle.cluster_name, "my-cluster");
         assert!(bundle.pod_logs.is_empty());
         assert!(bundle.events.is_empty());
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn bundle_serialization_contains_expected_keys() {
-        let mut bundle = DiagnosticBundle::new("claim-1", "cluster-a");
+        let mut bundle = DiagnosticBundle::new("lease-1", "cluster-a");
         bundle.pod_logs = vec![PodLog {
             namespace: "default".to_string(),
             pod: "nginx-0".to_string(),
@@ -348,7 +348,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&bundle).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(v["claim_id"], "claim-1");
+        assert_eq!(v["lease_id"], "lease-1");
         assert_eq!(v["cluster_name"], "cluster-a");
         assert!(v["captured_at"].is_string());
         assert!(v["pod_logs"].is_array());
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn bundle_serialization_includes_secrets_when_set() {
-        let mut bundle = DiagnosticBundle::new("claim-2", "cluster-b");
+        let mut bundle = DiagnosticBundle::new("lease-2", "cluster-b");
         bundle.secrets_dump = Some("secret-data".to_string());
 
         let json = serde_json::to_string_pretty(&bundle).unwrap();
@@ -731,14 +731,14 @@ mod tests {
         assert_eq!(bucket, "my-bucket");
         assert_eq!(prefix, "");
 
-        let claim_id = "claim-1";
+        let lease_id = "lease-1";
         let key = if prefix.is_empty() {
-            format!("{claim_id}/diagnostics.json")
+            format!("{lease_id}/diagnostics.json")
         } else {
             let prefix = prefix.trim_end_matches('/');
-            format!("{prefix}/{claim_id}/diagnostics.json")
+            format!("{prefix}/{lease_id}/diagnostics.json")
         };
-        assert_eq!(key, "claim-1/diagnostics.json");
+        assert_eq!(key, "lease-1/diagnostics.json");
     }
 
     #[test]
@@ -748,14 +748,14 @@ mod tests {
         let (bucket, prefix) = uri.split_once('/').unwrap_or((uri, ""));
         assert_eq!(bucket, "my-bucket");
 
-        let claim_id = "claim-1";
+        let lease_id = "lease-1";
         let key = if prefix.is_empty() {
-            format!("{claim_id}/diagnostics.json")
+            format!("{lease_id}/diagnostics.json")
         } else {
             let prefix = prefix.trim_end_matches('/');
-            format!("{prefix}/{claim_id}/diagnostics.json")
+            format!("{prefix}/{lease_id}/diagnostics.json")
         };
-        assert_eq!(key, "some/prefix/claim-1/diagnostics.json");
+        assert_eq!(key, "some/prefix/lease-1/diagnostics.json");
     }
 
     #[test]

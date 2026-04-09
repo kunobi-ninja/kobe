@@ -137,23 +137,23 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Start claim controller
-    let claim_client = client.clone();
-    let claim_ns = namespace.clone();
-    let claim_pools = pools.clone();
-    let claim_authenticator = authenticator.clone();
-    let claim_shutdown = shutdown.clone();
-    let claim_backend = backend.clone();
-    let claim_factory = factory.clone();
-    let claim_handle = tokio::spawn(async move {
-        controllers::claim::run_claim_controller(
-            claim_client,
-            &claim_ns,
-            claim_backend,
-            claim_pools,
-            claim_authenticator,
-            Some(claim_factory),
-            claim_shutdown,
+    // Start lease controller
+    let lease_client = client.clone();
+    let lease_ns = namespace.clone();
+    let lease_pools = pools.clone();
+    let lease_authenticator = authenticator.clone();
+    let lease_shutdown = shutdown.clone();
+    let lease_backend = backend.clone();
+    let lease_factory = factory.clone();
+    let lease_handle = tokio::spawn(async move {
+        controllers::lease::run_lease_controller(
+            lease_client,
+            &lease_ns,
+            lease_backend,
+            lease_pools,
+            lease_authenticator,
+            Some(lease_factory),
+            lease_shutdown,
         )
         .await;
     });
@@ -174,10 +174,10 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => error!("Profile controller panicked: {e}"),
                 }
             }
-            result = claim_handle => {
+            result = lease_handle => {
                 match result {
-                    Ok(()) => warn!("Claim controller exited unexpectedly"),
-                    Err(e) => error!("Claim controller panicked: {e}"),
+                    Ok(()) => warn!("Lease controller exited unexpectedly"),
+                    Err(e) => error!("Lease controller panicked: {e}"),
                 }
             }
         }
@@ -324,7 +324,7 @@ mod testutil;
 #[cfg(test)]
 mod controllers_test_anchor {
     #[allow(unused_imports)]
-    use crate::controllers::claim;
+    use crate::controllers::lease;
     #[allow(unused_imports)]
     use crate::controllers::profile;
 }

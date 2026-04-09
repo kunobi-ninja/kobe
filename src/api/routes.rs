@@ -14,7 +14,7 @@ use tracing::info;
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
 use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::ClusterBackend;
-use crate::controllers::claim::extend_lease_ttl;
+use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
 use crate::metrics;
 use crate::pool::{PoolState, count_states, is_valid_k8s_name, parse_duration};
@@ -267,7 +267,7 @@ async fn create_lease<B: ClusterBackend>(
         &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
     );
 
-    let claim = build_lease_crd(
+    let lease = build_lease_crd(
         &lease_id,
         &state.namespace,
         &req.profile,
@@ -276,7 +276,7 @@ async fn create_lease<B: ClusterBackend>(
         policy.default_priority,
     );
 
-    if let Err(e) = leases_api.create(&PostParams::default(), &claim).await {
+    if let Err(e) = leases_api.create(&PostParams::default(), &lease).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -367,8 +367,8 @@ async fn get_lease<B: ClusterBackend>(
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match leases_api.get(&id).await {
-        Ok(claim) => {
-            if claim.spec.requester.identity != identity.identity {
+        Ok(lease) => {
+            if lease.spec.requester.identity != identity.identity {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
@@ -379,7 +379,7 @@ async fn get_lease<B: ClusterBackend>(
                     .into_response();
             }
 
-            let status = claim.status.clone().unwrap_or_default();
+            let status = lease.status.clone().unwrap_or_default();
 
             let kubeconfig = if status.phase == LeasePhase::Bound {
                 if let Some(ref cluster_name) = status.cluster_name {
@@ -414,7 +414,7 @@ async fn get_lease<B: ClusterBackend>(
                     kubeconfig,
                     expires_at: status.expires_at,
                     phase: status.phase.to_string(),
-                    profile: claim.spec.pool_ref,
+                    profile: lease.spec.pool_ref,
                     queue_position: status.queue_position,
                     diagnostics_url: status.diagnostics_url,
                     effective_ttl: None,
@@ -449,7 +449,7 @@ async fn release_lease<B: ClusterBackend>(
 ) -> Response {
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
-    let claim = match leases_api.get(&id).await {
+    let lease = match leases_api.get(&id).await {
         Ok(c) => c,
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
             return StatusCode::NOT_FOUND.into_response();
@@ -466,11 +466,11 @@ async fn release_lease<B: ClusterBackend>(
         }
     };
 
-    if claim.spec.requester.identity != identity.identity {
+    if lease.spec.requester.identity != identity.identity {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let status = claim.status.clone().unwrap_or_default();
+    let status = lease.status.clone().unwrap_or_default();
 
     if matches!(
         status.phase,
@@ -501,7 +501,7 @@ async fn release_lease<B: ClusterBackend>(
     }
 
     metrics::CLAIMS_TOTAL
-        .with_label_values(&[claim.spec.pool_ref.as_str(), "released"])
+        .with_label_values(&[lease.spec.pool_ref.as_str(), "released"])
         .inc();
 
     if status.phase == LeasePhase::Pending {
@@ -522,8 +522,8 @@ async fn extend_lease<B: ClusterBackend>(
 ) -> Response {
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
     match leases_api.get(&id).await {
-        Ok(claim) => {
-            if claim.spec.requester.identity != identity.identity {
+        Ok(lease) => {
+            if lease.spec.requester.identity != identity.identity {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(ErrorResponse {
@@ -572,7 +572,7 @@ async fn extend_lease<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(crate::controllers::claim::LeaseError::Lifecycle(e)) => (
+        Err(crate::controllers::lease::LeaseError::Lifecycle(e)) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: e.to_string(),
@@ -580,7 +580,7 @@ async fn extend_lease<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(crate::controllers::claim::LeaseError::Kube(e)) => (
+        Err(crate::controllers::lease::LeaseError::Kube(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: "Failed to extend lease".to_string(),
@@ -600,12 +600,12 @@ async fn get_diagnostics<B: ClusterBackend>(
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match leases_api.get(&id).await {
-        Ok(claim) => {
-            if claim.spec.requester.identity != identity.identity {
+        Ok(lease) => {
+            if lease.spec.requester.identity != identity.identity {
                 return StatusCode::NOT_FOUND.into_response();
             }
 
-            let status = claim.status.unwrap_or_default();
+            let status = lease.status.unwrap_or_default();
             if let Some(url) = status.diagnostics_url {
                 (
                     StatusCode::OK,
