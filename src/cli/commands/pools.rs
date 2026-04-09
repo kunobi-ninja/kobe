@@ -23,9 +23,9 @@ pub async fn pools() -> Result<()> {
             println!("No pools available.");
         } else {
             for pool in items {
-                let name = pool["metadata"]["name"].as_str().unwrap_or("?");
-                let ready = pool["status"]["ready"].as_u64().unwrap_or(0);
-                let claimed = pool["status"]["claimed"].as_u64().unwrap_or(0);
+                let name = pool["name"].as_str().unwrap_or("?");
+                let ready = pool["ready"].as_u64().unwrap_or(0);
+                let claimed = pool["claimed"].as_u64().unwrap_or(0);
                 println!("{name}  ready={ready}  claimed={claimed}");
             }
         }
