@@ -62,32 +62,28 @@ pub async fn status() -> Result<()> {
         .await
         .ok()
         .flatten();
-    let pools: Vec<serde_json::Value> = match with_auth(
-        client.get(format!("{endpoint}/v1/pools")),
-        &pools_token,
-    )
-    .send()
-    .await
-    {
-        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    let pools: Vec<serde_json::Value> =
+        match with_auth(client.get(format!("{endpoint}/v1/pools")), &pools_token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
 
     // Fetch leases
     let leases_token = get_auth_header(endpoint, "GET", "/v1/leases", b"")
         .await
         .ok()
         .flatten();
-    let leases: Vec<serde_json::Value> = match with_auth(
-        client.get(format!("{endpoint}/v1/leases")),
-        &leases_token,
-    )
-    .send()
-    .await
-    {
-        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    let leases: Vec<serde_json::Value> =
+        match with_auth(client.get(format!("{endpoint}/v1/leases")), &leases_token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
 
     // Pools with leases grouped underneath
     println!("\x1b[1mPools\x1b[0m");
