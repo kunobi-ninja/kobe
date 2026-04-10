@@ -33,7 +33,7 @@ spec:
               priority:
                 default: 50
                 description: |-
-                  Claim priority for queue ordering.
+                  Lease priority for queue ordering.
                   Higher values are served first.
                 format: uint32
                 minimum: 0.0
@@ -65,7 +65,7 @@ spec:
             nullable: true
             properties:
               boundAt:
-                description: When the claim was bound to a vcluster.
+                description: When the lease was bound to a vcluster.
                 nullable: true
                 type: string
               clusterName:
@@ -77,12 +77,12 @@ spec:
                 nullable: true
                 type: string
               expiresAt:
-                description: When the claim expires (TTL deadline).
+                description: When the lease expires (TTL deadline).
                 nullable: true
                 type: string
               extensionsCount:
                 default: 0
-                description: Number of TTL extensions granted for this claim.
+                description: Number of TTL extensions granted for this lease.
                 format: uint32
                 minimum: 0.0
                 type: integer
