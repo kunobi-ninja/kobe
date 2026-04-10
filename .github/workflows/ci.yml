@@ -35,7 +35,7 @@ jobs:
     runs-on: kunobi-runners
     container:
       image: rust:1.93-bookworm
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
