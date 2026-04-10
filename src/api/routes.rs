@@ -75,6 +75,7 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .route("/v1/leases/{id}/diagnostics", get(get_diagnostics::<B>))
         .route("/v1/pools", get(list_pools::<B>))
         .route("/v1/pools/{name}", get(get_pool::<B>))
+        .route("/v1/pools/{name}/leases", get(list_pool_leases::<B>))
         .layer(axum::middleware::from_fn(concurrency_limit));
 
     // Non-limited infrastructure routes
@@ -151,6 +152,9 @@ struct LeaseSummary {
     queue_position: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics_url: Option<String>,
+    /// Requester identity (included in pool lease listings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requester: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -344,6 +348,7 @@ async fn list_leases<B: ClusterBackend>(
                         expires_at: status.expires_at,
                         queue_position: status.queue_position,
                         diagnostics_url: status.diagnostics_url,
+                        requester: None,
                     }
                 })
                 .collect();
@@ -723,6 +728,57 @@ async fn get_pool<B: ClusterBackend>(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: "Failed to get profile".to_string(),
+                detail: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/pools/{name}/leases — list all leases for a pool.
+#[tracing::instrument(skip_all)]
+async fn list_pool_leases<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(pool_name): Path<String>,
+) -> Response {
+    let policy = policy_for(&identity);
+    if !is_pool_allowed(&pool_name, &policy) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={pool_name}"));
+
+    match leases_api.list(&lp).await {
+        Ok(leases) => {
+            let summaries: Vec<LeaseSummary> = leases
+                .iter()
+                .filter(|c| {
+                    let status = c.status.clone().unwrap_or_default();
+                    matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
+                })
+                .map(|c| {
+                    let status = c.status.clone().unwrap_or_default();
+                    LeaseSummary {
+                        id: c.name_any(),
+                        phase: status.phase.to_string(),
+                        profile: c.spec.pool_ref.clone(),
+                        cluster_name: status.cluster_name,
+                        expires_at: status.expires_at,
+                        queue_position: status.queue_position,
+                        diagnostics_url: None,
+                        requester: Some(c.spec.requester.identity.clone()),
+                    }
+                })
+                .collect();
+
+            (StatusCode::OK, Json(summaries)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to list pool leases".to_string(),
                 detail: Some(e.to_string()),
             }),
         )

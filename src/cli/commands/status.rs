@@ -71,19 +71,8 @@ pub async fn status() -> Result<()> {
             _ => Vec::new(),
         };
 
-    // Fetch leases
-    let leases_token = get_auth_header(endpoint, "GET", "/v1/leases", b"")
-        .await
-        .ok()
-        .flatten();
-    let leases: Vec<serde_json::Value> =
-        match with_auth(client.get(format!("{endpoint}/v1/leases")), &leases_token)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-            _ => Vec::new(),
-        };
+    // Get own identity for (you) marker — use fingerprint from config
+    let my_identity = config.ssh_fingerprint.clone();
 
     // Pools with leases grouped underneath
     println!("\x1b[1mPools\x1b[0m");
@@ -102,20 +91,51 @@ pub async fn status() -> Result<()> {
             };
             println!("  {name}  {ready_color}ready={ready}\x1b[0m{claimed_str}");
 
-            // Show leases for this pool
-            let pool_leases: Vec<&serde_json::Value> = leases
-                .iter()
-                .filter(|l| l["profile"].as_str() == Some(name))
-                .collect();
+            // Fetch all leases for this pool
+            let pool_path = format!("/v1/pools/{name}/leases");
+            let pool_leases_token = get_auth_header(endpoint, "GET", &pool_path, b"")
+                .await
+                .ok()
+                .flatten();
+            let pool_leases: Vec<serde_json::Value> = match with_auth(
+                client.get(format!("{endpoint}{pool_path}")),
+                &pool_leases_token,
+            )
+            .send()
+            .await
+            {
+                Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+                _ => Vec::new(),
+            };
+
             for l in &pool_leases {
                 let id = l["id"].as_str().unwrap_or("?");
                 let cluster = l["cluster_name"].as_str().unwrap_or("-");
                 let phase = l["phase"].as_str().unwrap_or("?");
+                let requester = l["requester"].as_str().unwrap_or("?");
                 let expires = l["expires_at"]
                     .as_str()
                     .map(format_relative_time)
                     .unwrap_or_else(|| phase.to_string());
-                println!("    \x1b[2m{id}\x1b[0m  {cluster}  \x1b[2m{expires}\x1b[0m");
+
+                // Check if this lease is ours
+                let is_mine = my_identity
+                    .as_deref()
+                    .map(|fp| requester.contains(fp))
+                    .unwrap_or(false);
+                let owner = if is_mine {
+                    "\x1b[32m(you)\x1b[0m".to_string()
+                } else {
+                    format!("\x1b[2m{requester}\x1b[0m")
+                };
+
+                println!(
+                    "    {:<24}  {:<28}  {:<12}  {}",
+                    format!("\x1b[2m{id}\x1b[0m"),
+                    cluster,
+                    format!("\x1b[2m{expires}\x1b[0m"),
+                    owner
+                );
             }
         }
     }
