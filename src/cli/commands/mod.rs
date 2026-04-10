@@ -6,29 +6,36 @@ mod login;
 mod pools;
 mod release;
 mod status;
+mod version;
 
 pub use claim::claim;
-pub use config::{config_set, config_show};
+pub use config::{
+    config_contexts, config_current_context, config_set, config_set_context, config_show,
+    config_use_context,
+};
 pub use config_tui::run_config_tui as config_interactive;
 pub use leases::leases;
 pub use login::{login, logout};
 pub use pools::pools;
 pub use release::release;
 pub use status::status;
+pub use version::version;
 
-use config::{AuthMode, CliConfig};
+use config::{AuthMode, ResolvedConfig};
+
+pub(crate) fn cli_version() -> &'static str {
+    option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 /// Get a valid auth header value based on the configured auth mode.
 /// Returns None for no-auth mode, Some(header) for token/oidc/ssh.
 pub(crate) async fn get_auth_header(
-    endpoint: &str,
+    config: &ResolvedConfig,
     method: &str,
     path: &str,
     body: &[u8],
 ) -> anyhow::Result<Option<String>> {
-    let config = CliConfig::load()?;
-
-    match config.auth {
+    match &config.auth {
         AuthMode::None => Ok(None),
         AuthMode::Token => match &config.token {
             Some(t) => Ok(Some(format!("Bearer {t}"))),
@@ -37,15 +44,16 @@ pub(crate) async fn get_auth_header(
             ),
         },
         AuthMode::Oidc => {
-            let service_config = kunobi_auth::client::ServiceConfig::discover(endpoint).await?;
+            let service_config =
+                kunobi_auth::client::ServiceConfig::discover(&config.endpoint).await?;
             let client = kunobi_auth::client::AuthClient::new(service_config)?;
             Ok(Some(format!("Bearer {}", client.token().await?)))
         }
         AuthMode::Ssh => {
             let client = kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
             // Discover audience from /v1/status — retry once if server hasn't loaded policies yet
-            let audience = discover_ssh_audience(endpoint).await?;
-            tofu_check(endpoint, &audience).await?;
+            let audience = discover_ssh_audience(&config.endpoint).await?;
+            tofu_check(&config.endpoint, &audience).await?;
             let header = client.authorize(&audience, method, path, body).await?;
             Ok(Some(header))
         }

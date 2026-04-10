@@ -1,14 +1,15 @@
 use anyhow::Result;
 
 use super::config::{AuthMode, CliConfig};
-use super::{authed_client, get_auth_header, with_auth};
+use super::{authed_client, cli_version, get_auth_header, with_auth};
 
-pub async fn status() -> Result<()> {
+pub async fn status(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
-    let endpoint = config.endpoint();
+    let config = config.resolve(context_override, endpoint_override)?;
+    let endpoint = config.endpoint.as_str();
 
     // Fetch server status (unauthenticated — /v1/status supports OptionalAuth)
-    let token = get_auth_header(endpoint, "GET", "/v1/status", b"")
+    let token = get_auth_header(&config, "GET", "/v1/status", b"")
         .await
         .ok()
         .flatten();
@@ -23,10 +24,10 @@ pub async fn status() -> Result<()> {
     }
 
     let server: serde_json::Value = response.json().await?;
-    let version = server["version"].as_str().unwrap_or("?");
+    let endpoint_version = server["version"].as_str().unwrap_or("?");
 
     // Auth summary
-    let auth_summary = match config.auth {
+    let auth_summary = match &config.auth {
         AuthMode::Ssh => {
             let fp = config
                 .ssh_fingerprint
@@ -48,8 +49,13 @@ pub async fn status() -> Result<()> {
 
     // Header
     println!();
-    println!("\x1b[1mkobe {version}\x1b[0m");
-    println!("  \x1b[2m{endpoint}\x1b[0m");
+    println!("\x1b[1mkobe\x1b[0m");
+    println!("  cli version: {}", cli_version());
+    if let Some(context) = &config.context {
+        println!("  context: {context}");
+    }
+    println!("  endpoint: \x1b[2m{endpoint}\x1b[0m");
+    println!("  endpoint version: {endpoint_version}");
     println!();
 
     // Auth
@@ -58,7 +64,7 @@ pub async fn status() -> Result<()> {
     println!();
 
     // Fetch pools
-    let pools_token = get_auth_header(endpoint, "GET", "/v1/pools", b"")
+    let pools_token = get_auth_header(&config, "GET", "/v1/pools", b"")
         .await
         .ok()
         .flatten();
@@ -93,7 +99,7 @@ pub async fn status() -> Result<()> {
 
             // Fetch all leases for this pool
             let pool_path = format!("/v1/pools/{name}/leases");
-            let pool_leases_token = get_auth_header(endpoint, "GET", &pool_path, b"")
+            let pool_leases_token = get_auth_header(&config, "GET", &pool_path, b"")
                 .await
                 .ok()
                 .flatten();

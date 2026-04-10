@@ -61,6 +61,9 @@ target "builder" {
   dockerfile = "docker/builder.Dockerfile"
   context    = "."
   platforms  = [PLATFORM]
+  args = {
+    BUILD_VERSION = BUILD_VERSION
+  }
 }
 
 # =============================================================================

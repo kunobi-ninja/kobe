@@ -77,7 +77,27 @@ struct EditorState {
 }
 
 fn build_fields(config: &CliConfig) -> Vec<FormField> {
-    let auth_str = match config.auth {
+    let current_context = config
+        .current_context
+        .as_deref()
+        .and_then(|name| config.contexts.get(name));
+    let endpoint = current_context
+        .map(|context| context.endpoint.clone())
+        .or_else(|| config.endpoint.clone())
+        .unwrap_or_default();
+    let auth = current_context
+        .map(|context| context.auth.clone())
+        .unwrap_or_else(|| config.auth.clone());
+    let token = current_context
+        .and_then(|context| context.token.clone())
+        .or_else(|| config.token.clone())
+        .unwrap_or_default();
+    let ssh_fingerprint = current_context
+        .and_then(|context| context.ssh_fingerprint.clone())
+        .or_else(|| config.ssh_fingerprint.clone())
+        .unwrap_or_default();
+
+    let auth_str = match auth {
         AuthMode::None => "none",
         AuthMode::Token => "token",
         AuthMode::Oidc => "oidc",
@@ -88,7 +108,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
         FormField {
             label: "Endpoint",
             kind: FieldKind::Text,
-            value: config.endpoint.clone().unwrap_or_default(),
+            value: endpoint,
             options: vec![],
             default_hint: "(default: https://kobe.kunobi.ninja)",
             is_password: false,
@@ -106,7 +126,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
         FormField {
             label: "Token",
             kind: FieldKind::Password,
-            value: config.token.clone().unwrap_or_default(),
+            value: token,
             options: vec![],
             default_hint: "(not set)",
             is_password: true,
@@ -115,7 +135,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
         FormField {
             label: "SSH fingerprint",
             kind: FieldKind::Text,
-            value: config.ssh_fingerprint.clone().unwrap_or_default(),
+            value: ssh_fingerprint,
             options: vec![],
             default_hint: "(optional — uses ~/.ssh/id_ed25519)",
             is_password: false,
@@ -124,7 +144,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
     ]
 }
 
-fn fields_to_config(fields: &[FormField]) -> CliConfig {
+fn fields_to_config(fields: &[FormField], previous: &CliConfig) -> CliConfig {
     let endpoint = if fields[0].value.is_empty() {
         None
     } else {
@@ -150,7 +170,30 @@ fn fields_to_config(fields: &[FormField]) -> CliConfig {
         Some(fields[3].value.clone())
     };
 
+    let mut config = CliConfig {
+        current_context: previous.current_context.clone(),
+        contexts: previous.contexts.clone(),
+        endpoint: previous.endpoint.clone(),
+        auth: previous.auth.clone(),
+        token: previous.token.clone(),
+        ssh_fingerprint: previous.ssh_fingerprint.clone(),
+    };
+
+    if let Some(current_context) = &previous.current_context {
+        if let Some(context) = config.contexts.get_mut(current_context) {
+            if let Some(endpoint) = endpoint {
+                context.endpoint = endpoint;
+            }
+            context.auth = auth;
+            context.token = token;
+            context.ssh_fingerprint = ssh_fingerprint;
+            return config;
+        }
+    }
+
     CliConfig {
+        current_context: config.current_context,
+        contexts: config.contexts,
         endpoint,
         auth,
         token,
@@ -250,8 +293,8 @@ pub fn run_config_tui() -> Result<()> {
                             }
                         }
                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let config = fields_to_config(&state.fields);
-                            config.save()?;
+                            let updated_config = fields_to_config(&state.fields, &config);
+                            updated_config.save()?;
                             state.dirty = false;
                             state.status = Some("Saved!".to_string());
                         }
@@ -292,16 +335,16 @@ pub fn run_config_tui() -> Result<()> {
                     Mode::ConfirmQuit => match key.code {
                         KeyCode::Char('y') => break,
                         KeyCode::Char('s') => {
-                            let config = fields_to_config(&state.fields);
-                            config.save()?;
+                            let updated_config = fields_to_config(&state.fields, &config);
+                            updated_config.save()?;
                             break;
                         }
                         _ => state.mode = Mode::Navigate,
                     },
                     Mode::ConfirmSave => match key.code {
                         KeyCode::Char('y') => {
-                            let config = fields_to_config(&state.fields);
-                            config.save()?;
+                            let updated_config = fields_to_config(&state.fields, &config);
+                            updated_config.save()?;
                             state.dirty = false;
                             state.status = Some("Saved!".to_string());
                             state.mode = Mode::Navigate;

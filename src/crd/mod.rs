@@ -1,13 +1,13 @@
 pub mod access_policy;
-pub mod lease;
 #[allow(dead_code)]
 pub mod datastore;
+pub mod lease;
 pub mod profile;
 
 pub use access_policy::*;
-pub use lease::*;
 #[allow(unused_imports)]
 pub use datastore::*;
+pub use lease::*;
 pub use profile::*;
 
 /// Schema helper for `serde_json::Value` fields that need an explicit `type: object`

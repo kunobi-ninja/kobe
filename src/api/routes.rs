@@ -8,7 +8,6 @@ use axum::{Json, Router};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
@@ -17,7 +16,7 @@ use crate::backend::ClusterBackend;
 use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
 use crate::metrics;
-use crate::pool::{PoolState, count_states, is_valid_k8s_name, parse_duration};
+use crate::pool::{is_valid_k8s_name, parse_duration};
 use kunobi_auth::server::{AuthnProvider, OptionalAuth};
 
 /// Shared application state for axum routes.
@@ -26,7 +25,6 @@ pub struct AppState<B: ClusterBackend> {
     pub client: Client,
     pub authenticator: Arc<JwtAuthenticator>,
     pub namespace: String,
-    pub pools: Arc<RwLock<std::collections::HashMap<String, PoolState>>>,
     pub backend: B,
 }
 
@@ -809,33 +807,18 @@ async fn status<B: ClusterBackend>(
 
     let sessions = session.into_iter().collect::<Vec<_>>();
 
-    // Pools — only show pools the caller can access
+    // Pools — read CRD status so every replica reports the same view.
     let pool_infos = if sessions.is_empty() {
         vec![]
     } else {
-        let pools = state.pools.read().await;
-        pools
-            .iter()
-            .map(|(name, pool_state)| {
-                let counts = count_states(pool_state);
-                StatusPool {
-                    name: name.clone(),
-                    ready: counts.ready,
-                    claimed: counts.claimed,
-                    total: counts.ready + counts.claimed + counts.creating,
-                }
-            })
-            .filter(|p| {
-                sessions
-                    .iter()
-                    .any(|s| s.pools.iter().any(|pattern| pool_matches(&p.name, pattern)))
-            })
-            .collect()
+        accessible_pool_statuses(&state, &sessions).await
     };
 
     Json(StatusResponse {
         version: std::env::var("BUILD_VERSION")
-            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+            .ok()
+            .or_else(|| option_env!("BUILD_VERSION").map(str::to_string))
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         auth: AuthStatusBlock { methods, sessions },
         pools: pool_infos,
     })
@@ -892,6 +875,38 @@ async fn accessible_pools_for_provider<B: ClusterBackend>(
     }
 }
 
+async fn accessible_pool_statuses<B: ClusterBackend>(
+    state: &AppState<B>,
+    sessions: &[StatusSession],
+) -> Vec<StatusPool> {
+    let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    let profiles = match profiles_api.list(&ListParams::default()).await {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            tracing::warn!("Failed to list profiles for status endpoint: {e}");
+            return vec![];
+        }
+    };
+
+    profiles
+        .iter()
+        .map(|profile| {
+            let status = profile.status.clone().unwrap_or_default();
+            StatusPool {
+                name: profile.name_any(),
+                ready: status.ready,
+                claimed: status.claimed,
+                total: status.ready + status.claimed + status.creating,
+            }
+        })
+        .filter(|p| {
+            sessions
+                .iter()
+                .any(|s| s.pools.iter().any(|pattern| pool_matches(&p.name, pattern)))
+        })
+        .collect()
+}
+
 /// Check if a pool name matches a pattern.
 fn pool_matches(pool: &str, pattern: &str) -> bool {
     if pattern == "*" {
@@ -908,29 +923,40 @@ async fn healthz() -> StatusCode {
 }
 
 async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response {
-    let pools = state.pools.read().await;
+    let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    let profiles = match profiles_api.list(&ListParams::default()).await {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            tracing::warn!("Failed to list profiles for metrics endpoint: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "failed to list profiles").into_response();
+        }
+    };
+
     metrics::POOL_CLUSTERS.reset();
     metrics::QUEUE_DEPTH.reset();
 
-    for (profile, pool_state) in pools.iter() {
-        let counts = count_states(pool_state);
+    for profile in profiles.iter() {
+        let name = profile.name_any();
+        let status = profile.status.clone().unwrap_or_default();
         metrics::POOL_CLUSTERS
-            .with_label_values(&[profile.as_str(), "creating"])
-            .set(counts.creating as i64);
+            .with_label_values(&[name.as_str(), "creating"])
+            .set(status.creating as i64);
         metrics::POOL_CLUSTERS
-            .with_label_values(&[profile.as_str(), "ready"])
-            .set(counts.ready as i64);
+            .with_label_values(&[name.as_str(), "ready"])
+            .set(status.ready as i64);
         metrics::POOL_CLUSTERS
-            .with_label_values(&[profile.as_str(), "claimed"])
-            .set(counts.claimed as i64);
+            .with_label_values(&[name.as_str(), "claimed"])
+            .set(status.claimed as i64);
         metrics::POOL_CLUSTERS
-            .with_label_values(&[profile.as_str(), "unhealthy"])
-            .set(counts.unhealthy as i64);
+            .with_label_values(&[name.as_str(), "unhealthy"])
+            .set(status.unhealthy as i64);
         metrics::POOL_CLUSTERS
-            .with_label_values(&[profile.as_str(), "recycling"])
-            .set(counts.recycling as i64);
+            .with_label_values(&[name.as_str(), "recycling"])
+            .set(0);
+        metrics::QUEUE_DEPTH
+            .with_label_values(&[name.as_str()])
+            .set(status.queue_depth as i64);
     }
-    drop(pools);
 
     let body = metrics::gather();
     (
@@ -1121,7 +1147,6 @@ mod tests {
 
     // --- Router / handler tests using tower::ServiceExt::oneshot ---
 
-    use std::collections::HashMap;
     use tower::ServiceExt;
 
     /// Helper: build an axum Router backed by MockBackend and wiremock.
@@ -1130,14 +1155,12 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
         let backend = crate::testutil::MockBackend::new();
-        let pools = Arc::new(RwLock::new(HashMap::new()));
         let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
 
         let state = AppState {
             client,
             backend,
             namespace: "test-ns".to_string(),
-            pools,
             authenticator,
         };
 
@@ -1159,7 +1182,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_returns_200() {
-        let (app, _server) = test_app().await;
+        let (app, server) = test_app().await;
+
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let empty_list = crate::testutil::k8s_list_response::<serde_json::Value>(vec![]);
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterpools",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&empty_list))
+            .mount(&server)
+            .await;
 
         let req = http::Request::builder()
             .uri("/metrics")

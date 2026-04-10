@@ -3,12 +3,14 @@ use std::time::Duration;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::Client;
-use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{Api, ObjectMeta, PostParams};
 use tracing::{info, warn};
 
 const LEASE_DURATION_SECS: i32 = 15;
-const RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const RENEW_INTERVAL: Duration = Duration::from_secs(5);
+const RENEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const OBSERVE_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Convert chrono::DateTime<Utc> to k8s-openapi's jiff::Timestamp (used by MicroTime in k8s-openapi 0.27+).
 fn chrono_to_timestamp(
@@ -31,16 +33,30 @@ pub async fn run_leader_election(
     namespace: &str,
     lease_name: &str,
 ) -> anyhow::Result<tokio::sync::watch::Receiver<bool>> {
+    run_leader_election_with_config(
+        client,
+        namespace,
+        lease_name,
+        RETRY_INTERVAL,
+        OBSERVE_ERROR_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_leader_election_with_config(
+    client: Client,
+    namespace: &str,
+    lease_name: &str,
+    retry_interval: Duration,
+    observe_error_timeout: Duration,
+) -> anyhow::Result<tokio::sync::watch::Receiver<bool>> {
     let leases: Api<Lease> = Api::namespaced(client.clone(), namespace);
     let identity = pod_identity();
 
     info!(identity = %identity, lease = lease_name, "Starting leader election");
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut observe_error_deadline = None;
     loop {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Failed to acquire leader lease within 5 minutes");
-        }
         match try_acquire(&leases, lease_name, &identity).await {
             Ok(true) => {
                 info!(identity = %identity, "Acquired leader lease");
@@ -48,11 +64,20 @@ pub async fn run_leader_election(
             }
             Ok(false) => {
                 info!("Another instance is leader, waiting...");
-                tokio::time::sleep(RETRY_INTERVAL).await;
+                observe_error_deadline = None;
+                tokio::time::sleep(retry_interval).await;
             }
             Err(e) => {
+                let now = tokio::time::Instant::now();
+                let deadline = observe_error_deadline.get_or_insert(now + observe_error_timeout);
+                if now >= *deadline {
+                    anyhow::bail!(
+                        "Failed to observe or acquire leader lease within {:?}: {e}",
+                        observe_error_timeout
+                    );
+                }
                 warn!("Leader election error: {e}, retrying...");
-                tokio::time::sleep(RETRY_INTERVAL).await;
+                tokio::time::sleep(retry_interval).await;
             }
         }
     }
@@ -73,7 +98,7 @@ async fn try_acquire(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow:
     let micro_now = MicroTime(chrono_to_timestamp(now)?);
 
     match leases.get(name).await {
-        Ok(existing) => {
+        Ok(mut existing) => {
             let spec = existing.spec.as_ref();
             let holder = spec.and_then(|s| s.holder_identity.as_deref());
             let renew_time = spec.and_then(|s| s.renew_time.as_ref());
@@ -82,8 +107,7 @@ async fn try_acquire(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow:
                 .unwrap_or(LEASE_DURATION_SECS);
 
             if holder == Some(identity) {
-                renew_lease(leases, name, identity).await?;
-                return Ok(true);
+                return renew_existing_lease(leases, name, existing, identity).await;
             }
 
             let expired = match renew_time {
@@ -107,23 +131,14 @@ async fn try_acquire(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow:
             if expired {
                 let transitions = spec.and_then(|s| s.lease_transitions).unwrap_or(0) + 1;
 
-                let patch = serde_json::json!({
-                    "spec": {
-                        "holderIdentity": identity,
-                        "leaseDurationSeconds": LEASE_DURATION_SECS,
-                        "acquireTime": micro_now,
-                        "renewTime": micro_now,
-                        "leaseTransitions": transitions
-                    }
-                });
-                leases
-                    .patch(
-                        name,
-                        &PatchParams::apply("kobe-operator"),
-                        &Patch::Merge(&patch),
-                    )
-                    .await?;
-                Ok(true)
+                let spec = existing.spec.get_or_insert_with(Default::default);
+                spec.holder_identity = Some(identity.to_string());
+                spec.lease_duration_seconds = Some(LEASE_DURATION_SECS);
+                spec.acquire_time = Some(micro_now.clone());
+                spec.renew_time = Some(micro_now);
+                spec.lease_transitions = Some(transitions);
+
+                replace_lease(leases, name, existing).await
             } else {
                 Ok(false)
             }
@@ -143,29 +158,63 @@ async fn try_acquire(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow:
                     ..Default::default()
                 }),
             };
-            leases.create(&PostParams::default(), &lease).await?;
-            Ok(true)
+            match leases.create(&PostParams::default(), &lease).await {
+                Ok(_) => Ok(true),
+                Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    info!(lease = name, "Leader lease was created by another instance");
+                    Ok(false)
+                }
+                Err(e) => Err(e.into()),
+            }
         }
         Err(e) => Err(e.into()),
     }
 }
 
-async fn renew_lease(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow::Result<()> {
+async fn renew_existing_lease(
+    leases: &Api<Lease>,
+    name: &str,
+    mut lease: Lease,
+    identity: &str,
+) -> anyhow::Result<bool> {
     let now = MicroTime(chrono_to_timestamp(chrono::Utc::now())?);
-    let patch = serde_json::json!({
-        "spec": {
-            "holderIdentity": identity,
-            "renewTime": now
+    let spec = lease.spec.get_or_insert_with(Default::default);
+    spec.holder_identity = Some(identity.to_string());
+    spec.lease_duration_seconds = Some(LEASE_DURATION_SECS);
+    spec.renew_time = Some(now);
+
+    replace_lease(leases, name, lease).await
+}
+
+async fn replace_lease(leases: &Api<Lease>, name: &str, lease: Lease) -> anyhow::Result<bool> {
+    match leases.replace(name, &PostParams::default(), &lease).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+            info!(lease = name, "Leader lease update conflicted; retrying");
+            Ok(false)
         }
-    });
-    leases
-        .patch(
-            name,
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
-        )
-        .await?;
-    Ok(())
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn renew_lease(leases: &Api<Lease>, name: &str, identity: &str) -> anyhow::Result<bool> {
+    let existing = leases.get(name).await?;
+    let holder = existing
+        .spec
+        .as_ref()
+        .and_then(|s| s.holder_identity.as_deref());
+
+    if holder != Some(identity) {
+        warn!(
+            lease = name,
+            holder = holder.unwrap_or("<none>"),
+            identity = identity,
+            "Leader lease is held by another instance"
+        );
+        return Ok(false);
+    }
+
+    renew_existing_lease(leases, name, existing, identity).await
 }
 
 async fn renew_loop(
@@ -182,15 +231,17 @@ async fn renew_loop(
     loop {
         interval.tick().await;
 
-        match renew_lease(&leases, lease_name, identity).await {
-            Ok(()) => {
-                consecutive_failures = 0;
-            }
-            Err(e) => {
+        match tokio::time::timeout(
+            RENEW_REQUEST_TIMEOUT,
+            renew_lease(&leases, lease_name, identity),
+        )
+        .await
+        {
+            Err(_) => {
                 consecutive_failures += 1;
                 warn!(
                     failures = consecutive_failures,
-                    "Failed to renew leader lease: {e}"
+                    "Timed out renewing leader lease"
                 );
                 if consecutive_failures >= 2 {
                     warn!("Lost leader lease — stepping down");
@@ -198,6 +249,28 @@ async fn renew_loop(
                     return;
                 }
             }
+            Ok(result) => match result {
+                Ok(true) => {
+                    consecutive_failures = 0;
+                }
+                Ok(false) => {
+                    warn!("Lost leader lease — stepping down");
+                    let _ = tx.send(false);
+                    return;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    warn!(
+                        failures = consecutive_failures,
+                        "Failed to renew leader lease: {e}"
+                    );
+                    if consecutive_failures >= 2 {
+                        warn!("Lost leader lease — stepping down");
+                        let _ = tx.send(false);
+                        return;
+                    }
+                }
+            },
         }
     }
 }
@@ -296,7 +369,8 @@ mod tests {
             "kind": "Lease",
             "metadata": {
                 "name": name,
-                "namespace": ns
+                "namespace": ns,
+                "resourceVersion": "1"
             },
             "spec": {
                 "holderIdentity": holder,
@@ -372,8 +446,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        // PATCH to renew — return 200
-        Mock::given(method("PATCH"))
+        // PUT to renew with the current resourceVersion — return 200
+        Mock::given(method("PUT"))
             .and(path(
                 "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
             ))
@@ -431,14 +505,248 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_try_acquire_updates_expired_lease() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+        let identity = "my-pod-id";
+
+        let renew_time = (chrono::Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "my-lease",
+                "test-ns",
+                "other-pod",
+                &renew_time,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(lease_json(
+                    "my-lease",
+                    "test-ns",
+                    identity,
+                    &chrono::Utc::now()
+                        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                        .to_string(),
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = try_acquire(&leases, "my-lease", identity).await;
+        assert!(result.is_ok(), "try_acquire should succeed: {result:?}");
+        assert!(
+            result.unwrap(),
+            "try_acquire should acquire an expired lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_conflict_on_expired_lease_returns_false() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+
+        let renew_time = (chrono::Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "my-lease",
+                "test-ns",
+                "other-pod",
+                &renew_time,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = try_acquire(&leases, "my-lease", "my-pod-id").await;
+        assert!(result.is_ok(), "try_acquire should succeed: {result:?}");
+        assert!(
+            !result.unwrap(),
+            "conflict means another standby won the expired lease race"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_create_conflict_returns_false() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("leases", "my-lease")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "AlreadyExists",
+                "code": 409
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = try_acquire(&leases, "my-lease", "my-pod-id").await;
+        assert!(result.is_ok(), "try_acquire should succeed: {result:?}");
+        assert!(
+            !result.unwrap(),
+            "create conflict means another replica created the lease first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_leader_election_waits_for_active_leader_without_error() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let identity = "other-pod";
+        let renew_time = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "my-lease",
+                "test-ns",
+                identity,
+                &renew_time,
+            )))
+            .mount(&server)
+            .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(40),
+            run_leader_election_with_config(
+                client,
+                "test-ns",
+                "my-lease",
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "standby replicas should keep waiting while another leader is healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_leader_election_times_out_on_observe_errors() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+
+        let error_response = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "metadata": {},
+            "status": "Failure",
+            "message": "Internal server error",
+            "reason": "InternalError",
+            "code": 500
+        });
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(error_response))
+            .mount(&server)
+            .await;
+
+        let result = run_leader_election_with_config(
+            client,
+            "test-ns",
+            "my-lease",
+            Duration::from_millis(5),
+            Duration::from_millis(15),
+        )
+        .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to observe or acquire leader lease"),
+            "real API observation failures should still fail the pod"
+        );
+    }
+
+    #[tokio::test]
     async fn test_renew_lease_success() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
         let leases: Api<Lease> = Api::namespaced(client, "test-ns");
         let identity = "my-pod-id";
 
-        // PATCH returns 200
-        Mock::given(method("PATCH"))
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "my-lease",
+                "test-ns",
+                identity,
+                "2026-02-26T10:00:00.000000Z",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PUT returns 200
+        Mock::given(method("PUT"))
             .and(path(
                 "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
             ))
@@ -454,5 +762,78 @@ mod tests {
 
         let result = renew_lease(&leases, "my-lease", identity).await;
         assert!(result.is_ok(), "renew_lease should succeed: {result:?}");
+        assert!(result.unwrap(), "renew_lease should report success");
+    }
+
+    #[tokio::test]
+    async fn test_renew_lease_returns_false_when_held_by_other() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "my-lease",
+                "test-ns",
+                "other-pod",
+                "2026-02-26T10:00:00.000000Z",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = renew_lease(&leases, "my-lease", "my-pod-id").await;
+        assert!(result.is_ok(), "renew_lease should succeed: {result:?}");
+        assert!(
+            !result.unwrap(),
+            "renew_lease should not take over a lease held by another replica"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_renew_lease_conflict_returns_false() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let leases: Api<Lease> = Api::namespaced(client, "test-ns");
+        let identity = "my-pod-id";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_json(
+                "my-lease",
+                "test-ns",
+                identity,
+                "2026-02-26T10:00:00.000000Z",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/my-lease",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = renew_lease(&leases, "my-lease", identity).await;
+        assert!(result.is_ok(), "renew_lease should succeed: {result:?}");
+        assert!(
+            !result.unwrap(),
+            "renew conflict means leadership was not confirmed"
+        );
     }
 }

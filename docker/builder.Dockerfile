@@ -23,6 +23,9 @@ RUN mkdir -p src/cli/commands && \
 # Build the real binaries — clean slate for kobe crates
 FROM deps AS build
 
+ARG BUILD_VERSION=dev
+ENV BUILD_VERSION=${BUILD_VERSION}
+
 COPY . .
 RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe && \
     ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe

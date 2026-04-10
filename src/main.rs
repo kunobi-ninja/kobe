@@ -78,7 +78,6 @@ async fn main() -> anyhow::Result<()> {
         client: client.clone(),
         authenticator: authenticator.clone(),
         namespace: namespace.clone(),
-        pools: pools.clone(),
         backend: backend.clone(),
     };
 

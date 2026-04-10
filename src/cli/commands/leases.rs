@@ -3,10 +3,11 @@ use anyhow::Result;
 use super::config::CliConfig;
 use super::{authed_client, get_auth_header, with_auth};
 
-pub async fn leases() -> Result<()> {
+pub async fn leases(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
-    let endpoint = config.endpoint();
-    let token = get_auth_header(endpoint, "GET", "/v1/leases", b"").await?;
+    let config = config.resolve(context_override, endpoint_override)?;
+    let endpoint = config.endpoint.as_str();
+    let token = get_auth_header(&config, "GET", "/v1/leases", b"").await?;
 
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}/v1/leases")), &token)

@@ -4,9 +4,16 @@ use std::path::PathBuf;
 use super::config::CliConfig;
 use super::{authed_client, get_auth_header, with_auth};
 
-pub async fn claim(pool: &str, ttl: &str, output: Option<&str>) -> Result<()> {
+pub async fn claim(
+    pool: &str,
+    ttl: &str,
+    output: Option<&str>,
+    context_override: Option<&str>,
+    endpoint_override: Option<&str>,
+) -> Result<()> {
     let config = CliConfig::load()?;
-    let endpoint = config.endpoint();
+    let config = config.resolve(context_override, endpoint_override)?;
+    let endpoint = config.endpoint.as_str();
     let body_json = serde_json::json!({
         "profile": pool,
         "ttl": ttl,
@@ -14,7 +21,7 @@ pub async fn claim(pool: &str, ttl: &str, output: Option<&str>) -> Result<()> {
     let body_bytes = serde_json::to_vec(&body_json)?;
     // Body signing not yet supported server-side (extractor doesn't have body access).
     // Sign with empty body for now.
-    let token = get_auth_header(endpoint, "POST", "/v1/leases", b"").await?;
+    let token = get_auth_header(&config, "POST", "/v1/leases", b"").await?;
 
     let client = authed_client();
     let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
