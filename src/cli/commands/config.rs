@@ -123,7 +123,11 @@ pub struct CliConfig {
     pub current_target: Option<String>,
 
     /// Named endpoint/auth configurations.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", alias = "contexts")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "contexts"
+    )]
     pub targets: BTreeMap<String, KobeTarget>,
 
     /// Kobe API endpoint.
@@ -224,9 +228,10 @@ impl CliConfig {
         let target_name = target_override.or(self.current_target.as_deref());
 
         if let Some(name) = target_name {
-            let target = self.targets.get(name).ok_or_else(|| {
-                anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
-            })?;
+            let target = self
+                .targets
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
 
             return Ok(ResolvedConfig {
                 target: Some(name.to_string()),
@@ -335,9 +340,7 @@ pub async fn config_current_target(output: OutputFormat) -> Result<()> {
     };
 
     if !config.targets.contains_key(&current_target) {
-        anyhow::bail!(
-            "Current target '{current_target}' does not exist. Run: kobe config list"
-        );
+        anyhow::bail!("Current target '{current_target}' does not exist. Run: kobe config list");
     }
 
     match output {

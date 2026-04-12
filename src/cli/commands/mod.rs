@@ -1,6 +1,6 @@
-mod lease_create;
 mod config;
 mod config_tui;
+mod lease_create;
 mod leases;
 mod login;
 mod pools;
@@ -12,12 +12,11 @@ mod version;
 use clap::ValueEnum;
 use serde::Serialize;
 
-pub use lease_create::lease_create;
 pub use config::{
-    config_current_target, config_list_targets, config_set_target, config_show,
-    config_use_target,
+    config_current_target, config_list_targets, config_set_target, config_show, config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
+pub use lease_create::lease_create;
 pub use login::{login, logout};
 pub use release::release;
 pub use status::status;
@@ -52,9 +51,9 @@ pub(crate) async fn get_auth_header(
         AuthMode::None => Ok(None),
         AuthMode::Token => match &config.token {
             Some(t) => Ok(Some(format!("Bearer {t}"))),
-            None => anyhow::bail!(
-                "Auth mode is 'token' but no token configured. Run: kobe config edit"
-            ),
+            None => {
+                anyhow::bail!("Auth mode is 'token' but no token configured. Run: kobe config edit")
+            }
         },
         AuthMode::Oidc => {
             let service_config =

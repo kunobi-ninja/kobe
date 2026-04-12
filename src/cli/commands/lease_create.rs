@@ -97,16 +97,16 @@ pub async fn lease_create(
         .ok_or_else(|| anyhow::anyhow!("Lease {} became bound without kubeconfig", ready.id))?;
     let path = write_kubeconfig(&accepted.id, kubeconfig, kubeconfig_path)?;
     if let Err(err) = record_kubeconfig(&config.endpoint, &accepted.id, &path) {
-        eprintln!("Warning: failed to record local kubeconfig path for {}: {err}", accepted.id);
+        eprintln!(
+            "Warning: failed to record local kubeconfig path for {}: {err}",
+            accepted.id
+        );
     }
 
     emit_ready_output(&ready, accepted.effective_ttl, path, output)
 }
 
-fn emit_pending_output(
-    accepted: &LeaseAcceptedResponse,
-    output: OutputFormat,
-) -> Result<()> {
+fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Text => {
             println!("Lease:   {}", accepted.id);

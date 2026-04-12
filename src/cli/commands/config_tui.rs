@@ -130,9 +130,10 @@ fn build_fields(config: &CliConfig, target: &EditTarget) -> Result<Vec<FormField
             config.ssh_fingerprint.clone().unwrap_or_default(),
         ),
         EditTarget::Target(name) => {
-            let target = config.targets.get(name).ok_or_else(|| {
-                anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
-            })?;
+            let target = config
+                .targets
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
             (
                 target.endpoint.clone(),
                 target.auth.clone(),
@@ -242,9 +243,10 @@ fn fields_to_config(
             ssh_fingerprint,
         }),
         EditTarget::Target(name) => {
-            let target = config.targets.get_mut(name).ok_or_else(|| {
-                anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
-            })?;
+            let target = config
+                .targets
+                .get_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
             if let Some(endpoint) = endpoint {
                 target.endpoint = endpoint;
             }

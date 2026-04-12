@@ -133,7 +133,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Commands::Release { lease_id } => commands::release(&lease_id, target, endpoint, output).await,
+        Commands::Release { lease_id } => {
+            commands::release(&lease_id, target, endpoint, output).await
+        }
         Commands::Config { action } => match action {
             Some(ConfigAction::View) => commands::config_show(target, output).await,
             Some(ConfigAction::Edit { name }) => {

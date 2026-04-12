@@ -48,7 +48,9 @@ pub async fn release(
             eprintln!("Warning: failed to forget local kubeconfig path for {lease_id}: {err}");
         }
         match output {
-            OutputFormat::Text => println!("Lease {lease_id} not found (already released or expired)"),
+            OutputFormat::Text => {
+                println!("Lease {lease_id} not found (already released or expired)")
+            }
             OutputFormat::Json => print_json(&ReleaseOutput {
                 lease_id,
                 status: "not_found",

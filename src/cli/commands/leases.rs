@@ -56,10 +56,7 @@ pub(crate) async fn fetch_leases_path(
     Ok(response.json().await?)
 }
 
-pub(crate) async fn fetch_lease(
-    config: &ResolvedConfig,
-    lease_id: &str,
-) -> Result<LeaseDetail> {
+pub(crate) async fn fetch_lease(config: &ResolvedConfig, lease_id: &str) -> Result<LeaseDetail> {
     let path = format!("/v1/leases/{lease_id}");
     let endpoint = config.endpoint.as_str();
     let token = get_auth_header(config, "GET", &path, b"").await?;
@@ -70,7 +67,10 @@ pub(crate) async fn fetch_lease(
         .await?;
 
     if !response.status().is_success() {
-        anyhow::bail!("Failed to get lease {lease_id} (HTTP {})", response.status());
+        anyhow::bail!(
+            "Failed to get lease {lease_id} (HTTP {})",
+            response.status()
+        );
     }
 
     Ok(response.json().await?)

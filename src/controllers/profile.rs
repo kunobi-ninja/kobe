@@ -1365,9 +1365,17 @@ mod tests {
         let pool_state = build_pool_state(&ctx, "test-profile").await;
 
         assert!(pool_state.clusters.contains_key("pool-test-profile-7"));
-        assert!(!pool_state.clusters.contains_key("pool-test-profile-7-server"));
+        assert!(
+            !pool_state
+                .clusters
+                .contains_key("pool-test-profile-7-server")
+        );
         assert_eq!(
-            pool_state.clusters.get("pool-test-profile-7").unwrap().state,
+            pool_state
+                .clusters
+                .get("pool-test-profile-7")
+                .unwrap()
+                .state,
             ClusterState::Ready
         );
     }
