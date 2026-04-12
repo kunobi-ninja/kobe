@@ -1,6 +1,7 @@
 mod commands;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use commands::OutputFormat;
 
 #[derive(Parser)]
 #[command(
@@ -9,13 +10,17 @@ use clap::{CommandFactory, Parser, Subcommand};
     version = commands::cli_version()
 )]
 struct Cli {
-    /// One-off endpoint override using the selected context's auth.
+    /// One-off endpoint override using the selected target's auth.
     #[arg(long, global = true, value_name = "URL")]
     endpoint: Option<String>,
 
-    /// Named CLI context to use.
-    #[arg(long, global = true, value_name = "NAME")]
-    context: Option<String>,
+    /// Named CLI target to use.
+    #[arg(long = "target", alias = "context", global = true, value_name = "NAME")]
+    target: Option<String>,
+
+    /// Output format.
+    #[arg(long, short = 'o', global = true, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
 
     #[command(subcommand)]
     command: Commands,
@@ -23,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show status overview (server, pools, leases)
+    /// Show status overview
     Status,
     /// Show CLI and endpoint versions
     Version,
@@ -31,12 +36,27 @@ enum Commands {
     Login,
     /// Remove stored credentials
     Logout,
-    /// List available cluster pools
-    Pools,
-    /// Manage cluster leases
+    /// Lease a cluster from a pool and wait until it is ready
     Lease {
-        #[command(subcommand)]
-        action: LeaseAction,
+        /// Pool name (e.g. ci-small)
+        pool: String,
+        /// Lease TTL
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// Return immediately after creating the lease request
+        #[arg(long)]
+        no_wait: bool,
+        /// Maximum time to wait for the lease to become usable (e.g. 30s, 5m, 1h)
+        #[arg(long, value_name = "DURATION", conflicts_with = "no_wait")]
+        wait_timeout: Option<String>,
+        /// Write kubeconfig to this path (default: ~/.kube/kobe-{lease-id})
+        #[arg(long = "kubeconfig", value_name = "PATH")]
+        kubeconfig: Option<String>,
+    },
+    /// Release a cluster lease
+    Release {
+        /// Lease ID
+        lease_id: String,
     },
     /// Manage CLI configuration
     Config {
@@ -46,55 +66,26 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum LeaseAction {
-    /// Create a new lease (claim a cluster from a pool)
-    Create {
-        /// Pool name (e.g. ci-small)
-        pool: String,
-        /// Lease TTL
-        #[arg(long, default_value = "1h")]
-        ttl: String,
-        /// Write kubeconfig to this path (default: ~/.kube/kobe-{lease-id})
-        #[arg(long, short)]
-        output: Option<String>,
-    },
-    /// List your active leases
-    List,
-    /// Release a cluster lease
-    Release {
-        /// Lease ID
-        lease_id: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum ConfigAction {
-    /// Set a configuration value
-    Set {
-        /// Key (endpoint, auth, token, ssh-fingerprint)
-        key: String,
-        /// Value
-        value: String,
-    },
     /// Show current configuration
     View,
     /// Edit configuration in the TUI
     Edit {
-        /// Context name to edit (defaults to current context, else legacy config)
+        /// Target name to edit (defaults to current target, else legacy config)
         name: Option<String>,
     },
-    /// List named contexts
-    GetContexts,
-    /// Show the current named context
-    CurrentContext,
-    /// Select the current named context
-    UseContext {
-        /// Context name
+    /// List named targets
+    List,
+    /// Show the current named target
+    Current,
+    /// Select the current named target
+    Use {
+        /// Target name
         name: String,
     },
-    /// Create or replace a named context
-    SetContext {
-        /// Context name
+    /// Create or replace a named target
+    Set {
+        /// Target name
         name: String,
         /// Kobe API endpoint
         #[arg(long)]
@@ -114,53 +105,64 @@ enum ConfigAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let context = cli.context.as_deref();
+    let target = cli.target.as_deref();
     let endpoint = cli.endpoint.as_deref();
+    let output = cli.output;
 
     match cli.command {
-        Commands::Status => commands::status(context, endpoint).await,
-        Commands::Version => commands::version(context, endpoint).await,
-        Commands::Login => commands::login(context, endpoint).await,
-        Commands::Logout => commands::logout(context, endpoint).await,
-        Commands::Pools => commands::pools(context, endpoint).await,
-        Commands::Lease { action } => match action {
-            LeaseAction::Create { pool, ttl, output } => {
-                commands::claim(&pool, &ttl, output.as_deref(), context, endpoint).await
-            }
-            LeaseAction::List => commands::leases(context, endpoint).await,
-            LeaseAction::Release { lease_id } => {
-                commands::release(&lease_id, context, endpoint).await
-            }
-        },
+        Commands::Status => commands::status(target, endpoint, output).await,
+        Commands::Version => commands::version(target, endpoint, output).await,
+        Commands::Login => commands::login(target, endpoint).await,
+        Commands::Logout => commands::logout(target, endpoint).await,
+        Commands::Lease {
+            pool,
+            ttl,
+            no_wait,
+            wait_timeout,
+            kubeconfig,
+        } => {
+            commands::lease_create(
+                &pool,
+                &ttl,
+                no_wait,
+                wait_timeout.as_deref(),
+                kubeconfig.as_deref(),
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::Release { lease_id } => commands::release(&lease_id, target, endpoint, output).await,
         Commands::Config { action } => match action {
-            Some(ConfigAction::Set { key, value }) => commands::config_set(&key, &value).await,
-            Some(ConfigAction::View) => commands::config_show(context).await,
+            Some(ConfigAction::View) => commands::config_show(target, output).await,
             Some(ConfigAction::Edit { name }) => {
-                if let (Some(flag), Some(arg)) = (context, name.as_deref()) {
+                if let (Some(flag), Some(arg)) = (target, name.as_deref()) {
                     if flag != arg {
                         anyhow::bail!(
-                            "Specify either --context {flag} or config edit {arg}, not both"
+                            "Specify either --target {flag} or config edit {arg}, not both"
                         );
                     }
                 }
-                commands::config_interactive(name.as_deref().or(context))
+                commands::config_interactive(name.as_deref().or(target))
             }
-            Some(ConfigAction::GetContexts) => commands::config_contexts().await,
-            Some(ConfigAction::CurrentContext) => commands::config_current_context().await,
-            Some(ConfigAction::UseContext { name }) => commands::config_use_context(&name).await,
-            Some(ConfigAction::SetContext {
+            Some(ConfigAction::List) => commands::config_list_targets(output).await,
+            Some(ConfigAction::Current) => commands::config_current_target(output).await,
+            Some(ConfigAction::Use { name }) => commands::config_use_target(&name, output).await,
+            Some(ConfigAction::Set {
                 name,
                 endpoint,
                 auth,
                 token,
                 ssh_fingerprint,
             }) => {
-                commands::config_set_context(
+                commands::config_set_target(
                     &name,
                     &endpoint,
                     auth.as_deref(),
                     token.as_deref(),
                     ssh_fingerprint.as_deref(),
+                    output,
                 )
                 .await
             }

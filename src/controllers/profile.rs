@@ -584,6 +584,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
         ready: counts.ready,
         leased: counts.leased,
         creating: counts.creating,
+        recycling: counts.recycling,
         unhealthy: counts.unhealthy,
         queue_depth,
         golden_backup: existing_golden_backup,
@@ -674,13 +675,15 @@ async fn build_pool_state<B: ClusterBackend>(
             continue;
         }
 
+        let cluster_name = logical_cluster_name(&sts_name);
+
         let ready_replicas = sts
             .status
             .as_ref()
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0);
 
-        let live_state = if claimed_clusters.contains(&sts_name) {
+        let live_state = if claimed_clusters.contains(&cluster_name) {
             ClusterState::Leased
         } else if ready_replicas > 0 {
             ClusterState::Ready
@@ -690,11 +693,11 @@ async fn build_pool_state<B: ClusterBackend>(
 
         let cached_entry = cached
             .as_ref()
-            .and_then(|pool| pool.clusters.get(&sts_name));
+            .and_then(|pool| pool.clusters.get(&cluster_name));
         let state = match cached_entry.map(|entry| &entry.state) {
             Some(ClusterState::Recycling) => ClusterState::Recycling,
             Some(ClusterState::Unhealthy) => ClusterState::Unhealthy,
-            Some(ClusterState::Creating) if !claimed_clusters.contains(&sts_name) => {
+            Some(ClusterState::Creating) if live_state == ClusterState::Creating => {
                 ClusterState::Creating
             }
             _ => live_state,
@@ -716,13 +719,14 @@ async fn build_pool_state<B: ClusterBackend>(
 
         debug!(
             profile = profile_name,
-            cluster = %sts_name,
+            cluster = %cluster_name,
+            statefulset = %sts_name,
             ?state,
             "Discovered cluster from K8s"
         );
 
         clusters.insert(
-            sts_name,
+            cluster_name,
             ClusterEntry {
                 state: state.clone(),
                 idle_since,
@@ -740,6 +744,13 @@ async fn build_pool_state<B: ClusterBackend>(
     );
 
     PoolState { clusters }
+}
+
+fn logical_cluster_name(sts_name: &str) -> String {
+    sts_name
+        .strip_suffix("-server")
+        .unwrap_or(sts_name)
+        .to_string()
 }
 
 /// Evaluate readiness gates for clusters in Creating state.
@@ -1317,6 +1328,103 @@ mod tests {
         assert!(entry.idle_since.is_some());
         assert_eq!(entry.health_failures, 2);
         assert_eq!(entry.spec_hash, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_build_pool_state_normalizes_server_suffix() {
+        let (ctx, server) = test_profile_context().await;
+
+        Mock::given(method("GET"))
+            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "metadata": { "name": "pool-test-profile-7-server", "namespace": "test-ns" },
+                    "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
+                    "status": { "readyReplicas": 1, "replicas": 1 }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/profile=test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        let pool_state = build_pool_state(&ctx, "test-profile").await;
+
+        assert!(pool_state.clusters.contains_key("pool-test-profile-7"));
+        assert!(!pool_state.clusters.contains_key("pool-test-profile-7-server"));
+        assert_eq!(
+            pool_state.clusters.get("pool-test-profile-7").unwrap().state,
+            ClusterState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_pool_state_heals_creating_when_statefulset_is_ready() {
+        let (ctx, server) = test_profile_context().await;
+
+        {
+            let mut pools = ctx.pools.write().await;
+            let mut clusters = HashMap::new();
+            clusters.insert(
+                "pool-heal-profile-1".to_string(),
+                ClusterEntry {
+                    state: ClusterState::Creating,
+                    idle_since: None,
+                    health_failures: 0,
+                    state_since: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                    spec_hash: Some(7),
+                },
+            );
+            pools.insert("heal-profile".to_string(), PoolState { clusters });
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "metadata": { "name": "pool-heal-profile-1-server", "namespace": "test-ns" },
+                    "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
+                    "status": { "readyReplicas": 1, "replicas": 1 }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/profile=heal-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        let pool_state = build_pool_state(&ctx, "heal-profile").await;
+        let entry = pool_state.clusters.get("pool-heal-profile-1").unwrap();
+
+        assert_eq!(entry.state, ClusterState::Ready);
+        assert!(entry.idle_since.is_some());
     }
 
     // -----------------------------------------------------------------------

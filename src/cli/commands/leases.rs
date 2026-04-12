@@ -1,10 +1,10 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::config::{CliConfig, ResolvedConfig};
+use super::config::ResolvedConfig;
 use super::{authed_client, get_auth_header, with_auth};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LeaseSummary {
     pub id: String,
@@ -18,6 +18,23 @@ pub(crate) struct LeaseSummary {
     pub queue_position: u32,
     #[serde(default)]
     pub requester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct LeaseDetail {
+    pub id: String,
+    pub phase: String,
+    pub profile: String,
+    #[serde(default)]
+    pub cluster_name: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub queue_position: u32,
+    #[serde(default)]
+    pub kubeconfig: Option<String>,
 }
 
 pub(crate) async fn fetch_leases_path(
@@ -34,6 +51,26 @@ pub(crate) async fn fetch_leases_path(
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to list leases (HTTP {})", response.status());
+    }
+
+    Ok(response.json().await?)
+}
+
+pub(crate) async fn fetch_lease(
+    config: &ResolvedConfig,
+    lease_id: &str,
+) -> Result<LeaseDetail> {
+    let path = format!("/v1/leases/{lease_id}");
+    let endpoint = config.endpoint.as_str();
+    let token = get_auth_header(config, "GET", &path, b"").await?;
+
+    let client = authed_client();
+    let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to get lease {lease_id} (HTTP {})", response.status());
     }
 
     Ok(response.json().await?)
@@ -73,44 +110,4 @@ pub(crate) fn lease_when_label(lease: &LeaseSummary) -> String {
     } else {
         lease_phase_label(lease)
     }
-}
-
-pub(crate) fn shorten_requester(requester: &str) -> String {
-    if requester.len() > 28 {
-        format!(
-            "{}...{}",
-            &requester[..14],
-            &requester[requester.len() - 6..]
-        )
-    } else {
-        requester.to_string()
-    }
-}
-
-pub async fn leases(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
-    let config = CliConfig::load()?;
-    let config = config.resolve(context_override, endpoint_override)?;
-    let items = fetch_leases_path(&config, "/v1/leases").await?;
-
-    if items.is_empty() {
-        println!("No active leases.");
-        return Ok(());
-    }
-
-    println!(
-        "{:<24}  {:<12}  {:<8}  {:<28}  WHEN",
-        "LEASE", "POOL", "PHASE", "CLUSTER"
-    );
-    for lease in &items {
-        println!(
-            "{:<24}  {:<12}  {:<8}  {:<28}  {}",
-            lease.id,
-            lease.profile,
-            lease_phase_label(lease),
-            lease_cluster_label(lease),
-            lease_when_label(lease)
-        );
-    }
-
-    Ok(())
 }

@@ -14,14 +14,14 @@ use super::config::{AuthMode, CliConfig};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EditTarget {
     Legacy,
-    Context(String),
+    Target(String),
 }
 
 impl EditTarget {
     fn label(&self) -> String {
         match self {
             Self::Legacy => "legacy config".to_string(),
-            Self::Context(name) => format!("context {name}"),
+            Self::Target(name) => format!("target {name}"),
         }
     }
 }
@@ -93,7 +93,7 @@ enum Mode {
 
 struct EditorState {
     target: EditTarget,
-    current_context: Option<String>,
+    current_target: Option<String>,
     fields: Vec<FormField>,
     cursor: usize,
     mode: Mode,
@@ -103,19 +103,19 @@ struct EditorState {
     status: Option<String>,
 }
 
-fn resolve_edit_target(config: &CliConfig, context_override: Option<&str>) -> Result<EditTarget> {
-    if let Some(name) = context_override {
-        if config.contexts.contains_key(name) {
-            return Ok(EditTarget::Context(name.to_string()));
+fn resolve_edit_target(config: &CliConfig, target_override: Option<&str>) -> Result<EditTarget> {
+    if let Some(name) = target_override {
+        if config.targets.contains_key(name) {
+            return Ok(EditTarget::Target(name.to_string()));
         }
-        anyhow::bail!("Unknown context '{name}'. Run: kobe config get-contexts");
+        anyhow::bail!("Unknown target '{name}'. Run: kobe config list");
     }
 
-    if let Some(name) = &config.current_context {
-        if config.contexts.contains_key(name) {
-            return Ok(EditTarget::Context(name.clone()));
+    if let Some(name) = &config.current_target {
+        if config.targets.contains_key(name) {
+            return Ok(EditTarget::Target(name.clone()));
         }
-        anyhow::bail!("Current context '{name}' does not exist. Run: kobe config get-contexts");
+        anyhow::bail!("Current target '{name}' does not exist. Run: kobe config list");
     }
 
     Ok(EditTarget::Legacy)
@@ -129,15 +129,15 @@ fn build_fields(config: &CliConfig, target: &EditTarget) -> Result<Vec<FormField
             config.token.clone().unwrap_or_default(),
             config.ssh_fingerprint.clone().unwrap_or_default(),
         ),
-        EditTarget::Context(name) => {
-            let context = config.contexts.get(name).ok_or_else(|| {
-                anyhow::anyhow!("Unknown context '{name}'. Run: kobe config get-contexts")
+        EditTarget::Target(name) => {
+            let target = config.targets.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
             })?;
             (
-                context.endpoint.clone(),
-                context.auth.clone(),
-                context.token.clone().unwrap_or_default(),
-                context.ssh_fingerprint.clone().unwrap_or_default(),
+                target.endpoint.clone(),
+                target.auth.clone(),
+                target.token.clone().unwrap_or_default(),
+                target.ssh_fingerprint.clone().unwrap_or_default(),
             )
         }
     };
@@ -224,8 +224,8 @@ fn fields_to_config(
     };
 
     let mut config = CliConfig {
-        current_context: previous.current_context.clone(),
-        contexts: previous.contexts.clone(),
+        current_target: previous.current_target.clone(),
+        targets: previous.targets.clone(),
         endpoint: previous.endpoint.clone(),
         auth: previous.auth.clone(),
         token: previous.token.clone(),
@@ -234,23 +234,23 @@ fn fields_to_config(
 
     match target {
         EditTarget::Legacy => Ok(CliConfig {
-            current_context: config.current_context,
-            contexts: config.contexts,
+            current_target: config.current_target,
+            targets: config.targets,
             endpoint,
             auth,
             token,
             ssh_fingerprint,
         }),
-        EditTarget::Context(name) => {
-            let context = config.contexts.get_mut(name).ok_or_else(|| {
-                anyhow::anyhow!("Unknown context '{name}'. Run: kobe config get-contexts")
+        EditTarget::Target(name) => {
+            let target = config.targets.get_mut(name).ok_or_else(|| {
+                anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
             })?;
             if let Some(endpoint) = endpoint {
-                context.endpoint = endpoint;
+                target.endpoint = endpoint;
             }
-            context.auth = auth;
-            context.token = token;
-            context.ssh_fingerprint = ssh_fingerprint;
+            target.auth = auth;
+            target.token = token;
+            target.ssh_fingerprint = ssh_fingerprint;
             Ok(config)
         }
     }
@@ -281,9 +281,9 @@ fn cycle_select(field: &mut FormField, backwards: bool) -> bool {
 
 // ── Main TUI entry point ─────────────────────────────────────────────────
 
-pub fn run_config_tui(context_override: Option<&str>) -> Result<()> {
+pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
-    let target = resolve_edit_target(&config, context_override)?;
+    let target = resolve_edit_target(&config, target_override)?;
     let fields = build_fields(&config, &target)?;
 
     enable_raw_mode()?;
@@ -292,7 +292,7 @@ pub fn run_config_tui(context_override: Option<&str>) -> Result<()> {
 
     let mut state = EditorState {
         target,
-        current_context: config.current_context.clone(),
+        current_target: config.current_target.clone(),
         fields,
         cursor: 0,
         mode: Mode::Navigate,
@@ -441,9 +441,9 @@ fn draw(f: &mut Frame, state: &EditorState) {
             Span::styled(state.target.label(), Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled(" current context: ", Style::default().fg(Color::Gray)),
+            Span::styled(" current target: ", Style::default().fg(Color::Gray)),
             Span::styled(
-                state.current_context.as_deref().unwrap_or("(none)"),
+                state.current_target.as_deref().unwrap_or("(none)"),
                 Style::default().fg(Color::White),
             ),
         ]),
@@ -568,11 +568,11 @@ fn draw(f: &mut Frame, state: &EditorState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::config::KobeContext;
+    use crate::commands::config::KobeTarget;
     use std::collections::BTreeMap;
 
-    fn sample_context(endpoint: &str, auth: AuthMode) -> KobeContext {
-        KobeContext {
+    fn sample_target(endpoint: &str, auth: AuthMode) -> KobeTarget {
+        KobeTarget {
             endpoint: endpoint.to_string(),
             auth,
             token: None,
@@ -581,65 +581,65 @@ mod tests {
     }
 
     #[test]
-    fn resolve_edit_target_prefers_requested_context() {
-        let mut contexts = BTreeMap::new();
-        contexts.insert(
+    fn resolve_edit_target_prefers_requested_target() {
+        let mut targets = BTreeMap::new();
+        targets.insert(
             "prod".to_string(),
-            sample_context("https://prod.example.com", AuthMode::Oidc),
+            sample_target("https://prod.example.com", AuthMode::Oidc),
         );
-        contexts.insert(
+        targets.insert(
             "staging".to_string(),
-            sample_context("https://staging.example.com", AuthMode::Ssh),
+            sample_target("https://staging.example.com", AuthMode::Ssh),
         );
 
         let config = CliConfig {
-            current_context: Some("prod".to_string()),
-            contexts,
+            current_target: Some("prod".to_string()),
+            targets,
             ..CliConfig::default()
         };
 
         let target = resolve_edit_target(&config, Some("staging")).unwrap();
-        assert_eq!(target, EditTarget::Context("staging".to_string()));
+        assert_eq!(target, EditTarget::Target("staging".to_string()));
     }
 
     #[test]
     fn build_fields_keeps_auth_specific_fields_visible() {
-        let mut contexts = BTreeMap::new();
-        contexts.insert(
+        let mut targets = BTreeMap::new();
+        targets.insert(
             "prod".to_string(),
-            sample_context("https://prod.example.com", AuthMode::Oidc),
+            sample_target("https://prod.example.com", AuthMode::Oidc),
         );
 
         let config = CliConfig {
-            current_context: Some("prod".to_string()),
-            contexts,
+            current_target: Some("prod".to_string()),
+            targets,
             ..CliConfig::default()
         };
 
-        let fields = build_fields(&config, &EditTarget::Context("prod".to_string())).unwrap();
+        let fields = build_fields(&config, &EditTarget::Target("prod".to_string())).unwrap();
         assert_eq!(fields.len(), 4);
         assert!(!fields[2].is_active(&fields));
         assert!(!fields[3].is_active(&fields));
     }
 
     #[test]
-    fn build_fields_for_context_does_not_inherit_legacy_credentials() {
-        let mut contexts = BTreeMap::new();
-        contexts.insert(
+    fn build_fields_for_target_does_not_inherit_legacy_credentials() {
+        let mut targets = BTreeMap::new();
+        targets.insert(
             "prod".to_string(),
-            sample_context("https://prod.example.com", AuthMode::Oidc),
+            sample_target("https://prod.example.com", AuthMode::Oidc),
         );
 
         let config = CliConfig {
-            current_context: Some("prod".to_string()),
-            contexts,
+            current_target: Some("prod".to_string()),
+            targets,
             endpoint: Some("https://legacy.example.com".to_string()),
             auth: AuthMode::Token,
             token: Some("legacy-token".to_string()),
             ssh_fingerprint: Some("SHA256:legacy".to_string()),
         };
 
-        let fields = build_fields(&config, &EditTarget::Context("prod".to_string())).unwrap();
+        let fields = build_fields(&config, &EditTarget::Target("prod".to_string())).unwrap();
         assert_eq!(fields[0].value, "https://prod.example.com");
         assert_eq!(fields[1].value, "oidc");
         assert!(fields[2].value.is_empty());
@@ -647,16 +647,16 @@ mod tests {
     }
 
     #[test]
-    fn fields_to_config_updates_selected_context_only() {
-        let mut contexts = BTreeMap::new();
-        contexts.insert(
+    fn fields_to_config_updates_selected_target_only() {
+        let mut targets = BTreeMap::new();
+        targets.insert(
             "prod".to_string(),
-            sample_context("https://prod.example.com", AuthMode::Oidc),
+            sample_target("https://prod.example.com", AuthMode::Oidc),
         );
 
         let previous = CliConfig {
-            current_context: Some("prod".to_string()),
-            contexts,
+            current_target: Some("prod".to_string()),
+            targets,
             endpoint: Some("https://legacy.example.com".to_string()),
             auth: AuthMode::Token,
             token: Some("legacy-token".to_string()),
@@ -707,7 +707,7 @@ mod tests {
         ];
 
         let updated =
-            fields_to_config(&fields, &previous, &EditTarget::Context("prod".to_string())).unwrap();
+            fields_to_config(&fields, &previous, &EditTarget::Target("prod".to_string())).unwrap();
 
         assert_eq!(
             updated.endpoint.as_deref(),
@@ -715,7 +715,7 @@ mod tests {
         );
         assert_eq!(updated.auth, AuthMode::Token);
 
-        let prod = updated.contexts.get("prod").unwrap();
+        let prod = updated.targets.get("prod").unwrap();
         assert_eq!(prod.endpoint, "https://new.example.com");
         assert_eq!(prod.auth, AuthMode::Ssh);
         assert_eq!(prod.ssh_fingerprint.as_deref(), Some("SHA256:test"));

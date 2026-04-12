@@ -1,30 +1,43 @@
-mod claim;
+mod lease_create;
 mod config;
 mod config_tui;
 mod leases;
 mod login;
 mod pools;
 mod release;
+mod state;
 mod status;
 mod version;
 
-pub use claim::claim;
+use clap::ValueEnum;
+use serde::Serialize;
+
+pub use lease_create::lease_create;
 pub use config::{
-    config_contexts, config_current_context, config_set, config_set_context, config_show,
-    config_use_context,
+    config_current_target, config_list_targets, config_set_target, config_show,
+    config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
-pub use leases::leases;
 pub use login::{login, logout};
-pub use pools::pools;
 pub use release::release;
 pub use status::status;
 pub use version::version;
 
 use config::{AuthMode, ResolvedConfig};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
 pub(crate) fn cli_version() -> &'static str {
     option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+pub(crate) fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 /// Get a valid auth header value based on the configured auth mode.
@@ -40,7 +53,7 @@ pub(crate) async fn get_auth_header(
         AuthMode::Token => match &config.token {
             Some(t) => Ok(Some(format!("Bearer {t}"))),
             None => anyhow::bail!(
-                "Auth mode is 'token' but no token configured. Run: kobe config set token <value>"
+                "Auth mode is 'token' but no token configured. Run: kobe config edit"
             ),
         },
         AuthMode::Oidc => {

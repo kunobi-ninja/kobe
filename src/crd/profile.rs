@@ -448,9 +448,13 @@ pub struct ClusterPoolStatus {
     #[serde(default, alias = "claimed")]
     pub leased: u32,
 
-    /// Number of clusters being created or recycled.
+    /// Number of clusters being created.
     #[serde(default)]
     pub creating: u32,
+
+    /// Number of clusters currently being recycled.
+    #[serde(default)]
+    pub recycling: u32,
 
     /// Number of clusters currently unhealthy and being recycled.
     #[serde(default)]

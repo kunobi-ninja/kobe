@@ -1,10 +1,10 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::config::{CliConfig, ResolvedConfig};
+use super::config::ResolvedConfig;
 use super::{authed_client, get_auth_header, with_auth};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PoolPolicySummary {
     pub mode: String,
@@ -16,7 +16,7 @@ pub(crate) struct PoolPolicySummary {
     pub queue_timeout: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PoolSummary {
     pub name: String,
@@ -25,6 +25,8 @@ pub(crate) struct PoolSummary {
     pub leased: u32,
     #[serde(default)]
     pub creating: u32,
+    #[serde(default)]
+    pub recycling: u32,
     #[serde(default)]
     pub unhealthy: u32,
     #[serde(default)]
@@ -49,20 +51,12 @@ pub(crate) async fn fetch_pools_for_config(config: &ResolvedConfig) -> Result<Ve
     Ok(response.json().await?)
 }
 
-pub(crate) async fn fetch_pools(
-    context_override: Option<&str>,
-    endpoint_override: Option<&str>,
-) -> Result<Vec<PoolSummary>> {
-    let config = CliConfig::load()?;
-    let config = config.resolve(context_override, endpoint_override)?;
-    fetch_pools_for_config(&config).await
-}
-
 pub(crate) fn format_capacity(pool: &PoolSummary) -> String {
     let mut parts = vec![
         format!("ready={}", pool.ready),
         format!("leased={}", pool.leased),
         format!("creating={}", pool.creating),
+        format!("recycling={}", pool.recycling),
         format!("queue={}", pool.queue_depth),
     ];
 
@@ -109,24 +103,6 @@ pub(crate) fn print_pool_block(pool: &PoolSummary, indent: &str) {
     }
 }
 
-pub async fn pools(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
-    let pools = fetch_pools(context_override, endpoint_override).await?;
-
-    if pools.is_empty() {
-        println!("No pools available.");
-        return Ok(());
-    }
-
-    for (index, pool) in pools.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-        print_pool_block(pool, "");
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{PoolSummary, format_policy};
@@ -142,6 +118,7 @@ mod tests {
 
         assert_eq!(pool.leased, 1);
         assert_eq!(pool.creating, 0);
+        assert_eq!(pool.recycling, 0);
         assert_eq!(pool.unhealthy, 0);
         assert_eq!(pool.queue_depth, 0);
         assert!(pool.policy.is_none());

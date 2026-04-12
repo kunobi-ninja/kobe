@@ -122,6 +122,8 @@ struct LeaseResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     kubeconfig: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
     phase: String,
     profile: String,
@@ -188,6 +190,7 @@ struct ProfileResponse {
     ready: u32,
     leased: u32,
     creating: u32,
+    recycling: u32,
     unhealthy: u32,
     queue_depth: u32,
     policy: PoolPolicyResponse,
@@ -231,6 +234,7 @@ fn profile_response(profile: &ClusterPool) -> ProfileResponse {
         ready: status.ready,
         leased: status.leased,
         creating: status.creating,
+        recycling: status.recycling,
         unhealthy: status.unhealthy,
         queue_depth: status.queue_depth,
         policy: pool_policy_response(profile),
@@ -364,6 +368,7 @@ async fn create_lease<B: ClusterBackend>(
     let mut resp = LeaseResponse {
         id: lease_id,
         kubeconfig: None,
+        cluster_name: None,
         expires_at: None,
         phase: "Pending".to_string(),
         profile: req.profile,
@@ -476,6 +481,7 @@ async fn get_lease<B: ClusterBackend>(
                 Json(LeaseResponse {
                     id,
                     kubeconfig,
+                    cluster_name: status.cluster_name,
                     expires_at: status.expires_at,
                     phase: status.phase.to_string(),
                     profile: lease.spec.pool_ref,
