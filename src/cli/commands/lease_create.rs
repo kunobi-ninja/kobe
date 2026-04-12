@@ -8,6 +8,17 @@ use super::leases::LeaseDetail;
 use super::state::record_kubeconfig;
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
 
+pub struct LeaseCreateCommand<'a> {
+    pub pool: &'a str,
+    pub ttl: &'a str,
+    pub no_wait: bool,
+    pub wait_timeout: Option<&'a str>,
+    pub kubeconfig_path: Option<&'a str>,
+    pub target_override: Option<&'a str>,
+    pub endpoint_override: Option<&'a str>,
+    pub output: OutputFormat,
+}
+
 #[derive(Deserialize)]
 struct LeaseAcceptedResponse {
     id: String,
@@ -34,22 +45,13 @@ struct LeaseCreateOutput {
     kubeconfig_path: Option<String>,
 }
 
-pub async fn lease_create(
-    pool: &str,
-    ttl: &str,
-    no_wait: bool,
-    wait_timeout: Option<&str>,
-    kubeconfig_path: Option<&str>,
-    target_override: Option<&str>,
-    endpoint_override: Option<&str>,
-    output: OutputFormat,
-) -> Result<()> {
+pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     let config = CliConfig::load()?;
-    let config = config.resolve(target_override, endpoint_override)?;
+    let config = config.resolve(command.target_override, command.endpoint_override)?;
     let endpoint = config.endpoint.as_str();
     let body_json = serde_json::json!({
-        "profile": pool,
-        "ttl": ttl,
+        "profile": command.pool,
+        "ttl": command.ttl,
     });
     let body_bytes = serde_json::to_vec(&body_json)?;
     // Body signing not yet supported server-side (extractor doesn't have body access).
@@ -75,11 +77,11 @@ pub async fn lease_create(
 
     let accepted: LeaseAcceptedResponse = response.json().await?;
 
-    if no_wait {
-        return emit_pending_output(&accepted, output);
+    if command.no_wait {
+        return emit_pending_output(&accepted, command.output);
     }
 
-    if output == OutputFormat::Text {
+    if command.output == OutputFormat::Text {
         eprintln!("Waiting for lease {} to become ready...", accepted.id);
     }
 
@@ -87,7 +89,7 @@ pub async fn lease_create(
         &config,
         &accepted.id,
         accepted.effective_ttl.clone(),
-        wait_timeout,
+        command.wait_timeout,
     )
     .await?;
 
@@ -95,7 +97,7 @@ pub async fn lease_create(
         .kubeconfig
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Lease {} became bound without kubeconfig", ready.id))?;
-    let path = write_kubeconfig(&accepted.id, kubeconfig, kubeconfig_path)?;
+    let path = write_kubeconfig(&accepted.id, kubeconfig, command.kubeconfig_path)?;
     if let Err(err) = record_kubeconfig(&config.endpoint, &accepted.id, &path) {
         eprintln!(
             "Warning: failed to record local kubeconfig path for {}: {err}",
@@ -103,7 +105,7 @@ pub async fn lease_create(
         );
     }
 
-    emit_ready_output(&ready, accepted.effective_ttl, path, output)
+    emit_ready_output(&ready, accepted.effective_ttl, path, command.output)
 }
 
 fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -> Result<()> {

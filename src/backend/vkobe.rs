@@ -1321,10 +1321,10 @@ mod tests {
             .find(|r| {
                 r.api_groups
                     .as_ref()
-                    .map_or(false, |g| g.contains(&"".to_string()))
+                    .is_some_and(|g| g.contains(&"".to_string()))
                     && r.resources
                         .as_ref()
-                        .map_or(false, |res| res.contains(&"pods".to_string()))
+                        .is_some_and(|res| res.contains(&"pods".to_string()))
             })
             .expect("Should have a core API group rule for pods");
 
@@ -1360,7 +1360,7 @@ mod tests {
             .find(|r| {
                 r.api_groups
                     .as_ref()
-                    .map_or(false, |g| g.contains(&"networking.k8s.io".to_string()))
+                    .is_some_and(|g| g.contains(&"networking.k8s.io".to_string()))
             })
             .expect("Should have a networking.k8s.io rule");
         let net_resources = networking_rule.resources.as_ref().unwrap();
@@ -1373,7 +1373,7 @@ mod tests {
             .find(|r| {
                 r.resources
                     .as_ref()
-                    .map_or(false, |res| res.contains(&"pods/status".to_string()))
+                    .is_some_and(|res| res.contains(&"pods/status".to_string()))
             })
             .expect("Should have a pods/status rule");
         assert!(status_rule.verbs.contains(&"get".to_string()));

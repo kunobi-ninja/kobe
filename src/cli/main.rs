@@ -121,16 +121,16 @@ async fn main() -> anyhow::Result<()> {
             wait_timeout,
             kubeconfig,
         } => {
-            commands::lease_create(
-                &pool,
-                &ttl,
+            commands::lease_create(commands::LeaseCreateCommand {
+                pool: &pool,
+                ttl: &ttl,
                 no_wait,
-                wait_timeout.as_deref(),
-                kubeconfig.as_deref(),
-                target,
-                endpoint,
+                wait_timeout: wait_timeout.as_deref(),
+                kubeconfig_path: kubeconfig.as_deref(),
+                target_override: target,
+                endpoint_override: endpoint,
                 output,
-            )
+            })
             .await
         }
         Commands::Release { lease_id } => {

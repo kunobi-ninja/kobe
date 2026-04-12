@@ -16,7 +16,7 @@ pub use config::{
     config_current_target, config_list_targets, config_set_target, config_show, config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
-pub use lease_create::lease_create;
+pub use lease_create::{LeaseCreateCommand, lease_create};
 pub use login::{login, logout};
 pub use release::release;
 pub use status::status;
