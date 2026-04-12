@@ -335,7 +335,7 @@ spec:
                 properties:
                   maxClusters:
                     default: 8
-                    description: Hard ceiling on total clusters (warm + claimed + creating).
+                    description: Hard ceiling on total clusters (warm + leased + creating).
                     format: uint32
                     minimum: 0.0
                     type: integer
@@ -417,12 +417,6 @@ spec:
           status:
             nullable: true
             properties:
-              claimed:
-                default: 0
-                description: Number of clusters currently bound to claims.
-                format: uint32
-                minimum: 0.0
-                type: integer
               creating:
                 default: 0
                 description: Number of clusters being created or recycled.
@@ -444,6 +438,12 @@ spec:
                 description: Name of the PostgreSQL template database for golden images (k3s backend).
                 nullable: true
                 type: string
+              leased:
+                default: 0
+                description: Number of clusters currently leased.
+                format: uint32
+                minimum: 0.0
+                type: integer
               queueDepth:
                 default: 0
                 description: Current queue depth (claims waiting for clusters).

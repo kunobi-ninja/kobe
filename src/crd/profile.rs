@@ -391,7 +391,7 @@ pub struct ScalingConfig {
     #[serde(default = "default_min_ready")]
     pub min_ready: u32,
 
-    /// Hard ceiling on total clusters (warm + claimed + creating).
+    /// Hard ceiling on total clusters (warm + leased + creating).
     #[serde(default = "default_max_clusters")]
     pub max_clusters: u32,
 
@@ -444,9 +444,9 @@ pub struct ClusterPoolStatus {
     #[serde(default)]
     pub ready: u32,
 
-    /// Number of clusters currently bound to claims.
-    #[serde(default)]
-    pub claimed: u32,
+    /// Number of clusters currently leased.
+    #[serde(default, alias = "claimed")]
+    pub leased: u32,
 
     /// Number of clusters being created or recycled.
     #[serde(default)]

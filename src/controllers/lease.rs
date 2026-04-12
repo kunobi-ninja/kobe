@@ -285,7 +285,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
                 if let Some(ref cluster_name) = ready_cluster {
                     if let Some(entry) = pool.clusters.get_mut(cluster_name) {
-                        entry.state = ClusterState::Claimed;
+                        entry.state = ClusterState::Leased;
                         entry.idle_since = None;
                     }
                 }
@@ -1015,11 +1015,11 @@ mod tests {
         // Successful bind → requeue at 60s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
 
-        // Verify the cluster state changed to Claimed.
+        // Verify the cluster state changed to Leased.
         let pools = ctx.pools.read().await;
         let pool = pools.get("test-profile").unwrap();
         let entry = pool.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Claimed);
+        assert_eq!(entry.state, ClusterState::Leased);
     }
 
     // -----------------------------------------------------------------------
@@ -1105,7 +1105,7 @@ mod tests {
             clusters.insert(
                 "pool-test-1".to_string(),
                 crate::pool::ClusterEntry {
-                    state: ClusterState::Claimed,
+                    state: ClusterState::Leased,
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
@@ -1199,7 +1199,7 @@ mod tests {
             clusters.insert(
                 "pool-test-1".to_string(),
                 crate::pool::ClusterEntry {
-                    state: ClusterState::Claimed,
+                    state: ClusterState::Leased,
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),

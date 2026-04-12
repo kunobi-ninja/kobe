@@ -1,6 +1,10 @@
 use anyhow::Result;
 
 use super::config::{AuthMode, CliConfig};
+use super::leases::{
+    fetch_leases_path, lease_cluster_label, lease_phase_label, lease_when_label, shorten_requester,
+};
+use super::pools::{fetch_pools_for_config, print_pool_block};
 use super::{authed_client, cli_version, get_auth_header, with_auth};
 
 pub async fn status(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
@@ -26,7 +30,6 @@ pub async fn status(context_override: Option<&str>, endpoint_override: Option<&s
     let server: serde_json::Value = response.json().await?;
     let endpoint_version = server["version"].as_str().unwrap_or("?");
 
-    // Auth summary
     let auth_summary = match &config.auth {
         AuthMode::Ssh => {
             let fp = config
@@ -40,131 +43,80 @@ pub async fn status(context_override: Option<&str>, endpoint_override: Option<&s
                     }
                 })
                 .unwrap_or_else(|| "auto".to_string());
-            format!("ssh \x1b[2m{fp}\x1b[0m")
+            format!("ssh {fp}")
         }
         AuthMode::Oidc => "oidc".to_string(),
         AuthMode::Token => "token".to_string(),
         AuthMode::None => "none".to_string(),
     };
 
-    // Header
+    let pools = fetch_pools_for_config(&config).await.unwrap_or_default();
+    let my_identity = config.ssh_fingerprint.clone();
+
     println!();
     println!("\x1b[1mkobe\x1b[0m");
     println!("  cli version: {}", cli_version());
     if let Some(context) = &config.context {
         println!("  context: {context}");
     }
-    println!("  endpoint: \x1b[2m{endpoint}\x1b[0m");
+    println!("  endpoint: {endpoint}");
     println!("  endpoint version: {endpoint_version}");
     println!();
 
-    // Auth
     println!("\x1b[1mAuth\x1b[0m");
     println!("  {auth_summary}");
     println!();
 
-    // Fetch pools
-    let pools_token = get_auth_header(&config, "GET", "/v1/pools", b"")
-        .await
-        .ok()
-        .flatten();
-    let pools: Vec<serde_json::Value> =
-        match with_auth(client.get(format!("{endpoint}/v1/pools")), &pools_token)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-            _ => Vec::new(),
-        };
-
-    // Get own identity for (you) marker — use fingerprint from config
-    let my_identity = config.ssh_fingerprint.clone();
-
-    // Pools with leases grouped underneath
     println!("\x1b[1mPools\x1b[0m");
     if pools.is_empty() {
-        println!("  \x1b[2mNo pools available\x1b[0m");
-    } else {
-        for p in &pools {
-            let name = p["name"].as_str().unwrap_or("?");
-            let ready = p["ready"].as_u64().unwrap_or(0);
-            let claimed = p["claimed"].as_u64().unwrap_or(0);
-            let ready_color = if ready > 0 { "\x1b[32m" } else { "\x1b[33m" };
-            let claimed_str = if claimed > 0 {
-                format!("  \x1b[33mleased={claimed}\x1b[0m")
-            } else {
-                String::new()
-            };
-            println!("  {name}  {ready_color}ready={ready}\x1b[0m{claimed_str}");
+        println!("  No pools available");
+        println!();
+        return Ok(());
+    }
 
-            // Fetch all leases for this pool
-            let pool_path = format!("/v1/pools/{name}/leases");
-            let pool_leases_token = get_auth_header(&config, "GET", &pool_path, b"")
-                .await
-                .ok()
-                .flatten();
-            let pool_leases: Vec<serde_json::Value> = match with_auth(
-                client.get(format!("{endpoint}{pool_path}")),
-                &pool_leases_token,
-            )
-            .send()
+    for (index, pool) in pools.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+
+        print_pool_block(pool, "  ");
+
+        let pool_path = format!("/v1/pools/{}/leases", pool.name);
+        let pool_leases = fetch_leases_path(&config, &pool_path)
             .await
-            {
-                Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-                _ => Vec::new(),
+            .unwrap_or_default();
+
+        if pool_leases.is_empty() {
+            println!("    leases:   none");
+            continue;
+        }
+
+        println!("    leases:");
+        for lease in &pool_leases {
+            let owner = match lease.requester.as_deref() {
+                Some(requester)
+                    if my_identity
+                        .as_deref()
+                        .map(|identity| requester.contains(identity))
+                        .unwrap_or(false) =>
+                {
+                    "(you)".to_string()
+                }
+                Some(requester) => shorten_requester(requester),
+                None => "-".to_string(),
             };
 
-            for l in &pool_leases {
-                let id = l["id"].as_str().unwrap_or("?");
-                let cluster = l["cluster_name"].as_str().unwrap_or("-");
-                let phase = l["phase"].as_str().unwrap_or("?");
-                let requester = l["requester"].as_str().unwrap_or("?");
-                let expires = l["expires_at"]
-                    .as_str()
-                    .map(format_relative_time)
-                    .unwrap_or_else(|| phase.to_string());
-
-                // Check if this lease is ours
-                let is_mine = my_identity
-                    .as_deref()
-                    .map(|fp| requester.contains(fp))
-                    .unwrap_or(false);
-                let owner = if is_mine {
-                    "\x1b[32m(you)\x1b[0m".to_string()
-                } else {
-                    format!("\x1b[2m{requester}\x1b[0m")
-                };
-
-                println!(
-                    "    {:<24}  {:<28}  {:<12}  {}",
-                    format!("\x1b[2m{id}\x1b[0m"),
-                    cluster,
-                    format!("\x1b[2m{expires}\x1b[0m"),
-                    owner
-                );
-            }
+            println!(
+                "      {:<24}  {:<8}  {:<28}  {:<12}  {}",
+                lease.id,
+                lease_phase_label(lease),
+                lease_cluster_label(lease),
+                lease_when_label(lease),
+                owner
+            );
         }
     }
     println!();
 
     Ok(())
-}
-
-/// Format an ISO timestamp as a relative time string (e.g., "28m left").
-fn format_relative_time(iso: &str) -> String {
-    let Ok(expires) = chrono::DateTime::parse_from_rfc3339(iso) else {
-        return iso.to_string();
-    };
-    let now = chrono::Utc::now();
-    let diff = expires.signed_duration_since(now);
-
-    if diff.num_seconds() < 0 {
-        "expired".to_string()
-    } else if diff.num_hours() > 0 {
-        format!("{}h {}m left", diff.num_hours(), diff.num_minutes() % 60)
-    } else if diff.num_minutes() > 0 {
-        format!("{}m left", diff.num_minutes())
-    } else {
-        format!("{}s left", diff.num_seconds())
-    }
 }

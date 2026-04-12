@@ -1,16 +1,34 @@
 use anyhow::Result;
+use serde::Deserialize;
 
-use super::config::CliConfig;
+use super::config::{CliConfig, ResolvedConfig};
 use super::{authed_client, get_auth_header, with_auth};
 
-pub async fn leases(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
-    let config = CliConfig::load()?;
-    let config = config.resolve(context_override, endpoint_override)?;
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LeaseSummary {
+    pub id: String,
+    pub phase: String,
+    pub profile: String,
+    #[serde(default)]
+    pub cluster_name: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub queue_position: u32,
+    #[serde(default)]
+    pub requester: Option<String>,
+}
+
+pub(crate) async fn fetch_leases_path(
+    config: &ResolvedConfig,
+    path: &str,
+) -> Result<Vec<LeaseSummary>> {
     let endpoint = config.endpoint.as_str();
-    let token = get_auth_header(&config, "GET", "/v1/leases", b"").await?;
+    let token = get_auth_header(config, "GET", path, b"").await?;
 
     let client = authed_client();
-    let response = with_auth(client.get(format!("{endpoint}/v1/leases")), &token)
+    let response = with_auth(client.get(format!("{endpoint}{path}")), &token)
         .send()
         .await?;
 
@@ -18,27 +36,10 @@ pub async fn leases(context_override: Option<&str>, endpoint_override: Option<&s
         anyhow::bail!("Failed to list leases (HTTP {})", response.status());
     }
 
-    let body: serde_json::Value = response.json().await?;
-    if let Some(items) = body.as_array() {
-        if items.is_empty() {
-            println!("No active leases.");
-        } else {
-            for lease in items {
-                let id = lease["id"].as_str().unwrap_or("?");
-                let cluster = lease["cluster_name"].as_str().unwrap_or("-");
-                let phase = lease["phase"].as_str().unwrap_or("?");
-                let expires = lease["expires_at"]
-                    .as_str()
-                    .map(format_relative_time)
-                    .unwrap_or_else(|| phase.to_string());
-                println!("{id}  {cluster}  {expires}");
-            }
-        }
-    }
-    Ok(())
+    Ok(response.json().await?)
 }
 
-fn format_relative_time(iso: &str) -> String {
+pub(crate) fn format_relative_time(iso: &str) -> String {
     let Ok(expires) = chrono::DateTime::parse_from_rfc3339(iso) else {
         return iso.to_string();
     };
@@ -54,4 +55,62 @@ fn format_relative_time(iso: &str) -> String {
     } else {
         format!("{}s left", diff.num_seconds())
     }
+}
+
+pub(crate) fn lease_phase_label(lease: &LeaseSummary) -> String {
+    lease.phase.to_ascii_lowercase()
+}
+
+pub(crate) fn lease_cluster_label(lease: &LeaseSummary) -> &str {
+    lease.cluster_name.as_deref().unwrap_or("-")
+}
+
+pub(crate) fn lease_when_label(lease: &LeaseSummary) -> String {
+    if lease.phase.eq_ignore_ascii_case("pending") && lease.queue_position > 0 {
+        format!("queue #{}", lease.queue_position)
+    } else if let Some(expires_at) = lease.expires_at.as_deref() {
+        format_relative_time(expires_at)
+    } else {
+        lease_phase_label(lease)
+    }
+}
+
+pub(crate) fn shorten_requester(requester: &str) -> String {
+    if requester.len() > 28 {
+        format!(
+            "{}...{}",
+            &requester[..14],
+            &requester[requester.len() - 6..]
+        )
+    } else {
+        requester.to_string()
+    }
+}
+
+pub async fn leases(context_override: Option<&str>, endpoint_override: Option<&str>) -> Result<()> {
+    let config = CliConfig::load()?;
+    let config = config.resolve(context_override, endpoint_override)?;
+    let items = fetch_leases_path(&config, "/v1/leases").await?;
+
+    if items.is_empty() {
+        println!("No active leases.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<24}  {:<12}  {:<8}  {:<28}  WHEN",
+        "LEASE", "POOL", "PHASE", "CLUSTER"
+    );
+    for lease in &items {
+        println!(
+            "{:<24}  {:<12}  {:<8}  {:<28}  {}",
+            lease.id,
+            lease.profile,
+            lease_phase_label(lease),
+            lease_cluster_label(lease),
+            lease_when_label(lease)
+        );
+    }
+
+    Ok(())
 }

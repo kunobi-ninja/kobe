@@ -26,7 +26,7 @@ pub enum ClusterState {
     /// Ready and idle, available for claims.
     Ready,
     /// Bound to a claim.
-    Claimed,
+    Leased,
     /// Failed health check, being recycled.
     Unhealthy,
     /// Being deleted and recreated.
@@ -120,7 +120,7 @@ pub fn compute_pool_actions(
 
     let counts = count_states(state);
     let total =
-        counts.creating + counts.ready + counts.claimed + counts.unhealthy + counts.recycling;
+        counts.creating + counts.ready + counts.leased + counts.unhealthy + counts.recycling;
 
     // Determine target from scaling config or fixed size
     let (min_ready, max_clusters, scale_up_threshold, scale_down_after) =
@@ -211,7 +211,7 @@ fn max_existing_index(state: &PoolState, profile_name: &str) -> u32 {
 pub struct StateCounts {
     pub creating: u32,
     pub ready: u32,
-    pub claimed: u32,
+    pub leased: u32,
     pub unhealthy: u32,
     pub recycling: u32,
 }
@@ -222,7 +222,7 @@ pub fn count_states(state: &PoolState) -> StateCounts {
         match entry.state {
             ClusterState::Creating => c.creating += 1,
             ClusterState::Ready => c.ready += 1,
-            ClusterState::Claimed => c.claimed += 1,
+            ClusterState::Leased => c.leased += 1,
             ClusterState::Unhealthy => c.unhealthy += 1,
             ClusterState::Recycling => c.recycling += 1,
         }
@@ -347,7 +347,7 @@ mod tests {
     fn test_max_existing_index() {
         let mut clusters = HashMap::new();
         clusters.insert("pool-test-0".into(), make_entry(ClusterState::Ready));
-        clusters.insert("pool-test-5".into(), make_entry(ClusterState::Claimed));
+        clusters.insert("pool-test-5".into(), make_entry(ClusterState::Leased));
         clusters.insert("pool-test-2".into(), make_entry(ClusterState::Creating));
         let state = PoolState { clusters };
 
@@ -378,7 +378,7 @@ mod tests {
         clusters.insert(
             "b".into(),
             ClusterEntry {
-                state: ClusterState::Claimed,
+                state: ClusterState::Leased,
                 idle_since: None,
                 health_failures: 0,
                 state_since: None,
@@ -400,7 +400,7 @@ mod tests {
         let counts = count_states(&state);
 
         assert_eq!(counts.ready, 1);
-        assert_eq!(counts.claimed, 1);
+        assert_eq!(counts.leased, 1);
         assert_eq!(counts.creating, 1);
     }
 
@@ -562,14 +562,14 @@ mod tests {
             }),
         );
         let mut clusters = HashMap::new();
-        clusters.insert("pool-test-0".into(), make_entry(ClusterState::Claimed));
-        clusters.insert("pool-test-1".into(), make_entry(ClusterState::Claimed));
+        clusters.insert("pool-test-0".into(), make_entry(ClusterState::Leased));
+        clusters.insert("pool-test-1".into(), make_entry(ClusterState::Leased));
         let state = PoolState { clusters };
         let now = chrono::Utc::now();
 
         let actions = compute_pool_actions(&profile, &state, now);
 
-        // At max_clusters=2 with 2 claimed, no room to create
+        // At max_clusters=2 with 2 leased, no room to create
         assert!(actions.is_empty());
     }
 
@@ -687,11 +687,11 @@ mod tests {
         clusters.insert(
             "pool-test-profile-2".into(),
             ClusterEntry {
-                state: ClusterState::Claimed,
+                state: ClusterState::Leased,
                 idle_since: None,
                 health_failures: 0,
                 state_since: None,
-                spec_hash: Some(stale_hash), // stale but claimed
+                spec_hash: Some(stale_hash), // stale but leased
             },
         );
         let state = PoolState { clusters };

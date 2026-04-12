@@ -1,6 +1,6 @@
 mod commands;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -38,7 +38,7 @@ enum Commands {
         #[command(subcommand)]
         action: LeaseAction,
     },
-    /// Manage CLI configuration (interactive if no subcommand)
+    /// Manage CLI configuration
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -78,6 +78,11 @@ enum ConfigAction {
     },
     /// Show current configuration
     View,
+    /// Edit configuration in the TUI
+    Edit {
+        /// Context name to edit (defaults to current context, else legacy config)
+        name: Option<String>,
+    },
     /// List named contexts
     GetContexts,
     /// Show the current named context
@@ -130,6 +135,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config { action } => match action {
             Some(ConfigAction::Set { key, value }) => commands::config_set(&key, &value).await,
             Some(ConfigAction::View) => commands::config_show(context).await,
+            Some(ConfigAction::Edit { name }) => {
+                if let (Some(flag), Some(arg)) = (context, name.as_deref()) {
+                    if flag != arg {
+                        anyhow::bail!(
+                            "Specify either --context {flag} or config edit {arg}, not both"
+                        );
+                    }
+                }
+                commands::config_interactive(name.as_deref().or(context))
+            }
             Some(ConfigAction::GetContexts) => commands::config_contexts().await,
             Some(ConfigAction::CurrentContext) => commands::config_current_context().await,
             Some(ConfigAction::UseContext { name }) => commands::config_use_context(&name).await,
@@ -149,7 +164,17 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await
             }
-            None => commands::config_interactive(),
+            None => print_config_help(),
         },
     }
+}
+
+fn print_config_help() -> anyhow::Result<()> {
+    let mut cmd = Cli::command();
+    let config_cmd = cmd
+        .find_subcommand_mut("config")
+        .ok_or_else(|| anyhow::anyhow!("config command is not available"))?;
+    config_cmd.print_help()?;
+    println!();
+    Ok(())
 }

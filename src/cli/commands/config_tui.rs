@@ -11,6 +11,21 @@ use std::time::Duration;
 
 use super::config::{AuthMode, CliConfig};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditTarget {
+    Legacy,
+    Context(String),
+}
+
+impl EditTarget {
+    fn label(&self) -> String {
+        match self {
+            Self::Legacy => "legacy config".to_string(),
+            Self::Context(name) => format!("context {name}"),
+        }
+    }
+}
+
 // ── Field definitions ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,18 +43,30 @@ struct FormField {
     options: Vec<&'static str>,
     default_hint: &'static str,
     is_password: bool,
-    /// (field_index, required_value) — only show when fields[index].value == required_value
-    visible_when: Option<(usize, &'static str)>,
+    /// (field_index, required_value) — only active when fields[index].value == required_value
+    active_when: Option<(usize, &'static str)>,
+    inactive_hint: Option<&'static str>,
 }
 
 impl FormField {
-    fn display_value(&self) -> String {
+    fn display_value(&self, active: bool) -> String {
         if self.value.is_empty() {
-            self.default_hint.to_string()
+            if active {
+                self.default_hint.to_string()
+            } else {
+                self.inactive_hint.unwrap_or(self.default_hint).to_string()
+            }
         } else if self.is_password {
-            "*".repeat(self.value.len().min(20))
-        } else {
+            let masked = "*".repeat(self.value.len().min(20));
+            if active {
+                masked
+            } else {
+                format!("{masked}  (inactive)")
+            }
+        } else if active {
             self.value.clone()
+        } else {
+            format!("{}  (inactive)", self.value)
         }
     }
 
@@ -47,8 +74,8 @@ impl FormField {
         self.value.is_empty()
     }
 
-    fn visible(&self, fields: &[FormField]) -> bool {
-        match self.visible_when {
+    fn is_active(&self, fields: &[FormField]) -> bool {
+        match self.active_when {
             Some((idx, val)) => fields.get(idx).map(|f| f.value == val).unwrap_or(true),
             None => true,
         }
@@ -58,15 +85,15 @@ impl FormField {
 // ── Editor state ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 enum Mode {
     Navigate,
     Editing,
     ConfirmQuit,
-    ConfirmSave,
 }
 
 struct EditorState {
+    target: EditTarget,
+    current_context: Option<String>,
     fields: Vec<FormField>,
     cursor: usize,
     mode: Mode,
@@ -76,26 +103,44 @@ struct EditorState {
     status: Option<String>,
 }
 
-fn build_fields(config: &CliConfig) -> Vec<FormField> {
-    let current_context = config
-        .current_context
-        .as_deref()
-        .and_then(|name| config.contexts.get(name));
-    let endpoint = current_context
-        .map(|context| context.endpoint.clone())
-        .or_else(|| config.endpoint.clone())
-        .unwrap_or_default();
-    let auth = current_context
-        .map(|context| context.auth.clone())
-        .unwrap_or_else(|| config.auth.clone());
-    let token = current_context
-        .and_then(|context| context.token.clone())
-        .or_else(|| config.token.clone())
-        .unwrap_or_default();
-    let ssh_fingerprint = current_context
-        .and_then(|context| context.ssh_fingerprint.clone())
-        .or_else(|| config.ssh_fingerprint.clone())
-        .unwrap_or_default();
+fn resolve_edit_target(config: &CliConfig, context_override: Option<&str>) -> Result<EditTarget> {
+    if let Some(name) = context_override {
+        if config.contexts.contains_key(name) {
+            return Ok(EditTarget::Context(name.to_string()));
+        }
+        anyhow::bail!("Unknown context '{name}'. Run: kobe config get-contexts");
+    }
+
+    if let Some(name) = &config.current_context {
+        if config.contexts.contains_key(name) {
+            return Ok(EditTarget::Context(name.clone()));
+        }
+        anyhow::bail!("Current context '{name}' does not exist. Run: kobe config get-contexts");
+    }
+
+    Ok(EditTarget::Legacy)
+}
+
+fn build_fields(config: &CliConfig, target: &EditTarget) -> Result<Vec<FormField>> {
+    let (endpoint, auth, token, ssh_fingerprint) = match target {
+        EditTarget::Legacy => (
+            config.endpoint.clone().unwrap_or_default(),
+            config.auth.clone(),
+            config.token.clone().unwrap_or_default(),
+            config.ssh_fingerprint.clone().unwrap_or_default(),
+        ),
+        EditTarget::Context(name) => {
+            let context = config.contexts.get(name).ok_or_else(|| {
+                anyhow::anyhow!("Unknown context '{name}'. Run: kobe config get-contexts")
+            })?;
+            (
+                context.endpoint.clone(),
+                context.auth.clone(),
+                context.token.clone().unwrap_or_default(),
+                context.ssh_fingerprint.clone().unwrap_or_default(),
+            )
+        }
+    };
 
     let auth_str = match auth {
         AuthMode::None => "none",
@@ -104,7 +149,7 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
         AuthMode::Ssh => "ssh",
     };
 
-    vec![
+    Ok(vec![
         FormField {
             label: "Endpoint",
             kind: FieldKind::Text,
@@ -112,7 +157,8 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             options: vec![],
             default_hint: "(default: https://kobe.kunobi.ninja)",
             is_password: false,
-            visible_when: None,
+            active_when: None,
+            inactive_hint: None,
         },
         FormField {
             label: "Auth mode",
@@ -121,7 +167,8 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             options: vec!["none", "token", "oidc", "ssh"],
             default_hint: "oidc",
             is_password: false,
-            visible_when: None,
+            active_when: None,
+            inactive_hint: None,
         },
         FormField {
             label: "Token",
@@ -130,21 +177,27 @@ fn build_fields(config: &CliConfig) -> Vec<FormField> {
             options: vec![],
             default_hint: "(not set)",
             is_password: true,
-            visible_when: Some((1, "token")), // only visible when auth mode == "token"
+            active_when: Some((1, "token")),
+            inactive_hint: Some("(used when auth=token)"),
         },
         FormField {
             label: "SSH fingerprint",
             kind: FieldKind::Text,
             value: ssh_fingerprint,
             options: vec![],
-            default_hint: "(optional — uses ~/.ssh/id_ed25519)",
+            default_hint: "(optional - uses ~/.ssh/id_ed25519)",
             is_password: false,
-            visible_when: Some((1, "ssh")), // only visible when auth mode == "ssh"
+            active_when: Some((1, "ssh")),
+            inactive_hint: Some("(used when auth=ssh)"),
         },
-    ]
+    ])
 }
 
-fn fields_to_config(fields: &[FormField], previous: &CliConfig) -> CliConfig {
+fn fields_to_config(
+    fields: &[FormField],
+    previous: &CliConfig,
+    target: &EditTarget,
+) -> Result<CliConfig> {
     let endpoint = if fields[0].value.is_empty() {
         None
     } else {
@@ -179,39 +232,67 @@ fn fields_to_config(fields: &[FormField], previous: &CliConfig) -> CliConfig {
         ssh_fingerprint: previous.ssh_fingerprint.clone(),
     };
 
-    if let Some(current_context) = &previous.current_context {
-        if let Some(context) = config.contexts.get_mut(current_context) {
+    match target {
+        EditTarget::Legacy => Ok(CliConfig {
+            current_context: config.current_context,
+            contexts: config.contexts,
+            endpoint,
+            auth,
+            token,
+            ssh_fingerprint,
+        }),
+        EditTarget::Context(name) => {
+            let context = config.contexts.get_mut(name).ok_or_else(|| {
+                anyhow::anyhow!("Unknown context '{name}'. Run: kobe config get-contexts")
+            })?;
             if let Some(endpoint) = endpoint {
                 context.endpoint = endpoint;
             }
             context.auth = auth;
             context.token = token;
             context.ssh_fingerprint = ssh_fingerprint;
-            return config;
+            Ok(config)
         }
     }
+}
 
-    CliConfig {
-        current_context: config.current_context,
-        contexts: config.contexts,
-        endpoint,
-        auth,
-        token,
-        ssh_fingerprint,
+fn cycle_select(field: &mut FormField, backwards: bool) -> bool {
+    if field.kind != FieldKind::Select || field.options.is_empty() {
+        return false;
     }
+
+    let idx = field
+        .options
+        .iter()
+        .position(|option| *option == field.value)
+        .unwrap_or(0);
+    let next = if backwards {
+        if idx == 0 {
+            field.options.len() - 1
+        } else {
+            idx - 1
+        }
+    } else {
+        (idx + 1) % field.options.len()
+    };
+    field.value = field.options[next].to_string();
+    true
 }
 
 // ── Main TUI entry point ─────────────────────────────────────────────────
 
-pub fn run_config_tui() -> Result<()> {
+pub fn run_config_tui(context_override: Option<&str>) -> Result<()> {
     let config = CliConfig::load()?;
-    let fields = build_fields(&config);
+    let target = resolve_edit_target(&config, context_override)?;
+    let fields = build_fields(&config, &target)?;
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let mut state = EditorState {
+        target,
+        current_context: config.current_context.clone(),
         fields,
         cursor: 0,
         mode: Mode::Navigate,
@@ -243,57 +324,41 @@ pub fn run_config_tui() -> Result<()> {
                             break;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            // Skip hidden fields
-                            let mut next = state.cursor;
-                            loop {
-                                if next == 0 {
-                                    break;
-                                }
-                                next -= 1;
-                                if state.fields[next].visible(&state.fields) {
-                                    break;
-                                }
-                            }
-                            if state.fields[next].visible(&state.fields) {
-                                state.cursor = next;
+                            state.status = None;
+                            if state.cursor > 0 {
+                                state.cursor -= 1;
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            let mut next = state.cursor;
-                            loop {
-                                if next >= state.fields.len() - 1 {
-                                    break;
-                                }
-                                next += 1;
-                                if state.fields[next].visible(&state.fields) {
-                                    break;
-                                }
+                            state.status = None;
+                            if state.cursor + 1 < state.fields.len() {
+                                state.cursor += 1;
                             }
-                            if state.fields[next].visible(&state.fields) {
-                                state.cursor = next;
+                        }
+                        KeyCode::Left => {
+                            state.status = None;
+                            if cycle_select(&mut state.fields[state.cursor], true) {
+                                state.dirty = true;
+                            }
+                        }
+                        KeyCode::Right => {
+                            state.status = None;
+                            if cycle_select(&mut state.fields[state.cursor], false) {
+                                state.dirty = true;
                             }
                         }
                         KeyCode::Enter => {
+                            state.status = None;
                             let field = &state.fields[state.cursor];
-                            match field.kind {
-                                FieldKind::Select => {
-                                    // Cycle through options
-                                    let current = &state.fields[state.cursor].value;
-                                    let opts = &state.fields[state.cursor].options;
-                                    let idx = opts.iter().position(|o| o == current).unwrap_or(0);
-                                    let next = (idx + 1) % opts.len();
-                                    state.fields[state.cursor].value = opts[next].to_string();
-                                    state.dirty = true;
-                                }
-                                _ => {
-                                    state.edit_buffer = state.fields[state.cursor].value.clone();
-                                    state.edit_cursor = state.edit_buffer.len();
-                                    state.mode = Mode::Editing;
-                                }
+                            if field.kind != FieldKind::Select {
+                                state.edit_buffer = field.value.clone();
+                                state.edit_cursor = state.edit_buffer.len();
+                                state.mode = Mode::Editing;
                             }
                         }
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let updated_config = fields_to_config(&state.fields, &config);
+                        KeyCode::Char('s') => {
+                            let updated_config =
+                                fields_to_config(&state.fields, &config, &state.target)?;
                             updated_config.save()?;
                             state.dirty = false;
                             state.status = Some("Saved!".to_string());
@@ -335,19 +400,10 @@ pub fn run_config_tui() -> Result<()> {
                     Mode::ConfirmQuit => match key.code {
                         KeyCode::Char('y') => break,
                         KeyCode::Char('s') => {
-                            let updated_config = fields_to_config(&state.fields, &config);
+                            let updated_config =
+                                fields_to_config(&state.fields, &config, &state.target)?;
                             updated_config.save()?;
                             break;
-                        }
-                        _ => state.mode = Mode::Navigate,
-                    },
-                    Mode::ConfirmSave => match key.code {
-                        KeyCode::Char('y') => {
-                            let updated_config = fields_to_config(&state.fields, &config);
-                            updated_config.save()?;
-                            state.dirty = false;
-                            state.status = Some("Saved!".to_string());
-                            state.mode = Mode::Navigate;
                         }
                         _ => state.mode = Mode::Navigate,
                     },
@@ -369,19 +425,32 @@ fn draw(f: &mut Frame, state: &EditorState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
+            Constraint::Length(4), // Header
             Constraint::Min(10),   // Form
             Constraint::Length(3), // Status bar
         ])
         .split(area);
 
-    // Title
-    let title = Paragraph::new(" Kobe Configuration")
-        .style(Style::default().fg(Color::Cyan).bold())
-        .block(Block::default().borders(Borders::BOTTOM));
-    f.render_widget(title, chunks[0]);
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            " Kobe Configuration",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(vec![
+            Span::styled(" editing: ", Style::default().fg(Color::Gray)),
+            Span::styled(state.target.label(), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" current context: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                state.current_context.as_deref().unwrap_or("(none)"),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ])
+    .block(Block::default().borders(Borders::BOTTOM));
+    f.render_widget(header, chunks[0]);
 
-    // Form fields
     let form_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -391,35 +460,29 @@ fn draw(f: &mut Frame, state: &EditorState) {
     let inner = form_block.inner(chunks[1]);
     f.render_widget(form_block, chunks[1]);
 
-    let visible_fields: Vec<(usize, &FormField)> = state
-        .fields
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| f.visible(&state.fields))
-        .collect();
-
     let field_height = 2u16;
-    for (vi, (i, field)) in visible_fields.iter().enumerate() {
-        let y = inner.y + (vi as u16) * field_height;
+    for (i, field) in state.fields.iter().enumerate() {
+        let y = inner.y + (i as u16) * field_height;
         if y + field_height > inner.y + inner.height {
             break;
         }
 
+        let active = field.is_active(&state.fields);
         let field_area = Rect::new(inner.x, y, inner.width, field_height);
-        let is_selected = *i == state.cursor;
+        let is_selected = i == state.cursor;
         let is_editing = is_selected && state.mode == Mode::Editing;
 
-        // Label
         let label_style = if is_selected {
             Style::default().fg(Color::Yellow).bold()
-        } else {
+        } else if active {
             Style::default().fg(Color::Gray)
+        } else {
+            Style::default().fg(Color::DarkGray)
         };
 
         let indicator = if is_selected { "▸ " } else { "  " };
         let label = format!("{indicator}{}", field.label);
 
-        // Value
         let value_text = if is_editing {
             if field.is_password {
                 format!("{}_", "*".repeat(state.edit_buffer.len()))
@@ -432,22 +495,22 @@ fn draw(f: &mut Frame, state: &EditorState) {
             let opts: Vec<String> = field
                 .options
                 .iter()
-                .map(|o| {
-                    if *o == field.value.as_str() {
-                        format!("[{}]", o)
+                .map(|option| {
+                    if *option == field.value.as_str() {
+                        format!("[{}]", option)
                     } else {
-                        format!(" {} ", o)
+                        format!(" {} ", option)
                     }
                 })
                 .collect();
             opts.join("  ")
         } else {
-            field.display_value()
+            field.display_value(active)
         };
 
         let value_style = if is_editing {
             Style::default().fg(Color::White)
-        } else if field.is_placeholder() {
+        } else if !active || field.is_placeholder() {
             Style::default().fg(Color::DarkGray).italic()
         } else if field.is_password {
             Style::default().fg(Color::DarkGray)
@@ -463,26 +526,28 @@ fn draw(f: &mut Frame, state: &EditorState) {
         f.render_widget(Paragraph::new(line), field_area);
     }
 
-    // Status bar
     let status_text = match state.mode {
         Mode::ConfirmQuit => {
             " Unsaved changes. [y] quit  [s] save & quit  [any] cancel".to_string()
         }
-        Mode::ConfirmSave => " Save changes? [y] yes  [any] cancel".to_string(),
-        Mode::Editing => " Editing — Enter to confirm, Esc to cancel".to_string(),
+        Mode::Editing => " Editing - Enter to confirm, Esc to cancel".to_string(),
         Mode::Navigate => {
             let mut parts = vec![
                 " ↑↓ navigate",
-                " Enter edit/cycle",
-                " Ctrl+S save",
+                " Enter edit",
+                " ←→ change select",
+                " s save",
                 " q quit",
             ];
+            if !state.fields[state.cursor].is_active(&state.fields) {
+                parts.push(" field inactive for current auth mode");
+            }
             if state.dirty {
                 parts.push(" [modified]");
             }
-            if let Some(ref s) = state.status {
+            if let Some(ref status) = state.status {
                 parts.push(" ");
-                parts.push(s);
+                parts.push(status);
             }
             parts.join("  │")
         }
@@ -498,4 +563,161 @@ fn draw(f: &mut Frame, state: &EditorState) {
         .style(status_style)
         .block(Block::default().borders(Borders::TOP));
     f.render_widget(status, chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::config::KobeContext;
+    use std::collections::BTreeMap;
+
+    fn sample_context(endpoint: &str, auth: AuthMode) -> KobeContext {
+        KobeContext {
+            endpoint: endpoint.to_string(),
+            auth,
+            token: None,
+            ssh_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn resolve_edit_target_prefers_requested_context() {
+        let mut contexts = BTreeMap::new();
+        contexts.insert(
+            "prod".to_string(),
+            sample_context("https://prod.example.com", AuthMode::Oidc),
+        );
+        contexts.insert(
+            "staging".to_string(),
+            sample_context("https://staging.example.com", AuthMode::Ssh),
+        );
+
+        let config = CliConfig {
+            current_context: Some("prod".to_string()),
+            contexts,
+            ..CliConfig::default()
+        };
+
+        let target = resolve_edit_target(&config, Some("staging")).unwrap();
+        assert_eq!(target, EditTarget::Context("staging".to_string()));
+    }
+
+    #[test]
+    fn build_fields_keeps_auth_specific_fields_visible() {
+        let mut contexts = BTreeMap::new();
+        contexts.insert(
+            "prod".to_string(),
+            sample_context("https://prod.example.com", AuthMode::Oidc),
+        );
+
+        let config = CliConfig {
+            current_context: Some("prod".to_string()),
+            contexts,
+            ..CliConfig::default()
+        };
+
+        let fields = build_fields(&config, &EditTarget::Context("prod".to_string())).unwrap();
+        assert_eq!(fields.len(), 4);
+        assert!(!fields[2].is_active(&fields));
+        assert!(!fields[3].is_active(&fields));
+    }
+
+    #[test]
+    fn build_fields_for_context_does_not_inherit_legacy_credentials() {
+        let mut contexts = BTreeMap::new();
+        contexts.insert(
+            "prod".to_string(),
+            sample_context("https://prod.example.com", AuthMode::Oidc),
+        );
+
+        let config = CliConfig {
+            current_context: Some("prod".to_string()),
+            contexts,
+            endpoint: Some("https://legacy.example.com".to_string()),
+            auth: AuthMode::Token,
+            token: Some("legacy-token".to_string()),
+            ssh_fingerprint: Some("SHA256:legacy".to_string()),
+        };
+
+        let fields = build_fields(&config, &EditTarget::Context("prod".to_string())).unwrap();
+        assert_eq!(fields[0].value, "https://prod.example.com");
+        assert_eq!(fields[1].value, "oidc");
+        assert!(fields[2].value.is_empty());
+        assert!(fields[3].value.is_empty());
+    }
+
+    #[test]
+    fn fields_to_config_updates_selected_context_only() {
+        let mut contexts = BTreeMap::new();
+        contexts.insert(
+            "prod".to_string(),
+            sample_context("https://prod.example.com", AuthMode::Oidc),
+        );
+
+        let previous = CliConfig {
+            current_context: Some("prod".to_string()),
+            contexts,
+            endpoint: Some("https://legacy.example.com".to_string()),
+            auth: AuthMode::Token,
+            token: Some("legacy-token".to_string()),
+            ssh_fingerprint: None,
+        };
+
+        let fields = vec![
+            FormField {
+                label: "Endpoint",
+                kind: FieldKind::Text,
+                value: "https://new.example.com".to_string(),
+                options: vec![],
+                default_hint: "",
+                is_password: false,
+                active_when: None,
+                inactive_hint: None,
+            },
+            FormField {
+                label: "Auth mode",
+                kind: FieldKind::Select,
+                value: "ssh".to_string(),
+                options: vec![],
+                default_hint: "",
+                is_password: false,
+                active_when: None,
+                inactive_hint: None,
+            },
+            FormField {
+                label: "Token",
+                kind: FieldKind::Password,
+                value: "".to_string(),
+                options: vec![],
+                default_hint: "",
+                is_password: true,
+                active_when: Some((1, "token")),
+                inactive_hint: None,
+            },
+            FormField {
+                label: "SSH fingerprint",
+                kind: FieldKind::Text,
+                value: "SHA256:test".to_string(),
+                options: vec![],
+                default_hint: "",
+                is_password: false,
+                active_when: Some((1, "ssh")),
+                inactive_hint: None,
+            },
+        ];
+
+        let updated =
+            fields_to_config(&fields, &previous, &EditTarget::Context("prod".to_string())).unwrap();
+
+        assert_eq!(
+            updated.endpoint.as_deref(),
+            Some("https://legacy.example.com")
+        );
+        assert_eq!(updated.auth, AuthMode::Token);
+
+        let prod = updated.contexts.get("prod").unwrap();
+        assert_eq!(prod.endpoint, "https://new.example.com");
+        assert_eq!(prod.auth, AuthMode::Ssh);
+        assert_eq!(prod.ssh_fingerprint.as_deref(), Some("SHA256:test"));
+    }
 }

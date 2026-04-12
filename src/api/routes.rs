@@ -166,10 +166,31 @@ struct ExtendLeaseResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolPolicyResponse {
+    mode: String,
+    ttl: String,
+    warm_target: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_clusters: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scale_up_threshold: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scale_down_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_timeout: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProfileResponse {
     name: String,
     ready: u32,
-    claimed: u32,
+    leased: u32,
+    creating: u32,
+    unhealthy: u32,
+    queue_depth: u32,
+    policy: PoolPolicyResponse,
 }
 
 #[derive(Serialize)]
@@ -177,6 +198,43 @@ struct ErrorResponse {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+}
+
+fn pool_policy_response(profile: &ClusterPool) -> PoolPolicyResponse {
+    if let Some(scaling) = &profile.spec.scaling {
+        PoolPolicyResponse {
+            mode: "autoscaled".to_string(),
+            ttl: profile.spec.ttl.clone(),
+            warm_target: scaling.min_ready,
+            max_clusters: Some(scaling.max_clusters),
+            scale_up_threshold: Some(scaling.scale_up_threshold),
+            scale_down_after: Some(scaling.scale_down_after.clone()),
+            queue_timeout: Some(scaling.queue_timeout.clone()),
+        }
+    } else {
+        PoolPolicyResponse {
+            mode: "fixed".to_string(),
+            ttl: profile.spec.ttl.clone(),
+            warm_target: profile.spec.size,
+            max_clusters: None,
+            scale_up_threshold: None,
+            scale_down_after: None,
+            queue_timeout: None,
+        }
+    }
+}
+
+fn profile_response(profile: &ClusterPool) -> ProfileResponse {
+    let status = profile.status.clone().unwrap_or_default();
+    ProfileResponse {
+        name: profile.name_any(),
+        ready: status.ready,
+        leased: status.leased,
+        creating: status.creating,
+        unhealthy: status.unhealthy,
+        queue_depth: status.queue_depth,
+        policy: pool_policy_response(profile),
+    }
 }
 
 // --- Route handlers ---
@@ -665,14 +723,7 @@ async fn list_pools<B: ClusterBackend>(
             let response: Vec<ProfileResponse> = profiles
                 .iter()
                 .filter(|p| is_pool_allowed(&p.name_any(), &policy))
-                .map(|p| {
-                    let status = p.status.clone().unwrap_or_default();
-                    ProfileResponse {
-                        name: p.name_any(),
-                        ready: status.ready,
-                        claimed: status.claimed,
-                    }
-                })
+                .map(profile_response)
                 .collect();
 
             (StatusCode::OK, Json(response)).into_response()
@@ -702,18 +753,7 @@ async fn get_pool<B: ClusterBackend>(
     let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
 
     match profiles_api.get(&name).await {
-        Ok(profile) => {
-            let status = profile.status.unwrap_or_default();
-            (
-                StatusCode::OK,
-                Json(ProfileResponse {
-                    name,
-                    ready: status.ready,
-                    claimed: status.claimed,
-                }),
-            )
-                .into_response()
-        }
+        Ok(profile) => (StatusCode::OK, Json(profile_response(&profile))).into_response(),
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -855,7 +895,7 @@ struct StatusSession {
 struct StatusPool {
     name: String,
     ready: u32,
-    claimed: u32,
+    leased: u32,
     total: u32,
 }
 
@@ -895,8 +935,8 @@ async fn accessible_pool_statuses<B: ClusterBackend>(
             StatusPool {
                 name: profile.name_any(),
                 ready: status.ready,
-                claimed: status.claimed,
-                total: status.ready + status.claimed + status.creating,
+                leased: status.leased,
+                total: status.ready + status.leased + status.creating,
             }
         })
         .filter(|p| {
@@ -945,8 +985,8 @@ async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) ->
             .with_label_values(&[name.as_str(), "ready"])
             .set(status.ready as i64);
         metrics::POOL_CLUSTERS
-            .with_label_values(&[name.as_str(), "claimed"])
-            .set(status.claimed as i64);
+            .with_label_values(&[name.as_str(), "leased"])
+            .set(status.leased as i64);
         metrics::POOL_CLUSTERS
             .with_label_values(&[name.as_str(), "unhealthy"])
             .set(status.unhealthy as i64);

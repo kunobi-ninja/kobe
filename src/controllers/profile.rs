@@ -582,7 +582,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
     let status = ClusterPoolStatus {
         ready: counts.ready,
-        claimed: counts.claimed,
+        leased: counts.leased,
         creating: counts.creating,
         unhealthy: counts.unhealthy,
         queue_depth,
@@ -605,27 +605,25 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
 /// Build pool state by observing actual K8s resources.
 ///
-/// On first call (empty cache), scans StatefulSets matching the profile
-/// naming pattern and cross-references with active ClusterLease resources.
-/// On subsequent calls, returns the cached state which the controllers
-/// keep up-to-date incrementally.
+/// Live Kubernetes state is the source of truth for whether a cluster is
+/// currently leased. We still merge in cached controller state so transient
+/// operator-driven transitions like Creating, Unhealthy, and Recycling keep
+/// their local metadata (`idle_since`, `state_since`, `spec_hash`) instead of
+/// being reset on every profile reconcile.
 async fn build_pool_state<B: ClusterBackend>(
     ctx: &ProfileContext<B>,
     profile_name: &str,
 ) -> PoolState {
-    if let Some(cached) = ctx.pools.read().await.get(profile_name) {
-        if !cached.clusters.is_empty() {
-            return cached.clone();
-        }
-    }
+    let cached = ctx.pools.read().await.get(profile_name).cloned();
 
     info!(
         profile = profile_name,
-        "Rebuilding pool state from K8s resources"
+        "Refreshing pool state from K8s resources"
     );
 
     let ns = &ctx.namespace;
     let mut clusters = HashMap::new();
+    let now = chrono::Utc::now();
 
     // List all bound leases for this profile once
     let claimed_clusters = {
@@ -682,12 +680,38 @@ async fn build_pool_state<B: ClusterBackend>(
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0);
 
-        let state = if claimed_clusters.contains(&sts_name) {
-            ClusterState::Claimed
+        let live_state = if claimed_clusters.contains(&sts_name) {
+            ClusterState::Leased
         } else if ready_replicas > 0 {
             ClusterState::Ready
         } else {
             ClusterState::Creating
+        };
+
+        let cached_entry = cached
+            .as_ref()
+            .and_then(|pool| pool.clusters.get(&sts_name));
+        let state = match cached_entry.map(|entry| &entry.state) {
+            Some(ClusterState::Recycling) => ClusterState::Recycling,
+            Some(ClusterState::Unhealthy) => ClusterState::Unhealthy,
+            Some(ClusterState::Creating) if !claimed_clusters.contains(&sts_name) => {
+                ClusterState::Creating
+            }
+            _ => live_state,
+        };
+
+        let idle_since = if state == ClusterState::Ready {
+            match cached_entry {
+                Some(entry) if entry.state == ClusterState::Ready => entry.idle_since.or(Some(now)),
+                _ => Some(now),
+            }
+        } else {
+            None
+        };
+
+        let state_since = match cached_entry {
+            Some(entry) if entry.state == state => entry.state_since.or(Some(now)),
+            _ => Some(now),
         };
 
         debug!(
@@ -701,14 +725,10 @@ async fn build_pool_state<B: ClusterBackend>(
             sts_name,
             ClusterEntry {
                 state: state.clone(),
-                idle_since: if state == ClusterState::Ready {
-                    Some(chrono::Utc::now())
-                } else {
-                    None
-                },
-                health_failures: 0,
-                state_since: Some(chrono::Utc::now()),
-                spec_hash: None, // unknown after rebuild — won't trigger recreation
+                idle_since,
+                health_failures: cached_entry.map(|entry| entry.health_failures).unwrap_or(0),
+                state_since,
+                spec_hash: cached_entry.and_then(|entry| entry.spec_hash),
             },
         );
     }
@@ -716,7 +736,7 @@ async fn build_pool_state<B: ClusterBackend>(
     info!(
         profile = profile_name,
         discovered = clusters.len(),
-        "Pool state rebuilt from K8s"
+        "Pool state refreshed from K8s"
     );
 
     PoolState { clusters }
@@ -998,7 +1018,7 @@ mod tests {
             },
             "status": {
                 "ready": 0,
-                "claimed": 0,
+                "leased": 0,
                 "creating": 0,
                 "unhealthy": 0,
                 "queueDepth": 0
@@ -1138,9 +1158,9 @@ mod tests {
                     },
                 ),
                 (
-                    "pool-test-claimed".to_string(),
+                    "pool-test-leased".to_string(),
                     ClusterEntry {
-                        state: ClusterState::Claimed,
+                        state: ClusterState::Leased,
                         idle_since: None,
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
@@ -1239,36 +1259,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_pool_state_cached() {
-        let (ctx, _server) = test_profile_context().await;
+    async fn test_build_pool_state_refreshes_cached_entries_from_live_state() {
+        let (ctx, server) = test_profile_context().await;
 
         // Pre-populate the pools cache.
         {
             let mut pools = ctx.pools.write().await;
             let mut clusters = HashMap::new();
             clusters.insert(
-                "pool-cached-0".to_string(),
+                "pool-cached-profile-0".to_string(),
                 ClusterEntry {
-                    state: ClusterState::Ready,
+                    state: ClusterState::Leased,
                     idle_since: Some(chrono::Utc::now()),
-                    health_failures: 0,
+                    health_failures: 2,
                     state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
+                    spec_hash: Some(42),
                 },
             );
             pools.insert("cached-profile".to_string(), PoolState { clusters });
         }
 
-        // If caching works, no HTTP calls should be made.
-        // (No wiremock mounts, so any K8s call would cause a connection error.)
+        Mock::given(method("GET"))
+            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "metadata": { "name": "pool-cached-profile-0", "namespace": "test-ns" },
+                    "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
+                    "status": { "readyReplicas": 1, "replicas": 1 }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        // No active leases, so the cached Leased entry should heal back to Ready.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/profile=cached-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
         let pool_state = build_pool_state(&ctx, "cached-profile").await;
 
         assert_eq!(pool_state.clusters.len(), 1);
-        assert!(pool_state.clusters.contains_key("pool-cached-0"));
-        assert_eq!(
-            pool_state.clusters.get("pool-cached-0").unwrap().state,
-            ClusterState::Ready
-        );
+        assert!(pool_state.clusters.contains_key("pool-cached-profile-0"));
+        let entry = pool_state.clusters.get("pool-cached-profile-0").unwrap();
+        assert_eq!(entry.state, ClusterState::Ready);
+        assert!(entry.idle_since.is_some());
+        assert_eq!(entry.health_failures, 2);
+        assert_eq!(entry.spec_hash, Some(42));
     }
 
     // -----------------------------------------------------------------------
@@ -1347,10 +1395,9 @@ mod tests {
 
         let profile = make_test_profile("at-cap", 2, 5);
 
-        // Pre-populate pool state with 2 Ready clusters (matching size default of 3,
-        // but the profile uses default size since minSize/maxSize are not spec fields).
-        // With default size=3, 2 Ready and 0 Creating is below target, so we need 3.
-        // Let's put 3 Ready clusters.
+        // Pre-populate pool state with 3 Ready clusters. Reconcile now refreshes
+        // live occupancy from Kubernetes, so we also need matching StatefulSets
+        // below to keep the pool at target capacity.
         {
             let mut pools = ctx.pools.write().await;
             let mut clusters = HashMap::new();
@@ -1380,6 +1427,31 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(
+                    (0..3)
+                        .map(|i| {
+                            serde_json::json!({
+                                "apiVersion": "apps/v1",
+                                "kind": "StatefulSet",
+                                "metadata": { "name": format!("pool-at-cap-{i}"), "namespace": "test-ns" },
+                                "spec": {
+                                    "replicas": 1,
+                                    "selector": { "matchLabels": {} },
+                                    "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } },
+                                    "serviceName": ""
+                                },
+                                "status": { "readyReplicas": 1, "replicas": 1 }
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
             ))
             .mount(&server)
             .await;
@@ -1416,7 +1488,7 @@ mod tests {
         {
             let mut pools = ctx.pools.write().await;
             let mut clusters = HashMap::new();
-            // 2 Ready, 1 Claimed, 1 Creating, 1 Unhealthy
+            // 2 Ready, 1 Leased, 1 Creating, 1 Unhealthy
             clusters.insert(
                 "pool-status-test-0".to_string(),
                 ClusterEntry {
@@ -1440,7 +1512,7 @@ mod tests {
             clusters.insert(
                 "pool-status-test-2".to_string(),
                 ClusterEntry {
-                    state: ClusterState::Claimed,
+                    state: ClusterState::Leased,
                     idle_since: None,
                     health_failures: 0,
                     state_since: Some(chrono::Utc::now()),
@@ -1506,7 +1578,7 @@ mod tests {
                 let mut resp = profile_response_json("status-test");
                 resp["status"] = serde_json::json!({
                     "ready": 2,
-                    "claimed": 1,
+                    "leased": 1,
                     "creating": 1,
                     "unhealthy": 1,
                     "queueDepth": 1

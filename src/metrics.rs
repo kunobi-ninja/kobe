@@ -7,7 +7,7 @@ use prometheus::{
 
 /// Pool state gauges — set at scrape time from shared pool state.
 ///
-/// Labels: `profile` (e.g. "e2e-basic"), `state` (creating/ready/claimed/unhealthy/recycling).
+/// Labels: `profile` (e.g. "e2e-basic"), `state` (creating/ready/leased/unhealthy/recycling).
 pub static POOL_CLUSTERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "kunobi_clusters",

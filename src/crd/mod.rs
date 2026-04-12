@@ -100,7 +100,7 @@ mod tests {
     fn test_status_golden_fields_present() {
         let json = serde_json::json!({
             "ready": 2,
-            "claimed": 1,
+            "leased": 1,
             "creating": 0,
             "unhealthy": 0,
             "queueDepth": 0,
@@ -111,6 +111,24 @@ mod tests {
         let status: ClusterPoolStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status.golden_backup.as_deref(), Some("golden-myprofile-3"));
         assert_eq!(status.golden_generation, Some(7));
+    }
+
+    #[test]
+    fn test_status_accepts_legacy_claimed_field() {
+        let json = serde_json::json!({
+            "ready": 2,
+            "claimed": 1,
+            "creating": 0,
+            "unhealthy": 0,
+            "queueDepth": 0
+        });
+
+        let status: ClusterPoolStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status.ready, 2);
+        assert_eq!(status.leased, 1);
+        assert_eq!(status.creating, 0);
+        assert_eq!(status.unhealthy, 0);
+        assert_eq!(status.queue_depth, 0);
     }
 
     /// Test SnapshotRefreshTrigger default variant.

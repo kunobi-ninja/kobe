@@ -69,7 +69,7 @@ When a client claims a cluster, Kobe assigns one from the warm pool instantly. W
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/v1/claims` | Claim a cluster from a profile's pool |
-| `DELETE` | `/v1/claims/:id` | Release a claimed cluster |
+| `DELETE` | `/v1/claims/:id` | Release a leased cluster |
 | `GET` | `/v1/profiles` | List available profiles with pool status |
 | `GET` | `/v1/profiles/:name` | Get a specific profile's pool status |
 
@@ -106,13 +106,13 @@ spec:
       memory: "1Gi"
 status:
   ready: 2
-  claimed: 1
+  leased: 1
   creating: 0
 ```
 
 ### ClusterClaim
 
-Represents a claimed cluster (created internally by the HTTP API, not by users directly):
+Represents a leased cluster (created internally by the HTTP API, not by users directly):
 
 ```yaml
 apiVersion: kunobi.ninja/v1alpha1
