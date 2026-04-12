@@ -419,7 +419,7 @@ spec:
             properties:
               creating:
                 default: 0
-                description: Number of clusters being created or recycled.
+                description: Number of clusters being created.
                 format: uint32
                 minimum: 0.0
                 type: integer
@@ -453,6 +453,12 @@ spec:
               ready:
                 default: 0
                 description: Number of idle clusters ready for claims.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              recycling:
+                default: 0
+                description: Number of clusters currently being recycled.
                 format: uint32
                 minimum: 0.0
                 type: integer
