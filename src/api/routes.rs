@@ -1,16 +1,23 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use anyhow::Context;
+use axum::body::{self, Body};
+use axum::extract::{Path, RawQuery, State};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
+use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
+use crate::api::connect::{
+    backend_access_from_kubeconfig, build_connect_kubeconfig, ensure_lease_connect_token,
+    validate_lease_connect_token,
+};
 use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::ClusterBackend;
 use crate::controllers::lease::extend_lease_ttl;
@@ -55,6 +62,7 @@ impl<B: ClusterBackend + Clone + Send + Sync + 'static> AuthnProvider for AppSta
 /// Maximum concurrent API requests. Provides application-level DoS protection.
 /// For per-client rate limiting, configure at the ingress controller level.
 const MAX_CONCURRENT_API_REQUESTS: usize = 200;
+const CONNECT_PROXY_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
 
@@ -76,9 +84,14 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .route("/v1/pools/{name}/leases", get(list_pool_leases::<B>))
         .layer(axum::middleware::from_fn(concurrency_limit));
 
+    let connect_routes = Router::new()
+        .route("/connect/{id}", any(connect_proxy_root::<B>))
+        .route("/connect/{id}/{*path}", any(connect_proxy::<B>));
+
     // Non-limited infrastructure routes
     Router::new()
         .merge(api_routes)
+        .merge(connect_routes)
         .route("/v1/status", get(status::<B>))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler::<B>))
@@ -239,6 +252,75 @@ fn profile_response(profile: &ClusterPool) -> ProfileResponse {
         queue_depth: status.queue_depth,
         policy: pool_policy_response(profile),
     }
+}
+
+fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(message.into()))
+        .expect("connect error response")
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn connect_server_url(headers: &HeaderMap, lease_id: &str) -> anyhow::Result<String> {
+    let host = header_value(headers, "x-forwarded-host")
+        .or_else(|| header_value(headers, HOST.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("Missing Host header"))?;
+    let scheme = header_value(headers, "x-forwarded-proto").unwrap_or_else(|| {
+        if host.starts_with("localhost")
+            || host.starts_with("127.0.0.1")
+            || host.starts_with("[::1]")
+        {
+            "http"
+        } else {
+            "https"
+        }
+    });
+    Ok(format!("{scheme}://{host}/connect/{lease_id}"))
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn should_skip_request_header(name: &HeaderName) -> bool {
+    name == HOST || name == AUTHORIZATION || name == CONTENT_LENGTH || name == CONNECTION
+}
+
+fn should_skip_response_header(name: &HeaderName) -> bool {
+    name == CONTENT_LENGTH || name == CONNECTION
+}
+
+fn backend_request_url(
+    base_server: &str,
+    proxied_path: &str,
+    raw_query: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut url = url::Url::parse(base_server)
+        .with_context(|| format!("Invalid backend server URL: {base_server}"))?;
+    let base_path = url.path().trim_end_matches('/');
+    let normalized_path = proxied_path.trim_start_matches('/');
+    let new_path = if normalized_path.is_empty() {
+        if base_path.is_empty() {
+            "/".to_string()
+        } else {
+            base_path.to_string()
+        }
+    } else if base_path.is_empty() {
+        format!("/{normalized_path}")
+    } else {
+        format!("{base_path}/{normalized_path}")
+    };
+    url.set_path(&new_path);
+    url.set_query(raw_query);
+    Ok(url.to_string())
 }
 
 // --- Route handlers ---
@@ -432,6 +514,7 @@ async fn get_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
 
@@ -452,18 +535,56 @@ async fn get_lease<B: ClusterBackend>(
 
             let kubeconfig = if status.phase == LeasePhase::Bound {
                 if let Some(ref cluster_name) = status.cluster_name {
-                    match state
-                        .backend
-                        .extract_kubeconfig(cluster_name, &state.namespace)
+                    match connect_server_url(&headers, &id) {
+                        Ok(server_url) => match ensure_lease_connect_token(
+                            &state.client,
+                            &state.namespace,
+                            &lease,
+                        )
                         .await
-                    {
-                        Ok(kc) => Some(kc),
+                        {
+                            Ok(connect_token) => {
+                                match build_connect_kubeconfig(
+                                    &server_url,
+                                    &id,
+                                    Some(cluster_name),
+                                    &connect_token,
+                                ) {
+                                    Ok(kubeconfig) => Some(kubeconfig),
+                                    Err(err) => {
+                                        return (
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            Json(ErrorResponse {
+                                                error: "Failed to build lease kubeconfig"
+                                                    .to_string(),
+                                                detail: Some(err.to_string()),
+                                            }),
+                                        )
+                                            .into_response();
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(ErrorResponse {
+                                        error: "Failed to provision lease access token".to_string(),
+                                        detail: Some(err.to_string()),
+                                    }),
+                                )
+                                    .into_response();
+                            }
+                        },
                         Err(_) => {
                             return (
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 Json(ErrorResponse {
-                                    error: "Failed to extract kubeconfig".to_string(),
-                                    detail: Some("The cluster may be shutting down".to_string()),
+                                    error: "Failed to determine public connect endpoint"
+                                        .to_string(),
+                                    detail: Some(
+                                        "The request did not include a usable host header"
+                                            .to_string(),
+                                    ),
                                 }),
                             )
                                 .into_response();
@@ -509,6 +630,195 @@ async fn get_lease<B: ClusterBackend>(
         )
             .into_response(),
     }
+}
+
+#[tracing::instrument(skip_all)]
+async fn connect_proxy_root<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    Path(id): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+    raw_query: RawQuery,
+    body: Body,
+) -> Response {
+    connect_proxy_inner(state, id, String::new(), method, headers, raw_query, body).await
+}
+
+#[tracing::instrument(skip_all)]
+async fn connect_proxy<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    Path((id, path)): Path<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+    raw_query: RawQuery,
+    body: Body,
+) -> Response {
+    connect_proxy_inner(state, id, path, method, headers, raw_query, body).await
+}
+
+async fn connect_proxy_inner<B: ClusterBackend>(
+    state: AppState<B>,
+    lease_id: String,
+    path: String,
+    method: Method,
+    headers: HeaderMap,
+    raw_query: RawQuery,
+    body: Body,
+) -> Response {
+    let Some(connect_token) = extract_bearer_token(&headers) else {
+        return connect_error(StatusCode::UNAUTHORIZED, "Missing Bearer token");
+    };
+
+    let token_is_valid = match validate_lease_connect_token(
+        &state.client,
+        &state.namespace,
+        &lease_id,
+        connect_token,
+    )
+    .await
+    {
+        Ok(valid) => valid,
+        Err(err) => {
+            return connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to validate lease token: {err}"),
+            );
+        }
+    };
+
+    if !token_is_valid {
+        return connect_error(StatusCode::UNAUTHORIZED, "Invalid lease token");
+    }
+
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let lease = match leases_api.get(&lease_id).await {
+        Ok(lease) => lease,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            return connect_error(StatusCode::NOT_FOUND, "Lease not found");
+        }
+        Err(err) => {
+            return connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load lease: {err}"),
+            );
+        }
+    };
+
+    let status = lease.status.clone().unwrap_or_default();
+    if status.phase != LeasePhase::Bound {
+        return connect_error(
+            StatusCode::CONFLICT,
+            format!("Lease is not active (phase {})", status.phase),
+        );
+    }
+
+    let Some(cluster_name) = status.cluster_name.as_deref() else {
+        return connect_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Lease is bound without a cluster name",
+        );
+    };
+
+    let raw_kubeconfig = match state
+        .backend
+        .extract_kubeconfig(cluster_name, &state.namespace)
+        .await
+    {
+        Ok(kubeconfig) => kubeconfig,
+        Err(err) => {
+            return connect_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Failed to extract backend kubeconfig: {err}"),
+            );
+        }
+    };
+
+    let backend = match backend_access_from_kubeconfig(&raw_kubeconfig) {
+        Ok(backend) => backend,
+        Err(err) => {
+            return connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse backend kubeconfig: {err}"),
+            );
+        }
+    };
+
+    let request_url = match backend_request_url(&backend.server, &path, raw_query.0.as_deref()) {
+        Ok(url) => url,
+        Err(err) => {
+            return connect_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+        }
+    };
+
+    let body_bytes = match body::to_bytes(body, CONNECT_PROXY_MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return connect_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Failed to read request body: {err}"),
+            );
+        }
+    };
+
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(err) => {
+            return connect_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("Unsupported method: {err}"),
+            );
+        }
+    };
+
+    let mut request = backend
+        .client
+        .request(reqwest_method, request_url)
+        .body(body_bytes.clone());
+    for (name, value) in &headers {
+        if should_skip_request_header(name) {
+            continue;
+        }
+        request = request.header(name, value.clone());
+    }
+    if let Some(token) = backend.bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+
+    let backend_response = match request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            return connect_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to reach leased cluster: {err}"),
+            );
+        }
+    };
+
+    let status_code = backend_response.status();
+    let response_headers = backend_response.headers().clone();
+    let response_bytes = match backend_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return connect_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read leased cluster response: {err}"),
+            );
+        }
+    };
+
+    let mut response = Response::builder().status(status_code);
+    if let Some(headers_mut) = response.headers_mut() {
+        for (name, value) in &response_headers {
+            if should_skip_response_header(name) {
+                continue;
+            }
+            headers_mut.append(name, value.clone());
+        }
+    }
+
+    response
+        .body(Body::from(response_bytes))
+        .expect("connect proxy response")
 }
 
 #[tracing::instrument(skip_all)]
@@ -1084,6 +1394,8 @@ fn hash_identity(identity: &str) -> String {
 mod tests {
     use super::*;
 
+    use base64::Engine;
+
     #[test]
     fn test_hash_identity_deterministic() {
         let id = "repo:zondax/kunobi:ref:refs/heads/main";
@@ -1213,6 +1525,67 @@ mod tests {
         (build_router(state), server)
     }
 
+    fn lease_object_json(
+        name: &str,
+        requester_identity: &str,
+        phase: &str,
+        cluster_name: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+                "uid": format!("{name}-uid"),
+            },
+            "spec": {
+                "poolRef": "ci-small",
+                "ttl": "1h",
+                "requester": {
+                    "type": "github-actions:ci",
+                    "identity": requester_identity,
+                },
+                "priority": 50
+            },
+            "status": {
+                "phase": phase,
+                "clusterName": cluster_name,
+                "expiresAt": "2026-04-13T18:00:00Z",
+                "queuePosition": 0
+            }
+        })
+    }
+
+    fn secret_object_json(name: &str, token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+            },
+            "data": {
+                "token": base64::engine::general_purpose::STANDARD.encode(token)
+            },
+            "type": "Opaque"
+        })
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn response_text(response: Response) -> String {
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
     #[tokio::test]
     async fn test_healthz_returns_200() {
         let (app, _server) = test_app().await;
@@ -1260,6 +1633,173 @@ mod tests {
             ct.contains("text/plain"),
             "Expected text/plain content-type, got: {ct}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_lease_rewrites_bound_kubeconfig_for_connect_proxy() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        backend.set_kubeconfig("raw-backend-kubeconfig");
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+        };
+
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "lease-abc",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/api/v1/namespaces/.*/secrets"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
+            )
+            .mount(&server)
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "kobe.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        let response = get_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("lease-abc".to_string()),
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let kubeconfig = body["kubeconfig"].as_str().unwrap();
+        assert!(kubeconfig.contains("server: https://kobe.example/connect/lease-abc"));
+        assert!(kubeconfig.contains("current-context: lease-abc"));
+        assert!(kubeconfig.contains("cluster: pool-ci-small-6"));
+        assert!(kubeconfig.contains("user: lease-abc"));
+        assert!(!kubeconfig.contains("current-context: default"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_proxy_forwards_to_backend_cluster() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        backend.set_kubeconfig(&format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
+            server.uri()
+        ));
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+        };
+
+        use wiremock::matchers::{header, method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "lease-abc",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .and(header("authorization", "Bearer backend-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_raw(r#"{"gitVersion":"v1.32.0"}"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer lease-token".parse().unwrap());
+
+        let response = connect_proxy::<crate::testutil::MockBackend>(
+            State(state),
+            Path(("lease-abc".to_string(), "version".to_string())),
+            Method::GET,
+            headers,
+            RawQuery(None),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_connect_proxy_requires_bearer_token() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+        };
+
+        let response = connect_proxy::<crate::testutil::MockBackend>(
+            State(state),
+            Path(("lease-abc".to_string(), "version".to_string())),
+            Method::GET,
+            HeaderMap::new(),
+            RawQuery(None),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response_text(response).await, "Missing Bearer token");
     }
 
     // --- Auth-protected endpoints return 401 without Authorization header ---
