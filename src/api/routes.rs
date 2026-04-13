@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::body::{self, Body};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
@@ -11,7 +13,7 @@ use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
 use crate::api::connect::{
@@ -63,6 +65,7 @@ impl<B: ClusterBackend + Clone + Send + Sync + 'static> AuthnProvider for AppSta
 /// For per-client rate limiting, configure at the ingress controller level.
 const MAX_CONCURRENT_API_REQUESTS: usize = 200;
 const CONNECT_PROXY_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
 
@@ -95,6 +98,7 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .route("/v1/status", get(status::<B>))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler::<B>))
+        .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
 }
 
@@ -118,6 +122,55 @@ async fn concurrency_limit(
         }
     };
     next.run(request).await
+}
+
+async fn request_logging(mut request: axum::extract::Request, next: Next) -> Response {
+    let request_id = request_id_from_headers(request.headers())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+
+    let mut response = next.run(request).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let status = response.status();
+
+    if !matches!(path.as_str(), "/healthz" | "/metrics") {
+        if status.is_server_error() {
+            warn!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                status = status.as_u16(),
+                latency_ms,
+                "HTTP request completed with server error"
+            );
+        } else {
+            info!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                status = status.as_u16(),
+                latency_ms,
+                "HTTP request completed"
+            );
+        }
+    }
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+
+    response
 }
 
 // --- Request/Response types ---
@@ -260,6 +313,10 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
         .header("content-type", "text/plain; charset=utf-8")
         .body(Body::from(message.into()))
         .expect("connect error response")
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
@@ -665,7 +722,29 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     raw_query: RawQuery,
     body: Body,
 ) -> Response {
+    let request_id = request_id_from_headers(&headers).unwrap_or("-");
+    let request_path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path)
+    };
+
+    debug!(
+        request_id = %request_id,
+        lease_id = %lease_id,
+        method = %method,
+        path = %request_path,
+        "Connect proxy request received"
+    );
+
     let Some(connect_token) = extract_bearer_token(&headers) else {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            method = %method,
+            path = %request_path,
+            "Connect proxy rejected request without bearer token"
+        );
         return connect_error(StatusCode::UNAUTHORIZED, "Missing Bearer token");
     };
 
@@ -679,6 +758,12 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     {
         Ok(valid) => valid,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                error = %err,
+                "Connect proxy failed to validate lease token"
+            );
             return connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to validate lease token: {err}"),
@@ -687,6 +772,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     };
 
     if !token_is_valid {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            method = %method,
+            path = %request_path,
+            "Connect proxy rejected invalid lease token"
+        );
         return connect_error(StatusCode::UNAUTHORIZED, "Invalid lease token");
     }
 
@@ -694,9 +786,20 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let lease = match leases_api.get(&lease_id).await {
         Ok(lease) => lease,
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                "Connect proxy lease not found"
+            );
             return connect_error(StatusCode::NOT_FOUND, "Lease not found");
         }
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                error = %err,
+                "Connect proxy failed to load lease"
+            );
             return connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to load lease: {err}"),
@@ -706,6 +809,12 @@ async fn connect_proxy_inner<B: ClusterBackend>(
 
     let status = lease.status.clone().unwrap_or_default();
     if status.phase != LeasePhase::Bound {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            phase = %status.phase,
+            "Connect proxy rejected lease outside Bound phase"
+        );
         return connect_error(
             StatusCode::CONFLICT,
             format!("Lease is not active (phase {})", status.phase),
@@ -713,6 +822,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     }
 
     let Some(cluster_name) = status.cluster_name.as_deref() else {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            "Connect proxy found bound lease without cluster name"
+        );
         return connect_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Lease is bound without a cluster name",
@@ -726,6 +840,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     {
         Ok(kubeconfig) => kubeconfig,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                error = %err,
+                "Connect proxy failed to extract backend kubeconfig"
+            );
             return connect_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("Failed to extract backend kubeconfig: {err}"),
@@ -736,6 +857,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let backend = match backend_access_from_kubeconfig(&raw_kubeconfig) {
         Ok(backend) => backend,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                error = %err,
+                "Connect proxy failed to parse backend kubeconfig"
+            );
             return connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to parse backend kubeconfig: {err}"),
@@ -746,6 +874,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let request_url = match backend_request_url(&backend.server, &path, raw_query.0.as_deref()) {
         Ok(url) => url,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                error = %err,
+                "Connect proxy failed to build backend request URL"
+            );
             return connect_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
         }
     };
@@ -753,6 +888,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let body_bytes = match body::to_bytes(body, CONNECT_PROXY_MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                error = %err,
+                "Connect proxy failed to read request body"
+            );
             return connect_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("Failed to read request body: {err}"),
@@ -763,6 +905,14 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                method = %method,
+                path = %request_path,
+                error = %err,
+                "Connect proxy received unsupported HTTP method"
+            );
             return connect_error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 format!("Unsupported method: {err}"),
@@ -787,6 +937,16 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let backend_response = match request.send().await {
         Ok(response) => response,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                upstream = %backend.server,
+                method = %method,
+                path = %request_path,
+                error = %err,
+                "Connect proxy failed to reach leased cluster"
+            );
             return connect_error(
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to reach leased cluster: {err}"),
@@ -799,6 +959,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let response_bytes = match backend_response.bytes().await {
         Ok(bytes) => bytes,
         Err(err) => {
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                error = %err,
+                "Connect proxy failed to read leased cluster response"
+            );
             return connect_error(
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to read leased cluster response: {err}"),
@@ -815,6 +982,17 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             headers_mut.append(name, value.clone());
         }
     }
+
+    debug!(
+        request_id = %request_id,
+        lease_id = %lease_id,
+        cluster = %cluster_name,
+        upstream = %backend.server,
+        method = %method,
+        path = %request_path,
+        status = status_code.as_u16(),
+        "Connect proxy completed upstream request"
+    );
 
     response
         .body(Body::from(response_bytes))

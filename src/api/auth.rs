@@ -764,7 +764,12 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
                 .validate_ssh(ssh_header, method, path_with_query, None)
                 .await
                 .map_err(|e| {
-                    warn!("SSH authentication failed: {e}");
+                    warn!(
+                        method = method,
+                        path = path_with_query,
+                        error = %e,
+                        "SSH authentication failed"
+                    );
                     axum::http::StatusCode::UNAUTHORIZED
                 });
         }
@@ -774,8 +779,20 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
             .strip_prefix("Bearer ")
             .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
 
+        let method = parts.method.as_str();
+        let path_with_query = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(parts.uri.path());
+
         state.authenticator.validate(token).await.map_err(|e| {
-            warn!("Authentication failed: {e}");
+            warn!(
+                method = method,
+                path = path_with_query,
+                error = %e,
+                "Bearer authentication failed"
+            );
             axum::http::StatusCode::UNAUTHORIZED
         })
     }
