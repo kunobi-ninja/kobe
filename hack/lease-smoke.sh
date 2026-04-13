@@ -35,6 +35,8 @@ ENDPOINT_VERSION=""
 ENDPOINT_URL=""
 TARGET_NAME=""
 POOL_JSON=""
+POOL_SNAPSHOT_BEFORE=""
+POOL_SNAPSHOT_AFTER=""
 
 cleanup() {
   if [[ -n "$LEASE_ID" && "$RELEASED" -eq 0 ]]; then
@@ -72,6 +74,7 @@ preflight_pool_state() {
   leased="$(printf '%s' "$POOL_JSON" | jq -r '.leased')"
   recycling="$(printf '%s' "$POOL_JSON" | jq -r '.recycling // 0')"
   queue_depth="$(printf '%s' "$POOL_JSON" | jq -r '.queueDepth')"
+  POOL_SNAPSHOT_BEFORE="$(printf '%s' "$POOL_JSON" | jq -c '{ready, leased, creating, recycling, queueDepth}')"
 
   echo "Pool '$POOL': ready=$ready leased=$leased creating=$creating recycling=$recycling queue=$queue_depth" >&2
 
@@ -95,40 +98,81 @@ print_failure_diagnostics() {
   local kubeconfig_path="$1"
   local raw_out
   local raw_err
+  local server_url
+  local bearer_token
+  local before_ready=""
+  local before_leased=""
+  local before_creating=""
+  local before_recycling=""
+  local before_queue=""
+  local after_ready=""
+  local after_leased=""
+  local after_creating=""
+  local after_recycling=""
+  local after_queue=""
 
-  echo "Smoke diagnostics:" >&2
-  echo "  target:           ${TARGET_NAME:-unknown}" >&2
-  echo "  endpoint:         ${ENDPOINT_URL:-unknown}" >&2
-  echo "  endpointVersion:  ${ENDPOINT_VERSION:-unknown}" >&2
-  echo "  lease:            ${LEASE_ID:-unknown}" >&2
-  echo "  cluster:          ${CLUSTER_NAME:-unknown}" >&2
-  echo "  kubeconfig:       ${kubeconfig_path:-unknown}" >&2
-  echo "  server:           ${SERVER:-unknown}" >&2
+  STATUS_JSON="$(cargo run --bin kobe -- "${KOBE_ARGS[@]}" status -o json)"
+  POOL_JSON="$(printf '%s' "$STATUS_JSON" | jq -c --arg pool "$POOL" '.pools[] | select(.name == $pool)')"
   if [[ -n "$POOL_JSON" ]]; then
-    echo "  pool snapshot:    $(printf '%s' "$POOL_JSON" | jq -c '{ready, leased, creating, recycling, queueDepth}')" >&2
+    POOL_SNAPSHOT_AFTER="$(printf '%s' "$POOL_JSON" | jq -c '{ready, leased, creating, recycling, queueDepth}')"
+    after_ready="$(printf '%s' "$POOL_JSON" | jq -r '.ready')"
+    after_leased="$(printf '%s' "$POOL_JSON" | jq -r '.leased')"
+    after_creating="$(printf '%s' "$POOL_JSON" | jq -r '.creating')"
+    after_recycling="$(printf '%s' "$POOL_JSON" | jq -r '.recycling // 0')"
+    after_queue="$(printf '%s' "$POOL_JSON" | jq -r '.queueDepth')"
   fi
+
+  if [[ -n "$POOL_SNAPSHOT_BEFORE" ]]; then
+    before_ready="$(printf '%s' "$POOL_SNAPSHOT_BEFORE" | jq -r '.ready')"
+    before_leased="$(printf '%s' "$POOL_SNAPSHOT_BEFORE" | jq -r '.leased')"
+    before_creating="$(printf '%s' "$POOL_SNAPSHOT_BEFORE" | jq -r '.creating')"
+    before_recycling="$(printf '%s' "$POOL_SNAPSHOT_BEFORE" | jq -r '.recycling // 0')"
+    before_queue="$(printf '%s' "$POOL_SNAPSHOT_BEFORE" | jq -r '.queueDepth')"
+  fi
+
+  echo >&2
+  echo "Smoke diagnostics" >&2
+  echo "  endpoint   ${ENDPOINT_URL:-unknown} (${ENDPOINT_VERSION:-unknown})" >&2
+  echo "  target     ${TARGET_NAME:-unknown}" >&2
+  echo "  lease      ${LEASE_ID:-unknown}" >&2
+  echo "  cluster    ${CLUSTER_NAME:-unknown}" >&2
+  echo "  server     ${SERVER:-unknown}" >&2
+  echo "  kubeconfig ${kubeconfig_path:-unknown}" >&2
+  echo >&2
+  echo "  pool" >&2
+  if [[ -n "$before_ready" ]]; then
+    echo "    before  ready=$before_ready leased=$before_leased creating=$before_creating recycling=$before_recycling queue=$before_queue" >&2
+  fi
+  if [[ -n "$after_ready" ]]; then
+    echo "    after   ready=$after_ready leased=$after_leased creating=$after_creating recycling=$after_recycling queue=$after_queue" >&2
+  fi
+  echo >&2
+  echo "  probes" >&2
 
   raw_out="$(mktemp)"
   raw_err="$(mktemp)"
-  trap 'rm -f "$raw_out" "$raw_err"' RETURN
+  server_url="$(kubectl --kubeconfig "$kubeconfig_path" config view --raw -o jsonpath='{.clusters[0].cluster.server}')"
+  bearer_token="$(kubectl --kubeconfig "$kubeconfig_path" config view --raw -o jsonpath='{.users[0].user.token}')"
 
-  for raw_path in /version /api /apis; do
-    if kubectl --request-timeout=5s --kubeconfig "$kubeconfig_path" get --raw "$raw_path" >"$raw_out" 2>"$raw_err"; then
+  for raw_path in version api apis; do
+    if curl -fsS --max-time 5 -H "Authorization: Bearer ${bearer_token}" "${server_url}/${raw_path}" >"$raw_out" 2>"$raw_err"; then
       local preview
       preview="$(tr '\n' ' ' <"$raw_out")"
       if (( ${#preview} > 120 )); then
         preview="${preview:0:117}..."
       fi
-      echo "  probe ${raw_path}: ok ${preview}" >&2
+      echo "    /${raw_path}  ok   ${preview}" >&2
     else
       local preview
       preview="$(tr '\n' ' ' <"$raw_err")"
       if (( ${#preview} > 120 )); then
         preview="${preview:0:117}..."
       fi
-      echo "  probe ${raw_path}: ${preview:-failed}" >&2
+      echo "    /${raw_path}  err  ${preview:-failed}" >&2
     fi
   done
+
+  rm -f "$raw_out" "$raw_err"
 }
 
 wait_for_cluster_api() {
@@ -142,7 +186,6 @@ wait_for_cluster_api() {
 
   probe_out="$(mktemp)"
   probe_err="$(mktemp)"
-  trap 'rm -f "$probe_out" "$probe_err"' RETURN
 
   while (( SECONDS < deadline )); do
     attempt=$((attempt + 1))
@@ -169,6 +212,7 @@ wait_for_cluster_api() {
     echo "Last readiness error: $last_error" >&2
   fi
   print_failure_diagnostics "$kubeconfig_path"
+  rm -f "$probe_out" "$probe_err"
   return 1
 }
 
