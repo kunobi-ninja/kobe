@@ -27,6 +27,234 @@ spec:
               (`spec.poolRef` omitted). Backend-specific resources are implementation
               details owned by the reconciler for this instance.
             properties:
+              addons:
+                default: []
+                description: Standalone addons. Pool-managed instances derive this from the pool.
+                items:
+                  properties:
+                    manifest:
+                      description: Inline Kubernetes manifest YAML to apply after vcluster is ready.
+                      nullable: true
+                      type: string
+                    name:
+                      description: Human-readable name for the addon.
+                      type: string
+                    url:
+                      description: URL to fetch manifest from (alternative to inline).
+                      nullable: true
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              backend:
+                description: Standalone backend configuration. Pool-managed instances derive this from the pool.
+                nullable: true
+                properties:
+                  capi:
+                    description: CAPI backend configuration (capi backend only).
+                    nullable: true
+                    properties:
+                      infrastructureApiVersion:
+                        description: API version of the infrastructure CRD (e.g. "infrastructure.cluster.x-k8s.io/v1alpha1").
+                        type: string
+                      infrastructureKind:
+                        description: Kind of the infrastructure CRD (e.g. "VCluster", "K0smotronCluster").
+                        type: string
+                      infrastructurePlural:
+                        description: |-
+                          Optional explicit plural form for the infrastructure CRD resource name.
+                          If not set, derived automatically by lowercasing the kind and appending "s".
+                          Use this for kinds with irregular plurals (e.g. "ingresses" for "Ingress").
+                        nullable: true
+                        type: string
+                      infrastructureSpec:
+                        description: |-
+                          Raw JSON/YAML spec to embed in the infrastructure resource.
+                          This is provider-specific and passed through as-is.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    required:
+                    - infrastructureApiVersion
+                    - infrastructureKind
+                    type: object
+                  datastore:
+                    description: Shared PostgreSQL datastore configuration (k3s/k0s backends only).
+                    nullable: true
+                    properties:
+                      goldenTemplates:
+                        default: false
+                        description: Enable golden images via PostgreSQL template databases.
+                        type: boolean
+                      secretKey:
+                        default: connection-url
+                        description: 'Key in the Secret (default: "connection-url").'
+                        type: string
+                      secretRef:
+                        description: Name of the Secret containing the PostgreSQL connection URL.
+                        type: string
+                    required:
+                    - secretRef
+                    type: object
+                  type:
+                    default: k3s
+                    description: Backend type.
+                    enum:
+                    - k3s
+                    - k0s
+                    - capi
+                    - vkobe
+                    type: string
+                  vkobe:
+                    description: vkobe backend configuration (vkobe backend only).
+                    nullable: true
+                    properties:
+                      dataStoreRef:
+                        description: Reference to the KobeStore CRD that this cluster connects to.
+                        properties:
+                          name:
+                            description: Name of the KobeStore resource in the same namespace.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      kcm:
+                        description: Optional KCM (kube-controller-manager) configuration.
+                        nullable: true
+                        properties:
+                          controllers:
+                            default:
+                            - deployment
+                            - replicaset
+                            - statefulset
+                            - daemonset
+                            - job
+                            - cronjob
+                            - namespace
+                            - serviceaccount
+                            - garbagecollector
+                            description: Which controllers to enable in the virtual KCM.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      metricsPort:
+                        default: 9090
+                        description: 'Port for health/metrics endpoints (default: 9090).'
+                        format: uint16
+                        maximum: 65535.0
+                        minimum: 0.0
+                        type: integer
+                      proxyPort:
+                        default: 8443
+                        description: 'Port for the virtual API server proxy (default: 8443).'
+                        format: uint16
+                        maximum: 65535.0
+                        minimum: 0.0
+                        type: integer
+                      syncers:
+                        default:
+                        - pods
+                        - services
+                        - configmaps
+                        - secrets
+                        - endpoints
+                        - ingresses
+                        description: Which resource syncers to enable. Defaults to core set.
+                        items:
+                          type: string
+                        type: array
+                      version:
+                        default: '1.32'
+                        description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
+                        type: string
+                    required:
+                    - dataStoreRef
+                    type: object
+                type: object
+              cluster:
+                description: Standalone cluster configuration. Pool-managed instances derive this from the pool.
+                nullable: true
+                properties:
+                  agents:
+                    description: |-
+                      Number of k3s agent replicas (k3s backend only).
+                      When set, creates a separate agent Deployment that joins the server.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  expose:
+                    description: Expose config (ingress/LoadBalancer/NodePort).
+                    nullable: true
+                    properties:
+                      exposeType:
+                        description: 'Expose type: "ingress", "NodePort", "LoadBalancer".'
+                        type: string
+                      ingressClassName:
+                        description: Ingress class name (when expose_type="ingress").
+                        nullable: true
+                        type: string
+                      nodePort:
+                        description: NodePort number (when expose_type="NodePort").
+                        format: int32
+                        nullable: true
+                        type: integer
+                    required:
+                    - exposeType
+                    type: object
+                  persistence:
+                    description: Persistence config.
+                    nullable: true
+                    properties:
+                      storageClassName:
+                        description: Storage class name for dynamic provisioning.
+                        nullable: true
+                        type: string
+                      storageRequestSize:
+                        description: Storage request size (e.g., "10Gi").
+                        nullable: true
+                        type: string
+                      storageType:
+                        description: 'Storage type: "emptyDir", "dynamic", etc.'
+                        nullable: true
+                        type: string
+                    type: object
+                  serverArgs:
+                    default: []
+                    description: Extra k3s server args.
+                    items:
+                      type: string
+                    type: array
+                  servers:
+                    default: 1
+                    description: Number of control plane servers.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  version:
+                    description: k3s version (e.g., "v1.31.3+k3s1").
+                    type: string
+                required:
+                - version
+                type: object
+              healthCheck:
+                description: Standalone health-check configuration. Pool-managed instances derive this from the pool.
+                nullable: true
+                properties:
+                  failureThreshold:
+                    default: 3
+                    description: Consecutive failures before recycling a cluster.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  intervalSeconds:
+                    default: 30
+                    description: How often to probe warm clusters, in seconds.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
               poolRef:
                 description: Optional owning pool. When absent, this instance is standalone.
                 nullable: true
@@ -35,6 +263,60 @@ spec:
                     type: string
                 required:
                 - name
+                type: object
+              readinessGates:
+                default: []
+                description: Standalone readiness gates. Pool-managed instances derive this from the pool.
+                items:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    type:
+                      enum:
+                      - CRDExists
+                      - DeploymentReady
+                      - DaemonSetReady
+                      - URLHealthy
+                      type: string
+                    url:
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              snapshot:
+                description: Optional standalone snapshot/restore configuration.
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: Enable golden image snapshotting via Velero.
+                    type: boolean
+                  goldenPrefix:
+                    default: golden
+                    description: Prefix for the golden backup name (e.g. "golden-<profile>").
+                    type: string
+                  refreshOn:
+                    default: ProfileChange
+                    description: When to refresh the golden image.
+                    enum:
+                    - ProfileChange
+                    - Manual
+                    type: string
+                  storageLocation:
+                    default: default
+                    description: Velero BackupStorageLocation name to use.
+                    type: string
+                  ttl:
+                    default: 720h
+                    description: How long the Velero backup should be retained (e.g. "720h").
+                    type: string
+                  veleroNamespace:
+                    default: velero
+                    description: Namespace where the Velero server is installed.
+                    type: string
                 type: object
             type: object
           status:

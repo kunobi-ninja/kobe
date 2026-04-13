@@ -134,7 +134,10 @@ mod cluster_instance_tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
             ))
-            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![
                     instance_response_json(
@@ -177,7 +180,10 @@ mod cluster_instance_tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
             ))
-            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![instance_response_json(
                     "pool-test-profile-0",
@@ -306,7 +312,6 @@ async fn reconcile_profile(
                     let backend = if let Some(ref f) = ctx.factory {
                         f.backend_for(&profile)?
                     } else {
-                        // Fallback: in tests, wrap the clone in a no-op dispatch.
                         crate::backend::BackendDispatch::K3s(crate::backend::K3sBackend::new(
                             ctx.client.clone(),
                             None,
@@ -340,7 +345,6 @@ async fn reconcile_profile(
                                     .with_label_values(&[profile_name.as_str(), "ok"])
                                     .inc();
 
-                                // Patch profile status with new golden backup info.
                                 let profiles_api: Api<ClusterPool> =
                                     Api::namespaced(client.clone(), &ns);
                                 let status_patch = serde_json::json!({
@@ -364,7 +368,6 @@ async fn reconcile_profile(
                                     );
                                 }
 
-                                // Clean up old backups.
                                 if let Err(e) = velero
                                     .cleanup_old_backups(&profile_name, &snapshot, generation)
                                     .await
@@ -393,11 +396,9 @@ async fn reconcile_profile(
         }
     }
 
-    // Compute actions
     let now = chrono::Utc::now();
     let actions = compute_pool_actions(&profile, &pool_state, now);
 
-    // Execute actions
     for action in &actions {
         match action {
             PoolAction::Create(cluster_name) => {
@@ -448,14 +449,12 @@ async fn reconcile_profile(
         }
     }
 
-    // Store updated pool state
     ctx.pools
         .write()
         .await
         .insert(name.clone(), pool_state.clone());
     sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
 
-    // Update profile status
     let counts = count_states(&pool_state);
 
     let queue_depth = {
@@ -484,8 +483,6 @@ async fn reconcile_profile(
 
     let profiles_api: Api<ClusterPool> = Api::namespaced(ctx.client.clone(), &ns);
 
-    // Preserve existing golden backup/generation status values so they are
-    // not overwritten with None on every reconcile loop.
     let (existing_golden_backup, existing_golden_generation) = profile
         .status
         .as_ref()
@@ -576,7 +573,6 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
     PoolState { clusters }
 }
 
-/// Error policy: requeue with backoff on failure.
 fn error_policy(
     _profile: Arc<ClusterPool>,
     error: &ProfileError,
@@ -606,6 +602,12 @@ async fn ensure_cluster_instance(
             pool_ref: Some(ResourceRef {
                 name: profile.name_any(),
             }),
+            backend: None,
+            cluster: None,
+            addons: Vec::new(),
+            health_check: None,
+            readiness_gates: Vec::new(),
+            snapshot: None,
         },
         status: Some(ClusterInstanceStatus {
             phase: ClusterInstancePhase::Creating,
@@ -706,833 +708,4 @@ async fn get_cluster_instance_status(
         .await
         .ok()
         .and_then(|instance| instance.status)
-}
-
-#[cfg(any())]
-mod tests {
-    use super::*;
-    use crate::pool::{ClusterEntry, ClusterState, PoolState};
-    use crate::testutil::MockBackend;
-    use std::collections::HashMap;
-    use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /// Build a `ProfileContext<MockBackend>` wired to a local wiremock server.
-    async fn test_profile_context() -> (Arc<ProfileContext<MockBackend>>, MockServer) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let server = MockServer::start().await;
-        let client = crate::testutil::mock_k8s_client(&server);
-        let backend = MockBackend::new();
-        let pools = Arc::new(RwLock::new(HashMap::new()));
-
-        let ctx = Arc::new(ProfileContext {
-            client,
-            backend,
-            namespace: "test-ns".to_string(),
-            pools,
-            health_failures: RwLock::new(HashMap::new()),
-            velero: None,
-            factory: None,
-        });
-        (ctx, server)
-    }
-
-    /// Build a `ClusterPool` CRD object for testing.
-    fn make_test_profile(name: &str, min_size: u32, max_size: u32) -> Arc<ClusterPool> {
-        Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterPool",
-                "metadata": {
-                    "name": name,
-                    "namespace": "test-ns",
-                    "generation": 1
-                },
-                "spec": {
-                    "minSize": min_size,
-                    "maxSize": max_size,
-                    "cluster": {
-                        "version": "v1.28.0",
-                        "serverCount": 1
-                    },
-                    "readinessGates": [],
-                    "addons": []
-                }
-            }))
-            .unwrap(),
-        )
-    }
-
-    /// Build a minimal `ClusterPool` JSON value for K8s API responses.
-    fn profile_response_json(name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "ClusterPool",
-            "metadata": {
-                "name": name,
-                "namespace": "test-ns",
-                "generation": 1
-            },
-            "spec": {
-                "size": 3,
-                "ttl": "2h",
-                "cluster": {
-                    "version": "v1.28.0"
-                }
-            },
-            "status": {
-                "ready": 0,
-                "leased": 0,
-                "creating": 0,
-                "unhealthy": 0,
-                "queueDepth": 0
-            }
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // error_policy
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_error_policy_returns_requeue_60s() {
-        let (ctx, _server) = test_profile_context().await;
-        let profile = make_test_profile("err-profile", 2, 5);
-        let error = ProfileError::Lifecycle(anyhow::anyhow!("test error"));
-        let action = error_policy(profile, &error, ctx);
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
-    }
-
-    // -----------------------------------------------------------------------
-    // evaluate_cluster_readiness
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_evaluate_cluster_readiness_all_pass() {
-        let (ctx, _server) = test_profile_context().await;
-
-        // Backend defaults to ready=true, so all gates pass.
-        let gates = vec![crate::crd::ReadinessGate::CrdExists {
-            name: "test-crd".to_string(),
-        }];
-
-        let mut pool_state = PoolState {
-            clusters: HashMap::from([(
-                "pool-test-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            )]),
-        };
-
-        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
-
-        // Cluster should transition from Creating to Ready.
-        let entry = pool_state.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Ready);
-        assert!(entry.idle_since.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_cluster_readiness_one_gate_fails() {
-        let (ctx, _server) = test_profile_context().await;
-
-        // Set backend to return ready=false.
-        ctx.backend.set_readiness(false);
-
-        let gates = vec![crate::crd::ReadinessGate::CrdExists {
-            name: "test-crd".to_string(),
-        }];
-
-        let mut pool_state = PoolState {
-            clusters: HashMap::from([(
-                "pool-test-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            )]),
-        };
-
-        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
-
-        // Cluster should remain Creating.
-        let entry = pool_state.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Creating);
-        assert!(entry.idle_since.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_cluster_readiness_gate_error() {
-        let (ctx, _server) = test_profile_context().await;
-
-        // Set backend to return error on readiness check.
-        ctx.backend.fail_readiness("connection refused");
-
-        let gates = vec![crate::crd::ReadinessGate::CrdExists {
-            name: "test-crd".to_string(),
-        }];
-
-        let mut pool_state = PoolState {
-            clusters: HashMap::from([(
-                "pool-test-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            )]),
-        };
-
-        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
-
-        // Cluster should remain Creating on error.
-        let entry = pool_state.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Creating);
-        assert!(entry.idle_since.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_cluster_readiness_requires_health() {
-        let (ctx, _server) = test_profile_context().await;
-        ctx.backend.set_health(false);
-
-        let gates = vec![crate::crd::ReadinessGate::CrdExists {
-            name: "test-crd".to_string(),
-        }];
-
-        let mut pool_state = PoolState {
-            clusters: HashMap::from([(
-                "pool-test-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            )]),
-        };
-
-        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
-
-        let entry = pool_state.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Creating);
-        assert!(entry.idle_since.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_cluster_readiness_without_gates_uses_health() {
-        let (ctx, _server) = test_profile_context().await;
-
-        let mut pool_state = PoolState {
-            clusters: HashMap::from([(
-                "pool-test-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            )]),
-        };
-
-        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &[], &mut pool_state).await;
-
-        let entry = pool_state.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Ready);
-        assert!(entry.idle_since.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_evaluate_cluster_readiness_skips_non_creating() {
-        let (ctx, _server) = test_profile_context().await;
-
-        let gates = vec![crate::crd::ReadinessGate::CrdExists {
-            name: "test-crd".to_string(),
-        }];
-
-        let mut pool_state = PoolState {
-            clusters: HashMap::from([
-                (
-                    "pool-test-ready".to_string(),
-                    ClusterEntry {
-                        state: ClusterState::Ready,
-                        idle_since: Some(chrono::Utc::now()),
-                        health_failures: 0,
-                        state_since: Some(chrono::Utc::now()),
-                        spec_hash: None,
-                    },
-                ),
-                (
-                    "pool-test-leased".to_string(),
-                    ClusterEntry {
-                        state: ClusterState::Leased,
-                        idle_since: None,
-                        health_failures: 0,
-                        state_since: Some(chrono::Utc::now()),
-                        spec_hash: None,
-                    },
-                ),
-            ]),
-        };
-
-        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
-
-        // No readiness or health checks should have been performed (no Creating clusters).
-        let calls = ctx.backend.call_count();
-        assert_eq!(calls.check_readiness_gate, 0);
-        assert_eq!(calls.check_health, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_pool_state
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_build_pool_state_empty_cache() {
-        let (ctx, server) = test_profile_context().await;
-
-        // Mock LIST StatefulSets: return 2 STS with the expected prefix.
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(vec![
-                    serde_json::json!({
-                        "apiVersion": "apps/v1",
-                        "kind": "StatefulSet",
-                        "metadata": { "name": "pool-test-profile-0", "namespace": "test-ns" },
-                        "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
-                        "status": { "readyReplicas": 1, "replicas": 1 }
-                    }),
-                    serde_json::json!({
-                        "apiVersion": "apps/v1",
-                        "kind": "StatefulSet",
-                        "metadata": { "name": "pool-test-profile-1", "namespace": "test-ns" },
-                        "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
-                        "status": { "readyReplicas": 0, "replicas": 1 }
-                    }),
-                    // A StatefulSet that does NOT match the prefix should be ignored.
-                    serde_json::json!({
-                        "apiVersion": "apps/v1",
-                        "kind": "StatefulSet",
-                        "metadata": { "name": "other-sts-0", "namespace": "test-ns" },
-                        "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
-                        "status": { "readyReplicas": 1, "replicas": 1 }
-                    }),
-                ]),
-            ))
-            .mount(&server)
-            .await;
-
-        // Mock LIST claims: return empty list.
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=test-profile",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        let pool_state = build_pool_state(&ctx, "test-profile").await;
-
-        // Should discover 2 clusters matching the prefix.
-        assert_eq!(pool_state.clusters.len(), 2);
-        assert!(pool_state.clusters.contains_key("pool-test-profile-0"));
-        assert!(pool_state.clusters.contains_key("pool-test-profile-1"));
-
-        // Raw pool rebuild should keep newly observed clusters in Creating until
-        // readiness evaluation promotes them.
-        assert_eq!(
-            pool_state
-                .clusters
-                .get("pool-test-profile-0")
-                .unwrap()
-                .state,
-            ClusterState::Creating
-        );
-        assert_eq!(
-            pool_state
-                .clusters
-                .get("pool-test-profile-1")
-                .unwrap()
-                .state,
-            ClusterState::Creating
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_pool_state_refreshes_cached_entries_from_live_state() {
-        let (ctx, server) = test_profile_context().await;
-
-        // Pre-populate the pools cache.
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = HashMap::new();
-            clusters.insert(
-                "pool-cached-profile-0".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Leased,
-                    idle_since: Some(chrono::Utc::now()),
-                    health_failures: 2,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: Some(42),
-                },
-            );
-            pools.insert("cached-profile".to_string(), PoolState { clusters });
-        }
-
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(vec![serde_json::json!({
-                    "apiVersion": "apps/v1",
-                    "kind": "StatefulSet",
-                    "metadata": { "name": "pool-cached-profile-0", "namespace": "test-ns" },
-                    "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
-                    "status": { "readyReplicas": 1, "replicas": 1 }
-                })]),
-            ))
-            .mount(&server)
-            .await;
-
-        // No active leases, so the cached Leased entry should heal back to
-        // Creating until readiness evaluation runs again.
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=cached-profile",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        let pool_state = build_pool_state(&ctx, "cached-profile").await;
-
-        assert_eq!(pool_state.clusters.len(), 1);
-        assert!(pool_state.clusters.contains_key("pool-cached-profile-0"));
-        let entry = pool_state.clusters.get("pool-cached-profile-0").unwrap();
-        assert_eq!(entry.state, ClusterState::Creating);
-        assert!(entry.idle_since.is_none());
-        assert_eq!(entry.health_failures, 2);
-        assert_eq!(entry.spec_hash, Some(42));
-    }
-
-    #[tokio::test]
-    async fn test_build_pool_state_normalizes_server_suffix() {
-        let (ctx, server) = test_profile_context().await;
-
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(vec![serde_json::json!({
-                    "apiVersion": "apps/v1",
-                    "kind": "StatefulSet",
-                    "metadata": { "name": "pool-test-profile-7-server", "namespace": "test-ns" },
-                    "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
-                    "status": { "readyReplicas": 1, "replicas": 1 }
-                })]),
-            ))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=test-profile",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        let pool_state = build_pool_state(&ctx, "test-profile").await;
-
-        assert!(pool_state.clusters.contains_key("pool-test-profile-7"));
-        assert!(
-            !pool_state
-                .clusters
-                .contains_key("pool-test-profile-7-server")
-        );
-        assert_eq!(
-            pool_state
-                .clusters
-                .get("pool-test-profile-7")
-                .unwrap()
-                .state,
-            ClusterState::Creating
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_pool_state_keeps_creating_until_readiness_evaluation() {
-        let (ctx, server) = test_profile_context().await;
-
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = HashMap::new();
-            clusters.insert(
-                "pool-heal-profile-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
-                    spec_hash: Some(7),
-                },
-            );
-            pools.insert("heal-profile".to_string(), PoolState { clusters });
-        }
-
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(vec![serde_json::json!({
-                    "apiVersion": "apps/v1",
-                    "kind": "StatefulSet",
-                    "metadata": { "name": "pool-heal-profile-1-server", "namespace": "test-ns" },
-                    "spec": { "replicas": 1, "selector": { "matchLabels": {} }, "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } }, "serviceName": "" },
-                    "status": { "readyReplicas": 1, "replicas": 1 }
-                })]),
-            ))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=heal-profile",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        let pool_state = build_pool_state(&ctx, "heal-profile").await;
-        let entry = pool_state.clusters.get("pool-heal-profile-1").unwrap();
-
-        assert_eq!(entry.state, ClusterState::Creating);
-        assert!(entry.idle_since.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // reconcile_profile: scales up when pool is empty
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_reconcile_profile_scales_up() {
-        let (ctx, server) = test_profile_context().await;
-
-        let profile = make_test_profile("scale-up", 2, 5);
-
-        // Mock LIST StatefulSets: empty (no existing clusters).
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        // Mock LIST claims for build_pool_state (building pool state).
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=scale-up",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        // Mock PATCH profile status.
-        Mock::given(method("PATCH"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/scale-up/status",
-            ))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(profile_response_json("scale-up")),
-            )
-            .mount(&server)
-            .await;
-
-        let action = reconcile_profile(profile, ctx.clone()).await.unwrap();
-
-        // Should requeue at 30s on success.
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
-
-        // Give spawned create tasks time to run.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Backend.create should have been called (size=3 default, MAX_BURST=2).
-        let calls = ctx.backend.call_count();
-        assert!(calls.create > 0, "Expected at least one create call");
-
-        // Pool state should have entries.
-        let pools = ctx.pools.read().await;
-        let pool = pools.get("scale-up").unwrap();
-        assert!(
-            !pool.clusters.is_empty(),
-            "Pool should have cluster entries"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // reconcile_profile: at capacity (no scaling needed)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_reconcile_profile_at_capacity() {
-        let (ctx, server) = test_profile_context().await;
-
-        let profile = make_test_profile("at-cap", 2, 5);
-
-        // Pre-populate pool state with 3 Ready clusters. Reconcile now refreshes
-        // live occupancy from Kubernetes, so we also need matching StatefulSets
-        // below to keep the pool at target capacity.
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = HashMap::new();
-            for i in 0..3 {
-                clusters.insert(
-                    format!("pool-at-cap-{i}"),
-                    ClusterEntry {
-                        state: ClusterState::Ready,
-                        idle_since: Some(chrono::Utc::now()),
-                        health_failures: 0,
-                        state_since: Some(chrono::Utc::now()),
-                        spec_hash: None,
-                    },
-                );
-            }
-            pools.insert("at-cap".to_string(), PoolState { clusters });
-        }
-
-        // Mock LIST claims for queue_depth calculation in reconcile.
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=at-cap",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
-            ))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/test-ns/statefulsets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(
-                    (0..3)
-                        .map(|i| {
-                            serde_json::json!({
-                                "apiVersion": "apps/v1",
-                                "kind": "StatefulSet",
-                                "metadata": { "name": format!("pool-at-cap-{i}"), "namespace": "test-ns" },
-                                "spec": {
-                                    "replicas": 1,
-                                    "selector": { "matchLabels": {} },
-                                    "template": { "metadata": { "labels": {} }, "spec": { "containers": [] } },
-                                    "serviceName": ""
-                                },
-                                "status": { "readyReplicas": 1, "replicas": 1 }
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-            ))
-            .mount(&server)
-            .await;
-
-        // Mock PATCH profile status.
-        Mock::given(method("PATCH"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/at-cap/status",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(profile_response_json("at-cap")))
-            .mount(&server)
-            .await;
-
-        let action = reconcile_profile(profile, ctx.clone()).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
-
-        // No create calls should have been made — pool is at capacity.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let calls = ctx.backend.call_count();
-        assert_eq!(calls.create, 0, "No create calls expected at capacity");
-    }
-
-    // -----------------------------------------------------------------------
-    // reconcile_profile: status update includes correct counts
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_reconcile_profile_status_update() {
-        let (ctx, server) = test_profile_context().await;
-
-        let profile = make_test_profile("status-test", 2, 5);
-
-        // Pre-populate pool with diverse cluster states.
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = HashMap::new();
-            // 2 Ready, 1 Leased, 1 Creating, 1 Unhealthy
-            clusters.insert(
-                "pool-status-test-0".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Ready,
-                    idle_since: Some(chrono::Utc::now()),
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            clusters.insert(
-                "pool-status-test-1".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Ready,
-                    idle_since: Some(chrono::Utc::now()),
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            clusters.insert(
-                "pool-status-test-2".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Leased,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            clusters.insert(
-                "pool-status-test-3".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Creating,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            clusters.insert(
-                "pool-status-test-4".to_string(),
-                ClusterEntry {
-                    state: ClusterState::Unhealthy,
-                    idle_since: None,
-                    health_failures: 3,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            pools.insert("status-test".to_string(), PoolState { clusters });
-        }
-
-        // Mock LIST claims: 1 pending claim.
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kobe.kunobi.ninja/profile=status-test",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(vec![serde_json::json!({
-                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                    "kind": "ClusterLease",
-                    "metadata": { "name": "pending-claim-1", "namespace": "test-ns" },
-                    "spec": {
-                        "poolRef": "status-test",
-                        "ttl": "1h",
-                        "requester": { "type": "test:ci", "identity": "u" },
-                        "priority": 50
-                    },
-                    "status": { "phase": "Pending" }
-                })]),
-            ))
-            .mount(&server)
-            .await;
-
-        // Capture the status PATCH body using a closure to verify counts.
-        // We set up the mock to just return success with the profile JSON.
-        Mock::given(method("PATCH"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/status-test/status",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json({
-                let mut resp = profile_response_json("status-test");
-                resp["status"] = serde_json::json!({
-                    "ready": 2,
-                    "leased": 1,
-                    "creating": 1,
-                    "unhealthy": 1,
-                    "queueDepth": 1
-                });
-                resp
-            }))
-            .mount(&server)
-            .await;
-
-        let action = reconcile_profile(profile, ctx.clone()).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
-
-        // Give spawned tasks time to run (Unhealthy clusters trigger Delete).
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Verify pool state was stored correctly.
-        let pools = ctx.pools.read().await;
-        let pool = pools.get("status-test").unwrap();
-
-        // Count the final states (note: Unhealthy may have been deleted by actions,
-        // and new clusters may have been created via Create actions).
-        // The important thing is the reconciler ran without errors.
-        assert!(
-            !pool.clusters.is_empty(),
-            "Pool should still have clusters after reconciliation"
-        );
-    }
 }

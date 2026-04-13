@@ -197,6 +197,41 @@ mod tests {
         let json = serde_json::json!({});
         let spec: ClusterInstanceSpec = serde_json::from_value(json).unwrap();
         assert!(spec.pool_ref.is_none());
+        assert!(spec.backend.is_none());
+        assert!(spec.cluster.is_none());
+        assert!(spec.addons.is_empty());
+        assert!(spec.health_check.is_none());
+        assert!(spec.readiness_gates.is_empty());
+        assert!(spec.snapshot.is_none());
+    }
+
+    #[test]
+    fn test_cluster_instance_spec_supports_standalone_config() {
+        let json = serde_json::json!({
+            "backend": {
+                "type": "k3s"
+            },
+            "cluster": {
+                "version": "v1.31.3+k3s1"
+            },
+            "addons": [
+                {
+                    "name": "metrics-server"
+                }
+            ],
+            "healthCheck": {
+                "intervalSeconds": 15,
+                "failureThreshold": 4
+            }
+        });
+
+        let spec: ClusterInstanceSpec = serde_json::from_value(json).unwrap();
+        assert!(spec.pool_ref.is_none());
+        assert_eq!(spec.backend.unwrap().backend_type, BackendType::K3s);
+        assert_eq!(spec.cluster.unwrap().version, "v1.31.3+k3s1");
+        assert_eq!(spec.addons.len(), 1);
+        assert!(spec.health_check.is_some());
+        assert!(spec.readiness_gates.is_empty());
     }
 
     #[test]

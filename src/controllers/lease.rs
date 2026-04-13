@@ -994,7 +994,10 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
             ))
-            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
             ))
@@ -1035,7 +1038,10 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
             ))
-            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 crate::testutil::k8s_list_response(vec![serde_json::json!({
                     "apiVersion": "kobe.kunobi.ninja/v1alpha1",

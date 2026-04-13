@@ -2,6 +2,10 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::crd::{
+    Addon, BackendConfig, ClusterConfig, HealthCheckConfig, ReadinessGate, SnapshotConfig,
+};
+
 /// Reference to another Kobe-managed resource in the same namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +33,30 @@ pub struct ClusterInstanceSpec {
     /// Optional owning pool. When absent, this instance is standalone.
     #[serde(default)]
     pub pool_ref: Option<ResourceRef>,
+
+    /// Standalone backend configuration. Pool-managed instances derive this from the pool.
+    #[serde(default)]
+    pub backend: Option<BackendConfig>,
+
+    /// Standalone cluster configuration. Pool-managed instances derive this from the pool.
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
+
+    /// Standalone addons. Pool-managed instances derive this from the pool.
+    #[serde(default)]
+    pub addons: Vec<Addon>,
+
+    /// Standalone health-check configuration. Pool-managed instances derive this from the pool.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+
+    /// Standalone readiness gates. Pool-managed instances derive this from the pool.
+    #[serde(default)]
+    pub readiness_gates: Vec<ReadinessGate>,
+
+    /// Optional standalone snapshot/restore configuration.
+    #[serde(default)]
+    pub snapshot: Option<SnapshotConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
