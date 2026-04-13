@@ -29,6 +29,12 @@ CONNECT_TIMEOUT_SECONDS_COLD="${CONNECT_TIMEOUT_SECONDS_COLD:-60}"
 
 LEASE_ID=""
 RELEASED=0
+STATUS_JSON=""
+CLI_VERSION=""
+ENDPOINT_VERSION=""
+ENDPOINT_URL=""
+TARGET_NAME=""
+POOL_JSON=""
 
 cleanup() {
   if [[ -n "$LEASE_ID" && "$RELEASED" -eq 0 ]]; then
@@ -40,8 +46,6 @@ cleanup() {
 trap cleanup EXIT
 
 preflight_pool_state() {
-  local status_json
-  local pool_json
   local ready
   local creating
   local leased
@@ -49,19 +53,25 @@ preflight_pool_state() {
   local queue_depth
 
   echo "Checking pool state..." >&2
-  status_json="$(cargo run --bin kobe -- "${KOBE_ARGS[@]}" status -o json)"
-  pool_json="$(printf '%s' "$status_json" | jq -c --arg pool "$POOL" '.pools[] | select(.name == $pool)')"
+  STATUS_JSON="$(cargo run --bin kobe -- "${KOBE_ARGS[@]}" status -o json)"
+  CLI_VERSION="$(printf '%s' "$STATUS_JSON" | jq -r '.cliVersion')"
+  ENDPOINT_VERSION="$(printf '%s' "$STATUS_JSON" | jq -r '.endpointVersion')"
+  ENDPOINT_URL="$(printf '%s' "$STATUS_JSON" | jq -r '.endpoint')"
+  TARGET_NAME="$(printf '%s' "$STATUS_JSON" | jq -r '.target // "default"')"
+  POOL_JSON="$(printf '%s' "$STATUS_JSON" | jq -c --arg pool "$POOL" '.pools[] | select(.name == $pool)')"
 
-  if [[ -z "$pool_json" ]]; then
+  echo "Kobe target='$TARGET_NAME' endpoint='$ENDPOINT_URL' cli=$CLI_VERSION endpointVersion=$ENDPOINT_VERSION" >&2
+
+  if [[ -z "$POOL_JSON" ]]; then
     echo "Pool '$POOL' was not found in kobe status output" >&2
     exit 1
   fi
 
-  ready="$(printf '%s' "$pool_json" | jq -r '.ready')"
-  creating="$(printf '%s' "$pool_json" | jq -r '.creating')"
-  leased="$(printf '%s' "$pool_json" | jq -r '.leased')"
-  recycling="$(printf '%s' "$pool_json" | jq -r '.recycling // 0')"
-  queue_depth="$(printf '%s' "$pool_json" | jq -r '.queueDepth')"
+  ready="$(printf '%s' "$POOL_JSON" | jq -r '.ready')"
+  creating="$(printf '%s' "$POOL_JSON" | jq -r '.creating')"
+  leased="$(printf '%s' "$POOL_JSON" | jq -r '.leased')"
+  recycling="$(printf '%s' "$POOL_JSON" | jq -r '.recycling // 0')"
+  queue_depth="$(printf '%s' "$POOL_JSON" | jq -r '.queueDepth')"
 
   echo "Pool '$POOL': ready=$ready leased=$leased creating=$creating recycling=$recycling queue=$queue_depth" >&2
 
@@ -79,6 +89,46 @@ preflight_pool_state() {
   echo "Pool '$POOL' has no ready clusters. Failing fast because this smoke test is for the warm path." >&2
   echo "Set ALLOW_COLD_START=1 to exercise provisioning latency instead." >&2
   exit 1
+}
+
+print_failure_diagnostics() {
+  local kubeconfig_path="$1"
+  local raw_out
+  local raw_err
+
+  echo "Smoke diagnostics:" >&2
+  echo "  target:           ${TARGET_NAME:-unknown}" >&2
+  echo "  endpoint:         ${ENDPOINT_URL:-unknown}" >&2
+  echo "  endpointVersion:  ${ENDPOINT_VERSION:-unknown}" >&2
+  echo "  lease:            ${LEASE_ID:-unknown}" >&2
+  echo "  cluster:          ${CLUSTER_NAME:-unknown}" >&2
+  echo "  kubeconfig:       ${kubeconfig_path:-unknown}" >&2
+  echo "  server:           ${SERVER:-unknown}" >&2
+  if [[ -n "$POOL_JSON" ]]; then
+    echo "  pool snapshot:    $(printf '%s' "$POOL_JSON" | jq -c '{ready, leased, creating, recycling, queueDepth}')" >&2
+  fi
+
+  raw_out="$(mktemp)"
+  raw_err="$(mktemp)"
+  trap 'rm -f "$raw_out" "$raw_err"' RETURN
+
+  for raw_path in /version /api /apis; do
+    if kubectl --request-timeout=5s --kubeconfig "$kubeconfig_path" get --raw "$raw_path" >"$raw_out" 2>"$raw_err"; then
+      local preview
+      preview="$(tr '\n' ' ' <"$raw_out")"
+      if (( ${#preview} > 120 )); then
+        preview="${preview:0:117}..."
+      fi
+      echo "  probe ${raw_path}: ok ${preview}" >&2
+    else
+      local preview
+      preview="$(tr '\n' ' ' <"$raw_err")"
+      if (( ${#preview} > 120 )); then
+        preview="${preview:0:117}..."
+      fi
+      echo "  probe ${raw_path}: ${preview:-failed}" >&2
+    fi
+  done
 }
 
 wait_for_cluster_api() {
@@ -118,6 +168,7 @@ wait_for_cluster_api() {
   if [[ -n "$last_error" ]]; then
     echo "Last readiness error: $last_error" >&2
   fi
+  print_failure_diagnostics "$kubeconfig_path"
   return 1
 }
 
