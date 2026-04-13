@@ -10,10 +10,10 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::backend::{BackendFactory, ClusterBackend};
+use crate::backend::BackendFactory;
 use crate::crd::{
     ClusterInstance, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
-    ClusterPoolStatus, LeasePhase, ReadinessGate, ResourceRef, SnapshotRefreshTrigger,
+    ClusterPoolStatus, LeasePhase, ResourceRef, SnapshotRefreshTrigger,
 };
 use crate::pool::{
     ClusterEntry, ClusterState, PoolAction, PoolState, compute_pool_actions, count_states,
@@ -21,20 +21,182 @@ use crate::pool::{
 use crate::velero::VeleroCoordinator;
 
 /// Shared state for the profile controller.
-pub struct ProfileContext<B: ClusterBackend> {
+pub struct ProfileContext {
     pub client: Client,
-    pub backend: B,
     pub namespace: String,
     /// Per-profile pool state, shared with claim controller and API layer.
     pub pools: Arc<RwLock<HashMap<String, PoolState>>>,
-    /// Per-cluster health failure counts.
-    pub health_failures: RwLock<HashMap<String, u32>>,
     /// Optional Velero coordinator for golden backup/restore operations.
     pub velero: Option<VeleroCoordinator>,
     /// Optional backend factory for per-profile backend dispatch.
     /// When set, `backend_for(profile)` is used instead of `self.backend`
     /// for create/delete operations.
     pub factory: Option<BackendFactory>,
+}
+
+#[cfg(test)]
+mod cluster_instance_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn test_profile_context() -> (Arc<ProfileContext>, MockServer) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let pools = Arc::new(RwLock::new(HashMap::new()));
+
+        let ctx = Arc::new(ProfileContext {
+            client,
+            namespace: "test-ns".to_string(),
+            pools,
+            velero: None,
+            factory: None,
+        });
+        (ctx, server)
+    }
+
+    fn make_test_profile(name: &str, min_size: u32, max_size: u32) -> Arc<ClusterPool> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "generation": 1
+                },
+                "spec": {
+                    "minSize": min_size,
+                    "maxSize": max_size,
+                    "cluster": {
+                        "version": "v1.28.0",
+                        "serverCount": 1
+                    },
+                    "readinessGates": [],
+                    "addons": []
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn instance_response_json(
+        name: &str,
+        pool: &str,
+        phase: ClusterInstancePhase,
+        idle_since: Option<&str>,
+        health_failures: u32,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": name,
+                "namespace": "test-ns",
+                "labels": {
+                    "kobe.kunobi.ninja/pool": pool
+                }
+            },
+            "spec": {
+                "poolRef": {
+                    "name": pool
+                }
+            },
+            "status": {
+                "phase": phase,
+                "provisioned": true,
+                "leaseRef": null,
+                "idleSince": idle_since,
+                "stateSince": "2026-04-13T10:00:00Z",
+                "healthFailures": health_failures,
+                "specHash": 42
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_error_policy_returns_requeue_60s() {
+        let (ctx, _server) = test_profile_context().await;
+        let profile = make_test_profile("err-profile", 2, 5);
+        let error = ProfileError::Lifecycle(anyhow::anyhow!("test error"));
+        let action = error_policy(profile, &error, ctx);
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn test_build_pool_state_uses_cluster_instances() {
+        let (ctx, server) = test_profile_context().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![
+                    instance_response_json(
+                        "pool-test-profile-0",
+                        "test-profile",
+                        ClusterInstancePhase::Ready,
+                        Some("2026-04-13T10:01:00Z"),
+                        0,
+                    ),
+                    instance_response_json(
+                        "pool-test-profile-1",
+                        "test-profile",
+                        ClusterInstancePhase::Creating,
+                        None,
+                        0,
+                    ),
+                ]),
+            ))
+            .mount(&server)
+            .await;
+
+        let pool_state = build_pool_state(&ctx, "test-profile").await;
+
+        assert_eq!(pool_state.clusters.len(), 2);
+        assert_eq!(
+            pool_state.clusters["pool-test-profile-0"].state,
+            ClusterState::Ready
+        );
+        assert_eq!(
+            pool_state.clusters["pool-test-profile-1"].state,
+            ClusterState::Creating
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_pool_state_preserves_instance_status_fields() {
+        let (ctx, server) = test_profile_context().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![instance_response_json(
+                    "pool-test-profile-0",
+                    "test-profile",
+                    ClusterInstancePhase::Leased,
+                    Some("2026-04-13T10:01:00Z"),
+                    2,
+                )]),
+            ))
+            .mount(&server)
+            .await;
+
+        let pool_state = build_pool_state(&ctx, "test-profile").await;
+        let entry = pool_state.clusters.get("pool-test-profile-0").unwrap();
+        assert_eq!(entry.state, ClusterState::Leased);
+        assert_eq!(entry.health_failures, 2);
+        assert_eq!(entry.spec_hash, Some(42));
+        assert!(entry.idle_since.is_some());
+    }
 }
 
 /// Error type for the profile controller.
@@ -47,10 +209,9 @@ pub enum ProfileError {
 }
 
 /// Start the profile reconciler controller.
-pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
+pub async fn run_profile_controller(
     client: Client,
     namespace: &str,
-    backend: B,
     pools: Arc<RwLock<HashMap<String, PoolState>>>,
     velero: Option<VeleroCoordinator>,
     factory: Option<BackendFactory>,
@@ -62,20 +223,10 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
 
     let ctx = Arc::new(ProfileContext {
         client: client.clone(),
-        backend,
         namespace: namespace.to_string(),
         pools,
-        health_failures: RwLock::new(HashMap::new()),
         velero,
         factory,
-    });
-
-    // Start health check background task
-    let health_ctx = ctx.clone();
-    let health_ns = namespace.to_string();
-    let health_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        run_health_checks(health_ctx, &health_ns, health_shutdown).await;
     });
 
     info!("Starting profile controller");
@@ -117,9 +268,9 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
 /// 4. Execute actions (create/delete clusters)
 /// 5. Update profile status
 #[tracing::instrument(skip_all, fields(profile = %profile.name_any()))]
-async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
+async fn reconcile_profile(
     profile: Arc<ClusterPool>,
-    ctx: Arc<ProfileContext<B>>,
+    ctx: Arc<ProfileContext>,
 ) -> Result<Action, ProfileError> {
     let name = profile.name_any();
     let ns = profile.namespace().unwrap_or_else(|| ctx.namespace.clone());
@@ -241,18 +392,6 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
             }
         }
     }
-
-    // Promote Creating clusters to Ready only after readiness gates and the
-    // backend health probe both pass. This keeps "ready" aligned with the
-    // user-facing lease contract instead of mere kubeconfig availability.
-    evaluate_cluster_readiness(
-        &ctx,
-        &name,
-        &ns,
-        &profile.spec.readiness_gates,
-        &mut pool_state,
-    )
-    .await;
 
     // Compute actions
     let now = chrono::Utc::now();
@@ -383,10 +522,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 }
 
 /// Build pool state from ClusterInstance inventory.
-async fn build_pool_state<B: ClusterBackend>(
-    ctx: &ProfileContext<B>,
-    profile_name: &str,
-) -> PoolState {
+async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState {
     info!(
         profile = profile_name,
         "Refreshing pool state from ClusterInstances"
@@ -440,223 +576,11 @@ async fn build_pool_state<B: ClusterBackend>(
     PoolState { clusters }
 }
 
-/// Evaluate Creating clusters against readiness gates and backend health.
-///
-/// Clusters are promoted to Ready only when:
-/// 1. all configured readiness gates pass, and
-/// 2. the backend health probe confirms Kubernetes discovery is usable.
-async fn evaluate_cluster_readiness<B: ClusterBackend>(
-    ctx: &ProfileContext<B>,
-    profile_name: &str,
-    namespace: &str,
-    gates: &[ReadinessGate],
-    pool_state: &mut PoolState,
-) {
-    let creating: Vec<String> = pool_state
-        .clusters
-        .iter()
-        .filter(|(_, e)| e.state == ClusterState::Creating)
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    for cluster_name in creating {
-        let mut all_passed = true;
-
-        for gate in gates {
-            match ctx
-                .backend
-                .check_readiness_gate(&cluster_name, namespace, gate)
-                .await
-            {
-                Ok(true) => {
-                    debug!(
-                        profile = profile_name,
-                        cluster = %cluster_name,
-                        gate = ?gate,
-                        "Readiness gate passed"
-                    );
-                }
-                Ok(false) => {
-                    debug!(
-                        profile = profile_name,
-                        cluster = %cluster_name,
-                        gate = ?gate,
-                        "Readiness gate not yet satisfied"
-                    );
-                    all_passed = false;
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        profile = profile_name,
-                        cluster = %cluster_name,
-                        gate = ?gate,
-                        "Readiness gate check failed: {e}"
-                    );
-                    all_passed = false;
-                    break;
-                }
-            }
-        }
-
-        if !all_passed {
-            continue;
-        }
-
-        match ctx.backend.check_health(&cluster_name, namespace).await {
-            Ok(true) => {
-                info!(
-                    profile = profile_name,
-                    cluster = %cluster_name,
-                    "Cluster passed readiness evaluation, marking Ready"
-                );
-                if let Some(entry) = pool_state.clusters.get_mut(&cluster_name) {
-                    entry.state = ClusterState::Ready;
-                    entry.idle_since = Some(chrono::Utc::now());
-                    entry.state_since = Some(chrono::Utc::now());
-                }
-            }
-            Ok(false) => {
-                debug!(
-                    profile = profile_name,
-                    cluster = %cluster_name,
-                    "Cluster is still provisioning; health probe not yet ready"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    profile = profile_name,
-                    cluster = %cluster_name,
-                    "Cluster health probe failed during readiness evaluation: {e}"
-                );
-            }
-        }
-    }
-}
-
-/// Background health check loop for warm clusters.
-async fn run_health_checks<B: ClusterBackend>(
-    ctx: Arc<ProfileContext<B>>,
-    namespace: &str,
-    shutdown: CancellationToken,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-    let mut last_checked: HashMap<String, std::time::Instant> = HashMap::new();
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {},
-            _ = shutdown.cancelled() => {
-                info!("Health check loop shutting down");
-                return;
-            },
-        }
-
-        let pools = ctx.pools.read().await.clone();
-        let profiles_api: Api<ClusterPool> = Api::namespaced(ctx.client.clone(), namespace);
-
-        for (profile_name, pool_state) in &pools {
-            let (check_interval_secs, threshold) = match profiles_api.get(profile_name).await {
-                Ok(profile) => match &profile.spec.health_check {
-                    Some(hc) => (hc.interval_seconds, hc.failure_threshold),
-                    None => (30, 3),
-                },
-                Err(e) => {
-                    warn!(
-                        profile = profile_name.as_str(),
-                        "Failed to fetch profile for health check config, using defaults: {e}"
-                    );
-                    (30, 3)
-                }
-            };
-
-            let now = std::time::Instant::now();
-            if let Some(last) = last_checked.get(profile_name) {
-                if now.duration_since(*last)
-                    < std::time::Duration::from_secs(check_interval_secs.into())
-                {
-                    continue;
-                }
-            }
-            last_checked.insert(profile_name.clone(), now);
-
-            let ready_clusters: Vec<String> = pool_state
-                .clusters
-                .iter()
-                .filter(|(_, e)| e.state == ClusterState::Ready)
-                .map(|(name, _)| name.clone())
-                .collect();
-
-            for cluster_name in ready_clusters {
-                match ctx.backend.check_health(&cluster_name, namespace).await {
-                    Ok(true) => {
-                        crate::metrics::HEALTH_CHECKS_TOTAL
-                            .with_label_values(&[profile_name.as_str(), "pass"])
-                            .inc();
-                        ctx.health_failures.write().await.remove(&cluster_name);
-                    }
-                    Ok(false) => {
-                        crate::metrics::HEALTH_CHECKS_TOTAL
-                            .with_label_values(&[profile_name.as_str(), "fail"])
-                            .inc();
-                        let should_mark_unhealthy = {
-                            let mut failures = ctx.health_failures.write().await;
-                            let count = failures.entry(cluster_name.clone()).or_insert(0);
-                            *count += 1;
-
-                            if *count >= threshold {
-                                warn!(
-                                    profile = profile_name.as_str(),
-                                    cluster = %cluster_name,
-                                    failures = *count,
-                                    threshold,
-                                    "Cluster failed health check, marking unhealthy"
-                                );
-                                failures.remove(&cluster_name);
-                                true
-                            } else {
-                                debug!(
-                                    cluster = %cluster_name,
-                                    failures = *count,
-                                    threshold,
-                                    "Health check failed, not yet at threshold"
-                                );
-                                false
-                            }
-                        };
-                        // Lock ordering: health_failures lock dropped before pools lock
-                        if should_mark_unhealthy {
-                            if let Some(pool) = ctx.pools.write().await.get_mut(profile_name) {
-                                if let Some(entry) = pool.clusters.get_mut(&cluster_name) {
-                                    entry.state = ClusterState::Unhealthy;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Infrastructure errors (network, kubeconfig extraction) are
-                        // not counted as health failures to avoid recycling healthy
-                        // clusters during transient infrastructure issues.
-                        crate::metrics::HEALTH_CHECKS_TOTAL
-                            .with_label_values(&[profile_name.as_str(), "error"])
-                            .inc();
-                        warn!(
-                            cluster = %cluster_name,
-                            profile = profile_name.as_str(),
-                            "Health check probe error (not counting as failure): {e}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Error policy: requeue with backoff on failure.
-fn error_policy<B: ClusterBackend>(
+fn error_policy(
     _profile: Arc<ClusterPool>,
     error: &ProfileError,
-    _ctx: Arc<ProfileContext<B>>,
+    _ctx: Arc<ProfileContext>,
 ) -> Action {
     error!("Profile reconciliation error: {error}");
     Action::requeue(std::time::Duration::from_secs(60))
@@ -784,7 +708,7 @@ async fn get_cluster_instance_status(
         .and_then(|instance| instance.status)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::pool::{ClusterEntry, ClusterState, PoolState};

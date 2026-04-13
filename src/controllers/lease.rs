@@ -804,10 +804,9 @@ fn error_policy<B: ClusterBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::ClusterState;
     use crate::testutil::MockBackend;
     use std::collections::HashMap;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // -----------------------------------------------------------------------
@@ -991,6 +990,17 @@ mod tests {
             .mount(&server)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
         let action = reconcile_lease(lease, ctx).await.unwrap();
         // No ready cluster → requeue at 5s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
@@ -1005,23 +1015,6 @@ mod tests {
         let (ctx, server) = test_lease_context().await;
         let lease = make_test_lease("bind-1", "Pending");
 
-        // Pre-populate pool state with a ready cluster.
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = std::collections::HashMap::new();
-            clusters.insert(
-                "pool-test-1".to_string(),
-                crate::pool::ClusterEntry {
-                    state: ClusterState::Ready,
-                    idle_since: Some(chrono::Utc::now()),
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            pools.insert("test-profile".to_string(), PoolState { clusters });
-        }
-
         // Mock PATCH for queue-position status update.
         Mock::given(method("PATCH"))
             .and(path(
@@ -1034,6 +1027,49 @@ mod tests {
                 "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Bound", "clusterName": "pool-test-1" }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param("labelSelector", "kobe.kunobi.ninja/pool=test-profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": {
+                        "name": "pool-test-1",
+                        "namespace": "test-ns",
+                        "labels": { "kobe.kunobi.ninja/pool": "test-profile" }
+                    },
+                    "spec": { "poolRef": { "name": "test-profile" } },
+                    "status": {
+                        "phase": "Ready",
+                        "provisioned": true,
+                        "leaseRef": null,
+                        "idleSince": chrono::Utc::now().to_rfc3339(),
+                        "stateSince": chrono::Utc::now().to_rfc3339(),
+                        "healthFailures": 0,
+                        "specHash": 1
+                    }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": { "name": "pool-test-1", "namespace": "test-ns" },
+                "spec": { "poolRef": { "name": "test-profile" } },
+                "status": { "phase": "Leased", "provisioned": true, "leaseRef": { "name": "bind-1" } }
             })))
             .mount(&server)
             .await;
@@ -1055,12 +1091,6 @@ mod tests {
         let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
         // Successful bind → requeue at 60s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
-
-        // Verify the cluster state changed to Leased.
-        let pools = ctx.pools.read().await;
-        let pool = pools.get("test-profile").unwrap();
-        let entry = pool.clusters.get("pool-test-1").unwrap();
-        assert_eq!(entry.state, ClusterState::Leased);
     }
 
     // -----------------------------------------------------------------------
@@ -1139,23 +1169,6 @@ mod tests {
         let (ctx, server) = test_lease_context().await;
         let lease = make_test_lease("released-1", "Released");
 
-        // Pre-populate pool state with the cluster.
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = std::collections::HashMap::new();
-            clusters.insert(
-                "pool-test-1".to_string(),
-                crate::pool::ClusterEntry {
-                    state: ClusterState::Leased,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            pools.insert("test-profile".to_string(), PoolState { clusters });
-        }
-
         // Mock PATCH for status update to Recycling.
         Mock::given(method("PATCH"))
             .and(path(
@@ -1172,6 +1185,20 @@ mod tests {
             .mount(&server)
             .await;
 
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": { "name": "pool-test-1", "namespace": "test-ns" },
+                "spec": { "poolRef": { "name": "test-profile" } },
+                "status": { "phase": "Recycling", "provisioned": true, "leaseRef": null }
+            })))
+            .mount(&server)
+            .await;
+
         // Mock GET for profile (for diagnostics check — return profile with no diagnostics).
         Mock::given(method("GET"))
             .and(path(
@@ -1183,13 +1210,8 @@ mod tests {
 
         let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
-
-        // Give the spawned deletion task time to run.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Verify the backend got a delete call.
         let calls = ctx.backend.call_count();
-        assert_eq!(calls.delete, 1);
+        assert_eq!(calls.delete, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1230,25 +1252,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_recycling_lease_cluster_still_present() {
-        let (ctx, _server) = test_lease_context().await;
+        let (ctx, server) = test_lease_context().await;
         let lease = make_test_lease("recycling-2", "Recycling");
 
-        // Pre-populate pool state so the cluster is still present.
-        {
-            let mut pools = ctx.pools.write().await;
-            let mut clusters = std::collections::HashMap::new();
-            clusters.insert(
-                "pool-test-1".to_string(),
-                crate::pool::ClusterEntry {
-                    state: ClusterState::Leased,
-                    idle_since: None,
-                    health_failures: 0,
-                    state_since: Some(chrono::Utc::now()),
-                    spec_hash: None,
-                },
-            );
-            pools.insert("test-profile".to_string(), PoolState { clusters });
-        }
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": { "name": "pool-test-1", "namespace": "test-ns" },
+                "spec": { "poolRef": { "name": "test-profile" } },
+                "status": { "phase": "Recycling", "provisioned": true, "leaseRef": null }
+            })))
+            .mount(&server)
+            .await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
         // Cluster still present → requeue at 15s.

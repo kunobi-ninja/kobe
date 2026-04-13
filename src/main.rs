@@ -120,14 +120,12 @@ async fn main() -> anyhow::Result<()> {
     let profile_ns = namespace.clone();
     let profile_pools = pools.clone();
     let profile_shutdown = shutdown.clone();
-    let profile_backend = backend.clone();
     let profile_velero = velero.clone();
     let profile_factory = factory.clone();
     let profile_handle = tokio::spawn(async move {
         controllers::profile::run_profile_controller(
             profile_client,
             &profile_ns,
-            profile_backend,
             profile_pools,
             profile_velero,
             Some(profile_factory),
@@ -142,12 +140,14 @@ async fn main() -> anyhow::Result<()> {
     let instance_shutdown = shutdown.clone();
     let instance_backend = backend.clone();
     let instance_factory = factory.clone();
+    let instance_velero = velero.clone();
     let instance_handle = tokio::spawn(async move {
         controllers::instance::run_instance_controller(
             instance_client,
             &instance_ns,
             instance_backend,
             Some(instance_factory),
+            instance_velero,
             instance_shutdown,
         )
         .await;
