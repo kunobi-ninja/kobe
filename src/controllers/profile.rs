@@ -5,15 +5,15 @@ use futures::StreamExt;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
-    BackendType, ClusterLease, ClusterPool, ClusterPoolStatus, LeasePhase, ReadinessGate,
-    SnapshotRefreshTrigger,
+    BackendType, ClusterInstance, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease,
+    ClusterPool, ClusterPoolStatus, LeasePhase, ReadinessGate, ResourceRef, SnapshotRefreshTrigger,
 };
 use crate::pool::{
     ClusterEntry, ClusterState, PoolAction, PoolState, compute_pool_actions, count_states,
@@ -58,6 +58,7 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
 ) {
     let profiles: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
     let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
 
     let ctx = Arc::new(ProfileContext {
         client: client.clone(),
@@ -80,6 +81,7 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
     info!("Starting profile controller");
 
     let controller = Controller::new(profiles, Config::default())
+        .owns(instances, Config::default())
         .owns(leases, Config::default())
         .run(reconcile_profile, error_policy, ctx)
         .for_each(|result| async move {
@@ -261,6 +263,8 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
         match action {
             PoolAction::Create(cluster_name) => {
                 info!(profile = %name, cluster = %cluster_name, "Creating cluster");
+                let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
+                ensure_cluster_instance(&instances_api, &profile, cluster_name).await?;
                 pool_state.clusters.insert(
                     cluster_name.clone(),
                     ClusterEntry {
@@ -471,6 +475,22 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
 
                     match result {
                         Ok(()) => {
+                            let _ = patch_cluster_instance_status(
+                                &bg_client,
+                                &bg_ns,
+                                &c_name,
+                                ClusterInstanceStatus {
+                                    phase: ClusterInstancePhase::Creating,
+                                    lease_ref: None,
+                                    idle_since: None,
+                                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                    health_failures: 0,
+                                    spec_hash: Some(crate::pool::profile_spec_hash(
+                                        &profile_for_dispatch,
+                                    )),
+                                },
+                            )
+                            .await;
                             if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
                                 if let Some(entry) = pool.clusters.get_mut(&c_name) {
                                     entry.state = ClusterState::Creating;
@@ -481,10 +501,22 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         }
                         Err(e) => {
                             error!(cluster = %c_name, "Failed to create cluster: {e:?}");
-                            // Remove the failed entry so the next reconciliation can retry
-                            if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
-                                pool.clusters.remove(&c_name);
-                            }
+                            let _ = patch_cluster_instance_status(
+                                &bg_client,
+                                &bg_ns,
+                                &c_name,
+                                ClusterInstanceStatus {
+                                    phase: ClusterInstancePhase::Failed,
+                                    lease_ref: None,
+                                    idle_since: None,
+                                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                    health_failures: 0,
+                                    spec_hash: Some(crate::pool::profile_spec_hash(
+                                        &profile_for_dispatch,
+                                    )),
+                                },
+                            )
+                            .await;
                         }
                     }
                 });
@@ -502,6 +534,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                 let factory = ctx.factory.clone();
                 let profile_for_dispatch = profile.as_ref().clone();
                 let fallback_backend = ctx.backend.clone();
+                let delete_client = ctx.client.clone();
                 tokio::spawn(async move {
                     let delete_result = if let Some(ref factory) = factory {
                         match factory.backend_for(&profile_for_dispatch) {
@@ -513,6 +546,9 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                     };
                     match delete_result {
                         Ok(_) => {
+                            let instances_api: Api<ClusterInstance> =
+                                Api::namespaced(delete_client.clone(), &c_ns);
+                            let _ = instances_api.delete(&c_name, &Default::default()).await;
                             if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
                                 pool.clusters.remove(&c_name);
                             }
@@ -537,6 +573,7 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
         .write()
         .await
         .insert(name.clone(), pool_state.clone());
+    sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
 
     // Update profile status
     let counts = count_states(&pool_state);
@@ -604,137 +641,51 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
     Ok(Action::requeue(std::time::Duration::from_secs(30)))
 }
 
-/// Build pool state by observing actual K8s resources.
-///
-/// Live Kubernetes state is the source of truth for whether a cluster is
-/// currently leased. We still merge in cached controller state so transient
-/// operator-driven transitions like Creating, Unhealthy, and Recycling keep
-/// their local metadata (`idle_since`, `state_since`, `spec_hash`) instead of
-/// being reset on every profile reconcile.
+/// Build pool state from ClusterInstance inventory.
 async fn build_pool_state<B: ClusterBackend>(
     ctx: &ProfileContext<B>,
     profile_name: &str,
 ) -> PoolState {
-    let cached = ctx.pools.read().await.get(profile_name).cloned();
-
     info!(
         profile = profile_name,
-        "Refreshing pool state from K8s resources"
+        "Refreshing pool state from ClusterInstances"
     );
 
     let ns = &ctx.namespace;
     let mut clusters = HashMap::new();
-    let now = chrono::Utc::now();
-
-    // List all bound leases for this profile once
-    let claimed_clusters = {
-        let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), ns);
-        let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={profile_name}"));
-        match leases_api.list(&lp).await {
-            Ok(leases) => leases
-                .iter()
-                .filter_map(|c| {
-                    let status = c.status.clone().unwrap_or_default();
-                    if matches!(status.phase, LeasePhase::Bound) {
-                        status.cluster_name
-                    } else {
-                        None
-                    }
-                })
-                .collect::<std::collections::HashSet<String>>(),
-            Err(e) => {
-                warn!(
-                    profile = profile_name,
-                    "Failed to list leases during pool rebuild: {e}, using empty set"
-                );
-                std::collections::HashSet::new()
-            }
-        }
-    };
-
-    // Find StatefulSets matching this profile's naming pattern
-    // (backends create StatefulSets for virtual cluster control planes)
-    let sts_api: Api<k8s_openapi::api::apps::v1::StatefulSet> =
-        Api::namespaced(ctx.client.clone(), ns);
-    let prefix = format!("pool-{profile_name}-");
-
-    let sts_list = match sts_api.list(&ListParams::default()).await {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), ns);
+    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/pool={profile_name}"));
+    let instances = match instances_api.list(&lp).await {
         Ok(list) => list,
         Err(e) => {
             warn!(
                 profile = profile_name,
-                "Failed to list StatefulSets during pool rebuild: {e}"
+                "Failed to list ClusterInstances during pool rebuild: {e}"
             );
             return PoolState { clusters };
         }
     };
 
-    for sts in &sts_list {
-        let sts_name = sts.metadata.name.clone().unwrap_or_default();
-        if !sts_name.starts_with(&prefix) {
-            continue;
-        }
-
-        let cluster_name = logical_cluster_name(&sts_name);
-
-        let ready_replicas = sts
-            .status
-            .as_ref()
-            .and_then(|s| s.ready_replicas)
-            .unwrap_or(0);
-
-        let cached_entry = cached
-            .as_ref()
-            .and_then(|pool| pool.clusters.get(&cluster_name));
-        let live_state = if claimed_clusters.contains(&cluster_name) {
-            ClusterState::Leased
-        } else if ready_replicas > 0 {
-            match cached_entry.map(|entry| &entry.state) {
-                Some(ClusterState::Ready) => ClusterState::Ready,
-                _ => ClusterState::Creating,
-            }
-        } else {
-            ClusterState::Creating
-        };
-        let state = match cached_entry.map(|entry| &entry.state) {
-            Some(ClusterState::Recycling) => ClusterState::Recycling,
-            Some(ClusterState::Unhealthy) => ClusterState::Unhealthy,
-            Some(ClusterState::Creating) if live_state == ClusterState::Creating => {
-                ClusterState::Creating
-            }
-            _ => live_state,
-        };
-
-        let idle_since = if state == ClusterState::Ready {
-            match cached_entry {
-                Some(entry) if entry.state == ClusterState::Ready => entry.idle_since.or(Some(now)),
-                _ => Some(now),
-            }
-        } else {
-            None
-        };
-
-        let state_since = match cached_entry {
-            Some(entry) if entry.state == state => entry.state_since.or(Some(now)),
-            _ => Some(now),
-        };
+    for instance in &instances {
+        let cluster_name = instance.name_any();
+        let status = instance.status.clone().unwrap_or_default();
+        let state = cluster_state_from_phase(&status.phase);
 
         debug!(
             profile = profile_name,
             cluster = %cluster_name,
-            statefulset = %sts_name,
             ?state,
-            "Discovered cluster from K8s"
+            "Discovered cluster from ClusterInstance"
         );
 
         clusters.insert(
             cluster_name,
             ClusterEntry {
-                state: state.clone(),
-                idle_since,
-                health_failures: cached_entry.map(|entry| entry.health_failures).unwrap_or(0),
-                state_since,
-                spec_hash: cached_entry.and_then(|entry| entry.spec_hash),
+                state,
+                idle_since: parse_optional_time(status.idle_since.as_deref()),
+                health_failures: status.health_failures,
+                state_since: parse_optional_time(status.state_since.as_deref()),
+                spec_hash: status.spec_hash,
             },
         );
     }
@@ -742,17 +693,10 @@ async fn build_pool_state<B: ClusterBackend>(
     info!(
         profile = profile_name,
         discovered = clusters.len(),
-        "Pool state refreshed from K8s"
+        "Pool state refreshed from ClusterInstances"
     );
 
     PoolState { clusters }
-}
-
-fn logical_cluster_name(sts_name: &str) -> String {
-    sts_name
-        .strip_suffix("-server")
-        .unwrap_or(sts_name)
-        .to_string()
 }
 
 /// Evaluate Creating clusters against readiness gates and backend health.
@@ -975,6 +919,113 @@ fn error_policy<B: ClusterBackend>(
 ) -> Action {
     error!("Profile reconciliation error: {error}");
     Action::requeue(std::time::Duration::from_secs(60))
+}
+
+async fn ensure_cluster_instance(
+    instances_api: &Api<ClusterInstance>,
+    profile: &ClusterPool,
+    cluster_name: &str,
+) -> Result<(), ProfileError> {
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("kobe.kunobi.ninja/pool".to_string(), profile.name_any());
+
+    let instance = ClusterInstance {
+        metadata: kube::core::ObjectMeta {
+            name: Some(cluster_name.to_string()),
+            namespace: profile.namespace(),
+            labels: Some(labels),
+            owner_references: profile.controller_owner_ref(&()).map(|owner| vec![owner]),
+            ..Default::default()
+        },
+        spec: crate::crd::ClusterInstanceSpec {
+            pool_ref: Some(ResourceRef {
+                name: profile.name_any(),
+            }),
+        },
+        status: Some(ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Creating,
+            lease_ref: None,
+            idle_since: None,
+            state_since: Some(chrono::Utc::now().to_rfc3339()),
+            health_failures: 0,
+            spec_hash: Some(crate::pool::profile_spec_hash(profile)),
+        }),
+    };
+
+    match instances_api.create(&Default::default(), &instance).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()),
+        Err(e) => Err(ProfileError::Kube(e)),
+    }
+}
+
+async fn patch_cluster_instance_status(
+    client: &Client,
+    namespace: &str,
+    cluster_name: &str,
+    status: ClusterInstanceStatus,
+) -> Result<(), kube::Error> {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let patch = serde_json::json!({ "status": status });
+    instances_api
+        .patch_status(
+            cluster_name,
+            &PatchParams::apply("kobe-operator"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_state: &PoolState) {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    for (cluster_name, entry) in &pool_state.clusters {
+        let current = match instances_api.get(cluster_name).await {
+            Ok(instance) => instance.status.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        let _ = patch_cluster_instance_status(
+            client,
+            namespace,
+            cluster_name,
+            ClusterInstanceStatus {
+                phase: cluster_phase_from_state(&entry.state),
+                lease_ref: current.lease_ref,
+                idle_since: entry.idle_since.map(|ts| ts.to_rfc3339()),
+                state_since: entry.state_since.map(|ts| ts.to_rfc3339()),
+                health_failures: entry.health_failures,
+                spec_hash: entry.spec_hash,
+            },
+        )
+        .await;
+    }
+}
+
+fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {
+    match phase {
+        ClusterInstancePhase::Creating => ClusterState::Creating,
+        ClusterInstancePhase::Ready => ClusterState::Ready,
+        ClusterInstancePhase::Leased => ClusterState::Leased,
+        ClusterInstancePhase::Recycling => ClusterState::Recycling,
+        ClusterInstancePhase::Unhealthy => ClusterState::Unhealthy,
+        ClusterInstancePhase::Failed => ClusterState::Unhealthy,
+    }
+}
+
+fn cluster_phase_from_state(state: &ClusterState) -> ClusterInstancePhase {
+    match state {
+        ClusterState::Creating => ClusterInstancePhase::Creating,
+        ClusterState::Ready => ClusterInstancePhase::Ready,
+        ClusterState::Leased => ClusterInstancePhase::Leased,
+        ClusterState::Recycling => ClusterInstancePhase::Recycling,
+        ClusterState::Unhealthy => ClusterInstancePhase::Unhealthy,
+    }
+}
+
+fn parse_optional_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    value
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 #[cfg(test)]

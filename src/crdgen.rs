@@ -15,6 +15,10 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::ClusterLease::crd()).unwrap()
         ),
+        "clusterinstances" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::ClusterInstance::crd()).unwrap()
+        ),
         "accesspolicies" => print!(
             "{}",
             serde_yaml_ng::to_string(&crd::AccessPolicy::crd()).unwrap()
@@ -32,6 +36,11 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::ClusterLease::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::ClusterInstance::crd()).unwrap()
             );
             println!("---");
             print!(

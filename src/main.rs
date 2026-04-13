@@ -203,6 +203,7 @@ async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
     let required_crds = [
         "clusterpools.kobe.kunobi.ninja",
         "clusterleases.kobe.kunobi.ninja",
+        "clusterinstances.kobe.kunobi.ninja",
         "accesspolicies.kobe.kunobi.ninja",
         "kobestores.kobe.kunobi.ninja",
     ];

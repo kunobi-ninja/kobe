@@ -1,0 +1,90 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterinstances.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: ClusterInstance
+    plural: clusterinstances
+    shortNames:
+    - ci
+    singular: clusterinstance
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClusterInstanceSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              ClusterInstance is the authoritative inventory record for one provisioned cluster.
+
+              Instances may be pool-managed (`spec.poolRef` present) or standalone
+              (`spec.poolRef` omitted). Backend-specific resources are implementation
+              details owned by the reconciler for this instance.
+            properties:
+              poolRef:
+                description: Optional owning pool. When absent, this instance is standalone.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+            type: object
+          status:
+            nullable: true
+            properties:
+              healthFailures:
+                default: 0
+                description: Consecutive health failures observed for this instance.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              idleSince:
+                description: When the instance became idle and eligible for scale-down.
+                nullable: true
+                type: string
+              leaseRef:
+                description: Lease currently attached to this instance.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              phase:
+                default: Creating
+                enum:
+                - Creating
+                - Ready
+                - Leased
+                - Recycling
+                - Unhealthy
+                - Failed
+                type: string
+              specHash:
+                description: Hash of the pool spec that created this instance, used for drift detection.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              stateSince:
+                description: When the instance entered its current phase.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: ClusterInstance
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

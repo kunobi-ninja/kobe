@@ -53,6 +53,7 @@ test-smoke pool='ci-small' ttl='2m' *args:
 crdgen:
     cargo run --bin crdgen -- clusterpools > charts/kobe/crds/clusterpools.yaml
     cargo run --bin crdgen -- clusterleases > charts/kobe/crds/clusterleases.yaml
+    cargo run --bin crdgen -- clusterinstances > charts/kobe/crds/clusterinstances.yaml
     cargo run --bin crdgen -- accesspolicies > charts/kobe/crds/accesspolicies.yaml
     cargo run --bin crdgen -- kobestores > charts/kobe/crds/kobestores.yaml
 

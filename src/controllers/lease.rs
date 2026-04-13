@@ -11,15 +11,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
-use crate::crd::{ClusterLease, ClusterLeaseStatus, ClusterPool, LeasePhase};
+use crate::crd::{
+    ClusterInstance, ClusterInstancePhase, ClusterLease, ClusterLeaseStatus, ClusterPool,
+    LeasePhase,
+};
 use crate::diagnostics;
-use crate::pool::{ClusterState, PoolState, parse_duration};
+use crate::pool::{PoolState, parse_duration};
 
 /// Shared state for the lease controller.
 pub struct LeaseContext<B: ClusterBackend> {
     pub client: Client,
     pub backend: B,
-    /// Reference to pool state shared with profile controller.
+    /// Legacy shared pool cache kept during the ClusterInstance migration.
+    #[allow(dead_code)]
     pub pools: Arc<RwLock<std::collections::HashMap<String, PoolState>>>,
     /// Priority queue of pending leases per profile.
     pub queues: RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
@@ -27,7 +31,8 @@ pub struct LeaseContext<B: ClusterBackend> {
     pub namespace: String,
     /// Authenticator for policy lookups by requester_type.
     pub authenticator: Arc<JwtAuthenticator>,
-    /// Optional backend factory for per-profile backend dispatch.
+    /// Legacy backend factory kept during the ClusterInstance migration.
+    #[allow(dead_code)]
     pub factory: Option<BackendFactory>,
 }
 
@@ -269,29 +274,8 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 return Ok(Action::requeue(std::time::Duration::from_secs(5)));
             }
 
-            let reserved_cluster = {
-                let mut pools = ctx.pools.write().await;
-                let pool = pools
-                    .entry(lease.spec.pool_ref.clone())
-                    .or_insert_with(|| PoolState {
-                        clusters: std::collections::HashMap::new(),
-                    });
-
-                let ready_cluster = pool
-                    .clusters
-                    .iter()
-                    .find(|(_, e)| e.state == ClusterState::Ready)
-                    .map(|(name, _)| name.clone());
-
-                if let Some(ref cluster_name) = ready_cluster {
-                    if let Some(entry) = pool.clusters.get_mut(cluster_name) {
-                        entry.state = ClusterState::Leased;
-                        entry.idle_since = None;
-                    }
-                }
-
-                ready_cluster
-            };
+            let reserved_cluster =
+                reserve_ready_instance(&ctx.client, &ns, &lease.spec.pool_ref, &name).await?;
 
             if let Some(cluster_name) = reserved_cluster {
                 let ttl =
@@ -349,13 +333,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     }
                     Err(e) => {
                         warn!(lease = %name, cluster = %cluster_name, "Bind patch failed, rolling back reservation");
-                        let mut pools = ctx.pools.write().await;
-                        if let Some(pool) = pools.get_mut(&lease.spec.pool_ref) {
-                            if let Some(entry) = pool.clusters.get_mut(&cluster_name) {
-                                entry.state = ClusterState::Ready;
-                                entry.idle_since = Some(chrono::Utc::now());
-                            }
-                        }
+                        rollback_instance_reservation(&ctx.client, &ns, &cluster_name).await;
                         Err(LeaseError::Kube(e))
                     }
                 }
@@ -434,6 +412,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 .await?;
 
             if let Some(cluster_name) = &status.cluster_name {
+                mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
                 let profile = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await;
                 if let Some(ref profile) = profile {
                     if let Some(ref diag_config) = profile.spec.diagnostics {
@@ -482,35 +461,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     }
                 }
 
-                let c_name = cluster_name.clone();
-                let c_ns = ns.clone();
-                let pool_ref = lease.spec.pool_ref.clone();
-                let pools = ctx.pools.clone();
-                let factory = ctx.factory.clone();
-                let profile_for_dispatch = profile.clone();
-                let fallback_backend = ctx.backend.clone();
-                tokio::spawn(async move {
-                    // Use per-profile backend dispatch when factory is available.
-                    let delete_result =
-                        if let (Some(factory), Some(p)) = (&factory, &profile_for_dispatch) {
-                            match factory.backend_for(p) {
-                                Ok(b) => b.delete(&c_name, &c_ns).await,
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            fallback_backend.delete(&c_name, &c_ns).await
-                        };
-                    match delete_result {
-                        Ok(_) => {
-                            if let Some(pool) = pools.write().await.get_mut(&pool_ref) {
-                                pool.clusters.remove(&c_name);
-                            }
-                        }
-                        Err(e) => {
-                            error!(cluster = %c_name, "Failed to delete cluster during recycle: {e}");
-                        }
-                    }
-                });
+                debug!(cluster = %cluster_name, "Marked ClusterInstance recycling");
             } else {
                 info!(lease = %name, "No cluster to recycle, lease will be cleaned up");
             }
@@ -520,11 +471,15 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
         LeasePhase::Recycling => {
             let cluster_gone = if let Some(cluster_name) = &status.cluster_name {
-                let pools = ctx.pools.read().await;
-                pools
-                    .get(&lease.spec.pool_ref)
-                    .map(|p| !p.clusters.contains_key(cluster_name))
-                    .unwrap_or(true)
+                let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
+                match instances_api.get(cluster_name).await {
+                    Ok(_) => false,
+                    Err(kube::Error::Api(ae)) if ae.code == 404 => true,
+                    Err(e) => {
+                        warn!(lease = %name, cluster = %cluster_name, "Failed to query ClusterInstance during recycle: {e}");
+                        false
+                    }
+                }
             } else {
                 true
             };
@@ -636,6 +591,91 @@ pub async fn extend_lease_ttl(
     );
 
     Ok(new_expiry.to_rfc3339())
+}
+
+async fn reserve_ready_instance(
+    client: &Client,
+    namespace: &str,
+    pool_ref: &str,
+    lease_name: &str,
+) -> Result<Option<String>, LeaseError> {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/pool={pool_ref}"));
+    let instances = instances_api.list(&lp).await?;
+    let mut ready: Vec<ClusterInstance> = instances
+        .into_iter()
+        .filter(|instance| {
+            instance
+                .status
+                .as_ref()
+                .map(|s| s.phase == ClusterInstancePhase::Ready)
+                .unwrap_or(false)
+        })
+        .collect();
+    ready.sort_by_key(|instance| instance.name_any());
+
+    let Some(instance) = ready.first() else {
+        return Ok(None);
+    };
+
+    let cluster_name = instance.name_any();
+    let current = instance.status.clone().unwrap_or_default();
+    let patch = serde_json::json!({
+        "status": {
+            "phase": "Leased",
+            "leaseRef": { "name": lease_name },
+            "idleSince": serde_json::Value::Null,
+            "stateSince": chrono::Utc::now().to_rfc3339(),
+            "healthFailures": current.health_failures,
+            "specHash": current.spec_hash
+        }
+    });
+    instances_api
+        .patch_status(
+            &cluster_name,
+            &PatchParams::apply("kobe-operator"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+    Ok(Some(cluster_name))
+}
+
+async fn rollback_instance_reservation(client: &Client, namespace: &str, cluster_name: &str) {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let patch = serde_json::json!({
+        "status": {
+            "phase": "Ready",
+            "leaseRef": serde_json::Value::Null,
+            "idleSince": chrono::Utc::now().to_rfc3339(),
+            "stateSince": chrono::Utc::now().to_rfc3339()
+        }
+    });
+    let _ = instances_api
+        .patch_status(
+            cluster_name,
+            &PatchParams::apply("kobe-operator"),
+            &Patch::Merge(&patch),
+        )
+        .await;
+}
+
+async fn mark_instance_recycling(client: &Client, namespace: &str, cluster_name: &str) {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let patch = serde_json::json!({
+        "status": {
+            "phase": "Recycling",
+            "leaseRef": serde_json::Value::Null,
+            "idleSince": serde_json::Value::Null,
+            "stateSince": chrono::Utc::now().to_rfc3339()
+        }
+    });
+    let _ = instances_api
+        .patch_status(
+            cluster_name,
+            &PatchParams::apply("kobe-operator"),
+            &Patch::Merge(&patch),
+        )
+        .await;
 }
 
 /// Background reaper that force-expires overdue Bound leases.
@@ -764,6 +804,7 @@ fn error_policy<B: ClusterBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::ClusterState;
     use crate::testutil::MockBackend;
     use std::collections::HashMap;
     use wiremock::matchers::{method, path};

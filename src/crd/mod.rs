@@ -1,12 +1,14 @@
 pub mod access_policy;
 #[allow(dead_code)]
 pub mod datastore;
+pub mod instance;
 pub mod lease;
 pub mod profile;
 
 pub use access_policy::*;
 #[allow(unused_imports)]
 pub use datastore::*;
+pub use instance::*;
 pub use lease::*;
 pub use profile::*;
 
@@ -188,6 +190,24 @@ mod tests {
         assert_eq!(LeasePhase::Released.to_string(), "Released");
         assert_eq!(LeasePhase::Expired.to_string(), "Expired");
         assert_eq!(LeasePhase::Recycling.to_string(), "Recycling");
+    }
+
+    #[test]
+    fn test_cluster_instance_spec_optional_pool_ref() {
+        let json = serde_json::json!({});
+        let spec: ClusterInstanceSpec = serde_json::from_value(json).unwrap();
+        assert!(spec.pool_ref.is_none());
+    }
+
+    #[test]
+    fn test_cluster_instance_status_defaults() {
+        let status = ClusterInstanceStatus::default();
+        assert_eq!(status.phase, ClusterInstancePhase::Creating);
+        assert!(status.lease_ref.is_none());
+        assert!(status.idle_since.is_none());
+        assert!(status.state_since.is_none());
+        assert_eq!(status.health_failures, 0);
+        assert!(status.spec_hash.is_none());
     }
 
     /// Deserialize an AccessPolicySpec from a full JSON payload including
