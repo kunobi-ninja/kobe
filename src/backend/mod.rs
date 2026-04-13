@@ -277,10 +277,11 @@ pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Cli
     Client::try_from(config).context("Failed to create client from kubeconfig")
 }
 
-/// Check the health of a virtual cluster by hitting its `/healthz` endpoint.
+/// Check whether a virtual cluster is actually usable for Kubernetes discovery.
 ///
 /// Returns `Ok(false)` if the kubeconfig Secret does not exist yet (cluster
-/// still provisioning). Returns `Ok(true)` if the API server responds "ok".
+/// still provisioning), if the API server times out, or if either `/api` or
+/// `/apis` is not yet serving successfully.
 pub async fn check_virtual_health(client: &Client, name: &str, namespace: &str) -> Result<bool> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret_name = format!("{name}-kubeconfig");
@@ -304,12 +305,18 @@ pub async fn check_virtual_health(client: &Client, name: &str, namespace: &str) 
         .await
         .context("Failed to build virtual client for health check")?;
 
-    let req = ::http::Request::builder()
-        .uri("/healthz")
-        .body(vec![])
-        .unwrap();
+    for path in ["/api", "/apis"] {
+        if !probe_virtual_path(&vc_client, path, name).await? {
+            return Ok(false);
+        }
+    }
 
-    // 5 second timeout — virtual cluster health checks should be fast
+    Ok(true)
+}
+
+async fn probe_virtual_path(vc_client: &Client, path: &str, cluster_name: &str) -> Result<bool> {
+    let req = ::http::Request::builder().uri(path).body(vec![]).unwrap();
+
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         vc_client.request_text(req),
@@ -317,10 +324,23 @@ pub async fn check_virtual_health(client: &Client, name: &str, namespace: &str) 
     .await;
 
     match result {
-        Ok(Ok(body)) => Ok(body.trim() == "ok"),
-        Ok(Err(e)) => Err(e).context("Health probe request failed"),
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(kube::Error::Api(ae))) if matches!(ae.code, 404 | 429 | 500 | 502 | 503 | 504) => {
+            debug!(
+                cluster = cluster_name,
+                probe = path,
+                status = ae.code,
+                "Virtual cluster discovery probe not yet ready"
+            );
+            Ok(false)
+        }
+        Ok(Err(e)) => Err(e).with_context(|| format!("Discovery probe {path} failed")),
         Err(_) => {
-            debug!(cluster = name, "Health probe timed out after 5s");
+            debug!(
+                cluster = cluster_name,
+                probe = path,
+                "Virtual cluster discovery probe timed out after 5s"
+            );
             Ok(false)
         }
     }
@@ -541,12 +561,133 @@ fn is_private_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn kubeconfig_secret_response(
+        cluster_name: &str,
+        namespace: &str,
+        kubeconfig: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": format!("{cluster_name}-kubeconfig"),
+                "namespace": namespace,
+            },
+            "data": {
+                "kubeconfig": base64::engine::general_purpose::STANDARD.encode(kubeconfig),
+            }
+        })
+    }
+
+    fn backend_kubeconfig(server_url: &str) -> String {
+        format!(
+            r#"apiVersion: v1
+kind: Config
+clusters:
+- name: default
+  cluster:
+    server: {server_url}
+users:
+- name: default
+  user:
+    token: test-token
+contexts:
+- name: default
+  context:
+    cluster: default
+    user: default
+current-context: default
+"#
+        )
+    }
 
     #[test]
     fn test_validate_url_allows_https() {
         assert!(
             validate_url("https://raw.githubusercontent.com/org/repo/main/manifest.yaml").is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn check_virtual_health_requires_discovery() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let kubeconfig = backend_kubeconfig(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(kubeconfig_secret_response(
+                    "test-cluster",
+                    "test-ns",
+                    &kubeconfig,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/apis"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("not ready"))
+            .mount(&server)
+            .await;
+
+        let result = check_virtual_health(&client, "test-cluster", "test-ns")
+            .await
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn check_virtual_health_succeeds_when_discovery_is_serving() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let kubeconfig = backend_kubeconfig(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(kubeconfig_secret_response(
+                    "test-cluster",
+                    "test-ns",
+                    &kubeconfig,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/apis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let result = check_virtual_health(&client, "test-cluster", "test-ns")
+            .await
+            .unwrap();
+        assert!(result);
     }
 
     #[test]

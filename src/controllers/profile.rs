@@ -110,7 +110,7 @@ pub async fn run_profile_controller<B: ClusterBackend + Clone + 'static>(
 /// Main reconciliation logic for a ClusterPool.
 ///
 /// 1. Build current pool state from cluster observations
-/// 2. Evaluate readiness gates for Creating clusters
+/// 2. Evaluate readiness gates and discovery health for Creating clusters
 /// 3. Compute desired actions via pool manager (scale up/down)
 /// 4. Execute actions (create/delete clusters)
 /// 5. Update profile status
@@ -240,17 +240,17 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
         }
     }
 
-    // Check readiness gates for Creating clusters
-    if !profile.spec.readiness_gates.is_empty() {
-        evaluate_readiness_gates(
-            &ctx,
-            &name,
-            &ns,
-            &profile.spec.readiness_gates,
-            &mut pool_state,
-        )
-        .await;
-    }
+    // Promote Creating clusters to Ready only after readiness gates and the
+    // backend health probe both pass. This keeps "ready" aligned with the
+    // user-facing lease contract instead of mere kubeconfig availability.
+    evaluate_cluster_readiness(
+        &ctx,
+        &name,
+        &ns,
+        &profile.spec.readiness_gates,
+        &mut pool_state,
+    )
+    .await;
 
     // Compute actions
     let now = chrono::Utc::now();
@@ -473,8 +473,8 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         Ok(()) => {
                             if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
                                 if let Some(entry) = pool.clusters.get_mut(&c_name) {
-                                    entry.state = ClusterState::Ready;
-                                    entry.idle_since = Some(chrono::Utc::now());
+                                    entry.state = ClusterState::Creating;
+                                    entry.idle_since = None;
                                     entry.state_since = Some(chrono::Utc::now());
                                 }
                             }
@@ -683,17 +683,19 @@ async fn build_pool_state<B: ClusterBackend>(
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0);
 
-        let live_state = if claimed_clusters.contains(&cluster_name) {
-            ClusterState::Leased
-        } else if ready_replicas > 0 {
-            ClusterState::Ready
-        } else {
-            ClusterState::Creating
-        };
-
         let cached_entry = cached
             .as_ref()
             .and_then(|pool| pool.clusters.get(&cluster_name));
+        let live_state = if claimed_clusters.contains(&cluster_name) {
+            ClusterState::Leased
+        } else if ready_replicas > 0 {
+            match cached_entry.map(|entry| &entry.state) {
+                Some(ClusterState::Ready) => ClusterState::Ready,
+                _ => ClusterState::Creating,
+            }
+        } else {
+            ClusterState::Creating
+        };
         let state = match cached_entry.map(|entry| &entry.state) {
             Some(ClusterState::Recycling) => ClusterState::Recycling,
             Some(ClusterState::Unhealthy) => ClusterState::Unhealthy,
@@ -753,9 +755,12 @@ fn logical_cluster_name(sts_name: &str) -> String {
         .to_string()
 }
 
-/// Evaluate readiness gates for clusters in Creating state.
-/// Clusters that pass all gates transition to Ready.
-async fn evaluate_readiness_gates<B: ClusterBackend>(
+/// Evaluate Creating clusters against readiness gates and backend health.
+///
+/// Clusters are promoted to Ready only when:
+/// 1. all configured readiness gates pass, and
+/// 2. the backend health probe confirms Kubernetes discovery is usable.
+async fn evaluate_cluster_readiness<B: ClusterBackend>(
     ctx: &ProfileContext<B>,
     profile_name: &str,
     namespace: &str,
@@ -809,15 +814,36 @@ async fn evaluate_readiness_gates<B: ClusterBackend>(
             }
         }
 
-        if all_passed {
-            info!(
-                profile = profile_name,
-                cluster = %cluster_name,
-                "All readiness gates passed, marking cluster Ready"
-            );
-            if let Some(entry) = pool_state.clusters.get_mut(&cluster_name) {
-                entry.state = ClusterState::Ready;
-                entry.idle_since = Some(chrono::Utc::now());
+        if !all_passed {
+            continue;
+        }
+
+        match ctx.backend.check_health(&cluster_name, namespace).await {
+            Ok(true) => {
+                info!(
+                    profile = profile_name,
+                    cluster = %cluster_name,
+                    "Cluster passed readiness evaluation, marking Ready"
+                );
+                if let Some(entry) = pool_state.clusters.get_mut(&cluster_name) {
+                    entry.state = ClusterState::Ready;
+                    entry.idle_since = Some(chrono::Utc::now());
+                    entry.state_since = Some(chrono::Utc::now());
+                }
+            }
+            Ok(false) => {
+                debug!(
+                    profile = profile_name,
+                    cluster = %cluster_name,
+                    "Cluster is still provisioning; health probe not yet ready"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    profile = profile_name,
+                    cluster = %cluster_name,
+                    "Cluster health probe failed during readiness evaluation: {e}"
+                );
             }
         }
     }
@@ -1051,11 +1077,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // evaluate_readiness_gates
+    // evaluate_cluster_readiness
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_evaluate_readiness_gates_all_pass() {
+    async fn test_evaluate_cluster_readiness_all_pass() {
         let (ctx, _server) = test_profile_context().await;
 
         // Backend defaults to ready=true, so all gates pass.
@@ -1076,7 +1102,7 @@ mod tests {
             )]),
         };
 
-        evaluate_readiness_gates(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
+        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
 
         // Cluster should transition from Creating to Ready.
         let entry = pool_state.clusters.get("pool-test-1").unwrap();
@@ -1085,7 +1111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evaluate_readiness_gates_one_fails() {
+    async fn test_evaluate_cluster_readiness_one_gate_fails() {
         let (ctx, _server) = test_profile_context().await;
 
         // Set backend to return ready=false.
@@ -1108,7 +1134,7 @@ mod tests {
             )]),
         };
 
-        evaluate_readiness_gates(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
+        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
 
         // Cluster should remain Creating.
         let entry = pool_state.clusters.get("pool-test-1").unwrap();
@@ -1117,7 +1143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evaluate_readiness_gates_error() {
+    async fn test_evaluate_cluster_readiness_gate_error() {
         let (ctx, _server) = test_profile_context().await;
 
         // Set backend to return error on readiness check.
@@ -1140,7 +1166,7 @@ mod tests {
             )]),
         };
 
-        evaluate_readiness_gates(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
+        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
 
         // Cluster should remain Creating on error.
         let entry = pool_state.clusters.get("pool-test-1").unwrap();
@@ -1149,7 +1175,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evaluate_readiness_gates_skips_non_creating() {
+    async fn test_evaluate_cluster_readiness_requires_health() {
+        let (ctx, _server) = test_profile_context().await;
+        ctx.backend.set_health(false);
+
+        let gates = vec![crate::crd::ReadinessGate::CrdExists {
+            name: "test-crd".to_string(),
+        }];
+
+        let mut pool_state = PoolState {
+            clusters: HashMap::from([(
+                "pool-test-1".to_string(),
+                ClusterEntry {
+                    state: ClusterState::Creating,
+                    idle_since: None,
+                    health_failures: 0,
+                    state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
+                },
+            )]),
+        };
+
+        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
+
+        let entry = pool_state.clusters.get("pool-test-1").unwrap();
+        assert_eq!(entry.state, ClusterState::Creating);
+        assert!(entry.idle_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_cluster_readiness_without_gates_uses_health() {
+        let (ctx, _server) = test_profile_context().await;
+
+        let mut pool_state = PoolState {
+            clusters: HashMap::from([(
+                "pool-test-1".to_string(),
+                ClusterEntry {
+                    state: ClusterState::Creating,
+                    idle_since: None,
+                    health_failures: 0,
+                    state_since: Some(chrono::Utc::now()),
+                    spec_hash: None,
+                },
+            )]),
+        };
+
+        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &[], &mut pool_state).await;
+
+        let entry = pool_state.clusters.get("pool-test-1").unwrap();
+        assert_eq!(entry.state, ClusterState::Ready);
+        assert!(entry.idle_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_cluster_readiness_skips_non_creating() {
         let (ctx, _server) = test_profile_context().await;
 
         let gates = vec![crate::crd::ReadinessGate::CrdExists {
@@ -1181,11 +1260,12 @@ mod tests {
             ]),
         };
 
-        evaluate_readiness_gates(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
+        evaluate_cluster_readiness(&ctx, "test-profile", "test-ns", &gates, &mut pool_state).await;
 
-        // No readiness checks should have been performed (no Creating clusters).
+        // No readiness or health checks should have been performed (no Creating clusters).
         let calls = ctx.backend.call_count();
         assert_eq!(calls.check_readiness_gate, 0);
+        assert_eq!(calls.check_health, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1250,14 +1330,15 @@ mod tests {
         assert!(pool_state.clusters.contains_key("pool-test-profile-0"));
         assert!(pool_state.clusters.contains_key("pool-test-profile-1"));
 
-        // First STS has readyReplicas=1 -> Ready, second has 0 -> Creating.
+        // Raw pool rebuild should keep newly observed clusters in Creating until
+        // readiness evaluation promotes them.
         assert_eq!(
             pool_state
                 .clusters
                 .get("pool-test-profile-0")
                 .unwrap()
                 .state,
-            ClusterState::Ready
+            ClusterState::Creating
         );
         assert_eq!(
             pool_state
@@ -1304,7 +1385,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        // No active leases, so the cached Leased entry should heal back to Ready.
+        // No active leases, so the cached Leased entry should heal back to
+        // Creating until readiness evaluation runs again.
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
@@ -1324,8 +1406,8 @@ mod tests {
         assert_eq!(pool_state.clusters.len(), 1);
         assert!(pool_state.clusters.contains_key("pool-cached-profile-0"));
         let entry = pool_state.clusters.get("pool-cached-profile-0").unwrap();
-        assert_eq!(entry.state, ClusterState::Ready);
-        assert!(entry.idle_since.is_some());
+        assert_eq!(entry.state, ClusterState::Creating);
+        assert!(entry.idle_since.is_none());
         assert_eq!(entry.health_failures, 2);
         assert_eq!(entry.spec_hash, Some(42));
     }
@@ -1376,12 +1458,12 @@ mod tests {
                 .get("pool-test-profile-7")
                 .unwrap()
                 .state,
-            ClusterState::Ready
+            ClusterState::Creating
         );
     }
 
     #[tokio::test]
-    async fn test_build_pool_state_heals_creating_when_statefulset_is_ready() {
+    async fn test_build_pool_state_keeps_creating_until_readiness_evaluation() {
         let (ctx, server) = test_profile_context().await;
 
         {
@@ -1431,8 +1513,8 @@ mod tests {
         let pool_state = build_pool_state(&ctx, "heal-profile").await;
         let entry = pool_state.clusters.get("pool-heal-profile-1").unwrap();
 
-        assert_eq!(entry.state, ClusterState::Ready);
-        assert!(entry.idle_since.is_some());
+        assert_eq!(entry.state, ClusterState::Creating);
+        assert!(entry.idle_since.is_none());
     }
 
     // -----------------------------------------------------------------------
