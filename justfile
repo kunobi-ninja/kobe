@@ -45,8 +45,8 @@ run *args:
 
 # Lease a real warm cluster, verify kubectl can reach it, then release it
 [group('dev')]
-test-smoke pool='ci-small' ttl='15m' *args:
-    bash ./hack/lease-smoke.sh {{ pool }} {{ ttl }} {{ args }}
+test-smoke pool='ci-small' ttl='2m' *args:
+    @bun run ./hack/test-smoke.ts {{ pool }} {{ ttl }} {{ args }}
 
 # Regenerate CRD YAML files from Rust types
 [group('build')]
