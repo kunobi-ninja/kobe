@@ -203,6 +203,7 @@ mod tests {
     fn test_cluster_instance_status_defaults() {
         let status = ClusterInstanceStatus::default();
         assert_eq!(status.phase, ClusterInstancePhase::Creating);
+        assert!(!status.provisioned);
         assert!(status.lease_ref.is_none());
         assert!(status.idle_since.is_none());
         assert!(status.state_since.is_none());

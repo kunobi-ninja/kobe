@@ -69,6 +69,10 @@ spec:
                 - Unhealthy
                 - Failed
                 type: string
+              provisioned:
+                default: false
+                description: Whether backend resources have been provisioned for this instance.
+                type: boolean
               specHash:
                 description: Hash of the pool spec that created this instance, used for drift detection.
                 format: uint64

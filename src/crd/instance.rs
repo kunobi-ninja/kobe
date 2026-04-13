@@ -48,6 +48,10 @@ pub struct ClusterInstanceStatus {
     #[serde(default)]
     pub phase: ClusterInstancePhase,
 
+    /// Whether backend resources have been provisioned for this instance.
+    #[serde(default)]
+    pub provisioned: bool,
+
     /// Lease currently attached to this instance.
     #[serde(default)]
     pub lease_ref: Option<ResourceRef>,

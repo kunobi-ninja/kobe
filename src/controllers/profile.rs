@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
-    BackendType, ClusterInstance, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease,
-    ClusterPool, ClusterPoolStatus, LeasePhase, ReadinessGate, ResourceRef, SnapshotRefreshTrigger,
+    ClusterInstance, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
+    ClusterPoolStatus, LeasePhase, ReadinessGate, ResourceRef, SnapshotRefreshTrigger,
 };
 use crate::pool::{
     ClusterEntry, ClusterState, PoolAction, PoolState, compute_pool_actions, count_states,
@@ -275,289 +275,30 @@ async fn reconcile_profile<B: ClusterBackend + Clone + 'static>(
                         spec_hash: Some(crate::pool::profile_spec_hash(&profile)),
                     },
                 );
-
-                let config = profile.spec.cluster.clone();
-                let addons = profile.spec.addons.clone();
-                let c_name = cluster_name.clone();
-                let c_ns = ns.clone();
-                let fallback_backend = ctx.backend.clone();
-                let factory = ctx.factory.clone();
-                let profile_for_dispatch = profile.as_ref().clone();
-                let pools_ref = ctx.pools.clone();
-                let profile_name = name.clone();
-                let velero = ctx.velero.clone();
-                let snapshot = profile.spec.snapshot.clone();
-                let profile_gen = profile.metadata.generation.unwrap_or(1);
-                let spec = profile.spec.clone();
-                let bg_client = ctx.client.clone();
-                let bg_ns = ns.clone();
-
-                tokio::spawn(async move {
-                    // Determine whether to restore from golden backup or create fresh.
-                    // K3s uses PG template databases for golden images,
-                    // so Velero restore only applies to non-K3s backends.
-                    let is_k3s = matches!(
-                        profile_for_dispatch.spec.backend.backend_type,
-                        BackendType::K3s
-                    );
-                    let use_restore = if !is_k3s {
-                        if let (Some(velero), Some(snapshot)) = (&velero, &snapshot) {
-                            if snapshot.enabled {
-                                match velero
-                                    .get_golden_backup(&profile_name, snapshot, profile_gen)
-                                    .await
-                                {
-                                    Ok(Some(backup_name)) => Some((backup_name, snapshot.clone())),
-                                    Ok(None) => None,
-                                    Err(e) => {
-                                        warn!(
-                                            profile = %profile_name,
-                                            error = %e,
-                                            "Failed to check golden backup, falling back to fresh create"
-                                        );
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let result = if let Some((backup_name, snap_config)) = use_restore {
-                        // Restore from golden backup.
-                        info!(
-                            profile = %profile_name,
-                            cluster = %c_name,
-                            backup = %backup_name,
-                            "Restoring cluster from golden backup"
-                        );
-                        let velero_ref = velero.as_ref().unwrap();
-                        match velero_ref
-                            .restore_from_golden(&backup_name, &snap_config, &profile_name, &c_ns)
-                            .await
-                        {
-                            Ok(()) => {
-                                crate::metrics::PROVISION_METHOD
-                                    .with_label_values(&[profile_name.as_str(), "restore"])
-                                    .inc();
-                                Ok(())
-                            }
-                            Err(e) => {
-                                warn!(
-                                    profile = %profile_name,
-                                    cluster = %c_name,
-                                    error = %e,
-                                    "Failed to restore from golden backup, falling back to fresh create"
-                                );
-                                // Fall back to fresh create using fallback backend.
-                                fallback_backend
-                                    .create(&c_name, &c_ns, &config, &addons)
-                                    .await
-                                    .map(|()| {
-                                        crate::metrics::PROVISION_METHOD
-                                            .with_label_values(&[profile_name.as_str(), "fresh"])
-                                            .inc();
-                                    })
-                            }
-                        }
-                    } else {
-                        // Fresh create (no golden backup available or snapshot not enabled).
-                        // Use per-profile backend dispatch when factory is available.
-                        let create_result = if let Some(ref factory) = factory {
-                            match factory.backend_for(&profile_for_dispatch) {
-                                Ok(b) => b.create(&c_name, &c_ns, &config, &addons).await,
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            fallback_backend
-                                .create(&c_name, &c_ns, &config, &addons)
-                                .await
-                        };
-                        if create_result.is_ok() {
-                            crate::metrics::PROVISION_METHOD
-                                .with_label_values(&[profile_name.as_str(), "fresh"])
-                                .inc();
-
-                            // If snapshot is enabled but no golden backup exists yet,
-                            // trigger golden backup creation in the background.
-                            // (K3s uses PG templates instead of Velero snapshots.)
-                            if !is_k3s {
-                                if let (Some(velero), Some(snapshot)) = (&velero, &snapshot) {
-                                    if snapshot.enabled {
-                                        let velero = velero.clone();
-                                        let snapshot = snapshot.clone();
-                                        let profile_name = profile_name.clone();
-                                        let spec = spec.clone();
-                                        let backend = fallback_backend.clone();
-                                        let generation = profile_gen;
-                                        let client = bg_client.clone();
-                                        let status_ns = bg_ns.clone();
-
-                                        tokio::spawn(async move {
-                                            info!(
-                                                profile = %profile_name,
-                                                "No golden backup found, creating one in the background"
-                                            );
-                                            match velero
-                                                .create_golden_backup(
-                                                    &profile_name,
-                                                    &spec,
-                                                    &backend,
-                                                    &snapshot,
-                                                    generation,
-                                                )
-                                                .await
-                                            {
-                                                Ok(backup_name) => {
-                                                    info!(
-                                                        profile = %profile_name,
-                                                        backup = %backup_name,
-                                                        "Background golden backup created successfully"
-                                                    );
-                                                    crate::metrics::GOLDEN_BACKUP_TOTAL
-                                                        .with_label_values(&[
-                                                            profile_name.as_str(),
-                                                            "ok",
-                                                        ])
-                                                        .inc();
-
-                                                    // Patch profile status so subsequent reconciles
-                                                    // know the golden backup exists and skip rebuilding.
-                                                    let profiles_api: Api<ClusterPool> =
-                                                        Api::namespaced(client, &status_ns);
-                                                    let status_patch = serde_json::json!({
-                                                        "status": {
-                                                            "goldenBackup": backup_name,
-                                                            "goldenGeneration": generation,
-                                                        }
-                                                    });
-                                                    if let Err(e) = profiles_api
-                                                        .patch_status(
-                                                            &profile_name,
-                                                            &PatchParams::apply("kobe-operator"),
-                                                            &Patch::Merge(&status_patch),
-                                                        )
-                                                        .await
-                                                    {
-                                                        error!(
-                                                            profile = %profile_name,
-                                                            error = %e,
-                                                            "Failed to patch profile status after background golden backup"
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        profile = %profile_name,
-                                                        error = %e,
-                                                        "Background golden backup creation failed"
-                                                    );
-                                                    crate::metrics::GOLDEN_BACKUP_TOTAL
-                                                        .with_label_values(&[
-                                                            profile_name.as_str(),
-                                                            "error",
-                                                        ])
-                                                        .inc();
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            } // if !is_k3s
-                        }
-                        create_result
-                    };
-
-                    match result {
-                        Ok(()) => {
-                            let _ = patch_cluster_instance_status(
-                                &bg_client,
-                                &bg_ns,
-                                &c_name,
-                                ClusterInstanceStatus {
-                                    phase: ClusterInstancePhase::Creating,
-                                    lease_ref: None,
-                                    idle_since: None,
-                                    state_since: Some(chrono::Utc::now().to_rfc3339()),
-                                    health_failures: 0,
-                                    spec_hash: Some(crate::pool::profile_spec_hash(
-                                        &profile_for_dispatch,
-                                    )),
-                                },
-                            )
-                            .await;
-                            if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
-                                if let Some(entry) = pool.clusters.get_mut(&c_name) {
-                                    entry.state = ClusterState::Creating;
-                                    entry.idle_since = None;
-                                    entry.state_since = Some(chrono::Utc::now());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(cluster = %c_name, "Failed to create cluster: {e:?}");
-                            let _ = patch_cluster_instance_status(
-                                &bg_client,
-                                &bg_ns,
-                                &c_name,
-                                ClusterInstanceStatus {
-                                    phase: ClusterInstancePhase::Failed,
-                                    lease_ref: None,
-                                    idle_since: None,
-                                    state_since: Some(chrono::Utc::now().to_rfc3339()),
-                                    health_failures: 0,
-                                    spec_hash: Some(crate::pool::profile_spec_hash(
-                                        &profile_for_dispatch,
-                                    )),
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                });
             }
             PoolAction::Delete(cluster_name) => {
                 info!(profile = %name, cluster = %cluster_name, "Deleting cluster");
                 if let Some(entry) = pool_state.clusters.get_mut(cluster_name) {
                     entry.state = ClusterState::Recycling;
                 }
-
-                let c_name = cluster_name.clone();
-                let c_ns = ns.clone();
-                let profile_name = name.clone();
-                let pools_ref = ctx.pools.clone();
-                let factory = ctx.factory.clone();
-                let profile_for_dispatch = profile.as_ref().clone();
-                let fallback_backend = ctx.backend.clone();
-                let delete_client = ctx.client.clone();
-                tokio::spawn(async move {
-                    let delete_result = if let Some(ref factory) = factory {
-                        match factory.backend_for(&profile_for_dispatch) {
-                            Ok(b) => b.delete(&c_name, &c_ns).await,
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        fallback_backend.delete(&c_name, &c_ns).await
-                    };
-                    match delete_result {
-                        Ok(_) => {
-                            let instances_api: Api<ClusterInstance> =
-                                Api::namespaced(delete_client.clone(), &c_ns);
-                            let _ = instances_api.delete(&c_name, &Default::default()).await;
-                            if let Some(pool) = pools_ref.write().await.get_mut(&profile_name) {
-                                pool.clusters.remove(&c_name);
-                            }
-                        }
-                        Err(e) => {
-                            error!(cluster = %c_name, "Failed to delete cluster: {e:?}");
-                        }
-                    }
-                });
+                let current = get_cluster_instance_status(&ctx.client, &ns, cluster_name)
+                    .await
+                    .unwrap_or_default();
+                let _ = patch_cluster_instance_status(
+                    &ctx.client,
+                    &ns,
+                    cluster_name,
+                    ClusterInstanceStatus {
+                        phase: ClusterInstancePhase::Recycling,
+                        provisioned: current.provisioned,
+                        lease_ref: current.lease_ref,
+                        idle_since: None,
+                        state_since: Some(chrono::Utc::now().to_rfc3339()),
+                        health_failures: current.health_failures,
+                        spec_hash: current.spec_hash,
+                    },
+                )
+                .await;
             }
             PoolAction::MarkUnhealthy(cluster_name) => {
                 warn!(profile = %name, cluster = %cluster_name, "Marking cluster unhealthy");
@@ -944,6 +685,7 @@ async fn ensure_cluster_instance(
         },
         status: Some(ClusterInstanceStatus {
             phase: ClusterInstancePhase::Creating,
+            provisioned: false,
             lease_ref: None,
             idle_since: None,
             state_since: Some(chrono::Utc::now().to_rfc3339()),
@@ -990,6 +732,7 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
             cluster_name,
             ClusterInstanceStatus {
                 phase: cluster_phase_from_state(&entry.state),
+                provisioned: current.provisioned,
                 lease_ref: current.lease_ref,
                 idle_since: entry.idle_since.map(|ts| ts.to_rfc3339()),
                 state_since: entry.state_since.map(|ts| ts.to_rfc3339()),
@@ -1026,6 +769,19 @@ fn parse_optional_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::U
     value
         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+async fn get_cluster_instance_status(
+    client: &Client,
+    namespace: &str,
+    cluster_name: &str,
+) -> Option<ClusterInstanceStatus> {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    instances_api
+        .get(cluster_name)
+        .await
+        .ok()
+        .and_then(|instance| instance.status)
 }
 
 #[cfg(test)]

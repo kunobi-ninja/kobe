@@ -136,6 +136,23 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    // Start instance controller
+    let instance_client = client.clone();
+    let instance_ns = namespace.clone();
+    let instance_shutdown = shutdown.clone();
+    let instance_backend = backend.clone();
+    let instance_factory = factory.clone();
+    let instance_handle = tokio::spawn(async move {
+        controllers::instance::run_instance_controller(
+            instance_client,
+            &instance_ns,
+            instance_backend,
+            Some(instance_factory),
+            instance_shutdown,
+        )
+        .await;
+    });
+
     // Start lease controller
     let lease_client = client.clone();
     let lease_ns = namespace.clone();
@@ -171,6 +188,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("Profile controller exited unexpectedly"),
                     Err(e) => error!("Profile controller panicked: {e}"),
+                }
+            }
+            result = instance_handle => {
+                match result {
+                    Ok(()) => warn!("Instance controller exited unexpectedly"),
+                    Err(e) => error!("Instance controller panicked: {e}"),
                 }
             }
             result = lease_handle => {
