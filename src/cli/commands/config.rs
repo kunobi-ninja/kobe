@@ -240,10 +240,9 @@ impl CliConfig {
         if let Some(endpoint) = endpoint_override {
             let target_name = target_override.or(self.current_target.as_deref());
             if let Some(name) = target_name {
-                let target = self
-                    .targets
-                    .get(name)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
+                let target = self.targets.get(name).ok_or_else(|| {
+                    anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
+                })?;
                 return Ok(ResolvedConfig {
                     target: Some(name.to_string()),
                     endpoint: endpoint.to_string(),
@@ -492,13 +491,17 @@ fn config_view_output(config: &CliConfig, target_override: Option<&str>) -> Conf
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string());
     let exists = config_path().map(|p| p.exists()).unwrap_or(false);
-    let resolved = config.resolve(target_override, None).ok().map(|resolved| ResolvedConfigOutput {
-        target: resolved.target,
-        endpoint: resolved.endpoint,
-        auth: resolved.auth,
-        token: resolved.token,
-        ssh_fingerprint: resolved.ssh_fingerprint,
-    });
+    let resolved =
+        config
+            .resolve(target_override, None)
+            .ok()
+            .map(|resolved| ResolvedConfigOutput {
+                target: resolved.target,
+                endpoint: resolved.endpoint,
+                auth: resolved.auth,
+                token: resolved.token,
+                ssh_fingerprint: resolved.ssh_fingerprint,
+            });
 
     ConfigViewOutput {
         path,
@@ -562,7 +565,9 @@ fn print_config(config: &CliConfig, target_override: Option<&str>) -> Result<()>
             );
         } else {
             println!("resolved: none");
-            println!("hint:     run 'kobe config set <name> --endpoint <url> ...' or pass --endpoint");
+            println!(
+                "hint:     run 'kobe config set <name> --endpoint <url> ...' or pass --endpoint"
+            );
         }
         return Ok(());
     }

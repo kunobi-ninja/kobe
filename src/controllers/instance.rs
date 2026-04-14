@@ -727,7 +727,9 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/standalone-4",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("standalone-4")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(instance_api_response("standalone-4")),
+            )
             .mount(&server)
             .await;
 
