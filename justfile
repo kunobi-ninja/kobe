@@ -35,7 +35,7 @@ build:
 
 # Build just the CLI
 [group('build')]
-cli:
+build-cli:
     cargo build --release --bin kobe
 
 # Run the CLI (pass args after --)
@@ -50,7 +50,7 @@ test-smoke pool='ci-small' ttl='2m' *args:
 
 # Regenerate CRD YAML files from Rust types
 [group('build')]
-crdgen:
+build-crdgen:
     cargo run --bin crdgen -- clusterpools > charts/kobe/crds/clusterpools.yaml
     cargo run --bin crdgen -- clusterleases > charts/kobe/crds/clusterleases.yaml
     cargo run --bin crdgen -- clusterinstances > charts/kobe/crds/clusterinstances.yaml
