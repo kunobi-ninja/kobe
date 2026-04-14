@@ -1,0 +1,85 @@
+---
+title: SSH keys
+description: Authenticate with an Ed25519 SSH key via your SSH agent.
+---
+
+# SSH keys
+
+kobe supports SSH Ed25519 key authentication using SSHSIG — the same signing format used by `ssh-keygen -Y sign`. Authentication works via your SSH agent, so the private key never leaves the agent.
+
+Only Ed25519 keys are supported.
+
+## How it works
+
+When a client requests SSH auth, the server issues a challenge. The client signs the challenge with the Ed25519 private key held by the SSH agent, and sends back the SSHSIG-format signature. The server verifies the signature against the authorized keys listed in the `AccessPolicy`.
+
+On first login, the CLI uses TOFU (Trust On First Use) to store the server's SSH fingerprint locally and warns if it changes in future sessions.
+
+## Configure an AccessPolicy
+
+List authorized public keys in OpenSSH `authorized_keys` format:
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: developers-ssh
+  namespace: kobe
+spec:
+  auth:
+    ssh:
+      authorizedKeys:
+        - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@example.com"
+        - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@example.com"
+      revokedKeys: []    # keys listed here are rejected even if in authorizedKeys
+  rules:
+    - pools: ["dev-*"]
+      maxTtl: 4h
+      maxConcurrentLeases: 1
+      maxExtensions: 2
+```
+
+## Authenticate with the CLI
+
+Make sure your SSH agent is running and has your key loaded:
+
+```sh
+# check what keys are loaded
+ssh-add -l
+
+# add your key if it's not listed
+ssh-add ~/.ssh/id_ed25519
+```
+
+Then log in:
+
+```sh
+kobe config set auth ssh
+kobe login
+```
+
+The CLI contacts the endpoint, performs the SSHSIG challenge-response, and stores the session token locally. Subsequent commands use the stored token without re-prompting.
+
+## Revoke a key
+
+Add the key to `revokedKeys` in the `AccessPolicy`. Revoked keys take precedence over `authorizedKeys`:
+
+```yaml
+spec:
+  auth:
+    ssh:
+      authorizedKeys:
+        - "ssh-ed25519 AAAAC3... alice@example.com"
+      revokedKeys:
+        - "ssh-ed25519 AAAAC3... compromised-key@example.com"
+```
+
+The change takes effect immediately — kobe reloads `AccessPolicy` resources on every request.
+
+## Rotate keys
+
+To rotate a key, add the new key to `authorizedKeys` first, then remove the old one once all users have updated. There is no grace period — removing a key immediately prevents its use.
+
+<Callout type="warn">
+Removing an authorized key while a user has an active session does not invalidate their existing leases. It only prevents new leases from being claimed with that key.
+</Callout>

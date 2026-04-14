@@ -1,0 +1,104 @@
+---
+title: Quick start
+description: Configure the kobe CLI, lease your first cluster, and release it when done.
+---
+
+# Quick start
+
+## Configure the CLI
+
+<Steps>
+  <Step>
+    **Point the CLI at your kobe endpoint**
+
+    ```sh
+    kobe config set endpoint https://kobe.example.com
+    ```
+
+    Or open the interactive config editor:
+
+    ```sh
+    kobe config
+    ```
+  </Step>
+
+  <Step>
+    **Authenticate**
+
+    ```sh
+    kobe login
+    ```
+
+    kobe supports SSH key auth (Ed25519 via your SSH agent), OIDC tokens, and static bearer tokens. The login flow detects which methods your endpoint accepts and guides you through the appropriate one.
+
+    To check which auth methods are available on your endpoint:
+
+    ```sh
+    kobe status
+    ```
+  </Step>
+
+  <Step>
+    **List available pools**
+
+    ```sh
+    kobe status
+    ```
+
+    This shows the endpoint version, available auth methods, pool summary, and your active leases.
+  </Step>
+
+  <Step>
+    **Lease a cluster**
+
+    ```sh
+    kobe lease ci-small
+    ```
+
+    kobe writes the kubeconfig to `~/.kube/kobe-<lease-id>` by default and prints the lease ID and expiry. The cluster is ready to use immediately.
+
+    To write to a specific path:
+
+    ```sh
+    kobe lease ci-small --kubeconfig /tmp/kube.yaml
+    ```
+
+    To request a longer TTL (within your policy's `maxTtl`):
+
+    ```sh
+    kobe lease ci-small --ttl 2h
+    ```
+  </Step>
+
+  <Step>
+    **Use the cluster**
+
+    ```sh
+    KUBECONFIG=~/.kube/kobe-<lease-id> kubectl get nodes
+    ```
+
+    The cluster is a fully isolated Kubernetes environment. It won't affect other callers, and all resources you create are destroyed with it when the lease expires or is released.
+  </Step>
+
+  <Step>
+    **Release the cluster**
+
+    ```sh
+    kobe release <lease-id>
+    ```
+
+    This immediately destroys the cluster and returns it to the pool for recycling. Releasing early is good practice in CI — it lets the pool refill faster for the next run.
+  </Step>
+</Steps>
+
+## Manage active leases
+
+```sh
+kobe status
+```
+
+Shows your active leases together with pool availability. For raw lease data, call `GET /v1/leases`.
+
+## What happens when a lease expires
+
+kobe enforces TTLs server-side. When a lease expires, the operator sets its phase to `Expired` and begins recycling the cluster. The kubeconfig you received stops working at expiry — Kubernetes API calls will fail with certificate errors, since the client cert is issued with the same TTL.

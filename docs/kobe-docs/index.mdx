@@ -1,0 +1,35 @@
+---
+title: kobe
+description: Pre-warmed Kubernetes cluster pools for instant CI and developer environments.
+---
+
+# Introduction
+
+kobe is a Kubernetes operator that manages fleets of virtual clusters. It keeps warm pools of ready environments so CI jobs and developers can lease a Kubernetes cluster through a small HTTP API or the `kobe` CLI.
+
+Instead of creating a fresh cluster for every request, kobe continuously reconciles `ClusterPool` resources, provisions `ClusterInstance` objects in the background, and binds `ClusterLease` objects to ready instances on demand. The result is fast handoff, predictable TTL enforcement, and clean environment recycling after use.
+
+```sh
+# create a lease
+curl -X POST https://kobe.example.com/v1/leases \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"profile":"ci-small"}'
+
+# check the lease
+curl https://kobe.example.com/v1/leases/$LEASE_ID \
+  -H "Authorization: Bearer $TOKEN"
+
+# release when done
+curl -X DELETE https://kobe.example.com/v1/leases/$LEASE_ID \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+When a lease is released or expires, kobe recycles the backing instance and queues a fresh replacement so the pool stays warm.
+
+<Cards>
+  <Card title="Installation" href="/docs/getting-started/installation" description="Install the kobe CLI" />
+  <Card title="Quick start" href="/docs/getting-started/quick-start" description="Lease your first cluster in minutes" />
+  <Card title="Pools" href="/docs/pools/overview" description="Define cluster templates with ClusterPool" />
+  <Card title="How it works" href="/docs/how-it-works/architecture" description="Operator, API, pool lifecycle" />
+</Cards>

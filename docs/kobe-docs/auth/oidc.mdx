@@ -1,0 +1,131 @@
+---
+title: OIDC
+description: Configure JWT-based authentication with GitHub Actions, Clerk, Auth0, or any OIDC provider.
+---
+
+# OIDC
+
+OIDC authentication validates JWTs against a provider's JWKS endpoint. kobe caches JWKS keys in memory and refreshes them automatically when a key rotation is detected.
+
+## GitHub Actions
+
+GitHub Actions issues short-lived OIDC tokens that contain repository, ref, and workflow metadata. No secrets need to be stored — the token is minted fresh for each job.
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: github-ci
+  namespace: kobe
+spec:
+  auth:
+    oidc:
+      issuer: https://token.actions.githubusercontent.com
+      audience: ["https://kobe.example.com"]
+  identity: "{repository}"
+  rules:
+    - match:
+        claim: repository
+        value: my-org/api-service
+      pools: ["ci-*"]
+      maxTtl: 30m
+      maxConcurrentLeases: 5
+      maxExtensions: 0
+    - match:
+        claim: repository_owner
+        value: my-org
+      pools: ["ci-small"]
+      maxTtl: 20m
+      maxConcurrentLeases: 2
+      maxExtensions: 0
+```
+
+In your GitHub Actions workflow, request the token and pass it to kobe:
+
+```yaml
+jobs:
+  test:
+    permissions:
+      id-token: write    # required to request the OIDC token
+    steps:
+      - name: Claim cluster
+        run: |
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://kobe.example.com" | jq -r .value)
+          LEASE=$(curl -s -X POST https://kobe.example.com/v1/leases \
+            -H "Authorization: Bearer $TOKEN" \
+            -d '{"pool": "ci-small", "ttl": "20m"}')
+          echo "LEASE_ID=$(echo $LEASE | jq -r .id)" >> $GITHUB_ENV
+          echo "$LEASE" | jq -r .kubeconfig > /tmp/kube.yaml
+```
+
+## Clerk
+
+Clerk issues JWTs for authenticated users. Use this for developer-facing tooling where users log in with their Clerk account.
+
+```yaml
+spec:
+  auth:
+    oidc:
+      issuer: https://your-instance.clerk.accounts.dev
+      audience: []    # Clerk tokens don't include an audience claim by default
+      authorizedParties: ["https://app.example.com"]
+  identity: "{sub}"
+  rules:
+    - pools: ["dev-*"]
+      maxTtl: 4h
+      maxConcurrentLeases: 1
+      maxExtensions: 2
+```
+
+## Custom OIDC provider
+
+For any JWKS-compatible provider:
+
+```yaml
+spec:
+  auth:
+    oidc:
+      issuer: https://auth.example.com
+      jwksUrl: https://auth.example.com/.well-known/jwks.json    # optional override
+      audience: ["kobe"]
+      algorithms: ["RS256"]    # default; also supports ES256, RS384, ES384
+  identity: "{sub}"
+  rules:
+    - pools: ["*"]
+      maxTtl: 1h
+      maxConcurrentLeases: 2
+      maxExtensions: 1
+```
+
+If `jwksUrl` is not set, kobe derives it as `{issuer}/.well-known/jwks.json`.
+
+## Multi-role policies
+
+When a single OIDC provider issues tokens for users with different roles, use `match` clauses to apply different rules per role:
+
+```yaml
+spec:
+  auth:
+    oidc:
+      issuer: https://auth.example.com
+      audience: ["kobe"]
+  identity: "{private_metadata.team}:{sub}"
+  rules:
+    - match:
+        claim: private_metadata.role
+        value: admin
+      pools: ["*"]
+      maxTtl: 8h
+      maxConcurrentLeases: 10
+      maxExtensions: 5
+    - match:
+        claim: private_metadata.role
+        value: developer
+      pools: ["dev-*"]
+      maxTtl: 2h
+      maxConcurrentLeases: 2
+      maxExtensions: 2
+```
+
+The `match` clause supports dot-path traversal into nested JWT claims.

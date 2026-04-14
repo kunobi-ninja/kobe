@@ -1,0 +1,131 @@
+---
+title: Pools
+description: Define cluster templates with ClusterPool and control pool size, TTL, addons, and health checks.
+---
+
+# Pools
+
+A `ClusterPool` defines a template for virtual clusters: which backend to use, what version to run, which addons to install, and how many warm clusters to maintain. The operator reconciles the pool continuously, keeping the target number of ready clusters available at all times.
+
+## Minimal example
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ci-small
+  namespace: kobe
+spec:
+  size: 3
+  ttl: 1h
+  cluster:
+    version: v1.32.0+k3s1
+```
+
+This pool keeps 3 warm clusters ready, each limited to a 1-hour lease TTL. Clients leasing from `ci-small` get a cluster immediately from the warm set.
+
+## Full spec reference
+
+```yaml
+spec:
+  # Fixed pool size (number of warm clusters to maintain).
+  # Ignored when `scaling` is set.
+  size: 3
+
+  # Default TTL for leases against this pool.
+  # AccessPolicy rules can cap this further per identity.
+  ttl: 2h
+
+  # Cluster configuration (backend-agnostic).
+  cluster:
+    version: v1.32.0+k3s1    # cluster version (format depends on backend)
+    servers: 1                # control plane replicas (k3s/k0s)
+
+  # Backend selection and backend-specific config.
+  # Defaults to k3s if omitted.
+  backend:
+    type: k3s                 # k3s | k0s | capi | vkobe
+
+  # Addons to install after the cluster is ready.
+  addons:
+    - name: metrics-server
+      manifest: |
+        # inline YAML manifest
+
+  # Resource limits applied to each cluster pod.
+  resources:
+    limits:
+      cpu: "2"
+      memory: 2Gi
+    requests:
+      cpu: "500m"
+      memory: 512Mi
+
+  # Health check configuration.
+  # Clusters failing the check are recycled automatically.
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+
+  # Readiness gates — all must pass before a cluster enters Ready.
+  readinessGates:
+    - type: AddonsReady
+
+  # Autoscaling (overrides fixed `size` when set).
+  scaling:
+    minReady: 1
+    maxClusters: 10
+    scaleUpThreshold: 0
+    scaleDownAfter: 30m
+
+  # Diagnostic bundle capture on release/expiry.
+  diagnostics:
+    enabled: true
+    storage: s3://my-diagnostics-bucket/kobe/diag
+    retentionDays: 7
+
+  # Velero golden image snapshot.
+  snapshot:
+    enabled: true
+    schedule: "0 2 * * *"
+```
+
+## Addons
+
+Addons are applied with `kubectl apply` after the cluster reaches a running state. You can inline a manifest directly or reference a URL:
+
+```yaml
+addons:
+  - name: cert-manager
+    manifest: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: cert-manager
+      ---
+      # ... rest of cert-manager manifest
+```
+
+Addon failures don't block the cluster from becoming `Ready` unless a `readinessGate` of type `AddonsReady` is configured.
+
+## Readiness gates
+
+Readiness gates let you require specific conditions before a cluster enters the warm pool. Without gates, a cluster is considered ready as soon as the API server responds. With `AddonsReady`, it must also complete addon installation.
+
+```yaml
+readinessGates:
+  - type: AddonsReady
+```
+
+## Diagnostics
+
+When `diagnostics` is configured, kobe captures a support bundle from the cluster on lease release or expiry and uploads it to the configured object storage. The bundle includes pod logs, events, and resource snapshots from the virtual cluster namespace.
+
+```yaml
+diagnostics:
+  enabled: true
+  storage: s3://kobe-diagnostics/bundles
+  retentionDays: 7
+```
+
+The operator uses the standard AWS credential chain (environment variables, IAM role, instance profile) to authenticate with S3.

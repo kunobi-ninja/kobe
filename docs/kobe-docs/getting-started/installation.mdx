@@ -1,0 +1,70 @@
+---
+title: Installation
+description: How to install the kobe CLI.
+---
+
+# Installation
+
+The `kobe` CLI is a self-contained binary. It connects to a kobe operator endpoint — the operator itself runs in your Kubernetes cluster.
+
+## Install the CLI
+
+<Tabs items={["mise (recommended)", "cargo-binstall", "from source"]}>
+  <Tab value="mise (recommended)">
+    [mise](https://mise.jdx.dev) downloads the pre-built binary from GitHub releases and pins the version per project or globally.
+
+    ```sh
+    # install globally
+    mise use -g github:kunobi-ninja/kobe@latest
+    ```
+
+    To pin a version in your project so every contributor gets the same binary:
+
+    ```toml title="mise.toml"
+    [tools]
+    "github:kunobi-ninja/kobe" = "latest"
+    ```
+
+    Running `mise install` in the project root will install the pinned version.
+  </Tab>
+  <Tab value="cargo-binstall">
+    [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads a pre-built binary from GitHub releases without compiling.
+
+    ```sh
+    cargo binstall kobe
+    ```
+
+    If no pre-built binary is available for your target, it falls back to compiling from source automatically.
+  </Tab>
+  <Tab value="from source">
+    ```sh
+    cargo install --git https://github.com/kunobi-ninja/kobe --bin kobe
+    ```
+
+    This compiles the CLI only. Rust 1.85 or later is required.
+  </Tab>
+</Tabs>
+
+## Verify the installation
+
+```sh
+kobe --help
+```
+
+You should see the list of available subcommands. If the command isn't found, make sure the binary is on your `PATH`.
+
+## Deploy the operator
+
+The `kobe-operator` binary runs in your host Kubernetes cluster. Refer to the Helm chart or Flux deployment in the kobe repository for production setup. The operator requires:
+
+- A host Kubernetes cluster (k3s, k0s, EKS, GKE, or any conformant cluster)
+- Permission to manage `ClusterPool`, `ClusterLease`, `ClusterInstance`, `AccessPolicy`, and `KobeStore` CRDs
+- Network access between the operator and a kobe endpoint your clients can reach
+
+Install the CRDs:
+
+```sh
+cargo run --bin crdgen -- all | kubectl apply -f -
+```
+
+Or apply them from the Helm chart, which bundles the generated CRD manifests.

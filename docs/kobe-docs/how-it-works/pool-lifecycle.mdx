@@ -1,0 +1,92 @@
+---
+title: Pool lifecycle
+description: How pool instances move through Creating, Ready, Leased, and Recycling phases - and what triggers each transition.
+---
+
+# Pool lifecycle
+
+Every virtual cluster in a pool is represented by a `ClusterInstance`. The operator reconciles each instance continuously and drives its transitions automatically.
+
+## Phases
+
+```
+Creating -> Ready -> Leased -> Recycling -> [destroyed]
+                                                 |
+                                                 v
+                                          [replacement: Creating]
+```
+
+### Creating
+
+The operator has issued the backend command to create the instance (for example a k3s StatefulSet, a CAPI cluster, or a vkobe pod). The instance is not yet available for leases. It stays in this phase until:
+
+- The Kubernetes control plane is reachable
+- All addons have been installed
+- All `readinessGates` in the pool spec are satisfied
+
+Instances that stay in `Creating` too long are recycled automatically.
+
+### Ready
+
+The instance is warm and waiting in the pool. It passes health checks and can be leased immediately. The pool manager targets the configured warm capacity using either fixed `size` or autoscaling `minReady`.
+
+### Leased
+
+A `ClusterLease` is bound to this instance. The lease includes a TTL, and the operator enforces expiry server-side regardless of client activity.
+
+Callers can extend a lease up to `maxExtensions` times (default: 2) using `PATCH /v1/leases/:id`.
+
+### Recycling
+
+The lease has been released or expired. The operator destroys the instance and immediately creates a replacement. The replacement enters `Creating` and works through the readiness pipeline before becoming `Ready` again.
+
+## Pool status
+
+The operator reports aggregate counts on the `ClusterPool` status:
+
+```yaml
+status:
+  ready: 2      # clusters in Ready phase
+  leased: 1     # clusters in Leased phase
+  creating: 1   # clusters in Creating phase
+  recycling: 0  # clusters being torn down and replaced
+  unhealthy: 0  # clusters marked unhealthy
+  queueDepth: 0 # leases waiting for capacity
+```
+
+These counts are also visible via the API:
+
+```sh
+kobe status                   # endpoint + per-pool summary
+curl https://.../v1/pools     # all pools
+curl https://.../v1/pools/x   # one pool
+```
+
+## Health checks
+
+When `healthCheck` is configured on a pool, the operator periodically probes each `Ready` cluster. A cluster that fails the health check is moved directly to `Recycling` — it is destroyed and replaced without being offered for new claims.
+
+```yaml
+spec:
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+```
+
+## Autoscaling
+
+When `scaling` is set on a pool, the operator adjusts the number of warm instances based on demand instead of holding a fixed `size`. The pool grows when leases arrive faster than clusters can be created, and shrinks back down during quiet periods.
+
+```yaml
+spec:
+  scaling:
+    minReady: 1
+    maxClusters: 10
+    scaleUpThreshold: 0  # start creating more when ready count drops to this
+    scaleDownAfter: 30m
+    queueTimeout: 5m
+```
+
+## Velero snapshots
+
+When `snapshot` is configured, the operator maintains a Velero backup of a golden cluster and restores new pool members from it. This skips the addon installation phase, reducing `Creating` time from minutes to seconds for complex addon stacks. See [Velero guide](/docs/guides/velero-golden-images) for setup details.

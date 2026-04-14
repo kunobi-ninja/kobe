@@ -1,0 +1,154 @@
+---
+title: Command reference
+description: All kobe CLI commands with flags and examples.
+---
+
+# Command reference
+
+## Quick reference
+
+| Command | Description |
+|---|---|
+| `kobe status` | Show endpoint status, auth methods, and pool summary |
+| `kobe version` | Show CLI and endpoint versions |
+| `kobe login` | Authenticate with the kobe service |
+| `kobe logout` | Remove stored credentials |
+| `kobe lease <pool>` | Lease a cluster from a pool |
+| `kobe release <lease-id>` | Release a leased cluster |
+| `kobe config view` | Print current configuration |
+| `kobe config edit` | Open the configuration TUI |
+| `kobe config list` | List named targets |
+| `kobe config current` | Show the current target |
+| `kobe config use <name>` | Switch the current target |
+| `kobe config set <name> --endpoint ...` | Create or replace a named target |
+
+---
+
+## `kobe status`
+
+```sh
+kobe status
+```
+
+Queries `GET /v1/status` on the configured endpoint. Shows the operator version, available auth methods, active sessions, and pool summary. Does not require authentication.
+
+Useful for verifying connectivity and checking which auth methods the endpoint accepts before logging in.
+
+---
+
+## `kobe version`
+
+```sh
+kobe version
+```
+
+Prints the local CLI version and, when reachable, the endpoint version reported by `GET /v1/status`.
+
+---
+
+## `kobe login`
+
+```sh
+kobe login
+```
+
+Authenticates with the configured kobe endpoint. The flow depends on the configured `auth` mode:
+
+- `ssh` — challenges your SSH agent to sign with your Ed25519 key
+- `token` — validates the token set in config or `KOBE_TOKEN`
+- `oidc` — opens a browser for OIDC authentication
+
+On successful login, kobe stores a session token locally. Subsequent commands use the stored token without re-prompting.
+
+---
+
+## `kobe logout`
+
+```sh
+kobe logout
+```
+
+Removes the stored session token and credentials from the local config. The next command that requires auth will prompt you to log in again.
+
+---
+
+## `kobe lease`
+
+```sh
+kobe lease <pool> [--ttl <duration>] [--kubeconfig <path>] [--no-wait]
+```
+
+Creates a lease from the specified pool. By default the CLI waits until the lease is `Bound` and writes the kubeconfig to disk.
+
+```sh
+kobe lease ci-small
+kobe lease ci-small --ttl 30m
+kobe lease ci-small --kubeconfig /tmp/kube.yaml
+kobe lease ci-small --no-wait
+```
+
+Prints the lease ID and expiry on success. The cluster is ready to use as soon as the command returns.
+
+**Flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ttl` | pool default | Requested lease TTL. Capped by AccessPolicy `maxTtl`. |
+| `--kubeconfig` | `~/.kube/kobe-<id>` | Path to write the kubeconfig. |
+| `--no-wait` | disabled | Return after creating the lease instead of waiting for kubeconfig. |
+| `--wait-timeout` | unset | Maximum time to wait for the lease to become usable. |
+
+---
+
+## Lease visibility
+
+```sh
+kobe status
+```
+
+The current CLI does not expose a standalone `kobe leases` command anymore. Use `kobe status` for an endpoint summary plus your active leases, or query `GET /v1/leases` directly.
+
+---
+
+## `kobe release`
+
+```sh
+kobe release <lease-id>
+```
+
+Releases a lease immediately. The cluster is destroyed and a replacement is queued in the pool. Use this when your CI job finishes before the TTL expires — it helps the pool refill faster for subsequent jobs.
+
+```sh
+kobe release lease-a1b2c3d4e5f6
+```
+
+---
+
+## `kobe config`
+
+```sh
+kobe config view
+kobe config edit
+kobe config list
+kobe config current
+kobe config use work
+kobe config set work --endpoint https://kobe.example.com --auth ssh
+```
+
+The CLI stores named targets in `~/.config/kobe/config.json`. Most users set up one or more targets and switch between them with `kobe config use`.
+
+**Common subcommands**
+
+| Command | Description |
+|---|---|
+| `kobe config view` | Show the full config, including named targets |
+| `kobe config edit` | Open the TUI editor |
+| `kobe config list` | List named targets |
+| `kobe config current` | Show the current target |
+| `kobe config use <name>` | Switch the active target |
+| `kobe config set <name> ...` | Create or replace a named target |
+
+```sh
+kobe config set work --endpoint https://kobe.example.com --auth ssh
+kobe config use work
+```

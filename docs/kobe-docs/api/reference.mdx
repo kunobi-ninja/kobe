@@ -1,0 +1,250 @@
+---
+title: API reference
+description: All HTTP endpoints with request and response shapes.
+---
+
+# API reference
+
+The kobe HTTP API is served by the operator. All endpoints except `/v1/status`, `/healthz`, and `/metrics` require authentication via a `Bearer` token in the `Authorization` header.
+
+## Quick reference
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `POST` | `/v1/leases` | Required | Create a lease from a pool |
+| `GET` | `/v1/leases` | Required | List your active leases |
+| `GET` | `/v1/leases/:id` | Required | Get a specific lease |
+| `DELETE` | `/v1/leases/:id` | Required | Release a lease |
+| `PATCH` | `/v1/leases/:id` | Required | Extend a lease TTL |
+| `GET` | `/v1/leases/:id/diagnostics` | Required | Get diagnostics bundle URL |
+| `GET` | `/v1/pools` | Required | List available pools |
+| `GET` | `/v1/pools/:name` | Required | Get a specific pool's status |
+| `GET` | `/v1/pools/:name/leases` | Required | List leases for a specific pool |
+| `GET` | `/v1/status` | Optional | Endpoint status, auth methods, pool summary |
+| `GET` | `/healthz` | None | Liveness probe |
+| `GET` | `/metrics` | None | Prometheus metrics |
+
+---
+
+## `POST /v1/leases`
+
+Creates a lease from the specified pool. Returns `202 Accepted` immediately with the lease ID and `Pending` phase. Poll `GET /v1/leases/:id` until the phase is `Bound` and `kubeconfig` is populated.
+
+**Request body**
+
+```json
+{
+  "profile": "ci-small",
+  "ttl": "30m"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `profile` | string | Yes | Pool name to lease from |
+| `ttl` | string | No | Requested TTL (e.g. `"30m"`, `"1h"`). Defaults to the pool's `spec.ttl`. Capped by AccessPolicy `maxTtl`. |
+
+**Response** — `202 Accepted`
+
+```json
+{
+  "id": "lease-a1b2c3d4e5f6",
+  "phase": "Pending",
+  "profile": "ci-small",
+  "queue_position": 0,
+  "effective_ttl": "30m"
+}
+```
+
+`effective_ttl` reports the TTL the server accepted after policy clamping.
+
+Once bound, `GET /v1/leases/:id` returns:
+
+```json
+{
+  "id": "lease-a1b2c3d4e5f6",
+  "phase": "Bound",
+  "profile": "ci-small",
+  "kubeconfig": "apiVersion: v1\nclusters:\n...",
+  "expires_at": "2026-04-09T15:00:00Z"
+}
+```
+
+**Errors**
+
+| Status | Meaning |
+|---|---|
+| `400` | Invalid profile name or TTL format |
+| `403` | Profile not allowed for your identity |
+| `429` | Concurrent lease limit reached, or server overloaded |
+
+---
+
+## `GET /v1/leases`
+
+Lists all active leases belonging to your identity.
+
+**Response** — `200 OK`
+
+```json
+[
+  {
+    "id": "lease-a1b2c3d4e5f6",
+    "phase": "Bound",
+    "profile": "ci-small",
+    "expires_at": "2026-04-09T15:00:00Z"
+  }
+]
+```
+
+---
+
+## `GET /v1/leases/:id`
+
+Returns the full lease, including `kubeconfig` once the phase is `Bound`.
+
+**Response** — `200 OK`
+
+```json
+{
+  "id": "lease-a1b2c3d4e5f6",
+  "phase": "Bound",
+  "profile": "ci-small",
+  "kubeconfig": "apiVersion: v1\n...",
+  "expires_at": "2026-04-09T15:00:00Z"
+}
+```
+
+Possible values for `phase`: `Pending`, `Bound`, `Released`, `Expired`, `Recycling`.
+
+---
+
+## `DELETE /v1/leases/:id`
+
+Releases a lease immediately. The cluster is destroyed and a fresh replacement is queued. Returns `204 No Content`.
+
+---
+
+## `PATCH /v1/leases/:id`
+
+Extends a lease TTL. Only allowed up to `maxExtensions` times per lease (configured in AccessPolicy, default: 2).
+
+**Request body**
+
+```json
+{
+  "extend_ttl": "30m"
+}
+```
+
+**Response** — `200 OK`
+
+```json
+{
+  "expires_at": "2026-04-09T16:00:00Z"
+}
+```
+
+---
+
+## `GET /v1/leases/:id/diagnostics`
+
+Returns a pre-signed S3 URL to the diagnostics bundle for the lease, if diagnostics are configured on the pool and a bundle was captured.
+
+Returns `404` if no bundle exists.
+
+---
+
+## `GET /v1/pools`
+
+Lists all pools accessible to your identity, including their policy and capacity summary.
+
+**Response** — `200 OK`
+
+```json
+[
+  {
+    "name": "ci-small",
+    "ready": 3,
+    "leased": 1,
+    "creating": 0,
+    "recycling": 0,
+    "unhealthy": 0,
+    "queueDepth": 0,
+    "policy": {
+      "mode": "fixed",
+      "ttl": "2h",
+      "warmTarget": 3
+    }
+  }
+]
+```
+
+---
+
+## `GET /v1/pools/:name`
+
+Returns status for a single pool.
+
+**Response** — `200 OK`
+
+```json
+{
+  "name": "ci-small",
+  "ready": 3,
+  "leased": 1,
+  "creating": 0,
+  "recycling": 0,
+  "unhealthy": 0,
+  "queueDepth": 0,
+  "policy": {
+    "mode": "fixed",
+    "ttl": "2h",
+    "warmTarget": 3
+  }
+}
+```
+
+---
+
+## `GET /v1/pools/:name/leases`
+
+Lists leases currently associated with one pool. This is useful for operational visibility when debugging queueing, stuck leases, or tenant usage.
+
+**Response** - `200 OK`
+
+```json
+[
+  {
+    "id": "lease-a1b2c3d4e5f6",
+    "phase": "Bound",
+    "profile": "ci-small",
+    "cluster_name": "pool-ci-small-0",
+    "requester": "github:org/repo",
+    "expires_at": "2026-04-09T15:00:00Z"
+  }
+]
+```
+
+---
+
+## `GET /v1/status`
+
+Public endpoint — no auth required, but providing a token enriches the response with accessible pools.
+
+**Response** — `200 OK`
+
+```json
+{
+  "version": "0.1.0",
+  "auth": {
+    "methods": ["oidc", "ssh"],
+    "sessions": []
+  },
+  "pools": [
+    { "name": "ci-small", "ready": 3, "leased": 1, "creating": 0 }
+  ]
+}
+```
+
+This is the endpoint `kobe status` queries.

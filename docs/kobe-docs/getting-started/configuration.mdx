@@ -1,0 +1,68 @@
+---
+title: Configuration
+description: CLI config file, environment variables, and per-command overrides.
+---
+
+# Configuration
+
+The kobe CLI stores its config at `~/.config/kobe/config.json`. It supports named targets, so one machine can talk to multiple kobe deployments.
+
+## Config file
+
+```json title="~/.config/kobe/config.json"
+{
+  "current_target": "work",
+  "targets": {
+    "work": {
+      "endpoint": "https://kobe.example.com",
+      "auth": "ssh",
+      "ssh_fingerprint": "SHA256:..."
+    }
+  }
+}
+```
+
+To inspect the current config:
+
+```sh
+kobe config view
+```
+
+To create or replace a target:
+
+```sh
+kobe config set work --endpoint https://kobe.example.com --auth ssh
+kobe config use work
+```
+
+To edit interactively:
+
+```sh
+kobe config edit
+```
+
+## Environment variables
+
+| Variable | Description |
+|---|---|
+| `KOBE_ENDPOINT` | One-off endpoint override |
+| `KOBE_TOKEN` | Bearer token when using `token` auth |
+
+Environment variables are most useful in CI, where you typically inject a token directly:
+
+```sh
+KOBE_ENDPOINT=https://kobe.example.com \
+KOBE_TOKEN=$CI_KOBE_TOKEN \
+  kobe lease ci-small --ttl 30m
+```
+
+## SSH key auth
+
+When `auth = "ssh"`, kobe uses your SSH agent to sign a challenge with your Ed25519 key. The agent must be running and have the key loaded:
+
+```sh
+ssh-add ~/.ssh/id_ed25519
+kobe login
+```
+
+kobe uses TOFU (Trust On First Use) for server fingerprint verification. On first login to an endpoint, it stores the fingerprint in the config file and warns if it changes in the future.

@@ -1,0 +1,65 @@
+---
+title: Architecture
+description: The operator, HTTP API, pool manager, and virtual cluster runtime - and how a lease flows through them.
+---
+
+# Architecture
+
+kobe has four main components: the **operator**, the **HTTP API**, the **pool manager**, and **kobe-sync**. Understanding what each one does makes it easier to configure pools correctly and diagnose problems.
+
+## The operator
+
+`kobe-operator` is a Kubernetes controller that runs in your host cluster. It watches `ClusterPool`, `ClusterInstance`, `ClusterLease`, `AccessPolicy`, and `KobeStore` resources and reconciles them continuously.
+
+`ClusterPool` defines the desired pool shape. The pool controller keeps enough `ClusterInstance` objects around to satisfy that shape. The instance controller provisions and health-checks the underlying backend resources. The lease controller binds `ClusterLease` objects to ready instances, generates short-lived kubeconfigs, and enforces release and expiry.
+
+## The HTTP API
+
+The API server is embedded in the operator process. It handles lease requests, authentication, and pool status queries.
+
+```
+parse request
+    ↓
+authenticate (SSH / OIDC / token)
+    ↓
+enforce AccessPolicy (pool allowlist, TTL cap, concurrency limit)
+    ↓
+create ClusterLease CRD
+    ↓
+wait for operator to bind a ready ClusterInstance
+    ↓
+return kubeconfig with short-lived client certificate
+```
+
+Concurrency is bounded at 200 simultaneous API requests for DoS protection. Infrastructure routes (`/healthz`, `/metrics`) are exempt.
+
+## The pool manager
+
+The pool manager runs inside the operator and tracks the state of every instance across all pools. It makes decisions about when to create, recycle, or destroy instances based on pool spec and current state.
+
+Each pool instance moves through these states:
+
+```
+Creating -> Ready (warm) -> Leased -> Recycling -> [destroyed, replaced]
+```
+
+The pool manager uses a per-pool lock to prevent races when multiple requests try to assign the same ready instance concurrently.
+
+## kobe-sync
+
+`kobe-sync` is a per-cluster sidecar that runs inside each virtual cluster pod. It acts as a reverse proxy between clients and the virtual kube-apiserver, and synchronizes selected Kubernetes resources between the virtual cluster and the host.
+
+For the vkobe backend, kobe-sync also runs a lightweight kube-apiserver and kube-controller-manager, making the virtual cluster entirely self-contained within a single pod. See [Backends](/docs/pools/backends) for details.
+
+## High availability
+
+The operator supports multi-replica deployments via leader election. Only the leader runs controllers; replicas are warm standbys that take over within seconds if the leader pod fails. The API server runs on all replicas — requests are load-balanced, and any replica can serve them.
+
+## Binaries
+
+| Binary | Role |
+|---|---|
+| `kobe-operator` | Operator + HTTP API server |
+| `kobe-sync` | Per-cluster virtual runtime and proxy |
+| `kobe` | CLI client |
+| `crdgen` | CRD schema generator |

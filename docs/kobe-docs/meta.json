@@ -1,0 +1,12 @@
+{
+  "title": "kobe",
+  "pages": [
+    "index",
+    "getting-started",
+    "how-it-works",
+    "pools",
+    "auth",
+    "api",
+    "commands"
+  ]
+}

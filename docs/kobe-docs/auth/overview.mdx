@@ -1,0 +1,85 @@
+---
+title: Authentication
+description: How AccessPolicy configures authentication and authorization for lease requests.
+---
+
+# Authentication
+
+kobe uses `AccessPolicy` CRDs to configure both authentication (who can call the API) and authorization (which pools they can access, at what TTL, and how many concurrent leases they can hold).
+
+Each `AccessPolicy` configures one authentication method. You can have multiple policies in the same namespace for different teams or identity providers.
+
+## Auth methods
+
+| Method | Use case |
+|---|---|
+| `oidc` | GitHub Actions, Clerk, Auth0, or any OIDC provider |
+| `ssh` | Developer workstations using an SSH agent |
+| `token` | Simple bearer token from a Kubernetes Secret |
+| `serviceAccount` | In-cluster workloads using a Kubernetes ServiceAccount token |
+
+## AccessPolicy structure
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: github-ci
+  namespace: kobe
+spec:
+  # Authentication method — exactly one should be set.
+  auth:
+    oidc:
+      issuer: https://token.actions.githubusercontent.com
+      audience: ["https://kobe.example.com"]
+
+  # Identity template — interpolated from JWT claims.
+  # Defaults to "{sub}". Ignored for token and serviceAccount auth.
+  identity: "{repository}:{ref}"
+
+  # Authorization rules — first matching rule wins.
+  rules:
+    - match:
+        claim: repository
+        value: my-org/my-repo
+      pools:
+        - "ci-*"
+      maxTtl: 1h
+      maxConcurrentLeases: 3
+      maxExtensions: 2
+```
+
+## Authorization rules
+
+Rules control what an authenticated caller can do. Fields:
+
+| Field | Description |
+|---|---|
+| `pools` | Pool name patterns. Supports `*` suffix wildcard (e.g., `ci-*`) and literal `*` for all pools. |
+| `maxTtl` | Maximum TTL the caller can request. Requests for longer TTLs are capped to this value. |
+| `maxConcurrentLeases` | How many active leases this identity can hold simultaneously. |
+| `maxExtensions` | How many times a lease can be extended via `PATCH /v1/leases/:id`. |
+
+For OIDC policies, a `match` clause lets you apply different rules to different roles or repositories within the same provider. The first rule whose `match` clause passes is used. Rules without a `match` clause always apply.
+
+## Identity template
+
+The `identity` field controls how kobe derives a stable identity string from the authenticated caller. This identity is stored on the `ClusterLease` and used for concurrency tracking.
+
+```yaml
+# GitHub Actions: include the repo and ref
+identity: "{repository}:{ref}"
+
+# Clerk: use the user ID
+identity: "{sub}"
+
+# Multi-level claim (dot-path)
+identity: "{private_metadata.team}:{sub}"
+```
+
+For `token` and `serviceAccount` auth, the identity is set to the ServiceAccount name or the token's subject — the `identity` field is ignored.
+
+<Cards>
+  <Card title="OIDC" href="/docs/auth/oidc" description="GitHub Actions, Clerk, and custom OIDC providers" />
+  <Card title="SSH keys" href="/docs/auth/ssh-keys" description="Ed25519 key auth via SSH agent" />
+</Cards>

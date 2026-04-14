@@ -1,0 +1,136 @@
+---
+title: Backends
+description: k3s, k0s, CAPI, and vkobe — how each backend provisions virtual clusters.
+---
+
+# Backends
+
+kobe supports four backends for provisioning virtual clusters. The backend is selected per pool via `spec.backend.type`. All backends expose the same lease API; the difference is how each `ClusterInstance` is provisioned and what runtime it uses.
+
+## k3s (default)
+
+k3s clusters are managed as Kubernetes StatefulSets in the host cluster. Each cluster is a k3s server pod with an embedded SQLite datastore by default.
+
+```yaml
+spec:
+  backend:
+    type: k3s
+  cluster:
+    version: v1.32.0+k3s1
+    servers: 1
+```
+
+**When to use:** The default choice for most use cases. Fast to provision, low overhead, and well-tested.
+
+### Shared PostgreSQL datastore
+
+For golden image workflows, k3s can use a shared PostgreSQL datastore instead of embedded SQLite. This enables `CREATE DATABASE ... TEMPLATE` to clone a pre-seeded database into new cluster pods, reducing addon setup time.
+
+```yaml
+spec:
+  backend:
+    type: k3s
+    datastore:
+      secretRef: kobe-postgres-secret    # Secret with key "connection-url"
+      goldenTemplates: true
+```
+
+The referenced Secret must contain a `connection-url` key with a valid PostgreSQL DSN.
+
+## k0s
+
+k0s clusters follow the same pattern as k3s but use the k0s distribution. Use this if your workloads require k0s-specific features or you're standardizing on k0s in production.
+
+```yaml
+spec:
+  backend:
+    type: k0s
+  cluster:
+    version: v1.32.0+k0s.0
+```
+
+## CAPI (Cluster API)
+
+The CAPI backend delegates cluster provisioning to any Cluster API infrastructure provider. kobe creates the necessary CAPI `Cluster` and infrastructure CRDs, then waits for the cluster to reach `Ready` state before adding it to the warm pool.
+
+```yaml
+spec:
+  backend:
+    type: capi
+    capi:
+      infrastructureApiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      infrastructureKind: VCluster
+      infrastructureSpec:
+        # Provider-specific spec, passed through as-is
+        helmRelease:
+          chart:
+            name: vcluster
+            version: "0.24.1"
+```
+
+**When to use:** When you need to use an existing CAPI infrastructure provider, or when kobe's built-in backends don't support your target environment.
+
+## vkobe
+
+vkobe is kobe's lightweight virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not use vcluster or any third-party runtime.
+
+```yaml
+spec:
+  backend:
+    type: vkobe
+    vkobe:
+      dataStoreRef:
+        name: kobe-etcd             # name of a KobeStore CRD in the same namespace
+      version: "1.32"               # Kubernetes API version to expose
+      syncers:
+        - pods
+        - services
+        - configmaps
+        - secrets
+        - endpoints
+        - ingresses
+      kcm:
+        controllers:
+          - deployment
+          - replicaset
+          - statefulset
+          - job
+          - namespace
+          - serviceaccount
+          - garbagecollector
+```
+
+vkobe clusters share the host cluster's node pool. Pods scheduled in the virtual cluster are translated and created as host pods, making them subject to the host's resource constraints and scheduling.
+
+**When to use:** When you want the lowest possible overhead per cluster, don't need full node isolation, and are comfortable with a proxy-based architecture.
+
+### KobeStore CRD
+
+The vkobe backend requires a `KobeStore` CRD that points to an external etcd or kine instance:
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: KobeStore
+metadata:
+  name: kobe-etcd
+  namespace: kobe
+spec:
+  driver: etcd
+  endpoints:
+    - https://etcd.kobe.svc:2379
+  tls:
+    secretRef: etcd-client-certs
+  capacity:
+    maxClusters: 100
+```
+
+## Comparison
+
+| | k3s | k0s | CAPI | vkobe |
+|---|---|---|---|---|
+| Isolation | Full | Full | Full | Namespace |
+| Overhead per cluster | Low | Low | Provider-dependent | Very low |
+| Provision time | ~30s | ~30s | ~60s+ | ~5s |
+| Golden images (Velero) | Yes | Yes | Varies | No |
+| Shared etcd | Via PostgreSQL | Via PostgreSQL | No | Yes (required) |
+| Custom addons | Yes | Yes | Yes | Yes |
