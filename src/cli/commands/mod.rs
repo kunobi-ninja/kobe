@@ -13,7 +13,8 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 pub use config::{
-    config_current_target, config_list_targets, config_set_target, config_show, config_use_target,
+    config_current_target, config_export, config_import, config_list_targets, config_set_target,
+    config_show, config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
 pub use lease_create::{LeaseCreateCommand, lease_create};

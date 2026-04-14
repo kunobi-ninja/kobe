@@ -69,6 +69,16 @@ enum Commands {
 enum ConfigAction {
     /// Show current configuration
     View,
+    /// Export the saved configuration as JSON
+    Export {
+        /// Destination path, or '-' for stdout
+        path: Option<String>,
+    },
+    /// Import configuration from JSON
+    Import {
+        /// Source path, or '-' for stdin
+        path: Option<String>,
+    },
     /// Edit configuration in the TUI
     Edit {
         /// Target name to edit (defaults to current target, else legacy config)
@@ -138,6 +148,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { action } => match action {
             Some(ConfigAction::View) => commands::config_show(target, output).await,
+            Some(ConfigAction::Export { path }) => {
+                commands::config_export(path.as_deref(), output).await
+            }
+            Some(ConfigAction::Import { path }) => {
+                commands::config_import(path.as_deref(), output).await
+            }
             Some(ConfigAction::Edit { name }) => {
                 if let (Some(flag), Some(arg)) = (target, name.as_deref()) {
                     if flag != arg {

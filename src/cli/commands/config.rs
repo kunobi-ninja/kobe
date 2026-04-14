@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 
 use super::{OutputFormat, print_json};
@@ -60,34 +61,51 @@ pub struct ResolvedConfig {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigLegacyOutput<'a> {
-    endpoint: Option<&'a str>,
-    auth: &'a AuthMode,
+struct ConfigLegacyOutput {
+    endpoint: Option<String>,
+    auth: AuthMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<&'a str>,
+    token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ssh_fingerprint: Option<&'a str>,
+    ssh_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigTargetOutput<'a> {
-    endpoint: &'a str,
-    auth: &'a AuthMode,
+struct ConfigTargetOutput {
+    endpoint: String,
+    auth: AuthMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<&'a str>,
+    token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ssh_fingerprint: Option<&'a str>,
+    ssh_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigViewOutput<'a> {
+struct ConfigViewOutput {
+    path: String,
+    exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    current_target: Option<&'a str>,
-    targets: BTreeMap<&'a str, ConfigTargetOutput<'a>>,
+    resolved: Option<ResolvedConfigOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    legacy: Option<ConfigLegacyOutput<'a>>,
+    current_target: Option<String>,
+    targets: BTreeMap<String, ConfigTargetOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy: Option<ConfigLegacyOutput>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedConfigOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    endpoint: String,
+    auth: AuthMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,8 +165,6 @@ pub struct CliConfig {
     pub ssh_fingerprint: Option<String>,
 }
 
-const DEFAULT_ENDPOINT: &str = "https://kobe.kunobi.ninja";
-
 fn is_default_auth(auth: &AuthMode) -> bool {
     auth == &AuthMode::default()
 }
@@ -182,10 +198,6 @@ impl CliConfig {
         Ok(())
     }
 
-    pub fn endpoint(&self) -> &str {
-        self.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT)
-    }
-
     fn migrate_legacy_to_default_target(&mut self) -> bool {
         if !self.targets.is_empty() || self.current_target.is_some() {
             return false;
@@ -203,10 +215,10 @@ impl CliConfig {
         self.targets.insert(
             "default".to_string(),
             KobeTarget {
-                endpoint: self
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
+                endpoint: match self.endpoint.clone() {
+                    Some(endpoint) => endpoint,
+                    None => return false,
+                },
                 auth: self.auth.clone(),
                 token: self.token.clone(),
                 ssh_fingerprint: self.ssh_fingerprint.clone(),
@@ -225,6 +237,31 @@ impl CliConfig {
         target_override: Option<&str>,
         endpoint_override: Option<&str>,
     ) -> Result<ResolvedConfig> {
+        if let Some(endpoint) = endpoint_override {
+            let target_name = target_override.or(self.current_target.as_deref());
+            if let Some(name) = target_name {
+                let target = self
+                    .targets
+                    .get(name)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
+                return Ok(ResolvedConfig {
+                    target: Some(name.to_string()),
+                    endpoint: endpoint.to_string(),
+                    auth: target.auth.clone(),
+                    token: target.token.clone(),
+                    ssh_fingerprint: target.ssh_fingerprint.clone(),
+                });
+            }
+
+            return Ok(ResolvedConfig {
+                target: None,
+                endpoint: endpoint.to_string(),
+                auth: self.auth.clone(),
+                token: self.token.clone(),
+                ssh_fingerprint: self.ssh_fingerprint.clone(),
+            });
+        }
+
         let target_name = target_override.or(self.current_target.as_deref());
 
         if let Some(name) = target_name {
@@ -242,15 +279,25 @@ impl CliConfig {
             });
         }
 
-        Ok(ResolvedConfig {
-            target: None,
-            endpoint: endpoint_override
-                .map(str::to_string)
-                .unwrap_or_else(|| self.endpoint().to_string()),
-            auth: self.auth.clone(),
-            token: self.token.clone(),
-            ssh_fingerprint: self.ssh_fingerprint.clone(),
-        })
+        if let Some(endpoint) = self.endpoint.as_deref() {
+            return Ok(ResolvedConfig {
+                target: None,
+                endpoint: endpoint.to_string(),
+                auth: self.auth.clone(),
+                token: self.token.clone(),
+                ssh_fingerprint: self.ssh_fingerprint.clone(),
+            });
+        }
+
+        if !self.targets.is_empty() {
+            anyhow::bail!(
+                "No current target configured. Run: kobe config list, kobe config use <name>, or pass --target <name>"
+            );
+        }
+
+        anyhow::bail!(
+            "No endpoint configured. Run: kobe config set <name> --endpoint <url> ..., use kobe config import, or pass --endpoint <url>"
+        )
     }
 }
 
@@ -265,8 +312,61 @@ pub async fn config_show(target_override: Option<&str>, output: OutputFormat) ->
     let config = CliConfig::load()?;
     match output {
         OutputFormat::Text => print_config(&config, target_override)?,
-        OutputFormat::Json => print_json(&config_view_output(&config))?,
+        OutputFormat::Json => print_json(&config_view_output(&config, target_override))?,
     }
+    Ok(())
+}
+
+pub async fn config_export(path: Option<&str>, output: OutputFormat) -> Result<()> {
+    let config = CliConfig::load()?;
+    let serialized = serde_json::to_string_pretty(&config)?;
+
+    match path {
+        Some("-") => {
+            println!("{serialized}");
+        }
+        Some(path) => {
+            std::fs::write(path, format!("{serialized}\n"))?;
+            match output {
+                OutputFormat::Text => println!("Exported config to {path}"),
+                OutputFormat::Json => print_json(&serde_json::json!({ "path": path }))?,
+            }
+        }
+        None => match output {
+            OutputFormat::Text => println!("{serialized}"),
+            OutputFormat::Json => print_json(&config_view_output(&config, None))?,
+        },
+    }
+
+    Ok(())
+}
+
+pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<()> {
+    let source = path.unwrap_or("-");
+    let mut input = String::new();
+
+    if source == "-" {
+        std::io::stdin().read_to_string(&mut input)?;
+    } else {
+        input = std::fs::read_to_string(source)?;
+    }
+
+    let mut config: CliConfig = serde_json::from_str(&input)?;
+    if let Some(current) = config.current_target.as_deref() {
+        if !config.targets.contains_key(current) {
+            anyhow::bail!("Imported config references unknown current_target '{current}'");
+        }
+    }
+    if config.migrate_legacy_to_default_target() {
+        // Preserve migration behavior for older exported configs.
+    }
+    config.save()?;
+
+    match output {
+        OutputFormat::Text => println!("Imported config into {}", config_path()?.display()),
+        OutputFormat::Json => print_json(&config_view_output(&config, None))?,
+    }
+
     Ok(())
 }
 
@@ -387,20 +487,35 @@ pub async fn config_list_targets(output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn config_view_output<'a>(config: &'a CliConfig) -> ConfigViewOutput<'a> {
+fn config_view_output(config: &CliConfig, target_override: Option<&str>) -> ConfigViewOutput {
+    let path = config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let exists = config_path().map(|p| p.exists()).unwrap_or(false);
+    let resolved = config.resolve(target_override, None).ok().map(|resolved| ResolvedConfigOutput {
+        target: resolved.target,
+        endpoint: resolved.endpoint,
+        auth: resolved.auth,
+        token: resolved.token,
+        ssh_fingerprint: resolved.ssh_fingerprint,
+    });
+
     ConfigViewOutput {
-        current_target: config.current_target.as_deref(),
+        path,
+        exists,
+        resolved,
+        current_target: config.current_target.clone(),
         targets: config
             .targets
             .iter()
             .map(|(name, target)| {
                 (
-                    name.as_str(),
+                    name.clone(),
                     ConfigTargetOutput {
-                        endpoint: &target.endpoint,
-                        auth: &target.auth,
-                        token: target.token.as_deref(),
-                        ssh_fingerprint: target.ssh_fingerprint.as_deref(),
+                        endpoint: target.endpoint.clone(),
+                        auth: target.auth.clone(),
+                        token: target.token.clone(),
+                        ssh_fingerprint: target.ssh_fingerprint.clone(),
                     },
                 )
             })
@@ -409,7 +524,7 @@ fn config_view_output<'a>(config: &'a CliConfig) -> ConfigViewOutput<'a> {
     }
 }
 
-fn legacy_output(config: &CliConfig) -> Option<ConfigLegacyOutput<'_>> {
+fn legacy_output(config: &CliConfig) -> Option<ConfigLegacyOutput> {
     let has_legacy = config.endpoint.is_some()
         || config.auth != AuthMode::default()
         || config.token.is_some()
@@ -419,24 +534,58 @@ fn legacy_output(config: &CliConfig) -> Option<ConfigLegacyOutput<'_>> {
     }
 
     Some(ConfigLegacyOutput {
-        endpoint: config.endpoint.as_deref(),
-        auth: &config.auth,
-        token: config.token.as_deref(),
-        ssh_fingerprint: config.ssh_fingerprint.as_deref(),
+        endpoint: config.endpoint.clone(),
+        auth: config.auth.clone(),
+        token: config.token.clone(),
+        ssh_fingerprint: config.ssh_fingerprint.clone(),
     })
 }
 
 fn print_config(config: &CliConfig, target_override: Option<&str>) -> Result<()> {
-    let resolved = config.resolve(target_override, None)?;
-    if let Some(target) = &resolved.target {
-        println!("target:   {target}");
+    let path = config_path()?;
+    let exists = path.exists();
+
+    println!("config:   {}", path.display());
+    println!("exists:   {}", if exists { "yes" } else { "no" });
+
+    let resolved = config.resolve(target_override, None);
+
+    if !exists {
+        println!();
+        println!("No saved config found.");
+        if let Ok(resolved) = resolved {
+            println!("resolved-endpoint: {}", resolved.endpoint);
+            print_auth(
+                &resolved.auth,
+                resolved.token.as_deref(),
+                resolved.ssh_fingerprint.as_deref(),
+            );
+        } else {
+            println!("resolved: none");
+            println!("hint:     run 'kobe config set <name> --endpoint <url> ...' or pass --endpoint");
+        }
+        return Ok(());
     }
-    println!("endpoint: {}", resolved.endpoint);
-    print_auth(
-        &resolved.auth,
-        resolved.token.as_deref(),
-        resolved.ssh_fingerprint.as_deref(),
-    );
+
+    let resolved = resolved?;
+
+    if let Some(target) = &resolved.target {
+        println!("current-target: {target}");
+        println!("endpoint: {}", resolved.endpoint);
+        print_auth(
+            &resolved.auth,
+            resolved.token.as_deref(),
+            resolved.ssh_fingerprint.as_deref(),
+        );
+    } else if config.targets.is_empty() {
+        println!("mode:     legacy");
+        println!("endpoint: {}", resolved.endpoint);
+        print_auth(
+            &resolved.auth,
+            resolved.token.as_deref(),
+            resolved.ssh_fingerprint.as_deref(),
+        );
+    }
 
     if !config.targets.is_empty() {
         println!();
@@ -452,6 +601,9 @@ fn print_config(config: &CliConfig, target_override: Option<&str>) -> Result<()>
                 target.endpoint, target.auth
             );
         }
+    } else if exists {
+        println!();
+        println!("targets:  (none)");
     }
 
     Ok(())
