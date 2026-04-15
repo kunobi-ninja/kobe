@@ -22,6 +22,8 @@ rules:
     resources:
       - clusterpools
       - clusterpools/status
+      - clusterinstances
+      - clusterinstances/status
       - clusterleases
       - clusterleases/status
       - accesspolicies

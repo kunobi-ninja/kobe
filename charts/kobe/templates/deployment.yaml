@@ -75,8 +75,8 @@ spec:
             httpGet:
               path: /healthz
               port: http
-            failureThreshold: 30
-            periodSeconds: 2
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp

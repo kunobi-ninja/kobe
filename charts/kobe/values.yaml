@@ -58,6 +58,11 @@ resources:
     cpu: 500m
     memory: 256Mi
 
+probes:
+  startup:
+    failureThreshold: 180
+    periodSeconds: 2
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
