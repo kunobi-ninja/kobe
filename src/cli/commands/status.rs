@@ -17,6 +17,8 @@ struct StatusAuthOutput {
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -37,6 +39,8 @@ struct StatusOutput {
     auth: StatusAuthOutput,
     leases: Vec<LeaseSummary>,
     pools: Vec<StatusPoolOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pools_error: Option<String>,
 }
 
 pub async fn status(
@@ -49,10 +53,10 @@ pub async fn status(
     let endpoint = config.endpoint.as_str();
 
     // Fetch server status (unauthenticated — /v1/status supports OptionalAuth)
-    let token = get_auth_header(&config, "GET", "/v1/status", b"")
-        .await
-        .ok()
-        .flatten();
+    let (token, auth_error) = match get_auth_header(&config, "GET", "/v1/status", b"").await {
+        Ok(token) => (token, None),
+        Err(err) => (None, Some(err.to_string())),
+    };
 
     let client = authed_client();
     let response = with_auth(client.get(format!("{endpoint}/v1/status")), &token)
@@ -87,10 +91,18 @@ pub async fn status(
     };
     let auth_mode = config.auth.to_string();
 
-    let pools = fetch_pools_for_config(&config).await.unwrap_or_default();
-    let leases = fetch_leases_path(&config, "/v1/leases")
-        .await
-        .unwrap_or_default();
+    let (pools, pools_error, leases) = if auth_error.is_some() {
+        (Vec::new(), None, Vec::new())
+    } else {
+        let (pools, pools_error) = match fetch_pools_for_config(&config).await {
+            Ok(pools) => (pools, None),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        };
+        let leases = fetch_leases_path(&config, "/v1/leases")
+            .await
+            .unwrap_or_default();
+        (pools, pools_error, leases)
+    };
     let leases = enrich_leases(&config, leases).await;
 
     let mut pool_details = Vec::with_capacity(pools.len());
@@ -108,9 +120,11 @@ pub async fn status(
                 mode: auth_mode,
                 summary: auth_summary,
                 ssh_fingerprint: config.ssh_fingerprint.clone(),
+                error: auth_error.clone(),
             },
             leases,
             pools: pool_details,
+            pools_error,
         });
     }
 
@@ -126,6 +140,11 @@ pub async fn status(
 
     println!("\x1b[1mAuth\x1b[0m");
     println!("  {auth_summary}");
+    if let Some(err) = &auth_error {
+        println!("  failed: {err}");
+        println!();
+        return Ok(());
+    }
     println!();
 
     println!("\x1b[1mLeases\x1b[0m");
@@ -149,6 +168,12 @@ pub async fn status(
     println!();
 
     println!("\x1b[1mPools\x1b[0m");
+    if let Some(err) = &pools_error {
+        println!("  Error listing pools: {err}");
+        println!();
+        return Ok(());
+    }
+
     if pool_details.is_empty() {
         println!("  No pools available");
         println!();
