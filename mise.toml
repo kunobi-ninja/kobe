@@ -2,5 +2,6 @@
 experimental = true
 
 [tools]
+bun = "latest"
 just = "latest"
 rust = { version = "1.93", profile = "default" }
