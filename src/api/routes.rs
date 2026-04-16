@@ -65,6 +65,7 @@ impl<B: ClusterBackend + Clone + Send + Sync + 'static> AuthnProvider for AppSta
 /// For per-client rate limiting, configure at the ingress controller level.
 const MAX_CONCURRENT_API_REQUESTS: usize = 200;
 const CONNECT_PROXY_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+const CONNECT_PROXY_LOG_BODY_LIMIT: usize = 256;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -317,6 +318,29 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
 
 fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
+}
+
+fn summarize_response_body(bytes: &bytes::Bytes) -> String {
+    let body = String::from_utf8_lossy(bytes);
+    let mut snippet = String::with_capacity(body.len().min(CONNECT_PROXY_LOG_BODY_LIMIT));
+    let mut used = 0usize;
+
+    for ch in body.chars() {
+        let ch = if ch.is_control() && ch != '\n' && ch != '\t' {
+            ' '
+        } else {
+            ch
+        };
+        let ch_len = ch.len_utf8();
+        if used + ch_len > CONNECT_PROXY_LOG_BODY_LIMIT {
+            snippet.push_str("...");
+            break;
+        }
+        snippet.push(ch);
+        used += ch_len;
+    }
+
+    snippet.replace('\n', "\\n")
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
@@ -983,16 +1007,31 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         }
     }
 
-    debug!(
-        request_id = %request_id,
-        lease_id = %lease_id,
-        cluster = %cluster_name,
-        upstream = %backend.server,
-        method = %method,
-        path = %request_path,
-        status = status_code.as_u16(),
-        "Connect proxy completed upstream request"
-    );
+    let response_body_summary = summarize_response_body(&response_bytes);
+    if status_code.is_server_error() {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            cluster = %cluster_name,
+            upstream = %backend.server,
+            method = %method,
+            path = %request_path,
+            status = status_code.as_u16(),
+            response_body = %response_body_summary,
+            "Connect proxy received upstream server error"
+        );
+    } else {
+        debug!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            cluster = %cluster_name,
+            upstream = %backend.server,
+            method = %method,
+            path = %request_path,
+            status = status_code.as_u16(),
+            "Connect proxy completed upstream request"
+        );
+    }
 
     response
         .body(Body::from(response_bytes))
