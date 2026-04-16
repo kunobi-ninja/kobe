@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use kube::api::{Api, ListParams, Patch, PatchParams};
@@ -26,7 +27,9 @@ pub struct LeaseContext<B: ClusterBackend> {
     #[allow(dead_code)]
     pub pools: Arc<RwLock<std::collections::HashMap<String, PoolState>>>,
     /// Priority queue of pending leases per profile.
-    pub queues: RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
+    pub queues: RwLock<HashMap<String, Vec<PendingLease>>>,
+    /// In-process guard against overlapping reconciles for the same lease.
+    pub active_reconciles: Mutex<HashSet<String>>,
     /// Operator namespace.
     pub namespace: String,
     /// Authenticator for policy lookups by requester_type.
@@ -34,6 +37,19 @@ pub struct LeaseContext<B: ClusterBackend> {
     /// Legacy backend factory kept during the ClusterInstance migration.
     #[allow(dead_code)]
     pub factory: Option<BackendFactory>,
+}
+
+struct ActiveLeaseReconcileGuard<'a> {
+    active_reconciles: &'a Mutex<HashSet<String>>,
+    lease_name: String,
+}
+
+impl Drop for ActiveLeaseReconcileGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active_reconciles) = self.active_reconciles.lock() {
+            active_reconciles.remove(&self.lease_name);
+        }
+    }
 }
 
 /// A pending lease in the priority queue.
@@ -69,7 +85,8 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
         client: client.clone(),
         backend,
         pools,
-        queues: RwLock::new(std::collections::HashMap::new()),
+        queues: RwLock::new(HashMap::new()),
+        active_reconciles: Mutex::new(HashSet::new()),
         namespace: namespace.to_string(),
         authenticator,
         factory,
@@ -183,6 +200,14 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     ctx: Arc<LeaseContext<B>>,
 ) -> Result<Action, LeaseError> {
     let name = lease.name_any();
+    let _active_reconcile = match try_start_reconcile(&ctx, &name) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            info!(lease = %name, "Lease already reconciling, deferring duplicate event");
+            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+        }
+        Err(err) => return Err(err),
+    };
     let ns = lease.namespace().unwrap_or_else(|| ctx.namespace.clone());
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
 
@@ -767,7 +792,7 @@ async fn run_reaper<B: ClusterBackend>(
 }
 
 async fn remove_from_queue(
-    queues: &RwLock<std::collections::HashMap<String, Vec<PendingLease>>>,
+    queues: &RwLock<HashMap<String, Vec<PendingLease>>>,
     profile: &str,
     lease_name: &str,
 ) {
@@ -775,6 +800,25 @@ async fn remove_from_queue(
     if let Some(queue) = queues.get_mut(profile) {
         queue.retain(|p| p.lease_name != lease_name);
     }
+}
+
+fn try_start_reconcile<'a, B: ClusterBackend>(
+    ctx: &'a LeaseContext<B>,
+    lease_name: &str,
+) -> Result<Option<ActiveLeaseReconcileGuard<'a>>, LeaseError> {
+    let mut active_reconciles = ctx.active_reconciles.lock().map_err(|err| {
+        LeaseError::Lifecycle(anyhow::anyhow!("lease reconcile guard poisoned: {err}"))
+    })?;
+
+    if !active_reconciles.insert(lease_name.to_string()) {
+        return Ok(None);
+    }
+    drop(active_reconciles);
+
+    Ok(Some(ActiveLeaseReconcileGuard {
+        active_reconciles: &ctx.active_reconciles,
+        lease_name: lease_name.to_string(),
+    }))
 }
 
 async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<ClusterPool> {
@@ -805,7 +849,6 @@ fn error_policy<B: ClusterBackend>(
 mod tests {
     use super::*;
     use crate::testutil::MockBackend;
-    use std::collections::HashMap;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -827,6 +870,7 @@ mod tests {
             backend,
             pools,
             queues: RwLock::new(HashMap::new()),
+            active_reconciles: Mutex::new(HashSet::new()),
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
@@ -1097,6 +1141,20 @@ mod tests {
         let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
         // Successful bind → requeue at 60s.
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_returns_quickly_when_same_lease_is_already_in_progress() {
+        let (ctx, _server) = test_lease_context().await;
+        let lease = make_test_lease("duplicate-1", "Pending");
+
+        ctx.active_reconciles
+            .lock()
+            .expect("active reconciles lock")
+            .insert("duplicate-1".to_string());
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(1)));
     }
 
     // -----------------------------------------------------------------------

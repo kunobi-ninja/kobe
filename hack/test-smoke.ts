@@ -167,6 +167,30 @@ function renderPool(poolStatus: PoolStatus): string {
   return `ready=${poolStatus.ready} leased=${poolStatus.leased} creating=${poolStatus.creating} recycling=${poolStatus.recycling ?? 0} queue=${poolStatus.queueDepth}`;
 }
 
+function describeLeaseControllerAnomaly(
+  lease: LeaseStatus | undefined,
+  before: PoolStatus | null,
+  after: PoolStatus,
+): string | null {
+  if (lease?.phase === "Pending" && lease.clusterName) {
+    return "lease is still pending even though a cluster name was assigned";
+  }
+
+  if (lease?.phase === "Pending" && after.leased > (before?.leased ?? 0)) {
+    return "lease remained pending while pool leased capacity increased";
+  }
+
+  if (
+    lease?.phase === "Pending" &&
+    after.queueDepth > (before?.queueDepth ?? 0) &&
+    after.creating > (before?.creating ?? 0)
+  ) {
+    return "lease was re-queued while the pool started creating replacement capacity";
+  }
+
+  return null;
+}
+
 function summarizeProbePayload(path: string, payload: unknown): string {
   if (!payload || typeof payload !== "object") {
     return truncate(String(payload));
@@ -276,6 +300,7 @@ async function printLeaseWaitDiagnostics(reason: string): Promise<void> {
   const status = await fetchStatus();
   const poolAfter = selectPool(status, pool);
   const matchingLease = leaseId ? (status.leases ?? []).find((lease) => lease.id === leaseId) : undefined;
+  const anomaly = describeLeaseControllerAnomaly(matchingLease, poolBefore, poolAfter);
 
   errorLine("");
   errorLine("Smoke diagnostics");
@@ -311,6 +336,12 @@ async function printLeaseWaitDiagnostics(reason: string): Promise<void> {
         `    ${lease.id} phase=${lease.phase ?? "-"} cluster=${lease.clusterName ?? "-"}`
       );
     }
+  }
+
+  if (anomaly) {
+    errorLine("");
+    errorLine("  controller anomaly");
+    errorLine(`    ${anomaly}`);
   }
 }
 
