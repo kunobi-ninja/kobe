@@ -11,7 +11,8 @@ use tracing::{debug, error, info, warn};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
     Addon, BackendConfig, BackendType, ClusterConfig, ClusterInstance, ClusterInstancePhase,
-    ClusterInstanceStatus, ClusterPool, HealthCheckConfig, ReadinessGate, SnapshotConfig,
+    ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig, LeasePhase, ReadinessGate,
+    SnapshotConfig,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -170,6 +171,10 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             let next = evaluate_ready_instance(&ctx, &config, &name, &ns, &status).await?;
             Ok(next)
         }
+        ClusterInstancePhase::Leased => {
+            let next = evaluate_leased_instance(&ctx, &name, &ns, &status).await?;
+            Ok(next)
+        }
         ClusterInstancePhase::Recycling => {
             info!(instance = %name, owner = %owner, "Deleting backend resources");
             match delete_instance_backend(&ctx, &config, &name, &ns).await {
@@ -184,6 +189,96 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         _ => Ok(Action::requeue(std::time::Duration::from_secs(30))),
+    }
+}
+
+async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    name: &str,
+    namespace: &str,
+    status: &ClusterInstanceStatus,
+) -> Result<Action, InstanceError> {
+    let Some(lease_ref) = &status.lease_ref else {
+        warn!(instance = %name, "Leased instance is missing lease_ref, recycling");
+        let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+        patch_instance_status(
+            &instances_api,
+            name,
+            ClusterInstanceStatus {
+                phase: ClusterInstancePhase::Recycling,
+                provisioned: status.provisioned,
+                lease_ref: None,
+                idle_since: None,
+                state_since: Some(chrono::Utc::now().to_rfc3339()),
+                health_failures: status.health_failures,
+                spec_hash: status.spec_hash,
+            },
+        )
+        .await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+    };
+
+    let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    match leases_api.get(&lease_ref.name).await {
+        Ok(lease) => {
+            let lease_status = lease.status.unwrap_or_default();
+            let should_recycle = matches!(
+                lease_status.phase,
+                LeasePhase::Released | LeasePhase::Expired | LeasePhase::Recycling
+            );
+            if should_recycle {
+                info!(
+                    instance = %name,
+                    lease = %lease_ref.name,
+                    phase = %lease_status.phase,
+                    "Lease is terminating, recycling instance"
+                );
+                let instances_api: Api<ClusterInstance> =
+                    Api::namespaced(ctx.client.clone(), namespace);
+                patch_instance_status(
+                    &instances_api,
+                    name,
+                    ClusterInstanceStatus {
+                        phase: ClusterInstancePhase::Recycling,
+                        provisioned: status.provisioned,
+                        lease_ref: None,
+                        idle_since: None,
+                        state_since: Some(chrono::Utc::now().to_rfc3339()),
+                        health_failures: status.health_failures,
+                        spec_hash: status.spec_hash,
+                    },
+                )
+                .await?;
+                Ok(Action::requeue(std::time::Duration::from_secs(10)))
+            } else {
+                Ok(Action::requeue(std::time::Duration::from_secs(30)))
+            }
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            warn!(
+                instance = %name,
+                lease = %lease_ref.name,
+                "Lease CR not found for leased instance, recycling"
+            );
+            let instances_api: Api<ClusterInstance> =
+                Api::namespaced(ctx.client.clone(), namespace);
+            patch_instance_status(
+                &instances_api,
+                name,
+                ClusterInstanceStatus {
+                    phase: ClusterInstancePhase::Recycling,
+                    provisioned: status.provisioned,
+                    lease_ref: None,
+                    idle_since: None,
+                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                    health_failures: status.health_failures,
+                    spec_hash: status.spec_hash,
+                },
+            )
+            .await?;
+            Ok(Action::requeue(std::time::Duration::from_secs(10)))
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -737,5 +832,130 @@ mod tests {
 
         assert_eq!(action, Action::await_change());
         assert_eq!(backend.call_count().delete, 1);
+    }
+
+    #[tokio::test]
+    async fn leased_instance_with_missing_lease_recycles() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let instance = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": {
+                    "name": "leased-1",
+                    "namespace": "test-ns"
+                },
+                "spec": {
+                    "backend": { "type": "k3s" },
+                    "cluster": { "version": "v1.31.3+k3s1" }
+                },
+                "status": {
+                    "phase": "Leased",
+                    "provisioned": true,
+                    "leaseRef": { "name": "lease-gone" },
+                    "healthFailures": 0
+                }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-gone",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/leased-1/status",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "status": {
+                    "phase": "Recycling",
+                    "leaseRef": null
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("leased-1")))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        let calls = backend.call_count();
+        assert_eq!(calls.check_health, 0);
+        assert_eq!(calls.delete, 0);
+    }
+
+    #[tokio::test]
+    async fn leased_instance_with_released_lease_recycles() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let instance = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": {
+                    "name": "leased-2",
+                    "namespace": "test-ns"
+                },
+                "spec": {
+                    "backend": { "type": "k3s" },
+                    "cluster": { "version": "v1.31.3+k3s1" }
+                },
+                "status": {
+                    "phase": "Leased",
+                    "provisioned": true,
+                    "leaseRef": { "name": "lease-released" },
+                    "healthFailures": 0
+                }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-released",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "lease-released",
+                    "namespace": "test-ns"
+                },
+                "spec": {
+                    "poolRef": "ci-small",
+                    "ttl": "1h",
+                    "requester": { "type": "ssh:user", "identity": "user" }
+                },
+                "status": {
+                    "phase": "Released"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/leased-2/status",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "status": {
+                    "phase": "Recycling",
+                    "leaseRef": null
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("leased-2")))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        let calls = backend.call_count();
+        assert_eq!(calls.check_health, 0);
+        assert_eq!(calls.delete, 0);
     }
 }
