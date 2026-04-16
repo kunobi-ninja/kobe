@@ -376,7 +376,18 @@ fn should_skip_request_header(name: &HeaderName) -> bool {
 }
 
 fn should_skip_response_header(name: &HeaderName) -> bool {
-    name == CONTENT_LENGTH || name == CONNECTION
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "content-length"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn backend_request_url(
@@ -2017,6 +2028,26 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response_text(response).await, "Missing Bearer token");
+    }
+
+    #[test]
+    fn test_connect_proxy_skips_hop_by_hop_response_headers() {
+        for header in [
+            CONNECTION,
+            CONTENT_LENGTH,
+            HeaderName::from_static("keep-alive"),
+            HeaderName::from_static("proxy-authenticate"),
+            HeaderName::from_static("proxy-authorization"),
+            HeaderName::from_static("te"),
+            HeaderName::from_static("trailer"),
+            HeaderName::from_static("transfer-encoding"),
+            HeaderName::from_static("upgrade"),
+        ] {
+            assert!(
+                should_skip_response_header(&header),
+                "expected {header} to be stripped from proxied responses"
+            );
+        }
     }
 
     // --- Auth-protected endpoints return 401 without Authorization header ---
