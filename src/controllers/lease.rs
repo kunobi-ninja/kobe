@@ -211,7 +211,49 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     let ns = lease.namespace().unwrap_or_else(|| ctx.namespace.clone());
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
 
+    let lease = if lease.resource_version().is_some() {
+        match leases_api.get(&name).await {
+            Ok(current) => Arc::new(current),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!(lease = %name, "Lease disappeared before reconcile could load current state");
+                return Ok(Action::await_change());
+            }
+            Err(err) => return Err(LeaseError::Kube(err)),
+        }
+    } else {
+        lease
+    };
+
     let status = lease.status.clone().unwrap_or_default();
+    if status.phase == LeasePhase::Pending && status.cluster_name.is_some() {
+        info!(
+            lease = %name,
+            cluster = ?status.cluster_name,
+            "Lease has an assigned cluster while still marked Pending; restoring Bound phase"
+        );
+
+        let repaired_status = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            cluster_name: status.cluster_name.clone(),
+            bound_at: status.bound_at.clone(),
+            expires_at: status.expires_at.clone(),
+            queue_position: 0,
+            diagnostics_url: status.diagnostics_url.clone(),
+            extensions_count: status.extensions_count,
+            max_extensions: status.max_extensions,
+        };
+
+        leases_api
+            .patch_status(
+                &name,
+                &PatchParams::apply("kobe-operator"),
+                &Patch::Merge(&serde_json::json!({ "status": repaired_status })),
+            )
+            .await?;
+        remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+
     let phase = &status.phase;
 
     match phase {
@@ -1155,6 +1197,160 @@ mod tests {
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stale_pending_event_uses_fresh_bound_state() {
+        let (ctx, server) = test_lease_context().await;
+        let lease: Arc<ClusterLease> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "stale-1",
+                    "namespace": "test-ns",
+                    "resourceVersion": "1"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "u" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Pending",
+                    "queuePosition": 1,
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/stale-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "stale-1",
+                    "namespace": "test-ns",
+                    "resourceVersion": "2"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "u" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Bound",
+                    "clusterName": "pool-test-1",
+                    "boundAt": chrono::Utc::now().to_rfc3339(),
+                    "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "queuePosition": 0,
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_repairs_pending_lease_with_assigned_cluster() {
+        let (ctx, server) = test_lease_context().await;
+        let lease: Arc<ClusterLease> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "repair-1",
+                    "namespace": "test-ns",
+                    "resourceVersion": "1"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "u" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Pending",
+                    "clusterName": "pool-test-1",
+                    "boundAt": chrono::Utc::now().to_rfc3339(),
+                    "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "queuePosition": 1,
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/repair-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "repair-1",
+                    "namespace": "test-ns",
+                    "resourceVersion": "1"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "u" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Pending",
+                    "clusterName": "pool-test-1",
+                    "boundAt": chrono::Utc::now().to_rfc3339(),
+                    "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "queuePosition": 1,
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/repair-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "repair-1", "namespace": "test-ns" },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "u" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Bound",
+                    "clusterName": "pool-test-1",
+                    "queuePosition": 0,
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
     }
 
     // -----------------------------------------------------------------------
