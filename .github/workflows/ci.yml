@@ -32,30 +32,44 @@ concurrency:
 jobs:
   checks:
     name: Rust Checks
-    uses: Zondax/_workflows/.github/workflows/_checks-rs.yaml@v9
-    with:
-      runs_on: kunobi-runners
-      timeout_minutes: 35
-      base_image: rust:1.93-bookworm
-      enable_coverage: false
-      enable_build: false
-      audit_command: >-
-        cargo audit
-        --ignore RUSTSEC-2023-0071
-        --ignore RUSTSEC-2025-0134
-        --ignore RUSTSEC-2026-0002
-        --ignore RUSTSEC-2026-0098
-        --ignore RUSTSEC-2026-0099
-
-  chart-checks:
-    name: Chart Checks
-    needs: checks
     runs-on: kunobi-runners
     container:
       image: rust:1.93-bookworm
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Add Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2026-0002 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -78,7 +92,7 @@ jobs:
 
   docker-dry-run:
     if: github.event_name == 'pull_request'
-    needs: chart-checks
+    needs: checks
     runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
@@ -92,14 +106,30 @@ jobs:
 
   publish:
     if: github.event_name != 'pull_request'
-    needs: chart-checks
-    uses: Zondax/_workflows/.github/workflows/_publish-docker-bake.yaml@v9
-    with:
-      runner: kunobi-runners
-      timeout_minutes: 20
-      bake_file: docker-bake.hcl
-      bake_targets: operator-push,kobe-sync-push
-      platforms: linux/amd64
-    secrets:
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    needs: checks
+    runs-on: kunobi-runners
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract version from release
+        if: github.event_name == 'release'
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          VERSION: ${{ steps.version.outputs.version || '0.0.0' }}
+          BUILD_VERSION: ${{ github.ref_name || 'dev' }}
+          BUILD_COMMIT: ${{ github.sha }}
+        run: docker buildx bake -f docker-bake.hcl push
