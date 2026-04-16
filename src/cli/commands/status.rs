@@ -6,7 +6,7 @@ use super::leases::{
     LeaseSummary, fetch_lease, fetch_leases_path, lease_cluster_label, lease_phase_label,
     lease_when_label,
 };
-use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_block};
+use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
 use super::state::resolve_kubeconfig_path;
 use super::{OutputFormat, authed_client, cli_version, get_auth_header, print_json, with_auth};
 
@@ -41,6 +41,14 @@ struct StatusOutput {
     pools: Vec<StatusPoolOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pools_error: Option<String>,
+}
+
+fn auth_error_hint(error: &str) -> Option<&'static str> {
+    if error.contains("found in SSH agent") {
+        Some("check SSH_AUTH_SOCK and ssh-add -l")
+    } else {
+        None
+    }
 }
 
 pub async fn status(
@@ -142,6 +150,9 @@ pub async fn status(
     println!("  {auth_summary}");
     if let Some(err) = &auth_error {
         println!("  failed: {err}");
+        if let Some(hint) = auth_error_hint(err) {
+            println!("  hint: {hint}");
+        }
         println!();
         return Ok(());
     }
@@ -180,13 +191,8 @@ pub async fn status(
         return Ok(());
     }
 
-    for (index, pool_detail) in pool_details.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-
-        print_pool_block(&pool_detail.pool, "  ");
-    }
+    let pools: Vec<PoolSummary> = pool_details.into_iter().map(|detail| detail.pool).collect();
+    print_pool_table(&pools, "  ");
     println!();
 
     Ok(())

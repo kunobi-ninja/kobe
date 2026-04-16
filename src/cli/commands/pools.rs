@@ -51,22 +51,6 @@ pub(crate) async fn fetch_pools_for_config(config: &ResolvedConfig) -> Result<Ve
     Ok(response.json().await?)
 }
 
-pub(crate) fn format_capacity(pool: &PoolSummary) -> String {
-    let mut parts = vec![
-        format!("ready={}", pool.ready),
-        format!("leased={}", pool.leased),
-        format!("creating={}", pool.creating),
-        format!("recycling={}", pool.recycling),
-        format!("queue={}", pool.queue_depth),
-    ];
-
-    if pool.unhealthy > 0 {
-        parts.push(format!("unhealthy={}", pool.unhealthy));
-    }
-
-    parts.join("  ")
-}
-
 pub(crate) fn format_policy(pool: &PoolSummary) -> Option<String> {
     let Some(policy) = &pool.policy else {
         return None;
@@ -74,32 +58,34 @@ pub(crate) fn format_policy(pool: &PoolSummary) -> Option<String> {
 
     if policy.mode == "autoscaled" {
         let max_clusters = policy.max_clusters.unwrap_or(policy.warm_target);
-        let scale_up_threshold = policy.scale_up_threshold.unwrap_or(0);
         let scale_down_after = policy.scale_down_after.as_deref().unwrap_or("-");
-        let queue_timeout = policy.queue_timeout.as_deref().unwrap_or("-");
 
         Some(format!(
-            "ttl={}  warm={}/{}  scale-up-at={}  scale-down-after={}  queue-timeout={}",
-            policy.ttl,
-            policy.warm_target,
-            max_clusters,
-            scale_up_threshold,
-            scale_down_after,
-            queue_timeout
+            "ttl {}  warm {}/{}  scale down after {}",
+            policy.ttl, policy.warm_target, max_clusters, scale_down_after
         ))
     } else {
         Some(format!(
-            "ttl={}  warm={} fixed",
+            "ttl {}  warm {} fixed",
             policy.ttl, policy.warm_target
         ))
     }
 }
 
-pub(crate) fn print_pool_block(pool: &PoolSummary, indent: &str) {
-    println!("{indent}{}", pool.name);
-    println!("{indent}  capacity: {}", format_capacity(pool));
-    if let Some(policy) = format_policy(pool) {
-        println!("{indent}  policy:   {policy}");
+pub(crate) fn print_pool_table(pools: &[PoolSummary], indent: &str) {
+    for (index, pool) in pools.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+
+        println!("{indent}{}", pool.name);
+        println!(
+            "{indent}  ready {}  leased {}  creating {}  recycling {}  queue {}",
+            pool.ready, pool.leased, pool.creating, pool.recycling, pool.queue_depth
+        );
+        if let Some(policy) = format_policy(pool) {
+            println!("{indent}  {policy}");
+        }
     }
 }
 
