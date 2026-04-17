@@ -71,7 +71,7 @@ pub enum PoolAction {
 /// Computes the desired pool actions given current state and profile config.
 ///
 /// This is the core autoscaling logic:
-/// - Scale up when ready clusters < desired floor
+/// - Scale up when ready + creating clusters < desired floor
 /// - Scale down when idle clusters > min_ready and idle too long
 /// - Respect max_clusters ceiling
 /// - Cap creation burst to avoid thundering herd
@@ -123,7 +123,7 @@ pub fn compute_pool_actions(
         counts.creating + counts.ready + counts.leased + counts.unhealthy + counts.recycling;
 
     // Determine target from scaling config or fixed size
-    let (min_ready, max_clusters, scale_up_threshold, scale_down_after) =
+    let (min_ready, max_clusters, _scale_up_threshold, scale_down_after) =
         if let Some(scaling) = &spec.scaling {
             (
                 scaling.min_ready,
@@ -137,9 +137,9 @@ pub fn compute_pool_actions(
         };
 
     // --- Scale Up ---
-    // We want at least `min_ready` clusters in Ready state.
-    // Scale up when ready clusters fall to scale_up_threshold.
-    if counts.ready <= scale_up_threshold && total < max_clusters {
+    // We want at least `min_ready` clusters available or on the way.
+    // Refill whenever ready + creating drops below the warm target.
+    if counts.ready + counts.creating < min_ready && total < max_clusters {
         let deficit = min_ready.saturating_sub(counts.ready + counts.creating);
         let room = max_clusters.saturating_sub(total);
         let to_create = deficit.min(room).min(MAX_BURST);
@@ -547,6 +547,33 @@ mod tests {
         let actions = compute_pool_actions(&profile, &state, now);
 
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_scale_up_when_warm_pool_drops_below_min_ready() {
+        let profile = make_profile(
+            2,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 2,
+                max_clusters: 8,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+            }),
+        );
+        let mut clusters = HashMap::new();
+        clusters.insert("pool-test-0".into(), make_entry(ClusterState::Ready));
+        clusters.insert("pool-test-1".into(), make_entry(ClusterState::Leased));
+        let state = PoolState { clusters };
+        let now = chrono::Utc::now();
+
+        let actions = compute_pool_actions(&profile, &state, now);
+
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(creates.len(), 1);
     }
 
     #[test]
