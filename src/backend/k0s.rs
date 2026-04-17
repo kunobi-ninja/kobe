@@ -18,12 +18,12 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, EnvVar, KeyToPath, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource,
-    Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Service, ServicePort, ServiceSpec, Volume, VolumeMount, Event as K8sEvent, Pod,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
-use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
@@ -636,7 +636,7 @@ spec:
 
     /// Wait for the kubeconfig Secret to appear (created by the sidecar).
     async fn wait_ready(&self, name: &str, namespace: &str) -> Result<()> {
-        debug!(cluster = name, "Waiting for k0s cluster to become ready");
+        info!(cluster = name, "Waiting for k0s cluster kubeconfig Secret");
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-kubeconfig");
@@ -653,11 +653,12 @@ spec:
                     return Ok(());
                 }
                 Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    if attempt % 12 == 0 {
-                        debug!(
+                    if attempt % 6 == 0 {
+                        info!(
                             cluster = name,
                             attempt = attempt + 1,
-                            "Waiting for k0s cluster kubeconfig..."
+                            elapsed_seconds = attempt * 5,
+                            "Waiting for k0s cluster kubeconfig Secret"
                         );
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -668,7 +669,113 @@ spec:
             }
         }
 
-        anyhow::bail!("k0s cluster {name} not ready after 10 minutes");
+        let pod_summary = self
+            .summarize_server_pod(name, namespace)
+            .await
+            .unwrap_or_else(|e| format!("unavailable ({e})"));
+        let event_summary = self
+            .summarize_server_pod_events(name, namespace)
+            .await
+            .unwrap_or_else(|e| format!("unavailable ({e})"));
+
+        warn!(
+            cluster = name,
+            pod = %pod_summary,
+            events = %event_summary,
+            "k0s cluster readiness timed out"
+        );
+
+        anyhow::bail!(
+            "k0s cluster {name} not ready after 10 minutes; pod: {pod_summary}; events: {event_summary}"
+        );
+    }
+
+    async fn summarize_server_pod(&self, name: &str, namespace: &str) -> Result<String> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod_name = format!("{name}-server-0");
+        let pod = pods
+            .get(&pod_name)
+            .await
+            .with_context(|| format!("Failed to get server pod {pod_name}"))?;
+
+        let phase = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.as_deref())
+            .unwrap_or("Unknown");
+
+        let mut container_states = Vec::new();
+        if let Some(statuses) = pod.status.as_ref().and_then(|s| s.container_statuses.as_ref()) {
+            for status in statuses {
+                let state = status
+                    .state
+                    .as_ref()
+                    .and_then(|state| {
+                        state
+                            .waiting
+                            .as_ref()
+                            .map(|waiting| format!("waiting:{}", waiting.reason.as_deref().unwrap_or("-")))
+                            .or_else(|| state.running.as_ref().map(|_| "running".to_string()))
+                            .or_else(|| {
+                                state.terminated.as_ref().map(|terminated| {
+                                    format!(
+                                        "terminated:{}",
+                                        terminated.reason.as_deref().unwrap_or("-")
+                                    )
+                                })
+                            })
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                container_states.push(format!(
+                    "{}={} image={}",
+                    status.name,
+                    state,
+                    status.image
+                ));
+            }
+        }
+
+        Ok(format!(
+            "{} phase={} {}",
+            pod_name,
+            phase,
+            container_states.join(", ")
+        ))
+    }
+
+    async fn summarize_server_pod_events(&self, name: &str, namespace: &str) -> Result<String> {
+        let events: Api<K8sEvent> = Api::namespaced(self.client.clone(), namespace);
+        let pod_name = format!("{name}-server-0");
+        let items = events
+            .list(&ListParams::default())
+            .await
+            .context("Failed to list pod events")?;
+
+        let mut matches: Vec<String> = items
+            .into_iter()
+            .filter(|event| {
+                event
+                    .involved_object
+                    .name
+                    .as_deref()
+                    .map(|involved| involved == pod_name)
+                    .unwrap_or(false)
+            })
+            .map(|event| {
+                format!(
+                    "{}:{}",
+                    event.reason.unwrap_or_else(|| "-".to_string()),
+                    event.message.unwrap_or_else(|| "-".to_string())
+                )
+            })
+            .collect();
+
+        if matches.is_empty() {
+            return Ok("no matching pod events".to_string());
+        }
+
+        matches.truncate(3);
+        Ok(matches.join(" | "))
     }
 
     /// Delete a resource, ignoring 404 (already deleted).
@@ -700,7 +807,12 @@ impl ClusterBackend for K0sBackend {
         config: &ClusterConfig,
         addons: &[Addon],
     ) -> Result<()> {
-        info!(cluster = name, "Creating k0s cluster");
+        info!(
+            cluster = name,
+            version = %config.version,
+            image = %k0s_image(&config.version),
+            "Creating k0s cluster"
+        );
 
         // 1. Create token secret
         self.create_token_secret(name, namespace).await?;

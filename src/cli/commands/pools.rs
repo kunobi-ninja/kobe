@@ -61,7 +61,7 @@ pub(crate) fn format_policy(pool: &PoolSummary) -> Option<String> {
         let scale_down_after = policy.scale_down_after.as_deref().unwrap_or("-");
 
         Some(format!(
-            "ttl {}  warm {}/{}  scale down after {}",
+            "ttl {}  warm {} [max {}]  scale down after {}",
             policy.ttl, policy.warm_target, max_clusters, scale_down_after
         ))
     } else {
@@ -120,5 +120,27 @@ mod tests {
         .expect("pool payload should deserialize");
 
         assert!(format_policy(&pool).is_none());
+    }
+
+    #[test]
+    fn format_policy_renders_autoscaled_warm_target_and_max_capacity() {
+        let pool: PoolSummary = serde_json::from_value(serde_json::json!({
+            "name": "ci-small",
+            "ready": 2,
+            "leased": 0,
+            "policy": {
+                "mode": "autoscaled",
+                "ttl": "1h",
+                "warmTarget": 2,
+                "maxClusters": 8,
+                "scaleDownAfter": "30m"
+            }
+        }))
+        .expect("pool payload should deserialize");
+
+        assert_eq!(
+            format_policy(&pool).as_deref(),
+            Some("ttl 1h  warm 2 [max 8]  scale down after 30m")
+        );
     }
 }
