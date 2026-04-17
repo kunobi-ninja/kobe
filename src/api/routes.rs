@@ -66,6 +66,7 @@ impl<B: ClusterBackend + Clone + Send + Sync + 'static> AuthnProvider for AppSta
 const MAX_CONCURRENT_API_REQUESTS: usize = 200;
 const CONNECT_PROXY_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const CONNECT_PROXY_LOG_BODY_LIMIT: usize = 256;
+const CONNECT_PROXY_LOG_HEADER_LIMIT: usize = 12;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -341,6 +342,30 @@ fn summarize_response_body(bytes: &bytes::Bytes) -> String {
     }
 
     snippet.replace('\n', "\\n")
+}
+
+fn summarize_headers(headers: &HeaderMap) -> String {
+    let mut rendered = headers
+        .iter()
+        .take(CONNECT_PROXY_LOG_HEADER_LIMIT)
+        .map(|(name, value)| {
+            let value = value
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|_| "<non-utf8>".to_string());
+            format!("{name}={}", summarize_response_body(&bytes::Bytes::from(value)))
+        })
+        .collect::<Vec<_>>();
+
+    if headers.len() > CONNECT_PROXY_LOG_HEADER_LIMIT {
+        rendered.push(format!("...+{} more", headers.len() - CONNECT_PROXY_LOG_HEADER_LIMIT));
+    }
+
+    rendered.join(", ")
+}
+
+fn verbose_connect_proxy_logging(path: &str, status_code: StatusCode) -> bool {
+    matches!(path, "/api" | "/apis" | "/version") || !status_code.is_success()
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
@@ -920,6 +945,17 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         }
     };
 
+    info!(
+        request_id = %request_id,
+        lease_id = %lease_id,
+        cluster = %cluster_name,
+        upstream = %backend.server,
+        method = %method,
+        path = %request_path,
+        query = raw_query.0.as_deref().unwrap_or(""),
+        "Connect proxy forwarding request upstream"
+    );
+
     let body_bytes = match body::to_bytes(body, CONNECT_PROXY_MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -991,6 +1027,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
 
     let status_code = backend_response.status();
     let response_headers = backend_response.headers().clone();
+    let response_header_summary = summarize_headers(&response_headers);
     let response_bytes = match backend_response.bytes().await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -1008,17 +1045,39 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         }
     };
 
+    let response_body_summary = summarize_response_body(&response_bytes);
+    let response_body_len = response_bytes.len();
+
+    if verbose_connect_proxy_logging(&request_path, status_code) {
+        info!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            cluster = %cluster_name,
+            upstream = %backend.server,
+            method = %method,
+            path = %request_path,
+            status = status_code.as_u16(),
+            body_bytes = response_body_len,
+            upstream_headers = %response_header_summary,
+            response_body = %response_body_summary,
+            "Connect proxy received upstream response"
+        );
+    }
+
     let mut response = Response::builder().status(status_code);
+    let mut stripped_headers = Vec::new();
+    let mut forwarded_headers = Vec::new();
     if let Some(headers_mut) = response.headers_mut() {
         for (name, value) in &response_headers {
             if should_skip_response_header(name) {
+                stripped_headers.push(name.to_string());
                 continue;
             }
             headers_mut.append(name, value.clone());
+            forwarded_headers.push(name.to_string());
         }
     }
 
-    let response_body_summary = summarize_response_body(&response_bytes);
     if status_code.is_server_error() {
         warn!(
             request_id = %request_id,
@@ -1032,7 +1091,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             "Connect proxy received upstream server error"
         );
     } else {
-        debug!(
+        info!(
             request_id = %request_id,
             lease_id = %lease_id,
             cluster = %cluster_name,
@@ -1040,7 +1099,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             method = %method,
             path = %request_path,
             status = status_code.as_u16(),
-            "Connect proxy completed upstream request"
+            body_bytes = response_body_len,
+            stripped_headers = %stripped_headers.join(","),
+            forwarded_headers = %forwarded_headers.join(","),
+            "Connect proxy forwarding response downstream"
         );
     }
 
