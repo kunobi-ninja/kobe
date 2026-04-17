@@ -41,6 +41,15 @@ pub const DB_PREFIX: &str = "k0s_";
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kobe-operator";
 
+/// Convert a k0s semver version to a valid Docker image reference.
+///
+/// k0s releases use `+` for build metadata (e.g. `v1.30.1+k0s.0`), but `+` is
+/// illegal in OCI image tags. Published images use `-` instead
+/// (e.g. `k0sproject/k0s:v1.30.1-k0s.0`).
+fn k0s_image(version: &str) -> String {
+    format!("k0sproject/k0s:{}", version.replace('+', "-"))
+}
+
 /// The kubeconfig publisher sidecar script, mounted from a ConfigMap.
 ///
 /// Waits for k0s to generate the admin kubeconfig at `/var/lib/k0s/pki/admin.conf`,
@@ -289,7 +298,7 @@ spec:
 
     /// Build the k0s controller container.
     fn build_server_container(name: &str, namespace: &str, config: &ClusterConfig) -> Container {
-        let image = format!("k0sproject/k0s:{}", config.version);
+        let image = k0s_image(&config.version);
 
         let args = vec![
             "controller".to_string(),
@@ -470,7 +479,7 @@ spec:
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
     ) -> StatefulSet {
-        let k0s_image = format!("k0sproject/k0s:{}", config.version);
+        let k0s_image = k0s_image(&config.version);
         let labels = Self::server_labels(name);
 
         // Build the k0s.yaml so the ConfigMap is consistent but note: the
@@ -559,7 +568,7 @@ spec:
         config: &ClusterConfig,
         replicas: u32,
     ) -> Deployment {
-        let k0s_image = format!("k0sproject/k0s:{}", config.version);
+        let k0s_image = k0s_image(&config.version);
         let labels = Self::agent_labels(name);
 
         let container = Container {
@@ -868,6 +877,16 @@ mod tests {
     }
 
     #[test]
+    fn test_k0s_image_replaces_plus_with_hyphen() {
+        assert_eq!(k0s_image("v1.30.1+k0s.0"), "k0sproject/k0s:v1.30.1-k0s.0");
+    }
+
+    #[test]
+    fn test_k0s_image_preserves_hyphen_tags() {
+        assert_eq!(k0s_image("v1.30.1-k0s.0"), "k0sproject/k0s:v1.30.1-k0s.0");
+    }
+
+    #[test]
     fn test_build_k0s_config_yaml_no_pg() {
         let yaml = K0sBackend::build_k0s_config_yaml(None, &[]);
         assert!(
@@ -919,7 +938,7 @@ mod tests {
         assert_eq!(server.name, "k0s-controller");
         assert_eq!(
             server.image.as_deref(),
-            Some("k0sproject/k0s:v1.30.1+k0s.0")
+            Some("k0sproject/k0s:v1.30.1-k0s.0")
         );
         assert_eq!(server.command.as_ref().unwrap(), &vec!["k0s".to_string()]);
 
@@ -1043,7 +1062,7 @@ mod tests {
     #[test]
     fn test_publisher_sidecar_has_correct_env() {
         let sidecar =
-            K0sBackend::build_publisher_sidecar("my-cluster", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
+            K0sBackend::build_publisher_sidecar("my-cluster", "ns", "k0sproject/k0s:v1.30.1-k0s.0");
         let env = sidecar.env.as_ref().unwrap();
         assert!(
             env.iter()
@@ -1058,7 +1077,7 @@ mod tests {
     #[test]
     fn test_publisher_sidecar_mounts() {
         let sidecar =
-            K0sBackend::build_publisher_sidecar("c", "ns", "k0sproject/k0s:v1.30.1+k0s.0");
+            K0sBackend::build_publisher_sidecar("c", "ns", "k0sproject/k0s:v1.30.1-k0s.0");
         let mounts = sidecar.volume_mounts.as_ref().unwrap();
         assert!(mounts.iter().any(|m| m.name == "k0s-data"));
         assert!(mounts.iter().any(|m| m.name == "publisher-script"));
