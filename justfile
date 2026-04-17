@@ -48,6 +48,11 @@ run *args:
 test-smoke pool='ci-small' ttl='2m' *args:
     @bun run ./hack/test-smoke.ts {{ pool }} {{ ttl }} {{ args }}
 
+# Lease one warm cluster and verify the pool refills back to the warm target
+[group('dev')]
+test-smoke-pool pool='ci-small' ttl='2m' *args:
+    @bun run ./hack/test-smoke-pool.ts {{ pool }} {{ ttl }} {{ args }}
+
 # Regenerate CRD YAML files from Rust types
 [group('build')]
 build-crdgen:
