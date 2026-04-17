@@ -17,8 +17,8 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Container, EnvVar, KeyToPath, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource,
-    Service, ServicePort, ServiceSpec, Volume, VolumeMount, Event as K8sEvent, Pod,
+    ConfigMap, Container, EnvVar, Event as K8sEvent, KeyToPath, Pod, PodSpec, PodTemplateSpec,
+    Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -705,7 +705,11 @@ spec:
             .unwrap_or("Unknown");
 
         let mut container_states = Vec::new();
-        if let Some(statuses) = pod.status.as_ref().and_then(|s| s.container_statuses.as_ref()) {
+        if let Some(statuses) = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+        {
             for status in statuses {
                 let state = status
                     .state
@@ -714,7 +718,9 @@ spec:
                         state
                             .waiting
                             .as_ref()
-                            .map(|waiting| format!("waiting:{}", waiting.reason.as_deref().unwrap_or("-")))
+                            .map(|waiting| {
+                                format!("waiting:{}", waiting.reason.as_deref().unwrap_or("-"))
+                            })
                             .or_else(|| state.running.as_ref().map(|_| "running".to_string()))
                             .or_else(|| {
                                 state.terminated.as_ref().map(|terminated| {
@@ -726,12 +732,7 @@ spec:
                             })
                     })
                     .unwrap_or_else(|| "unknown".to_string());
-                container_states.push(format!(
-                    "{}={} image={}",
-                    status.name,
-                    state,
-                    status.image
-                ));
+                container_states.push(format!("{}={} image={}", status.name, state, status.image));
             }
         }
 
