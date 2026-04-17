@@ -353,12 +353,18 @@ fn summarize_headers(headers: &HeaderMap) -> String {
                 .to_str()
                 .map(str::to_string)
                 .unwrap_or_else(|_| "<non-utf8>".to_string());
-            format!("{name}={}", summarize_response_body(&bytes::Bytes::from(value)))
+            format!(
+                "{name}={}",
+                summarize_response_body(&bytes::Bytes::from(value))
+            )
         })
         .collect::<Vec<_>>();
 
     if headers.len() > CONNECT_PROXY_LOG_HEADER_LIMIT {
-        rendered.push(format!("...+{} more", headers.len() - CONNECT_PROXY_LOG_HEADER_LIMIT));
+        rendered.push(format!(
+            "...+{} more",
+            headers.len() - CONNECT_PROXY_LOG_HEADER_LIMIT
+        ));
     }
 
     rendered.join(", ")
