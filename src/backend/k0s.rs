@@ -173,7 +173,7 @@ spec:
   storage:
 {storage_section}
   network:
-    provider: kube-router
+    provider: kuberouter
 "#
         );
 
@@ -1011,7 +1011,7 @@ mod tests {
         );
         assert!(yaml.contains("apiVersion: k0s.k0sproject.io/v1beta1"));
         assert!(yaml.contains("kind: ClusterConfig"));
-        assert!(yaml.contains("provider: kube-router"));
+        assert!(yaml.contains("provider: kuberouter"));
     }
 
     #[test]
