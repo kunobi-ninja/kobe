@@ -1083,12 +1083,15 @@ mod tests {
             "test-cluster-k0s-config"
         );
 
-        // Check that server container mounts k0s-config at /etc/k0s
+        // Check that server container mounts only the config file so /etc/k0s stays writable.
         let server = &pod_spec.containers[0];
         let mounts = server.volume_mounts.as_ref().unwrap();
         let config_mount = mounts.iter().find(|m| m.name == "k0s-config");
         assert!(config_mount.is_some(), "Should mount k0s-config");
-        assert_eq!(config_mount.unwrap().mount_path, "/etc/k0s");
+        let config_mount = config_mount.unwrap();
+        assert_eq!(config_mount.mount_path, "/etc/k0s/k0s.yaml");
+        assert_eq!(config_mount.sub_path.as_deref(), Some("k0s.yaml"));
+        assert!(config_mount.read_only.unwrap_or(false));
     }
 
     #[test]
