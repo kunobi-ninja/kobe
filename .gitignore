@@ -1,5 +1,14 @@
 
 target/
+.tmp/
+
+.kobe.toml
+
+.codex/
+.cursor/
+.gemini/
+.windsurf/
+.mcp.json
 
 docs/plans/
 .worktrees/

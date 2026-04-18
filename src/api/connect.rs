@@ -155,6 +155,12 @@ pub(crate) fn backend_access_from_kubeconfig(raw_kubeconfig: &str) -> Result<Bac
         builder = builder.identity(identity);
     }
 
+    // Virtual clusters use generated/self-signed serving certs and are accessed over
+    // cluster-internal service DNS. Match the same trust model as the internal
+    // kube-rs health checks so the connect proxy can reach leased clusters
+    // consistently even when the serving certificate SANs are narrow.
+    builder = builder.danger_accept_invalid_certs(true);
+
     let client = builder
         .build()
         .context("Failed to build backend proxy client")?;

@@ -17,6 +17,7 @@ LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 COPY --from=builder /app/target/release/kobe-operator /kobe-operator
+COPY --from=builder /app/target/release/kubeconfig-publisher /kubeconfig-publisher
 
 EXPOSE 8080
 

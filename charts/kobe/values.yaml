@@ -29,6 +29,9 @@ serviceAccount:
   name: ""
   annotations: {}
 
+poolServiceAccount: ""
+poolPublisherServiceAccount: ""
+
 annotations: {}
 podAnnotations: {}
 
@@ -48,7 +51,9 @@ containerSecurityContext:
       - ALL
 
 service:
+  type: ClusterIP
   port: 8080
+  nodePort: null
 
 resources:
   requests:

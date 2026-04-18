@@ -39,7 +39,7 @@ enum Commands {
     /// Lease a cluster from a pool and wait until it is ready
     Lease {
         /// Pool name (e.g. ci-small)
-        pool: String,
+        pool: Option<String>,
         /// Lease TTL
         #[arg(long, default_value = "1h")]
         ttl: String,
@@ -49,14 +49,20 @@ enum Commands {
         /// Maximum time to wait for the lease to become usable (e.g. 30s, 5m, 1h)
         #[arg(long, value_name = "DURATION", conflicts_with = "no_wait")]
         wait_timeout: Option<String>,
-        /// Write kubeconfig to this path (default: ~/.kube/kobe-{lease-id})
+        /// Write kubeconfig to this path (default: ~/.kube/kobe-{pool}-{short-lease}.yaml)
         #[arg(long = "kubeconfig", value_name = "PATH")]
         kubeconfig: Option<String>,
     },
     /// Release a cluster lease
     Release {
         /// Lease ID
-        lease_id: String,
+        lease_id: Option<String>,
+    },
+    /// Release all active leases and remove local Kobe lease kubeconfigs
+    Purge {
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Manage CLI configuration
     Config {
@@ -132,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
             kubeconfig,
         } => {
             commands::lease_create(commands::LeaseCreateCommand {
-                pool: &pool,
+                pool: pool.as_deref(),
                 ttl: &ttl,
                 no_wait,
                 wait_timeout: wait_timeout.as_deref(),
@@ -144,8 +150,9 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Release { lease_id } => {
-            commands::release(&lease_id, target, endpoint, output).await
+            commands::release(lease_id.as_deref(), target, endpoint, output).await
         }
+        Commands::Purge { yes } => commands::purge(target, endpoint, output, yes).await,
         Commands::Config { action } => match action {
             Some(ConfigAction::View) => commands::config_show(target, output).await,
             Some(ConfigAction::Export { path }) => {

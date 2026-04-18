@@ -126,7 +126,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     Ok(Action::requeue(std::time::Duration::from_secs(5)))
                 }
                 Err(e) => {
-                    warn!(instance = %name, error = %e, "Provisioning failed");
+                    warn!(instance = %name, error = %format!("{e:#}"), "Provisioning failed");
                     patch_instance_status(
                         &instances_api,
                         &name,
@@ -183,7 +183,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     Ok(Action::await_change())
                 }
                 Err(e) => {
-                    warn!(instance = %name, error = %e, "Delete failed");
+                    warn!(instance = %name, error = %format!("{e:#}"), "Delete failed");
                     Ok(Action::requeue(std::time::Duration::from_secs(15)))
                 }
             }

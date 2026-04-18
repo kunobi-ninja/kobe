@@ -3,5 +3,7 @@ experimental = true
 
 [tools]
 bun = "latest"
+helm = "latest"
 just = "latest"
-rust = { version = "1.93", profile = "default" }
+kind = "latest"
+rust = { version = "1.95.0", profile = "default" }

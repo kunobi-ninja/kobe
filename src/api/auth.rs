@@ -93,6 +93,14 @@ struct CompiledProvider {
     rules: Vec<AccessRule>,
 }
 
+/// A compiled static token provider, built from an AccessPolicy + Secret.
+#[derive(Debug, Clone)]
+struct CompiledTokenProvider {
+    name: String,
+    token: String,
+    rules: Vec<AccessRule>,
+}
+
 /// A compiled SSH policy provider, pairing kunobi-auth's CompiledSshProvider
 /// with kobe-specific authorization rules.
 struct CompiledSshPolicyProvider {
@@ -107,6 +115,8 @@ pub struct JwtAuthenticator {
     providers: RwLock<Vec<CompiledProvider>>,
     /// Compiled SSH providers from AccessPolicy CRDs.
     ssh_providers: RwLock<Vec<CompiledSshPolicyProvider>>,
+    /// Compiled static token providers from AccessPolicy CRDs + referenced Secrets.
+    token_providers: RwLock<Vec<CompiledTokenProvider>>,
     /// Nonce tracker for SSH replay protection.
     nonce_tracker: NonceTracker,
     /// Cached JWKS per URL.
@@ -129,6 +139,7 @@ impl JwtAuthenticator {
             http,
             providers: RwLock::new(Vec::new()),
             ssh_providers: RwLock::new(Vec::new()),
+            token_providers: RwLock::new(Vec::new()),
             nonce_tracker: NonceTracker::new(std::time::Duration::from_secs(60)),
             jwks_cache: RwLock::new(HashMap::new()),
             ssh_namespace,
@@ -137,12 +148,19 @@ impl JwtAuthenticator {
 
     /// Recompile the provider lookup table from AccessPolicy CRDs.
     /// Called by the AccessPolicy watcher whenever CRDs change.
-    pub async fn update_policies(&self, policies: Vec<AccessPolicy>) {
+    pub async fn update_policies(
+        &self,
+        policies: Vec<AccessPolicy>,
+        token_secrets: HashMap<String, String>,
+    ) {
         let mut oidc_policies = Vec::new();
+        let mut token_policies = Vec::new();
         let mut ssh_policies = Vec::new();
         for policy in policies {
             if policy.spec.auth.ssh.is_some() {
                 ssh_policies.push(policy);
+            } else if policy.spec.auth.token.is_some() {
+                token_policies.push(policy);
             } else {
                 oidc_policies.push(policy);
             }
@@ -238,12 +256,46 @@ impl JwtAuthenticator {
         let ssh_count = ssh_compiled.len();
         *self.ssh_providers.write().await = ssh_compiled;
         debug!(ssh_providers = ssh_count, "SSH policies updated");
+
+        let token_compiled: Vec<CompiledTokenProvider> = token_policies
+            .into_iter()
+            .filter_map(|ap| {
+                let policy_name = ap.metadata.name.unwrap_or_default();
+                let spec = ap.spec;
+                let token_auth = spec.auth.token?;
+                let token = match token_secrets.get(&token_auth.secret_ref) {
+                    Some(token) if !token.is_empty() => token.clone(),
+                    _ => {
+                        warn!(
+                            provider = %policy_name,
+                            secret_ref = %token_auth.secret_ref,
+                            "Missing or empty token Secret, skipping token provider"
+                        );
+                        return None;
+                    }
+                };
+
+                Some(CompiledTokenProvider {
+                    name: policy_name,
+                    token,
+                    rules: spec.rules,
+                })
+            })
+            .collect();
+
+        let token_count = token_compiled.len();
+        *self.token_providers.write().await = token_compiled;
+        debug!(
+            token_providers = token_count,
+            "Static token policies updated"
+        );
     }
 
     /// Return the list of supported auth methods for the /v1/status endpoint.
     pub async fn auth_methods(&self) -> Vec<AuthMethodInfo> {
         let providers = self.providers.read().await;
         let ssh_providers = self.ssh_providers.read().await;
+        let token_providers = self.token_providers.read().await;
 
         let mut methods: Vec<AuthMethodInfo> = providers
             .iter()
@@ -266,6 +318,16 @@ impl JwtAuthenticator {
             });
         }
 
+        for tp in token_providers.iter() {
+            methods.push(AuthMethodInfo {
+                method_type: "token".to_string(),
+                issuer: None,
+                client_id: None,
+                description: Some(tp.name.clone()),
+                audience: None,
+            });
+        }
+
         methods
     }
 
@@ -282,7 +344,24 @@ impl JwtAuthenticator {
             None => (requester_type, None),
         };
         let providers = self.providers.read().await;
-        let provider = providers.iter().find(|p| p.name == policy_name)?;
+        if let Some(provider) = providers.iter().find(|p| p.name == policy_name) {
+            let rule = find_matching_rule(&provider.rules, matched_value)?;
+            return Some(access_rule_to_policy(rule));
+        }
+        drop(providers);
+
+        let ssh_providers = self.ssh_providers.read().await;
+        if let Some(provider) = ssh_providers
+            .iter()
+            .find(|p| p.provider.name == policy_name)
+        {
+            let rule = find_matching_rule(&provider.rules, matched_value)?;
+            return Some(access_rule_to_policy(rule));
+        }
+        drop(ssh_providers);
+
+        let token_providers = self.token_providers.read().await;
+        let provider = token_providers.iter().find(|p| p.name == policy_name)?;
         let rule = find_matching_rule(&provider.rules, matched_value)?;
         Some(access_rule_to_policy(rule))
     }
@@ -346,6 +425,30 @@ impl JwtAuthenticator {
     /// Peeks at the unverified `iss` claim to select the correct provider(s),
     /// then validates the token signature and claims against that provider's JWKS.
     pub async fn validate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
+        {
+            let token_providers = self.token_providers.read().await;
+            if let Some(provider) = token_providers.iter().find(|p| p.token == token) {
+                let rule = find_matching_rule(&provider.rules, None).ok_or_else(|| {
+                    AuthError::InvalidToken(
+                        "No access rule configured for static token provider".into(),
+                    )
+                })?;
+
+                debug!(
+                    requester_type = %provider.name,
+                    provider = %provider.name,
+                    "Static token validated"
+                );
+
+                return Ok(AuthIdentity {
+                    requester_type: provider.name.clone(),
+                    identity: provider.name.clone(),
+                    issuer: "token".to_string(),
+                    policy: access_rule_to_policy(rule),
+                });
+            }
+        }
+
         let header = decode_header(token).map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
         let providers = self.providers.read().await;
@@ -1240,7 +1343,7 @@ mod tests {
         }))
         .unwrap();
 
-        auth.update_policies(vec![policy]).await;
+        auth.update_policies(vec![policy], HashMap::new()).await;
 
         // No match clause — look up by policy name alone
         let result = auth.policy_for_requester_type("test-policy").await;
@@ -1276,7 +1379,7 @@ mod tests {
         }))
         .unwrap();
 
-        auth.update_policies(vec![policy]).await;
+        auth.update_policies(vec![policy], HashMap::new()).await;
 
         // Policy name alone should find the rule (no match clause)
         assert!(auth.policy_for_requester_type("my-policy").await.is_some());
@@ -1311,5 +1414,43 @@ mod tests {
             err_msg.contains("No auth policies configured"),
             "Expected 'No auth policies configured' in error, got: {err_msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_validate_static_token() {
+        let auth = JwtAuthenticator::new("test".to_string());
+
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "AccessPolicy",
+            "metadata": { "name": "local-token" },
+            "spec": {
+                "auth": {
+                    "token": {
+                        "secretRef": "local-token-secret"
+                    }
+                },
+                "rules": [{
+                    "pools": ["*"],
+                    "maxTtl": "1h",
+                    "maxConcurrentLeases": 10
+                }]
+            }
+        }))
+        .unwrap();
+
+        let mut token_secrets = HashMap::new();
+        token_secrets.insert(
+            "local-token-secret".to_string(),
+            "e2e-dev-token".to_string(),
+        );
+
+        auth.update_policies(vec![policy], token_secrets).await;
+
+        let identity = auth.validate("e2e-dev-token").await.unwrap();
+        assert_eq!(identity.requester_type, "local-token");
+        assert_eq!(identity.identity, "local-token");
+        assert_eq!(identity.issuer, "token");
+        assert_eq!(identity.policy.allowed_pools, vec!["*"]);
     }
 }

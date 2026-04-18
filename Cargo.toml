@@ -22,9 +22,13 @@ path = "src/crdgen.rs"
 name = "kobe"
 path = "src/cli/main.rs"
 
+[[bin]]
+name = "kubeconfig-publisher"
+path = "src/kubeconfig_publisher_bin.rs"
+
 [dependencies]
 # Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
-kube = { version = "3.0", features = ["runtime", "derive", "client"] }
+kube = { version = "3.0", features = ["runtime", "derive", "client", "ws"] }
 k8s-openapi = { version = "0.27", features = ["v1_32"] }
 
 # Web framework
@@ -41,6 +45,7 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+toml = "0.8"
 
 # Auth
 jsonwebtoken = "9"

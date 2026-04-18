@@ -63,6 +63,75 @@ pub(crate) fn forget_kubeconfig(endpoint: &str, lease_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remove_kubeconfig(endpoint: &str, lease_id: &str) -> Result<Option<PathBuf>> {
+    let recorded = if let Ok(state) = CliState::load() {
+        state
+            .lease_artifacts
+            .get(&lease_key(endpoint, lease_id))
+            .map(|artifact| PathBuf::from(&artifact.kubeconfig_path))
+    } else {
+        None
+    };
+
+    forget_kubeconfig(endpoint, lease_id)?;
+
+    let path = recorded.unwrap_or_else(|| default_kubeconfig_path(lease_id));
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        return Ok(Some(path));
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn endpoint_kubeconfigs(endpoint: &str) -> Result<Vec<PathBuf>> {
+    let state = CliState::load()?;
+    let prefix = format!("{endpoint}::");
+    Ok(state
+        .lease_artifacts
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, artifact)| PathBuf::from(&artifact.kubeconfig_path))
+        .collect())
+}
+
+pub(crate) fn forget_endpoint_kubeconfigs(endpoint: &str) -> Result<()> {
+    let mut state = CliState::load()?;
+    let prefix = format!("{endpoint}::");
+    state
+        .lease_artifacts
+        .retain(|key, _| !key.starts_with(&prefix));
+    state.save()?;
+    Ok(())
+}
+
+pub(crate) fn local_kubeconfig_candidates() -> Result<Vec<PathBuf>> {
+    let kube_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".kube");
+    if !kube_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&kube_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        let is_current_style = name.starts_with("kobe-") && name.ends_with(".yaml");
+        let is_legacy_style = name.starts_with("kobe-lease-");
+        if !(is_current_style || is_legacy_style) {
+            continue;
+        }
+        candidates.push(path);
+    }
+
+    Ok(candidates)
+}
+
 pub(crate) fn resolve_kubeconfig_path(endpoint: &str, lease_id: &str) -> Option<String> {
     if let Ok(state) = CliState::load() {
         if let Some(artifact) = state.lease_artifacts.get(&lease_key(endpoint, lease_id)) {

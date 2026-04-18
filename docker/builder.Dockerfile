@@ -2,11 +2,14 @@
 # Builder — compile both release binaries
 # Used as a named context by operator and kobe-sync Dockerfiles via Bake.
 # =============================================================================
-FROM rust:1.93-slim-bookworm AS deps
+FROM rust:1-slim-bookworm AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN rustup toolchain install 1.95.0 && \
+    rustup default 1.95.0
 
 WORKDIR /app
 
@@ -27,5 +30,5 @@ ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 COPY . .
-RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe && \
-    ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe
+RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe --bin kubeconfig-publisher && \
+    ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe target/release/kubeconfig-publisher

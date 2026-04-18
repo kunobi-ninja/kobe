@@ -1,4 +1,4 @@
-native_platform := arch() + if arch() == "x86_64" { "/amd64" } else { "/arm64" }
+native_platform := "linux/" + if arch() == "x86_64" { "amd64" } else { "arm64" }
 
 # Show available recipes
 default:
@@ -46,12 +46,27 @@ run *args:
 # Lease a real warm cluster, verify kubectl can reach it, then release it
 [group('dev')]
 test-smoke pool='ci-small' ttl='2m' *args:
-    @bun run ./hack/test-smoke.ts {{ pool }} {{ ttl }} {{ args }}
+    @mise exec -- bun run ./hack/test-smoke.ts {{ pool }} {{ ttl }} {{ args }}
 
 # Lease one warm cluster and verify the pool refills back to the warm target
 [group('dev')]
 test-smoke-pool pool='ci-small' ttl='2m' *args:
-    @bun run ./hack/test-smoke-pool.ts {{ pool }} {{ ttl }} {{ args }}
+    @mise exec -- bun run ./hack/test-smoke-pool.ts {{ pool }} {{ ttl }} {{ args }}
+
+# Local e2e environment entrypoint
+[group('dev')]
+e2e *args:
+    @mise exec -- bun run ./hack/e2e.ts {{ args }}
+
+# Create or refresh the local e2e cluster
+[group('dev')]
+e2e-up *args:
+    @mise exec -- bun run ./hack/e2e.ts up {{ args }}
+
+# Delete the local e2e cluster
+[group('dev')]
+e2e-down *args:
+    @mise exec -- bun run ./hack/e2e.ts down {{ args }}
 
 # Regenerate CRD YAML files from Rust types
 [group('build')]

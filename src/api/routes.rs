@@ -21,7 +21,7 @@ use crate::api::connect::{
     validate_lease_connect_token,
 };
 use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
-use crate::backend::ClusterBackend;
+use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
 use crate::metrics;
@@ -35,6 +35,7 @@ pub struct AppState<B: ClusterBackend> {
     pub authenticator: Arc<JwtAuthenticator>,
     pub namespace: String,
     pub backend: B,
+    pub factory: Option<BackendFactory>,
 }
 
 /// Implement kunobi-auth's AuthnProvider so that RequiredAuth/OptionalAuth extractors work.
@@ -52,10 +53,16 @@ impl<B: ClusterBackend + Clone + Send + Sync + 'static> AuthnProvider for AppSta
             .await
             .map_err(|e| kunobi_auth::AuthError::Unauthorized(e.to_string()))?;
 
+        let method = if kobe_identity.issuer == "token" {
+            "token"
+        } else {
+            "oidc"
+        };
+
         Ok(kunobi_auth::AuthIdentity {
             provider: kobe_identity.requester_type,
             identity: kobe_identity.identity,
-            method: "oidc".to_string(),
+            method: method.to_string(),
             claims: std::collections::HashMap::new(),
         })
     }
@@ -70,6 +77,17 @@ const CONNECT_PROXY_LOG_HEADER_LIMIT: usize = 12;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 static API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut rendered = err.to_string();
+    let mut current = err.source();
+    while let Some(source) = current {
+        rendered.push_str(": ");
+        rendered.push_str(&source.to_string());
+        current = source.source();
+    }
+    rendered
+}
 
 /// Build the axum router with all API routes.
 ///
@@ -899,24 +917,118 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         );
     };
 
-    let raw_kubeconfig = match state
-        .backend
-        .extract_kubeconfig(cluster_name, &state.namespace)
-        .await
-    {
-        Ok(kubeconfig) => kubeconfig,
-        Err(err) => {
-            warn!(
-                request_id = %request_id,
-                lease_id = %lease_id,
-                cluster = %cluster_name,
-                error = %err,
-                "Connect proxy failed to extract backend kubeconfig"
-            );
-            return connect_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Failed to extract backend kubeconfig: {err}"),
-            );
+    let mut chosen_backend = "fallback".to_string();
+    let raw_kubeconfig = if let Some(factory) = state.factory.as_ref() {
+        let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+        match pools_api.get(&lease.spec.pool_ref).await {
+            Ok(pool) => {
+                chosen_backend = format!("{:?}", pool.spec.backend.backend_type);
+                match factory.backend_for(&pool) {
+                    Ok(backend) => match backend
+                        .extract_kubeconfig(cluster_name, &state.namespace)
+                        .await
+                    {
+                        Ok(kubeconfig) => kubeconfig,
+                        Err(err) => {
+                            warn!(
+                                request_id = %request_id,
+                                lease_id = %lease_id,
+                                pool = %lease.spec.pool_ref,
+                                cluster = %cluster_name,
+                                backend = %chosen_backend,
+                                error = %err,
+                                "Connect proxy failed to extract backend kubeconfig"
+                            );
+                            return connect_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("Failed to extract backend kubeconfig: {err}"),
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        warn!(
+                            request_id = %request_id,
+                            lease_id = %lease_id,
+                            pool = %lease.spec.pool_ref,
+                            cluster = %cluster_name,
+                            error = %err,
+                            "Connect proxy failed to resolve backend for pool, falling back"
+                        );
+                        chosen_backend = "fallback".to_string();
+                        match state
+                            .backend
+                            .extract_kubeconfig(cluster_name, &state.namespace)
+                            .await
+                        {
+                            Ok(kubeconfig) => kubeconfig,
+                            Err(err) => {
+                                warn!(
+                                    request_id = %request_id,
+                                    lease_id = %lease_id,
+                                    cluster = %cluster_name,
+                                    error = %err,
+                                    "Connect proxy failed to extract backend kubeconfig"
+                                );
+                                return connect_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    format!("Failed to extract backend kubeconfig: {err}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    pool = %lease.spec.pool_ref,
+                    cluster = %cluster_name,
+                    error = %err,
+                    "Connect proxy failed to load pool for backend resolution, falling back"
+                );
+                match state
+                    .backend
+                    .extract_kubeconfig(cluster_name, &state.namespace)
+                    .await
+                {
+                    Ok(kubeconfig) => kubeconfig,
+                    Err(err) => {
+                        warn!(
+                            request_id = %request_id,
+                            lease_id = %lease_id,
+                            cluster = %cluster_name,
+                            error = %err,
+                            "Connect proxy failed to extract backend kubeconfig"
+                        );
+                        return connect_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("Failed to extract backend kubeconfig: {err}"),
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        match state
+            .backend
+            .extract_kubeconfig(cluster_name, &state.namespace)
+            .await
+        {
+            Ok(kubeconfig) => kubeconfig,
+            Err(err) => {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    cluster = %cluster_name,
+                    error = %err,
+                    "Connect proxy failed to extract backend kubeconfig"
+                );
+                return connect_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to extract backend kubeconfig: {err}"),
+                );
+            }
         }
     };
 
@@ -954,7 +1066,9 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     info!(
         request_id = %request_id,
         lease_id = %lease_id,
+        pool = %lease.spec.pool_ref,
         cluster = %cluster_name,
+        backend = %chosen_backend,
         upstream = %backend.server,
         method = %method,
         path = %request_path,
@@ -1021,7 +1135,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 upstream = %backend.server,
                 method = %method,
                 path = %request_path,
-                error = %err,
+                error = %error_chain(&err),
                 "Connect proxy failed to reach leased cluster"
             );
             return connect_error(
@@ -1816,6 +1930,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
+            factory: None,
         };
 
         (build_router(state), server)
@@ -1944,6 +2059,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
+            factory: None,
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -2015,6 +2131,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
+            factory: None,
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -2082,6 +2199,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
+            factory: None,
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(

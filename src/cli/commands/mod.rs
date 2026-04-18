@@ -3,7 +3,9 @@ mod config_tui;
 mod lease_create;
 mod leases;
 mod login;
+mod picker;
 mod pools;
+mod purge;
 mod release;
 mod state;
 mod status;
@@ -19,6 +21,7 @@ pub use config::{
 pub use config_tui::run_config_tui as config_interactive;
 pub use lease_create::{LeaseCreateCommand, lease_create};
 pub use login::{login, logout};
+pub use purge::purge;
 pub use release::release;
 pub use status::status;
 pub use version::version;

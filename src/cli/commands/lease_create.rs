@@ -1,15 +1,18 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_yaml_ng::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::config::CliConfig;
 use super::leases::LeaseDetail;
+use super::picker::{PickerItem, run_picker};
+use super::pools::fetch_pools_for_config;
 use super::state::record_kubeconfig;
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
 
 pub struct LeaseCreateCommand<'a> {
-    pub pool: &'a str,
+    pub pool: Option<&'a str>,
     pub ttl: &'a str,
     pub no_wait: bool,
     pub wait_timeout: Option<&'a str>,
@@ -49,8 +52,12 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(command.target_override, command.endpoint_override)?;
     let endpoint = config.endpoint.as_str();
+    let pool = match command.pool {
+        Some(pool) => pool.to_string(),
+        None => select_pool_for_lease(&config, command.output).await?,
+    };
     let body_json = serde_json::json!({
-        "profile": command.pool,
+        "profile": pool,
         "ttl": command.ttl,
     });
     let body_bytes = serde_json::to_vec(&body_json)?;
@@ -97,7 +104,12 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
         .kubeconfig
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Lease {} became bound without kubeconfig", ready.id))?;
-    let path = write_kubeconfig(&accepted.id, kubeconfig, command.kubeconfig_path)?;
+    let path = write_kubeconfig(
+        &accepted.id,
+        &accepted.profile,
+        kubeconfig,
+        command.kubeconfig_path,
+    )?;
     if let Err(err) = record_kubeconfig(&config.endpoint, &accepted.id, &path) {
         eprintln!(
             "Warning: failed to record local kubeconfig path for {}: {err}",
@@ -106,6 +118,49 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     }
 
     emit_ready_output(&ready, accepted.effective_ttl, path, command.output)
+}
+
+async fn select_pool_for_lease(
+    config: &super::config::ResolvedConfig,
+    output: OutputFormat,
+) -> Result<String> {
+    let pools = fetch_pools_for_config(config).await?;
+    if pools.is_empty() {
+        anyhow::bail!("No pools available");
+    }
+
+    if output == OutputFormat::Json {
+        return Ok(pools[0].name.clone());
+    }
+
+    let items: Vec<PickerItem> = pools
+        .iter()
+        .map(|pool| PickerItem {
+            primary: pool.name.clone(),
+            secondary: format!(
+                "ready={} leased={} creating={} queue={}  {}",
+                pool.ready,
+                pool.leased,
+                pool.creating,
+                pool.queue_depth,
+                pool.policy
+                    .as_ref()
+                    .map(|policy| format!(
+                        "warm {} [max {}]",
+                        policy.warm_target,
+                        policy.max_clusters.unwrap_or(policy.warm_target)
+                    ))
+                    .unwrap_or_else(|| "no policy".to_string())
+            ),
+        })
+        .collect();
+
+    let idx = run_picker(
+        "Lease Pool",
+        "Use ↑/↓ and Enter. Press q or Esc to cancel.",
+        &items,
+    )?;
+    Ok(pools[idx].name.clone())
 }
 
 fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -> Result<()> {
@@ -243,16 +298,18 @@ fn parse_wait_timeout(wait_timeout: Option<&str>) -> Result<Option<Instant>> {
 
 fn write_kubeconfig(
     lease_id: &str,
+    pool: &str,
     kubeconfig: &str,
     kubeconfig_path: Option<&str>,
 ) -> Result<PathBuf> {
     let path = match kubeconfig_path {
         Some(p) => PathBuf::from(p),
-        None => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".kube")
-            .join(format!("kobe-{lease_id}")),
+        None => default_named_kubeconfig_path(pool, lease_id),
     };
+
+    let kubeconfig =
+        rewrite_local_kubeconfig_names(kubeconfig, &local_kubeconfig_alias(pool, lease_id))
+            .unwrap_or_else(|_| kubeconfig.to_string());
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -265,6 +322,71 @@ fn write_kubeconfig(
     }
 
     Ok(path)
+}
+
+fn short_lease_id(lease_id: &str) -> &str {
+    lease_id
+        .strip_prefix("lease-")
+        .unwrap_or(lease_id)
+        .get(..8)
+        .unwrap_or_else(|| lease_id.strip_prefix("lease-").unwrap_or(lease_id))
+}
+
+fn local_kubeconfig_alias(pool: &str, lease_id: &str) -> String {
+    format!("kobe-{pool}-{}", short_lease_id(lease_id))
+}
+
+fn default_named_kubeconfig_path(pool: &str, lease_id: &str) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".kube")
+        .join(format!("{}.yaml", local_kubeconfig_alias(pool, lease_id)))
+}
+
+fn rewrite_local_kubeconfig_names(kubeconfig: &str, alias: &str) -> Result<String> {
+    let mut doc: Value = serde_yaml_ng::from_str(kubeconfig)?;
+
+    if let Some(clusters) = doc.get_mut("clusters").and_then(Value::as_sequence_mut) {
+        if let Some(cluster) = clusters.first_mut() {
+            if let Some(name) = cluster.get_mut("name") {
+                *name = Value::String(alias.to_string());
+            }
+        }
+    }
+
+    if let Some(current_context) = doc.get_mut("current-context") {
+        *current_context = Value::String(alias.to_string());
+    }
+
+    if let Some(contexts) = doc.get_mut("contexts").and_then(Value::as_sequence_mut) {
+        if let Some(context) = contexts.first_mut() {
+            if let Some(name) = context.get_mut("name") {
+                *name = Value::String(alias.to_string());
+            }
+            if let Some(cluster) = context
+                .get_mut("context")
+                .and_then(|ctx| ctx.get_mut("cluster"))
+            {
+                *cluster = Value::String(alias.to_string());
+            }
+            if let Some(user) = context
+                .get_mut("context")
+                .and_then(|ctx| ctx.get_mut("user"))
+            {
+                *user = Value::String(alias.to_string());
+            }
+        }
+    }
+
+    if let Some(users) = doc.get_mut("users").and_then(Value::as_sequence_mut) {
+        if let Some(user) = users.first_mut() {
+            if let Some(name) = user.get_mut("name") {
+                *name = Value::String(alias.to_string());
+            }
+        }
+    }
+
+    Ok(serde_yaml_ng::to_string(&doc)?)
 }
 
 fn parse_cli_duration(s: &str) -> Option<Duration> {
@@ -349,5 +471,39 @@ mod tests {
         assert_eq!(parse_cli_duration(""), None);
         assert_eq!(parse_cli_duration("10"), None);
         assert_eq!(parse_cli_duration("5d"), None);
+    }
+
+    #[test]
+    fn short_lease_id_strips_prefix_and_truncates() {
+        assert_eq!(short_lease_id("lease-9ff83245ea0f"), "9ff83245");
+        assert_eq!(short_lease_id("abc"), "abc");
+    }
+
+    #[test]
+    fn rewrite_local_kubeconfig_names_uses_alias_for_context_and_user() {
+        let raw = r#"apiVersion: v1
+kind: Config
+clusters:
+- name: pool-ci-k3s-small
+  cluster:
+    server: https://example
+contexts:
+- name: lease-abc
+  context:
+    cluster: pool-ci-k3s-small
+    user: lease-abc
+current-context: lease-abc
+users:
+- name: lease-abc
+  user:
+    token: test
+"#;
+
+        let rewritten = rewrite_local_kubeconfig_names(raw, "kobe-ci-k3s-small-9ff83245").unwrap();
+        assert!(rewritten.contains("current-context: kobe-ci-k3s-small-9ff83245"));
+        assert!(rewritten.contains("- name: kobe-ci-k3s-small-9ff83245"));
+        assert!(rewritten.contains("user: kobe-ci-k3s-small-9ff83245"));
+        assert!(rewritten.contains("cluster: kobe-ci-k3s-small-9ff83245"));
+        assert!(!rewritten.contains("name: pool-ci-k3s-small"));
     }
 }

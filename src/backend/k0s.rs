@@ -6,7 +6,8 @@
 //! - A **token Secret** for inter-node authentication
 //! - A **k0s.yaml ConfigMap** with cluster configuration (including datastore settings)
 //! - A **server StatefulSet** running `k0s controller --enable-worker`
-//! - A **kubeconfig-publisher sidecar** that creates the `{name}-kubeconfig` Secret
+//! - A **kubeconfig-publisher sidecar** that reads the generated admin
+//!   kubeconfig and publishes the `{name}-kubeconfig` Secret via `kube-rs`
 //! - A **ClusterIP Service** exposing port 6443
 //! - Optionally, an **agent Deployment** running `k0s worker`
 //!
@@ -23,7 +24,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PropagationPolicy};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
@@ -40,6 +41,8 @@ pub const DB_PREFIX: &str = "k0s_";
 
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kobe-operator";
+const DEFAULT_K0S_POD_CIDR: &str = "10.248.0.0/16";
+const DEFAULT_K0S_SERVICE_CIDR: &str = "10.128.0.0/16";
 
 /// Convert a k0s semver version to a valid Docker image reference.
 ///
@@ -49,28 +52,6 @@ const MANAGED_BY: &str = "kobe-operator";
 fn k0s_image(version: &str) -> String {
     format!("k0sproject/k0s:{}", version.replace('+', "-"))
 }
-
-/// The kubeconfig publisher sidecar script, mounted from a ConfigMap.
-///
-/// Waits for k0s to generate the admin kubeconfig at `/var/lib/k0s/pki/admin.conf`,
-/// rewrites the server URL to the ClusterIP Service address, and creates/updates
-/// a Kubernetes Secret.
-const KUBECONFIG_PUBLISHER_SCRIPT: &str = r#"#!/bin/sh
-set -e
-echo "Waiting for kubeconfig to appear..."
-while [ ! -f /var/lib/k0s/pki/admin.conf ]; do sleep 1; done
-echo "Kubeconfig found, rewriting server URL..."
-cp /var/lib/k0s/pki/admin.conf /tmp/kubeconfig
-sed -i "s|https://localhost:6443|https://${CLUSTER_NAME}-server.${NAMESPACE}.svc:6443|" /tmp/kubeconfig
-sed -i "s|https://127.0.0.1:6443|https://${CLUSTER_NAME}-server.${NAMESPACE}.svc:6443|" /tmp/kubeconfig
-echo "Publishing kubeconfig as Secret..."
-kubectl create secret generic ${CLUSTER_NAME}-kubeconfig \
-  --from-file=kubeconfig=/tmp/kubeconfig \
-  --namespace=${NAMESPACE} \
-  -o yaml --dry-run=client | kubectl apply -f -
-echo "Kubeconfig Secret published, sleeping..."
-sleep infinity
-"#;
 
 /// Direct k0s backend -- manages k0s clusters via raw Kubernetes resources.
 #[derive(Clone)]
@@ -173,6 +154,8 @@ spec:
   storage:
 {storage_section}
   network:
+    podCIDR: {DEFAULT_K0S_POD_CIDR}
+    serviceCIDR: {DEFAULT_K0S_SERVICE_CIDR}
     provider: kuberouter
 "#
         );
@@ -236,41 +219,6 @@ spec:
         Ok(())
     }
 
-    /// Create the ConfigMap containing the kubeconfig publisher script.
-    async fn create_publisher_configmap(&self, name: &str, namespace: &str) -> Result<()> {
-        let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
-        let cm_name = format!("{name}-kubeconfig-publisher");
-
-        let cm = ConfigMap {
-            metadata: ObjectMeta {
-                name: Some(cm_name.clone()),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name)),
-                ..Default::default()
-            },
-            data: Some({
-                let mut data = BTreeMap::new();
-                data.insert(
-                    "publish.sh".to_string(),
-                    KUBECONFIG_PUBLISHER_SCRIPT.to_string(),
-                );
-                data
-            }),
-            ..Default::default()
-        };
-
-        cms.patch(
-            &cm_name,
-            &PatchParams::apply("kobe-operator").force(),
-            &Patch::Apply(&cm),
-        )
-        .await
-        .with_context(|| format!("Failed to apply publisher ConfigMap {cm_name}"))?;
-
-        debug!(cluster = name, "Publisher ConfigMap applied");
-        Ok(())
-    }
-
     /// Create the ConfigMap containing the k0s.yaml cluster configuration.
     async fn create_k0s_config_configmap(
         &self,
@@ -300,24 +248,21 @@ spec:
     fn build_server_container(name: &str, namespace: &str, config: &ClusterConfig) -> Container {
         let image = k0s_image(&config.version);
 
-        let args = vec![
+        let mut args = vec![
             "controller".to_string(),
             format!("--config=/etc/k0s/k0s.yaml"),
             "--enable-worker".to_string(),
-            format!("--token-file=/var/lib/k0s/token/token"),
         ];
+        if config.servers > 1 {
+            args.push("--token-file=/var/lib/k0s/token/token".to_string());
+        }
 
         let mut volume_mounts = vec![
             VolumeMount {
-                name: "token".to_string(),
-                mount_path: "/var/lib/k0s/token".to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-            VolumeMount {
                 name: "k0s-config".to_string(),
-                mount_path: "/etc/k0s".to_string(),
+                mount_path: "/etc/k0s/k0s.yaml".to_string(),
                 read_only: Some(true),
+                sub_path: Some("k0s.yaml".to_string()),
                 ..Default::default()
             },
             VolumeMount {
@@ -326,6 +271,18 @@ spec:
                 ..Default::default()
             },
         ];
+
+        if config.servers > 1 {
+            volume_mounts.insert(
+                0,
+                VolumeMount {
+                    name: "token".to_string(),
+                    mount_path: "/var/lib/k0s/token".to_string(),
+                    read_only: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
 
         // If persistence is configured, mount data volume
         if config.persistence.is_some() {
@@ -360,10 +317,8 @@ spec:
                 ..Default::default()
             }),
             liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
-                http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                    path: Some("/healthz".to_string()),
+                tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
                     port: IntOrString::Int(6443),
-                    scheme: Some("HTTPS".to_string()),
                     ..Default::default()
                 }),
                 initial_delay_seconds: Some(30),
@@ -379,11 +334,14 @@ spec:
     }
 
     /// Build the kubeconfig publisher sidecar container.
-    fn build_publisher_sidecar(name: &str, namespace: &str, k0s_image: &str) -> Container {
+    fn build_publisher_sidecar(name: &str, namespace: &str) -> Container {
+        let image = std::env::var("KUBECONFIG_PUBLISHER_IMAGE")
+            .unwrap_or_else(|_| "zondax/kobe-operator:latest".to_string());
+
         Container {
             name: "kubeconfig-publisher".to_string(),
-            image: Some(k0s_image.to_string()),
-            command: Some(vec!["sh".to_string(), "/scripts/publish.sh".to_string()]),
+            image: Some(image),
+            command: Some(vec!["/kubeconfig-publisher".to_string()]),
             env: Some(vec![
                 EnvVar {
                     name: "CLUSTER_NAME".to_string(),
@@ -395,21 +353,26 @@ spec:
                     value: Some(namespace.to_string()),
                     ..Default::default()
                 },
-            ]),
-            volume_mounts: Some(vec![
-                VolumeMount {
-                    name: "k0s-data".to_string(),
-                    mount_path: "/var/lib/k0s".to_string(),
-                    read_only: Some(true),
+                EnvVar {
+                    name: "KUBECONFIG_PATH".to_string(),
+                    value: Some("/var/lib/k0s/pki/admin.conf".to_string()),
                     ..Default::default()
                 },
-                VolumeMount {
-                    name: "publisher-script".to_string(),
-                    mount_path: "/scripts".to_string(),
-                    read_only: Some(true),
+                EnvVar {
+                    name: "RUST_LOG".to_string(),
+                    value: Some(
+                        std::env::var("RUST_LOG")
+                            .unwrap_or_else(|_| "kubeconfig_publisher=info".to_string()),
+                    ),
                     ..Default::default()
                 },
             ]),
+            volume_mounts: Some(vec![VolumeMount {
+                name: "k0s-data".to_string(),
+                mount_path: "/var/lib/k0s".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            }]),
             ..Default::default()
         }
     }
@@ -417,20 +380,6 @@ spec:
     /// Build the volumes list for the server pod.
     fn build_server_volumes(name: &str, config: &ClusterConfig) -> Vec<Volume> {
         let mut volumes = vec![
-            // Token secret mount
-            Volume {
-                name: "token".to_string(),
-                secret: Some(SecretVolumeSource {
-                    secret_name: Some(format!("{name}-token")),
-                    items: Some(vec![KeyToPath {
-                        key: "token".to_string(),
-                        path: "token".to_string(),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
             // k0s config ConfigMap mount
             Volume {
                 name: "k0s-config".to_string(),
@@ -440,7 +389,7 @@ spec:
                 }),
                 ..Default::default()
             },
-            // Shared k0s data volume (controller writes kubeconfig here, sidecar reads it)
+            // Shared k0s data volume
             Volume {
                 name: "k0s-data".to_string(),
                 empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
@@ -448,17 +397,26 @@ spec:
                 }),
                 ..Default::default()
             },
-            // Publisher script ConfigMap
-            Volume {
-                name: "publisher-script".to_string(),
-                config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                    name: format!("{name}-kubeconfig-publisher"),
-                    default_mode: Some(0o755),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
         ];
+
+        if config.servers > 1 {
+            volumes.insert(
+                0,
+                Volume {
+                    name: "token".to_string(),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some(format!("{name}-token")),
+                        items: Some(vec![KeyToPath {
+                            key: "token".to_string(),
+                            path: "token".to_string(),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
 
         // Data volume -- PVC if persistence is configured, otherwise emptyDir
         if config.persistence.is_some() {
@@ -479,7 +437,6 @@ spec:
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
     ) -> StatefulSet {
-        let k0s_image = k0s_image(&config.version);
         let labels = Self::server_labels(name);
 
         // Build the k0s.yaml so the ConfigMap is consistent but note: the
@@ -487,7 +444,7 @@ spec:
         let _ = datastore_endpoint; // used to select kine vs etcd in the config
 
         let server_container = Self::build_server_container(name, namespace, config);
-        let publisher_sidecar = Self::build_publisher_sidecar(name, namespace, &k0s_image);
+        let publisher_sidecar = Self::build_publisher_sidecar(name, namespace);
         let volumes = Self::build_server_volumes(name, config);
 
         StatefulSet {
@@ -513,7 +470,8 @@ spec:
                         containers: vec![server_container, publisher_sidecar],
                         volumes: Some(volumes),
                         service_account_name: Some(
-                            std::env::var("POOL_SERVICE_ACCOUNT")
+                            std::env::var("POOL_PUBLISHER_SERVICE_ACCOUNT")
+                                .or_else(|_| std::env::var("POOL_SERVICE_ACCOUNT"))
                                 .unwrap_or_else(|_| "kobe-operator".to_string()),
                         ),
                         ..Default::default()
@@ -634,9 +592,9 @@ spec:
         }
     }
 
-    /// Wait for the kubeconfig Secret to appear (created by the sidecar).
+    /// Wait for the kubeconfig Secret to appear (created by the publisher sidecar).
     async fn wait_ready(&self, name: &str, namespace: &str) -> Result<()> {
-        info!(cluster = name, "Waiting for k0s cluster kubeconfig Secret");
+        info!(cluster = name, "Waiting for k0s cluster kubeconfig");
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-kubeconfig");
@@ -658,7 +616,7 @@ spec:
                             cluster = name,
                             attempt = attempt + 1,
                             elapsed_seconds = attempt * 5,
-                            "Waiting for k0s cluster kubeconfig Secret"
+                            "Waiting for k0s cluster kubeconfig"
                         );
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -791,11 +749,38 @@ spec:
             + 'static,
         <K as kube::Resource>::DynamicType: Default,
     {
-        match api.delete(name, &DeleteParams::default()).await {
+        let dp = DeleteParams {
+            propagation_policy: Some(PropagationPolicy::Foreground),
+            ..DeleteParams::default()
+        };
+        match api.delete(name, &dp).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn wait_deleted<K>(api: &Api<K>, name: &str) -> Result<()>
+    where
+        K: kube::Resource
+            + Clone
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        <K as kube::Resource>::DynamicType: Default,
+    {
+        for _ in 0..60 {
+            match api.get_opt(name).await {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+                Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        anyhow::bail!("resource {name} was not deleted within 60 seconds")
     }
 }
 
@@ -818,10 +803,7 @@ impl ClusterBackend for K0sBackend {
         // 1. Create token secret
         self.create_token_secret(name, namespace).await?;
 
-        // 2. Create publisher ConfigMap
-        self.create_publisher_configmap(name, namespace).await?;
-
-        // 3. If PostgreSQL configured, create per-cluster database
+        // 2. If PostgreSQL configured, create per-cluster database
         let datastore_endpoint =
             if let (Some(pool), Some(base_url)) = (&self.pg_pool, &self.pg_base_url) {
                 datastore::create_database(pool, name, DB_PREFIX).await?;
@@ -831,11 +813,11 @@ impl ClusterBackend for K0sBackend {
                 None
             };
 
-        // 4. Create k0s config ConfigMap
+        // 3. Create k0s config ConfigMap
         self.create_k0s_config_configmap(name, namespace, config, datastore_endpoint.as_deref())
             .await?;
 
-        // 5. Create server StatefulSet
+        // 4. Create server StatefulSet
         let sts =
             Self::build_server_statefulset(name, namespace, config, datastore_endpoint.as_deref());
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
@@ -850,7 +832,7 @@ impl ClusterBackend for K0sBackend {
             .with_context(|| format!("Failed to apply server StatefulSet for {name}"))?;
         info!(cluster = name, "Server StatefulSet applied");
 
-        // 6. Create Service
+        // 5. Create Service
         let svc = Self::build_service(name, namespace, config);
         let svc_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let svc_name = format!("{name}-server");
@@ -864,10 +846,10 @@ impl ClusterBackend for K0sBackend {
             .with_context(|| format!("Failed to apply Service for {name}"))?;
         info!(cluster = name, "Service applied");
 
-        // 7. Wait for kubeconfig Secret (created by sidecar)
+        // 6. Read kubeconfig from the server pod and publish Secret from the operator
         self.wait_ready(name, namespace).await?;
 
-        // 8. Create agent Deployment if requested
+        // 7. Create agent Deployment if requested
         if let Some(agents) = config.agents {
             if agents > 0 {
                 let deploy = Self::build_agent_deployment(name, namespace, config, agents);
@@ -885,7 +867,7 @@ impl ClusterBackend for K0sBackend {
             }
         }
 
-        // 9. Apply addons
+        // 8. Apply addons
         for addon in addons {
             self.apply_addon(name, namespace, addon).await?;
         }
@@ -908,14 +890,13 @@ impl ClusterBackend for K0sBackend {
 
         // Delete server StatefulSet
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
-        Self::delete_ignoring_not_found(&sts_api, &format!("{name}-server")).await?;
+        let sts_name = format!("{name}-server");
+        Self::delete_ignoring_not_found(&sts_api, &sts_name).await?;
+        Self::wait_deleted(&sts_api, &sts_name).await?;
 
         // Delete k0s config ConfigMap
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&cms, &format!("{name}-k0s-config")).await?;
-
-        // Delete publisher ConfigMap
-        Self::delete_ignoring_not_found(&cms, &format!("{name}-kubeconfig-publisher")).await?;
 
         // Delete secrets: token and kubeconfig
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
@@ -1012,6 +993,8 @@ mod tests {
         );
         assert!(yaml.contains("apiVersion: k0s.k0sproject.io/v1beta1"));
         assert!(yaml.contains("kind: ClusterConfig"));
+        assert!(yaml.contains("podCIDR: 10.248.0.0/16"));
+        assert!(yaml.contains("serviceCIDR: 10.128.0.0/16"));
         assert!(yaml.contains("provider: kuberouter"));
     }
 
@@ -1059,6 +1042,28 @@ mod tests {
         assert!(args.contains(&"controller".to_string()));
         assert!(args.contains(&"--config=/etc/k0s/k0s.yaml".to_string()));
         assert!(args.contains(&"--enable-worker".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("--token-file=")));
+    }
+
+    #[test]
+    fn test_multi_server_statefulset_enables_worker_and_token() {
+        let mut config = base_config();
+        config.servers = 3;
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+
+        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        let server = &pod_spec.containers[0];
+        let args = server.args.as_ref().unwrap();
+        let mounts = server.volume_mounts.as_ref().unwrap();
+        let volumes = pod_spec.volumes.as_ref().unwrap();
+
+        assert!(args.contains(&"--enable-worker".to_string()));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--token-file=/var/lib/k0s/token/token")
+        );
+        assert!(mounts.iter().any(|mount| mount.name == "token"));
+        assert!(volumes.iter().any(|volume| volume.name == "token"));
     }
 
     #[test]
@@ -1098,7 +1103,7 @@ mod tests {
         assert_eq!(spec.replicas, Some(1));
 
         let pod_spec = spec.template.spec.as_ref().unwrap();
-        assert_eq!(pod_spec.containers.len(), 2); // controller + sidecar
+        assert_eq!(pod_spec.containers.len(), 2);
     }
 
     #[test]
@@ -1173,10 +1178,16 @@ mod tests {
     }
 
     #[test]
-    fn test_publisher_sidecar_has_correct_env() {
-        let sidecar =
-            K0sBackend::build_publisher_sidecar("my-cluster", "ns", "k0sproject/k0s:v1.30.1-k0s.0");
+    fn test_publisher_sidecar_has_correct_env_and_mounts() {
+        let sidecar = K0sBackend::build_publisher_sidecar("my-cluster", "ns");
         let env = sidecar.env.as_ref().unwrap();
+        let mounts = sidecar.volume_mounts.as_ref().unwrap();
+
+        assert_eq!(sidecar.name, "kubeconfig-publisher");
+        assert_eq!(
+            sidecar.command.as_ref().unwrap(),
+            &vec!["/kubeconfig-publisher".to_string()]
+        );
         assert!(
             env.iter()
                 .any(|e| e.name == "CLUSTER_NAME" && e.value.as_deref() == Some("my-cluster"))
@@ -1185,15 +1196,10 @@ mod tests {
             env.iter()
                 .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns"))
         );
-    }
-
-    #[test]
-    fn test_publisher_sidecar_mounts() {
-        let sidecar =
-            K0sBackend::build_publisher_sidecar("c", "ns", "k0sproject/k0s:v1.30.1-k0s.0");
-        let mounts = sidecar.volume_mounts.as_ref().unwrap();
+        assert!(env.iter().any(|e| {
+            e.name == "KUBECONFIG_PATH" && e.value.as_deref() == Some("/var/lib/k0s/pki/admin.conf")
+        }));
         assert!(mounts.iter().any(|m| m.name == "k0s-data"));
-        assert!(mounts.iter().any(|m| m.name == "publisher-script"));
     }
 
     #[test]
@@ -1222,18 +1228,6 @@ mod tests {
         let data = cm.data.as_ref().unwrap();
         assert!(data.contains_key("k0s.yaml"));
         assert_eq!(data.get("k0s.yaml").unwrap(), yaml);
-    }
-
-    #[test]
-    fn test_kubeconfig_publisher_script_waits_for_k0s_path() {
-        assert!(
-            KUBECONFIG_PUBLISHER_SCRIPT.contains("/var/lib/k0s/pki/admin.conf"),
-            "Publisher script should wait for k0s admin.conf"
-        );
-        assert!(
-            !KUBECONFIG_PUBLISHER_SCRIPT.contains("/output/kubeconfig"),
-            "Publisher script should NOT reference k3s output path"
-        );
     }
 
     // =================================================================

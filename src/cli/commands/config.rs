@@ -171,20 +171,15 @@ fn is_default_auth(auth: &AuthMode) -> bool {
 
 impl CliConfig {
     pub fn load() -> Result<Self> {
-        let path = config_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = std::fs::read_to_string(&path)?;
-        let mut config: Self = serde_json::from_str(&data)?;
-        if config.migrate_legacy_to_default_target() {
-            config.save()?;
+        let mut config = Self::load_global()?;
+        if let Some(local) = Self::load_local()? {
+            config.overlay(local);
         }
         Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path()?;
+        let path = global_config_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -196,6 +191,55 @@ impl CliConfig {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
+    }
+
+    fn load_global() -> Result<Self> {
+        let path = global_config_path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let mut config: Self = serde_json::from_str(&data)?;
+        if config.migrate_legacy_to_default_target() {
+            config.save()?;
+        }
+        Ok(config)
+    }
+
+    fn load_local() -> Result<Option<Self>> {
+        let Some(path) = local_config_path()? else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let mut config: Self = toml::from_str(&data)?;
+        config.migrate_legacy_to_default_target();
+        Ok(Some(config))
+    }
+
+    fn overlay(&mut self, local: Self) {
+        if local.current_target.is_some() {
+            self.current_target = local.current_target;
+        }
+
+        for (name, target) in local.targets {
+            self.targets.insert(name, target);
+        }
+
+        if local.endpoint.is_some() {
+            self.endpoint = local.endpoint;
+        }
+        if local.auth != AuthMode::default() {
+            self.auth = local.auth;
+        }
+        if local.token.is_some() {
+            self.token = local.token;
+        }
+        if local.ssh_fingerprint.is_some() {
+            self.ssh_fingerprint = local.ssh_fingerprint;
+        }
     }
 
     fn migrate_legacy_to_default_target(&mut self) -> bool {
@@ -300,10 +344,16 @@ impl CliConfig {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
+fn global_config_path() -> Result<PathBuf> {
     let dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     Ok(dir.join("kobe").join("config.json"))
+}
+
+fn local_config_path() -> Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?;
+    Ok(Some(cwd.join(".kobe.toml")))
 }
 
 /// Show current config.
@@ -362,7 +412,7 @@ pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<(
     config.save()?;
 
     match output {
-        OutputFormat::Text => println!("Imported config into {}", config_path()?.display()),
+        OutputFormat::Text => println!("Imported config into {}", global_config_path()?.display()),
         OutputFormat::Json => print_json(&config_view_output(&config, None))?,
     }
 
@@ -487,10 +537,10 @@ pub async fn config_list_targets(output: OutputFormat) -> Result<()> {
 }
 
 fn config_view_output(config: &CliConfig, target_override: Option<&str>) -> ConfigViewOutput {
-    let path = config_path()
+    let path = global_config_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string());
-    let exists = config_path().map(|p| p.exists()).unwrap_or(false);
+    let exists = global_config_path().map(|p| p.exists()).unwrap_or(false);
     let resolved =
         config
             .resolve(target_override, None)
@@ -545,7 +595,7 @@ fn legacy_output(config: &CliConfig) -> Option<ConfigLegacyOutput> {
 }
 
 fn print_config(config: &CliConfig, target_override: Option<&str>) -> Result<()> {
-    let path = config_path()?;
+    let path = global_config_path()?;
     let exists = path.exists();
 
     println!("config:   {}", path.display());

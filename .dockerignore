@@ -1,5 +1,6 @@
 .git
 target
+.tmp
 tarpaulin-report.*
 docs
 *.md
@@ -7,3 +8,9 @@ docs
 .env.*
 .github
 .claude
+.codex
+.cursor
+.gemini
+.windsurf
+.mcp.json
+.kobe.toml

@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         authenticator: authenticator.clone(),
         namespace: namespace.clone(),
         backend: backend.clone(),
+        factory: Some(factory.clone()),
     };
 
     let app = build_router(state);
