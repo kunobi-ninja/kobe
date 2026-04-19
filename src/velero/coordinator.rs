@@ -1028,6 +1028,7 @@ mod tests {
                 expose: None,
             },
             addons: vec![],
+            bootstraps: vec![],
             resources: None,
             health_check: None,
             readiness_gates: vec![],

@@ -1,4 +1,5 @@
 pub mod access_policy;
+pub mod bootstrap_config;
 #[allow(dead_code)]
 pub mod datastore;
 pub mod instance;
@@ -6,6 +7,7 @@ pub mod lease;
 pub mod profile;
 
 pub use access_policy::*;
+pub use bootstrap_config::*;
 #[allow(unused_imports)]
 pub use datastore::*;
 pub use instance::*;
@@ -200,6 +202,7 @@ mod tests {
         assert!(spec.backend.is_none());
         assert!(spec.cluster.is_none());
         assert!(spec.addons.is_empty());
+        assert!(spec.bootstraps.is_empty());
         assert!(spec.health_check.is_none());
         assert!(spec.readiness_gates.is_empty());
         assert!(spec.snapshot.is_none());

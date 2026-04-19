@@ -23,6 +23,10 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::AccessPolicy::crd()).unwrap()
         ),
+        "bootstrapconfigs" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::BootstrapConfig::crd()).unwrap()
+        ),
         "kobestores" => print!(
             "{}",
             serde_yaml_ng::to_string(&crd::KobeStore::crd()).unwrap()
@@ -46,6 +50,11 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::AccessPolicy::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::BootstrapConfig::crd()).unwrap()
             );
             println!("---");
             print!(

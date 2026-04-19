@@ -8,11 +8,11 @@ use kube::{Client, ResourceExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::backend::{BackendFactory, ClusterBackend};
+use crate::backend::{BackendFactory, ClusterBackend, resolve_bootstrap_addons};
 use crate::crd::{
-    Addon, BackendConfig, BackendType, ClusterConfig, ClusterInstance, ClusterInstancePhase,
-    ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig, LeasePhase, ReadinessGate,
-    SnapshotConfig,
+    Addon, BackendConfig, BackendType, BootstrapRef, ClusterConfig, ClusterInstance,
+    ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig,
+    LeasePhase, ReadinessGate, SnapshotConfig,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -30,6 +30,7 @@ struct ResolvedInstanceConfig {
     backend: BackendConfig,
     cluster: ClusterConfig,
     addons: Vec<Addon>,
+    bootstraps: Vec<BootstrapRef>,
     health_check: Option<HealthCheckConfig>,
     readiness_gates: Vec<ReadinessGate>,
     snapshot: Option<SnapshotConfig>,
@@ -296,6 +297,7 @@ async fn resolve_instance_config(
             backend: profile.spec.backend,
             cluster: profile.spec.cluster,
             addons: profile.spec.addons,
+            bootstraps: profile.spec.bootstraps,
             health_check: profile.spec.health_check,
             readiness_gates: profile.spec.readiness_gates,
             snapshot: profile.spec.snapshot,
@@ -318,6 +320,7 @@ async fn resolve_instance_config(
         backend,
         cluster,
         addons: instance.spec.addons.clone(),
+        bootstraps: instance.spec.bootstraps.clone(),
         health_check: instance.spec.health_check.clone(),
         readiness_gates: instance.spec.readiness_gates.clone(),
         snapshot: instance.spec.snapshot.clone(),
@@ -508,7 +511,7 @@ fn backend_dispatch_for_config<B: ClusterBackend + Clone>(
                 ))
             }
             crate::crd::BackendType::Vkobe => Ok(crate::backend::BackendDispatch::Vkobe(
-                crate::backend::VkobeBackend::new(ctx.client.clone()),
+                crate::backend::VkobeBackend::new(ctx.client.clone(), config.backend.vkobe.clone()),
             )),
         }
     }
@@ -526,6 +529,7 @@ fn synthetic_profile(config: &ResolvedInstanceConfig) -> ClusterPool {
             backend: config.backend.clone(),
             cluster: config.cluster.clone(),
             addons: config.addons.clone(),
+            bootstraps: config.bootstraps.clone(),
             resources: None,
             health_check: config.health_check.clone(),
             readiness_gates: config.readiness_gates.clone(),
@@ -543,14 +547,17 @@ async fn create_instance_backend<B: ClusterBackend + Clone>(
     name: &str,
     namespace: &str,
 ) -> Result<(), anyhow::Error> {
+    let mut addons = config.addons.clone();
+    addons.extend(resolve_bootstrap_addons(&ctx.client, namespace, &config.bootstraps).await?);
+
     if ctx.factory.is_some() {
         let backend = backend_dispatch_for_config(ctx, config)?;
         backend
-            .create(name, namespace, &config.cluster, &config.addons)
+            .create(name, namespace, &config.cluster, &addons)
             .await
     } else {
         ctx.backend
-            .create(name, namespace, &config.cluster, &config.addons)
+            .create(name, namespace, &config.cluster, &addons)
             .await
     }
 }

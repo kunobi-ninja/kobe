@@ -605,6 +605,7 @@ async fn ensure_cluster_instance(
             backend: None,
             cluster: None,
             addons: Vec::new(),
+            bootstraps: Vec::new(),
             health_check: None,
             readiness_gates: Vec::new(),
             snapshot: None,

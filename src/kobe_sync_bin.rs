@@ -34,6 +34,8 @@ use kobe_sync::syncer::{self, SyncerContextV2};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // 1. Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

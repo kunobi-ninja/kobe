@@ -1,0 +1,43 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: bootstrapconfigs.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: BootstrapConfig
+    plural: bootstrapconfigs
+    shortNames:
+    - bc
+    singular: bootstrapconfig
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BootstrapConfigSpec via `CustomResource`
+        properties:
+          spec:
+            description: BootstrapConfig stores a reusable bootstrap bundle in the host cluster.
+            properties:
+              files:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: |-
+                  Bundle files keyed by file name.
+
+                  The initial MVP treats all `*.yaml` / `*.yml` entries as manifests and
+                  applies them in lexical order. This keeps the API ready for richer
+                  renderers later while already supporting built-in and custom bundles.
+                type: object
+            type: object
+        required:
+        - spec
+        title: BootstrapConfig
+        type: object
+    served: true
+    storage: true
+    subresources: {}

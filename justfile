@@ -48,6 +48,16 @@ run *args:
 test-smoke pool='ci-small' ttl='2m' *args:
     @mise exec -- bun run ./hack/test-smoke.ts {{ pool }} {{ ttl }} {{ args }}
 
+# Lease a local vkobe warm cluster, verify kubectl can reach it, then release it
+[group('dev')]
+test-smoke-vkobe ttl='2m' *args:
+    @mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-etcd {{ ttl }} {{ args }}
+
+# Lease a local vkobe+kine-sqlite warm cluster, verify API discovery, then release it
+[group('dev')]
+test-smoke-vkobe-kine ttl='2m' *args:
+    @mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-kine-sqlite {{ ttl }} {{ args }}
+
 # Lease one warm cluster and verify the pool refills back to the warm target
 [group('dev')]
 test-smoke-pool pool='ci-small' ttl='2m' *args:

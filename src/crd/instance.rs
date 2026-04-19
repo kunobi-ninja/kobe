@@ -3,7 +3,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::crd::{
-    Addon, BackendConfig, ClusterConfig, HealthCheckConfig, ReadinessGate, SnapshotConfig,
+    Addon, BackendConfig, BootstrapRef, ClusterConfig, HealthCheckConfig, ReadinessGate,
+    SnapshotConfig,
 };
 
 /// Reference to another Kobe-managed resource in the same namespace.
@@ -45,6 +46,10 @@ pub struct ClusterInstanceSpec {
     /// Standalone addons. Pool-managed instances derive this from the pool.
     #[serde(default)]
     pub addons: Vec<Addon>,
+
+    /// Standalone bootstraps. Pool-managed instances derive this from the pool.
+    #[serde(default)]
+    pub bootstraps: Vec<BootstrapRef>,
 
     /// Standalone health-check configuration. Pool-managed instances derive this from the pool.
     #[serde(default)]

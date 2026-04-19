@@ -26,7 +26,7 @@ use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, ClusterConfig, KobeStoreRef, ReadinessGate, VkobeConfig};
+use crate::crd::{Addon, ClusterConfig, KobeStore, KobeStoreRef, ReadinessGate, VkobeConfig};
 use crate::pki;
 
 use super::{
@@ -44,11 +44,59 @@ const DEFAULT_IMAGE: &str = "zondax/vkobe:latest";
 #[derive(Clone)]
 pub struct VkobeBackend {
     client: Client,
+    vkobe_config: Option<VkobeConfig>,
 }
 
 impl VkobeBackend {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(client: Client, vkobe_config: Option<VkobeConfig>) -> Self {
+        Self {
+            client,
+            vkobe_config,
+        }
+    }
+
+    fn effective_config(&self, config: &ClusterConfig) -> VkobeConfig {
+        self.vkobe_config
+            .clone()
+            .or_else(|| parse_kobe_sync_args(&config.server_args))
+            .unwrap_or(VkobeConfig {
+                data_store_ref: KobeStoreRef {
+                    name: "default".into(),
+                },
+                version: crate::crd::default_k8s_version(),
+                kcm: None,
+                syncers: vec![
+                    "pods".into(),
+                    "services".into(),
+                    "configmaps".into(),
+                    "secrets".into(),
+                    "endpoints".into(),
+                    "ingresses".into(),
+                ],
+                proxy_port: 8443,
+                metrics_port: 9090,
+            })
+    }
+
+    async fn resolve_store_endpoints(
+        &self,
+        namespace: &str,
+        config: &VkobeConfig,
+    ) -> Result<String> {
+        let stores: Api<KobeStore> = Api::namespaced(self.client.clone(), namespace);
+        let store = stores
+            .get(&config.data_store_ref.name)
+            .await
+            .with_context(|| format!("Failed to get KobeStore {}", config.data_store_ref.name))?;
+
+        if store.spec.endpoints.is_empty() {
+            anyhow::bail!(
+                "KobeStore {} has no endpoints configured",
+                config.data_store_ref.name
+            );
+        }
+
+        Ok(store.spec.endpoints.join(","))
     }
 
     /// Build a kube Client targeting the virtual cluster's API server.
@@ -225,33 +273,24 @@ impl ClusterBackend for VkobeBackend {
 
         // The namespace should already exist (Kobe creates it).
         // We need to find the kobe_sync config from server_args or default.
-        let kobe_sync_config = parse_kobe_sync_args(&config.server_args).unwrap_or(VkobeConfig {
-            data_store_ref: KobeStoreRef {
-                name: "default".into(),
-            },
-            version: crate::crd::default_k8s_version(),
-            kcm: None,
-            syncers: vec![
-                "pods".into(),
-                "services".into(),
-                "configmaps".into(),
-                "secrets".into(),
-                "endpoints".into(),
-                "ingresses".into(),
-            ],
-            proxy_port: 8443,
-            metrics_port: 9090,
-        });
+        let kobe_sync_config = self.effective_config(config);
 
         let kobe_sync_image =
             std::env::var("KOBE_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
 
-        // TODO: resolve KobeStore CRD to get actual etcd endpoints.
-        let etcd_endpoints = "https://etcd-0:2379";
+        let etcd_endpoints = self
+            .resolve_store_endpoints(namespace, &kobe_sync_config)
+            .await?;
+        info!(
+            cluster = name,
+            store = %kobe_sync_config.data_store_ref.name,
+            etcd_endpoints = %etcd_endpoints,
+            "Resolved vkobe store endpoints"
+        );
 
         // 1. Create ConfigMap (v2 — includes etcd connection info)
         let config_maps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
-        let cm = build_config_map_v2(name, namespace, &kobe_sync_config, etcd_endpoints);
+        let cm = build_config_map_v2(name, namespace, &kobe_sync_config, &etcd_endpoints);
         match config_maps.create(&PostParams::default(), &cm).await {
             Ok(_) => debug!(cluster = name, "ConfigMap created"),
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -321,6 +360,7 @@ impl ClusterBackend for VkobeBackend {
 
         // 4. Create RBAC resources for vkobe sidecar
         let (sa, role, rb, cr, crb) = build_rbac(name, namespace);
+        let host_auth_reader_binding = build_host_auth_reader_role_binding(name, namespace);
 
         // ServiceAccount
         let sa_api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
@@ -352,6 +392,19 @@ impl ClusterBackend for VkobeBackend {
             Err(e) => return Err(e).context("Failed to create RoleBinding"),
         }
 
+        // Host kube-system RoleBinding for extension-apiserver-authentication
+        let host_rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), "kube-system");
+        match host_rb_api
+            .create(&PostParams::default(), &host_auth_reader_binding)
+            .await
+        {
+            Ok(_) => debug!(cluster = name, "Host auth RoleBinding created"),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                debug!(cluster = name, "Host auth RoleBinding already exists");
+            }
+            Err(e) => return Err(e).context("Failed to create host auth RoleBinding"),
+        }
+
         // ClusterRole (cluster-scoped)
         let cr_api: Api<ClusterRole> = Api::all(self.client.clone());
         match cr_api.create(&PostParams::default(), &cr).await {
@@ -376,7 +429,13 @@ impl ClusterBackend for VkobeBackend {
 
         // 5. Create Deployment (v2 -- 3-container pod: apiserver + KCM + vkobe)
         let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-        let dep = build_deployment(name, namespace, &kobe_sync_config, &kobe_sync_image);
+        let dep = build_deployment(
+            name,
+            namespace,
+            &kobe_sync_config,
+            &etcd_endpoints,
+            &kobe_sync_image,
+        );
         match deployments.create(&PostParams::default(), &dep).await {
             Ok(_) => debug!(cluster = name, "Deployment created"),
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -503,6 +562,24 @@ impl ClusterBackend for VkobeBackend {
             Err(e) => warn!(cluster = name, error = %e, "Failed to delete RoleBinding"),
         }
 
+        // Host kube-system RoleBinding
+        let host_rb_name = format!("{name}-vkobe-auth-reader");
+        let host_rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), "kube-system");
+        match host_rb_api
+            .delete(&host_rb_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => debug!(cluster = name, "Host auth RoleBinding deleted"),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!(cluster = name, "Host auth RoleBinding already gone");
+            }
+            Err(e) => warn!(
+                cluster = name,
+                error = %e,
+                "Failed to delete host auth RoleBinding"
+            ),
+        }
+
         // Role (namespaced)
         let role_api: Api<Role> = Api::namespaced(self.client.clone(), namespace);
         match role_api.delete(&rbac_name, &DeleteParams::default()).await {
@@ -615,6 +692,16 @@ fn generate_client_cert(
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn normalize_kube_component_version(version: &str) -> String {
+    let trimmed = version.trim().trim_start_matches('v');
+    let parts: Vec<_> = trimmed.split('.').collect();
+    if parts.len() == 2 {
+        format!("v{trimmed}.0")
+    } else {
+        format!("v{trimmed}")
+    }
 }
 
 // ── RBAC for vkobe sidecar ─────────────────────────────────────────
@@ -766,6 +853,31 @@ fn build_rbac(
     (sa, role, role_binding, cluster_role, cluster_role_binding)
 }
 
+fn build_host_auth_reader_role_binding(name: &str, namespace: &str) -> RoleBinding {
+    let binding_name = format!("{name}-vkobe-auth-reader");
+    let sa_name = format!("{name}-vkobe");
+
+    RoleBinding {
+        metadata: ObjectMeta {
+            name: Some(binding_name),
+            namespace: Some("kube-system".to_string()),
+            labels: Some(VkobeBackend::cluster_labels(name)),
+            ..Default::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".into(),
+            kind: "Role".into(),
+            name: "extension-apiserver-authentication-reader".into(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".into(),
+            name: sa_name,
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        }]),
+    }
+}
+
 // ── v2: 3-container Deployment (kube-apiserver + KCM + vkobe) ──────
 
 /// Build the ConfigMap with etcd connection info for the virtual cluster.
@@ -832,16 +944,12 @@ pub fn build_deployment(
     name: &str,
     namespace: &str,
     kobe_sync_config: &VkobeConfig,
+    etcd_endpoints: &str,
     kobe_sync_image: &str,
 ) -> Deployment {
-    let version = &kobe_sync_config.version;
+    let version = normalize_kube_component_version(&kobe_sync_config.version);
     let proxy_port = kobe_sync_config.proxy_port;
     let metrics_port = kobe_sync_config.metrics_port;
-
-    // Derive etcd endpoints from the KobeStore ref. In production, the
-    // reconciler resolves the KobeStore CRD and passes the endpoints.
-    // For the build function, we use a placeholder that gets overridden.
-    let etcd_endpoints = "https://etcd-0:2379";
 
     let mut labels = BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
@@ -857,7 +965,7 @@ pub fn build_deployment(
     // ── Container 1: kube-apiserver ──────────────────────────────────
     let apiserver = Container {
         name: "kube-apiserver".to_string(),
-        image: Some(format!("registry.k8s.io/kube-apiserver:v{version}")),
+        image: Some(format!("registry.k8s.io/kube-apiserver:{version}")),
         command: Some(vec!["kube-apiserver".to_string()]),
         args: Some(vec![
             format!("--etcd-servers={etcd_endpoints}"),
@@ -902,9 +1010,7 @@ pub fn build_deployment(
     // ── Container 2: kube-controller-manager ─────────────────────────
     let kcm = Container {
         name: "kube-controller-manager".to_string(),
-        image: Some(format!(
-            "registry.k8s.io/kube-controller-manager:v{version}"
-        )),
+        image: Some(format!("registry.k8s.io/kube-controller-manager:{version}")),
         command: Some(vec!["kube-controller-manager".to_string()]),
         args: Some(vec![
             "--kubeconfig=/etc/kubernetes/controller-manager.conf".to_string(),
@@ -1087,6 +1193,13 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_kube_component_version_adds_patch() {
+        assert_eq!(normalize_kube_component_version("1.35"), "v1.35.0");
+        assert_eq!(normalize_kube_component_version("v1.35"), "v1.35.0");
+        assert_eq!(normalize_kube_component_version("1.35.1"), "v1.35.1");
+    }
+
+    #[test]
     fn test_base64_encode() {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert_eq!(base64_encode(b""), "");
@@ -1122,7 +1235,13 @@ mod tests {
     #[test]
     fn test_build_deployment_has_three_containers() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let containers = &dep
             .spec
             .as_ref()
@@ -1142,7 +1261,13 @@ mod tests {
     #[test]
     fn test_apiserver_container_has_etcd_flags() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let containers = &dep
             .spec
             .as_ref()
@@ -1163,7 +1288,10 @@ mod tests {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        assert!(args.iter().any(|a| a.starts_with("--etcd-servers=")));
+        assert!(
+            args.iter()
+                .any(|a| *a == "--etcd-servers=http://etcd.pool-prod.svc:2379")
+        );
         assert!(
             args.iter()
                 .any(|a| a.starts_with("--etcd-prefix=/kobe/cluster-1/"))
@@ -1173,7 +1301,13 @@ mod tests {
     #[test]
     fn test_kcm_container_has_disabled_controllers() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let containers = &dep
             .spec
             .as_ref()
@@ -1201,7 +1335,13 @@ mod tests {
     #[test]
     fn test_deployment_is_stateless() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let template = &dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         // No PVCs — stateless pod
         assert!(
@@ -1226,7 +1366,13 @@ mod tests {
     #[test]
     fn test_deployment_pki_volume_from_secret() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let volumes = dep
             .spec
             .as_ref()
@@ -1248,7 +1394,13 @@ mod tests {
     #[test]
     fn test_deployment_has_prometheus_annotations() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let annotations = dep
             .spec
             .as_ref()
@@ -1293,7 +1445,13 @@ mod tests {
     #[test]
     fn test_rbac_sa_name_matches_deployment() {
         let config = test_kobe_sync_config();
-        let dep = build_deployment("cluster-1", "pool-prod", &config, "test-image:latest");
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
         let (sa, ..) = build_rbac("cluster-1", "pool-prod");
 
         let sa_name_on_dep = dep
@@ -1443,6 +1601,27 @@ mod tests {
         assert_eq!(crb.role_ref.api_group, "rbac.authorization.k8s.io");
 
         let subject = &crb.subjects.as_ref().unwrap()[0];
+        assert_eq!(subject.kind, "ServiceAccount");
+        assert_eq!(subject.name, "test-cluster-vkobe");
+        assert_eq!(subject.namespace.as_deref(), Some("test-ns"));
+    }
+
+    #[test]
+    fn test_host_auth_reader_role_binding_references_builtin_role() {
+        let rb = build_host_auth_reader_role_binding("test-cluster", "test-ns");
+
+        assert_eq!(
+            rb.metadata.name.as_deref(),
+            Some("test-cluster-vkobe-auth-reader")
+        );
+        assert_eq!(rb.metadata.namespace.as_deref(), Some("kube-system"));
+        assert_eq!(rb.role_ref.kind, "Role");
+        assert_eq!(
+            rb.role_ref.name,
+            "extension-apiserver-authentication-reader"
+        );
+
+        let subject = &rb.subjects.as_ref().unwrap()[0];
         assert_eq!(subject.kind, "ServiceAccount");
         assert_eq!(subject.name, "test-cluster-vkobe");
         assert_eq!(subject.namespace.as_deref(), Some("test-ns"));

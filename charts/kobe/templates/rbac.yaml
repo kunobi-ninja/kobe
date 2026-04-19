@@ -40,7 +40,10 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
-    resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "events", "persistentvolumeclaims"]
+    resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]

@@ -12,8 +12,15 @@ const STATE_FILE = `${process.cwd()}/.tmp/e2e-state.json`;
 const DEMO_TOKEN = "e2e-dev-token";
 const DEMO_TOKEN_SECRET = "e2e-local-token";
 const DEMO_POLICY = "e2e-local-token";
-const DEMO_POOL = "e2e-k0s";
+const DEMO_K0S_POOL = "e2e-k0s";
 const DEMO_K0S_VERSION = "v1.35.1+k0s.0";
+const DEMO_VKOBE_ETCD_POOL = "e2e-vkobe-etcd";
+const DEMO_VKOBE_ETCD_STORE = "e2e-vkobe-store-etcd";
+const DEMO_VKOBE_ETCD_BACKEND = "e2e-vkobe-etcd";
+const DEMO_VKOBE_KINE_POOL = "e2e-vkobe-kine-sqlite";
+const DEMO_VKOBE_KINE_STORE = "e2e-vkobe-store-kine-sqlite";
+const DEMO_VKOBE_KINE_BACKEND = "e2e-vkobe-kine-sqlite";
+const DEMO_VKOBE_VERSION = "1.35";
 const LOCAL_TARGET = "e2e";
 const LOCAL_ENDPOINT = "http://127.0.0.1:8080";
 const LOCAL_NODE_PORT = 30080;
@@ -251,6 +258,10 @@ function nativePlatform(): string {
   return process.arch === "x64" ? "linux/amd64" : "linux/arm64";
 }
 
+function kubeContext(cluster: string): string {
+  return `kind-${cluster}`;
+}
+
 async function clusterExists(cluster: string): Promise<boolean> {
   const kind = await resolveTool("kind");
   const { stdout } = await runCommand([kind, "get", "clusters"], { allowFailure: true });
@@ -388,6 +399,8 @@ async function installChart(args: Args): Promise<void> {
     "./charts/kobe",
     "--namespace",
     args.namespace,
+    "--kube-context",
+    kubeContext(args.cluster),
     "--wait",
     "--timeout",
     "5m",
@@ -444,7 +457,7 @@ spec:
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
 metadata:
-  name: ${DEMO_POOL}
+  name: ${DEMO_K0S_POOL}
   namespace: ${namespace}
 spec:
   size: 1
@@ -467,31 +480,256 @@ spec:
     limits:
       cpu: "1"
       memory: "1Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DEMO_VKOBE_ETCD_BACKEND}
+  namespace: ${namespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${DEMO_VKOBE_ETCD_BACKEND}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${DEMO_VKOBE_ETCD_BACKEND}
+    spec:
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.18
+          command:
+            - /usr/local/bin/etcd
+          args:
+            - --name=${DEMO_VKOBE_ETCD_BACKEND}
+            - --data-dir=/var/lib/etcd
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://${DEMO_VKOBE_ETCD_BACKEND}.${namespace}.svc:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://${DEMO_VKOBE_ETCD_BACKEND}.${namespace}.svc:2380
+            - --initial-cluster=${DEMO_VKOBE_ETCD_BACKEND}=http://${DEMO_VKOBE_ETCD_BACKEND}.${namespace}.svc:2380
+            - --initial-cluster-state=new
+          ports:
+            - name: client
+              containerPort: 2379
+            - name: peer
+              containerPort: 2380
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/etcd
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${DEMO_VKOBE_ETCD_BACKEND}
+  namespace: ${namespace}
+spec:
+  selector:
+    app.kubernetes.io/name: ${DEMO_VKOBE_ETCD_BACKEND}
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+    - name: peer
+      port: 2380
+      targetPort: peer
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: KobeStore
+metadata:
+  name: ${DEMO_VKOBE_ETCD_STORE}
+  namespace: ${namespace}
+spec:
+  driver: etcd
+  endpoints:
+    - http://${DEMO_VKOBE_ETCD_BACKEND}.${namespace}.svc:2379
+  capacity:
+    maxClusters: 10
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DEMO_VKOBE_KINE_BACKEND}
+  namespace: ${namespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${DEMO_VKOBE_KINE_BACKEND}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${DEMO_VKOBE_KINE_BACKEND}
+    spec:
+      containers:
+        - name: kine
+          image: rancher/kine:latest
+          args:
+            - --endpoint=sqlite:///data/kine.db
+            - --listen-address=0.0.0.0:2379
+            - --metrics-bind-address=0
+            - --log-format=json
+          ports:
+            - name: client
+              containerPort: 2379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${DEMO_VKOBE_KINE_BACKEND}
+  namespace: ${namespace}
+spec:
+  selector:
+    app.kubernetes.io/name: ${DEMO_VKOBE_KINE_BACKEND}
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: KobeStore
+metadata:
+  name: ${DEMO_VKOBE_KINE_STORE}
+  namespace: ${namespace}
+spec:
+  driver: kine-sqlite
+  endpoints:
+    - http://${DEMO_VKOBE_KINE_BACKEND}.${namespace}.svc:2379
+  capacity:
+    maxClusters: 10
+  replicas: 1
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ${DEMO_VKOBE_ETCD_POOL}
+  namespace: ${namespace}
+spec:
+  size: 1
+  ttl: "1h"
+  backend:
+    type: vkobe
+    vkobe:
+      dataStoreRef:
+        name: ${DEMO_VKOBE_ETCD_STORE}
+      version: "${DEMO_VKOBE_VERSION}"
+      syncers:
+        - pods
+        - services
+        - configmaps
+        - secrets
+        - endpoints
+        - ingresses
+  cluster:
+    version: "${DEMO_VKOBE_VERSION}"
+    servers: 1
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 1
+    maxClusters: 2
+    scaleUpThreshold: 0
+    scaleDownAfter: "30m"
+    queueTimeout: "5m"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ${DEMO_VKOBE_KINE_POOL}
+  namespace: ${namespace}
+spec:
+  size: 1
+  ttl: "1h"
+  backend:
+    type: vkobe
+    vkobe:
+      dataStoreRef:
+        name: ${DEMO_VKOBE_KINE_STORE}
+      version: "${DEMO_VKOBE_VERSION}"
+      syncers:
+        - pods
+        - services
+        - configmaps
+        - secrets
+        - endpoints
+        - ingresses
+  cluster:
+    version: "${DEMO_VKOBE_VERSION}"
+    servers: 1
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 1
+    maxClusters: 2
+    scaleUpThreshold: 0
+    scaleDownAfter: "30m"
+    queueTimeout: "5m"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
 `;
 }
 
-async function bootstrapLocalResources(namespace: string): Promise<void> {
+async function bootstrapLocalResources(cluster: string, namespace: string): Promise<void> {
   step("Bootstrapping local demo token and pool");
   await runCommand(
     [
       "/bin/sh",
       "-lc",
-      `for name in $(kubectl get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_POOL} -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
-  kubectl delete statefulset -n ${namespace} "\${name}-server" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete deployment -n ${namespace} "\${name}-agent" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete service -n ${namespace} "\${name}-server" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete configmap -n ${namespace} "\${name}-k0s-config" "\${name}-kubeconfig-publisher" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete secret -n ${namespace} "\${name}-token" "\${name}-kubeconfig" --ignore-not-found >/dev/null 2>&1 || true
+      `CTX=${kubeContext(cluster)}
+for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_K0S_POOL} -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
+  kubectl --context "$CTX" delete statefulset -n ${namespace} "\${name}-server" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete deployment -n ${namespace} "\${name}-agent" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete service -n ${namespace} "\${name}-server" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete configmap -n ${namespace} "\${name}-k0s-config" "\${name}-kubeconfig-publisher" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete secret -n ${namespace} "\${name}-token" "\${name}-kubeconfig" --ignore-not-found >/dev/null 2>&1 || true
 done
-kubectl delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_POOL} --ignore-not-found >/dev/null 2>&1 || true
-kubectl delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_POOL} --ignore-not-found >/dev/null 2>&1 || true`,
+for pool in ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_KINE_POOL}; do
+for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=$pool -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
+  kubectl --context "$CTX" delete deployment -n ${namespace} "\${name}-vkobe" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete service -n ${namespace} "\${name}-api" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete configmap -n ${namespace} "\${name}-config" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete secret -n ${namespace} "\${name}-certs" "\${name}-kubeconfig" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete rolebinding.rbac.authorization.k8s.io -n ${namespace} "\${name}-vkobe" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete rolebinding.rbac.authorization.k8s.io -n kube-system "\${name}-vkobe-auth-reader" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete role.rbac.authorization.k8s.io -n ${namespace} "\${name}-vkobe" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete serviceaccount -n ${namespace} "\${name}-vkobe" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete clusterrolebinding.rbac.authorization.k8s.io "\${name}-vkobe-nodes" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete clusterrole.rbac.authorization.k8s.io "\${name}-vkobe-nodes" --ignore-not-found >/dev/null 2>&1 || true
+done
+done
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_K0S_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_ETCD_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_KINE_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_KINE_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete kobestore.kobe.kunobi.ninja -n ${namespace} ${DEMO_VKOBE_ETCD_STORE} ${DEMO_VKOBE_KINE_STORE} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete service -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true`,
     ],
     {
       step: "failed to clean up existing local demo pool resources",
     },
   );
   await runCommand(
-    ["/bin/sh", "-lc", `cat <<'EOF' | kubectl apply -f -
+    ["/bin/sh", "-lc", `cat <<'EOF' | kubectl --context ${kubeContext(cluster)} apply -f -
 ${bootstrapManifest(namespace)}EOF`],
     {
       step: "failed to apply local demo token/policy/pool",
@@ -520,7 +758,8 @@ async function printContext(cluster: string, namespace: string): Promise<void> {
   step("Local e2e environment is ready");
   info(`Context: kind-${cluster}`);
   info(`Namespace: ${namespace}`);
-  info(`Demo pool: ${DEMO_POOL}`);
+  info(`Demo pools: ${DEMO_K0S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_KINE_POOL}`);
+  info(`Demo vkobe stores: ${DEMO_VKOBE_ETCD_STORE} -> ${DEMO_VKOBE_ETCD_BACKEND}, ${DEMO_VKOBE_KINE_STORE} -> ${DEMO_VKOBE_KINE_BACKEND}`);
   info(`Demo token: ${DEMO_TOKEN}`);
   info(`Local config: .kobe.toml`);
   info("Next:");
@@ -550,11 +789,11 @@ async function up(args: Args): Promise<void> {
   await buildImages(args.imageTag);
   await loadImagesIntoKind(args.cluster, args.imageTag);
   await prepareHelm();
-  await runCommand(["/bin/sh", "-lc", `kubectl create namespace ${args.namespace} --dry-run=client -o yaml | kubectl apply -f -`], {
+  await runCommand(["/bin/sh", "-lc", `kubectl --context ${kubeContext(args.cluster)} create namespace ${args.namespace} --dry-run=client -o yaml | kubectl --context ${kubeContext(args.cluster)} apply -f -`], {
     step: `failed to ensure namespace '${args.namespace}'`,
   });
   await installChart(args);
-  await bootstrapLocalResources(args.namespace);
+  await bootstrapLocalResources(args.cluster, args.namespace);
   await writeLocalCliConfig();
   await saveState(args, fingerprint);
   await printContext(args.cluster, args.namespace);

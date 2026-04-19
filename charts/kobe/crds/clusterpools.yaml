@@ -176,6 +176,24 @@ spec:
                     - dataStoreRef
                     type: object
                 type: object
+              bootstraps:
+                default: []
+                description: Reusable host-cluster bootstrap bundles to apply into each cluster.
+                items:
+                  properties:
+                    name:
+                      description: Name of the BootstrapConfig resource in the same namespace.
+                      type: string
+                    params:
+                      additionalProperties:
+                        type: string
+                      default: {}
+                      description: Optional renderer-specific parameters for this bootstrap.
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
               cluster:
                 description: Cluster configuration.
                 properties:

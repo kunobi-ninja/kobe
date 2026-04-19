@@ -73,7 +73,15 @@ function normalizeVersion(version: string): string {
   return version.replace(/^v/, "").split("-")[0] ?? version;
 }
 
+function isDevelopmentVersion(version: string): boolean {
+  const normalized = version.trim().toLowerCase();
+  return normalized === "dev" || normalized === "local";
+}
+
 function versionGte(left: string, right: string): boolean {
+  if (isDevelopmentVersion(left)) {
+    return true;
+  }
   const leftParts = normalizeVersion(left).split(".").map(Number);
   const rightParts = normalizeVersion(right).split(".").map(Number);
   const length = Math.max(leftParts.length, rightParts.length);
@@ -84,6 +92,14 @@ function versionGte(left: string, right: string): boolean {
     if (l < r) return false;
   }
   return true;
+}
+
+function shortLeaseId(leaseId: string): string {
+  return leaseId.replace(/^lease-/, "").slice(0, 8);
+}
+
+function shouldSkipKubectlVerification(serverUrl: string): boolean {
+  return serverUrl.startsWith("http://127.0.0.1:") || serverUrl.startsWith("http://localhost:");
 }
 
 function truncate(text: string, max = 180): string {
@@ -433,15 +449,16 @@ async function main(): Promise<void> {
   const contextName = kubeconfig.contexts[0]?.name ?? "";
   const token = kubeconfig.users[0]?.user?.token ?? "";
   const expectedSuffix = `/connect/${leaseId}`;
+  const expectedContextName = `kobe-${pool}-${shortLeaseId(leaseId)}`;
 
   if (!serverUrl.endsWith(expectedSuffix)) {
     throw new Error(`Expected kubeconfig server to end with ${expectedSuffix}, got: ${serverUrl}`);
   }
-  if (contextName !== leaseId) {
-    throw new Error(`Expected kubeconfig context name '${leaseId}', got: ${contextName}`);
+  if (contextName !== expectedContextName) {
+    throw new Error(`Expected kubeconfig context name '${expectedContextName}', got: ${contextName}`);
   }
   if (!token) {
-    throw new Error(`Expected kubeconfig user '${leaseId}' to include a bearer token`);
+    throw new Error(`Expected kubeconfig user '${expectedContextName}' to include a bearer token`);
   }
 
   info("Waiting for cluster API discovery...");
@@ -457,6 +474,14 @@ async function main(): Promise<void> {
     const apisProbe = await probeLeasePath("apis", token);
 
     if (apiProbe.ok && apisProbe.ok) {
+      if (shouldSkipKubectlVerification(serverUrl)) {
+        info(
+          "Discovery ready. Skipping kubectl verification because local e2e uses an HTTP proxy endpoint and client-go does not send bearer tokens there.",
+        );
+        released = false;
+        return;
+      }
+
       info(`Discovery ready after ${elapsed}s. Verifying kubectl...`);
       const result = await kubectlText(
         kubeconfigPath,

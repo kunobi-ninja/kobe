@@ -184,6 +184,10 @@ pub struct ClusterPoolSpec {
     #[serde(default)]
     pub addons: Vec<Addon>,
 
+    /// Reusable host-cluster bootstrap bundles to apply into each cluster.
+    #[serde(default)]
+    pub bootstraps: Vec<BootstrapRef>,
+
     /// Resource limits per cluster.
     #[serde(default)]
     pub resources: Option<ResourceRequirements>,
@@ -309,6 +313,17 @@ pub struct Addon {
     /// URL to fetch manifest from (alternative to inline).
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapRef {
+    /// Name of the BootstrapConfig resource in the same namespace.
+    pub name: String,
+
+    /// Optional renderer-specific parameters for this bootstrap.
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

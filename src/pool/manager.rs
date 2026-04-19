@@ -15,6 +15,8 @@ pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
     profile.spec.cluster.agents.hash(&mut hasher);
     profile.spec.cluster.server_args.hash(&mut hasher);
     format!("{:?}", profile.spec.backend).hash(&mut hasher);
+    format!("{:?}", profile.spec.addons).hash(&mut hasher);
+    format!("{:?}", profile.spec.bootstraps).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -476,6 +478,7 @@ mod tests {
                     expose: None,
                 },
                 addons: vec![],
+                bootstraps: vec![],
                 resources: None,
                 health_check: None,
                 readiness_gates: vec![],

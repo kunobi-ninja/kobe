@@ -12,7 +12,9 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, BackendType, ClusterConfig, ClusterPool, ReadinessGate};
+use crate::crd::{
+    Addon, BackendType, BootstrapConfig, BootstrapRef, ClusterConfig, ClusterPool, ReadinessGate,
+};
 
 pub use capi::CapiBackend;
 pub use k0s::K0sBackend;
@@ -157,6 +159,7 @@ impl BackendFactory {
             }
             BackendType::Vkobe => Ok(BackendDispatch::Vkobe(VkobeBackend::new(
                 self.client.clone(),
+                profile.spec.backend.vkobe.clone(),
             ))),
         }
     }
@@ -493,6 +496,67 @@ pub async fn apply_addon_impl(vc_client: &Client, addon: &Addon) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a pool/bootstrap list into additive manifest addons.
+pub async fn resolve_bootstrap_addons(
+    client: &Client,
+    namespace: &str,
+    bootstraps: &[BootstrapRef],
+) -> Result<Vec<Addon>> {
+    if bootstraps.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bootstrap_configs: Api<BootstrapConfig> = Api::namespaced(client.clone(), namespace);
+    let mut resolved = Vec::with_capacity(bootstraps.len());
+
+    for bootstrap in bootstraps {
+        let config = bootstrap_configs
+            .get(&bootstrap.name)
+            .await
+            .with_context(|| format!("BootstrapConfig {} not found", bootstrap.name))?;
+        let manifest = render_bootstrap_config(&config)?;
+        resolved.push(Addon {
+            name: bootstrap.name.clone(),
+            manifest: Some(manifest),
+            url: None,
+        });
+    }
+
+    Ok(resolved)
+}
+
+fn render_bootstrap_config(config: &BootstrapConfig) -> Result<String> {
+    let mut yaml_entries: Vec<(&String, &String)> = config
+        .spec
+        .files
+        .iter()
+        .filter(|(name, _)| name.ends_with(".yaml") || name.ends_with(".yml"))
+        .collect();
+    yaml_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    if yaml_entries.is_empty() {
+        anyhow::bail!(
+            "BootstrapConfig {} has no *.yaml or *.yml files to apply",
+            config.name_any()
+        );
+    }
+
+    let manifests = yaml_entries
+        .into_iter()
+        .map(|(_, body)| body.trim())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>();
+
+    if manifests.is_empty() {
+        anyhow::bail!(
+            "BootstrapConfig {} has only empty manifest files",
+            config.name_any()
+        );
+    }
+
+    Ok(manifests.join("\n---\n"))
+}
+
 /// Validate that a URL is safe to fetch (not an SSRF target).
 ///
 /// Rejects:
@@ -605,11 +669,92 @@ current-context: default
         )
     }
 
+    fn bootstrap_config_response(
+        name: &str,
+        namespace: &str,
+        files: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "BootstrapConfig",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+            },
+            "spec": {
+                "files": files,
+            }
+        })
+    }
+
     #[test]
     fn test_validate_url_allows_https() {
         assert!(
             validate_url("https://raw.githubusercontent.com/org/repo/main/manifest.yaml").is_ok()
         );
+    }
+
+    #[test]
+    fn render_bootstrap_config_concatenates_yaml_files_in_lexical_order() {
+        let config: BootstrapConfig = serde_json::from_value(bootstrap_config_response(
+            "test-bundle",
+            "test-ns",
+            serde_json::json!({
+                "20-second.yaml": "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: second",
+                "10-first.yaml": "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: first",
+                "README.md": "# ignored"
+            }),
+        ))
+        .unwrap();
+
+        let rendered = render_bootstrap_config(&config).unwrap();
+        assert!(rendered.contains("name: first"));
+        assert!(rendered.contains("name: second"));
+        assert!(rendered.find("name: first") < rendered.find("name: second"));
+        assert!(!rendered.contains("# ignored"));
+    }
+
+    #[tokio::test]
+    async fn resolve_bootstrap_addons_loads_bootstrap_configs_as_manifest_addons() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/bootstrapconfigs/flux",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bootstrap_config_response(
+                "flux",
+                "test-ns",
+                serde_json::json!({
+                    "install.yaml": "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: flux-system"
+                }),
+            )))
+            .mount(&server)
+            .await;
+
+        let addons = resolve_bootstrap_addons(
+            &client,
+            "test-ns",
+            &[BootstrapRef {
+                name: "flux".to_string(),
+                params: Default::default(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(addons.len(), 1);
+        assert_eq!(addons[0].name, "flux");
+        assert!(
+            addons[0]
+                .manifest
+                .as_deref()
+                .unwrap()
+                .contains("flux-system")
+        );
+        assert!(addons[0].url.is_none());
     }
 
     #[tokio::test]
