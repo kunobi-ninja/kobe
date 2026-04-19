@@ -35,6 +35,7 @@ rules:
       - clusterleases
       - clusterleases/status
       - accesspolicies
+      - bootstrapconfigs
       - kobestores
       - kobestores/status
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

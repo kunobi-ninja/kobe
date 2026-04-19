@@ -58,6 +58,11 @@ test-smoke-vkobe ttl='2m' *args:
 test-smoke-vkobe-kine ttl='2m' *args:
     @mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-kine-sqlite {{ ttl }} {{ args }}
 
+# Lease a local bootstrap-enabled vkobe cluster and verify bootstrap resources exist
+[group('dev')]
+test-smoke-bootstrap-vkobe ttl='2m' *args:
+    @env POOL_WARMUP_TIMEOUT_SECONDS=90 mise exec -- bun run ./hack/test-smoke-bootstrap.ts e2e-vkobe-etcd-bootstrap default bootstrap-marker {{ ttl }} {{ args }}
+
 # Lease one warm cluster and verify the pool refills back to the warm target
 [group('dev')]
 test-smoke-pool pool='ci-small' ttl='2m' *args:

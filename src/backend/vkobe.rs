@@ -99,10 +99,80 @@ impl VkobeBackend {
         Ok(store.spec.endpoints.join(","))
     }
 
+    async fn ensure_pki_secret(
+        &self,
+        name: &str,
+        namespace: &str,
+        pki_material: &pki::VirtualClusterPki,
+        kcm_kubeconfig: &str,
+    ) -> Result<()> {
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let secret_name = format!("{name}-certs");
+
+        match secrets.get(&secret_name).await {
+            Ok(_) => {
+                debug!(
+                    cluster = name,
+                    secret = %secret_name,
+                    "Reusing existing vkobe PKI secret"
+                );
+                Ok(())
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                pki::create_pki_secret(&self.client, name, namespace, pki_material, kcm_kubeconfig)
+                    .await
+                    .context("Failed to create PKI secret")
+            }
+            Err(e) => Err(e).context("Failed to check vkobe PKI secret"),
+        }
+    }
+
     /// Build a kube Client targeting the virtual cluster's API server.
     async fn virtual_client(&self, name: &str, namespace: &str) -> Result<Client> {
         let kubeconfig_yaml = read_kubeconfig_secret(&self.client, name, namespace).await?;
         virtual_client_from_kubeconfig(&kubeconfig_yaml).await
+    }
+
+    /// Wait until the virtual cluster API is actually usable for discovery.
+    async fn wait_ready(&self, name: &str, namespace: &str) -> Result<()> {
+        info!(cluster = name, "Waiting for vkobe cluster API readiness");
+
+        for attempt in 0..120 {
+            match check_virtual_health(&self.client, name, namespace).await {
+                Ok(true) => {
+                    info!(
+                        cluster = name,
+                        attempts = attempt + 1,
+                        "vkobe cluster API is ready"
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {
+                    if attempt % 6 == 0 {
+                        info!(
+                            cluster = name,
+                            attempt = attempt + 1,
+                            elapsed_seconds = attempt * 5,
+                            "Waiting for vkobe cluster API readiness"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    if attempt % 6 == 0 {
+                        warn!(
+                            cluster = name,
+                            attempt = attempt + 1,
+                            error = %format!("{e:#}"),
+                            "vkobe readiness probe failed"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+
+        anyhow::bail!("vkobe cluster {name} not ready after 10 minutes");
     }
 
     /// Standard labels for resources belonging to a cluster.
@@ -346,15 +416,8 @@ impl ClusterBackend for VkobeBackend {
         .context("Failed to generate KCM kubeconfig")?;
 
         // Create the PKI Secret containing all certs + KCM kubeconfig.
-        pki::create_pki_secret(
-            &self.client,
-            name,
-            namespace,
-            &pki_material,
-            &kcm_kubeconfig,
-        )
-        .await
-        .context("Failed to create PKI secret")?;
+        self.ensure_pki_secret(name, namespace, &pki_material, &kcm_kubeconfig)
+            .await?;
 
         info!(cluster = name, "PKI secret created before Deployment");
 
@@ -448,18 +511,19 @@ impl ClusterBackend for VkobeBackend {
         let kubeconfig = self.build_kubeconfig(name, namespace).await?;
         self.store_kubeconfig(name, namespace, &kubeconfig).await?;
 
-        // 7. Apply addons
+        // 7. Wait until the virtual API is actually serving discovery.
+        self.wait_ready(name, namespace).await?;
+
+        // 8. Apply addons
         if !addons.is_empty() {
             let vc_client = self.virtual_client(name, namespace).await?;
             for addon in addons {
-                if let Err(e) = apply_addon_impl(&vc_client, addon).await {
-                    warn!(
-                        cluster = name,
-                        addon = addon.name,
-                        error = %e,
-                        "Failed to apply addon, will retry on next reconcile"
-                    );
-                }
+                apply_addon_impl(&vc_client, addon).await.with_context(|| {
+                    format!(
+                        "Failed to apply vkobe addon {} for cluster {name}",
+                        addon.name
+                    )
+                })?;
             }
         }
 

@@ -40,6 +40,14 @@ type KubeconfigView = {
 const [pool = "ci-small", ttl = "2m", ...kobeArgs] = Bun.argv.slice(2);
 
 const leaseWaitTimeout = Bun.env.LEASE_WAIT_TIMEOUT ?? "15s";
+const warmupTimeoutSeconds = parsePositiveInt(
+  Bun.env.POOL_WARMUP_TIMEOUT_SECONDS ?? "30",
+  "POOL_WARMUP_TIMEOUT_SECONDS",
+);
+const warmupRetrySeconds = parsePositiveInt(
+  Bun.env.POOL_WARMUP_RETRY_SECONDS ?? "2",
+  "POOL_WARMUP_RETRY_SECONDS",
+);
 const connectTimeoutSeconds = parsePositiveInt(
   Bun.env.CONNECT_TIMEOUT_SECONDS ?? "5",
   "CONNECT_TIMEOUT_SECONDS",
@@ -181,6 +189,35 @@ function selectPool(status: KobeStatus, name: string): PoolStatus {
 
 function renderPool(poolStatus: PoolStatus): string {
   return `ready=${poolStatus.ready} leased=${poolStatus.leased} creating=${poolStatus.creating} recycling=${poolStatus.recycling ?? 0} queue=${poolStatus.queueDepth}`;
+}
+
+async function waitForWarmPool(name: string): Promise<PoolStatus> {
+  const initialStatus = await fetchStatus();
+  let current = selectPool(initialStatus, name);
+  if (current.ready > 0) {
+    return current;
+  }
+
+  info(
+    `Pool '${name}' is not warm yet (${renderPool(current)}). Waiting up to ${warmupTimeoutSeconds}s for warm capacity...`,
+  );
+
+  const deadline = Date.now() + warmupTimeoutSeconds * 1000;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt += 1;
+    await Bun.sleep(warmupRetrySeconds * 1000);
+    current = selectPool(await fetchStatus(), name);
+    if (current.ready > 0) {
+      info(`Pool '${name}' became warm after ${attempt * warmupRetrySeconds}s.`);
+      return current;
+    }
+    info(`  [${attempt}] waiting for warm pool - ${renderPool(current)}`);
+  }
+
+  throw new Error(
+    `🚫 Pool '${name}' did not become warm within ${warmupTimeoutSeconds}s.\n   Expected at least one ready cluster.\n   Last state: ${renderPool(current)}`,
+  );
 }
 
 function describeLeaseControllerAnomaly(
@@ -394,11 +431,7 @@ async function main(): Promise<void> {
       `🚫 Endpoint ${endpointVersion} is too old for this smoke test.\n   Expected at least ${minEndpointVersion}.\n   Reason: this smoke test assumes the warm-cluster readiness fix.\n   Bail out: no lease requested.`,
     );
   }
-  if (poolBefore.ready <= 0) {
-    throw new Error(
-      `🚫 Pool '${pool}' is not warm.\n   Expected at least one ready cluster.\n   Current state: ${renderPool(poolBefore)}`,
-    );
-  }
+  poolBefore = await waitForWarmPool(pool);
 
   info(`Pool '${pool}': ${renderPool(poolBefore)}`);
   info(`Requesting lease from pool '${pool}' (ttl=${ttl}, lease wait timeout=${leaseWaitTimeout})...`);

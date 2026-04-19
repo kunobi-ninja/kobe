@@ -229,6 +229,7 @@ async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
         "clusterleases.kobe.kunobi.ninja",
         "clusterinstances.kobe.kunobi.ninja",
         "accesspolicies.kobe.kunobi.ninja",
+        "bootstrapconfigs.kobe.kunobi.ninja",
         "kobestores.kobe.kunobi.ninja",
     ];
 
