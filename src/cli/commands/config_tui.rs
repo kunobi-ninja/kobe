@@ -379,21 +379,15 @@ pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
                             state.edit_buffer.insert(state.edit_cursor, c);
                             state.edit_cursor += 1;
                         }
-                        KeyCode::Backspace => {
-                            if state.edit_cursor > 0 {
-                                state.edit_cursor -= 1;
-                                state.edit_buffer.remove(state.edit_cursor);
-                            }
+                        KeyCode::Backspace if state.edit_cursor > 0 => {
+                            state.edit_cursor -= 1;
+                            state.edit_buffer.remove(state.edit_cursor);
                         }
-                        KeyCode::Left => {
-                            if state.edit_cursor > 0 {
-                                state.edit_cursor -= 1;
-                            }
+                        KeyCode::Left if state.edit_cursor > 0 => {
+                            state.edit_cursor -= 1;
                         }
-                        KeyCode::Right => {
-                            if state.edit_cursor < state.edit_buffer.len() {
-                                state.edit_cursor += 1;
-                            }
+                        KeyCode::Right if state.edit_cursor < state.edit_buffer.len() => {
+                            state.edit_cursor += 1;
                         }
                         KeyCode::Home => state.edit_cursor = 0,
                         KeyCode::End => state.edit_cursor = state.edit_buffer.len(),

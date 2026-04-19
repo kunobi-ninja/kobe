@@ -32,7 +32,7 @@ pub async fn purge(
 
     let tracked = endpoint_kubeconfigs(&config.endpoint)?;
     let local = local_kubeconfig_candidates()?;
-    let removable_files = dedupe_paths(tracked.into_iter().chain(local.into_iter()));
+    let removable_files = dedupe_paths(tracked.into_iter().chain(local));
 
     if active_leases.is_empty() && removable_files.is_empty() {
         match output {
@@ -69,7 +69,7 @@ pub async fn purge(
 
     forget_endpoint_kubeconfigs(endpoint)?;
     let mut removed_paths = Vec::new();
-    for path in dedupe_paths(removable_files.into_iter()) {
+    for path in dedupe_paths(removable_files) {
         if path.exists() {
             std::fs::remove_file(&path)?;
             removed_paths.push(path);
