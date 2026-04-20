@@ -340,6 +340,14 @@ spec:
           status:
             nullable: true
             properties:
+              activeBootstrap:
+                description: Bootstrap currently running for this instance, if any.
+                nullable: true
+                type: string
+              bootstrapped:
+                default: false
+                description: Whether all configured bootstrap steps have completed successfully.
+                type: boolean
               healthFailures:
                 default: 0
                 description: Consecutive health failures observed for this instance.

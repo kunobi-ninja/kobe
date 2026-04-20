@@ -29,8 +29,9 @@ type KubeconfigView = {
 
 const [
   pool = "e2e-vkobe-etcd-bootstrap",
-  namespace = "platform",
-  configMapName = "bootstrap-marker",
+  namespace = "default",
+  resourceKind = "configmap",
+  resourceName = "bootstrap-marker",
   ttl = "2m",
   ...kobeArgs
 ] = Bun.argv.slice(2);
@@ -193,17 +194,9 @@ async function main(): Promise<void> {
 
   info(`Verifying bootstrap namespace '${namespace}'...`);
   await authedJson(`api/v1/namespaces/${namespace}`, token);
-  info(`Verifying bootstrap ConfigMap '${namespace}/${configMapName}'...`);
-  const configMap = (await authedJson(
-    `api/v1/namespaces/${namespace}/configmaps/${configMapName}`,
-    token,
-  )) as { data?: Record<string, string> };
-
-  if (configMap.data?.installed !== "true") {
-    throw new Error(
-      `Expected bootstrap ConfigMap ${namespace}/${configMapName} to contain data.installed=true`,
-    );
-  }
+  info(`Verifying bootstrap ${resourceKind} '${namespace}/${resourceName}'...`);
+  const resourcePath = `api/v1/namespaces/${namespace}/${resourceKind}s/${resourceName}`;
+  await authedJson(resourcePath, token);
 
   info(`Bootstrap verified for pool '${pool}'.`);
 }

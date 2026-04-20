@@ -23,4 +23,36 @@ pub struct BootstrapConfigSpec {
     /// renderers later while already supporting built-in and custom bundles.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+
+    /// Optional bootstrap runner job configuration.
+    ///
+    /// When set, the operator runs a host-cluster Job that targets the leased
+    /// cluster using its generated kubeconfig Secret. This is useful for
+    /// tool-driven installs like `flux install`, `helm upgrade --install`, or
+    /// `kustomize build | kubectl apply`.
+    #[serde(default)]
+    pub job: Option<BootstrapJobSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapJobSpec {
+    /// Container image for the bootstrap runner.
+    pub image: String,
+
+    /// Optional image pull policy.
+    #[serde(default)]
+    pub image_pull_policy: Option<String>,
+
+    /// Entrypoint command for the runner container.
+    #[serde(default)]
+    pub command: Vec<String>,
+
+    /// Arguments for the runner container.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Extra environment variables passed to the runner.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }

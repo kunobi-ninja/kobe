@@ -18,12 +18,15 @@ const DEMO_VKOBE_ETCD_POOL = "e2e-vkobe-etcd";
 const DEMO_VKOBE_BOOTSTRAP_POOL = "e2e-vkobe-etcd-bootstrap";
 const DEMO_VKOBE_ETCD_STORE = "e2e-vkobe-store-etcd";
 const DEMO_VKOBE_ETCD_BACKEND = "e2e-vkobe-etcd";
+const DEMO_VKOBE_KINE_POOL = "e2e-vkobe-kine-sqlite";
+const DEMO_VKOBE_KINE_BOOTSTRAP_POOL = "e2e-vkobe-kine-sqlite-bootstrap";
+const DEMO_VKOBE_KINE_STORE = "e2e-vkobe-store-kine-sqlite";
+const DEMO_VKOBE_KINE_BACKEND = "e2e-vkobe-kine-sqlite";
 const DEMO_BOOTSTRAP_CONFIG = "e2e-basic-bootstrap";
 const DEMO_BOOTSTRAP_NAMESPACE = "default";
 const DEMO_BOOTSTRAP_CONFIGMAP = "bootstrap-marker";
-const DEMO_VKOBE_KINE_POOL = "e2e-vkobe-kine-sqlite";
-const DEMO_VKOBE_KINE_STORE = "e2e-vkobe-store-kine-sqlite";
-const DEMO_VKOBE_KINE_BACKEND = "e2e-vkobe-kine-sqlite";
+const DEMO_FLUX_BOOTSTRAP_CONFIG = "flux";
+const DEMO_FLUX_NAMESPACE = "flux-system";
 const DEMO_VKOBE_VERSION = "1.35";
 const LOCAL_TARGET = "e2e";
 const LOCAL_ENDPOINT = "http://127.0.0.1:8080";
@@ -751,6 +754,46 @@ spec:
     limits:
       cpu: "500m"
       memory: "512Mi"
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}
+  namespace: ${namespace}
+spec:
+  size: 1
+  ttl: "1h"
+  backend:
+    type: vkobe
+    vkobe:
+      dataStoreRef:
+        name: ${DEMO_VKOBE_KINE_STORE}
+      version: "${DEMO_VKOBE_VERSION}"
+      syncers:
+        - pods
+        - services
+        - configmaps
+        - secrets
+        - endpoints
+        - ingresses
+  cluster:
+    version: "${DEMO_VKOBE_VERSION}"
+    servers: 1
+  bootstraps:
+    - name: ${DEMO_FLUX_BOOTSTRAP_CONFIG}
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 1
+    maxClusters: 2
+    scaleUpThreshold: 0
+    scaleDownAfter: "30m"
+    queueTimeout: "30m"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
 `;
 }
 
@@ -768,7 +811,7 @@ for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n
   kubectl --context "$CTX" delete configmap -n ${namespace} "\${name}-k0s-config" "\${name}-kubeconfig-publisher" --ignore-not-found >/dev/null 2>&1 || true
   kubectl --context "$CTX" delete secret -n ${namespace} "\${name}-token" "\${name}-kubeconfig" --ignore-not-found >/dev/null 2>&1 || true
 done
-for pool in ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL}; do
+for pool in ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}; do
 for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=$pool -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
   kubectl --context "$CTX" delete deployment -n ${namespace} "\${name}-vkobe" --ignore-not-found >/dev/null 2>&1 || true
   kubectl --context "$CTX" delete service -n ${namespace} "\${name}-api" --ignore-not-found >/dev/null 2>&1 || true
@@ -786,7 +829,8 @@ kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespac
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_ETCD_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_KINE_POOL} --ignore-not-found >/dev/null 2>&1 || true
-kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete kobestore.kobe.kunobi.ninja -n ${namespace} ${DEMO_VKOBE_ETCD_STORE} ${DEMO_VKOBE_KINE_STORE} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete service -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true
@@ -826,9 +870,12 @@ async function printContext(cluster: string, namespace: string): Promise<void> {
   step("Local e2e environment is ready");
   info(`Context: kind-${cluster}`);
   info(`Namespace: ${namespace}`);
-  info(`Demo pools: ${DEMO_K0S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_BOOTSTRAP_POOL}, ${DEMO_VKOBE_KINE_POOL}`);
+  info(
+    `Demo pools: ${DEMO_K0S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_BOOTSTRAP_POOL}, ${DEMO_VKOBE_KINE_POOL}, ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}`,
+  );
   info(`Demo vkobe stores: ${DEMO_VKOBE_ETCD_STORE} -> ${DEMO_VKOBE_ETCD_BACKEND}, ${DEMO_VKOBE_KINE_STORE} -> ${DEMO_VKOBE_KINE_BACKEND}`);
   info(`Demo bootstrap: ${DEMO_BOOTSTRAP_CONFIG} -> ${DEMO_BOOTSTRAP_NAMESPACE}/${DEMO_BOOTSTRAP_CONFIGMAP}`);
+  info(`Demo bootstrap: ${DEMO_FLUX_BOOTSTRAP_CONFIG} -> installs Flux into ${DEMO_FLUX_NAMESPACE}`);
   info(`Demo token: ${DEMO_TOKEN}`);
   info(`Local config: .kobe.toml`);
   info("Next:");

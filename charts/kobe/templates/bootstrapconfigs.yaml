@@ -1,0 +1,21 @@
+{{- if .Values.bootstrapConfigs.flux.enabled }}
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: BootstrapConfig
+metadata:
+  name: flux
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  job:
+    image: {{ .Values.bootstrapConfigs.flux.image | quote }}
+    imagePullPolicy: {{ .Values.bootstrapConfigs.flux.imagePullPolicy | quote }}
+    command:
+      - flux
+    args:
+      - install
+      - --namespace=flux-system
+{{- with .Values.bootstrapConfigs.flux.args }}
+{{ toYaml . | nindent 6 }}
+{{- end }}
+{{- end }}

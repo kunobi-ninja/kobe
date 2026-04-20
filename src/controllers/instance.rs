@@ -1,14 +1,26 @@
+use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures::StreamExt;
-use kube::api::{Api, Patch, PatchParams};
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::core::v1::{
+    Container, EnvVar, PodSpec, PodTemplateSpec, SecretVolumeSource, Volume, VolumeMount,
+};
+use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::core::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::backend::{BackendFactory, ClusterBackend, resolve_bootstrap_addons};
+use crate::backend::{
+    BackendFactory, BootstrapJobPlan, ClusterBackend, resolve_bootstrap_addons,
+    resolve_bootstrap_jobs,
+};
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, ClusterConfig, ClusterInstance,
     ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig,
@@ -116,7 +128,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         ClusterInstanceStatus {
                             phase: ClusterInstancePhase::Creating,
                             provisioned: true,
+                            bootstrapped: false,
                             lease_ref: status.lease_ref,
+                            active_bootstrap: None,
                             idle_since: status.idle_since,
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
@@ -134,7 +148,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         ClusterInstanceStatus {
                             phase: ClusterInstancePhase::Failed,
                             provisioned: false,
+                            bootstrapped: false,
                             lease_ref: status.lease_ref,
+                            active_bootstrap: None,
                             idle_since: None,
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
@@ -149,21 +165,66 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         ClusterInstancePhase::Creating if status.provisioned => {
             let ready = evaluate_instance_readiness(&ctx, &config, &name, &ns).await?;
             if ready {
-                patch_instance_status(
-                    &instances_api,
-                    &name,
-                    ClusterInstanceStatus {
-                        phase: ClusterInstancePhase::Ready,
-                        provisioned: true,
-                        lease_ref: status.lease_ref,
-                        idle_since: Some(chrono::Utc::now().to_rfc3339()),
-                        state_since: Some(chrono::Utc::now().to_rfc3339()),
-                        health_failures: 0,
-                        spec_hash: status.spec_hash,
-                    },
-                )
-                .await?;
-                Ok(Action::requeue(std::time::Duration::from_secs(30)))
+                match reconcile_instance_bootstraps(&ctx, &config, &instance, &name, &ns).await {
+                    Ok(Some(active_bootstrap)) => {
+                        patch_instance_status(
+                            &instances_api,
+                            &name,
+                            ClusterInstanceStatus {
+                                phase: ClusterInstancePhase::Creating,
+                                provisioned: true,
+                                bootstrapped: false,
+                                lease_ref: status.lease_ref,
+                                active_bootstrap: Some(active_bootstrap),
+                                idle_since: None,
+                                state_since: status.state_since,
+                                health_failures: 0,
+                                spec_hash: status.spec_hash,
+                            },
+                        )
+                        .await?;
+                        Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                    }
+                    Ok(None) => {
+                        patch_instance_status(
+                            &instances_api,
+                            &name,
+                            ClusterInstanceStatus {
+                                phase: ClusterInstancePhase::Ready,
+                                provisioned: true,
+                                bootstrapped: true,
+                                lease_ref: status.lease_ref,
+                                active_bootstrap: None,
+                                idle_since: Some(chrono::Utc::now().to_rfc3339()),
+                                state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                health_failures: 0,
+                                spec_hash: status.spec_hash,
+                            },
+                        )
+                        .await?;
+                        Ok(Action::requeue(std::time::Duration::from_secs(30)))
+                    }
+                    Err(e) => {
+                        warn!(instance = %name, error = %format!("{e:#}"), "Bootstrap failed");
+                        patch_instance_status(
+                            &instances_api,
+                            &name,
+                            ClusterInstanceStatus {
+                                phase: ClusterInstancePhase::Failed,
+                                provisioned: true,
+                                bootstrapped: false,
+                                lease_ref: status.lease_ref,
+                                active_bootstrap: status.active_bootstrap,
+                                idle_since: None,
+                                state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                health_failures: status.health_failures,
+                                spec_hash: status.spec_hash,
+                            },
+                        )
+                        .await?;
+                        Ok(Action::requeue(std::time::Duration::from_secs(30)))
+                    }
+                }
             } else {
                 Ok(Action::requeue(std::time::Duration::from_secs(5)))
             }
@@ -208,7 +269,9 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
             ClusterInstanceStatus {
                 phase: ClusterInstancePhase::Recycling,
                 provisioned: status.provisioned,
+                bootstrapped: status.bootstrapped,
                 lease_ref: None,
+                active_bootstrap: None,
                 idle_since: None,
                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                 health_failures: status.health_failures,
@@ -242,7 +305,9 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                     ClusterInstanceStatus {
                         phase: ClusterInstancePhase::Recycling,
                         provisioned: status.provisioned,
+                        bootstrapped: status.bootstrapped,
                         lease_ref: None,
+                        active_bootstrap: None,
                         idle_since: None,
                         state_since: Some(chrono::Utc::now().to_rfc3339()),
                         health_failures: status.health_failures,
@@ -269,7 +334,9 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 ClusterInstanceStatus {
                     phase: ClusterInstancePhase::Recycling,
                     provisioned: status.provisioned,
+                    bootstrapped: status.bootstrapped,
                     lease_ref: None,
+                    active_bootstrap: None,
                     idle_since: None,
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: status.health_failures,
@@ -428,7 +495,9 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                     ClusterInstanceStatus {
                         phase: ClusterInstancePhase::Ready,
                         provisioned: status.provisioned,
+                        bootstrapped: status.bootstrapped,
                         lease_ref: status.lease_ref.clone(),
+                        active_bootstrap: status.active_bootstrap.clone(),
                         idle_since: status.idle_since.clone(),
                         state_since: status.state_since.clone(),
                         health_failures: 0,
@@ -456,11 +525,13 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                 ClusterInstanceStatus {
                     phase: next_phase,
                     provisioned: status.provisioned,
+                    bootstrapped: status.bootstrapped,
                     lease_ref: if failures >= threshold {
                         None
                     } else {
                         status.lease_ref.clone()
                     },
+                    active_bootstrap: None,
                     idle_since: if failures >= threshold {
                         None
                     } else {
@@ -539,6 +610,206 @@ fn synthetic_profile(config: &ResolvedInstanceConfig) -> ClusterPool {
         },
         status: None,
     }
+}
+
+async fn reconcile_instance_bootstraps<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    let plans = resolve_bootstrap_jobs(&ctx.client, namespace, &config.bootstraps).await?;
+    if plans.is_empty() {
+        return Ok(None);
+    }
+
+    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+
+    for plan in plans {
+        let job_name = bootstrap_job_name(name, &plan.name);
+        match jobs_api.get(&job_name).await {
+            Ok(job) => {
+                if job_succeeded(&job) {
+                    debug!(
+                        instance = %name,
+                        bootstrap = %plan.name,
+                        job = %job_name,
+                        "Bootstrap job already completed"
+                    );
+                    continue;
+                }
+
+                if let Some(message) = failed_job_message(&job) {
+                    anyhow::bail!(
+                        "Bootstrap '{}' failed in Job {}: {}",
+                        plan.name,
+                        job_name,
+                        message
+                    );
+                }
+
+                info!(
+                    instance = %name,
+                    bootstrap = %plan.name,
+                    job = %job_name,
+                    "Waiting for bootstrap job to complete"
+                );
+                return Ok(Some(plan.name));
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                let job = build_bootstrap_job(instance, namespace, &job_name, &plan);
+                info!(
+                    instance = %name,
+                    bootstrap = %plan.name,
+                    job = %job_name,
+                    image = %plan.image,
+                    "Creating bootstrap job"
+                );
+                jobs_api
+                    .create(&PostParams::default(), &job)
+                    .await
+                    .with_context(|| format!("Failed to create bootstrap Job {job_name}"))?;
+                return Ok(Some(plan.name));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to read bootstrap Job {job_name}"));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn build_bootstrap_job(
+    instance: &ClusterInstance,
+    namespace: &str,
+    job_name: &str,
+    plan: &BootstrapJobPlan,
+) -> Job {
+    let instance_name = instance.name_any();
+    let kubeconfig_secret_name = format!("{instance_name}-kubeconfig");
+
+    let labels = BTreeMap::from([
+        (
+            "app.kubernetes.io/managed-by".to_string(),
+            "kobe".to_string(),
+        ),
+        (
+            "kobe.kunobi.ninja/instance".to_string(),
+            instance_name.clone(),
+        ),
+        ("kobe.kunobi.ninja/bootstrap".to_string(), plan.name.clone()),
+    ]);
+
+    let mut env = vec![EnvVar {
+        name: "KUBECONFIG".to_string(),
+        value: Some("/bootstrap/kubeconfig".to_string()),
+        ..Default::default()
+    }];
+    env.extend(plan.env.iter().map(|(key, value)| EnvVar {
+        name: key.clone(),
+        value: Some(value.clone()),
+        ..Default::default()
+    }));
+
+    Job {
+        metadata: ObjectMeta {
+            name: Some(job_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: instance.controller_owner_ref(&()).map(|owner| vec![owner]),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            backoff_limit: Some(0),
+            ttl_seconds_after_finished: Some(3600),
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    automount_service_account_token: Some(false),
+                    restart_policy: Some("Never".to_string()),
+                    containers: vec![Container {
+                        name: "bootstrap".to_string(),
+                        image: Some(plan.image.clone()),
+                        image_pull_policy: plan.image_pull_policy.clone(),
+                        command: (!plan.command.is_empty()).then_some(plan.command.clone()),
+                        args: (!plan.args.is_empty()).then_some(plan.args.clone()),
+                        env: Some(env),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "kubeconfig".to_string(),
+                            mount_path: "/bootstrap".to_string(),
+                            read_only: Some(true),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }],
+                    volumes: Some(vec![Volume {
+                        name: "kubeconfig".to_string(),
+                        secret: Some(SecretVolumeSource {
+                            secret_name: Some(kubeconfig_secret_name),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn bootstrap_job_name(instance_name: &str, bootstrap_name: &str) -> String {
+    let raw = format!("{instance_name}-bootstrap-{bootstrap_name}");
+    if raw.len() <= 63 {
+        return raw;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let suffix = format!("{:08x}", hasher.finish() as u32);
+    let prefix_len = 63usize.saturating_sub(suffix.len() + 1);
+    format!("{}-{}", &raw[..prefix_len], suffix)
+}
+
+fn job_succeeded(job: &Job) -> bool {
+    job.status
+        .as_ref()
+        .and_then(|status| status.succeeded)
+        .unwrap_or(0)
+        > 0
+        || job
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.as_ref())
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Complete" && condition.status == "True")
+            })
+}
+
+fn failed_job_message(job: &Job) -> Option<String> {
+    job.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition.type_ == "Failed" && condition.status == "True")
+        })
+        .map(|condition| {
+            condition
+                .message
+                .clone()
+                .or_else(|| condition.reason.clone())
+                .unwrap_or_else(|| "job failed".to_string())
+        })
 }
 
 async fn create_instance_backend<B: ClusterBackend + Clone>(

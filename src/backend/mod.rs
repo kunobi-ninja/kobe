@@ -4,6 +4,7 @@ pub mod k0s;
 pub mod k3s;
 pub mod vkobe;
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
@@ -13,7 +14,8 @@ use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crd::{
-    Addon, BackendType, BootstrapConfig, BootstrapRef, ClusterConfig, ClusterPool, ReadinessGate,
+    Addon, BackendType, BootstrapConfig, BootstrapJobSpec, BootstrapRef, ClusterConfig,
+    ClusterPool, ReadinessGate,
 };
 
 pub use capi::CapiBackend;
@@ -514,18 +516,59 @@ pub async fn resolve_bootstrap_addons(
             .get(&bootstrap.name)
             .await
             .with_context(|| format!("BootstrapConfig {} not found", bootstrap.name))?;
-        let manifest = render_bootstrap_config(&config)?;
-        resolved.push(Addon {
-            name: bootstrap.name.clone(),
-            manifest: Some(manifest),
-            url: None,
-        });
+        if let Some(manifest) = render_bootstrap_config(&config)? {
+            resolved.push(Addon {
+                name: bootstrap.name.clone(),
+                manifest: Some(manifest),
+                url: None,
+            });
+        }
     }
 
     Ok(resolved)
 }
 
-fn render_bootstrap_config(config: &BootstrapConfig) -> Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapJobPlan {
+    pub name: String,
+    pub image: String,
+    pub image_pull_policy: Option<String>,
+    pub command: Vec<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+pub async fn resolve_bootstrap_jobs(
+    client: &Client,
+    namespace: &str,
+    bootstraps: &[BootstrapRef],
+) -> Result<Vec<BootstrapJobPlan>> {
+    if bootstraps.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bootstrap_configs: Api<BootstrapConfig> = Api::namespaced(client.clone(), namespace);
+    let mut resolved = Vec::new();
+
+    for bootstrap in bootstraps {
+        let config = bootstrap_configs
+            .get(&bootstrap.name)
+            .await
+            .with_context(|| format!("BootstrapConfig {} not found", bootstrap.name))?;
+
+        if let Some(job) = config.spec.job.as_ref() {
+            resolved.push(render_bootstrap_job_plan(
+                &bootstrap.name,
+                job,
+                &bootstrap.params,
+            )?);
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn render_bootstrap_config(config: &BootstrapConfig) -> Result<Option<String>> {
     let mut yaml_entries: Vec<(&String, &String)> = config
         .spec
         .files
@@ -535,10 +578,7 @@ fn render_bootstrap_config(config: &BootstrapConfig) -> Result<String> {
     yaml_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     if yaml_entries.is_empty() {
-        anyhow::bail!(
-            "BootstrapConfig {} has no *.yaml or *.yml files to apply",
-            config.name_any()
-        );
+        return Ok(None);
     }
 
     let manifests = yaml_entries
@@ -554,7 +594,50 @@ fn render_bootstrap_config(config: &BootstrapConfig) -> Result<String> {
         );
     }
 
-    Ok(manifests.join("\n---\n"))
+    Ok(Some(manifests.join("\n---\n")))
+}
+
+fn render_bootstrap_job_plan(
+    name: &str,
+    job: &BootstrapJobSpec,
+    params: &BTreeMap<String, String>,
+) -> Result<BootstrapJobPlan> {
+    if job.image.trim().is_empty() {
+        anyhow::bail!("BootstrapConfig {} job.image must not be empty", name);
+    }
+
+    let command = job
+        .command
+        .iter()
+        .map(|value| render_param_template(value, params))
+        .collect::<Vec<_>>();
+    let args = job
+        .args
+        .iter()
+        .map(|value| render_param_template(value, params))
+        .collect::<Vec<_>>();
+    let env = job
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), render_param_template(value, params)))
+        .collect::<BTreeMap<_, _>>();
+
+    Ok(BootstrapJobPlan {
+        name: name.to_string(),
+        image: render_param_template(&job.image, params),
+        image_pull_policy: job.image_pull_policy.clone(),
+        command,
+        args,
+        env,
+    })
+}
+
+fn render_param_template(input: &str, params: &BTreeMap<String, String>) -> String {
+    params
+        .iter()
+        .fold(input.to_string(), |rendered, (key, value)| {
+            rendered.replace(&format!("{{{{{key}}}}}"), value)
+        })
 }
 
 /// Validate that a URL is safe to fetch (not an SSRF target).
@@ -707,7 +790,7 @@ current-context: default
         ))
         .unwrap();
 
-        let rendered = render_bootstrap_config(&config).unwrap();
+        let rendered = render_bootstrap_config(&config).unwrap().unwrap();
         assert!(rendered.contains("name: first"));
         assert!(rendered.contains("name: second"));
         assert!(rendered.find("name: first") < rendered.find("name: second"));
@@ -755,6 +838,66 @@ current-context: default
                 .contains("flux-system")
         );
         assert!(addons[0].url.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_bootstrap_jobs_loads_job_configs_and_renders_params() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/bootstrapconfigs/flux",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "BootstrapConfig",
+                "metadata": {
+                    "name": "flux",
+                    "namespace": "test-ns",
+                },
+                "spec": {
+                    "job": {
+                        "image": "ghcr.io/example/{{channel}}:latest",
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["flux"],
+                        "args": ["install", "--namespace={{namespace}}"],
+                        "env": {
+                            "FLUX_NAMESPACE": "{{namespace}}"
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let jobs = resolve_bootstrap_jobs(
+            &client,
+            "test-ns",
+            &[BootstrapRef {
+                name: "flux".to_string(),
+                params: BTreeMap::from([
+                    ("channel".to_string(), "fluxcd".to_string()),
+                    ("namespace".to_string(), "flux-system".to_string()),
+                ]),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "flux");
+        assert_eq!(jobs[0].image, "ghcr.io/example/fluxcd:latest");
+        assert_eq!(jobs[0].command, vec!["flux".to_string()]);
+        assert_eq!(
+            jobs[0].args,
+            vec!["install".to_string(), "--namespace=flux-system".to_string()]
+        );
+        assert_eq!(
+            jobs[0].env.get("FLUX_NAMESPACE").map(String::as_str),
+            Some("flux-system")
+        );
     }
 
     #[tokio::test]

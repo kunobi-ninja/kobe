@@ -97,3 +97,10 @@ etcd:
       create: false
   persistence:
     size: 8Gi
+
+bootstrapConfigs:
+  flux:
+    enabled: true
+    image: ghcr.io/fluxcd/flux-cli:v2.2.3
+    imagePullPolicy: IfNotPresent
+    args: []

@@ -61,7 +61,12 @@ test-smoke-vkobe-kine ttl='2m' *args:
 # Lease a local bootstrap-enabled vkobe cluster and verify bootstrap resources exist
 [group('dev')]
 test-smoke-bootstrap-vkobe ttl='2m' *args:
-    @env POOL_WARMUP_TIMEOUT_SECONDS=90 mise exec -- bun run ./hack/test-smoke-bootstrap.ts e2e-vkobe-etcd-bootstrap default bootstrap-marker {{ ttl }} {{ args }}
+    @env POOL_WARMUP_TIMEOUT_SECONDS=90 mise exec -- bun run ./hack/test-smoke-bootstrap.ts e2e-vkobe-etcd-bootstrap default configmap bootstrap-marker {{ ttl }} {{ args }}
+
+# Lease a local vkobe+kine-sqlite cluster with Flux bootstrap and verify Flux namespace exists
+[group('dev')]
+test-smoke-bootstrap-vkobe-kine ttl='2m' *args:
+    @env POOL_WARMUP_TIMEOUT_SECONDS=120 mise exec -- bun run ./hack/test-smoke-bootstrap.ts e2e-vkobe-kine-sqlite-bootstrap flux-system deployment source-controller {{ ttl }} {{ args }}
 
 # Lease one warm cluster and verify the pool refills back to the warm target
 [group('dev')]
@@ -89,6 +94,7 @@ build-crdgen:
     cargo run --bin crdgen -- clusterpools > charts/kobe/crds/clusterpools.yaml
     cargo run --bin crdgen -- clusterleases > charts/kobe/crds/clusterleases.yaml
     cargo run --bin crdgen -- clusterinstances > charts/kobe/crds/clusterinstances.yaml
+    cargo run --bin crdgen -- bootstrapconfigs > charts/kobe/crds/bootstrapconfigs.yaml
     cargo run --bin crdgen -- accesspolicies > charts/kobe/crds/accesspolicies.yaml
     cargo run --bin crdgen -- kobestores > charts/kobe/crds/kobestores.yaml
 

@@ -431,7 +431,9 @@ async fn reconcile_profile(
                     ClusterInstanceStatus {
                         phase: ClusterInstancePhase::Recycling,
                         provisioned: current.provisioned,
+                        bootstrapped: current.bootstrapped,
                         lease_ref: current.lease_ref,
+                        active_bootstrap: None,
                         idle_since: None,
                         state_since: Some(chrono::Utc::now().to_rfc3339()),
                         health_failures: current.health_failures,
@@ -613,7 +615,9 @@ async fn ensure_cluster_instance(
         status: Some(ClusterInstanceStatus {
             phase: ClusterInstancePhase::Creating,
             provisioned: false,
+            bootstrapped: false,
             lease_ref: None,
+            active_bootstrap: None,
             idle_since: None,
             state_since: Some(chrono::Utc::now().to_rfc3339()),
             health_failures: 0,
@@ -660,7 +664,9 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
             ClusterInstanceStatus {
                 phase: cluster_phase_from_state(&entry.state),
                 provisioned: current.provisioned,
+                bootstrapped: current.bootstrapped,
                 lease_ref: current.lease_ref,
+                active_bootstrap: current.active_bootstrap,
                 idle_since: entry.idle_since.map(|ts| ts.to_rfc3339()),
                 state_since: entry.state_since.map(|ts| ts.to_rfc3339()),
                 health_failures: entry.health_failures,

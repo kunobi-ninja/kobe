@@ -85,9 +85,17 @@ pub struct ClusterInstanceStatus {
     #[serde(default)]
     pub provisioned: bool,
 
+    /// Whether all configured bootstrap steps have completed successfully.
+    #[serde(default)]
+    pub bootstrapped: bool,
+
     /// Lease currently attached to this instance.
     #[serde(default)]
     pub lease_ref: Option<ResourceRef>,
+
+    /// Bootstrap currently running for this instance, if any.
+    #[serde(default)]
+    pub active_bootstrap: Option<String>,
 
     /// When the instance became idle and eligible for scale-down.
     #[serde(default)]
