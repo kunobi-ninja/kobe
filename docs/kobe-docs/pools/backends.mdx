@@ -59,20 +59,19 @@ spec:
     type: capi
     capi:
       infrastructureApiVersion: infrastructure.cluster.x-k8s.io/v1beta1
-      infrastructureKind: VCluster
+      infrastructureKind: DockerCluster
       infrastructureSpec:
         # Provider-specific spec, passed through as-is
-        helmRelease:
-          chart:
-            name: vcluster
-            version: "0.24.1"
+        controlPlaneEndpoint:
+          host: ""
+          port: 6443
 ```
 
 **When to use:** When you need to use an existing CAPI infrastructure provider, or when kobe's built-in backends don't support your target environment.
 
 ## vkobe
 
-vkobe is kobe's lightweight virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not use vcluster or any third-party runtime.
+vkobe is kobe's lightweight virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not depend on any third-party virtual cluster runtime.
 
 ```yaml
 spec:

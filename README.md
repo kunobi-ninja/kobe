@@ -147,10 +147,7 @@ status:
 
 ## Documentation
 
-- [K3k + Velero Backend](docs/plans/2026-02-25-k3k-velero-backend.md)
-- [Direct K0s & CAPI Backends](docs/plans/2026-02-27-direct-k0s-and-capi-backends.md)
-- [OpenTelemetry Traces](docs/plans/2026-02-26-otel-traces-design.md)
-- [Docker CI Maturity](docs/plans/2026-02-26-docker-ci-maturity-design.md)
+See [docs/kobe-docs/](docs/kobe-docs/) for the user-facing documentation site.
 
 ## License
 
