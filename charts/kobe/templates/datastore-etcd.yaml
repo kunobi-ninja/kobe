@@ -1,0 +1,41 @@
+{{- /*
+  etcd KobeStore — emitted when etcd.enabled: true.
+  Two modes, selected by etcd.bundled:
+    - bundled: true  → chart deploys bitnami/etcd subchart, CR points at its Service.
+    - bundled: false → external etcd; etcd.endpoints[] must be set.
+
+  Subchart deployment itself is gated by Chart.yaml condition on etcd.bundled.
+*/ -}}
+{{- if .Values.etcd.bundled -}}
+  {{- if not .Values.etcd.enabled -}}
+  {{- fail "etcd.bundled: true requires etcd.enabled: true" -}}
+  {{- end -}}
+{{- end -}}
+{{- if .Values.etcd.enabled -}}
+{{- $name := .Values.etcd.storeName | default (printf "%s-etcd" (include "kobe.fullname" .)) -}}
+{{- $endpoints := list -}}
+{{- if .Values.etcd.bundled -}}
+  {{- $svc := printf "%s-etcd" .Release.Name -}}
+  {{- $endpoints = list (printf "http://%s.%s.svc:2379" $svc .Release.Namespace) -}}
+{{- else -}}
+  {{- $endpoints = .Values.etcd.endpoints -}}
+  {{- if not $endpoints -}}
+  {{- fail "etcd.enabled: true with bundled: false requires etcd.endpoints[] to be set." -}}
+  {{- end -}}
+{{- end -}}
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: KobeStore
+metadata:
+  name: {{ $name | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: datastore-etcd
+spec:
+  driver: etcd
+  endpoints:
+    {{- toYaml $endpoints | nindent 4 }}
+  capacity:
+    maxClusters: {{ .Values.etcd.maxClusters | default 50 }}
+  replicas: {{ if .Values.etcd.bundled }}{{ .Values.etcd.replicaCount | default 1 }}{{ else }}1{{ end }}
+{{- end }}

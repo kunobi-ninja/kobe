@@ -1,0 +1,39 @@
+{{- /*
+  Custom KobeStore CRs provided via values.kobeStores. Each entry becomes a KobeStore CR,
+  useful when the operator wants to point pools at an external etcd/kine instance
+  that the chart did not deploy (bring-your-own endpoints).
+
+  Example:
+    kobeStores:
+      - name: external-etcd
+        driver: etcd
+        endpoints:
+          - http://etcd.shared.svc:2379
+        capacity:
+          maxClusters: 100
+        replicas: 3
+*/ -}}
+{{- range .Values.kobeStores }}
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: KobeStore
+metadata:
+  name: {{ .name | quote }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: kobestore-user
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  driver: {{ .driver | quote }}
+  endpoints:
+    {{- toYaml .endpoints | nindent 4 }}
+  {{- with .capacity }}
+  capacity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  replicas: {{ .replicas | default 1 }}
+{{- end }}

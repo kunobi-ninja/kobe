@@ -88,9 +88,27 @@ networkPolicy:
   egressCIDRs:
     - 0.0.0.0/0
 
-# Optional bitnami/etcd subchart
+# -----------------------------------------------------------------------------
+# Datastores — state backends for vkobe virtual clusters.
+#
+# Each vkobe pool needs a KobeStore to persist cluster state. Two built-in
+# options: etcd (full cluster, HA) or Kine+SQLite (single replica, lightweight).
+# Both can be deployed by the chart OR wired to an external instance.
+#
+# The chart auto-creates the KobeStore CR so pools can reference it by name.
+# -----------------------------------------------------------------------------
+
+# etcd datastore. Three possible states:
+#   enabled: false                   → no etcd (default)
+#   enabled: true + bundled: true    → chart deploys bitnami/etcd subchart
+#   enabled: true + bundled: false   → external etcd; endpoints[] must be set
 etcd:
   enabled: false
+  bundled: false
+  endpoints: []
+  #   - http://my-etcd.platform.svc:2379
+
+  # Subchart values (apply only when bundled: true). Forwarded to bitnami/etcd.
   replicaCount: 3
   auth:
     rbac:
@@ -98,9 +116,47 @@ etcd:
   persistence:
     size: 8Gi
 
-bootstrapConfigs:
-  flux:
-    enabled: true
-    image: ghcr.io/fluxcd/flux-cli:v2.2.3
-    imagePullPolicy: IfNotPresent
-    args: []
+  # KobeStore config (applies whenever enabled: true).
+  # storeName: ""          # defaults to "<release>-etcd"
+  maxClusters: 50
+
+# Lightweight Kine + SQLite datastore (single replica, PVC-backed).
+# Suitable for dev, CI, and small production workloads where HA isn't needed.
+# SQLite is single-writer, so this cannot scale beyond one replica.
+# For an external Kine (PostgreSQL-backed, etc.) use kobeStores[] instead.
+kine:
+  enabled: false
+  # storeName: ""          # defaults to "<release>-kine"
+  image: rancher/kine:v0.13.2
+  imagePullPolicy: IfNotPresent
+  storage: 5Gi
+  # storageClassName: ""    # uses cluster default if unset
+  maxClusters: 20
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  nodeSelector: {}
+  tolerations: []
+
+# -----------------------------------------------------------------------------
+# KobeStore CRs for external / bring-your-own datastores. Use when the target
+# etcd/kine is managed outside the chart (shared across pools, pre-existing
+# cluster, etc.).
+#
+# Example:
+#   kobeStores:
+#     - name: external-etcd
+#       driver: etcd
+#       endpoints:
+#         - http://etcd.shared.svc:2379
+#       capacity:
+#         maxClusters: 100
+#       replicas: 3
+# -----------------------------------------------------------------------------
+kobeStores: []
+
+

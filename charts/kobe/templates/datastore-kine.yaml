@@ -1,0 +1,102 @@
+{{- if .Values.kine.enabled -}}
+{{- $name := printf "%s-kine" (include "kobe.fullname" .) -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: datastore-kine
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.kine.storage | quote }}
+  {{- with .Values.kine.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: datastore-kine
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # SQLite is single-writer
+  selector:
+    matchLabels:
+      {{- include "kobe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: datastore-kine
+  template:
+    metadata:
+      labels:
+        {{- include "kobe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: datastore-kine
+    spec:
+      {{- with .Values.kine.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kine.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: kine
+          image: {{ .Values.kine.image | quote }}
+          imagePullPolicy: {{ .Values.kine.imagePullPolicy | default "IfNotPresent" | quote }}
+          args:
+            - --endpoint=sqlite:///data/kine.db
+            - --listen-address=0.0.0.0:2379
+            - --metrics-bind-address=0
+            - --log-format=json
+          ports:
+            - name: client
+              containerPort: 2379
+          resources:
+            {{- toYaml .Values.kine.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $name }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: datastore-kine
+spec:
+  selector:
+    {{- include "kobe.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: datastore-kine
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: KobeStore
+metadata:
+  name: {{ .Values.kine.storeName | default $name | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: datastore-kine
+spec:
+  driver: kine-sqlite
+  endpoints:
+    - http://{{ $name }}.{{ .Release.Namespace }}.svc:2379
+  capacity:
+    maxClusters: {{ .Values.kine.maxClusters | default 20 }}
+  replicas: 1
+{{- end }}
