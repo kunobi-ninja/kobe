@@ -1,7 +1,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::config::ResolvedConfig;
+use super::leases::LeaseSummary;
 use super::{authed_client, get_auth_header, with_auth};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,7 +74,25 @@ pub(crate) fn format_policy(pool: &PoolSummary) -> Option<String> {
     }
 }
 
-pub(crate) fn print_pool_table(pools: &[PoolSummary], indent: &str) {
+/// Count leases in `Recycling` phase per pool (keyed by lease `profile`).
+///
+/// These leases are reclaiming their backend instances but still occupy a slot
+/// against the pool's `maxClusters` until cleanup completes — so the pool
+/// manager counts them toward capacity even though they do not appear in the
+/// pool's `recycling` instance count (the instance was already torn down).
+pub(crate) fn recycling_leases_by_pool(leases: &[LeaseSummary]) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for lease in leases {
+        if lease.phase.eq_ignore_ascii_case("recycling") {
+            *counts.entry(lease.profile.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], indent: &str) {
+    let recycling_leases = recycling_leases_by_pool(leases);
+
     for (index, pool) in pools.iter().enumerate() {
         if index > 0 {
             println!();
@@ -86,12 +106,21 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], indent: &str) {
         if let Some(policy) = format_policy(pool) {
             println!("{indent}  {policy}");
         }
+        if let Some(count) = recycling_leases.get(&pool.name)
+            && *count > 0
+        {
+            let leases_word = if *count == 1 { "lease" } else { "leases" };
+            println!(
+                "{indent}  note: {count} {leases_word} reclaiming capacity (new warm slots will open when cleanup finishes)"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolSummary, format_policy};
+    use super::{PoolSummary, format_policy, recycling_leases_by_pool};
+    use crate::commands::leases::LeaseSummary;
 
     #[test]
     fn pool_summary_accepts_legacy_claimed_field() {
@@ -142,5 +171,37 @@ mod tests {
             format_policy(&pool).as_deref(),
             Some("ttl 1h  warm 2 [max 8]  scale down after 30m")
         );
+    }
+
+    fn lease(phase: &str, pool: &str) -> LeaseSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": "l-test",
+            "phase": phase,
+            "profile": pool,
+        }))
+        .expect("test lease payload should deserialize")
+    }
+
+    #[test]
+    fn recycling_leases_by_pool_counts_per_pool_case_insensitive() {
+        let leases = vec![
+            lease("Recycling", "ci-k0s-small"),
+            lease("recycling", "ci-k0s-small"),
+            lease("Bound", "ci-k0s-small"),
+            lease("RECYCLING", "ci-k3s-small"),
+            lease("Pending", "ci-vkobe-small"),
+        ];
+
+        let counts = recycling_leases_by_pool(&leases);
+        assert_eq!(counts.get("ci-k0s-small"), Some(&2));
+        assert_eq!(counts.get("ci-k3s-small"), Some(&1));
+        assert_eq!(counts.get("ci-vkobe-small"), None);
+    }
+
+    #[test]
+    fn recycling_leases_by_pool_returns_empty_when_nothing_is_recycling() {
+        let leases = vec![lease("Bound", "ci-k0s-small"), lease("Pending", "ci-small")];
+        let counts = recycling_leases_by_pool(&leases);
+        assert!(counts.is_empty());
     }
 }

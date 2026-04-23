@@ -192,7 +192,7 @@ pub async fn status(
     }
 
     let pools: Vec<PoolSummary> = pool_details.into_iter().map(|detail| detail.pool).collect();
-    print_pool_table(&pools, "  ");
+    print_pool_table(&pools, &leases, "  ");
     println!();
 
     Ok(())

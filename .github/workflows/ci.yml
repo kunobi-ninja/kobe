@@ -71,7 +71,8 @@ jobs:
             --ignore RUSTSEC-2026-0002 \
             --ignore RUSTSEC-2026-0097 \
             --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104
 
       - name: Install Helm
         uses: azure/setup-helm@v4

@@ -370,7 +370,7 @@ spec:
                       Claims pending longer than this get 503. Format: "5m".
                     type: string
                   scaleDownAfter:
-                    default: 30m
+                    default: 5m
                     description: |-
                       Delete idle clusters after this duration if above `min_ready`.
                       Format: "30m", "1h", etc.
