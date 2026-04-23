@@ -15,10 +15,10 @@ spec:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
-    minReady: 1
+    minReady: 0
     maxClusters: 6
     scaleUpThreshold: 0
-    scaleDownAfter: "30m"
+    scaleDownAfter: "5m"
     queueTimeout: "5m"
   resources:
     limits:

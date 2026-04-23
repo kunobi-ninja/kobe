@@ -514,7 +514,7 @@ fn default_max_clusters() -> u32 {
     8
 }
 fn default_scale_down_after() -> String {
-    "30m".to_string()
+    "5m".to_string()
 }
 fn default_queue_timeout() -> String {
     "5m".to_string()

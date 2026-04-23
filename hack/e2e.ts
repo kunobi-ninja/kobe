@@ -396,8 +396,21 @@ async function prepareHelm(): Promise<void> {
 
 async function installChart(args: Args): Promise<void> {
   step(`Installing Helm release '${args.release}' into namespace '${args.namespace}'`);
+  // CRDs in charts/kobe/crds/ are installed by Helm on first install. On upgrades,
+  // re-apply with server-side apply using the "helm" field manager so ownership
+  // stays consistent with what Helm uses internally (avoids field-manager conflicts).
   await runCommand(
-    ["kubectl", "--context", kubeContext(args.cluster), "apply", "-f", "./charts/kobe/crds"],
+    [
+      "kubectl",
+      "--context",
+      kubeContext(args.cluster),
+      "apply",
+      "--server-side",
+      "--force-conflicts",
+      "--field-manager=helm",
+      "-f",
+      "./charts/kobe/crds",
+    ],
     {
       step: "failed to apply Kobe CRDs",
     },
@@ -484,10 +497,10 @@ spec:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
-    minReady: 1
+    minReady: 0
     maxClusters: 2
     scaleUpThreshold: 0
-    scaleDownAfter: "30m"
+    scaleDownAfter: "5m"
     queueTimeout: "5m"
   resources:
     limits:
@@ -667,10 +680,10 @@ spec:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
-    minReady: 1
+    minReady: 0
     maxClusters: 2
     scaleUpThreshold: 0
-    scaleDownAfter: "30m"
+    scaleDownAfter: "5m"
     queueTimeout: "5m"
   resources:
     limits:
@@ -707,10 +720,10 @@ spec:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
-    minReady: 1
+    minReady: 0
     maxClusters: 2
     scaleUpThreshold: 0
-    scaleDownAfter: "30m"
+    scaleDownAfter: "5m"
     queueTimeout: "30m"
   resources:
     limits:
@@ -745,10 +758,10 @@ spec:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
-    minReady: 1
+    minReady: 0
     maxClusters: 2
     scaleUpThreshold: 0
-    scaleDownAfter: "30m"
+    scaleDownAfter: "5m"
     queueTimeout: "5m"
   resources:
     limits:
@@ -785,10 +798,10 @@ spec:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
-    minReady: 1
+    minReady: 0
     maxClusters: 2
     scaleUpThreshold: 0
-    scaleDownAfter: "30m"
+    scaleDownAfter: "5m"
     queueTimeout: "30m"
   resources:
     limits:
