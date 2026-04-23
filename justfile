@@ -38,6 +38,11 @@ build:
 build-cli:
     cargo build --release --bin kobe
 
+# Build and install the CLI into ~/.cargo/bin (honors $CARGO_INSTALL_ROOT)
+[group('build')]
+install:
+    cargo install --path . --bin kobe --force
+
 # Run the CLI (pass args after --)
 [group('dev')]
 run *args:
