@@ -155,12 +155,19 @@ kine:
   # storageClassName: ""    # uses cluster default if unset
   maxClusters: 20
   resources:
+    # Kine is a SQLite-on-network shim and is far more sensitive to CPU
+    # throttling than typical etcd: every kube-apiserver bootstrap fans out
+    # hundreds of concurrent writes that all serialize through Kine's SQL
+    # connection pool. Empirically, 500m hits the throttle limit during a
+    # single vkobe pool member coming up alongside a steady-state one,
+    # producing "context deadline exceeded" txn errors. 2 cores leaves
+    # ample headroom.
     requests:
-      cpu: "50m"
-      memory: "64Mi"
+      cpu: "200m"
+      memory: "128Mi"
     limits:
-      cpu: "500m"
-      memory: "256Mi"
+      cpu: "2"
+      memory: "512Mi"
   nodeSelector: {}
   tolerations: []
 
