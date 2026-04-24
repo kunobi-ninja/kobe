@@ -423,6 +423,34 @@ pub struct ScalingConfig {
     /// Claims pending longer than this get 503. Format: "5m".
     #[serde(default = "default_queue_timeout")]
     pub queue_timeout: String,
+
+    /// Exponential backoff policy on consecutive provision failures.
+    /// When unset, sensible defaults apply (base 5s, multiplier 2, max 2m).
+    /// A broken pool that never reaches `Ready` caps at ~30 retries/hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_backoff: Option<FailureBackoffConfig>,
+}
+
+/// Per-pool exponential backoff configuration for consecutive provision
+/// failures. All fields optional — unset fields inherit defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailureBackoffConfig {
+    /// Base delay before retrying after the first failure. Format: "5s", "30s", "2m".
+    /// Defaults to "5s" when unset.
+    #[serde(default = "default_backoff_base")]
+    pub base: String,
+
+    /// Exponential multiplier applied to the delay on each consecutive failure.
+    /// Defaults to 2 (binary exponential).
+    #[serde(default = "default_backoff_multiplier")]
+    pub multiplier: u32,
+
+    /// Upper bound on the backoff delay. Prevents the retry interval from
+    /// growing unbounded on sustained failure. Format: "2m", "10m".
+    /// Defaults to "2m" when unset.
+    #[serde(default = "default_backoff_max")]
+    pub max: String,
 }
 
 // --- Enhancement: Diagnostics ---
@@ -491,6 +519,24 @@ pub struct ClusterPoolStatus {
     /// Name of the PostgreSQL template database for golden images (k3s backend).
     #[serde(default)]
     pub golden_template_db: Option<String>,
+
+    /// Number of consecutive provision attempts that failed before any
+    /// instance reached `Ready`. Resets to 0 when any instance reaches `Ready`.
+    /// Drives the exponential backoff that slows down broken-pool create loops
+    /// so one misconfigured pool cannot hammer the API at full speed.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+
+    /// Earliest time the pool manager may emit another `Create` action for
+    /// this pool (RFC3339). Set when `consecutive_failures > 0`. Cleared on
+    /// success or by explicit operator reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<String>,
+
+    /// Short description of the last provision failure, for operator
+    /// observability. Typically the first line of the error chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_reason: Option<String>,
 }
 
 // --- Defaults ---
@@ -518,6 +564,15 @@ fn default_scale_down_after() -> String {
 }
 fn default_queue_timeout() -> String {
     "5m".to_string()
+}
+fn default_backoff_base() -> String {
+    "5s".to_string()
+}
+fn default_backoff_multiplier() -> u32 {
+    2
+}
+fn default_backoff_max() -> String {
+    "2m".to_string()
 }
 fn default_retention_days() -> u32 {
     7

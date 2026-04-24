@@ -496,6 +496,9 @@ async fn reconcile_profile(
         .as_ref()
         .and_then(|s| s.golden_template_db.clone());
 
+    let (consecutive_failures, next_attempt_at, last_failure_reason) =
+        compute_backoff_state(&profile, &pool_state, &counts, now);
+
     let status = ClusterPoolStatus {
         ready: counts.ready,
         leased: counts.leased,
@@ -506,6 +509,9 @@ async fn reconcile_profile(
         golden_backup: existing_golden_backup,
         golden_generation: existing_golden_generation,
         golden_template_db: existing_golden_template_db,
+        consecutive_failures,
+        next_attempt_at,
+        last_failure_reason,
     };
 
     let patch = serde_json::json!({ "status": status });
@@ -675,6 +681,80 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
         )
         .await;
     }
+}
+
+/// Compute the next backoff state for a pool given the previous status,
+/// current pool state, and counts.
+///
+/// Semantics:
+/// - If any instance is `Ready` now OR was ever `Ready` in its lifetime
+///   (`idle_since` populated) → healthy. Reset counter to 0.
+/// - Otherwise, if there is any `Recycling` instance and nothing is
+///   `Creating`, the pool is in a "can't make progress" state. Bump the
+///   counter once per backoff window (gated by `next_attempt_at`) so that
+///   repeated reconciles within the same window don't over-increment.
+/// - Leaves state unchanged while `Creating > 0` (a new attempt is in flight).
+///
+/// Returns `(consecutive_failures, next_attempt_at, last_failure_reason)`.
+fn compute_backoff_state(
+    profile: &ClusterPool,
+    pool_state: &PoolState,
+    counts: &crate::pool::manager::StateCounts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (u32, Option<String>, Option<String>) {
+    let prev = profile
+        .status
+        .as_ref()
+        .map(|s| {
+            (
+                s.consecutive_failures,
+                s.next_attempt_at.clone(),
+                s.last_failure_reason.clone(),
+            )
+        })
+        .unwrap_or((0, None, None));
+
+    let (prev_failures, prev_next_attempt, prev_reason) = prev;
+
+    // Anything Ready (now or historically) = pool is healthy.
+    let any_ready_or_ever_ready = counts.ready > 0
+        || counts.leased > 0
+        || pool_state.clusters.values().any(|e| e.idle_since.is_some());
+
+    if any_ready_or_ever_ready {
+        return (0, None, None);
+    }
+
+    // A create attempt is still in flight — wait to see its outcome.
+    if counts.creating > 0 {
+        return (prev_failures, prev_next_attempt, prev_reason);
+    }
+
+    // Pool has failures and is not making progress. Bump only if the prior
+    // backoff window has elapsed (or no window was set), so repeated
+    // reconciles inside one window don't over-count.
+    if counts.recycling == 0 {
+        // Nothing has actually failed; hold the previous state.
+        return (prev_failures, prev_next_attempt, prev_reason);
+    }
+
+    let window_elapsed = match prev_next_attempt.as_deref() {
+        None => true,
+        Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
+            Ok(t) => now >= t.with_timezone(&chrono::Utc),
+            Err(_) => true,
+        },
+    };
+
+    if !window_elapsed {
+        return (prev_failures, prev_next_attempt, prev_reason);
+    }
+
+    let new_failures = prev_failures.saturating_add(1);
+    let delay = crate::pool::manager::backoff_delay_for(profile, new_failures);
+    let next_attempt = delay.map(|d| (now + d).to_rfc3339());
+
+    (new_failures, next_attempt, prev_reason)
 }
 
 fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {

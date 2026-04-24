@@ -351,6 +351,35 @@ spec:
                 description: Autoscaling configuration. When set, overrides fixed `size`.
                 nullable: true
                 properties:
+                  failureBackoff:
+                    description: |-
+                      Exponential backoff policy on consecutive provision failures.
+                      When unset, sensible defaults apply (base 5s, multiplier 2, max 2m).
+                      A broken pool that never reaches `Ready` caps at ~30 retries/hour.
+                    nullable: true
+                    properties:
+                      base:
+                        default: 5s
+                        description: |-
+                          Base delay before retrying after the first failure. Format: "5s", "30s", "2m".
+                          Defaults to "5s" when unset.
+                        type: string
+                      max:
+                        default: 2m
+                        description: |-
+                          Upper bound on the backoff delay. Prevents the retry interval from
+                          growing unbounded on sustained failure. Format: "2m", "10m".
+                          Defaults to "2m" when unset.
+                        type: string
+                      multiplier:
+                        default: 2
+                        description: |-
+                          Exponential multiplier applied to the delay on each consecutive failure.
+                          Defaults to 2 (binary exponential).
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                    type: object
                   maxClusters:
                     default: 8
                     description: Hard ceiling on total clusters (warm + leased + creating).
@@ -435,6 +464,16 @@ spec:
           status:
             nullable: true
             properties:
+              consecutiveFailures:
+                default: 0
+                description: |-
+                  Number of consecutive provision attempts that failed before any
+                  instance reached `Ready`. Resets to 0 when any instance reaches `Ready`.
+                  Drives the exponential backoff that slows down broken-pool create loops
+                  so one misconfigured pool cannot hammer the API at full speed.
+                format: uint32
+                minimum: 0.0
+                type: integer
               creating:
                 default: 0
                 description: Number of clusters being created.
@@ -456,12 +495,25 @@ spec:
                 description: Name of the PostgreSQL template database for golden images (k3s backend).
                 nullable: true
                 type: string
+              lastFailureReason:
+                description: |-
+                  Short description of the last provision failure, for operator
+                  observability. Typically the first line of the error chain.
+                nullable: true
+                type: string
               leased:
                 default: 0
                 description: Number of clusters currently leased.
                 format: uint32
                 minimum: 0.0
                 type: integer
+              nextAttemptAt:
+                description: |-
+                  Earliest time the pool manager may emit another `Create` action for
+                  this pool (RFC3339). Set when `consecutive_failures > 0`. Cleared on
+                  success or by explicit operator reset.
+                nullable: true
+                type: string
               queueDepth:
                 default: 0
                 description: Current queue depth (claims waiting for clusters).

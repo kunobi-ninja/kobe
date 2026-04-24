@@ -141,7 +141,15 @@ pub fn compute_pool_actions(
     // --- Scale Up ---
     // We want at least `min_ready` clusters available or on the way.
     // Refill whenever ready + creating drops below the warm target.
-    if counts.ready + counts.creating < min_ready && total < max_clusters {
+    //
+    // Guard with failure backoff: if the pool has had consecutive provision
+    // failures, respect the computed next_attempt_at window. This prevents
+    // a misconfigured pool (missing KobeStore, bad backend config, etc.)
+    // from turning into a create-recycle loop that hammers the API.
+    if counts.ready + counts.creating < min_ready
+        && total < max_clusters
+        && !backoff_active(profile, now)
+    {
         let deficit = min_ready.saturating_sub(counts.ready + counts.creating);
         let room = max_clusters.saturating_sub(total);
         let to_create = deficit.min(room).min(MAX_BURST);
@@ -190,6 +198,117 @@ pub fn compute_pool_actions(
 
 /// Maximum clusters to create in a single reconciliation pass.
 const MAX_BURST: u32 = 2;
+
+// --- Failure backoff ---
+//
+// When a pool's provision attempts consistently fail to reach `Ready`, the
+// pool manager should stop hammering the API with new `Create` actions and
+// let the backoff window elapse. Defaults tuned so a chronically broken
+// pool still retries roughly every 2 min at steady state — fast enough to
+// recover promptly once the operator fixes the config, slow enough to
+// avoid a create/recycle loop.
+
+/// Default base delay between provision attempts after the first failure.
+pub const DEFAULT_BACKOFF_BASE: chrono::Duration = chrono::Duration::seconds(5);
+/// Default exponential multiplier.
+pub const DEFAULT_BACKOFF_MULTIPLIER: u32 = 2;
+/// Default upper bound for the backoff delay.
+pub const DEFAULT_BACKOFF_MAX: chrono::Duration = chrono::Duration::seconds(120);
+
+/// Resolve the effective backoff config for a pool, falling back to defaults
+/// for any field the spec did not set.
+pub fn resolved_backoff(profile: &ClusterPool) -> (chrono::Duration, u32, chrono::Duration) {
+    let cfg = profile
+        .spec
+        .scaling
+        .as_ref()
+        .and_then(|s| s.failure_backoff.as_ref());
+
+    let base = cfg
+        .and_then(|c| parse_duration(&c.base))
+        .unwrap_or(DEFAULT_BACKOFF_BASE);
+    let multiplier = cfg
+        .map(|c| c.multiplier)
+        .filter(|m| *m >= 1)
+        .unwrap_or(DEFAULT_BACKOFF_MULTIPLIER);
+    let max = cfg
+        .and_then(|c| parse_duration(&c.max))
+        .unwrap_or(DEFAULT_BACKOFF_MAX);
+    (base, multiplier, max)
+}
+
+/// Compute the backoff delay for a pool with N consecutive failures using
+/// the profile's resolved config.
+///
+/// Default schedule (base=5s, multiplier=2, max=120s):
+///   n=1 →  5s,  n=2 → 10s,  n=3 → 20s,  n=4 → 40s,
+///   n=5 → 80s,  n=6+ → 120s (capped).
+///
+/// Returns `None` when `consecutive_failures == 0` (no backoff applies).
+pub fn backoff_delay_for(
+    profile: &ClusterPool,
+    consecutive_failures: u32,
+) -> Option<chrono::Duration> {
+    if consecutive_failures == 0 {
+        return None;
+    }
+    let (base, multiplier, max) = resolved_backoff(profile);
+    // 2^(n-1), saturating against u32 overflow at n >= 32.
+    let shift = consecutive_failures.saturating_sub(1).min(31);
+    let factor = (multiplier as u64).saturating_pow(shift);
+    let secs = base
+        .num_seconds()
+        .saturating_mul(factor as i64)
+        .min(max.num_seconds());
+    Some(chrono::Duration::seconds(secs))
+}
+
+/// Back-compat thin wrapper used by tests that do not need per-pool config.
+#[cfg(test)]
+pub fn backoff_delay(consecutive_failures: u32) -> Option<chrono::Duration> {
+    // Evaluates defaults by constructing a fresh profile.
+    let profile = ClusterPool {
+        metadata: Default::default(),
+        spec: crate::crd::ClusterPoolSpec {
+            size: 0,
+            ttl: String::new(),
+            backend: Default::default(),
+            cluster: crate::crd::ClusterConfig {
+                version: String::new(),
+                servers: 1,
+                agents: None,
+                server_args: vec![],
+                persistence: None,
+                expose: None,
+            },
+            addons: vec![],
+            bootstraps: vec![],
+            resources: None,
+            health_check: None,
+            readiness_gates: vec![],
+            scaling: None,
+            diagnostics: None,
+            snapshot: None,
+        },
+        status: None,
+    };
+    backoff_delay_for(&profile, consecutive_failures)
+}
+
+/// True if the pool's `status.nextAttemptAt` is in the future and scale-up
+/// should be suppressed until then.
+fn backoff_active(profile: &ClusterPool, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(status) = profile.status.as_ref() else {
+        return false;
+    };
+    let Some(next) = status.next_attempt_at.as_deref() else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(next) {
+        Ok(next_at) => now < next_at.with_timezone(&chrono::Utc),
+        Err(_) => false, // malformed status → don't block creates
+    }
+}
 
 /// Find the highest existing cluster index for a profile.
 ///
@@ -510,6 +629,7 @@ mod tests {
                 scale_up_threshold: 1,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                failure_backoff: None,
             }),
         );
         let state = PoolState {
@@ -539,6 +659,7 @@ mod tests {
                 scale_up_threshold: 1,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                failure_backoff: None,
             }),
         );
         let mut clusters = HashMap::new();
@@ -562,6 +683,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                failure_backoff: None,
             }),
         );
         let mut clusters = HashMap::new();
@@ -589,6 +711,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                failure_backoff: None,
             }),
         );
         let mut clusters = HashMap::new();
@@ -613,6 +736,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                failure_backoff: None,
             }),
         );
         let now = chrono::Utc::now();
@@ -660,6 +784,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                failure_backoff: None,
             }),
         );
         let now = chrono::Utc::now();
@@ -766,5 +891,174 @@ mod tests {
             .filter(|a| matches!(a, PoolAction::Delete(_)))
             .collect();
         assert_eq!(deletes.len(), 0);
+    }
+
+    // --- Failure backoff ---
+
+    #[test]
+    fn test_backoff_delay_default_schedule() {
+        // defaults: base=5s, x2, cap=2m
+        assert_eq!(backoff_delay(0), None);
+        assert_eq!(backoff_delay(1), Some(chrono::Duration::seconds(5)));
+        assert_eq!(backoff_delay(2), Some(chrono::Duration::seconds(10)));
+        assert_eq!(backoff_delay(3), Some(chrono::Duration::seconds(20)));
+        assert_eq!(backoff_delay(4), Some(chrono::Duration::seconds(40)));
+        assert_eq!(backoff_delay(5), Some(chrono::Duration::seconds(80)));
+        // capped at 120s from n=6 onward
+        assert_eq!(backoff_delay(6), Some(chrono::Duration::seconds(120)));
+        assert_eq!(backoff_delay(10), Some(chrono::Duration::seconds(120)));
+        // saturation at large N
+        assert_eq!(
+            backoff_delay(u32::MAX),
+            Some(chrono::Duration::seconds(120))
+        );
+    }
+
+    #[test]
+    fn test_backoff_delay_honors_per_pool_config() {
+        let mut p = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 1,
+                max_clusters: 3,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                failure_backoff: Some(crate::crd::FailureBackoffConfig {
+                    base: "2s".to_string(),
+                    multiplier: 3,
+                    max: "30s".to_string(),
+                }),
+            }),
+        );
+        p.status = None;
+        // base=2s, x3, cap=30s → 2s, 6s, 18s, 30s (cap), 30s, ...
+        assert_eq!(backoff_delay_for(&p, 1), Some(chrono::Duration::seconds(2)));
+        assert_eq!(backoff_delay_for(&p, 2), Some(chrono::Duration::seconds(6)));
+        assert_eq!(
+            backoff_delay_for(&p, 3),
+            Some(chrono::Duration::seconds(18))
+        );
+        assert_eq!(
+            backoff_delay_for(&p, 4),
+            Some(chrono::Duration::seconds(30))
+        );
+        assert_eq!(
+            backoff_delay_for(&p, 99),
+            Some(chrono::Duration::seconds(30))
+        );
+    }
+
+    #[test]
+    fn test_backoff_delay_falls_back_to_defaults_when_fields_invalid() {
+        let mut p = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 1,
+                max_clusters: 3,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                failure_backoff: Some(crate::crd::FailureBackoffConfig {
+                    base: "not-a-duration".to_string(),
+                    multiplier: 0, // invalid — zero disables, fallback
+                    max: "garbage".to_string(),
+                }),
+            }),
+        );
+        p.status = None;
+        // All three fields unparseable/invalid → full defaults (5s, x2, 120s cap)
+        assert_eq!(backoff_delay_for(&p, 1), Some(chrono::Duration::seconds(5)));
+        assert_eq!(
+            backoff_delay_for(&p, 10),
+            Some(chrono::Duration::seconds(120))
+        );
+    }
+
+    fn make_profile_with_backoff(
+        min_ready: u32,
+        max_clusters: u32,
+        consecutive_failures: u32,
+        next_attempt_at: Option<String>,
+    ) -> crate::crd::ClusterPool {
+        let mut p = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready,
+                max_clusters,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        p.status = Some(crate::crd::ClusterPoolStatus {
+            consecutive_failures,
+            next_attempt_at,
+            ..Default::default()
+        });
+        p
+    }
+
+    #[test]
+    fn test_scale_up_blocked_when_backoff_window_is_open() {
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let profile = make_profile_with_backoff(1, 3, 2, Some(future));
+        let state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(creates.len(), 0, "backoff window should suppress Create");
+    }
+
+    #[test]
+    fn test_scale_up_resumes_after_backoff_window_elapses() {
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let profile = make_profile_with_backoff(1, 3, 2, Some(past));
+        let state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(creates.len(), 1, "elapsed window should permit Create");
+    }
+
+    #[test]
+    fn test_scale_up_proceeds_when_no_backoff_state() {
+        let profile = make_profile_with_backoff(1, 3, 0, None);
+        let state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(creates.len(), 1);
+    }
+
+    #[test]
+    fn test_malformed_next_attempt_does_not_block_creates() {
+        let profile = make_profile_with_backoff(1, 3, 2, Some("not-a-timestamp".to_string()));
+        let state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(
+            creates.len(),
+            1,
+            "malformed timestamp should fail open, not lock the pool"
+        );
     }
 }
