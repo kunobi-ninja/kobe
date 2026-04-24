@@ -53,7 +53,6 @@ spec:
             - --endpoint=sqlite:///data/kine.db
             - --listen-address=0.0.0.0:2379
             - --metrics-bind-address=0
-            - --log-format=json
           ports:
             - name: client
               containerPort: 2379
