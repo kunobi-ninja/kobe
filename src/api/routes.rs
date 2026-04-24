@@ -9,6 +9,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
+use futures::TryStreamExt;
 use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
@@ -1148,41 +1149,6 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let status_code = backend_response.status();
     let response_headers = backend_response.headers().clone();
     let response_header_summary = summarize_headers(&response_headers);
-    let response_bytes = match backend_response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            warn!(
-                request_id = %request_id,
-                lease_id = %lease_id,
-                cluster = %cluster_name,
-                error = %err,
-                "Connect proxy failed to read leased cluster response"
-            );
-            return connect_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to read leased cluster response: {err}"),
-            );
-        }
-    };
-
-    let response_body_summary = summarize_response_body(&response_bytes);
-    let response_body_len = response_bytes.len();
-
-    if verbose_connect_proxy_logging(&request_path, status_code) {
-        info!(
-            request_id = %request_id,
-            lease_id = %lease_id,
-            cluster = %cluster_name,
-            upstream = %backend.server,
-            method = %method,
-            path = %request_path,
-            status = status_code.as_u16(),
-            body_bytes = response_body_len,
-            upstream_headers = %response_header_summary,
-            response_body = %response_body_summary,
-            "Connect proxy received upstream response"
-        );
-    }
 
     let mut response = Response::builder().status(status_code);
     let mut stripped_headers = Vec::new();
@@ -1198,7 +1164,46 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         }
     }
 
+    // Server errors are bounded and useful to log as full bodies. Stream every
+    // other response so long-poll endpoints (Kubernetes watches, SSE) are not
+    // buffered — buffering here would hang `kubectl -w` / helm's ListAndWatch.
     if status_code.is_server_error() {
+        let response_bytes = match backend_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    cluster = %cluster_name,
+                    error = %err,
+                    "Connect proxy failed to read leased cluster response"
+                );
+                return connect_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to read leased cluster response: {err}"),
+                );
+            }
+        };
+
+        let response_body_summary = summarize_response_body(&response_bytes);
+        let response_body_len = response_bytes.len();
+
+        if verbose_connect_proxy_logging(&request_path, status_code) {
+            info!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                cluster = %cluster_name,
+                upstream = %backend.server,
+                method = %method,
+                path = %request_path,
+                status = status_code.as_u16(),
+                body_bytes = response_body_len,
+                upstream_headers = %response_header_summary,
+                response_body = %response_body_summary,
+                "Connect proxy received upstream response"
+            );
+        }
+
         warn!(
             request_id = %request_id,
             lease_id = %lease_id,
@@ -1210,7 +1215,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             response_body = %response_body_summary,
             "Connect proxy received upstream server error"
         );
-    } else {
+
+        return response
+            .body(Body::from(response_bytes))
+            .expect("connect proxy response");
+    }
+
+    if verbose_connect_proxy_logging(&request_path, status_code) {
         info!(
             request_id = %request_id,
             lease_id = %lease_id,
@@ -1219,15 +1230,30 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             method = %method,
             path = %request_path,
             status = status_code.as_u16(),
-            body_bytes = response_body_len,
-            stripped_headers = %stripped_headers.join(","),
-            forwarded_headers = %forwarded_headers.join(","),
-            "Connect proxy forwarding response downstream"
+            upstream_headers = %response_header_summary,
+            "Connect proxy streaming upstream response"
         );
     }
 
+    info!(
+        request_id = %request_id,
+        lease_id = %lease_id,
+        cluster = %cluster_name,
+        upstream = %backend.server,
+        method = %method,
+        path = %request_path,
+        status = status_code.as_u16(),
+        stripped_headers = %stripped_headers.join(","),
+        forwarded_headers = %forwarded_headers.join(","),
+        "Connect proxy forwarding response downstream"
+    );
+
+    let response_stream = backend_response
+        .bytes_stream()
+        .map_err(std::io::Error::other);
+
     response
-        .body(Body::from(response_bytes))
+        .body(Body::from_stream(response_stream))
         .expect("connect proxy response")
 }
 
