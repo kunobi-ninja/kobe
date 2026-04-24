@@ -576,6 +576,23 @@ pub struct ClusterPoolStatus {
     /// observability. Typically the first line of the error chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_reason: Option<String>,
+
+    /// High-water mark of the highest cluster index this pool has ever
+    /// attempted to provision. Sticky across reconciles. Used together with
+    /// `last_ready_max_index` to detect rapid create→recycle churn that
+    /// would otherwise hide failures from `consecutive_failures` (which
+    /// only increments on a stable "all recycling, none creating" state —
+    /// a state that fast churn never produces because the next attempt
+    /// has already started).
+    #[serde(default)]
+    pub max_attempted_index: u32,
+
+    /// Highest cluster index that has ever reached `Ready` in this pool's
+    /// lifetime. Sticky across reconciles. `consecutive_failures` is then
+    /// derived as `max_attempted_index - last_ready_max_index`, which
+    /// correctly counts failed attempts even during rapid churn.
+    #[serde(default)]
+    pub last_ready_max_index: u32,
 }
 
 // --- Defaults ---

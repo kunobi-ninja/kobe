@@ -496,14 +496,13 @@ async fn reconcile_profile(
         .as_ref()
         .and_then(|s| s.golden_template_db.clone());
 
-    let (consecutive_failures, next_attempt_at, last_failure_reason) =
-        compute_backoff_state(&profile, &pool_state, &counts, now);
+    let backoff = compute_backoff_state(&profile, &pool_state, &counts, now);
 
     let phase = crate::pool::manager::compute_pool_phase(
         &profile,
         &counts,
-        consecutive_failures,
-        next_attempt_at.as_deref(),
+        backoff.consecutive_failures,
+        backoff.next_attempt_at.as_deref(),
         now,
     );
 
@@ -518,9 +517,11 @@ async fn reconcile_profile(
         golden_backup: existing_golden_backup,
         golden_generation: existing_golden_generation,
         golden_template_db: existing_golden_template_db,
-        consecutive_failures,
-        next_attempt_at,
-        last_failure_reason,
+        consecutive_failures: backoff.consecutive_failures,
+        next_attempt_at: backoff.next_attempt_at,
+        last_failure_reason: backoff.last_failure_reason,
+        max_attempted_index: backoff.max_attempted_index,
+        last_ready_max_index: backoff.last_ready_max_index,
     };
 
     let patch = serde_json::json!({ "status": status });
@@ -692,78 +693,125 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
     }
 }
 
-/// Compute the next backoff state for a pool given the previous status,
-/// current pool state, and counts.
+/// Backoff bookkeeping computed once per reconcile.
+pub(crate) struct BackoffState {
+    pub consecutive_failures: u32,
+    pub next_attempt_at: Option<String>,
+    pub last_failure_reason: Option<String>,
+    pub max_attempted_index: u32,
+    pub last_ready_max_index: u32,
+}
+
+/// Compute the next backoff state for a pool.
 ///
-/// Semantics:
-/// - If any instance is `Ready` now OR was ever `Ready` in its lifetime
-///   (`idle_since` populated) → healthy. Reset counter to 0.
-/// - Otherwise, if there is any `Recycling` instance and nothing is
-///   `Creating`, the pool is in a "can't make progress" state. Bump the
-///   counter once per backoff window (gated by `next_attempt_at`) so that
-///   repeated reconciles within the same window don't over-increment.
-/// - Leaves state unchanged while `Creating > 0` (a new attempt is in flight).
+/// Index-based detection:
+/// - `max_attempted_index` is the high-water mark of every cluster index the
+///   pool has tried (sticky across reconciles).
+/// - `last_ready_max_index` is the highest index that ever reached `Ready`
+///   (sticky too).
+/// - `consecutive_failures` is then derived as the gap:
+///   `max_attempted_index - last_ready_max_index`.
 ///
-/// Returns `(consecutive_failures, next_attempt_at, last_failure_reason)`.
+/// This counts failed attempts correctly even during rapid create→recycle
+/// churn, where the previous "no creating, only recycling" detector would
+/// never trigger because the next attempt has already started.
+///
+/// Window gate: `next_attempt_at` is only refreshed when `consecutive_failures`
+/// increases — repeated reconciles inside the same window do not over-extend
+/// the wait.
 fn compute_backoff_state(
     profile: &ClusterPool,
     pool_state: &PoolState,
     counts: &crate::pool::manager::StateCounts,
     now: chrono::DateTime<chrono::Utc>,
-) -> (u32, Option<String>, Option<String>) {
-    let prev = profile
-        .status
-        .as_ref()
-        .map(|s| {
-            (
-                s.consecutive_failures,
-                s.next_attempt_at.clone(),
-                s.last_failure_reason.clone(),
-            )
+) -> BackoffState {
+    let prev = profile.status.as_ref();
+    let prev_failures = prev.map(|s| s.consecutive_failures).unwrap_or(0);
+    let prev_next_attempt = prev.and_then(|s| s.next_attempt_at.clone());
+    let prev_reason = prev.and_then(|s| s.last_failure_reason.clone());
+    let prev_max_attempted = prev.map(|s| s.max_attempted_index).unwrap_or(0);
+    let prev_last_ready_max = prev.map(|s| s.last_ready_max_index).unwrap_or(0);
+
+    // High-water mark of any cluster name we've ever seen, including the
+    // current state and the sticky previous status value.
+    let profile_name = profile.metadata.name.clone().unwrap_or_default();
+    let live_max = max_index_in_state(pool_state, &profile_name);
+    let new_max_attempted = live_max.max(prev_max_attempted);
+
+    // Highest index of any instance that has ever reached `Ready` (or is
+    // currently Ready / Leased) in this reconcile's snapshot.
+    let max_ready_now = pool_state
+        .clusters
+        .iter()
+        .filter(|(_, e)| {
+            e.idle_since.is_some()
+                || matches!(
+                    e.state,
+                    crate::pool::ClusterState::Ready | crate::pool::ClusterState::Leased
+                )
         })
-        .unwrap_or((0, None, None));
+        .filter_map(|(name, _)| extract_cluster_index(name, &profile_name))
+        .max()
+        .unwrap_or(0);
+    let new_last_ready_max = max_ready_now.max(prev_last_ready_max);
 
-    let (prev_failures, prev_next_attempt, prev_reason) = prev;
-
-    // Anything Ready (now or historically) = pool is healthy.
-    let any_ready_or_ever_ready = counts.ready > 0
-        || counts.leased > 0
-        || pool_state.clusters.values().any(|e| e.idle_since.is_some());
-
-    if any_ready_or_ever_ready {
-        return (0, None, None);
+    // Anything currently Ready/leased OR an instance reached Ready in this
+    // pool's lifetime → reset failures to 0.
+    let any_ready = counts.ready > 0 || counts.leased > 0 || new_last_ready_max > 0;
+    if any_ready && new_last_ready_max >= new_max_attempted {
+        // Pool has caught up — every attempted index has reached Ready at
+        // some point. Clear failures.
+        return BackoffState {
+            consecutive_failures: 0,
+            next_attempt_at: None,
+            last_failure_reason: None,
+            max_attempted_index: new_max_attempted,
+            last_ready_max_index: new_last_ready_max,
+        };
     }
 
-    // A create attempt is still in flight — wait to see its outcome.
-    if counts.creating > 0 {
-        return (prev_failures, prev_next_attempt, prev_reason);
-    }
+    let new_failures = new_max_attempted.saturating_sub(new_last_ready_max);
 
-    // Pool has failures and is not making progress. Bump only if the prior
-    // backoff window has elapsed (or no window was set), so repeated
-    // reconciles inside one window don't over-count.
-    if counts.recycling == 0 {
-        // Nothing has actually failed; hold the previous state.
-        return (prev_failures, prev_next_attempt, prev_reason);
-    }
-
-    let window_elapsed = match prev_next_attempt.as_deref() {
-        None => true,
-        Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
-            Ok(t) => now >= t.with_timezone(&chrono::Utc),
-            Err(_) => true,
-        },
+    // Refresh next_attempt_at only when failure count strictly increased,
+    // so repeated reconciles inside one window don't push the wait further.
+    let next_attempt = if new_failures > prev_failures && new_failures > 0 {
+        crate::pool::manager::backoff_delay_for(profile, new_failures)
+            .map(|d| (now + d).to_rfc3339())
+    } else if new_failures == 0 {
+        None
+    } else {
+        prev_next_attempt
     };
 
-    if !window_elapsed {
-        return (prev_failures, prev_next_attempt, prev_reason);
+    BackoffState {
+        consecutive_failures: new_failures,
+        next_attempt_at: next_attempt,
+        last_failure_reason: prev_reason,
+        max_attempted_index: new_max_attempted,
+        last_ready_max_index: new_last_ready_max,
     }
+}
 
-    let new_failures = prev_failures.saturating_add(1);
-    let delay = crate::pool::manager::backoff_delay_for(profile, new_failures);
-    let next_attempt = delay.map(|d| (now + d).to_rfc3339());
+/// Compute the highest cluster index in the current pool state.
+/// Names follow `pool-{profile}-{index}`.
+fn max_index_in_state(state: &PoolState, profile_name: &str) -> u32 {
+    let prefix = format!("pool-{profile_name}-");
+    state
+        .clusters
+        .keys()
+        .filter_map(|name| extract_index_with_prefix(name, &prefix))
+        .max()
+        .unwrap_or(0)
+}
 
-    (new_failures, next_attempt, prev_reason)
+fn extract_cluster_index(name: &str, profile_name: &str) -> Option<u32> {
+    let prefix = format!("pool-{profile_name}-");
+    extract_index_with_prefix(name, &prefix)
+}
+
+fn extract_index_with_prefix(name: &str, prefix: &str) -> Option<u32> {
+    name.strip_prefix(prefix)
+        .and_then(|suffix| suffix.parse::<u32>().ok())
 }
 
 fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {
