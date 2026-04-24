@@ -3,7 +3,6 @@ mod backend;
 mod controllers;
 mod crd;
 mod diagnostics;
-mod leader;
 mod metrics;
 pub mod pki;
 mod pool;
@@ -110,8 +109,14 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── Wait for leader election before starting controllers ──
-    let leader_rx =
-        leader::run_leader_election(client.clone(), &namespace, "kobe-operator").await?;
+    //
+    // Lease-based leader election via the shared `kunobi-ha` crate. Acquire
+    // blocks until this replica owns the Lease; `changed()` on the guard
+    // fires when the Lease is lost (renewal past the renew deadline).
+    let leader_election =
+        kunobi_ha::leader::LeaderElection::builder(client.clone(), &namespace, "kobe-operator")
+            .build();
+    let leader_guard = leader_election.acquire().await?;
 
     // Detect Velero CRDs for snapshot support
     let velero = detect_velero(&client).await;
@@ -209,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Wait for shutdown signal, then stop everything
-    shutdown_signal(leader_rx, shutdown).await;
+    shutdown_signal(leader_guard, shutdown).await;
 
     // Wait for HTTP server to drain
     if let Err(e) = http_handle.await {
@@ -300,7 +305,7 @@ async fn detect_velero(client: &Client) -> Option<VeleroCoordinator> {
 }
 
 async fn shutdown_signal(
-    mut leader_rx: tokio::sync::watch::Receiver<bool>,
+    mut leader_guard: kunobi_ha::leader::LeaderGuard,
     shutdown: CancellationToken,
 ) {
     let ctrl_c = async {
@@ -322,11 +327,11 @@ async fn shutdown_signal(
 
     let leader_lost = async {
         loop {
-            if leader_rx.changed().await.is_err() {
+            if leader_guard.changed().await.is_err() {
                 warn!("Leader election watch channel closed unexpectedly");
                 break;
             }
-            if !*leader_rx.borrow() {
+            if !leader_guard.is_leader() {
                 break;
             }
         }
@@ -337,6 +342,11 @@ async fn shutdown_signal(
         _ = terminate => info!("Received SIGTERM, shutting down"),
         _ = leader_lost => info!("Lost leader lease, shutting down"),
     }
+
+    // Cooperative step-down so the next replica picks up the Lease quickly
+    // (within retry_period) instead of waiting for the full lease TTL to
+    // expire.
+    leader_guard.step_down().await;
 
     shutdown.cancel();
     info!("Shutdown signal sent to all background tasks");
