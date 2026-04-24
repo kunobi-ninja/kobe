@@ -45,6 +45,15 @@ spec:
       {{- with .Values.kine.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
+      # Run as `nobody` with `fsGroup` set so kubelet chowns the PVC mount
+      # on attach — otherwise the default root-owned volume is not writable
+      # by the container, SQLite fails to open `/data/kine.db` with
+      # "no such file or directory", and the pod crashloops.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
       containers:
         - name: kine
           image: {{ .Values.kine.image | quote }}
