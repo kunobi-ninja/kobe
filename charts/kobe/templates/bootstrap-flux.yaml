@@ -1,0 +1,29 @@
+{{- /*
+  Flux BootstrapConfig — always shipped with the chart.
+
+  Kobe + Flux is a first-class combination: pools commonly include `flux` in their
+  `spec.bootstraps` to install Flux into the virtual cluster at provision time.
+  To keep that path frictionless, this BootstrapConfig is unconditional — not
+  behind a values flag.
+
+  If you need a different Flux version or custom install args, create a separate
+  BootstrapConfig CR (different name) in your GitOps repo and reference that one
+  from your pools instead.
+*/ -}}
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: BootstrapConfig
+metadata:
+  name: flux
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+spec:
+  job:
+    image: ghcr.io/fluxcd/flux-cli:v2.2.3
+    imagePullPolicy: IfNotPresent
+    command:
+      - flux
+    args:
+      - install
+      - --namespace=flux-system

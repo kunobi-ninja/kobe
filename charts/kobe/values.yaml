@@ -89,6 +89,28 @@ networkPolicy:
     - 0.0.0.0/0
 
 # -----------------------------------------------------------------------------
+# Ingress — expose the kobe HTTP API externally.
+#
+# Opt-in. When enabled, the chart creates a networking.k8s.io/v1 Ingress
+# routing `host` to the kobe Service. Supports TLS via an explicit
+# pre-existing Secret or one managed by cert-manager via the annotation
+# `cert-manager.io/cluster-issuer`.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  path: /
+  pathType: Prefix
+  annotations: {}
+  # Example with cert-manager:
+  #   annotations:
+  #     cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    secretName: ""     # defaults to "<release>-tls" when empty
+
+# -----------------------------------------------------------------------------
 # Datastores — state backends for vkobe virtual clusters.
 #
 # Each vkobe pool needs a KobeStore to persist cluster state. Two built-in
