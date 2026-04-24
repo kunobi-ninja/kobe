@@ -160,7 +160,13 @@ pub struct CapiConfig {
     plural = "clusterpools",
     shortname = "cp",
     status = "ClusterPoolStatus",
-    namespaced
+    namespaced,
+    printcolumn = r#"{"name":"Phase",    "type":"string",  "jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Ready",    "type":"integer", "jsonPath":".status.ready"}"#,
+    printcolumn = r#"{"name":"Leased",   "type":"integer", "jsonPath":".status.leased"}"#,
+    printcolumn = r#"{"name":"Creating", "type":"integer", "jsonPath":".status.creating"}"#,
+    printcolumn = r#"{"name":"Failures", "type":"integer", "jsonPath":".status.consecutiveFailures"}"#,
+    printcolumn = r#"{"name":"Age",      "type":"date",    "jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterPoolSpec {
@@ -480,9 +486,42 @@ pub struct DiagnosticsConfig {
 
 // --- Status ---
 
+/// High-level human-readable summary of a pool's current state.
+///
+/// Derived from the other status counts + backoff fields each reconcile.
+/// Serves as the primary at-a-glance health indicator in `kubectl get
+/// clusterpools` and in dashboards — prefer parsing specific fields (like
+/// `ready`, `consecutiveFailures`) for programmatic decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ClusterPoolPhase {
+    /// At-or-above `minReady` ready clusters, or actively serving leases.
+    Healthy,
+    /// Creating clusters to reach `minReady` — either on first arrival
+    /// (no prior instances) or refilling after a scale-down / lease churn.
+    /// No consecutive failures.
+    ScalingUp,
+    /// Above `minReady` and shrinking toward it. Happens after
+    /// `scaleDownAfter` reaps idle clusters, or while leases recycle and
+    /// no refill is needed.
+    ScalingDown,
+    /// Consecutive provision failures, currently inside the backoff window.
+    Backoff,
+    /// Three or more consecutive failures sustained — requires operator
+    /// attention (misconfiguration, missing dependency, etc.).
+    Failing,
+    /// Pool scaled to zero by design — no demand, `minReady == 0`, nothing
+    /// in flight. Healthy steady state for a fully-idle pool.
+    Idle,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterPoolStatus {
+    /// High-level phase summary. Derived from counts + backoff state each
+    /// reconcile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ClusterPoolPhase>,
+
     /// Number of idle clusters ready for claims.
     #[serde(default)]
     pub ready: u32,

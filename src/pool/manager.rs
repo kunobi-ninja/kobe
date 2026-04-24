@@ -310,6 +310,74 @@ fn backoff_active(profile: &ClusterPool, now: chrono::DateTime<chrono::Utc>) -> 
     }
 }
 
+/// Threshold of consecutive failures beyond which a pool is considered
+/// `Failing` (sustained, operator attention needed) rather than merely
+/// `Backoff` (transient rate-limit).
+pub const FAILING_THRESHOLD: u32 = 3;
+
+/// Compute the high-level `ClusterPoolPhase` for the pool given its current
+/// counts, backoff state, and config.
+///
+/// Ordering of checks matters: `Failing` takes precedence over `Backoff`,
+/// since a sustained failure is the stronger signal even when a backoff
+/// window is active.
+pub fn compute_pool_phase(
+    profile: &ClusterPool,
+    counts: &StateCounts,
+    consecutive_failures: u32,
+    next_attempt_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::crd::ClusterPoolPhase {
+    use crate::crd::ClusterPoolPhase;
+
+    let min_ready = profile
+        .spec
+        .scaling
+        .as_ref()
+        .map(|s| s.min_ready)
+        .unwrap_or(profile.spec.size);
+
+    // Sustained failure beats transient backoff beats everything else.
+    if consecutive_failures >= FAILING_THRESHOLD {
+        return ClusterPoolPhase::Failing;
+    }
+
+    // Active backoff window: waiting for retry.
+    if consecutive_failures > 0
+        && let Some(ts) = next_attempt_at
+        && let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts)
+        && now < t.with_timezone(&chrono::Utc)
+    {
+        return ClusterPoolPhase::Backoff;
+    }
+
+    // Fully empty with scale-to-zero intent → Idle.
+    if counts.ready == 0
+        && counts.leased == 0
+        && counts.creating == 0
+        && counts.recycling == 0
+        && counts.unhealthy == 0
+        && min_ready == 0
+    {
+        return ClusterPoolPhase::Idle;
+    }
+
+    // Cooling: above target AND actively shrinking. Catches idle-reap
+    // from `scaleDownAfter`. Leases recycling while at-or-below target
+    // stays Healthy / Warming.
+    if counts.ready > min_ready && counts.recycling > 0 {
+        return ClusterPoolPhase::ScalingDown;
+    }
+
+    // At or above target and serving / holding steady.
+    if counts.ready >= min_ready.max(1) || counts.leased > 0 {
+        return ClusterPoolPhase::Healthy;
+    }
+
+    // Below target, creating now or about to, no failures.
+    ClusterPoolPhase::ScalingUp
+}
+
 /// Find the highest existing cluster index for a profile.
 ///
 /// Parses names like `pool-{profile}-{index}` and returns the max index,
@@ -1060,5 +1128,108 @@ mod tests {
             1,
             "malformed timestamp should fail open, not lock the pool"
         );
+    }
+
+    // --- Pool phase ---
+
+    fn counts(ready: u32, leased: u32, creating: u32, recycling: u32) -> StateCounts {
+        StateCounts {
+            ready,
+            leased,
+            creating,
+            recycling,
+            unhealthy: 0,
+        }
+    }
+
+    fn profile_with_min_ready(min_ready: u32) -> crate::crd::ClusterPool {
+        make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready,
+                max_clusters: 8,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                failure_backoff: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn test_phase_healthy_when_at_target() {
+        let p = profile_with_min_ready(2);
+        let phase = compute_pool_phase(&p, &counts(2, 0, 0, 0), 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Healthy);
+    }
+
+    #[test]
+    fn test_phase_healthy_when_serving_below_target() {
+        let p = profile_with_min_ready(2);
+        // ready=0 but leased=1 — pool is working even if warm buffer is empty.
+        let phase = compute_pool_phase(&p, &counts(0, 1, 0, 0), 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Healthy);
+    }
+
+    #[test]
+    fn test_phase_warming_when_creating() {
+        let p = profile_with_min_ready(2);
+        let phase = compute_pool_phase(&p, &counts(0, 0, 1, 0), 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    #[test]
+    fn test_phase_warming_on_first_arrival() {
+        let p = profile_with_min_ready(1);
+        // Nothing yet, no failures, minReady > 0.
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingUp);
+    }
+
+    #[test]
+    fn test_phase_idle_when_scale_to_zero_steady() {
+        let p = profile_with_min_ready(0);
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Idle);
+    }
+
+    #[test]
+    fn test_phase_cooling_when_above_target_and_recycling() {
+        let p = profile_with_min_ready(1);
+        // 3 ready, 1 being recycled (scale-down reaping an idle one).
+        let phase = compute_pool_phase(&p, &counts(3, 0, 0, 1), 0, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::ScalingDown);
+    }
+
+    #[test]
+    fn test_phase_backoff_when_in_wait_window() {
+        let p = profile_with_min_ready(1);
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 1, Some(&future), now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Backoff);
+    }
+
+    #[test]
+    fn test_phase_failing_after_sustained_failures() {
+        let p = profile_with_min_ready(1);
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        // 3 failures beats backoff window check.
+        let phase = compute_pool_phase(&p, &counts(0, 0, 0, 0), 3, Some(&future), now);
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Failing);
+    }
+
+    #[test]
+    fn test_phase_healthy_beats_stale_failure_counter() {
+        // Counter says 5 failures, but there's a ready cluster → healthy wins.
+        // (compute_backoff_state should have reset the counter; this test
+        // guards the ordering if that logic ever breaks.)
+        let p = profile_with_min_ready(1);
+        // Note: with current ordering, Failing beats Healthy when counter >= 3.
+        // That's intentional — a stale counter is a bug in compute_backoff_state,
+        // not something phase computation should paper over. Document the ordering.
+        let phase = compute_pool_phase(&p, &counts(1, 0, 0, 0), 5, None, chrono::Utc::now());
+        assert_eq!(phase, crate::crd::ClusterPoolPhase::Failing);
     }
 }

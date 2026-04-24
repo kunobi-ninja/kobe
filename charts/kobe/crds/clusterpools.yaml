@@ -13,7 +13,25 @@ spec:
     singular: clusterpool
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: integer
+    - jsonPath: .status.leased
+      name: Leased
+      type: integer
+    - jsonPath: .status.creating
+      name: Creating
+      type: integer
+    - jsonPath: .status.consecutiveFailures
+      name: Failures
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -512,6 +530,23 @@ spec:
                   Earliest time the pool manager may emit another `Create` action for
                   this pool (RFC3339). Set when `consecutive_failures > 0`. Cleared on
                   success or by explicit operator reset.
+                nullable: true
+                type: string
+              phase:
+                description: |-
+                  High-level human-readable summary of a pool's current state.
+
+                  Derived from the other status counts + backoff fields each reconcile.
+                  Serves as the primary at-a-glance health indicator in `kubectl get
+                  clusterpools` and in dashboards — prefer parsing specific fields (like
+                  `ready`, `consecutiveFailures`) for programmatic decisions.
+                enum:
+                - Healthy
+                - ScalingUp
+                - ScalingDown
+                - Backoff
+                - Failing
+                - Idle
                 nullable: true
                 type: string
               queueDepth:

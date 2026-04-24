@@ -499,7 +499,16 @@ async fn reconcile_profile(
     let (consecutive_failures, next_attempt_at, last_failure_reason) =
         compute_backoff_state(&profile, &pool_state, &counts, now);
 
+    let phase = crate::pool::manager::compute_pool_phase(
+        &profile,
+        &counts,
+        consecutive_failures,
+        next_attempt_at.as_deref(),
+        now,
+    );
+
     let status = ClusterPoolStatus {
+        phase: Some(phase),
         ready: counts.ready,
         leased: counts.leased,
         creating: counts.creating,
