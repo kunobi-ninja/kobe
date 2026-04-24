@@ -59,7 +59,18 @@ spec:
           image: {{ .Values.kine.image | quote }}
           imagePullPolicy: {{ .Values.kine.imagePullPolicy | default "IfNotPresent" | quote }}
           args:
-            - --endpoint=sqlite:///data/kine.db
+            # `_journal_mode=WAL` switches SQLite from the default
+            # rollback-journal mode to write-ahead-log, which lets readers
+            # and writers proceed concurrently. Without it, every kube
+            # apiserver bootstrap (hundreds of concurrent writes for
+            # APIServices, ServiceAccounts, etc.) serializes through a
+            # single exclusive lock and quickly hits "database is locked"
+            # txn errors when more than one vkobe pool member is starting.
+            #
+            # `_busy_timeout=10000` (10s) gives us a longer wait for the
+            # lock instead of failing fast — gives transient contention
+            # under high churn a chance to clear.
+            - --endpoint=sqlite:///data/kine.db?_journal_mode=WAL&_busy_timeout=10000
             - --listen-address=0.0.0.0:2379
             - --metrics-bind-address=0
           ports:
