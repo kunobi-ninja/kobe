@@ -68,7 +68,11 @@ tracing-opentelemetry = "0.32"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 
 # kobe-sync: reverse proxy
-hyper = { version = "1", features = ["http1", "http2", "server"] }
+# `client` feature is needed by the upgrade tunnel — we use
+# `hyper::client::conn::http1::handshake().with_upgrades()` to talk to the
+# host apiserver for exec/attach/portforward, since reqwest doesn't expose
+# the underlying connection post-101 Switching Protocols.
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 http-body-util = "0.1"
 bytes = "1"

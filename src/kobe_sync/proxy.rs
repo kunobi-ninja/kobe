@@ -5,8 +5,8 @@ use std::sync::{Arc, LazyLock};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::TryStreamExt;
-use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -54,9 +54,7 @@ pub(crate) type ProxyBody = BoxBody<Bytes, ProxyError>;
 /// Wrap `bytes` in a buffered `ProxyBody`. Used for tiny synthesized
 /// responses (errors, /healthz, /metrics).
 pub(crate) fn body_from_bytes(bytes: Bytes) -> ProxyBody {
-    Full::new(bytes)
-        .map_err(|e: Infallible| match e {})
-        .boxed()
+    Full::new(bytes).map_err(|e: Infallible| match e {}).boxed()
 }
 
 /// Convert an upstream `reqwest::Response` into a streamed
@@ -118,7 +116,8 @@ fn stream_upstream_response(resp: reqwest::Response) -> Response<ProxyBody> {
 // ---------------------------------------------------------------------------
 
 /// Path to the in-cluster Kubernetes CA certificate.
-const IN_CLUSTER_CA_CERT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+pub(crate) const IN_CLUSTER_CA_CERT_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 
 /// Build an HTTP client configured for talking to the host Kubernetes API server.
 ///
@@ -217,7 +216,6 @@ pub fn init_proxy_metrics() {
     LazyLock::force(&PROXY_REQUEST_DURATION);
 }
 
-
 // ---------------------------------------------------------------------------
 // Host configuration helpers
 // ---------------------------------------------------------------------------
@@ -294,10 +292,7 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
 /// Generic over any `hyper::body::Body<Data = Bytes>` so unit tests can
 /// drive it with a synthetic `Full<Bytes>` body without spinning up a
 /// real hyper server.
-async fn collect_body_bounded<B>(
-    body: B,
-    limit: usize,
-) -> Result<Bytes, Response<ProxyBody>>
+async fn collect_body_bounded<B>(body: B, limit: usize) -> Result<Bytes, Response<ProxyBody>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -498,9 +493,7 @@ pub fn extract_peer_identity_from_der(cert_der: &[u8]) -> Option<PeerIdentity> {
     // injection via a malformed Subject DN would let an attacker forge
     // X-Remote-Group entries or extra impersonation headers.
     if !username.is_empty() && !header_value_is_safe(&username) {
-        warn!(
-            "Rejecting peer cert: CN contains characters unsafe for HTTP header injection"
-        );
+        warn!("Rejecting peer cert: CN contains characters unsafe for HTTP header injection");
         return None;
     }
     for g in &groups {
@@ -555,8 +548,15 @@ pub struct VirtualClusterProxyV2 {
     host_apiserver_url: String,
     host_token: String,
     /// reqwest client for talking to the host apiserver (subresource
-    /// forwarding). Uses the in-cluster ServiceAccount token + CA.
+    /// forwarding, non-upgrade path: `kubectl logs`).
     host_client: reqwest::Client,
+    /// Long-lived state for the upgrade tunnel (host URL/token, rustls
+    /// config trusting the in-cluster CA, concurrency limits). reqwest
+    /// can't expose the post-101 socket, so the upgrade path drives a
+    /// raw hyper-client over `tokio_rustls` instead. Bundled into a
+    /// single struct so `dispatch_upgrade`'s call signature fits under
+    /// clippy's `too_many_arguments` threshold.
+    upgrade_ctx: Arc<crate::kobe_sync::upgrade::UpgradeContext>,
     translator: Arc<NameTranslator>,
     proxy_port: u16,
     metrics_port: u16,
@@ -590,7 +590,24 @@ impl VirtualClusterProxyV2 {
         let host_client = build_host_client()
             .context("Failed to build HTTP client for host apiserver subresource proxying")?;
 
+        // Separate rustls config for the upgrade path. reqwest can't
+        // hand back the post-101 socket, so exec/attach/portforward
+        // drive a raw hyper client over this connector.
+        let host_tls_config =
+            crate::kobe_sync::upgrade::build_host_tls_config(IN_CLUSTER_CA_CERT_PATH)
+                .context("Failed to build host TLS config for upgrade tunnel")?;
+
         let tls_acceptor = TlsAcceptor::from(config.tls_config);
+
+        let upgrade_limits = crate::kobe_sync::upgrade::UpgradeLimits::from_env();
+        crate::kobe_sync::upgrade::init_upgrade_metrics();
+
+        let upgrade_ctx = Arc::new(crate::kobe_sync::upgrade::UpgradeContext {
+            host_url: config.host_apiserver_url.clone(),
+            host_token: config.host_token.clone(),
+            tls: host_tls_config,
+            limits: upgrade_limits,
+        });
 
         Ok(Self {
             tls_acceptor,
@@ -599,6 +616,7 @@ impl VirtualClusterProxyV2 {
             host_apiserver_url: config.host_apiserver_url,
             host_token: config.host_token,
             host_client,
+            upgrade_ctx,
             translator: config.translator,
             proxy_port: config.proxy_port,
             metrics_port: config.metrics_port,
@@ -830,9 +848,7 @@ impl VirtualClusterProxyV2 {
             Err(resp) => return Ok(resp),
         };
 
-        let mut req_builder = self
-            .apiserver_client
-            .request(reqwest_method, &target_url);
+        let mut req_builder = self.apiserver_client.request(reqwest_method, &target_url);
 
         // Inject the validated peer-cert identity as front-proxy headers.
         // These are only honored by the apiserver because we connected
@@ -921,10 +937,18 @@ impl VirtualClusterProxyV2 {
     /// HOST kube-apiserver, translating the pod name from virtual to host
     /// coordinates.
     ///
-    /// Like `forward_to_apiserver`, the response body is **streamed**
-    /// rather than buffered — `kubectl logs -f` is the canonical use case
-    /// and would otherwise hang forever waiting for a body that never
-    /// arrives.
+    /// Two paths split here:
+    ///
+    /// - **HTTP Upgrade** (`Connection: upgrade`): exec/attach/portforward.
+    ///   Routed to `crate::kobe_sync::upgrade::dispatch_upgrade`, which
+    ///   negotiates SPDY/3.1 or WebSocket with the host apiserver and
+    ///   spawns a `copy_bidirectional` task to splice the two upgraded
+    ///   streams.
+    ///
+    /// - **Regular streaming response** (no upgrade): `kubectl logs`
+    ///   and `logs -f`. Body is streamed chunk-by-chunk like
+    ///   `forward_to_apiserver` — `logs -f` would otherwise hang
+    ///   forever waiting for a body that never closes.
     async fn handle_subresource(
         &self,
         req: Request<Incoming>,
@@ -943,21 +967,56 @@ impl VirtualClusterProxyV2 {
             virtual_ns = %sub.namespace,
             host_path = %host_path,
             subresource = %sub.subresource,
+            upgrade = crate::kobe_sync::upgrade::is_upgrade_request(&req),
             "Intercepting subresource request"
         );
 
-        // TODO: exec/attach/portforward additionally need HTTP Upgrade
-        // support (SPDY/3.1 or WebSocket v5.channel.k8s.io) — handled in
-        // a separate follow-up. The current code supports `logs` (and
-        // `logs -f` thanks to streaming below) but exec/attach return a
-        // streamed body that the client will reject as malformed.
+        // ---- Upgrade path (exec/attach/portforward) ------------------
+        if crate::kobe_sync::upgrade::is_upgrade_request(&req) {
+            let host_path_and_query = format!("{host_path}{query}");
+            // The peer-cert identity (validated at TLS handshake time)
+            // is attached as a request extension by the proxy's run
+            // loop. Use the username portion as the bucket key for
+            // per-identity concurrency caps.
+            let identity = req
+                .extensions()
+                .get::<PeerIdentity>()
+                .map(|id| id.username.clone());
+            let outcome = crate::kobe_sync::upgrade::dispatch_upgrade(
+                req,
+                &self.upgrade_ctx,
+                &host_path_and_query,
+                identity.as_deref(),
+            )
+            .await;
 
+            return match outcome {
+                Ok(crate::kobe_sync::upgrade::UpgradeOutcome::Switched(resp))
+                | Ok(crate::kobe_sync::upgrade::UpgradeOutcome::NotSwitched(resp))
+                | Ok(crate::kobe_sync::upgrade::UpgradeOutcome::Throttled(resp)) => Ok(resp),
+                Err(e) => {
+                    // dispatch_upgrade has already incremented the
+                    // appropriate `upgrades_total{result=…}` counter
+                    // for this failure mode (see `tag_upstream_error`
+                    // in upgrade.rs). Just relay a 502 to the client.
+                    error!(error = %e, "Upgrade dispatch to host apiserver failed");
+                    PROXY_ERRORS_TOTAL
+                        .with_label_values(&["upgrade_dispatch"])
+                        .inc();
+                    Ok(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("Upgrade error: {e}"),
+                    ))
+                }
+            };
+        }
+
+        // ---- Non-upgrade path (logs / logs -f) -----------------------
         let target_url = format!("{}{}{}", self.host_apiserver_url, host_path, query);
 
         let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
-        // Same body cap as forward_to_apiserver. log/exec/attach/portforward
-        // requests typically carry tiny bodies (or none), so the 3 MiB
-        // ceiling is generous.
+        // Same body cap as forward_to_apiserver. logs requests typically
+        // carry no body, so the 3 MiB ceiling is generous.
         let body_bytes = match collect_body_with_limit(req.into_body()).await {
             Ok(b) => b,
             Err(resp) => return Ok(resp),
@@ -1196,7 +1255,9 @@ mod tests_v2 {
         // The classic header-injection payload: a CRLF closes the
         // X-Remote-User header and opens a new one (e.g. an extra
         // X-Remote-Group: system:masters).
-        assert!(!header_value_is_safe("alice\r\nX-Remote-Group: system:masters"));
+        assert!(!header_value_is_safe(
+            "alice\r\nX-Remote-Group: system:masters"
+        ));
         assert!(!header_value_is_safe("alice\rsystem:masters"));
         assert!(!header_value_is_safe("alice\nsystem:masters"));
     }
@@ -1290,14 +1351,9 @@ mod tests_v2 {
     async fn collect_frames(body: ProxyBody) -> Vec<Bytes> {
         let mut frames: Vec<Bytes> = Vec::new();
         let mut body = body;
-        loop {
-            match body.frame().await {
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        frames.push(data);
-                    }
-                }
-                Some(Err(_)) | None => break,
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Ok(data) = frame.into_data() {
+                frames.push(data);
             }
         }
         frames
@@ -1327,7 +1383,11 @@ mod tests_v2 {
         let body: ProxyBody = StreamBody::new(stream).boxed();
 
         let frames = collect_frames(body).await;
-        assert_eq!(frames.len(), 3, "expected 3 separate frames, got {frames:?}");
+        assert_eq!(
+            frames.len(),
+            3,
+            "expected 3 separate frames, got {frames:?}"
+        );
         assert_eq!(frames[0], Bytes::from_static(b"{\"type\":\"ADDED\"}\n"));
         assert_eq!(frames[1], Bytes::from_static(b"{\"type\":\"MODIFIED\"}\n"));
         assert_eq!(frames[2], Bytes::from_static(b"{\"type\":\"DELETED\"}\n"));
@@ -1466,17 +1526,21 @@ mod tests_v2 {
         // with a chunked-encoding error rather than a clean EOF that
         // looks like end-of-watch.
         let err: ProxyError = "upstream connection reset".into();
-        let chunks: Vec<Result<Bytes, ProxyError>> = vec![
-            Ok(Bytes::from_static(b"{\"type\":\"ADDED\"}\n")),
-            Err(err),
-        ];
+        let chunks: Vec<Result<Bytes, ProxyError>> =
+            vec![Ok(Bytes::from_static(b"{\"type\":\"ADDED\"}\n")), Err(err)];
         let stream = stream::iter(chunks).map_ok(Frame::data);
         let body: ProxyBody = StreamBody::new(stream).boxed();
 
         let mut body = body;
         let first = body.frame().await.expect("first frame").expect("first ok");
-        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"{\"type\":\"ADDED\"}\n"));
+        assert_eq!(
+            first.into_data().unwrap(),
+            Bytes::from_static(b"{\"type\":\"ADDED\"}\n")
+        );
         let second = body.frame().await.expect("second frame");
-        assert!(second.is_err(), "second frame must propagate the upstream error");
+        assert!(
+            second.is_err(),
+            "second frame must propagate the upstream error"
+        );
     }
 }
