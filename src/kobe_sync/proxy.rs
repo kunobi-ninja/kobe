@@ -1,13 +1,15 @@
-use std::collections::HashSet;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use futures::TryStreamExt;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use http_body_util::combinators::BoxBody;
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use prometheus::{
@@ -19,6 +21,97 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::kobe_sync::syncer::translator::NameTranslator;
+
+// ---------------------------------------------------------------------------
+// Response body types
+// ---------------------------------------------------------------------------
+//
+// The proxy must STREAM upstream responses to the client rather than
+// buffering them in memory: K8s `watch` and `logs -f` endpoints return
+// chunked HTTP responses that may stay open indefinitely (until the
+// client cancels). Buffering them with `resp.bytes().await` would break
+// every controller / informer (they all use watch) and OOM the proxy on
+// busy clusters.
+//
+// `ProxyBody` is a boxed, dynamically-typed `Body` so we can return either:
+//   - `Full<Bytes>` for synthesized responses (errors, /healthz)
+//   - `StreamBody<…>` wrapping reqwest's `bytes_stream()` for forwarded
+//     responses, which propagates upstream chunks frame-by-frame and
+//     cancels the upstream connection when the client disconnects.
+
+/// Boxed error type used by the proxy's response body. Covers both
+/// reqwest stream errors (transport went away mid-response) and any
+/// other body adapter errors.
+pub(crate) type ProxyError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Dynamic body type returned by every proxy handler. Lets the same
+/// `Response<ProxyBody>` carry either a buffered `Full<Bytes>` (errors,
+/// health, small synthesized payloads) or a streamed `StreamBody`
+/// (forwarded apiserver responses) without forcing a buffered shape on
+/// long-lived watches.
+pub(crate) type ProxyBody = BoxBody<Bytes, ProxyError>;
+
+/// Wrap `bytes` in a buffered `ProxyBody`. Used for tiny synthesized
+/// responses (errors, /healthz, /metrics).
+pub(crate) fn body_from_bytes(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|e: Infallible| match e {})
+        .boxed()
+}
+
+/// Convert an upstream `reqwest::Response` into a streamed
+/// `Response<ProxyBody>`.
+///
+/// Preserves the upstream status code and a curated set of headers
+/// relevant to the wire framing (`content-type`, `content-encoding`,
+/// `content-length` if present, `cache-control`). The body is wrapped in
+/// a `StreamBody` over `bytes_stream()` so chunks flow through to the
+/// client as the apiserver emits them — essential for `watch` and
+/// `logs -f`.
+///
+/// On any upstream chunk error the stream yields an error frame; hyper
+/// then closes the client connection with a chunked-encoding terminator,
+/// signaling the failure cleanly. Dropping the response body on the
+/// client side cancels the upstream stream and closes the upstream
+/// connection.
+fn stream_upstream_response(resp: reqwest::Response) -> Response<ProxyBody> {
+    let status = resp.status().as_u16();
+    let resp_headers = resp.headers().clone();
+
+    let stream = resp
+        .bytes_stream()
+        .map_ok(Frame::data)
+        .map_err(|e| -> ProxyError { Box::new(e) });
+    let body: ProxyBody = StreamBody::new(stream).boxed();
+
+    let mut builder = Response::builder().status(status);
+    // Forward only headers that affect how the client decodes the body
+    // or caches it. Connection-management headers (Transfer-Encoding,
+    // Connection, Keep-Alive) are intentionally NOT forwarded — hyper
+    // owns the framing of the outgoing response and will pick whatever
+    // makes sense for the client connection.
+    for h in [
+        "content-type",
+        "content-encoding",
+        "cache-control",
+        "etag",
+        "last-modified",
+        "vary",
+    ] {
+        if let Some(v) = resp_headers.get(h) {
+            if let Ok(s) = v.to_str() {
+                builder = builder.header(h, s);
+            }
+        }
+    }
+
+    builder.body(body).unwrap_or_else(|_| {
+        // The only way `builder.body()` fails is invalid headers we
+        // already filtered for, but keep the fallback so the type
+        // checker is happy and we never panic on a request path.
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Response build error")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // TLS / Host client helpers
@@ -124,839 +217,6 @@ pub fn init_proxy_metrics() {
     LazyLock::force(&PROXY_REQUEST_DURATION);
 }
 
-// ---------------------------------------------------------------------------
-// v1 API path parsing & proxy infrastructure
-// ---------------------------------------------------------------------------
-// TODO(v2-migration): The v1 proxy (ApiPath, parse_api_path, ProxyConfig,
-// VirtualClusterProxy, translate_path, translate_request_body,
-// translate_response_body, etc.) is still used by the kobe_sync binary.
-// Replace with VirtualClusterProxyV2 once it has full HTTP forwarding and
-// subresource proxying, then remove this section.
-
-/// Parsed representation of a Kubernetes API path.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ApiPath {
-    /// `/api/v1/namespaces`
-    NamespaceList,
-    /// `/api/v1/namespaces/{name}`
-    NamespaceGet { name: String },
-    /// `/api/v1/namespaces/{ns}/{resource}`
-    NamespacedList {
-        namespace: String,
-        resource: String,
-        api_prefix: String,
-    },
-    /// `/api/v1/namespaces/{ns}/{resource}/{name}`
-    NamespacedResource {
-        namespace: String,
-        resource: String,
-        name: String,
-        api_prefix: String,
-    },
-    /// `/api/v1/namespaces/{ns}/{resource}/{name}/{subresource}`
-    Subresource {
-        namespace: String,
-        resource: String,
-        name: String,
-        subresource: String,
-        api_prefix: String,
-    },
-    /// `/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}`
-    ExtensionResource {
-        namespace: String,
-        resource: String,
-        name: String,
-        group: String,
-        version: String,
-    },
-    /// `/apis/{group}/{version}/namespaces/{ns}/{resource}`
-    ExtensionList {
-        namespace: String,
-        resource: String,
-        group: String,
-        version: String,
-    },
-    /// Cluster-scoped or unrecognized -- forward as-is.
-    PassThrough,
-}
-
-/// Parse a Kubernetes API path into a structured `ApiPath`.
-pub fn parse_api_path(path: &str) -> ApiPath {
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    // /apis/{group}/{version}/namespaces/{ns}/...
-    if segments.len() >= 2 && segments[0] == "apis" {
-        if segments.len() >= 5 && segments[3] == "namespaces" {
-            let group = segments[1].to_string();
-            let version = segments[2].to_string();
-            let ns = segments[4].to_string();
-
-            return match segments.len() {
-                // /apis/{group}/{version}/namespaces/{ns}/{resource}
-                6 => ApiPath::ExtensionList {
-                    namespace: ns,
-                    resource: segments[5].to_string(),
-                    group,
-                    version,
-                },
-                // /apis/{group}/{version}/namespaces/{ns}/{resource}/{name}
-                7 => ApiPath::ExtensionResource {
-                    namespace: ns,
-                    resource: segments[5].to_string(),
-                    name: segments[6].to_string(),
-                    group,
-                    version,
-                },
-                // /apis/{group}/{version}/namespaces/{ns}/{resource}/{name}/{subresource...}
-                8.. => {
-                    let api_prefix = format!("/apis/{}/{}", group, version);
-                    ApiPath::Subresource {
-                        namespace: ns,
-                        resource: segments[5].to_string(),
-                        name: segments[6].to_string(),
-                        subresource: segments[7..].join("/"),
-                        api_prefix,
-                    }
-                }
-                _ => ApiPath::PassThrough,
-            };
-        }
-        return ApiPath::PassThrough;
-    }
-
-    // /api/v1/...
-    if segments.len() >= 2 && segments[0] == "api" {
-        let api_version = segments[1]; // e.g., "v1"
-        let api_prefix = format!("/api/{api_version}");
-
-        // Check for namespaced paths: /api/v1/namespaces/...
-        if segments.len() >= 3 && segments[2] == "namespaces" {
-            return match segments.len() {
-                // /api/v1/namespaces
-                3 => ApiPath::NamespaceList,
-                // /api/v1/namespaces/{name}
-                4 => ApiPath::NamespaceGet {
-                    name: segments[3].to_string(),
-                },
-                // /api/v1/namespaces/{ns}/{resource}
-                5 => ApiPath::NamespacedList {
-                    namespace: segments[3].to_string(),
-                    resource: segments[4].to_string(),
-                    api_prefix,
-                },
-                // /api/v1/namespaces/{ns}/{resource}/{name}
-                6 => ApiPath::NamespacedResource {
-                    namespace: segments[3].to_string(),
-                    resource: segments[4].to_string(),
-                    name: segments[5].to_string(),
-                    api_prefix,
-                },
-                // /api/v1/namespaces/{ns}/{resource}/{name}/{subresource...}
-                7.. => ApiPath::Subresource {
-                    namespace: segments[3].to_string(),
-                    resource: segments[4].to_string(),
-                    name: segments[5].to_string(),
-                    subresource: segments[6..].join("/"),
-                    api_prefix,
-                },
-                _ => ApiPath::PassThrough,
-            };
-        }
-
-        // Cluster-scoped core API: /api/v1/{resource} or /api/v1/{resource}/{name}
-        return ApiPath::PassThrough;
-    }
-
-    ApiPath::PassThrough
-}
-
-// ---------------------------------------------------------------------------
-// Proxy configuration
-// ---------------------------------------------------------------------------
-
-/// Configuration for the `VirtualClusterProxy`.
-pub struct ProxyConfig {
-    /// TLS server configuration (produced by `CertificateManager::build_server_config()`).
-    pub tls_config: Arc<rustls::ServerConfig>,
-    /// URL of the host kube-apiserver (e.g., `https://10.0.0.1:6443`).
-    pub host_api_url: String,
-    /// ServiceAccount token for authenticating with the host API server.
-    pub host_token: String,
-    /// Name/namespace translator.
-    pub translator: Arc<NameTranslator>,
-    /// Set of virtual namespaces tracked by the proxy and syncers.
-    pub virtual_namespaces: Arc<tokio::sync::RwLock<HashSet<String>>>,
-    /// Port for the HTTPS proxy.
-    pub proxy_port: u16,
-    /// Port for the plain HTTP health/metrics server.
-    pub metrics_port: u16,
-}
-
-// ---------------------------------------------------------------------------
-// VirtualClusterProxy
-// ---------------------------------------------------------------------------
-
-/// Reverse proxy that presents a virtual Kubernetes API server.
-///
-/// Translates names and namespaces between the virtual cluster view and the
-/// host cluster, forwarding requests to the real API server after translation.
-pub struct VirtualClusterProxy {
-    tls_acceptor: TlsAcceptor,
-    host_api_url: String,
-    host_token: String,
-    translator: Arc<NameTranslator>,
-    virtual_namespaces: Arc<tokio::sync::RwLock<HashSet<String>>>,
-    proxy_port: u16,
-    metrics_port: u16,
-    http_client: reqwest::Client,
-}
-
-impl VirtualClusterProxy {
-    /// Create a new proxy from the given configuration.
-    pub fn new(config: ProxyConfig) -> Result<Self> {
-        let http_client =
-            build_host_client().context("Failed to build HTTP client for host API forwarding")?;
-
-        let tls_acceptor = TlsAcceptor::from(config.tls_config);
-
-        Ok(Self {
-            tls_acceptor,
-            host_api_url: config.host_api_url,
-            host_token: config.host_token,
-            translator: config.translator,
-            virtual_namespaces: config.virtual_namespaces,
-            proxy_port: config.proxy_port,
-            metrics_port: config.metrics_port,
-            http_client,
-        })
-    }
-
-    /// Main run loop: accepts TLS connections and serves HTTP requests.
-    ///
-    /// Stops when the cancellation token is triggered.
-    pub async fn run(
-        self: &Arc<Self>,
-        shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.proxy_port));
-        let listener = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("Failed to bind proxy listener on {addr}"))?;
-
-        info!(addr = %addr, "Virtual API server listening (TLS)");
-
-        let builder = ServerBuilder::new(TokioExecutor::new());
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("Proxy shutdown signal received");
-                    break;
-                }
-                result = listener.accept() => {
-                    let (tcp_stream, peer_addr) = match result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(error = %e, "Failed to accept TCP connection");
-                            PROXY_ERRORS_TOTAL.with_label_values(&["accept"]).inc();
-                            continue;
-                        }
-                    };
-
-                    debug!(peer = %peer_addr, "Accepted connection");
-
-                    let tls_acceptor = self.tls_acceptor.clone();
-                    let proxy = Arc::clone(self);
-                    let builder = builder.clone();
-
-                    tokio::spawn(async move {
-                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
-                                PROXY_ERRORS_TOTAL.with_label_values(&["tls"]).inc();
-                                return;
-                            }
-                        };
-
-                        let service = service_fn(move |req: Request<Incoming>| {
-                            let proxy = Arc::clone(&proxy);
-                            async move { proxy.handle_request(req).await }
-                        });
-
-                        let io = hyper_util::rt::TokioIo::new(tls_stream);
-                        if let Err(e) = builder.serve_connection(io, service).await {
-                            debug!(peer = %peer_addr, error = %e, "Connection error");
-                        }
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle a single HTTP request from the virtual API client.
-    async fn handle_request(
-        self: &Arc<Self>,
-        req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let start = std::time::Instant::now();
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let path = uri.path().to_string();
-        let query = uri.query().map(|q| q.to_string());
-
-        debug!(method = %method, path = %path, "Handling request");
-
-        let response = match self
-            .route_request(method.clone(), &path, query.as_deref(), req)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(error = %e, path = %path, "Request handling error");
-                PROXY_ERRORS_TOTAL.with_label_values(&["handler"]).inc();
-                error_response(StatusCode::BAD_GATEWAY, &format!("Proxy error: {e}"))
-            }
-        };
-
-        let status = response.status().as_u16().to_string();
-        let elapsed = start.elapsed().as_secs_f64();
-        let method_str = method.as_str();
-
-        PROXY_REQUESTS_TOTAL
-            .with_label_values(&[method_str, &status])
-            .inc();
-        PROXY_REQUEST_DURATION
-            .with_label_values(&[method_str])
-            .observe(elapsed);
-
-        Ok(response)
-    }
-
-    /// Route a request to the appropriate handler.
-    async fn route_request(
-        &self,
-        method: Method,
-        path: &str,
-        query: Option<&str>,
-        req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>> {
-        // Health endpoints.
-        if path == "/healthz" || path == "/readyz" || path == "/livez" {
-            return Ok(ok_response("ok"));
-        }
-
-        // Parse the Kubernetes API path.
-        let parsed = parse_api_path(path);
-
-        match &parsed {
-            // Virtual namespace management.
-            ApiPath::NamespaceList => {
-                return match method {
-                    Method::GET => Ok(self.handle_namespace_list().await),
-                    Method::POST => {
-                        let body = req
-                            .into_body()
-                            .collect()
-                            .await
-                            .map(|b| b.to_bytes())
-                            .unwrap_or_default();
-                        Ok(self.handle_namespace_create(&body).await)
-                    }
-                    _ => Ok(error_response(
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Method not allowed",
-                    )),
-                };
-            }
-
-            ApiPath::NamespaceGet { name } => {
-                let name = name.clone();
-                return match method {
-                    Method::GET => Ok(self.handle_namespace_get(&name).await),
-                    Method::DELETE => Ok(self.handle_namespace_delete(&name).await),
-                    _ => Ok(error_response(
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Method not allowed",
-                    )),
-                };
-            }
-
-            _ => {}
-        }
-
-        // Collect the request body.
-        let headers = req.headers().clone();
-        let body = req
-            .into_body()
-            .collect()
-            .await
-            .map(|b| b.to_bytes())
-            .unwrap_or_default();
-
-        // For PassThrough, forward the original path as-is.
-        if parsed == ApiPath::PassThrough {
-            return self
-                .forward_request(method, path, query, headers, body)
-                .await;
-        }
-
-        // Translate the body if it contains JSON with name/namespace fields.
-        let translated_body = self.translate_request_body(&parsed, &body);
-
-        // Translate the path to host-cluster coordinates.
-        let translated_path = self.translate_path(&parsed);
-
-        // Forward to the host API server.
-        self.forward_request(method, &translated_path, query, headers, translated_body)
-            .await
-    }
-
-    /// Translate a parsed API path into the host-cluster path.
-    fn translate_path(&self, parsed: &ApiPath) -> String {
-        let host_ns = self.translator.host_namespace();
-
-        match parsed {
-            ApiPath::NamespaceList | ApiPath::NamespaceGet { .. } => {
-                // These are handled before reaching translate_path.
-                "/api/v1/namespaces".to_string()
-            }
-
-            ApiPath::NamespacedList {
-                namespace: _,
-                resource,
-                api_prefix,
-            } => {
-                format!("{api_prefix}/namespaces/{host_ns}/{resource}")
-            }
-
-            ApiPath::NamespacedResource {
-                namespace,
-                resource,
-                name,
-                api_prefix,
-            } => {
-                let host_name = self.translator.to_host_name(name, namespace);
-                format!("{api_prefix}/namespaces/{host_ns}/{resource}/{host_name}")
-            }
-
-            ApiPath::Subresource {
-                namespace,
-                resource,
-                name,
-                subresource,
-                api_prefix,
-            } => {
-                let host_name = self.translator.to_host_name(name, namespace);
-                format!("{api_prefix}/namespaces/{host_ns}/{resource}/{host_name}/{subresource}")
-            }
-
-            ApiPath::ExtensionList {
-                namespace: _,
-                resource,
-                group,
-                version,
-            } => {
-                format!("/apis/{group}/{version}/namespaces/{host_ns}/{resource}")
-            }
-
-            ApiPath::ExtensionResource {
-                namespace,
-                resource,
-                name,
-                group,
-                version,
-            } => {
-                let host_name = self.translator.to_host_name(name, namespace);
-                format!("/apis/{group}/{version}/namespaces/{host_ns}/{resource}/{host_name}")
-            }
-
-            ApiPath::PassThrough => {
-                // Should not be called for PassThrough; the caller forwards the
-                // original path directly.
-                String::new()
-            }
-        }
-    }
-
-    /// Forward a request to the host API server and translate the response.
-    async fn forward_request(
-        &self,
-        method: Method,
-        path: &str,
-        query: Option<&str>,
-        headers: hyper::HeaderMap,
-        body: Bytes,
-    ) -> Result<Response<Full<Bytes>>> {
-        let url = format!(
-            "{}{}{}",
-            self.host_api_url,
-            path,
-            query.map(|q| format!("?{q}")).unwrap_or_default()
-        );
-
-        debug!(url = %url, method = %method, "Forwarding to host API");
-
-        let mut req_builder = self
-            .http_client
-            .request(method.clone(), &url)
-            .bearer_auth(&self.host_token);
-
-        // Forward relevant headers.
-        if let Some(ct) = headers.get("content-type") {
-            if let Ok(ct_str) = ct.to_str() {
-                req_builder = req_builder.header("content-type", ct_str);
-            }
-        }
-        if let Some(accept) = headers.get("accept") {
-            if let Ok(accept_str) = accept.to_str() {
-                req_builder = req_builder.header("accept", accept_str);
-            }
-        }
-        if let Some(user_agent) = headers.get("user-agent") {
-            if let Ok(ua_str) = user_agent.to_str() {
-                req_builder = req_builder.header("user-agent", ua_str);
-            }
-        }
-
-        if !body.is_empty() {
-            req_builder = req_builder.body(body.to_vec());
-        }
-
-        let resp = req_builder
-            .send()
-            .await
-            .with_context(|| format!("Failed to forward {method} request to {url}"))?;
-
-        let status = resp.status();
-        let resp_headers = resp.headers().clone();
-        let content_type = resp_headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let resp_body = resp
-            .bytes()
-            .await
-            .context("Failed to read response body from host API")?;
-
-        // Translate the response body (reverse name translation).
-        let translated_body = self.translate_response_body(&resp_body, content_type.as_deref());
-
-        let mut builder = Response::builder().status(status);
-        if let Some(ref ct) = content_type {
-            builder = builder.header("content-type", ct.as_str());
-        }
-
-        let response = builder
-            .body(Full::new(translated_body))
-            .unwrap_or_else(|_| {
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Response build error")
-            });
-
-        Ok(response)
-    }
-
-    /// Translate a response body, reversing host names back to virtual names.
-    ///
-    /// Only operates on JSON responses. Non-JSON bodies are returned as-is.
-    fn translate_response_body(&self, body: &[u8], content_type: Option<&str>) -> Bytes {
-        let is_json = content_type.map(|ct| ct.contains("json")).unwrap_or(false);
-
-        if !is_json || body.is_empty() {
-            return Bytes::copy_from_slice(body);
-        }
-
-        match serde_json::from_slice::<serde_json::Value>(body) {
-            Ok(mut value) => {
-                self.translate_json_value(&mut value);
-                match serde_json::to_vec(&value) {
-                    Ok(translated) => Bytes::from(translated),
-                    Err(_) => Bytes::copy_from_slice(body),
-                }
-            }
-            Err(_) => Bytes::copy_from_slice(body),
-        }
-    }
-
-    /// Recursively walk a JSON value and reverse-translate host names to virtual names.
-    ///
-    /// When a field named `"name"` matches the host translation pattern
-    /// (`{vname}-x-{vns}-x-vc`), the name is replaced with `vname` and the
-    /// sibling `"namespace"` field (if any) is set to `vns`.
-    fn translate_json_value(&self, value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                // Translate metadata.name if present and matches host pattern.
-                if let Some(name_val) = map.get("name") {
-                    if let Some(name_str) = name_val.as_str() {
-                        if let Some((virtual_name, virtual_ns)) =
-                            self.translator.to_virtual(name_str)
-                        {
-                            map.insert("name".to_string(), serde_json::Value::String(virtual_name));
-                            // Also set the namespace to the virtual namespace.
-                            map.insert(
-                                "namespace".to_string(),
-                                serde_json::Value::String(virtual_ns),
-                            );
-                        }
-                    }
-                }
-
-                // Recurse into all values.
-                for (_, v) in map.iter_mut() {
-                    self.translate_json_value(v);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    self.translate_json_value(item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Translate a request body, replacing virtual names with host names.
-    fn translate_request_body(&self, parsed: &ApiPath, body: &Bytes) -> Bytes {
-        if body.is_empty() {
-            return Bytes::new();
-        }
-
-        let virtual_ns = match parsed {
-            ApiPath::NamespacedList { namespace, .. }
-            | ApiPath::NamespacedResource { namespace, .. }
-            | ApiPath::Subresource { namespace, .. }
-            | ApiPath::ExtensionList { namespace, .. }
-            | ApiPath::ExtensionResource { namespace, .. } => namespace.clone(),
-            _ => return body.clone(),
-        };
-
-        match serde_json::from_slice::<serde_json::Value>(body) {
-            Ok(mut value) => {
-                self.translate_request_json(&mut value, &virtual_ns);
-                match serde_json::to_vec(&value) {
-                    Ok(translated) => Bytes::from(translated),
-                    Err(_) => body.clone(),
-                }
-            }
-            Err(_) => body.clone(),
-        }
-    }
-
-    /// Translate a request JSON value: replace virtual names with host names.
-    fn translate_request_json(&self, value: &mut serde_json::Value, virtual_ns: &str) {
-        if let serde_json::Value::Object(map) = value {
-            // Handle metadata.name translation.
-            if let Some(serde_json::Value::Object(meta_map)) = map.get_mut("metadata") {
-                if let Some(name_val) = meta_map.get("name") {
-                    if let Some(name_str) = name_val.as_str() {
-                        let host_name = self.translator.to_host_name(name_str, virtual_ns);
-                        meta_map.insert("name".to_string(), serde_json::Value::String(host_name));
-                    }
-                }
-                // Replace namespace with host namespace.
-                meta_map.insert(
-                    "namespace".to_string(),
-                    serde_json::Value::String(self.translator.host_namespace().to_string()),
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Virtual namespace management
-    // -----------------------------------------------------------------------
-
-    /// Return a synthetic namespace list from the virtual namespaces set.
-    async fn handle_namespace_list(&self) -> Response<Full<Bytes>> {
-        let namespaces = self.virtual_namespaces.read().await;
-        let items: Vec<serde_json::Value> = namespaces
-            .iter()
-            .map(|ns| make_namespace_object(ns))
-            .collect();
-
-        let list = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "NamespaceList",
-            "metadata": {
-                "resourceVersion": "1"
-            },
-            "items": items
-        });
-
-        json_response(StatusCode::OK, &list)
-    }
-
-    /// Return a synthetic namespace object if it exists.
-    async fn handle_namespace_get(&self, name: &str) -> Response<Full<Bytes>> {
-        let namespaces = self.virtual_namespaces.read().await;
-        if namespaces.contains(name) {
-            let ns = make_namespace_object(name);
-            json_response(StatusCode::OK, &ns)
-        } else {
-            let status = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Status",
-                "metadata": {},
-                "status": "Failure",
-                "message": format!("namespaces \"{name}\" not found"),
-                "reason": "NotFound",
-                "details": {
-                    "name": name,
-                    "kind": "namespaces"
-                },
-                "code": 404
-            });
-            json_response(StatusCode::NOT_FOUND, &status)
-        }
-    }
-
-    /// Create a virtual namespace.
-    async fn handle_namespace_create(&self, body: &Bytes) -> Response<Full<Bytes>> {
-        let parsed: serde_json::Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(e) => {
-                return error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {e}"));
-            }
-        };
-
-        let name = parsed
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str());
-
-        let name = match name {
-            Some(n) => n.to_string(),
-            None => {
-                return error_response(StatusCode::BAD_REQUEST, "metadata.name is required");
-            }
-        };
-
-        let mut namespaces = self.virtual_namespaces.write().await;
-        if namespaces.contains(&name) {
-            let status = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Status",
-                "metadata": {},
-                "status": "Failure",
-                "message": format!("namespaces \"{name}\" already exists"),
-                "reason": "AlreadyExists",
-                "details": {
-                    "name": name,
-                    "kind": "namespaces"
-                },
-                "code": 409
-            });
-            return json_response(StatusCode::CONFLICT, &status);
-        }
-
-        namespaces.insert(name.clone());
-        info!(namespace = %name, "Created virtual namespace");
-
-        let ns = make_namespace_object(&name);
-        json_response(StatusCode::CREATED, &ns)
-    }
-
-    /// Delete a virtual namespace.
-    async fn handle_namespace_delete(&self, name: &str) -> Response<Full<Bytes>> {
-        let mut namespaces = self.virtual_namespaces.write().await;
-        if namespaces.remove(name) {
-            info!(namespace = %name, "Deleted virtual namespace");
-            let ns = make_namespace_object(name);
-            json_response(StatusCode::OK, &ns)
-        } else {
-            let status = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Status",
-                "metadata": {},
-                "status": "Failure",
-                "message": format!("namespaces \"{name}\" not found"),
-                "reason": "NotFound",
-                "details": {
-                    "name": name,
-                    "kind": "namespaces"
-                },
-                "code": 404
-            });
-            json_response(StatusCode::NOT_FOUND, &status)
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Metrics / health server
-    // -----------------------------------------------------------------------
-
-    /// Run a plain HTTP server on the metrics port, serving `/healthz` and `/metrics`.
-    pub async fn run_metrics_server(
-        &self,
-        shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.metrics_port));
-        let listener = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("Failed to bind metrics listener on {addr}"))?;
-
-        info!(addr = %addr, "Metrics/health server listening (HTTP)");
-
-        let builder = ServerBuilder::new(TokioExecutor::new());
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("Metrics server shutdown signal received");
-                    break;
-                }
-                result = listener.accept() => {
-                    let (tcp_stream, _peer_addr) = match result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(error = %e, "Failed to accept metrics connection");
-                            continue;
-                        }
-                    };
-
-                    let builder = builder.clone();
-                    tokio::spawn(async move {
-                        let service = service_fn(|req: Request<Incoming>| async move {
-                            let path = req.uri().path().to_string();
-                            let response = match path.as_str() {
-                                "/healthz" | "/readyz" | "/livez" => ok_response("ok"),
-                                "/metrics" => {
-                                    let encoder = TextEncoder::new();
-                                    let metric_families = prometheus::gather();
-                                    let mut buffer = Vec::new();
-                                    let _ = encoder.encode(&metric_families, &mut buffer);
-                                    let body =
-                                        String::from_utf8(buffer).unwrap_or_default();
-                                    Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header(
-                                            "content-type",
-                                            "text/plain; version=0.0.4; charset=utf-8",
-                                        )
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap_or_else(|_| ok_response(""))
-                                }
-                                _ => error_response(StatusCode::NOT_FOUND, "Not Found"),
-                            };
-                            Ok::<_, hyper::Error>(response)
-                        });
-
-                        let io = hyper_util::rt::TokioIo::new(tcp_stream);
-                        if let Err(e) = builder.serve_connection(io, service).await {
-                            debug!(error = %e, "Metrics connection error");
-                        }
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Host configuration helpers
@@ -979,17 +239,17 @@ pub fn load_host_config() -> Result<(String, String)> {
 // ---------------------------------------------------------------------------
 
 /// Build a simple 200 OK response with a text body.
-fn ok_response(body: &str) -> Response<Full<Bytes>> {
+fn ok_response(body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(body_from_bytes(Bytes::from(body.to_string())))
         .unwrap()
 }
 
 /// Build an error response with the given status code and message in Kubernetes
 /// Status format.
-fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
     let body = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Status",
@@ -1002,549 +262,90 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body_bytes)))
+        .body(body_from_bytes(Bytes::from(body_bytes)))
         .unwrap()
 }
 
-/// Build a JSON response.
-fn json_response(status: StatusCode, value: &serde_json::Value) -> Response<Full<Bytes>> {
-    let body_bytes = serde_json::to_vec(value).unwrap_or_default();
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap()
-}
-
-/// Create a synthetic Kubernetes Namespace object.
-fn make_namespace_object(name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": {
-            "name": name,
-            "uid": format!("virtual-{name}"),
-            "resourceVersion": "1",
-            "creationTimestamp": "2024-01-01T00:00:00Z"
-        },
-        "spec": {
-            "finalizers": ["kubernetes"]
-        },
-        "status": {
-            "phase": "Active"
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
-// Tests
+// Body size limits
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Maximum body size (bytes) the proxy will buffer from a client before
+/// rejecting the request with 413 Payload Too Large.
+///
+/// Matches the upstream kube-apiserver default for `--max-request-bytes`
+/// (3 MiB), which is the limit applied to request bodies for create and
+/// update verbs and is comfortable for the largest realistic payloads
+/// (Helm-encoded ConfigMaps/Secrets, big CRD apply manifests, decent-size
+/// Job/Deployment specs).
+///
+/// Without this cap, `BodyExt::collect()` on the incoming hyper body would
+/// allocate unbounded memory: a single attacker-controlled connection
+/// could OOM the kobe-sync container by streaming an arbitrarily large
+/// body into a single request.
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
 
-    // -- parse_api_path tests --
-
-    #[test]
-    fn test_parse_namespace_list() {
-        assert_eq!(parse_api_path("/api/v1/namespaces"), ApiPath::NamespaceList);
-    }
-
-    #[test]
-    fn test_parse_namespace_get() {
-        assert_eq!(
-            parse_api_path("/api/v1/namespaces/default"),
-            ApiPath::NamespaceGet {
-                name: "default".to_string()
+/// Buffer a body up to `limit` bytes, rejecting larger payloads.
+///
+/// On overflow returns a 413 Payload Too Large response in K8s `Status`
+/// JSON shape. On other body errors returns 400. The caller substitutes
+/// this response when this function returns `Err`.
+///
+/// Generic over any `hyper::body::Body<Data = Bytes>` so unit tests can
+/// drive it with a synthetic `Full<Bytes>` body without spinning up a
+/// real hyper server.
+async fn collect_body_bounded<B>(
+    body: B,
+    limit: usize,
+) -> Result<Bytes, Response<ProxyBody>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let limited = Limited::new(body, limit);
+    match limited.collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) => {
+            // `Limited::collect()` errors with a boxed
+            // `LengthLimitError` once the cap is exceeded; other errors
+            // mean the underlying transport went away mid-body.
+            let too_large = e
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some();
+            if too_large {
+                PROXY_ERRORS_TOTAL
+                    .with_label_values(&["body_too_large"])
+                    .inc();
+                Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!("request body exceeds proxy limit of {limit} bytes"),
+                ))
+            } else {
+                PROXY_ERRORS_TOTAL.with_label_values(&["body_read"]).inc();
+                Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed to read request body: {e}"),
+                ))
             }
-        );
-    }
-
-    #[test]
-    fn test_parse_namespaced_list() {
-        assert_eq!(
-            parse_api_path("/api/v1/namespaces/default/pods"),
-            ApiPath::NamespacedList {
-                namespace: "default".to_string(),
-                resource: "pods".to_string(),
-                api_prefix: "/api/v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_namespaced_resource() {
-        assert_eq!(
-            parse_api_path("/api/v1/namespaces/default/pods/my-pod"),
-            ApiPath::NamespacedResource {
-                namespace: "default".to_string(),
-                resource: "pods".to_string(),
-                name: "my-pod".to_string(),
-                api_prefix: "/api/v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_subresource() {
-        assert_eq!(
-            parse_api_path("/api/v1/namespaces/default/pods/my-pod/log"),
-            ApiPath::Subresource {
-                namespace: "default".to_string(),
-                resource: "pods".to_string(),
-                name: "my-pod".to_string(),
-                subresource: "log".to_string(),
-                api_prefix: "/api/v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_subresource_exec() {
-        assert_eq!(
-            parse_api_path("/api/v1/namespaces/default/pods/my-pod/exec"),
-            ApiPath::Subresource {
-                namespace: "default".to_string(),
-                resource: "pods".to_string(),
-                name: "my-pod".to_string(),
-                subresource: "exec".to_string(),
-                api_prefix: "/api/v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_service_proxy_subresource() {
-        assert_eq!(
-            parse_api_path("/api/v1/namespaces/default/services/my-svc/proxy"),
-            ApiPath::Subresource {
-                namespace: "default".to_string(),
-                resource: "services".to_string(),
-                name: "my-svc".to_string(),
-                subresource: "proxy".to_string(),
-                api_prefix: "/api/v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_extension_resource() {
-        assert_eq!(
-            parse_api_path("/apis/apps/v1/namespaces/default/deployments/my-deploy"),
-            ApiPath::ExtensionResource {
-                namespace: "default".to_string(),
-                resource: "deployments".to_string(),
-                name: "my-deploy".to_string(),
-                group: "apps".to_string(),
-                version: "v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_extension_list() {
-        assert_eq!(
-            parse_api_path("/apis/apps/v1/namespaces/default/deployments"),
-            ApiPath::ExtensionList {
-                namespace: "default".to_string(),
-                resource: "deployments".to_string(),
-                group: "apps".to_string(),
-                version: "v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_extension_subresource() {
-        assert_eq!(
-            parse_api_path("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale"),
-            ApiPath::Subresource {
-                namespace: "default".to_string(),
-                resource: "deployments".to_string(),
-                name: "my-deploy".to_string(),
-                subresource: "scale".to_string(),
-                api_prefix: "/apis/apps/v1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_cluster_scoped() {
-        assert_eq!(parse_api_path("/api/v1/nodes"), ApiPath::PassThrough);
-        assert_eq!(parse_api_path("/api/v1/nodes/node-1"), ApiPath::PassThrough);
-    }
-
-    #[test]
-    fn test_parse_passthrough() {
-        assert_eq!(parse_api_path("/version"), ApiPath::PassThrough);
-        assert_eq!(parse_api_path("/openapi/v2"), ApiPath::PassThrough);
-        assert_eq!(parse_api_path("/"), ApiPath::PassThrough);
-    }
-
-    #[test]
-    fn test_parse_apis_cluster_scoped() {
-        assert_eq!(
-            parse_api_path("/apis/apiextensions.k8s.io/v1/customresourcedefinitions"),
-            ApiPath::PassThrough
-        );
-    }
-
-    // -- translate_path tests (standalone, without proxy instance) --
-
-    fn make_translator() -> Arc<NameTranslator> {
-        Arc::new(NameTranslator::new("pool-e2e-basic-0".to_string()))
-    }
-
-    #[test]
-    fn test_translate_namespaced_resource_path() {
-        let translator = make_translator();
-        let parsed = ApiPath::NamespacedResource {
-            namespace: "default".to_string(),
-            resource: "pods".to_string(),
-            name: "my-pod".to_string(),
-            api_prefix: "/api/v1".to_string(),
-        };
-
-        let host_ns = translator.host_namespace();
-        let result = match &parsed {
-            ApiPath::NamespacedResource {
-                namespace,
-                resource,
-                name,
-                api_prefix,
-            } => {
-                let host_name = translator.to_host_name(name, namespace);
-                format!("{api_prefix}/namespaces/{host_ns}/{resource}/{host_name}")
-            }
-            _ => unreachable!(),
-        };
-
-        assert_eq!(
-            result,
-            "/api/v1/namespaces/pool-e2e-basic-0/pods/my-pod-x-default-x-vc"
-        );
-    }
-
-    #[test]
-    fn test_translate_namespaced_list_path() {
-        let translator = make_translator();
-        let host_ns = translator.host_namespace();
-
-        let parsed = ApiPath::NamespacedList {
-            namespace: "default".to_string(),
-            resource: "services".to_string(),
-            api_prefix: "/api/v1".to_string(),
-        };
-
-        let result = match &parsed {
-            ApiPath::NamespacedList {
-                resource,
-                api_prefix,
-                ..
-            } => {
-                format!("{api_prefix}/namespaces/{host_ns}/{resource}")
-            }
-            _ => unreachable!(),
-        };
-
-        assert_eq!(result, "/api/v1/namespaces/pool-e2e-basic-0/services");
-    }
-
-    #[test]
-    fn test_translate_extension_resource_path() {
-        let translator = make_translator();
-        let host_ns = translator.host_namespace();
-
-        let parsed = ApiPath::ExtensionResource {
-            namespace: "kube-system".to_string(),
-            resource: "deployments".to_string(),
-            name: "nginx".to_string(),
-            group: "apps".to_string(),
-            version: "v1".to_string(),
-        };
-
-        let result = match &parsed {
-            ApiPath::ExtensionResource {
-                namespace,
-                resource,
-                name,
-                group,
-                version,
-            } => {
-                let host_name = translator.to_host_name(name, namespace);
-                format!("/apis/{group}/{version}/namespaces/{host_ns}/{resource}/{host_name}")
-            }
-            _ => unreachable!(),
-        };
-
-        assert_eq!(
-            result,
-            "/apis/apps/v1/namespaces/pool-e2e-basic-0/deployments/nginx-x-kube-system-x-vc"
-        );
-    }
-
-    #[test]
-    fn test_translate_subresource_path() {
-        let translator = make_translator();
-        let host_ns = translator.host_namespace();
-
-        let parsed = ApiPath::Subresource {
-            namespace: "default".to_string(),
-            resource: "pods".to_string(),
-            name: "my-pod".to_string(),
-            subresource: "log".to_string(),
-            api_prefix: "/api/v1".to_string(),
-        };
-
-        let result = match &parsed {
-            ApiPath::Subresource {
-                namespace,
-                resource,
-                name,
-                subresource,
-                api_prefix,
-            } => {
-                let host_name = translator.to_host_name(name, namespace);
-                format!("{api_prefix}/namespaces/{host_ns}/{resource}/{host_name}/{subresource}")
-            }
-            _ => unreachable!(),
-        };
-
-        assert_eq!(
-            result,
-            "/api/v1/namespaces/pool-e2e-basic-0/pods/my-pod-x-default-x-vc/log"
-        );
-    }
-
-    // -- JSON translation tests --
-
-    /// Standalone translate_json_value for tests (mirrors VirtualClusterProxy method).
-    fn translate_json_value_standalone(translator: &NameTranslator, value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                if let Some(name_val) = map.get("name") {
-                    if let Some(name_str) = name_val.as_str() {
-                        if let Some((virtual_name, virtual_ns)) = translator.to_virtual(name_str) {
-                            map.insert("name".to_string(), serde_json::Value::String(virtual_name));
-                            map.insert(
-                                "namespace".to_string(),
-                                serde_json::Value::String(virtual_ns),
-                            );
-                        }
-                    }
-                }
-                for (_, v) in map.iter_mut() {
-                    translate_json_value_standalone(translator, v);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    translate_json_value_standalone(translator, item);
-                }
-            }
-            _ => {}
         }
-    }
-
-    #[test]
-    fn test_translate_response_json_single_resource() {
-        let translator = make_translator();
-
-        let mut host_response = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": "my-pod-x-default-x-vc",
-                "namespace": "pool-e2e-basic-0"
-            }
-        });
-
-        translate_json_value_standalone(&translator, &mut host_response);
-
-        let meta = host_response.get("metadata").unwrap();
-        assert_eq!(meta.get("name").unwrap().as_str().unwrap(), "my-pod");
-        assert_eq!(meta.get("namespace").unwrap().as_str().unwrap(), "default");
-    }
-
-    #[test]
-    fn test_translate_response_json_list() {
-        let translator = make_translator();
-
-        let mut host_response = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "PodList",
-            "items": [
-                {
-                    "metadata": {
-                        "name": "web-x-default-x-vc",
-                        "namespace": "pool-e2e-basic-0"
-                    }
-                },
-                {
-                    "metadata": {
-                        "name": "api-x-staging-x-vc",
-                        "namespace": "pool-e2e-basic-0"
-                    }
-                }
-            ]
-        });
-
-        translate_json_value_standalone(&translator, &mut host_response);
-
-        let items = host_response.get("items").unwrap().as_array().unwrap();
-
-        let meta0 = items[0].get("metadata").unwrap();
-        assert_eq!(meta0.get("name").unwrap().as_str().unwrap(), "web");
-        assert_eq!(meta0.get("namespace").unwrap().as_str().unwrap(), "default");
-
-        let meta1 = items[1].get("metadata").unwrap();
-        assert_eq!(meta1.get("name").unwrap().as_str().unwrap(), "api");
-        assert_eq!(meta1.get("namespace").unwrap().as_str().unwrap(), "staging");
-    }
-
-    #[test]
-    fn test_translate_response_leaves_untranslated_names() {
-        let translator = make_translator();
-
-        let mut host_response = serde_json::json!({
-            "metadata": {
-                "name": "some-random-name",
-                "namespace": "pool-e2e-basic-0"
-            }
-        });
-
-        translate_json_value_standalone(&translator, &mut host_response);
-
-        let meta = host_response.get("metadata").unwrap();
-        assert_eq!(
-            meta.get("name").unwrap().as_str().unwrap(),
-            "some-random-name"
-        );
-    }
-
-    #[test]
-    fn test_translate_response_nested_objects() {
-        let translator = make_translator();
-
-        let mut host_response = serde_json::json!({
-            "metadata": {
-                "name": "svc-x-default-x-vc",
-                "namespace": "pool-e2e-basic-0"
-            },
-            "spec": {
-                "selector": {
-                    "app": "web"
-                }
-            }
-        });
-
-        translate_json_value_standalone(&translator, &mut host_response);
-
-        let meta = host_response.get("metadata").unwrap();
-        assert_eq!(meta.get("name").unwrap().as_str().unwrap(), "svc");
-        assert_eq!(meta.get("namespace").unwrap().as_str().unwrap(), "default");
-    }
-
-    // -- Namespace object tests --
-
-    #[test]
-    fn test_make_namespace_object() {
-        let ns = make_namespace_object("default");
-        assert_eq!(ns.get("kind").unwrap().as_str().unwrap(), "Namespace");
-        assert_eq!(
-            ns.get("metadata")
-                .unwrap()
-                .get("name")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "default"
-        );
-        assert_eq!(
-            ns.get("status")
-                .unwrap()
-                .get("phase")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "Active"
-        );
-    }
-
-    #[test]
-    fn test_ok_response() {
-        let resp = ok_response("ok");
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn test_error_response_format() {
-        let resp = error_response(StatusCode::NOT_FOUND, "not found");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn test_json_response_format() {
-        let value = serde_json::json!({"key": "value"});
-        let resp = json_response(StatusCode::OK, &value);
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // -- TLS host client tests --
-
-    #[test]
-    fn test_build_host_client_falls_back_outside_cluster() {
-        // Outside a real cluster the CA file won't exist, so the builder
-        // should fall back to danger_accept_invalid_certs and still succeed.
-        let client = build_host_client();
-        assert!(
-            client.is_ok(),
-            "build_host_client should succeed even without in-cluster CA: {:?}",
-            client.err()
-        );
-    }
-
-    #[test]
-    fn test_missing_ca_file_falls_back() {
-        let client = build_host_client_with_ca_path("/nonexistent/path/ca.crt");
-        assert!(
-            client.is_ok(),
-            "Should succeed with fallback when CA file is missing: {:?}",
-            client.err()
-        );
-    }
-
-    #[test]
-    fn test_empty_ca_file_falls_back() {
-        let dir = std::env::temp_dir().join("kobe_sync_test_empty_ca");
-        let _ = std::fs::create_dir_all(&dir);
-        let ca_path = dir.join("ca.crt");
-        std::fs::write(&ca_path, b"").unwrap();
-
-        let client = build_host_client_with_ca_path(ca_path.to_str().unwrap());
-        assert!(
-            client.is_ok(),
-            "Should succeed with fallback when CA file is empty: {:?}",
-            client.err()
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
+/// Convenience wrapper around `collect_body_bounded` using
+/// `MAX_REQUEST_BODY_BYTES` as the cap.
+async fn collect_body_with_limit(body: Incoming) -> Result<Bytes, Response<ProxyBody>> {
+    collect_body_bounded(body, MAX_REQUEST_BODY_BYTES).await
+}
+
 // ===========================================================================
-// V2 — Thin TLS Gateway
+// Subresource interception
 // ===========================================================================
 //
-// The v2 proxy acts as a thin TLS gateway in front of the local kube-apiserver.
-// Most requests are forwarded as-is. Only Pod subresource requests (exec, logs,
-// attach, portforward) are intercepted, translated to host pod names, and
-// proxied to the host kube-apiserver.
-//
-// The v1 proxy code above is still used by the binary and will be
-// removed when VirtualClusterProxyV2 has full HTTP forwarding.
-// ===========================================================================
+// Pod subresource requests (exec, logs, attach, portforward) target real
+// running containers. In a vkobe virtual cluster the workload pods live in
+// the host cluster under translated names, so we intercept these requests,
+// rewrite the path, and proxy them to the host apiserver instead of the
+// local one.
 
 /// A parsed Pod subresource request (exec, logs, attach, portforward).
 #[derive(Debug, Clone, PartialEq)]
@@ -1600,106 +401,535 @@ pub fn translate_subresource_to_host(
     (host_path, host_ns)
 }
 
-/// V2 proxy that acts as a thin TLS gateway in front of the local kube-apiserver.
+// ===========================================================================
+// VirtualClusterProxyV2 — front-proxy gateway for vkobe virtual clusters
+// ===========================================================================
+//
+// The proxy presents the virtual cluster's TLS endpoint to clients (kubectl,
+// flux, controllers, …) and forwards requests to the LOCAL kube-apiserver
+// running as a sidecar in the same pod. It uses the K8s "front-proxy"
+// authentication pattern (the same one kube-aggregator uses for extension
+// API servers) so that the local apiserver enforces RBAC against the
+// caller's real identity rather than against the proxy's own credentials.
+//
+// Auth handoff:
+//
+//     client ──TLS w/ client-cert (signed by ca.crt)──> proxy
+//                │
+//                │ rustls validates cert against ca.crt
+//                │ proxy parses Subject DN: CN → username, O → groups
+//                │
+//                └──mTLS w/ front-proxy-client cert───> local apiserver
+//                       + X-Remote-User: <CN>
+//                       + X-Remote-Group: <O>* (one per Organization RDN)
+//
+// The apiserver is configured with:
+//   --requestheader-client-ca-file=/pki/front-proxy-ca.crt
+//   --requestheader-allowed-names=front-proxy-client
+//   --requestheader-username-headers=X-Remote-User
+//   --requestheader-group-headers=X-Remote-Group
+//   --requestheader-extra-headers-prefix=X-Remote-Extra-
+//
+// so it ONLY trusts the X-Remote-* headers when the underlying TLS
+// connection presents the front-proxy-client cert. End-clients cannot spoof
+// identity by injecting headers because their cert chain is not trusted by
+// `requestheader-client-ca-file`.
+//
+// Pod subresource requests (exec/logs/attach/portforward) are intercepted
+// and proxied to the HOST cluster's apiserver instead — the actual workload
+// pods live in the host namespace under translated names.
+
+/// Identity extracted from the peer's TLS client certificate.
 ///
-/// Most requests are forwarded as-is to the local apiserver. Only Pod subresource
-/// requests (exec, logs, attach, portforward) are intercepted, translated to host
-/// pod names, and proxied to the host kube-apiserver.
-pub struct VirtualClusterProxyV2 {
-    /// Address of the local kube-apiserver to forward to.
-    pub apiserver_url: String,
-    /// URL of the host kube-apiserver for subresource proxying.
-    pub host_apiserver_url: String,
-    /// ServiceAccount token for authenticating with the host API server.
-    pub host_token: String,
-    /// Name translator for virtual-to-host name mapping.
-    pub translator: Arc<NameTranslator>,
-    /// TLS configuration for the proxy's frontend.
-    pub tls_config: Arc<rustls::ServerConfig>,
-    /// Port to listen on.
-    pub listen_port: u16,
+/// Mirrors what kube-apiserver derives from a client cert:
+/// - Subject CN → user name (RFC 1779 / RFC 2253 CN attribute)
+/// - Subject O  → group(s); a cert may have multiple O attributes
+#[derive(Debug, Clone)]
+pub struct PeerIdentity {
+    pub username: String,
+    pub groups: Vec<String>,
 }
 
-impl VirtualClusterProxyV2 {
-    /// Handle an incoming request -- either forward to local apiserver or intercept subresource.
-    pub async fn handle_request(
-        &self,
-        req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let path = req.uri().path().to_string();
+/// Reject any string that contains characters which could break HTTP header
+/// framing or sneak in additional headers / impersonation attributes.
+///
+/// Belt-and-suspenders: `reqwest::RequestBuilder::header` already rejects
+/// these via `HeaderValue::from_str`, but we want to fail fast with a
+/// useful log line rather than silently dropping the value or panicking
+/// somewhere deep in hyper. The cluster CA only ever signs certs we
+/// generate ourselves (see `pki::generate_signed_cert`) — control chars
+/// in CN/O would mean either a bug in our cert generation or a CA
+/// compromise. Either way, refuse the identity.
+fn header_value_is_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| !c.is_control() && c != '\r' && c != '\n' && c.is_ascii())
+}
 
-        if let Some(sub) = parse_subresource(&path) {
-            // Intercepted subresource -- translate and proxy to host
-            self.handle_subresource(req, sub).await
-        } else {
-            // Pass-through to local kube-apiserver
-            self.forward_to_apiserver(req).await
+/// Parse a single peer cert (DER) and extract `(CN, [O])`.
+///
+/// Returns `None` if the cert can't be parsed, if the cert has no
+/// recognizable identity (neither CN nor O), or if any of the extracted
+/// values contain control characters that would be unsafe to inject into
+/// HTTP headers.
+pub fn extract_peer_identity_from_der(cert_der: &[u8]) -> Option<PeerIdentity> {
+    use x509_parser::prelude::*;
+
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    let subject = cert.subject();
+
+    let username = subject
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let groups: Vec<String> = subject
+        .iter_organization()
+        .filter_map(|o| o.as_str().ok().map(|s| s.to_string()))
+        .collect();
+
+    if username.is_empty() && groups.is_empty() {
+        return None;
+    }
+
+    // Reject anything that wouldn't be a valid HTTP header value — header
+    // injection via a malformed Subject DN would let an attacker forge
+    // X-Remote-Group entries or extra impersonation headers.
+    if !username.is_empty() && !header_value_is_safe(&username) {
+        warn!(
+            "Rejecting peer cert: CN contains characters unsafe for HTTP header injection"
+        );
+        return None;
+    }
+    for g in &groups {
+        if !header_value_is_safe(g) {
+            warn!(
+                "Rejecting peer cert: Organization contains characters unsafe for HTTP header injection"
+            );
+            return None;
         }
     }
 
+    Some(PeerIdentity { username, groups })
+}
+
+/// Configuration for [`VirtualClusterProxyV2`].
+pub struct ProxyConfigV2 {
+    /// TLS server configuration (validates incoming client certs against
+    /// the cluster CA via `WebPkiClientVerifier`).
+    pub tls_config: Arc<rustls::ServerConfig>,
+    /// URL of the local kube-apiserver sidecar (e.g. `https://127.0.0.1:6443`).
+    pub apiserver_url: String,
+    /// PEM-encoded cluster CA — used to verify the local apiserver's
+    /// serving cert when the proxy connects to it via mTLS.
+    pub apiserver_ca_pem: String,
+    /// PEM-encoded front-proxy-client certificate (signed by
+    /// `front-proxy-ca.crt`). Used as the proxy's client identity when
+    /// connecting to the local apiserver.
+    pub front_proxy_client_cert_pem: String,
+    /// PEM-encoded front-proxy-client private key.
+    pub front_proxy_client_key_pem: String,
+    /// URL of the host kube-apiserver — used only for pod subresource
+    /// proxying (exec/logs/attach/portforward).
+    pub host_apiserver_url: String,
+    /// ServiceAccount token for authenticating to the host apiserver
+    /// during subresource proxying.
+    pub host_token: String,
+    /// Virtual-to-host name translator (subresource targeting).
+    pub translator: Arc<NameTranslator>,
+    /// Listen port for the HTTPS proxy.
+    pub proxy_port: u16,
+    /// Listen port for the plain-HTTP metrics/health server.
+    pub metrics_port: u16,
+}
+
+/// Front-proxy gateway in front of a vkobe local kube-apiserver.
+pub struct VirtualClusterProxyV2 {
+    tls_acceptor: TlsAcceptor,
+    apiserver_url: String,
+    /// reqwest client pre-configured with mTLS (front-proxy-client identity)
+    /// and the cluster CA root for verifying the local apiserver.
+    apiserver_client: reqwest::Client,
+    host_apiserver_url: String,
+    host_token: String,
+    /// reqwest client for talking to the host apiserver (subresource
+    /// forwarding). Uses the in-cluster ServiceAccount token + CA.
+    host_client: reqwest::Client,
+    translator: Arc<NameTranslator>,
+    proxy_port: u16,
+    metrics_port: u16,
+}
+
+impl VirtualClusterProxyV2 {
+    /// Build a new V2 proxy from the given configuration.
+    pub fn new(config: ProxyConfigV2) -> Result<Self> {
+        // mTLS client to local apiserver: present front-proxy-client cert,
+        // verify the apiserver's serving cert against the cluster CA.
+        let mut identity_pem = config.front_proxy_client_cert_pem.clone().into_bytes();
+        if !identity_pem.ends_with(b"\n") {
+            identity_pem.push(b'\n');
+        }
+        identity_pem.extend_from_slice(config.front_proxy_client_key_pem.as_bytes());
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .context("Failed to parse front-proxy-client identity PEM")?;
+
+        let apiserver_ca = reqwest::Certificate::from_pem(config.apiserver_ca_pem.as_bytes())
+            .context("Failed to parse cluster CA PEM for apiserver verification")?;
+
+        let apiserver_client = reqwest::Client::builder()
+            .identity(identity)
+            .add_root_certificate(apiserver_ca)
+            // The local apiserver's serving cert SAN list contains
+            // `localhost` and `127.0.0.1`, so name verification works
+            // when we connect to https://127.0.0.1:6443.
+            .build()
+            .context("Failed to build mTLS client for local apiserver")?;
+
+        let host_client = build_host_client()
+            .context("Failed to build HTTP client for host apiserver subresource proxying")?;
+
+        let tls_acceptor = TlsAcceptor::from(config.tls_config);
+
+        Ok(Self {
+            tls_acceptor,
+            apiserver_url: config.apiserver_url,
+            apiserver_client,
+            host_apiserver_url: config.host_apiserver_url,
+            host_token: config.host_token,
+            host_client,
+            translator: config.translator,
+            proxy_port: config.proxy_port,
+            metrics_port: config.metrics_port,
+        })
+    }
+
+    /// Main run loop: accepts TLS connections, extracts peer identity, and
+    /// serves HTTP requests with that identity attached as a request
+    /// extension.
+    pub async fn run(
+        self: &Arc<Self>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.proxy_port));
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("Failed to bind proxy listener on {addr}"))?;
+
+        info!(addr = %addr, "Virtual API server (V2) listening (mTLS front-proxy)");
+
+        let builder = ServerBuilder::new(TokioExecutor::new());
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Proxy V2 shutdown signal received");
+                    break;
+                }
+                result = listener.accept() => {
+                    let (tcp_stream, peer_addr) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to accept TCP connection");
+                            PROXY_ERRORS_TOTAL.with_label_values(&["accept"]).inc();
+                            continue;
+                        }
+                    };
+
+                    let tls_acceptor = self.tls_acceptor.clone();
+                    let proxy = Arc::clone(self);
+                    let builder = builder.clone();
+
+                    tokio::spawn(async move {
+                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                                PROXY_ERRORS_TOTAL.with_label_values(&["tls"]).inc();
+                                return;
+                            }
+                        };
+
+                        // Extract peer identity from the rustls connection
+                        // BEFORE handing off to hyper. The connection's
+                        // peer_certificates() returns the chain the client
+                        // presented; we identify the leaf as cert[0]. The
+                        // verifier already validated the chain against
+                        // ca.crt, so we just need to parse Subject DN.
+                        let peer_identity = {
+                            let (_io, conn) = tls_stream.get_ref();
+                            conn.peer_certificates()
+                                .and_then(|certs| certs.first())
+                                .and_then(|leaf| extract_peer_identity_from_der(leaf.as_ref()))
+                        };
+                        let peer_identity = Arc::new(peer_identity);
+
+                        let service = service_fn(move |mut req: Request<Incoming>| {
+                            let proxy = Arc::clone(&proxy);
+                            let peer_identity = Arc::clone(&peer_identity);
+                            async move {
+                                if let Some(id) = peer_identity.as_ref().clone() {
+                                    req.extensions_mut().insert(id);
+                                }
+                                proxy.handle_request(req).await
+                            }
+                        });
+
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        if let Err(e) = builder.serve_connection(io, service).await {
+                            debug!(peer = %peer_addr, error = %e, "Connection error");
+                        }
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Serve plain-HTTP `/healthz`, `/readyz`, `/livez`, `/metrics`.
+    ///
+    /// Identical surface to V1's metrics server so the existing pod probes
+    /// and Prometheus scrape config keep working.
+    pub async fn run_metrics_server(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.metrics_port));
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("Failed to bind metrics listener on {addr}"))?;
+
+        info!(addr = %addr, "Metrics/health server (V2) listening (HTTP)");
+
+        let builder = ServerBuilder::new(TokioExecutor::new());
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Metrics server shutdown signal received");
+                    break;
+                }
+                result = listener.accept() => {
+                    let (tcp_stream, _peer_addr) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to accept metrics connection");
+                            continue;
+                        }
+                    };
+
+                    let builder = builder.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(|req: Request<Incoming>| async move {
+                            let path = req.uri().path().to_string();
+                            let response = match path.as_str() {
+                                "/healthz" | "/readyz" | "/livez" => ok_response("ok"),
+                                "/metrics" => {
+                                    let encoder = TextEncoder::new();
+                                    let metric_families = prometheus::gather();
+                                    let mut buffer = Vec::new();
+                                    let _ = encoder.encode(&metric_families, &mut buffer);
+                                    let body =
+                                        String::from_utf8(buffer).unwrap_or_default();
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(
+                                            "content-type",
+                                            "text/plain; version=0.0.4; charset=utf-8",
+                                        )
+                                        .body(body_from_bytes(Bytes::from(body)))
+                                        .unwrap_or_else(|_| ok_response(""))
+                                }
+                                _ => error_response(StatusCode::NOT_FOUND, "Not Found"),
+                            };
+                            Ok::<_, hyper::Error>(response)
+                        });
+
+                        let io = hyper_util::rt::TokioIo::new(tcp_stream);
+                        if let Err(e) = builder.serve_connection(io, service).await {
+                            debug!(error = %e, "Metrics connection error");
+                        }
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Top-level dispatch: route to subresource handler or local-apiserver
+    /// forward.
+    pub async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<ProxyBody>, hyper::Error> {
+        let start = std::time::Instant::now();
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+
+        let response = if let Some(sub) = parse_subresource(&path) {
+            self.handle_subresource(req, sub).await
+        } else {
+            self.forward_to_apiserver(req).await
+        };
+
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+
+        let status = response.status().as_u16().to_string();
+        let elapsed = start.elapsed().as_secs_f64();
+        let method_str = method.as_str();
+
+        PROXY_REQUESTS_TOTAL
+            .with_label_values(&[method_str, &status])
+            .inc();
+        PROXY_REQUEST_DURATION
+            .with_label_values(&[method_str])
+            .observe(elapsed);
+
+        Ok(response)
+    }
+
+    /// Forward a request to the LOCAL kube-apiserver via mTLS using the
+    /// front-proxy-client identity, and inject `X-Remote-User` /
+    /// `X-Remote-Group` headers carrying the original caller's identity
+    /// (or anonymous if no client cert was presented).
+    ///
+    /// The response body is **streamed** chunk-by-chunk back to the
+    /// client rather than buffered. This is mandatory for `watch`
+    /// requests (long-poll, never close) and for `logs -f` / chunked
+    /// responses, which would otherwise grow unbounded in proxy memory
+    /// and never reach the client. When the client disconnects the
+    /// `StreamBody` is dropped, which drops the upstream reqwest
+    /// response, which closes the upstream connection — so abandoned
+    /// watches don't leak fd's at the apiserver.
     async fn forward_to_apiserver(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<ProxyBody>, hyper::Error> {
         let uri = req.uri().clone();
         let method = req.method().clone();
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        // Forward to local apiserver.
         let target_url = format!("{}{}", self.apiserver_url, path);
 
-        // Build forwarded request using reqwest.
-        // Localhost apiserver uses self-signed certs from our own PKI, so we
-        // accept invalid certs for this local-only connection.
-        let client = match reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!("Client build error: {e}"))))
-                    .unwrap());
-            }
+        let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
+        let identity = req.extensions().get::<PeerIdentity>().cloned();
+
+        // Capture the headers we want to forward before consuming the body.
+        let headers = req.headers().clone();
+        // Enforce a hard cap on body size so a single attacker-controlled
+        // connection cannot OOM the proxy by streaming an unbounded body.
+        // See `MAX_REQUEST_BODY_BYTES`.
+        let body_bytes = match collect_body_with_limit(req.into_body()).await {
+            Ok(b) => b,
+            Err(resp) => return Ok(resp),
         };
 
-        let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
-        let body_bytes = BodyExt::collect(req.into_body())
-            .await
-            .map(|b| b.to_bytes())
-            .unwrap_or_default();
+        let mut req_builder = self
+            .apiserver_client
+            .request(reqwest_method, &target_url);
 
-        let resp = match client
-            .request(reqwest_method, &target_url)
-            .body(body_bytes.to_vec())
-            .send()
-            .await
-        {
+        // Inject the validated peer-cert identity as front-proxy headers.
+        // These are only honored by the apiserver because we connected
+        // with the front-proxy-client cert (CN=front-proxy-client signed
+        // by front-proxy-ca.crt); clients CANNOT set them themselves on
+        // the wire because the proxy strips client-supplied X-Remote-*
+        // headers in the loop below.
+        //
+        // When NO client cert was presented, deliberately do NOT inject
+        // an explicit "system:anonymous" identity. Sending headers would
+        // authenticate the request via requestheader auth, bypassing the
+        // apiserver's own `--anonymous-auth` policy. Instead, leave the
+        // headers off entirely so the apiserver's authentication chain
+        // runs normally (anonymous-auth, if enabled, applies the canonical
+        // system:anonymous + system:unauthenticated identity; if disabled,
+        // the request is rejected with 401 — which is the correct
+        // behavior).
+        if let Some(id) = identity {
+            req_builder = req_builder.header("X-Remote-User", id.username);
+            for group in id.groups {
+                req_builder = req_builder.header("X-Remote-Group", group);
+            }
+        }
+
+        // Forward a narrow allowlist of pass-through headers.
+        //
+        // Explicitly NOT forwarded (privilege escalation vectors):
+        //   - Authorization: would let a client supply a bearer token the
+        //     apiserver might honor in addition to/instead of our headers.
+        //   - X-Remote-User / X-Remote-Group / X-Remote-Extra-*: the
+        //     apiserver would honor these (we presented the front-proxy
+        //     cert) — clients cannot be allowed to forge their own
+        //     identity.
+        //
+        // Forwarded:
+        //   - Content negotiation (content-type, accept, accept-encoding).
+        //   - Diagnostic / cache (user-agent, if-match, if-none-match,
+        //     kubectl-command).
+        //   - K8s impersonation (Impersonate-User/Group/Uid/Extra-*) is
+        //     forwarded: the apiserver authorizes impersonation against
+        //     the X-Remote-User identity via the `impersonate` verb in
+        //     RBAC, so passing these through is safe and required for
+        //     `kubectl --as` to work.
+        for (name, value) in headers.iter() {
+            let n = name.as_str().to_ascii_lowercase();
+            let forward = matches!(
+                n.as_str(),
+                "content-type"
+                    | "accept"
+                    | "accept-encoding"
+                    | "user-agent"
+                    | "if-match"
+                    | "if-none-match"
+                    | "kubectl-command"
+                    | "impersonate-user"
+                    | "impersonate-group"
+                    | "impersonate-uid"
+            ) || n.starts_with("impersonate-extra-");
+            if forward {
+                if let Ok(v) = value.to_str() {
+                    req_builder = req_builder.header(name.as_str(), v);
+                }
+            }
+        }
+
+        if !body_bytes.is_empty() {
+            req_builder = req_builder.body(body_bytes.to_vec());
+        }
+
+        let resp = match req_builder.send().await {
             Ok(r) => r,
             Err(e) => {
+                error!(error = %e, url = %target_url, "Failed to forward to local apiserver");
                 PROXY_ERRORS_TOTAL.with_label_values(&["forward"]).inc();
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!("Proxy error: {e}"))))
-                    .unwrap());
+                return Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Proxy error: {e}"),
+                ));
             }
         };
 
-        let status = resp.status().as_u16();
-        let resp_bytes = resp.bytes().await.unwrap_or_default();
-
-        Ok(Response::builder()
-            .status(status)
-            .body(Full::new(resp_bytes))
-            .unwrap())
+        Ok(stream_upstream_response(resp))
     }
 
+    /// Forward a pod subresource (exec/logs/attach/portforward) to the
+    /// HOST kube-apiserver, translating the pod name from virtual to host
+    /// coordinates.
+    ///
+    /// Like `forward_to_apiserver`, the response body is **streamed**
+    /// rather than buffered — `kubectl logs -f` is the canonical use case
+    /// and would otherwise hang forever waiting for a body that never
+    /// arrives.
     async fn handle_subresource(
         &self,
         req: Request<Incoming>,
         sub: SubresourceRequest,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<ProxyBody>, hyper::Error> {
         let (host_path, _host_ns) = translate_subresource_to_host(&sub, &self.translator);
         let query = req
             .uri()
@@ -1716,31 +946,25 @@ impl VirtualClusterProxyV2 {
             "Intercepting subresource request"
         );
 
-        // TODO: For exec/attach/portforward, SPDY/WebSocket upgrade is needed.
-        // This implementation handles basic HTTP forwarding (e.g. logs).
-        // Streaming upgrade support will be added in a follow-up task.
+        // TODO: exec/attach/portforward additionally need HTTP Upgrade
+        // support (SPDY/3.1 or WebSocket v5.channel.k8s.io) — handled in
+        // a separate follow-up. The current code supports `logs` (and
+        // `logs -f` thanks to streaming below) but exec/attach return a
+        // streamed body that the client will reject as malformed.
 
         let target_url = format!("{}{}{}", self.host_apiserver_url, host_path, query);
 
-        // Use build_host_client() which loads the in-cluster CA for proper
-        // TLS verification against the host API server.
-        let client = match build_host_client() {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!("Client build error: {e}"))))
-                    .unwrap());
-            }
+        let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
+        // Same body cap as forward_to_apiserver. log/exec/attach/portforward
+        // requests typically carry tiny bodies (or none), so the 3 MiB
+        // ceiling is generous.
+        let body_bytes = match collect_body_with_limit(req.into_body()).await {
+            Ok(b) => b,
+            Err(resp) => return Ok(resp),
         };
 
-        let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
-        let body_bytes = BodyExt::collect(req.into_body())
-            .await
-            .map(|b| b.to_bytes())
-            .unwrap_or_default();
-
-        let resp = match client
+        let resp = match self
+            .host_client
             .request(reqwest_method, &target_url)
             .bearer_auth(&self.host_token)
             .body(body_bytes.to_vec())
@@ -1750,22 +974,14 @@ impl VirtualClusterProxyV2 {
             Ok(r) => r,
             Err(e) => {
                 PROXY_ERRORS_TOTAL.with_label_values(&["subresource"]).inc();
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!(
-                        "Subresource proxy error: {e}"
-                    ))))
-                    .unwrap());
+                return Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Subresource proxy error: {e}"),
+                ));
             }
         };
 
-        let status = resp.status().as_u16();
-        let resp_bytes = resp.bytes().await.unwrap_or_default();
-
-        Ok(Response::builder()
-            .status(status)
-            .body(Full::new(resp_bytes))
-            .unwrap())
+        Ok(stream_upstream_response(resp))
     }
 }
 
@@ -1900,5 +1116,367 @@ mod tests_v2 {
             host_path,
             "/api/v1/namespaces/pool-dev/pods/web-server-x-staging-x-vc/log"
         );
+    }
+
+    // -- extract_peer_identity_from_der tests --
+    //
+    // These exercise the front-proxy auth path: a client connects to the
+    // V2 proxy with a TLS client cert; the proxy must extract Subject CN
+    // (username) and Subject O (groups) and forward them as
+    // X-Remote-User / X-Remote-Group impersonation headers.
+
+    /// Build a self-signed DER-encoded cert with the given CN and Organization.
+    /// Used as a stand-in for a client cert presented during mTLS.
+    ///
+    /// Note: rcgen's `DistinguishedName::push` replaces by `DnType`, so we
+    /// only test the single-Organization shape here. That matches what
+    /// `VkobeBackend::generate_client_cert` actually produces (CN=<name>-admin,
+    /// O=system:masters). Multi-group certs would require lower-level DER
+    /// construction; not worth it given the production code path is single-O.
+    fn make_test_client_cert_der(cn: &str, org: Option<&str>) -> Vec<u8> {
+        use rcgen::{CertificateParams, DnType, KeyPair};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        if let Some(o) = org {
+            params.distinguished_name.push(DnType::OrganizationName, o);
+        }
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn test_extract_peer_identity_cn_only() {
+        let der = make_test_client_cert_der("alice@example.com", None);
+        let id = extract_peer_identity_from_der(&der).expect("should parse identity");
+        assert_eq!(id.username, "alice@example.com");
+        assert!(id.groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_peer_identity_kubeconfig_admin_shape() {
+        // Mirrors the kubeconfig client cert produced by VkobeBackend in
+        // src/backend/vkobe.rs: CN=<name>-admin, O=system:masters. This is
+        // the cert that flux/kubectl will present when bootstrapping a
+        // virtual cluster, so the proxy must report it as a cluster-admin
+        // identity to the local apiserver.
+        let der = make_test_client_cert_der("ci-vkobe-flux-01-admin", Some("system:masters"));
+        let id = extract_peer_identity_from_der(&der).expect("should parse identity");
+        assert_eq!(id.username, "ci-vkobe-flux-01-admin");
+        assert_eq!(id.groups, vec!["system:masters".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_peer_identity_invalid_der() {
+        // Garbage bytes -> None, never panics.
+        assert!(extract_peer_identity_from_der(b"not a real cert").is_none());
+        assert!(extract_peer_identity_from_der(&[]).is_none());
+    }
+
+    // -- header_value_is_safe — header injection sanitization --
+
+    #[test]
+    fn test_header_value_is_safe_accepts_normal_identities() {
+        assert!(header_value_is_safe("alice"));
+        assert!(header_value_is_safe("system:masters"));
+        assert!(header_value_is_safe("ci-vkobe-flux-01-admin"));
+        assert!(header_value_is_safe("user@example.com"));
+    }
+
+    #[test]
+    fn test_header_value_is_safe_rejects_empty() {
+        assert!(!header_value_is_safe(""));
+    }
+
+    #[test]
+    fn test_header_value_is_safe_rejects_crlf() {
+        // The classic header-injection payload: a CRLF closes the
+        // X-Remote-User header and opens a new one (e.g. an extra
+        // X-Remote-Group: system:masters).
+        assert!(!header_value_is_safe("alice\r\nX-Remote-Group: system:masters"));
+        assert!(!header_value_is_safe("alice\rsystem:masters"));
+        assert!(!header_value_is_safe("alice\nsystem:masters"));
+    }
+
+    #[test]
+    fn test_header_value_is_safe_rejects_other_control_chars() {
+        assert!(!header_value_is_safe("alice\0"));
+        assert!(!header_value_is_safe("alice\t"));
+        assert!(!header_value_is_safe("alice\x1b"));
+    }
+
+    #[test]
+    fn test_header_value_is_safe_rejects_non_ascii() {
+        // Conservative: reject anything outside ASCII to keep parity with
+        // typical apiserver header expectations.
+        assert!(!header_value_is_safe("álice"));
+        assert!(!header_value_is_safe("👤"));
+    }
+
+    // -- collect_body_bounded — body-size DoS guard --
+
+    #[tokio::test]
+    async fn test_collect_body_bounded_accepts_under_limit() {
+        let body = Full::new(Bytes::from(vec![b'x'; 100]));
+        let result = collect_body_bounded(body, 1024).await;
+        let bytes = result.expect("should accept body under the limit");
+        assert_eq!(bytes.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_collect_body_bounded_accepts_at_exact_limit() {
+        let body = Full::new(Bytes::from(vec![b'x'; 1024]));
+        let result = collect_body_bounded(body, 1024).await;
+        assert!(
+            result.is_ok(),
+            "body equal to the cap should be accepted, not rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_body_bounded_rejects_over_limit_with_413() {
+        // Single attacker-controlled connection trying to OOM the proxy
+        // with a 1 KiB body when the cap is 100 bytes.
+        let body = Full::new(Bytes::from(vec![b'x'; 1024]));
+        let result = collect_body_bounded(body, 100).await;
+        let resp = result.expect_err("should be rejected as too large");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Body should be a K8s-style Status response so kubectl/clients
+        // see a structured error, not a bare HTTP message.
+        let body_bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["kind"], "Status");
+        assert_eq!(v["status"], "Failure");
+        assert_eq!(v["code"], 413);
+    }
+
+    #[tokio::test]
+    async fn test_collect_body_bounded_zero_limit_rejects_any_body() {
+        // Edge case: a 0-byte cap rejects any non-empty body. (Empty
+        // body: no Frame is yielded, so `Limited` never errors and we
+        // return an empty Bytes. The hyper Body trait permits a body
+        // that produces no frames for size_hint.)
+        let body = Full::new(Bytes::from_static(b"x"));
+        let result = collect_body_bounded(body, 0).await;
+        let resp = result.expect_err("non-empty body should fail with cap=0");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn test_max_request_body_bytes_matches_apiserver_default() {
+        // Belt-and-suspenders: lock in the canonical kube-apiserver
+        // request-body limit (3 MiB). Bumping this should be a deliberate
+        // policy decision, not a silent change.
+        assert_eq!(MAX_REQUEST_BODY_BYTES, 3 * 1024 * 1024);
+    }
+
+    // -- streaming response bodies --
+    //
+    // These tests assert the proxy DOES stream rather than buffer. The
+    // distinction matters because watch/logs -f bodies never close: a
+    // buffering proxy hangs forever; a streaming proxy delivers chunks
+    // as they arrive at the apiserver.
+
+    /// Drive a `ProxyBody` to completion and return all data frames as a
+    /// `Vec<Bytes>` so tests can assert per-frame delivery (i.e. the
+    /// body wasn't silently coalesced into one big chunk).
+    async fn collect_frames(body: ProxyBody) -> Vec<Bytes> {
+        let mut frames: Vec<Bytes> = Vec::new();
+        let mut body = body;
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        frames.push(data);
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn test_body_from_bytes_is_a_proxybody() {
+        // Buffered synthesized responses (errors, /healthz) round-trip
+        // through ProxyBody as a single frame, no streaming overhead.
+        let body = body_from_bytes(Bytes::from_static(b"hello"));
+        let frames = collect_frames(body).await;
+        let total: Vec<u8> = frames.iter().flat_map(|f| f.iter().copied()).collect();
+        assert_eq!(total, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_streamed_body_delivers_multiple_frames() {
+        use futures::stream;
+        // Synthesize a multi-chunk stream — exactly the shape of a
+        // chunked HTTP watch response (one frame per event).
+        let chunks: Vec<Result<Bytes, ProxyError>> = vec![
+            Ok(Bytes::from_static(b"{\"type\":\"ADDED\"}\n")),
+            Ok(Bytes::from_static(b"{\"type\":\"MODIFIED\"}\n")),
+            Ok(Bytes::from_static(b"{\"type\":\"DELETED\"}\n")),
+        ];
+        let stream = stream::iter(chunks).map_ok(Frame::data);
+        let body: ProxyBody = StreamBody::new(stream).boxed();
+
+        let frames = collect_frames(body).await;
+        assert_eq!(frames.len(), 3, "expected 3 separate frames, got {frames:?}");
+        assert_eq!(frames[0], Bytes::from_static(b"{\"type\":\"ADDED\"}\n"));
+        assert_eq!(frames[1], Bytes::from_static(b"{\"type\":\"MODIFIED\"}\n"));
+        assert_eq!(frames[2], Bytes::from_static(b"{\"type\":\"DELETED\"}\n"));
+    }
+
+    /// Spin up a minimal HTTP/1.1 server that writes a chunked response
+    /// with timed chunks, returning its bound `SocketAddr`. The server
+    /// accepts exactly one connection and then exits.
+    ///
+    /// Used to drive `stream_upstream_response` end-to-end with a real
+    /// `reqwest::Response`, asserting the response actually streams from
+    /// the wire rather than buffering. A pure-stream-mock test (above)
+    /// can prove `StreamBody` does the right thing in isolation but
+    /// cannot prove the reqwest → StreamBody seam.
+    async fn spawn_chunked_server(
+        status_line: &'static str,
+        headers: &'static [&'static str],
+        chunks: Vec<&'static [u8]>,
+    ) -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain request bytes (we don't care what kind of request).
+            // Wait briefly for the request line + headers; that's enough
+            // for reqwest to send the request.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                tokio::io::AsyncReadExt::read(&mut sock, &mut buf),
+            )
+            .await;
+
+            sock.write_all(format!("{status_line}\r\n").as_bytes())
+                .await
+                .unwrap();
+            for h in headers {
+                sock.write_all(format!("{h}\r\n").as_bytes()).await.unwrap();
+            }
+            sock.write_all(b"Transfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            for chunk in chunks {
+                sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                sock.write_all(chunk).await.unwrap();
+                sock.write_all(b"\r\n").await.unwrap();
+                // Flush so reqwest sees each chunk as it arrives —
+                // critical to test that streaming works (vs. the kernel
+                // coalescing all writes into one segment).
+                sock.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            sock.write_all(b"0\r\n\r\n").await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_stream_upstream_response_proxies_chunked_body() {
+        // End-to-end: a real chunked HTTP server (the apiserver
+        // analogue) → reqwest → stream_upstream_response → ProxyBody →
+        // collect_frames. Asserts:
+        //   - Status code is preserved.
+        //   - content-type header is preserved.
+        //   - All bytes from all chunks flow through.
+        //   - Connection-management headers (Transfer-Encoding) are
+        //     NOT forwarded (hyper owns the outgoing framing).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let addr = spawn_chunked_server(
+            "HTTP/1.1 200 OK",
+            &["Content-Type: application/json"],
+            vec![
+                b"{\"type\":\"ADDED\"}\n",
+                b"{\"type\":\"MODIFIED\"}\n",
+                b"{\"type\":\"DELETED\"}\n",
+            ],
+        )
+        .await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("upstream request");
+
+        let response = stream_upstream_response(resp);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(
+            response.headers().get("transfer-encoding").is_none(),
+            "Transfer-Encoding from upstream must NOT be propagated; \
+             hyper owns outgoing connection framing"
+        );
+
+        let frames = collect_frames(response.into_body()).await;
+        let total: Vec<u8> = frames.iter().flat_map(|f| f.iter().copied()).collect();
+        assert_eq!(
+            total,
+            b"{\"type\":\"ADDED\"}\n{\"type\":\"MODIFIED\"}\n{\"type\":\"DELETED\"}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_upstream_response_preserves_status_code() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let addr = spawn_chunked_server(
+            "HTTP/1.1 404 Not Found",
+            &["Content-Type: application/json"],
+            vec![b"{\"kind\":\"Status\",\"code\":404}"],
+        )
+        .await;
+
+        let client = reqwest::Client::new();
+        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+        let response = stream_upstream_response(resp);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_streamed_body_propagates_errors() {
+        use futures::stream;
+        // Simulate the apiserver dropping mid-stream (e.g. its TCP
+        // connection died). The proxy must surface the error rather
+        // than silently truncate, so hyper closes the client connection
+        // with a chunked-encoding error rather than a clean EOF that
+        // looks like end-of-watch.
+        let err: ProxyError = "upstream connection reset".into();
+        let chunks: Vec<Result<Bytes, ProxyError>> = vec![
+            Ok(Bytes::from_static(b"{\"type\":\"ADDED\"}\n")),
+            Err(err),
+        ];
+        let stream = stream::iter(chunks).map_ok(Frame::data);
+        let body: ProxyBody = StreamBody::new(stream).boxed();
+
+        let mut body = body;
+        let first = body.frame().await.expect("first frame").expect("first ok");
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"{\"type\":\"ADDED\"}\n"));
+        let second = body.frame().await.expect("second frame");
+        assert!(second.is_err(), "second frame must propagate the upstream error");
     }
 }

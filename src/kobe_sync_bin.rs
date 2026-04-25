@@ -17,18 +17,16 @@
 mod kobe_sync;
 mod pki;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use kobe_sync::certs::CertificateManager;
 use kobe_sync::config::KobeSyncRuntimeConfig;
-use kobe_sync::proxy::{ProxyConfig, VirtualClusterProxy};
+use kobe_sync::proxy::{ProxyConfigV2, VirtualClusterProxyV2};
 use kobe_sync::syncer::translator::NameTranslator;
 use kobe_sync::syncer::{self, SyncerContextV2};
 
@@ -131,34 +129,61 @@ async fn main() -> Result<()> {
     let always_on_handles = syncer::start_syncers_v2(ctx.clone(), &always_on, shutdown.clone());
     info!(count = always_on_handles.len(), "Always-on syncers started");
 
-    // 10. Start TLS proxy
-    //     For now we use the v1 VirtualClusterProxy infrastructure which does
-    //     full request rewriting. VirtualClusterProxyV2 (thin TLS gateway) has
-    //     placeholder handlers and will be wired in a future task.
-    let virtual_namespaces = Arc::new(RwLock::new(
-        config
-            .default_namespaces
-            .iter()
-            .cloned()
-            .collect::<HashSet<String>>(),
-    ));
-
+    // 10. Start TLS proxy (V2: front-proxy gateway)
+    //     V2 terminates client TLS, validates client certs against the
+    //     cluster CA, and forwards requests to the LOCAL kube-apiserver
+    //     sidecar via mTLS using the front-proxy-client cert. The original
+    //     caller's identity is carried in X-Remote-User / X-Remote-Group
+    //     headers — the same K8s front-proxy auth pattern that
+    //     kube-aggregator uses for extension API servers.
+    //
+    //     Pod subresources (exec/logs/attach/portforward) are intercepted
+    //     and proxied to the host apiserver instead, since the actual
+    //     workload pods live there under translated names.
     let (host_api_url, host_token) =
         load_host_config().context("Failed to load host API server configuration")?;
 
     info!(host_api_url = %host_api_url, "Host API server configured");
 
-    let proxy_config = ProxyConfig {
+    let front_proxy_client_cert = cert_manager
+        .front_proxy_client_cert_pem()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Front-proxy client certificate not found in {}-certs Secret. \
+                 The vkobe pool operator must pre-create the Secret with the full \
+                 PKI tree before kobe-sync starts.",
+                config.cluster_name
+            )
+        })?
+        .to_string();
+    let front_proxy_client_key = cert_manager
+        .front_proxy_client_key_pem()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Front-proxy client key not found in {}-certs Secret. \
+                 The vkobe pool operator must pre-create the Secret with the full \
+                 PKI tree before kobe-sync starts.",
+                config.cluster_name
+            )
+        })?
+        .to_string();
+
+    let proxy_config = ProxyConfigV2 {
         tls_config,
-        host_api_url,
+        apiserver_url: config.virtual_api_url.clone(),
+        apiserver_ca_pem: cert_manager.ca_cert_pem().to_string(),
+        front_proxy_client_cert_pem: front_proxy_client_cert,
+        front_proxy_client_key_pem: front_proxy_client_key,
+        host_apiserver_url: host_api_url,
         host_token,
         translator: translator.clone(),
-        virtual_namespaces,
         proxy_port: config.proxy_port,
         metrics_port: config.metrics_port,
     };
 
-    let proxy = Arc::new(VirtualClusterProxy::new(proxy_config).context("Failed to create proxy")?);
+    let proxy = Arc::new(
+        VirtualClusterProxyV2::new(proxy_config).context("Failed to create V2 proxy")?,
+    );
 
     let proxy_handle = tokio::spawn({
         let proxy = proxy.clone();

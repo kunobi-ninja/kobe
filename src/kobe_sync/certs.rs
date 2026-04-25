@@ -16,11 +16,24 @@ pub use crate::pki::VirtualClusterPki;
 /// Handles generation of a self-signed CA, issuance of serving certificates
 /// signed by that CA, and construction of rustls server configurations for
 /// mutual TLS.
+///
+/// When the cluster's full PKI Secret was pre-created by the pool operator
+/// (vkobe backend), this manager also exposes the front-proxy client
+/// material — used by the proxy to authenticate to the local kube-apiserver
+/// while forwarding the original caller's identity via X-Remote-* headers.
 pub struct CertificateManager {
     ca_cert_pem: String,
     ca_key_pem: String,
     serving_cert_pem: String,
     serving_key_pem: String,
+    /// Front-proxy client cert (PEM), signed by `front-proxy-ca.crt`.
+    ///
+    /// Present when the cluster Secret was created by the operator with the
+    /// full PKI tree (i.e. running under the vkobe backend). `None` for
+    /// standalone-dev kobe-sync where only ca.crt/ca.key are generated.
+    front_proxy_client_cert_pem: Option<String>,
+    /// Front-proxy client key (PEM).
+    front_proxy_client_key_pem: Option<String>,
 }
 
 impl CertificateManager {
@@ -36,7 +49,18 @@ impl CertificateManager {
             ca_key_pem,
             serving_cert_pem,
             serving_key_pem,
+            front_proxy_client_cert_pem: None,
+            front_proxy_client_key_pem: None,
         }
+    }
+
+    /// Attach front-proxy-client material (cert + key) to this manager.
+    ///
+    /// Used when the underlying cluster Secret contains the full PKI tree.
+    pub fn with_front_proxy_client(mut self, cert_pem: String, key_pem: String) -> Self {
+        self.front_proxy_client_cert_pem = Some(cert_pem);
+        self.front_proxy_client_key_pem = Some(key_pem);
+        self
     }
 
     /// Generate a new self-signed CA certificate and private key.
@@ -164,6 +188,16 @@ impl CertificateManager {
         &self.serving_key_pem
     }
 
+    /// PEM-encoded front-proxy client certificate, if present.
+    pub fn front_proxy_client_cert_pem(&self) -> Option<&str> {
+        self.front_proxy_client_cert_pem.as_deref()
+    }
+
+    /// PEM-encoded front-proxy client private key, if present.
+    pub fn front_proxy_client_key_pem(&self) -> Option<&str> {
+        self.front_proxy_client_key_pem.as_deref()
+    }
+
     /// Store the CA certificate and key in a Kubernetes Secret.
     ///
     /// Creates or updates a Secret named `{name}-certs` in the given namespace
@@ -256,6 +290,11 @@ impl CertificateManager {
         let secret_name = format!("{name}-certs");
         let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
 
+        // Tracks the front-proxy material when the operator pre-populated
+        // the Secret with the full vkobe PKI tree.
+        let mut front_proxy_client_cert_pem: Option<String> = None;
+        let mut front_proxy_client_key_pem: Option<String> = None;
+
         let (ca_cert_pem, ca_key_pem) = match api.get(&secret_name).await {
             Ok(secret) => {
                 info!(secret = %secret_name, "Loaded existing CA from Secret");
@@ -274,6 +313,22 @@ impl CertificateManager {
                     .context("CA cert is not valid UTF-8")?;
                 let ca_key = String::from_utf8(ca_key_bytes.0.clone())
                     .context("CA key is not valid UTF-8")?;
+
+                // Optional: full vkobe PKI Secret also carries the
+                // front-proxy-client material. Both keys must be present
+                // together; tolerate absence (standalone dev mode).
+                if let (Some(fp_cert), Some(fp_key)) = (
+                    data.get("front-proxy-client.crt"),
+                    data.get("front-proxy-client.key"),
+                ) {
+                    let cert_pem = String::from_utf8(fp_cert.0.clone())
+                        .context("front-proxy-client.crt is not valid UTF-8")?;
+                    let key_pem = String::from_utf8(fp_key.0.clone())
+                        .context("front-proxy-client.key is not valid UTF-8")?;
+                    info!(secret = %secret_name, "Loaded front-proxy client material from Secret");
+                    front_proxy_client_cert_pem = Some(cert_pem);
+                    front_proxy_client_key_pem = Some(key_pem);
+                }
 
                 (ca_cert, ca_key)
             }
@@ -297,6 +352,8 @@ impl CertificateManager {
             ca_key_pem,
             serving_cert_pem,
             serving_key_pem,
+            front_proxy_client_cert_pem,
+            front_proxy_client_key_pem,
         })
     }
 

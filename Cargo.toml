@@ -78,6 +78,12 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+# Used by the proxy to extract identity (Subject CN/O) from the peer's
+# client certificate, so it can be forwarded to the local apiserver as
+# X-Remote-User / X-Remote-Group impersonation headers (front-proxy
+# pattern). Also used in tests to assert SANs on generated apiserver
+# serving certs.
+x509-parser = "0.16"
 
 # Base64 encoding (used for kubeconfig generation)
 base64 = "0.22"
@@ -107,4 +113,3 @@ http = "1"
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
-x509-parser = "0.16"

@@ -1034,6 +1034,16 @@ pub fn build_deployment(
         args: Some(vec![
             format!("--etcd-servers={etcd_endpoints}"),
             format!("--etcd-prefix=/kobe/{name}/"),
+            // Bind only to the pod loopback. The apiserver is a sidecar
+            // consumed exclusively by KCM and kobe-sync inside the same
+            // pod (both connect via https://localhost:6443). Binding to
+            // 0.0.0.0 (the default) would expose it on the pod IP,
+            // letting any pod in the cluster network reach it directly
+            // — and anyone with the front-proxy-client cert (or the
+            // {name}-certs Secret) could then impersonate arbitrary
+            // identities via X-Remote-User headers, completely
+            // bypassing the kobe-sync front-proxy gateway.
+            "--bind-address=127.0.0.1".to_string(),
             "--service-cluster-ip-range=10.96.0.0/12".to_string(),
             "--service-account-key-file=/pki/sa.pub".to_string(),
             "--service-account-signing-key-file=/pki/sa.key".to_string(),
@@ -1041,7 +1051,19 @@ pub fn build_deployment(
             "--tls-cert-file=/pki/apiserver.crt".to_string(),
             "--tls-private-key-file=/pki/apiserver.key".to_string(),
             "--client-ca-file=/pki/ca.crt".to_string(),
+            // Front-proxy authentication: the kobe-sync sidecar terminates
+            // client TLS, validates the caller's cert against ca.crt, then
+            // re-establishes a separate mTLS connection to this apiserver
+            // using a client cert signed by front-proxy-ca. The apiserver
+            // trusts callers identified via X-Remote-User/X-Remote-Group
+            // headers ONLY when those connections present the front-proxy
+            // client cert (CN=front-proxy-client). This is the same pattern
+            // the kube-aggregator uses for extension API servers.
             "--requestheader-client-ca-file=/pki/front-proxy-ca.crt".to_string(),
+            "--requestheader-allowed-names=front-proxy-client".to_string(),
+            "--requestheader-username-headers=X-Remote-User".to_string(),
+            "--requestheader-group-headers=X-Remote-Group".to_string(),
+            "--requestheader-extra-headers-prefix=X-Remote-Extra-".to_string(),
             "--enable-admission-plugins=NodeRestriction".to_string(),
             "--authorization-mode=Node,RBAC".to_string(),
         ]),
@@ -1057,17 +1079,12 @@ pub fn build_deployment(
             read_only: Some(true),
             ..Default::default()
         }]),
-        readiness_probe: Some(Probe {
-            http_get: Some(HTTPGetAction {
-                path: Some("/healthz".to_string()),
-                port: IntOrString::Int(6443),
-                scheme: Some("HTTPS".to_string()),
-                ..Default::default()
-            }),
-            initial_delay_seconds: Some(10),
-            period_seconds: Some(10),
-            ..Default::default()
-        }),
+        // No readiness probe on the apiserver: with --bind-address=127.0.0.1
+        // the kubelet (host netns) cannot reach :6443 on the pod IP. The
+        // pod's readiness signal lives on the kobe-sync container instead
+        // (see below), which only serves traffic after `wait_for_apiserver`
+        // confirms the local apiserver is up — so kobe-sync ready ⇒
+        // apiserver ready.
         ..Default::default()
     };
 
@@ -1147,6 +1164,23 @@ pub fn build_deployment(
             read_only: Some(true),
             ..Default::default()
         }]),
+        // The pod's readiness signal: kobe-sync only starts serving its
+        // metrics/health endpoint after `wait_for_apiserver` succeeds, so
+        // kubelet seeing /readyz=200 implies the local apiserver is up
+        // and the proxy is accepting traffic. The metrics server listens
+        // on plain HTTP on `metrics_port` and is reachable from the
+        // kubelet via the pod IP (apiserver itself is loopback-bound).
+        readiness_probe: Some(Probe {
+            http_get: Some(HTTPGetAction {
+                path: Some("/readyz".to_string()),
+                port: IntOrString::Int(metrics_port.into()),
+                scheme: Some("HTTP".to_string()),
+                ..Default::default()
+            }),
+            initial_delay_seconds: Some(2),
+            period_seconds: Some(5),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
@@ -1360,6 +1394,135 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("--etcd-prefix=/kobe/cluster-1/"))
         );
+    }
+
+    #[test]
+    fn test_apiserver_binds_to_loopback_only() {
+        // Regression: the apiserver MUST bind to 127.0.0.1 so other pods
+        // in the cluster network can't reach it directly and forge
+        // X-Remote-* headers using the front-proxy-client cert. See the
+        // long comment in build_deployment for the threat model.
+        let config = test_kobe_sync_config();
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
+        let containers = &dep
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers;
+        let apiserver = containers
+            .iter()
+            .find(|c| c.name == "kube-apiserver")
+            .unwrap();
+        let args: Vec<&str> = apiserver
+            .args
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert!(
+            args.contains(&"--bind-address=127.0.0.1"),
+            "apiserver must bind to 127.0.0.1 to prevent pod-network bypass; \
+             args were: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_apiserver_has_requestheader_auth_flags() {
+        // The K8s front-proxy auth pattern requires this exact set of
+        // flags so the apiserver only honors X-Remote-* headers from
+        // connections that present the front-proxy-client cert.
+        let config = test_kobe_sync_config();
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
+        let apiserver = dep
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers
+            .iter()
+            .find(|c| c.name == "kube-apiserver")
+            .unwrap()
+            .clone();
+        let args: Vec<String> = apiserver.args.unwrap();
+        for required in [
+            "--requestheader-client-ca-file=/pki/front-proxy-ca.crt",
+            "--requestheader-allowed-names=front-proxy-client",
+            "--requestheader-username-headers=X-Remote-User",
+            "--requestheader-group-headers=X-Remote-Group",
+            "--requestheader-extra-headers-prefix=X-Remote-Extra-",
+        ] {
+            assert!(
+                args.iter().any(|a| a == required),
+                "apiserver missing required front-proxy flag: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_readiness_probe_lives_on_kobe_sync() {
+        // With the apiserver bound to loopback, the kubelet can't reach
+        // it directly. The pod's readiness signal lives on the kobe-sync
+        // container's metrics port instead — kobe-sync only starts
+        // serving after `wait_for_apiserver` confirms the local apiserver
+        // is up, so kobe-sync ready ⇒ apiserver ready.
+        let config = test_kobe_sync_config();
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
+        let containers = &dep
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers;
+
+        let apiserver = containers
+            .iter()
+            .find(|c| c.name == "kube-apiserver")
+            .unwrap();
+        assert!(
+            apiserver.readiness_probe.is_none(),
+            "apiserver should not have a readiness probe: kubelet cannot reach 127.0.0.1:6443 from the host netns"
+        );
+
+        let kobe_sync = containers.iter().find(|c| c.name == "vkobe").unwrap();
+        let probe = kobe_sync
+            .readiness_probe
+            .as_ref()
+            .expect("kobe-sync container must carry the pod's readiness probe");
+        let http = probe
+            .http_get
+            .as_ref()
+            .expect("readiness probe should be HTTPGet on the metrics port");
+        assert_eq!(http.path.as_deref(), Some("/readyz"));
+        assert_eq!(http.scheme.as_deref(), Some("HTTP"));
     }
 
     #[test]
