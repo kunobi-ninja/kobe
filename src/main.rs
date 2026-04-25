@@ -325,17 +325,12 @@ async fn shutdown_signal(
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    let leader_lost = async {
-        loop {
-            if leader_guard.changed().await.is_err() {
-                warn!("Leader election watch channel closed unexpectedly");
-                break;
-            }
-            if !leader_guard.is_leader() {
-                break;
-            }
-        }
-    };
+    // `lost()` resolves once the renewal task has signalled stepdown —
+    // either because the lease expired, another replica took it, or our
+    // own renewal task was aborted. No need for a manual poll loop or an
+    // is_leader() check; this is the kunobi-ha API designed to drop
+    // straight into a tokio::select!.
+    let leader_lost = leader_guard.lost();
 
     tokio::select! {
         _ = ctrl_c => info!("Received Ctrl+C, shutting down"),
