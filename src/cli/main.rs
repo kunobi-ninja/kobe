@@ -99,7 +99,11 @@ enum ConfigAction {
         /// Target name
         name: String,
     },
-    /// Create or replace a named target
+    /// Create or replace a named target. By default writes to the
+    /// local `./.kobe.toml` so the definition follows the project;
+    /// pass `--global` to write to `~/.config/kobe/config.json`
+    /// instead (use this for endpoints you want available from any
+    /// directory).
     Set {
         /// Target name
         name: String,
@@ -115,11 +119,22 @@ enum ConfigAction {
         /// SSH key fingerprint for auth=ssh
         #[arg(long = "ssh-fingerprint")]
         ssh_fingerprint: Option<String>,
+        /// Write to the global config file (`~/.config/kobe/config.json`)
+        /// instead of the local `./.kobe.toml`. Use for endpoints you
+        /// reuse across many projects.
+        #[arg(long)]
+        global: bool,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Reap session files whose parent shell has exited. Cheap (one
+    // readdir + a process-existence check per file) and idempotent;
+    // running it on every invocation keeps the cache directory tidy
+    // without needing a daemon or cron job.
+    commands::session::gc_dead_sessions();
+
     let cli = Cli::parse();
     let target = cli.target.as_deref();
     let endpoint = cli.endpoint.as_deref();
@@ -180,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
                 auth,
                 token,
                 ssh_fingerprint,
+                global,
             }) => {
                 commands::config_set_target(
                     &name,
@@ -187,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
                     auth.as_deref(),
                     token.as_deref(),
                     ssh_fingerprint.as_deref(),
+                    global,
                     output,
                 )
                 .await

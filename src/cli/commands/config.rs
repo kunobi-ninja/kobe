@@ -4,7 +4,34 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 
+use super::session;
 use super::{OutputFormat, print_json};
+
+/// Where a target definition lives. Computed during `CliConfig::load`
+/// based on which file each target appears in. Not serialized — pure
+/// runtime metadata for `kobe config list` / `current` UX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// Defined only in the global config (`~/.config/kobe/config.json`).
+    Global,
+    /// Defined only in the local project config (`./.kobe.toml`).
+    Local,
+    /// Defined in BOTH global and local. The local definition wins
+    /// when resolving (overlay order). `kobe config list` flags these
+    /// so users see the conflict instead of being silently surprised.
+    Both,
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scope::Global => write!(f, "global"),
+            Scope::Local => write!(f, "local"),
+            Scope::Both => write!(f, "both"),
+        }
+    }
+}
 
 /// Authentication mode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -115,12 +142,10 @@ struct ConfigListEntry<'a> {
     current: bool,
     endpoint: &'a str,
     auth: &'a AuthMode,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CurrentTargetOutput<'a> {
-    name: &'a str,
+    /// Where this target is defined (global / local / both). Pre-1.0
+    /// shape — clients that parse this JSON should expect the field to
+    /// be present from v0.12 onward.
+    scope: Scope,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,7 +157,11 @@ struct TargetMutationOutput<'a> {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CliConfig {
-    /// Current named target.
+    /// Current named target. **Legacy** — historically lived alongside
+    /// the targets map; today the per-shell session file is the source
+    /// of truth (see `session.rs`). We still parse this field for
+    /// backward compat with old configs and the `kobe config import`
+    /// payload, but writes go to the session file instead.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -147,6 +176,12 @@ pub struct CliConfig {
         alias = "contexts"
     )]
     pub targets: BTreeMap<String, KobeTarget>,
+
+    /// Per-target scope (Global/Local/Both). Populated during
+    /// `load()` and used by `config list` / `config current`. Not
+    /// serialized — pure runtime metadata.
+    #[serde(skip)]
+    pub target_scopes: BTreeMap<String, Scope>,
 
     /// Kobe API endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +207,12 @@ fn is_default_auth(auth: &AuthMode) -> bool {
 impl CliConfig {
     pub fn load() -> Result<Self> {
         let mut config = Self::load_global()?;
+        // Tag every target seen in the global file as Global. The
+        // overlay step below promotes any name that ALSO appears in
+        // local to `Both`.
+        for name in config.targets.keys() {
+            config.target_scopes.insert(name.clone(), Scope::Global);
+        }
         if let Some(local) = Self::load_local()? {
             config.overlay(local);
         }
@@ -193,7 +234,7 @@ impl CliConfig {
         Ok(())
     }
 
-    fn load_global() -> Result<Self> {
+    pub(crate) fn load_global() -> Result<Self> {
         let path = global_config_path()?;
         if !path.exists() {
             return Ok(Self::default());
@@ -225,6 +266,13 @@ impl CliConfig {
         }
 
         for (name, target) in local.targets {
+            // Scope bookkeeping: anything that was already Global
+            // becomes Both; anything new is Local.
+            let scope = match self.target_scopes.get(&name) {
+                Some(Scope::Global) => Scope::Both,
+                _ => Scope::Local,
+            };
+            self.target_scopes.insert(name.clone(), scope);
             self.targets.insert(name, target);
         }
 
@@ -276,19 +324,43 @@ impl CliConfig {
         true
     }
 
+    /// Resolve the active target for the current invocation.
+    ///
+    /// Priority order:
+    ///
+    /// 1. `--target <name>` flag (one-shot, no persistence).
+    /// 2. **Per-shell session file** at `<cache>/sessions/<ppid>.json`
+    ///    (set by `kobe config use <name>`). Different terminal
+    ///    windows resolve independently because their parent shells
+    ///    have distinct PIDs. See `session.rs`.
+    /// 3. Legacy `current_target` field in the config file (kept for
+    ///    backward compat with configs from before per-shell sessions
+    ///    existed and with `kobe config import` payloads).
+    /// 4. Legacy flat `endpoint` (pre-targets configs).
+    ///
+    /// `endpoint_override` lets `kobe -e https://...` flag short-circuit
+    /// the endpoint without touching auth (auth still comes from the
+    /// resolved target).
     pub fn resolve(
         &self,
         target_override: Option<&str>,
         endpoint_override: Option<&str>,
     ) -> Result<ResolvedConfig> {
+        let session_target = session::load()
+            .ok()
+            .and_then(|opt| opt.map(|(state, _, _)| state.current_target));
+
         if let Some(endpoint) = endpoint_override {
-            let target_name = target_override.or(self.current_target.as_deref());
+            let target_name = target_override
+                .map(|s| s.to_string())
+                .or_else(|| session_target.clone())
+                .or_else(|| self.current_target.clone());
             if let Some(name) = target_name {
-                let target = self.targets.get(name).ok_or_else(|| {
+                let target = self.targets.get(&name).ok_or_else(|| {
                     anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list")
                 })?;
                 return Ok(ResolvedConfig {
-                    target: Some(name.to_string()),
+                    target: Some(name),
                     endpoint: endpoint.to_string(),
                     auth: target.auth.clone(),
                     token: target.token.clone(),
@@ -305,16 +377,19 @@ impl CliConfig {
             });
         }
 
-        let target_name = target_override.or(self.current_target.as_deref());
+        let target_name = target_override
+            .map(|s| s.to_string())
+            .or(session_target)
+            .or_else(|| self.current_target.clone());
 
         if let Some(name) = target_name {
             let target = self
                 .targets
-                .get(name)
+                .get(&name)
                 .ok_or_else(|| anyhow::anyhow!("Unknown target '{name}'. Run: kobe config list"))?;
 
             return Ok(ResolvedConfig {
-                target: Some(name.to_string()),
+                target: Some(name),
                 endpoint: endpoint_override.unwrap_or(&target.endpoint).to_string(),
                 auth: target.auth.clone(),
                 token: target.token.clone(),
@@ -334,7 +409,10 @@ impl CliConfig {
 
         if !self.targets.is_empty() {
             anyhow::bail!(
-                "No current target configured. Run: kobe config list, kobe config use <name>, or pass --target <name>"
+                "No current target configured for this shell. \
+                 Run: kobe config use <name> (active for this terminal only) \
+                 or pass --target <name>. \
+                 Available targets: kobe config list."
             );
         }
 
@@ -419,15 +497,26 @@ pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<(
     Ok(())
 }
 
+/// Define or update a target.
+///
+/// By default writes to **local** `./.kobe.toml` so the definition
+/// follows the project (and can be committed to the repo if the
+/// endpoint is non-secret). Pass `global = true` to write to the
+/// global library at `~/.config/kobe/config.json` instead — useful for
+/// endpoints you reuse across many projects.
+///
+/// Does NOT touch the active-target session file. Defining a target
+/// and switching to it are separate operations; run `kobe config use
+/// <name>` afterwards to make it active for this shell.
 pub async fn config_set_target(
     name: &str,
     endpoint: &str,
     auth: Option<&str>,
     token: Option<&str>,
     ssh_fingerprint: Option<&str>,
+    global: bool,
     output: OutputFormat,
 ) -> Result<()> {
-    let mut config = CliConfig::load()?;
     let auth = match auth {
         Some(auth) => parse_auth_mode(auth)?,
         None if token.is_some() => AuthMode::Token,
@@ -439,22 +528,82 @@ pub async fn config_set_target(
         anyhow::bail!("Token targets require --token <value>");
     }
 
-    config.targets.insert(
-        name.to_string(),
-        KobeTarget {
-            endpoint: endpoint.to_string(),
-            auth,
-            token: token.map(str::to_string),
-            ssh_fingerprint: ssh_fingerprint.map(str::to_string),
-        },
-    );
-    config.current_target = Some(name.to_string());
-    config.save()?;
+    let target = KobeTarget {
+        endpoint: endpoint.to_string(),
+        auth,
+        token: token.map(str::to_string),
+        ssh_fingerprint: ssh_fingerprint.map(str::to_string),
+    };
+
+    let written_path = if global {
+        let mut config = CliConfig::load_global()?;
+        config.targets.insert(name.to_string(), target);
+        config.save()?;
+        global_config_path()?
+    } else {
+        write_target_to_local(name, target)?
+    };
 
     match output {
         OutputFormat::Text => {
             println!("Set target {name}");
-            println!("Current target: {name}");
+            println!("Wrote: {}", written_path.display());
+            println!("(use this target now: kobe config use {name})");
+        }
+        OutputFormat::Json => print_json(&TargetMutationOutput {
+            name,
+            current: false,
+        })?,
+    }
+    Ok(())
+}
+
+/// Insert/update a target in the local `./.kobe.toml`, creating the
+/// file if it doesn't exist. Returns the absolute path written.
+fn write_target_to_local(name: &str, target: KobeTarget) -> Result<PathBuf> {
+    let path = local_config_path()?
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine current directory for .kobe.toml"))?;
+
+    let mut local: CliConfig = if path.exists() {
+        let raw = std::fs::read_to_string(&path)?;
+        toml::from_str(&raw)?
+    } else {
+        CliConfig::default()
+    };
+
+    local.targets.insert(name.to_string(), target);
+
+    let toml_str = toml::to_string_pretty(&local)?;
+    std::fs::write(&path, toml_str)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Make `<name>` the active target for **this terminal window only**.
+///
+/// Writes the choice to `<cache>/sessions/<ppid>.json`, keyed by the
+/// parent shell's PID. Other windows have different parent PIDs and
+/// keep whatever they had. The session file is reaped automatically
+/// when the parent shell exits (see `session::gc_dead_sessions`).
+///
+/// Validates that the target exists in the merged config (global +
+/// local) before writing.
+pub async fn config_use_target(name: &str, output: OutputFormat) -> Result<()> {
+    let config = CliConfig::load()?;
+    if !config.targets.contains_key(name) {
+        anyhow::bail!(
+            "Unknown target '{name}'. Run: kobe config list (or define one with: kobe config set {name} --endpoint <url>)"
+        );
+    }
+
+    let saved_path = session::save(&session::SessionState {
+        current_target: name.to_string(),
+    })?;
+
+    match output {
+        OutputFormat::Text => {
+            println!("Active target for this shell: {name}");
+            println!("State: {}", saved_path.display());
         }
         OutputFormat::Json => print_json(&TargetMutationOutput {
             name,
@@ -464,45 +613,70 @@ pub async fn config_set_target(
     Ok(())
 }
 
-pub async fn config_use_target(name: &str, output: OutputFormat) -> Result<()> {
-    let mut config = CliConfig::load()?;
-    if !config.targets.contains_key(name) {
-        anyhow::bail!("Unknown target '{name}'. Run: kobe config list");
-    }
-    config.current_target = Some(name.to_string());
-    config.save()?;
-
-    match output {
-        OutputFormat::Text => println!("Current target: {name}"),
-        OutputFormat::Json => print_json(&TargetMutationOutput {
-            name,
-            current: true,
-        })?,
-    }
-    Ok(())
-}
-
+/// Print the active target for this shell, plus where the answer came
+/// from. Helps users debug "why is kobe pointing at X?" without
+/// needing to know the resolution rules by heart.
 pub async fn config_current_target(output: OutputFormat) -> Result<()> {
     let config = CliConfig::load()?;
-    let Some(current_target) = config.current_target else {
-        anyhow::bail!("Current target is not set. Run: kobe config list");
+    let session = session::load()?;
+
+    let (current_target, source) = match session {
+        Some((state, path, ppid)) => (state.current_target.clone(), Some((path, ppid))),
+        None => match config.current_target.clone() {
+            Some(t) => (t, None),
+            None => {
+                anyhow::bail!(
+                    "No active target set for this shell. \
+                     Run: kobe config use <name>. \
+                     Available targets: kobe config list."
+                )
+            }
+        },
     };
 
     if !config.targets.contains_key(&current_target) {
-        anyhow::bail!("Current target '{current_target}' does not exist. Run: kobe config list");
+        anyhow::bail!(
+            "Active target '{current_target}' is not defined. Run: kobe config list (or remove the stale state with: kobe config use <other>)."
+        );
     }
 
     match output {
-        OutputFormat::Text => println!("{current_target}"),
-        OutputFormat::Json => print_json(&CurrentTargetOutput {
-            name: &current_target,
-        })?,
+        OutputFormat::Text => match source {
+            Some((path, ppid)) => println!(
+                "{current_target}\n  source: session file (ppid={ppid}, {})",
+                path.display()
+            ),
+            None => println!(
+                "{current_target}\n  source: legacy config file (consider running: kobe config use {current_target})"
+            ),
+        },
+        OutputFormat::Json => {
+            let scope = config
+                .target_scopes
+                .get(&current_target)
+                .map(|s| s.to_string());
+            let source_str = source
+                .as_ref()
+                .map(|(p, ppid)| format!("session-file:{}:{}", ppid, p.display()))
+                .unwrap_or_else(|| "config-file".to_string());
+            print_json(&serde_json::json!({
+                "name": current_target,
+                "source": source_str,
+                "scope": scope,
+            }))?
+        }
     }
     Ok(())
 }
 
 pub async fn config_list_targets(output: OutputFormat) -> Result<()> {
     let config = CliConfig::load()?;
+    let session = session::load().ok().flatten();
+    let active = session
+        .as_ref()
+        .map(|(state, _, _)| state.current_target.clone())
+        .or_else(|| config.current_target.clone());
+
     match output {
         OutputFormat::Text => {
             if config.targets.is_empty() {
@@ -510,24 +684,89 @@ pub async fn config_list_targets(output: OutputFormat) -> Result<()> {
                 return Ok(());
             }
 
+            // Compute column widths so the table looks tidy on real
+            // terminals (long endpoints don't push the SCOPE column off
+            // the screen).
+            let name_w = config
+                .targets
+                .keys()
+                .map(|s| s.len())
+                .max()
+                .unwrap_or(4)
+                .max(4);
+            let endpoint_w = config
+                .targets
+                .values()
+                .map(|t| t.endpoint.len())
+                .max()
+                .unwrap_or(8)
+                .max(8);
+
+            println!(
+                "{:<8}{:<width_n$}  {:<width_e$}  {:<6}  SCOPE",
+                "ACTIVE",
+                "NAME",
+                "ENDPOINT",
+                "AUTH",
+                width_n = name_w,
+                width_e = endpoint_w,
+            );
+            let mut overlap_targets: Vec<&str> = Vec::new();
             for (name, target) in &config.targets {
-                let marker = if config.current_target.as_deref() == Some(name) {
-                    "*"
+                let marker = if active.as_deref() == Some(name) {
+                    "  *  "
                 } else {
-                    " "
+                    "     "
                 };
-                println!("{marker} {name}  {}  auth={}", target.endpoint, target.auth);
+                let scope = config
+                    .target_scopes
+                    .get(name)
+                    .copied()
+                    .unwrap_or(Scope::Global);
+                if scope == Scope::Both {
+                    overlap_targets.push(name);
+                }
+                println!(
+                    "{:<8}{:<width_n$}  {:<width_e$}  {:<6}  {}",
+                    marker,
+                    name,
+                    target.endpoint,
+                    target.auth.to_string(),
+                    scope,
+                    width_n = name_w,
+                    width_e = endpoint_w,
+                );
+            }
+            if !overlap_targets.is_empty() {
+                eprintln!();
+                eprintln!(
+                    "warning: {} target{} defined in BOTH global and local — local wins:",
+                    overlap_targets.len(),
+                    if overlap_targets.len() == 1 { "" } else { "s" }
+                );
+                for n in &overlap_targets {
+                    eprintln!("  - {n}");
+                }
+                eprintln!("  to inspect: cat ~/.config/kobe/config.json and ./.kobe.toml");
             }
         }
         OutputFormat::Json => {
             let targets = config
                 .targets
                 .iter()
-                .map(|(name, target)| ConfigListEntry {
-                    name,
-                    current: config.current_target.as_deref() == Some(name.as_str()),
-                    endpoint: &target.endpoint,
-                    auth: &target.auth,
+                .map(|(name, target)| {
+                    let scope = config
+                        .target_scopes
+                        .get(name)
+                        .copied()
+                        .unwrap_or(Scope::Global);
+                    ConfigListEntry {
+                        name,
+                        current: active.as_deref() == Some(name.as_str()),
+                        endpoint: &target.endpoint,
+                        auth: &target.auth,
+                        scope,
+                    }
                 })
                 .collect::<Vec<_>>();
             print_json(&targets)?;

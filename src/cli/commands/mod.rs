@@ -7,6 +7,7 @@ mod picker;
 mod pools;
 mod purge;
 mod release;
+pub(crate) mod session;
 mod state;
 mod status;
 mod version;

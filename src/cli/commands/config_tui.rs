@@ -231,6 +231,7 @@ fn fields_to_config(
         auth: previous.auth.clone(),
         token: previous.token.clone(),
         ssh_fingerprint: previous.ssh_fingerprint.clone(),
+        ..CliConfig::default()
     };
 
     match target {
@@ -241,6 +242,7 @@ fn fields_to_config(
             auth,
             token,
             ssh_fingerprint,
+            ..CliConfig::default()
         }),
         EditTarget::Target(name) => {
             let target = config
@@ -633,6 +635,7 @@ mod tests {
             auth: AuthMode::Token,
             token: Some("legacy-token".to_string()),
             ssh_fingerprint: Some("SHA256:legacy".to_string()),
+            ..CliConfig::default()
         };
 
         let fields = build_fields(&config, &EditTarget::Target("prod".to_string())).unwrap();
@@ -657,6 +660,7 @@ mod tests {
             auth: AuthMode::Token,
             token: Some("legacy-token".to_string()),
             ssh_fingerprint: None,
+            ..CliConfig::default()
         };
 
         let fields = vec![
