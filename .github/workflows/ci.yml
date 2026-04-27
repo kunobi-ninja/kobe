@@ -160,6 +160,14 @@ jobs:
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
     with:
       binary_name: kobe
+      # Match kache's target set exactly — drop x86_64-pc-windows-gnu.
+      # The Windows GNU cross-compile against Rust 1.94's std fails to
+      # link `GetHostNameW` (a Win32 API symbol newer std hostname code
+      # depends on), which mingw doesn't pull in via -lws2_32 by default
+      # — v0.12.3's release-cli job hit this and aborted. We have no
+      # Windows kobe consumer (Linux CI runners + macOS dev laptops only),
+      # so dropping the target is correct, not just expedient.
+      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin"]'
       extra_build_env: |
         BUILD_VERSION=${{ github.ref_name }}
         BUILD_COMMIT=${{ github.sha }}
