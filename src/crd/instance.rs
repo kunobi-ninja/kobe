@@ -109,7 +109,19 @@ pub struct ClusterInstanceStatus {
     #[serde(default)]
     pub health_failures: u32,
 
-    /// Hash of the pool spec that created this instance, used for drift detection.
-    #[serde(default)]
+    /// Hash of the pool spec that created this instance, used for drift
+    /// detection.
+    ///
+    /// `skip_serializing_if` is critical: this field is owned by the profile
+    /// controller (which writes `Some(...)` once at create time and on
+    /// subsequent reconciles), but the instance controller carries it through
+    /// every status patch via `spec_hash: status.spec_hash`. If the instance
+    /// controller's `status` read happens before the profile controller's
+    /// write, it holds `None` locally — and a JSON Merge Patch carrying
+    /// `"specHash": null` would *remove* the field from disk per RFC 7396.
+    /// Skipping serialization on `None` makes the field absent from the JSON
+    /// instead, which JSON Merge Patch interprets as "preserve on-disk
+    /// value" — closing the race regardless of which controller wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_hash: Option<u64>,
 }

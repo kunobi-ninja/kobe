@@ -600,6 +600,18 @@ async fn ensure_cluster_instance(
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/pool".to_string(), profile.name_any());
 
+    let initial_status = ClusterInstanceStatus {
+        phase: ClusterInstancePhase::Creating,
+        provisioned: false,
+        bootstrapped: false,
+        lease_ref: None,
+        active_bootstrap: None,
+        idle_since: None,
+        state_since: Some(chrono::Utc::now().to_rfc3339()),
+        health_failures: 0,
+        spec_hash: Some(crate::pool::profile_spec_hash(profile)),
+    };
+
     let instance = ClusterInstance {
         metadata: kube::core::ObjectMeta {
             name: Some(cluster_name.to_string()),
@@ -620,24 +632,45 @@ async fn ensure_cluster_instance(
             readiness_gates: Vec::new(),
             snapshot: None,
         },
-        status: Some(ClusterInstanceStatus {
-            phase: ClusterInstancePhase::Creating,
-            provisioned: false,
-            bootstrapped: false,
-            lease_ref: None,
-            active_bootstrap: None,
-            idle_since: None,
-            state_since: Some(chrono::Utc::now().to_rfc3339()),
-            health_failures: 0,
-            spec_hash: Some(crate::pool::profile_spec_hash(profile)),
-        }),
+        // The status field set here is silently dropped by the apiserver —
+        // status is a subresource and only `patch_status` / `update_status`
+        // persist it. We follow up with an explicit status patch below so the
+        // initial spec_hash is actually written, instead of staying `None`
+        // until the next reconcile sync (which previously could overwrite
+        // with `None` if in-memory pool_state lost the entry across an
+        // operator restart). See drift detection in
+        // `pool::compute_pool_actions`.
+        status: Some(initial_status.clone()),
     };
 
-    match instances_api.create(&Default::default(), &instance).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()),
-        Err(e) => Err(ProfileError::Kube(e)),
+    let created = match instances_api.create(&Default::default(), &instance).await {
+        Ok(_) => true,
+        Err(kube::Error::Api(ae)) if ae.code == 409 => false,
+        Err(e) => return Err(ProfileError::Kube(e)),
+    };
+
+    if created {
+        let patch = serde_json::json!({ "status": initial_status });
+        if let Err(err) = instances_api
+            .patch_status(
+                cluster_name,
+                &PatchParams::apply("kobe-operator"),
+                &Patch::Merge(&patch),
+            )
+            .await
+        {
+            // Best-effort: the periodic sync will retry. Log so an operator
+            // upgrade race is visible rather than silently leaving a hash
+            // unset.
+            warn!(
+                cluster = %cluster_name,
+                error = %err,
+                "Failed to write initial status (spec_hash) after create; pool sync will retry"
+            );
+        }
     }
+
+    Ok(())
 }
 
 async fn patch_cluster_instance_status(
@@ -678,7 +711,13 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
                 idle_since: entry.idle_since.map(|ts| ts.to_rfc3339()),
                 state_since: entry.state_since.map(|ts| ts.to_rfc3339()),
                 health_failures: entry.health_failures,
-                spec_hash: entry.spec_hash,
+                // Prefer the on-disk hash over the in-memory entry: an
+                // operator restart that rebuilds pool_state from the API may
+                // briefly hold `entry.spec_hash = None` for a cluster whose
+                // status already has a hash recorded. Without this `or`,
+                // the sync would clobber that hash to null and break drift
+                // detection until a manual ClusterInstance delete.
+                spec_hash: current.spec_hash.or(entry.spec_hash),
             },
         )
         .await;
