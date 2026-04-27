@@ -112,6 +112,16 @@ pub struct ClusterInstanceStatus {
     /// Hash of the pool spec that created this instance, used for drift
     /// detection.
     ///
+    /// `String` (not `u64`/`i64`): Kubernetes' OpenAPI structural schema
+    /// validator parses numeric values through `float64` and rejects integers
+    /// outside JSON's safe range (±2⁵³−1) with
+    /// `Invalid value: "number": specHash in body must be of type integer`.
+    /// Encoding as a fixed-width hex string sidesteps the precision problem
+    /// without throwing away any of the 64 bits of hash entropy. Same pattern
+    /// Kubernetes uses for `metadata.resourceVersion`. See
+    /// `pool::profile_spec_hash` for the encoding (`{:016x}` of a `u64`).
+    /// Equality comparison works directly via `==` on the string form.
+    ///
     /// `skip_serializing_if` is critical: this field is owned by the profile
     /// controller (which writes `Some(...)` once at create time and on
     /// subsequent reconciles), but the instance controller carries it through
@@ -123,5 +133,5 @@ pub struct ClusterInstanceStatus {
     /// instead, which JSON Merge Patch interprets as "preserve on-disk
     /// value" — closing the race regardless of which controller wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spec_hash: Option<u64>,
+    pub spec_hash: Option<String>,
 }

@@ -112,7 +112,7 @@ mod cluster_instance_tests {
                 "idleSince": idle_since,
                 "stateSince": "2026-04-13T10:00:00Z",
                 "healthFailures": health_failures,
-                "specHash": 42
+                "specHash": "002a000000000000"
             }
         })
     }
@@ -200,7 +200,7 @@ mod cluster_instance_tests {
         let entry = pool_state.clusters.get("pool-test-profile-0").unwrap();
         assert_eq!(entry.state, ClusterState::Leased);
         assert_eq!(entry.health_failures, 2);
-        assert_eq!(entry.spec_hash, Some(42));
+        assert_eq!(entry.spec_hash.as_deref(), Some("002a000000000000"));
         assert!(entry.idle_since.is_some());
     }
 }
@@ -717,7 +717,7 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
                 // status already has a hash recorded. Without this `or`,
                 // the sync would clobber that hash to null and break drift
                 // detection until a manual ClusterInstance delete.
-                spec_hash: current.spec_hash.or(entry.spec_hash),
+                spec_hash: current.spec_hash.or_else(|| entry.spec_hash.clone()),
             },
         )
         .await;

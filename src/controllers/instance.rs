@@ -134,7 +134,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             idle_since: status.idle_since,
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
-                            spec_hash: status.spec_hash,
+                            spec_hash: status.spec_hash.clone(),
                         },
                     )
                     .await?;
@@ -154,7 +154,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             idle_since: None,
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
-                            spec_hash: status.spec_hash,
+                            spec_hash: status.spec_hash.clone(),
                         },
                     )
                     .await?;
@@ -179,7 +179,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 idle_since: None,
                                 state_since: status.state_since,
                                 health_failures: 0,
-                                spec_hash: status.spec_hash,
+                                spec_hash: status.spec_hash.clone(),
                             },
                         )
                         .await?;
@@ -198,7 +198,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 idle_since: Some(chrono::Utc::now().to_rfc3339()),
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: 0,
-                                spec_hash: status.spec_hash,
+                                spec_hash: status.spec_hash.clone(),
                             },
                         )
                         .await?;
@@ -218,7 +218,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 idle_since: None,
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: status.health_failures,
-                                spec_hash: status.spec_hash,
+                                spec_hash: status.spec_hash.clone(),
                             },
                         )
                         .await?;
@@ -275,7 +275,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 idle_since: None,
                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                 health_failures: status.health_failures,
-                spec_hash: status.spec_hash,
+                spec_hash: status.spec_hash.clone(),
             },
         )
         .await?;
@@ -311,7 +311,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                         idle_since: None,
                         state_since: Some(chrono::Utc::now().to_rfc3339()),
                         health_failures: status.health_failures,
-                        spec_hash: status.spec_hash,
+                        spec_hash: status.spec_hash.clone(),
                     },
                 )
                 .await?;
@@ -340,7 +340,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                     idle_since: None,
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: status.health_failures,
-                    spec_hash: status.spec_hash,
+                    spec_hash: status.spec_hash.clone(),
                 },
             )
             .await?;
@@ -500,7 +500,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                         idle_since: status.idle_since.clone(),
                         state_since: status.state_since.clone(),
                         health_failures: 0,
-                        spec_hash: status.spec_hash,
+                        spec_hash: status.spec_hash.clone(),
                     },
                 )
                 .await?;
@@ -538,7 +538,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                     },
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: failures,
-                    spec_hash: status.spec_hash,
+                    spec_hash: status.spec_hash.clone(),
                 },
             )
             .await?;

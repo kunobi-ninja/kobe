@@ -3,9 +3,25 @@ use std::collections::HashMap;
 use crate::crd::ClusterPool;
 
 /// Hash of the cluster spec at creation time, used to detect drift.
-pub type SpecHash = u64;
+///
+/// `String` (not `u64`/`i64`) because the value travels over JSON via the
+/// `ClusterInstanceStatus.specHash` field, and Kubernetes' OpenAPI
+/// structural schema validator parses numeric values through `float64`
+/// internally — integers outside JSON's safe range (±2⁵³−1) lose precision,
+/// gain a fractional component, and fail `type: integer` validation with
+/// `Invalid value: "number": specHash in body must be of type integer`.
+/// Encoding as a string sidesteps the issue entirely with no entropy loss,
+/// matching the same pattern Kubernetes uses for `metadata.resourceVersion`
+/// and other large-integer-like fields.
+///
+/// The format is fixed-width 16-character lowercase hex (a `u64` rendered
+/// as `{:016x}`), so equality comparison works directly via `==`.
+pub type SpecHash = String;
 
 /// Compute a hash of the profile's cluster-relevant fields.
+///
+/// Returns the hash as fixed-width hex so the value round-trips through
+/// the apiserver as a string — see `SpecHash` doc for why this matters.
 pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -22,7 +38,7 @@ pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
     format!("{:?}", profile.spec.backend).hash(&mut hasher);
     format!("{:?}", profile.spec.addons).hash(&mut hasher);
     format!("{:?}", profile.spec.bootstraps).hash(&mut hasher);
-    hasher.finish()
+    format!("{:016x}", hasher.finish())
 }
 
 /// Tracks the state of each cluster in a profile's pool.
@@ -101,8 +117,8 @@ pub fn compute_pool_actions(
     let current_hash = profile_spec_hash(profile);
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Ready
-            && let Some(hash) = entry.spec_hash
-            && hash != current_hash
+            && let Some(hash) = &entry.spec_hash
+            && hash != &current_hash
         {
             tracing::info!(
                 cluster = %name,
@@ -898,8 +914,7 @@ mod tests {
     #[test]
     fn test_spec_drift_triggers_recreation_of_unclaimed_clusters() {
         let profile = make_profile(2, None);
-        let current_hash = profile_spec_hash(&profile);
-        let stale_hash = current_hash.wrapping_add(1); // different hash
+        let stale_hash = format!("{}-stale", profile_spec_hash(&profile));
 
         let mut clusters = HashMap::new();
         clusters.insert(
@@ -909,7 +924,7 @@ mod tests {
                 idle_since: Some(chrono::Utc::now()),
                 health_failures: 0,
                 state_since: None,
-                spec_hash: Some(stale_hash), // stale
+                spec_hash: Some(stale_hash.clone()), // stale
             },
         );
         clusters.insert(
@@ -919,7 +934,7 @@ mod tests {
                 idle_since: None,
                 health_failures: 0,
                 state_since: None,
-                spec_hash: Some(stale_hash), // stale but leased
+                spec_hash: Some(stale_hash.clone()), // stale but leased
             },
         );
         let state = PoolState { clusters };

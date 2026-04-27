@@ -1143,7 +1143,7 @@ mod tests {
                         "idleSince": chrono::Utc::now().to_rfc3339(),
                         "stateSince": chrono::Utc::now().to_rfc3339(),
                         "healthFailures": 0,
-                        "specHash": 1
+                        "specHash": "0000000000000001"
                     }
                 })]),
             ))
