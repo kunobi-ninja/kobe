@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -93,6 +93,44 @@ pub(crate) fn endpoint_kubeconfigs(endpoint: &str) -> Result<Vec<PathBuf>> {
         .filter(|(key, _)| key.starts_with(&prefix))
         .map(|(_, artifact)| PathBuf::from(&artifact.kubeconfig_path))
         .collect())
+}
+
+/// State-tracked kubeconfigs whose lease is not in the supplied active set.
+///
+/// Conservative: only considers entries we recorded ourselves (`record_kubeconfig`).
+/// Freestanding `~/.kube/kobe-*.yaml` files we never tracked are left alone — we
+/// cannot prove they correspond to an expired lease without parsing the filename
+/// and risking a false positive on an unrelated user-managed file.
+pub(crate) fn find_orphan_kubeconfigs(
+    endpoint: &str,
+    active_lease_ids: &BTreeSet<String>,
+) -> Result<Vec<OrphanKubeconfig>> {
+    let state = CliState::load()?;
+    let prefix = format!("{endpoint}::");
+    let mut orphans = Vec::new();
+    for (key, artifact) in &state.lease_artifacts {
+        let Some(lease_id) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if active_lease_ids.contains(lease_id) {
+            continue;
+        }
+        let path = PathBuf::from(&artifact.kubeconfig_path);
+        if !path.exists() {
+            continue;
+        }
+        orphans.push(OrphanKubeconfig {
+            lease_id: lease_id.to_string(),
+            path,
+        });
+    }
+    Ok(orphans)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OrphanKubeconfig {
+    pub lease_id: String,
+    pub path: PathBuf,
 }
 
 pub(crate) fn forget_endpoint_kubeconfigs(endpoint: &str) -> Result<()> {

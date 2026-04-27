@@ -76,6 +76,13 @@ enum Commands {
         /// Skip the confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Only remove kubeconfigs whose lease no longer exists server-side
+        /// (phase Released or Expired, or absent from the server entirely).
+        /// Active leases are not released. Files in `~/.kube/kobe-*.yaml`
+        /// that Kobe never recorded itself are not touched. Use this to clean
+        /// up files left behind by TTL expiry.
+        #[arg(long)]
+        orphans_only: bool,
     },
     /// Manage CLI configuration
     Config {
@@ -180,7 +187,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Release { lease_id } => {
             commands::release(lease_id.as_deref(), target, endpoint, output).await
         }
-        Commands::Purge { yes } => commands::purge(target, endpoint, output, yes).await,
+        Commands::Purge { yes, orphans_only } => {
+            commands::purge(target, endpoint, output, yes, orphans_only).await
+        }
         Commands::Config { action } => match action {
             Some(ConfigAction::View) => commands::config_show(target, output).await,
             Some(ConfigAction::Export { path }) => {

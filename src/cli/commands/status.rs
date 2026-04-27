@@ -7,7 +7,8 @@ use super::leases::{
     lease_when_label,
 };
 use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
-use super::state::resolve_kubeconfig_path;
+use super::purge::live_lease_ids;
+use super::state::{find_orphan_kubeconfigs, resolve_kubeconfig_path};
 use super::{OutputFormat, authed_client, cli_version, get_auth_header, print_json, with_auth};
 
 #[derive(Serialize)]
@@ -41,6 +42,10 @@ struct StatusOutput {
     pools: Vec<StatusPoolOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pools_error: Option<String>,
+    /// Always serialized so JSON consumers can rely on the field existing
+    /// (e.g. `jq '.orphanKubeconfigs | length'` on a fresh state with no
+    /// orphans returns 0 instead of erroring on `null`).
+    orphan_kubeconfigs: Vec<String>,
 }
 
 fn auth_error_hint(error: &str) -> Option<&'static str> {
@@ -113,6 +118,22 @@ pub async fn status(
     };
     let leases = enrich_leases(&config, leases).await;
 
+    // Orphan detection only makes sense when we successfully fetched leases —
+    // otherwise we don't know which lease IDs are actually active server-side
+    // and would surface a false positive on every tracked kubeconfig. Uses the
+    // shared `live_lease_ids` filter (treats Recycling leases as still-live so
+    // their kubeconfigs aren't flagged mid-teardown).
+    let orphan_kubeconfigs: Vec<String> = if auth_error.is_none() {
+        let live_ids = live_lease_ids(&leases);
+        find_orphan_kubeconfigs(endpoint, &live_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|orphan| orphan.path.display().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut pool_details = Vec::with_capacity(pools.len());
     for pool in pools {
         pool_details.push(StatusPoolOutput { pool });
@@ -133,6 +154,7 @@ pub async fn status(
             leases,
             pools: pool_details,
             pools_error,
+            orphan_kubeconfigs,
         });
     }
 
@@ -175,6 +197,12 @@ pub async fn status(
                 println!("    config:  {kubeconfig_path}");
             }
         }
+    }
+    if !orphan_kubeconfigs.is_empty() {
+        println!(
+            "  \x1b[33m{} orphan kubeconfig(s) detected (lease no longer exists). Run `kobe purge --orphans-only` to clean up.\x1b[0m",
+            orphan_kubeconfigs.len()
+        );
     }
     println!();
 
