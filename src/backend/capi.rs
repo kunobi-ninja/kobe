@@ -632,6 +632,7 @@ mod tests {
             server_args: vec![],
             persistence: None,
             expose: None,
+            taints: None,
         };
 
         let result = backend.create("my-vc", "test-ns", &config, &[]).await;

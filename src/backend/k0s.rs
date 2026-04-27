@@ -257,6 +257,21 @@ spec:
             args.push("--token-file=/var/lib/k0s/token/token".to_string());
         }
 
+        // Honor `cluster.taints`. When the field is set we take full control:
+        // pass `--no-taints` to suppress the default master taint, then add
+        // one `--taints=<key:effect>` per entry. Per-flag form mirrors k3s'
+        // `--node-taint` shape and is forward-safe against any future
+        // pflag StringSliceVar → StringArrayVar migration in upstream k0s
+        // (StringSlice splits on commas; StringArray does not). When the
+        // field is None we leave the default behaviour (master taint
+        // applied) untouched so existing pools are unaffected.
+        if let Some(taints) = &config.taints {
+            args.push("--no-taints".to_string());
+            for taint in taints {
+                args.push(format!("--taints={}", taint.to_kubelet_arg()));
+            }
+        }
+
         let mut volume_mounts = vec![
             VolumeMount {
                 name: "k0s-config".to_string(),
@@ -958,6 +973,7 @@ mod tests {
             server_args: vec![],
             persistence: None,
             expose: None,
+            taints: None,
         }
     }
 
@@ -1021,6 +1037,101 @@ mod tests {
         assert!(
             yaml.contains("tls-san: \"example.com\""),
             "Should include extra args: {yaml}"
+        );
+    }
+
+    #[test]
+    fn test_taints_field_omitted_keeps_default_master_taint() {
+        // Default (taints: None) must not pass --no-taints / --taints, so the
+        // k0s default master taint stays applied. Backwards-compatible.
+        let config = base_config();
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let args = sts
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap();
+        assert!(!args.iter().any(|a| a == "--no-taints"));
+        assert!(!args.iter().any(|a| a.starts_with("--taints=")));
+    }
+
+    #[test]
+    fn test_taints_empty_list_suppresses_default_master_taint() {
+        let mut config = base_config();
+        config.taints = Some(vec![]);
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let args = sts
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap();
+        assert!(args.iter().any(|a| a == "--no-taints"));
+        assert!(!args.iter().any(|a| a.starts_with("--taints=")));
+    }
+
+    #[test]
+    fn test_taints_populated_list_renders_kubelet_args() {
+        use crate::crd::{NodeTaint, TaintEffect};
+        let mut config = base_config();
+        config.taints = Some(vec![
+            NodeTaint {
+                key: "dedicated".to_string(),
+                value: Some("gpu".to_string()),
+                effect: TaintEffect::NoSchedule,
+            },
+            NodeTaint {
+                key: "drain-pending".to_string(),
+                value: None,
+                effect: TaintEffect::NoExecute,
+            },
+        ]);
+        let sts = K0sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let args = sts
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap();
+        assert!(args.iter().any(|a| a == "--no-taints"));
+        // One --taints flag per entry (per-flag form, not comma-list).
+        let taints_args: Vec<&String> =
+            args.iter().filter(|a| a.starts_with("--taints=")).collect();
+        assert_eq!(
+            taints_args.len(),
+            2,
+            "expected one --taints flag per entry, got {taints_args:?}"
+        );
+        assert!(
+            taints_args
+                .iter()
+                .any(|a| *a == "--taints=dedicated=gpu:NoSchedule")
+        );
+        // Value-less taint must render as `key:effect` (no `=`); the
+        // `key=:effect` form is invalid kubelet syntax.
+        assert!(
+            taints_args
+                .iter()
+                .any(|a| *a == "--taints=drain-pending:NoExecute")
         );
     }
 

@@ -213,6 +213,18 @@ impl K3sBackend {
             args.push(format!("--datastore-endpoint={endpoint}"));
         }
 
+        // Honor `cluster.taints`. k3s does NOT add a master taint by default,
+        // so we only need to act when the caller specified non-empty taints.
+        // An empty list and an absent field are equivalent for k3s. Each taint
+        // becomes its own `--node-taint key=value:effect` flag.
+        if let Some(taints) = &config.taints
+            && !taints.is_empty()
+        {
+            for taint in taints {
+                args.push(format!("--node-taint={}", taint.to_kubelet_arg()));
+            }
+        }
+
         // Append user-specified server args
         args.extend(config.server_args.iter().cloned());
 
@@ -747,6 +759,7 @@ mod tests {
             server_args: vec![],
             persistence: None,
             expose: None,
+            taints: None,
         }
     }
 
@@ -831,6 +844,100 @@ mod tests {
         let args = server.args.as_ref().unwrap();
         assert!(args.contains(&"--disable=traefik".to_string()));
         assert!(args.contains(&"--flannel-backend=none".to_string()));
+    }
+
+    #[test]
+    fn test_taints_field_omitted_no_node_taint_args() {
+        // Default (taints: None) keeps k3s's no-taint default — must not
+        // emit any --node-taint flags. Backwards-compatible.
+        let config = base_config();
+        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None);
+        let args = sts
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("--node-taint")));
+    }
+
+    #[test]
+    fn test_taints_empty_list_no_node_taint_args() {
+        // k3s does not apply a master taint by default, so an empty list
+        // is semantically equivalent to omission — no flags emitted.
+        let mut config = base_config();
+        config.taints = Some(vec![]);
+        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None);
+        let args = sts
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("--node-taint")));
+    }
+
+    #[test]
+    fn test_taints_populated_list_renders_node_taint_args() {
+        use crate::crd::{NodeTaint, TaintEffect};
+        let mut config = base_config();
+        config.taints = Some(vec![
+            NodeTaint {
+                key: "dedicated".to_string(),
+                value: Some("gpu".to_string()),
+                effect: TaintEffect::NoSchedule,
+            },
+            NodeTaint {
+                key: "drain-pending".to_string(),
+                value: None,
+                effect: TaintEffect::NoExecute,
+            },
+        ]);
+        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None);
+        let args = sts
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap();
+        let taint_args: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("--node-taint="))
+            .collect();
+        assert_eq!(
+            taint_args.len(),
+            2,
+            "expected one --node-taint flag per entry, got {taint_args:?}"
+        );
+        assert!(
+            taint_args
+                .iter()
+                .any(|a| *a == "--node-taint=dedicated=gpu:NoSchedule")
+        );
+        // Value-less taint must render as `key:effect` (no `=`).
+        assert!(
+            taint_args
+                .iter()
+                .any(|a| *a == "--node-taint=drain-pending:NoExecute")
+        );
     }
 
     #[test]

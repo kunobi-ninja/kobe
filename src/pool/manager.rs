@@ -14,6 +14,11 @@ pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
     profile.spec.cluster.servers.hash(&mut hasher);
     profile.spec.cluster.agents.hash(&mut hasher);
     profile.spec.cluster.server_args.hash(&mut hasher);
+    // Taints affect kubelet registration args (k0s `--no-taints`/`--taints`
+    // and k3s `--node-taint`) — a change must trigger pool recycling so
+    // existing warm clusters pick up the new taint set rather than
+    // continuing to serve under the previous configuration.
+    format!("{:?}", profile.spec.cluster.taints).hash(&mut hasher);
     format!("{:?}", profile.spec.backend).hash(&mut hasher);
     format!("{:?}", profile.spec.addons).hash(&mut hasher);
     format!("{:?}", profile.spec.bootstraps).hash(&mut hasher);
@@ -278,6 +283,7 @@ pub fn backoff_delay(consecutive_failures: u32) -> Option<chrono::Duration> {
                 server_args: vec![],
                 persistence: None,
                 expose: None,
+                taints: None,
             },
             addons: vec![],
             bootstraps: vec![],
@@ -661,6 +667,7 @@ mod tests {
                     server_args: vec![],
                     persistence: None,
                     expose: None,
+                    taints: None,
                 },
                 addons: vec![],
                 bootstraps: vec![],

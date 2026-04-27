@@ -271,6 +271,45 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  taints:
+                    description: |-
+                      Node taints applied to the cluster's control-plane node(s).
+
+                      Semantics:
+                      - **Field omitted** — backend default applies (e.g. k0s adds
+                        `node-role.kubernetes.io/master:NoSchedule` when running
+                        `controller --enable-worker`). Backward compatible.
+                      - **Empty list `[]`** — no taints applied; any backend default is
+                        suppressed. Useful for single-node CI/dev clusters where pods
+                        need to schedule on the control-plane node.
+                      - **Non-empty list** — exactly these taints are applied; backend
+                        defaults are suppressed.
+
+                      Currently honored by the k0s backend; other backends will gain
+                      support over time.
+                    items:
+                      description: A single taint applied to cluster nodes. Mirrors `core/v1.Taint`.
+                      properties:
+                        effect:
+                          description: Taint effect.
+                          enum:
+                          - NoSchedule
+                          - PreferNoSchedule
+                          - NoExecute
+                          type: string
+                        key:
+                          description: Taint key (e.g. `dedicated`).
+                          type: string
+                        value:
+                          description: Optional taint value (e.g. `gpu`).
+                          nullable: true
+                          type: string
+                      required:
+                      - effect
+                      - key
+                      type: object
+                    nullable: true
+                    type: array
                   version:
                     description: k3s version (e.g., "v1.31.3+k3s1").
                     type: string

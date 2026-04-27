@@ -291,6 +291,7 @@ mod tests {
             server_args: vec![],
             persistence: None,
             expose: None,
+            taints: None,
         }
     }
 

@@ -274,6 +274,78 @@ pub struct ClusterConfig {
     /// Expose config (ingress/LoadBalancer/NodePort).
     #[serde(default)]
     pub expose: Option<ExposeConfig>,
+
+    /// Node taints applied to the cluster's control-plane node(s).
+    ///
+    /// Semantics:
+    /// - **Field omitted** — backend default applies (e.g. k0s adds
+    ///   `node-role.kubernetes.io/master:NoSchedule` when running
+    ///   `controller --enable-worker`). Backward compatible.
+    /// - **Empty list `[]`** — no taints applied; any backend default is
+    ///   suppressed. Useful for single-node CI/dev clusters where pods
+    ///   need to schedule on the control-plane node.
+    /// - **Non-empty list** — exactly these taints are applied; backend
+    ///   defaults are suppressed.
+    ///
+    /// Currently honored by the k0s backend; other backends will gain
+    /// support over time.
+    #[serde(default)]
+    pub taints: Option<Vec<NodeTaint>>,
+}
+
+/// A single taint applied to cluster nodes. Mirrors `core/v1.Taint`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTaint {
+    /// Taint key (e.g. `dedicated`).
+    pub key: String,
+    /// Optional taint value (e.g. `gpu`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Taint effect.
+    pub effect: TaintEffect,
+}
+
+/// Allowed taint effects, matching `core/v1.TaintEffect`.
+///
+/// `PascalCase` is the wire form expected by Kubernetes; the explicit
+/// rename pins it so a future contributor copying the camelCase parent
+/// attribute (`NodeTaint`) onto this enum cannot silently break the CRD.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum TaintEffect {
+    NoSchedule,
+    PreferNoSchedule,
+    NoExecute,
+}
+
+impl std::fmt::Display for TaintEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaintEffect::NoSchedule => f.write_str("NoSchedule"),
+            TaintEffect::PreferNoSchedule => f.write_str("PreferNoSchedule"),
+            TaintEffect::NoExecute => f.write_str("NoExecute"),
+        }
+    }
+}
+
+impl NodeTaint {
+    /// Render the taint in the form accepted by `kubelet --register-with-taints`,
+    /// `k0s --taints`, and `k3s --node-taint`. The upstream parser
+    /// (`k8s.io/kubernetes/pkg/util/taints.parseTaint`) requires either
+    /// `key=value:effect` or `key:effect`. The `key=:effect` form (empty
+    /// explicit value) is implementation-dependent and at minimum produces
+    /// a taint whose `Value` is `""` rather than absent — asymmetric with
+    /// what a user typed and breaks `kubectl taint` removal matching.
+    // crdgen binary only consumes the CRD schema, never the impl — without this
+    // it warns dead_code in that build target while the operator does use it.
+    #[allow(dead_code)]
+    pub fn to_kubelet_arg(&self) -> String {
+        match &self.value {
+            Some(v) => format!("{}={}:{}", self.key, v, self.effect),
+            None => format!("{}:{}", self.key, self.effect),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
