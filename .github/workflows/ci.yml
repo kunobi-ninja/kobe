@@ -140,3 +140,28 @@ jobs:
           BUILD_VERSION: ${{ github.ref_name || 'dev' }}
           BUILD_COMMIT: ${{ github.sha }}
         run: docker buildx bake -f docker-bake.hcl push
+
+  # Builds the kobe CLI for multiple targets and attaches the tarballs to
+  # the GitHub release as assets, so downstream tooling can install via
+  # `mise` (ubi backend) or `gh release download` in seconds instead of
+  # `cargo install --git`, which forces every consumer to compile from
+  # source on every CI run.
+  #
+  # Mirrors the pattern kache (also in this org) uses — same shared
+  # reusable workflow, same asset-naming convention. Asset names follow
+  # `kobe-<target>.tar.gz` (e.g. `kobe-x86_64-unknown-linux-musl.tar.gz`)
+  # which `ubi` resolves automatically by the consumer's host triple.
+  #
+  # `extra_build_env` stamps the binary with the release tag so
+  # `kobe --version` reports the actual release; consumed by `build.rs`.
+  release-cli:
+    if: github.event_name == 'release'
+    needs: [checks]
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
+    with:
+      binary_name: kobe
+      extra_build_env: |
+        BUILD_VERSION=${{ github.ref_name }}
+        BUILD_COMMIT=${{ github.sha }}
+    permissions:
+      contents: write
