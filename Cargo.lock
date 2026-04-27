@@ -2086,7 +2086,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -2649,7 +2649,7 @@ dependencies = [
 [[package]]
 name = "kunobi-auth"
 version = "0.2.0"
-source = "git+https://github.com/kunobi-ninja/kunobi-auth.git?branch=main#282fe1e1253cab18a7946a6dbfc972540eed1201"
+source = "git+https://github.com/kunobi-ninja/kunobi-auth.git?tag=v0.3.0#17bc3045e90031cc93ae54fa860ac495267a52d2"
 dependencies = [
  "anyhow",
  "axum",
@@ -3501,7 +3501,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.37",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3538,7 +3538,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
