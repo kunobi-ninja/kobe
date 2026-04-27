@@ -641,21 +641,21 @@ impl ClusterBackend for K3sBackend {
         self.wait_ready(name, namespace).await?;
 
         // 7. Create agent Deployment if requested
-        if let Some(agents) = config.agents {
-            if agents > 0 {
-                let deploy = Self::build_agent_deployment(name, namespace, config, agents);
-                let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-                let deploy_name = format!("{name}-agent");
-                deploy_api
-                    .patch(
-                        &deploy_name,
-                        &PatchParams::apply("kobe-operator").force(),
-                        &Patch::Apply(&deploy),
-                    )
-                    .await
-                    .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
-                info!(cluster = name, agents = agents, "Agent Deployment applied");
-            }
+        if let Some(agents) = config.agents
+            && agents > 0
+        {
+            let deploy = Self::build_agent_deployment(name, namespace, config, agents);
+            let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+            let deploy_name = format!("{name}-agent");
+            deploy_api
+                .patch(
+                    &deploy_name,
+                    &PatchParams::apply("kobe-operator").force(),
+                    &Patch::Apply(&deploy),
+                )
+                .await
+                .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
+            info!(cluster = name, agents = agents, "Agent Deployment applied");
         }
 
         // 8. Apply addons
@@ -693,10 +693,10 @@ impl ClusterBackend for K3sBackend {
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-kubeconfig")).await?;
 
         // Drop database if PostgreSQL is configured
-        if let Some(pool) = &self.pg_pool {
-            if let Err(e) = datastore::drop_database(pool, name, "k3s_").await {
-                warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
-            }
+        if let Some(pool) = &self.pg_pool
+            && let Err(e) = datastore::drop_database(pool, name, "k3s_").await
+        {
+            warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
         }
 
         info!(cluster = name, "k3s cluster deleted");

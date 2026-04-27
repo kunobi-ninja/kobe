@@ -96,10 +96,10 @@ fn stream_upstream_response(resp: reqwest::Response) -> Response<ProxyBody> {
         "last-modified",
         "vary",
     ] {
-        if let Some(v) = resp_headers.get(h) {
-            if let Ok(s) = v.to_str() {
-                builder = builder.header(h, s);
-            }
+        if let Some(v) = resp_headers.get(h)
+            && let Ok(s) = v.to_str()
+        {
+            builder = builder.header(h, s);
         }
     }
 
@@ -907,10 +907,8 @@ impl VirtualClusterProxyV2 {
                     | "impersonate-group"
                     | "impersonate-uid"
             ) || n.starts_with("impersonate-extra-");
-            if forward {
-                if let Ok(v) = value.to_str() {
-                    req_builder = req_builder.header(name.as_str(), v);
-                }
+            if forward && let Ok(v) = value.to_str() {
+                req_builder = req_builder.header(name.as_str(), v);
             }
         }
 

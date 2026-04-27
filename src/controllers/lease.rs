@@ -313,26 +313,25 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 )
                 .await?;
 
-            if let Some(profile) = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await {
-                if let Some(scaling) = &profile.spec.scaling {
-                    if let Some(timeout) = parse_duration(&scaling.queue_timeout) {
-                        let age = chrono::Utc::now() - created_at;
-                        if age > timeout {
-                            warn!(lease = %name, "Lease exceeded queue timeout, expiring");
-                            remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-                            let patch = serde_json::json!({
-                                "status": { "phase": "Expired" }
-                            });
-                            leases_api
-                                .patch_status(
-                                    &name,
-                                    &PatchParams::apply("kobe-operator"),
-                                    &Patch::Merge(&patch),
-                                )
-                                .await?;
-                            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
-                        }
-                    }
+            if let Some(profile) = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await
+                && let Some(scaling) = &profile.spec.scaling
+                && let Some(timeout) = parse_duration(&scaling.queue_timeout)
+            {
+                let age = chrono::Utc::now() - created_at;
+                if age > timeout {
+                    warn!(lease = %name, "Lease exceeded queue timeout, expiring");
+                    remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                    let patch = serde_json::json!({
+                        "status": { "phase": "Expired" }
+                    });
+                    leases_api
+                        .patch_status(
+                            &name,
+                            &PatchParams::apply("kobe-operator"),
+                            &Patch::Merge(&patch),
+                        )
+                        .await?;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                 }
             }
 
@@ -481,49 +480,48 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             if let Some(cluster_name) = &status.cluster_name {
                 mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
                 let profile = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await;
-                if let Some(ref profile) = profile {
-                    if let Some(ref diag_config) = profile.spec.diagnostics {
-                        if diag_config.enabled {
-                            info!(lease = %name, "Capturing diagnostic bundle");
-                            let diag_url = match diagnostics::capture_bundle(
-                                cluster_name,
-                                &ns,
-                                diag_config,
+                if let Some(ref profile) = profile
+                    && let Some(ref diag_config) = profile.spec.diagnostics
+                    && diag_config.enabled
+                {
+                    info!(lease = %name, "Capturing diagnostic bundle");
+                    let diag_url = match diagnostics::capture_bundle(
+                        cluster_name,
+                        &ns,
+                        diag_config,
+                        &name,
+                        &ctx.backend,
+                    )
+                    .await
+                    {
+                        Ok(url) => Some(url),
+                        Err(e) => {
+                            warn!(
+                                lease = %name,
+                                cluster = %cluster_name,
+                                "Failed to capture diagnostic bundle: {e:#}"
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(url) = &diag_url {
+                        let patch = serde_json::json!({
+                            "status": { "diagnosticsUrl": url }
+                        });
+                        if let Err(e) = leases_api
+                            .patch_status(
                                 &name,
-                                &ctx.backend,
+                                &PatchParams::apply("kobe-operator"),
+                                &Patch::Merge(&patch),
                             )
                             .await
-                            {
-                                Ok(url) => Some(url),
-                                Err(e) => {
-                                    warn!(
-                                        lease = %name,
-                                        cluster = %cluster_name,
-                                        "Failed to capture diagnostic bundle: {e:#}"
-                                    );
-                                    None
-                                }
-                            };
-
-                            if let Some(url) = &diag_url {
-                                let patch = serde_json::json!({
-                                    "status": { "diagnosticsUrl": url }
-                                });
-                                if let Err(e) = leases_api
-                                    .patch_status(
-                                        &name,
-                                        &PatchParams::apply("kobe-operator"),
-                                        &Patch::Merge(&patch),
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        lease = %name,
-                                        diagnostics_url = %url,
-                                        "Failed to record diagnostics URL on lease status: {e}"
-                                    );
-                                }
-                            }
+                        {
+                            error!(
+                                lease = %name,
+                                diagnostics_url = %url,
+                                "Failed to record diagnostics URL on lease status: {e}"
+                            );
                         }
                     }
                 }

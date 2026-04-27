@@ -41,17 +41,16 @@ pub fn translate_endpoints_to_host(
                             .iter()
                             .map(|addr| {
                                 let mut new_addr = addr.clone();
-                                if let Some(ref target_ref) = addr.target_ref {
-                                    if let Some(ref pod_name) = target_ref.name {
-                                        if translator.to_virtual(pod_name).is_none() {
-                                            let mut new_ref = target_ref.clone();
-                                            new_ref.name =
-                                                Some(translator.to_host_name(pod_name, virtual_ns));
-                                            new_ref.namespace =
-                                                Some(translator.host_namespace().to_string());
-                                            new_addr.target_ref = Some(new_ref);
-                                        }
-                                    }
+                                if let Some(ref target_ref) = addr.target_ref
+                                    && let Some(ref pod_name) = target_ref.name
+                                    && translator.to_virtual(pod_name).is_none()
+                                {
+                                    let mut new_ref = target_ref.clone();
+                                    new_ref.name =
+                                        Some(translator.to_host_name(pod_name, virtual_ns));
+                                    new_ref.namespace =
+                                        Some(translator.host_namespace().to_string());
+                                    new_addr.target_ref = Some(new_ref);
                                 }
                                 new_addr
                             })
@@ -66,17 +65,16 @@ pub fn translate_endpoints_to_host(
                             .iter()
                             .map(|addr| {
                                 let mut new_addr = addr.clone();
-                                if let Some(ref target_ref) = addr.target_ref {
-                                    if let Some(ref pod_name) = target_ref.name {
-                                        if translator.to_virtual(pod_name).is_none() {
-                                            let mut new_ref = target_ref.clone();
-                                            new_ref.name =
-                                                Some(translator.to_host_name(pod_name, virtual_ns));
-                                            new_ref.namespace =
-                                                Some(translator.host_namespace().to_string());
-                                            new_addr.target_ref = Some(new_ref);
-                                        }
-                                    }
+                                if let Some(ref target_ref) = addr.target_ref
+                                    && let Some(ref pod_name) = target_ref.name
+                                    && translator.to_virtual(pod_name).is_none()
+                                {
+                                    let mut new_ref = target_ref.clone();
+                                    new_ref.name =
+                                        Some(translator.to_host_name(pod_name, virtual_ns));
+                                    new_ref.namespace =
+                                        Some(translator.host_namespace().to_string());
+                                    new_addr.target_ref = Some(new_ref);
                                 }
                                 new_addr
                             })

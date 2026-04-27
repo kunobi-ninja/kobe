@@ -86,10 +86,10 @@ async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
             .await?;
         if let Some(methods) = resp["auth"]["methods"].as_array() {
             for method in methods {
-                if method["type"].as_str() == Some("ssh") {
-                    if let Some(audience) = method["audience"].as_str() {
-                        return Ok(audience.to_string());
-                    }
+                if method["type"].as_str() == Some("ssh")
+                    && let Some(audience) = method["audience"].as_str()
+                {
+                    return Ok(audience.to_string());
                 }
             }
         }

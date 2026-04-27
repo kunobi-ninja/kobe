@@ -123,13 +123,13 @@ fn translate_volumes_v2(
         // Remove projected volumes that contain service account token
         // projections. These are auto-injected by Kubernetes for SA token
         // mounting and should not exist on the host Pod.
-        if let Some(ref projected) = vol.projected {
-            if let Some(ref sources) = projected.sources {
-                let has_sa_token = sources.iter().any(|s| s.service_account_token.is_some());
-                if has_sa_token {
-                    dropped_names.insert(vol.name.clone());
-                    continue;
-                }
+        if let Some(ref projected) = vol.projected
+            && let Some(ref sources) = projected.sources
+        {
+            let has_sa_token = sources.iter().any(|s| s.service_account_token.is_some());
+            if has_sa_token {
+                dropped_names.insert(vol.name.clone());
+                continue;
             }
         }
 
@@ -147,15 +147,14 @@ fn translate_volumes_v2(
         }
 
         // Secret volume source.
-        if let Some(ref secret) = vol.secret {
-            if let Some(ref secret_name) = secret.secret_name {
-                if translator.to_virtual(secret_name).is_none() {
-                    translated.secret = Some(SecretVolumeSource {
-                        secret_name: Some(translator.to_host_name(secret_name, virtual_ns)),
-                        ..secret.clone()
-                    });
-                }
-            }
+        if let Some(ref secret) = vol.secret
+            && let Some(ref secret_name) = secret.secret_name
+            && translator.to_virtual(secret_name).is_none()
+        {
+            translated.secret = Some(SecretVolumeSource {
+                secret_name: Some(translator.to_host_name(secret_name, virtual_ns)),
+                ..secret.clone()
+            });
         }
 
         // PVC volume source.

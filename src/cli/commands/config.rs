@@ -479,10 +479,10 @@ pub async fn config_import(path: Option<&str>, output: OutputFormat) -> Result<(
     }
 
     let mut config: CliConfig = serde_json::from_str(&input)?;
-    if let Some(current) = config.current_target.as_deref() {
-        if !config.targets.contains_key(current) {
-            anyhow::bail!("Imported config references unknown current_target '{current}'");
-        }
+    if let Some(current) = config.current_target.as_deref()
+        && !config.targets.contains_key(current)
+    {
+        anyhow::bail!("Imported config references unknown current_target '{current}'");
     }
     if config.migrate_legacy_to_default_target() {
         // Preserve migration behavior for older exported configs.

@@ -402,33 +402,32 @@ async fn provision_instance<B: ClusterBackend + Clone>(
 ) -> Result<(), InstanceError> {
     let is_k3s = matches!(config.backend.backend_type, BackendType::K3s);
 
-    if !is_k3s {
-        if let (Some(velero), Some(snapshot)) = (&ctx.velero, &config.snapshot) {
-            if snapshot.enabled {
-                let generation = 1;
-                if let Ok(Some(backup_name)) = velero
-                    .get_golden_backup(&config.owner_name, snapshot, generation)
-                    .await
-                {
-                    info!(
-                        instance = %name,
-                        owner = %config.owner_name,
-                        backup = %backup_name,
-                        "Restoring instance from golden backup"
-                    );
-                    if velero
-                        .restore_from_golden(&backup_name, snapshot, &config.owner_name, namespace)
-                        .await
-                        .is_ok()
-                    {
-                        crate::metrics::PROVISION_METHOD
-                            .with_label_values(&[config.owner_name.as_str(), "restore"])
-                            .inc();
-                        return Ok(());
-                    }
-                    warn!(instance = %name, backup = %backup_name, "Golden restore failed, falling back to fresh create");
-                }
+    if !is_k3s
+        && let (Some(velero), Some(snapshot)) = (&ctx.velero, &config.snapshot)
+        && snapshot.enabled
+    {
+        let generation = 1;
+        if let Ok(Some(backup_name)) = velero
+            .get_golden_backup(&config.owner_name, snapshot, generation)
+            .await
+        {
+            info!(
+                instance = %name,
+                owner = %config.owner_name,
+                backup = %backup_name,
+                "Restoring instance from golden backup"
+            );
+            if velero
+                .restore_from_golden(&backup_name, snapshot, &config.owner_name, namespace)
+                .await
+                .is_ok()
+            {
+                crate::metrics::PROVISION_METHOD
+                    .with_label_values(&[config.owner_name.as_str(), "restore"])
+                    .inc();
+                return Ok(());
             }
+            warn!(instance = %name, backup = %backup_name, "Golden restore failed, falling back to fresh create");
         }
     }
 

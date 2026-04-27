@@ -537,10 +537,10 @@ pub async fn dispatch_upgrade(
             .map(|c| c.to_bytes())
             .unwrap_or_default();
         let mut builder = Response::builder().status(upstream_status);
-        if let Some(ct) = resp_headers.get("content-type") {
-            if let Ok(s) = ct.to_str() {
-                builder = builder.header("content-type", s);
-            }
+        if let Some(ct) = resp_headers.get("content-type")
+            && let Ok(s) = ct.to_str()
+        {
+            builder = builder.header("content-type", s);
         }
         let resp = builder
             .body(body_from_bytes(body_bytes))

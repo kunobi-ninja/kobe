@@ -310,18 +310,17 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
                     .and_then(|s| s.node_name.as_deref())
                     .is_some();
 
-                if !already_bound {
-                    if let Err(e) =
+                if !already_bound
+                    && let Err(e) =
                         bind_virtual_pod(&ctx.virtual_client, &virtual_name, &virtual_ns, host_node)
                             .await
-                    {
-                        warn!(
-                            error = %e,
-                            virtual_name = %virtual_name,
-                            virtual_ns = %virtual_ns,
-                            "StatusSyncerV2: failed to bind virtual pod"
-                        );
-                    }
+                {
+                    warn!(
+                        error = %e,
+                        virtual_name = %virtual_name,
+                        virtual_ns = %virtual_ns,
+                        "StatusSyncerV2: failed to bind virtual pod"
+                    );
                 }
             }
         }

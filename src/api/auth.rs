@@ -563,10 +563,10 @@ impl JwtAuthenticator {
         // Check cache
         {
             let cache = self.jwks_cache.read().await;
-            if let Some(cached) = cache.get(jwks_url) {
-                if cached.fetched_at.elapsed() < JWKS_CACHE_TTL {
-                    return Self::find_key(&cached.keys, kid);
-                }
+            if let Some(cached) = cache.get(jwks_url)
+                && cached.fetched_at.elapsed() < JWKS_CACHE_TTL
+            {
+                return Self::find_key(&cached.keys, kid);
             }
         }
 
@@ -597,10 +597,10 @@ impl JwtAuthenticator {
 
         // Check-lock-check: another task may have refreshed while we were fetching
         let mut cache = self.jwks_cache.write().await;
-        if let Some(existing) = cache.get(jwks_url) {
-            if existing.fetched_at.elapsed() < JWKS_CACHE_TTL {
-                return Self::find_key(&existing.keys, kid);
-            }
+        if let Some(existing) = cache.get(jwks_url)
+            && existing.fetched_at.elapsed() < JWKS_CACHE_TTL
+        {
+            return Self::find_key(&existing.keys, kid);
         }
         cache.insert(jwks_url.to_string(), jwk_set);
         drop(cache);
@@ -661,10 +661,10 @@ fn find_matching_rule_with_claims<'a>(
     for rule in rules {
         match &rule.match_clause {
             Some(ClaimMatch { claim, value }) => {
-                if let Some(actual) = get_claim_value(&claims.extra, &claims.sub, claim) {
-                    if actual == *value {
-                        return Ok((rule, Some(value.clone())));
-                    }
+                if let Some(actual) = get_claim_value(&claims.extra, &claims.sub, claim)
+                    && actual == *value
+                {
+                    return Ok((rule, Some(value.clone())));
                 }
             }
             None => {

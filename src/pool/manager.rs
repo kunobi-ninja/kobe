@@ -95,28 +95,26 @@ pub fn compute_pool_actions(
     // --- Recycle unclaimed clusters with stale spec ---
     let current_hash = profile_spec_hash(profile);
     for (name, entry) in &state.clusters {
-        if entry.state == ClusterState::Ready {
-            if let Some(hash) = entry.spec_hash {
-                if hash != current_hash {
-                    tracing::info!(
-                        cluster = %name,
-                        "Cluster spec differs from profile, scheduling recreation"
-                    );
-                    actions.push(PoolAction::Delete(name.clone()));
-                }
-            }
+        if entry.state == ClusterState::Ready
+            && let Some(hash) = entry.spec_hash
+            && hash != current_hash
+        {
+            tracing::info!(
+                cluster = %name,
+                "Cluster spec differs from profile, scheduling recreation"
+            );
+            actions.push(PoolAction::Delete(name.clone()));
         }
     }
 
     // --- Timeout stuck Creating clusters (>10 minutes) ---
     let creating_timeout = chrono::Duration::minutes(10);
     for (name, entry) in &state.clusters {
-        if entry.state == ClusterState::Creating {
-            if let Some(since) = entry.state_since {
-                if now - since > creating_timeout {
-                    actions.push(PoolAction::Delete(name.clone()));
-                }
-            }
+        if entry.state == ClusterState::Creating
+            && let Some(since) = entry.state_since
+            && now - since > creating_timeout
+        {
+            actions.push(PoolAction::Delete(name.clone()));
         }
     }
 

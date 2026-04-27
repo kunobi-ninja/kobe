@@ -133,12 +133,11 @@ pub(crate) fn local_kubeconfig_candidates() -> Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn resolve_kubeconfig_path(endpoint: &str, lease_id: &str) -> Option<String> {
-    if let Ok(state) = CliState::load() {
-        if let Some(artifact) = state.lease_artifacts.get(&lease_key(endpoint, lease_id)) {
-            if Path::new(&artifact.kubeconfig_path).exists() {
-                return Some(artifact.kubeconfig_path.clone());
-            }
-        }
+    if let Ok(state) = CliState::load()
+        && let Some(artifact) = state.lease_artifacts.get(&lease_key(endpoint, lease_id))
+        && Path::new(&artifact.kubeconfig_path).exists()
+    {
+        return Some(artifact.kubeconfig_path.clone());
     }
 
     let default = default_kubeconfig_path(lease_id);

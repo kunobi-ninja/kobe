@@ -32,9 +32,22 @@ enum Commands {
     Status,
     /// Show CLI and endpoint versions
     Version,
-    /// Authenticate with the Kobe service
-    Login,
-    /// Remove stored credentials
+    /// Authenticate with the Kobe service.
+    ///
+    /// Default flow opens the system browser and listens on a localhost
+    /// callback. With --device, prints a verification URL + user code
+    /// for completing auth on any device with a browser — useful over
+    /// SSH, in CI, or on headless hosts.
+    Login {
+        /// Use the RFC 8628 Device Authorization Grant flow instead of
+        /// opening a local browser. Prints a URL + code for the user
+        /// to complete on a phone/laptop.
+        #[arg(long)]
+        device: bool,
+    },
+    /// Remove stored credentials. Also revokes the refresh + access
+    /// tokens at the IdP (RFC 7009) so a leaked token can't outlive
+    /// `kobe logout`.
     Logout,
     /// Lease a cluster from a pool and wait until it is ready
     Lease {
@@ -143,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Status => commands::status(target, endpoint, output).await,
         Commands::Version => commands::version(target, endpoint, output).await,
-        Commands::Login => commands::login(target, endpoint).await,
+        Commands::Login { device } => commands::login(target, endpoint, device).await,
         Commands::Logout => commands::logout(target, endpoint).await,
         Commands::Lease {
             pool,
@@ -177,12 +190,10 @@ async fn main() -> anyhow::Result<()> {
                 commands::config_import(path.as_deref(), output).await
             }
             Some(ConfigAction::Edit { name }) => {
-                if let (Some(flag), Some(arg)) = (target, name.as_deref()) {
-                    if flag != arg {
-                        anyhow::bail!(
-                            "Specify either --target {flag} or config edit {arg}, not both"
-                        );
-                    }
+                if let (Some(flag), Some(arg)) = (target, name.as_deref())
+                    && flag != arg
+                {
+                    anyhow::bail!("Specify either --target {flag} or config edit {arg}, not both");
                 }
                 commands::config_interactive(name.as_deref().or(target))
             }

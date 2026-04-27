@@ -309,103 +309,103 @@ pub fn run_config_tui(target_override: Option<&str>) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, &state))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
 
-                match state.mode {
-                    Mode::Navigate => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if state.dirty {
-                                state.mode = Mode::ConfirmQuit;
-                            } else {
-                                break;
-                            }
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match state.mode {
+                Mode::Navigate => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if state.dirty {
+                            state.mode = Mode::ConfirmQuit;
+                        } else {
                             break;
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            state.status = None;
-                            if state.cursor > 0 {
-                                state.cursor -= 1;
-                            }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.status = None;
+                        if state.cursor > 0 {
+                            state.cursor -= 1;
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            state.status = None;
-                            if state.cursor + 1 < state.fields.len() {
-                                state.cursor += 1;
-                            }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.status = None;
+                        if state.cursor + 1 < state.fields.len() {
+                            state.cursor += 1;
                         }
-                        KeyCode::Left => {
-                            state.status = None;
-                            if cycle_select(&mut state.fields[state.cursor], true) {
-                                state.dirty = true;
-                            }
+                    }
+                    KeyCode::Left => {
+                        state.status = None;
+                        if cycle_select(&mut state.fields[state.cursor], true) {
+                            state.dirty = true;
                         }
-                        KeyCode::Right => {
-                            state.status = None;
-                            if cycle_select(&mut state.fields[state.cursor], false) {
-                                state.dirty = true;
-                            }
+                    }
+                    KeyCode::Right => {
+                        state.status = None;
+                        if cycle_select(&mut state.fields[state.cursor], false) {
+                            state.dirty = true;
                         }
-                        KeyCode::Enter => {
-                            state.status = None;
-                            let field = &state.fields[state.cursor];
-                            if field.kind != FieldKind::Select {
-                                state.edit_buffer = field.value.clone();
-                                state.edit_cursor = state.edit_buffer.len();
-                                state.mode = Mode::Editing;
-                            }
+                    }
+                    KeyCode::Enter => {
+                        state.status = None;
+                        let field = &state.fields[state.cursor];
+                        if field.kind != FieldKind::Select {
+                            state.edit_buffer = field.value.clone();
+                            state.edit_cursor = state.edit_buffer.len();
+                            state.mode = Mode::Editing;
                         }
-                        KeyCode::Char('s') => {
-                            let updated_config =
-                                fields_to_config(&state.fields, &config, &state.target)?;
-                            updated_config.save()?;
-                            state.dirty = false;
-                            state.status = Some("Saved!".to_string());
+                    }
+                    KeyCode::Char('s') => {
+                        let updated_config =
+                            fields_to_config(&state.fields, &config, &state.target)?;
+                        updated_config.save()?;
+                        state.dirty = false;
+                        state.status = Some("Saved!".to_string());
+                    }
+                    _ => {}
+                },
+                Mode::Editing => match key.code {
+                    KeyCode::Enter | KeyCode::Esc => {
+                        if key.code == KeyCode::Enter {
+                            state.fields[state.cursor].value = state.edit_buffer.clone();
+                            state.dirty = true;
                         }
-                        _ => {}
-                    },
-                    Mode::Editing => match key.code {
-                        KeyCode::Enter | KeyCode::Esc => {
-                            if key.code == KeyCode::Enter {
-                                state.fields[state.cursor].value = state.edit_buffer.clone();
-                                state.dirty = true;
-                            }
-                            state.mode = Mode::Navigate;
-                        }
-                        KeyCode::Char(c) => {
-                            state.edit_buffer.insert(state.edit_cursor, c);
-                            state.edit_cursor += 1;
-                        }
-                        KeyCode::Backspace if state.edit_cursor > 0 => {
-                            state.edit_cursor -= 1;
-                            state.edit_buffer.remove(state.edit_cursor);
-                        }
-                        KeyCode::Left if state.edit_cursor > 0 => {
-                            state.edit_cursor -= 1;
-                        }
-                        KeyCode::Right if state.edit_cursor < state.edit_buffer.len() => {
-                            state.edit_cursor += 1;
-                        }
-                        KeyCode::Home => state.edit_cursor = 0,
-                        KeyCode::End => state.edit_cursor = state.edit_buffer.len(),
-                        _ => {}
-                    },
-                    Mode::ConfirmQuit => match key.code {
-                        KeyCode::Char('y') => break,
-                        KeyCode::Char('s') => {
-                            let updated_config =
-                                fields_to_config(&state.fields, &config, &state.target)?;
-                            updated_config.save()?;
-                            break;
-                        }
-                        _ => state.mode = Mode::Navigate,
-                    },
-                }
+                        state.mode = Mode::Navigate;
+                    }
+                    KeyCode::Char(c) => {
+                        state.edit_buffer.insert(state.edit_cursor, c);
+                        state.edit_cursor += 1;
+                    }
+                    KeyCode::Backspace if state.edit_cursor > 0 => {
+                        state.edit_cursor -= 1;
+                        state.edit_buffer.remove(state.edit_cursor);
+                    }
+                    KeyCode::Left if state.edit_cursor > 0 => {
+                        state.edit_cursor -= 1;
+                    }
+                    KeyCode::Right if state.edit_cursor < state.edit_buffer.len() => {
+                        state.edit_cursor += 1;
+                    }
+                    KeyCode::Home => state.edit_cursor = 0,
+                    KeyCode::End => state.edit_cursor = state.edit_buffer.len(),
+                    _ => {}
+                },
+                Mode::ConfirmQuit => match key.code {
+                    KeyCode::Char('y') => break,
+                    KeyCode::Char('s') => {
+                        let updated_config =
+                            fields_to_config(&state.fields, &config, &state.target)?;
+                        updated_config.save()?;
+                        break;
+                    }
+                    _ => state.mode = Mode::Navigate,
+                },
             }
         }
     }

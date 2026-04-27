@@ -33,12 +33,12 @@ pub fn translate_ingress_to_host(
         let mut new_spec = spec.clone();
 
         // Translate the default backend service name.
-        if let Some(ref mut default_backend) = new_spec.default_backend {
-            if let Some(ref mut svc) = default_backend.service {
-                if !svc.name.is_empty() && translator.to_virtual(&svc.name).is_none() {
-                    svc.name = translator.to_host_name(&svc.name, virtual_ns);
-                }
-            }
+        if let Some(ref mut default_backend) = new_spec.default_backend
+            && let Some(ref mut svc) = default_backend.service
+            && !svc.name.is_empty()
+            && translator.to_virtual(&svc.name).is_none()
+        {
+            svc.name = translator.to_host_name(&svc.name, virtual_ns);
         }
 
         // Translate rule backend service names.
@@ -46,10 +46,11 @@ pub fn translate_ingress_to_host(
             for rule in rules.iter_mut() {
                 if let Some(ref mut http) = rule.http {
                     for path in &mut http.paths {
-                        if let Some(ref mut svc) = path.backend.service {
-                            if !svc.name.is_empty() && translator.to_virtual(&svc.name).is_none() {
-                                svc.name = translator.to_host_name(&svc.name, virtual_ns);
-                            }
+                        if let Some(ref mut svc) = path.backend.service
+                            && !svc.name.is_empty()
+                            && translator.to_virtual(&svc.name).is_none()
+                        {
+                            svc.name = translator.to_host_name(&svc.name, virtual_ns);
                         }
                     }
                 }
@@ -59,10 +60,11 @@ pub fn translate_ingress_to_host(
         // Translate TLS secret names.
         if let Some(ref mut tls_list) = new_spec.tls {
             for tls in tls_list.iter_mut() {
-                if let Some(ref secret_name) = tls.secret_name.clone() {
-                    if !secret_name.is_empty() && translator.to_virtual(secret_name).is_none() {
-                        tls.secret_name = Some(translator.to_host_name(secret_name, virtual_ns));
-                    }
+                if let Some(ref secret_name) = tls.secret_name.clone()
+                    && !secret_name.is_empty()
+                    && translator.to_virtual(secret_name).is_none()
+                {
+                    tls.secret_name = Some(translator.to_host_name(secret_name, virtual_ns));
                 }
             }
         }

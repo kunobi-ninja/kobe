@@ -56,9 +56,9 @@ pub fn init() -> Result<Option<SdkTracerProvider>> {
 
 /// Gracefully shut down the OTel pipeline, flushing any pending spans.
 pub fn shutdown(provider: Option<SdkTracerProvider>) {
-    if let Some(provider) = provider {
-        if let Err(e) = provider.shutdown() {
-            eprintln!("OpenTelemetry shutdown error: {e}");
-        }
+    if let Some(provider) = provider
+        && let Err(e) = provider.shutdown()
+    {
+        eprintln!("OpenTelemetry shutdown error: {e}");
     }
 }

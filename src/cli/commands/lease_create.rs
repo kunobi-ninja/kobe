@@ -239,12 +239,12 @@ async fn wait_for_usable_lease(
     let client = authed_client();
 
     loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "Timed out waiting for lease {lease_id} to become ready. Use --no-wait to return the queued lease immediately."
-                );
-            }
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            anyhow::bail!(
+                "Timed out waiting for lease {lease_id} to become ready. Use --no-wait to return the queued lease immediately."
+            );
         }
 
         let token = get_auth_header(config, "GET", &path, b"").await?;
@@ -346,44 +346,42 @@ fn default_named_kubeconfig_path(pool: &str, lease_id: &str) -> PathBuf {
 fn rewrite_local_kubeconfig_names(kubeconfig: &str, alias: &str) -> Result<String> {
     let mut doc: Value = serde_yaml_ng::from_str(kubeconfig)?;
 
-    if let Some(clusters) = doc.get_mut("clusters").and_then(Value::as_sequence_mut) {
-        if let Some(cluster) = clusters.first_mut() {
-            if let Some(name) = cluster.get_mut("name") {
-                *name = Value::String(alias.to_string());
-            }
-        }
+    if let Some(clusters) = doc.get_mut("clusters").and_then(Value::as_sequence_mut)
+        && let Some(cluster) = clusters.first_mut()
+        && let Some(name) = cluster.get_mut("name")
+    {
+        *name = Value::String(alias.to_string());
     }
 
     if let Some(current_context) = doc.get_mut("current-context") {
         *current_context = Value::String(alias.to_string());
     }
 
-    if let Some(contexts) = doc.get_mut("contexts").and_then(Value::as_sequence_mut) {
-        if let Some(context) = contexts.first_mut() {
-            if let Some(name) = context.get_mut("name") {
-                *name = Value::String(alias.to_string());
-            }
-            if let Some(cluster) = context
-                .get_mut("context")
-                .and_then(|ctx| ctx.get_mut("cluster"))
-            {
-                *cluster = Value::String(alias.to_string());
-            }
-            if let Some(user) = context
-                .get_mut("context")
-                .and_then(|ctx| ctx.get_mut("user"))
-            {
-                *user = Value::String(alias.to_string());
-            }
+    if let Some(contexts) = doc.get_mut("contexts").and_then(Value::as_sequence_mut)
+        && let Some(context) = contexts.first_mut()
+    {
+        if let Some(name) = context.get_mut("name") {
+            *name = Value::String(alias.to_string());
+        }
+        if let Some(cluster) = context
+            .get_mut("context")
+            .and_then(|ctx| ctx.get_mut("cluster"))
+        {
+            *cluster = Value::String(alias.to_string());
+        }
+        if let Some(user) = context
+            .get_mut("context")
+            .and_then(|ctx| ctx.get_mut("user"))
+        {
+            *user = Value::String(alias.to_string());
         }
     }
 
-    if let Some(users) = doc.get_mut("users").and_then(Value::as_sequence_mut) {
-        if let Some(user) = users.first_mut() {
-            if let Some(name) = user.get_mut("name") {
-                *name = Value::String(alias.to_string());
-            }
-        }
+    if let Some(users) = doc.get_mut("users").and_then(Value::as_sequence_mut)
+        && let Some(user) = users.first_mut()
+        && let Some(name) = user.get_mut("name")
+    {
+        *name = Value::String(alias.to_string());
     }
 
     Ok(serde_yaml_ng::to_string(&doc)?)
