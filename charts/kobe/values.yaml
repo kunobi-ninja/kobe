@@ -162,12 +162,30 @@ kine:
     # single vkobe pool member coming up alongside a steady-state one,
     # producing "context deadline exceeded" txn errors. 2 cores leaves
     # ample headroom.
+    #
+    # Memory follows the same shape: under concurrent bootstrap load
+    # (ServiceAccounts, CRDs, CertManager, Flux components — all writing
+    # simultaneously) kine's SQLite WAL, connection pool buffers, and
+    # query plan cache push memory well past 512Mi. Hitting the limit
+    # OOMKills the pod, which causes apiserver lease renewals in every
+    # dependent vkobe instance to time out (5s deadline), kube-controller-
+    # manager loses its lease and shuts down, the bootstrap Job fails,
+    # the ClusterPool recycles the instance, the new instance triggers
+    # more bootstrap load on a freshly-restarted kine, and the cycle
+    # repeats — observed in production with 10+ kine restarts in a day,
+    # all OOMKilled, every vkobe-flux pool member stuck in a
+    # bootstrap-fail-recycle loop.
+    #
+    # 2Gi limit is conservative for the documented `maxClusters: 20`
+    # and proportional to the CPU bump above. 256Mi request gives
+    # scheduler enough signal not to over-pack the node when kine is
+    # actively serving traffic.
     requests:
       cpu: "200m"
-      memory: "128Mi"
+      memory: "256Mi"
     limits:
       cpu: "2"
-      memory: "512Mi"
+      memory: "2Gi"
   nodeSelector: {}
   tolerations: []
 
