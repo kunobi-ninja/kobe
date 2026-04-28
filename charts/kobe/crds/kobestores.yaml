@@ -83,6 +83,61 @@ spec:
             description: Runtime status of a KobeStore.
             nullable: true
             properties:
+              conditions:
+                description: |-
+                  Health conditions surfaced by the operator. Currently emitted:
+                  `Healthy` — based on the backing workload's pod
+                  `containerStatuses` (OOMKilled, restart pressure, NotReady).
+
+                  Pattern follows core/v1 condition shape so `kubectl` and ops
+                  tooling can read it consistently. The profile controller treats
+                  `Healthy=False` as a signal to halt new ClusterInstance creates
+                  against this store, breaking the bootstrap-fail-recycle loop
+                  that compounds load on a degraded backend.
+
+                  `skip_serializing_if = "Vec::is_empty"` avoids a JSON Merge
+                  Patch dropping the field to `null` when other status writers
+                  (e.g. the `ready` / `current_clusters` updater) re-emit status
+                  without conditions of their own.
+                items:
+                  description: |-
+                    One status condition on a KobeStore. Mirrors the core/v1 condition
+                    shape (type/status/reason/message/lastTransitionTime) so kubectl
+                    and operators see a familiar surface.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        RFC3339 of the last status change. Updated only when `status`
+                        flips (True ↔ False ↔ Unknown), not on every reconcile, so
+                        tools tailing `kubectl get -w` see meaningful events.
+                      nullable: true
+                      type: string
+                    message:
+                      description: |-
+                        Human-readable detail. Includes the last failure timestamp and
+                        any field operators need to triage without re-walking the
+                        kubectl describe chain.
+                      type: string
+                    reason:
+                      description: |-
+                        Machine-readable reason. Examples for `Healthy=False`:
+                        `MemoryPressure` (recent OOMKill), `RestartLoop` (≥3 restarts in window),
+                        `NotReady` (containers not all ready), `WorkloadMissing` (referenced
+                        Deployment/StatefulSet not found).
+                      type: string
+                    status:
+                      description: 'One of: `True`, `False`, `Unknown`.'
+                      type: string
+                    type:
+                      description: Condition name. Currently the only emitted value is `Healthy`.
+                      type: string
+                  required:
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
               currentClusters:
                 default: 0
                 description: Number of virtual clusters currently using this KobeStore.
@@ -91,7 +146,10 @@ spec:
                 type: integer
               ready:
                 default: false
-                description: Whether the KobeStore is reachable and healthy.
+                description: |-
+                  Whether the KobeStore is reachable and healthy.
+                  Kept for backward compatibility; new code should consult
+                  `conditions[type=Healthy]` for richer reasons + messages.
                 type: boolean
               usedBy:
                 default: []

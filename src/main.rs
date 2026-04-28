@@ -206,6 +206,25 @@ async fn main() -> anyhow::Result<()> {
         controllers::ipam::run_ipam_controller(ipam_client, &ipam_ns, ipam_shutdown).await;
     });
 
+    // Start KobeStore health controller. Watches `KobeStore` CRs,
+    // observes the backing Deployment/StatefulSet pods, and patches a
+    // `Healthy` condition into `status.conditions` based on OOMKill /
+    // restart loop / NotReady signals. The profile controller reads
+    // this condition before creating new ClusterInstances and pauses
+    // creates against degraded backends — breaking the bootstrap-
+    // fail-recycle loop that compounds load on a failing kine.
+    let health_client = client.clone();
+    let health_ns = namespace.clone();
+    let health_shutdown = shutdown.clone();
+    let health_handle = tokio::spawn(async move {
+        controllers::kobestore_health::run_kobestore_health_controller(
+            health_client,
+            &health_ns,
+            health_shutdown,
+        )
+        .await;
+    });
+
     // Monitor all tasks — if any dies, trigger shutdown
     let controller_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -238,6 +257,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("IPAM controller exited unexpectedly"),
                     Err(e) => error!("IPAM controller panicked: {e}"),
+                }
+            }
+            result = health_handle => {
+                match result {
+                    Ok(()) => warn!("KobeStore health controller exited unexpectedly"),
+                    Err(e) => error!("KobeStore health controller panicked: {e}"),
                 }
             }
         }

@@ -493,6 +493,7 @@ mod tests {
                     name: "vc-042".into(),
                 },
             ],
+            conditions: vec![],
         };
 
         let json = serde_json::to_value(&status).unwrap();

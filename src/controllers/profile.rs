@@ -418,9 +418,37 @@ async fn reconcile_profile(
         &bootstrap_specs,
     );
 
+    // Check whether the backend datastore is degraded. When kine/etcd
+    // is OOMKilling or in a restart loop, every new ClusterInstance we
+    // create will fail to bootstrap (apiserver lease writes time out
+    // → kube-controller-manager loses its lease → flux install hangs
+    // → BackoffLimitExceeded → recycle), and the recycle adds more
+    // load to the already-broken backend. Refusing to spawn new
+    // instances breaks that cycle. Other actions (Delete, Recycle of
+    // already-failed instances) still proceed so we don't strand
+    // resources.
+    //
+    // `None` means OK-to-create; `Some(reason)` means halt creates
+    // for this reconcile and surface the reason in the
+    // ClusterPool.status. See `controllers::kobestore_health` for the
+    // condition this reads from.
+    let backend_block = pool_creation_blocked_by_backend(&ctx.client, &ns, &profile).await;
+    if let Some(ref reason) = backend_block {
+        warn!(profile = %name, reason = %reason,
+              "Pool creates paused: backend datastore is degraded");
+    }
+
     for action in &actions {
         match action {
             PoolAction::Create(cluster_name) => {
+                if let Some(ref reason) = backend_block {
+                    debug!(
+                        profile = %name, cluster = %cluster_name,
+                        reason = %reason,
+                        "Skipping Create: backend datastore degraded"
+                    );
+                    continue;
+                }
                 info!(profile = %name, cluster = %cluster_name, "Creating cluster");
                 let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
                 ensure_cluster_instance(
@@ -665,6 +693,38 @@ async fn resolve_bootstrap_specs(
         }
     }
     specs
+}
+
+/// Returns `Some(reason)` when the pool's backend datastore (a
+/// `KobeStore`, currently only relevant for vkobe pools) is in a
+/// `Healthy=False` state, so the profile controller should refuse to
+/// create new ClusterInstances against it. `None` means either the
+/// pool doesn't reference a KobeStore (k3s/k0s/CAPI) or the backend
+/// is healthy / unknown / unevaluated.
+///
+/// Why not just always check the KobeStore? For vkobe pools we look
+/// up `profile.spec.backend.vkobe.data_store_ref.name` and read its
+/// status. For non-vkobe pools, the concept doesn't apply, so we skip.
+///
+/// Why "Unknown" doesn't block: the `Unknown` state is what the health
+/// controller writes for externally-managed KobeStores it can't
+/// observe. Blocking creates against external stores would be a
+/// regression — the operator has no basis to claim they're degraded.
+async fn pool_creation_blocked_by_backend(
+    client: &Client,
+    namespace: &str,
+    profile: &ClusterPool,
+) -> Option<String> {
+    let store_name = profile
+        .spec
+        .backend
+        .vkobe
+        .as_ref()
+        .map(|v| v.data_store_ref.name.clone())?;
+
+    let stores: Api<crate::crd::KobeStore> = Api::namespaced(client.clone(), namespace);
+    let store = stores.get(&store_name).await.ok()?;
+    crate::controllers::kobestore_health::unhealthy_reason(&store)
 }
 
 fn error_policy(
