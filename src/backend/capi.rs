@@ -633,6 +633,7 @@ mod tests {
             persistence: None,
             expose: None,
             taints: None,
+            ..Default::default()
         };
 
         let result = backend.create("my-vc", "test-ns", &config, &[]).await;

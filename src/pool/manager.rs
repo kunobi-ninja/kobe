@@ -18,11 +18,89 @@ use crate::crd::ClusterPool;
 /// as `{:016x}`), so equality comparison works directly via `==`.
 pub type SpecHash = String;
 
+/// Operator-level context that affects rendered backend resources but
+/// isn't part of the ClusterPool spec users write.
+///
+/// Anything in here is rolled into `profile_spec_hash`, so when the
+/// operator is upgraded with a new value (`KOBE_SYNC_IMAGE` bump,
+/// new defaults, …) existing pool members detect drift and recycle
+/// automatically. Without this, a sidecar image change in the operator
+/// Deployment env would land but every existing vkobe pool would keep
+/// running its old sidecar binary indefinitely (k8s only triggers a
+/// rollout when the *workload* spec changes, and the workload's image
+/// is interpolated from the operator env at create time — invisible to
+/// the workload's PodTemplate hash).
+///
+/// Backends that don't consume a particular field ignore it during
+/// hashing, so unrelated pool members aren't churned by a config bump
+/// that doesn't affect them (e.g. a `kobe-sync` image bump leaves k3s
+/// and k0s pool spec hashes untouched).
+#[derive(Debug, Clone)]
+pub struct RenderContext {
+    /// Image of the kobe-sync sidecar deployed inside vkobe pods. Read
+    /// from the `KOBE_SYNC_IMAGE` env at operator startup. Only vkobe
+    /// pools fold this into their spec hash.
+    pub kobe_sync_image: String,
+}
+
+impl RenderContext {
+    /// Read the operator-level config from environment at startup.
+    pub fn from_env() -> Self {
+        Self {
+            kobe_sync_image: std::env::var("KOBE_SYNC_IMAGE")
+                .unwrap_or_else(|_| "zondax/kobe-sync:unknown".to_string()),
+        }
+    }
+
+    /// Build a context with a specific kobe-sync image. Used in tests
+    /// and by callers that want to compare hashes against a known-good
+    /// reference value.
+    ///
+    /// `#[allow(dead_code)]` shields the cross-binary visibility quirk:
+    /// the `crdgen` binary imports this module to walk schemas but
+    /// never instantiates `RenderContext`, so clippy flags this as
+    /// dead from its perspective even though the operator binary and
+    /// tests both call it.
+    #[allow(dead_code)]
+    pub fn with_kobe_sync_image(image: impl Into<String>) -> Self {
+        Self {
+            kobe_sync_image: image.into(),
+        }
+    }
+}
+
 /// Compute a hash of the profile's cluster-relevant fields.
 ///
 /// Returns the hash as fixed-width hex so the value round-trips through
 /// the apiserver as a string — see `SpecHash` doc for why this matters.
-pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
+///
+/// The hash folds in three sources:
+///
+/// 1. The user-visible ClusterPool spec (cluster config, addons,
+///    bootstrap **references**, etc.).
+/// 2. `RenderContext` — operator-level config that affects rendering
+///    but isn't user-facing (e.g. the kobe-sync sidecar image).
+/// 3. `bootstrap_specs` — the resolved CONTENT of each `BootstrapConfig`
+///    referenced by the pool, keyed by name. The `spec.bootstraps` list
+///    only carries names; the apply/install manifests live inside each
+///    BootstrapConfig CR. Hashing only the names misses content changes
+///    (user updates the flux install manifest, the bootstrap shell
+///    script, etc.) — without folding the resolved spec into the hash,
+///    such edits would silently apply to NEW pool members but never
+///    recycle existing idle members. Caller resolves bootstrap CRs
+///    once per reconcile and passes them in.
+///
+/// Together these define drift: any change to user spec, operator-level
+/// config, or referenced BootstrapConfig content flips the hash, and
+/// `compute_pool_actions` recycles unclaimed pool members on the next
+/// reconcile. Leased members keep running; they'll get the fresh hash
+/// when they're released and recycled.
+pub fn profile_spec_hash(
+    profile: &ClusterPool,
+    render_ctx: &RenderContext,
+    bootstrap_specs: &std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec>,
+) -> SpecHash {
+    use crate::crd::BackendType;
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // Hash the fields that affect how a cluster is created
@@ -38,6 +116,40 @@ pub fn profile_spec_hash(profile: &ClusterPool) -> SpecHash {
     format!("{:?}", profile.spec.backend).hash(&mut hasher);
     format!("{:?}", profile.spec.addons).hash(&mut hasher);
     format!("{:?}", profile.spec.bootstraps).hash(&mut hasher);
+
+    // Resolved bootstrap CONTENT for each name referenced in the pool.
+    // Iterate the pool's reference list (not the resolved map) to keep
+    // hash order deterministic w.r.t. the user-visible spec — a missing
+    // resolution still flips the hash because we hash a sentinel.
+    for bs_ref in &profile.spec.bootstraps {
+        bs_ref.name.hash(&mut hasher);
+        match bootstrap_specs.get(&bs_ref.name) {
+            Some(spec) => {
+                // Debug-format hashing matches the pattern used elsewhere
+                // (taints, addons). Captures every Serialize-relevant
+                // field of `BootstrapConfigSpec` without forcing all
+                // nested types to derive `Hash`.
+                format!("{spec:?}").hash(&mut hasher);
+            }
+            None => {
+                // Reference a name we couldn't resolve (e.g. the CR was
+                // deleted) — fold a stable sentinel so hash stability
+                // doesn't depend on whether the lookup happened to
+                // succeed at this exact reconcile.
+                "<unresolved>".hash(&mut hasher);
+            }
+        }
+    }
+
+    // Operator-level config that ONLY affects vkobe-rendered resources
+    // (the kobe-sync sidecar). Folding it in here means a sidecar image
+    // bump in the operator Deployment env triggers drift on vkobe pools
+    // and recycles their pool members; k3s/k0s/capi pools don't see
+    // this bit so they aren't churned by an unrelated change.
+    if profile.spec.backend.backend_type == BackendType::Vkobe {
+        render_ctx.kobe_sync_image.hash(&mut hasher);
+    }
+
     format!("{:016x}", hasher.finish())
 }
 
@@ -102,6 +214,8 @@ pub fn compute_pool_actions(
     profile: &ClusterPool,
     state: &PoolState,
     now: chrono::DateTime<chrono::Utc>,
+    render_ctx: &RenderContext,
+    bootstrap_specs: &std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec>,
 ) -> Vec<PoolAction> {
     let spec = &profile.spec;
     let mut actions = Vec::new();
@@ -114,7 +228,7 @@ pub fn compute_pool_actions(
     }
 
     // --- Recycle unclaimed clusters with stale spec ---
-    let current_hash = profile_spec_hash(profile);
+    let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Ready
             && let Some(hash) = &entry.spec_hash
@@ -300,6 +414,7 @@ pub fn backoff_delay(consecutive_failures: u32) -> Option<chrono::Duration> {
                 persistence: None,
                 expose: None,
                 taints: None,
+                ..Default::default()
             },
             addons: vec![],
             bootstraps: vec![],
@@ -520,6 +635,14 @@ pub fn parse_duration(s: &str) -> Option<chrono::Duration> {
 mod tests {
     use super::*;
 
+    /// Default `RenderContext` for autoscaling tests that don't care
+    /// about the kobe-sync sidecar image (i.e. anything not asserting
+    /// vkobe-specific drift behaviour). Keeping the value stable
+    /// across tests keeps unrelated hashes pinned in test fixtures.
+    fn test_render_ctx() -> RenderContext {
+        RenderContext::with_kobe_sync_image("zondax/kobe-sync:test")
+    }
+
     #[test]
     fn test_parse_duration() {
         assert_eq!(parse_duration("30m"), Some(chrono::Duration::seconds(1800)));
@@ -684,6 +807,7 @@ mod tests {
                     persistence: None,
                     expose: None,
                     taints: None,
+                    ..Default::default()
                 },
                 addons: vec![],
                 bootstraps: vec![],
@@ -726,7 +850,13 @@ mod tests {
         };
         let now = chrono::Utc::now();
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         // Should create up to MAX_BURST (2) clusters
         assert_eq!(actions.len(), 2);
@@ -757,7 +887,13 @@ mod tests {
         let state = PoolState { clusters };
         let now = chrono::Utc::now();
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         assert!(actions.is_empty());
     }
@@ -781,7 +917,13 @@ mod tests {
         let state = PoolState { clusters };
         let now = chrono::Utc::now();
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         let creates: Vec<_> = actions
             .iter()
@@ -809,7 +951,13 @@ mod tests {
         let state = PoolState { clusters };
         let now = chrono::Utc::now();
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         // At max_clusters=2 with 2 leased, no room to create
         assert!(actions.is_empty());
@@ -853,7 +1001,13 @@ mod tests {
         );
         let state = PoolState { clusters };
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         // 2 ready, min_ready=1, one idle >30m → delete 1
         let deletes: Vec<_> = actions
@@ -901,7 +1055,13 @@ mod tests {
         );
         let state = PoolState { clusters };
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         // Both idle only 5m, threshold is 30m — no deletes
         let deletes: Vec<_> = actions
@@ -914,7 +1074,10 @@ mod tests {
     #[test]
     fn test_spec_drift_triggers_recreation_of_unclaimed_clusters() {
         let profile = make_profile(2, None);
-        let stale_hash = format!("{}-stale", profile_spec_hash(&profile));
+        let stale_hash = format!(
+            "{}-stale",
+            profile_spec_hash(&profile, &test_render_ctx(), &Default::default())
+        );
 
         let mut clusters = HashMap::new();
         clusters.insert(
@@ -940,7 +1103,13 @@ mod tests {
         let state = PoolState { clusters };
         let now = chrono::Utc::now();
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         // Only the Ready (unclaimed) cluster should be deleted
         let deletes: Vec<_> = actions
@@ -953,10 +1122,148 @@ mod tests {
         }
     }
 
+    /// Regression for the prod incident where a kobe-sync sidecar
+    /// image bump in the operator Deployment landed but vkobe pool
+    /// members never recycled — they kept running the OLD sidecar
+    /// binary indefinitely because the user-visible pool spec hadn't
+    /// changed. Bumping `RenderContext.kobe_sync_image` MUST flip the
+    /// hash for vkobe pools so existing idle members get recycled.
+    #[test]
+    fn vkobe_pool_recycles_when_kobe_sync_image_changes() {
+        let mut profile = make_profile(2, None);
+        // Force backend to vkobe so the sidecar image affects rendering.
+        profile.spec.backend.backend_type = crate::crd::BackendType::Vkobe;
+
+        let old_ctx = RenderContext::with_kobe_sync_image("zondax/kobe-sync:v0.9.0");
+        let new_ctx = RenderContext::with_kobe_sync_image("zondax/kobe-sync:v0.12.3");
+        let bs = std::collections::BTreeMap::new();
+
+        let old_hash = profile_spec_hash(&profile, &old_ctx, &bs);
+        let new_hash = profile_spec_hash(&profile, &new_ctx, &bs);
+        assert_ne!(
+            old_hash, new_hash,
+            "vkobe pool must recompute its spec hash when KOBE_SYNC_IMAGE changes"
+        );
+    }
+
+    /// Same scenario, but for a k3s pool — a kobe-sync image bump
+    /// MUST NOT churn k3s pool members because the sidecar isn't part
+    /// of their rendered resources. Otherwise every operator upgrade
+    /// would needlessly recycle every pool member of every backend.
+    #[test]
+    fn k3s_pool_not_recycled_by_kobe_sync_image_change() {
+        let profile = make_profile(2, None); // default backend is k3s
+        assert_eq!(
+            profile.spec.backend.backend_type,
+            crate::crd::BackendType::K3s
+        );
+        let old_ctx = RenderContext::with_kobe_sync_image("zondax/kobe-sync:v0.9.0");
+        let new_ctx = RenderContext::with_kobe_sync_image("zondax/kobe-sync:v0.12.3");
+        let bs = std::collections::BTreeMap::new();
+
+        assert_eq!(
+            profile_spec_hash(&profile, &old_ctx, &bs),
+            profile_spec_hash(&profile, &new_ctx, &bs),
+            "k3s pool spec hash must NOT depend on the kobe-sync sidecar image"
+        );
+    }
+
+    /// Editing the CONTENT of a referenced BootstrapConfig (not just
+    /// its name) must flip the hash so existing pool members pick up
+    /// the new manifests on the next reconcile. Without this, a user
+    /// updating the flux install would silently apply only to NEW
+    /// members and leave existing idle ones running the old logic.
+    /// Editing the CONTENT of a referenced BootstrapConfig (not just
+    /// its name) must flip the hash so existing pool members pick up
+    /// the new manifests on the next reconcile. Without this, a user
+    /// updating the flux install would silently apply only to NEW
+    /// members and leave existing idle ones running the old logic.
+    #[test]
+    fn pool_recycles_when_referenced_bootstrap_content_changes() {
+        use crate::crd::{BootstrapConfigSpec, BootstrapRef};
+        use std::collections::BTreeMap;
+        let mut profile = make_profile(2, None);
+        profile.spec.bootstraps = vec![BootstrapRef {
+            name: "flux".to_string(),
+            ..Default::default()
+        }];
+
+        let mut bs_v1 = BTreeMap::new();
+        bs_v1.insert(
+            "flux".to_string(),
+            BootstrapConfigSpec {
+                files: {
+                    let mut f = BTreeMap::new();
+                    f.insert(
+                        "00-namespace.yaml".to_string(),
+                        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: flux-system\n"
+                            .to_string(),
+                    );
+                    f
+                },
+                job: None,
+            },
+        );
+
+        let mut bs_v2 = BTreeMap::new();
+        bs_v2.insert(
+            "flux".to_string(),
+            BootstrapConfigSpec {
+                files: {
+                    let mut f = BTreeMap::new();
+                    // Same key, edited manifest body — content drift only.
+                    f.insert(
+                        "00-namespace.yaml".to_string(),
+                        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: flux-system-v2\n"
+                            .to_string(),
+                    );
+                    f
+                },
+                job: None,
+            },
+        );
+
+        let ctx = test_render_ctx();
+        let h1 = profile_spec_hash(&profile, &ctx, &bs_v1);
+        let h2 = profile_spec_hash(&profile, &ctx, &bs_v2);
+        assert_ne!(
+            h1, h2,
+            "editing a referenced BootstrapConfig's content must flip the pool hash"
+        );
+    }
+
+    /// A pool with NO bootstraps must not be sensitive to the
+    /// bootstrap_specs map at all — passing different maps gives the
+    /// same hash because the iteration in `profile_spec_hash` is keyed
+    /// off the pool's own reference list.
+    #[test]
+    fn pool_without_bootstraps_ignores_bootstrap_specs() {
+        use crate::crd::BootstrapConfigSpec;
+        use std::collections::BTreeMap;
+        let profile = make_profile(2, None);
+        assert!(profile.spec.bootstraps.is_empty());
+
+        let ctx = test_render_ctx();
+        let mut bs_a = BTreeMap::new();
+        bs_a.insert(
+            "irrelevant".to_string(),
+            BootstrapConfigSpec {
+                files: BTreeMap::new(),
+                job: None,
+            },
+        );
+
+        assert_eq!(
+            profile_spec_hash(&profile, &ctx, &Default::default()),
+            profile_spec_hash(&profile, &ctx, &bs_a),
+            "pool with no bootstraps must not be affected by unrelated entries in the resolved map"
+        );
+    }
+
     #[test]
     fn test_no_drift_when_spec_hash_matches() {
         let profile = make_profile(2, None);
-        let current_hash = profile_spec_hash(&profile);
+        let current_hash = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
 
         let mut clusters = HashMap::new();
         clusters.insert(
@@ -972,7 +1279,13 @@ mod tests {
         let state = PoolState { clusters };
         let now = chrono::Utc::now();
 
-        let actions = compute_pool_actions(&profile, &state, now);
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
 
         let deletes: Vec<_> = actions
             .iter()
@@ -1095,7 +1408,13 @@ mod tests {
         let state = PoolState {
             clusters: HashMap::new(),
         };
-        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, PoolAction::Create(_)))
@@ -1110,7 +1429,13 @@ mod tests {
         let state = PoolState {
             clusters: HashMap::new(),
         };
-        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, PoolAction::Create(_)))
@@ -1124,7 +1449,13 @@ mod tests {
         let state = PoolState {
             clusters: HashMap::new(),
         };
-        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, PoolAction::Create(_)))
@@ -1138,7 +1469,13 @@ mod tests {
         let state = PoolState {
             clusters: HashMap::new(),
         };
-        let actions = compute_pool_actions(&profile, &state, chrono::Utc::now());
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
         let creates: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, PoolAction::Create(_)))

@@ -121,6 +121,18 @@ async fn main() -> anyhow::Result<()> {
     // Detect Velero CRDs for snapshot support
     let velero = detect_velero(&client).await;
 
+    // Snapshot operator-level config that affects rendered backend
+    // resources. Folded into the per-pool spec hash so a sidecar image
+    // bump in the operator Deployment env triggers vkobe pool recycling
+    // automatically (see `pool::manager::RenderContext`). Read once at
+    // startup — env changes already require a Deployment rollout, which
+    // restarts the operator and re-evaluates this.
+    let render_ctx = pool::RenderContext::from_env();
+    info!(
+        kobe_sync_image = %render_ctx.kobe_sync_image,
+        "Render context initialised"
+    );
+
     // Start profile controller
     let profile_client = client.clone();
     let profile_ns = namespace.clone();
@@ -128,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let profile_shutdown = shutdown.clone();
     let profile_velero = velero.clone();
     let profile_factory = factory.clone();
+    let profile_render_ctx = render_ctx.clone();
     let profile_handle = tokio::spawn(async move {
         controllers::profile::run_profile_controller(
             profile_client,
@@ -135,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             profile_pools,
             profile_velero,
             Some(profile_factory),
+            profile_render_ctx,
             profile_shutdown,
         )
         .await;

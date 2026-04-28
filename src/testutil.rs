@@ -292,6 +292,7 @@ mod tests {
             persistence: None,
             expose: None,
             taints: None,
+            ..Default::default()
         }
     }
 

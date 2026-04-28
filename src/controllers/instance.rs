@@ -23,9 +23,10 @@ use crate::backend::{
 };
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, ClusterConfig, ClusterInstance,
-    ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig,
-    LeasePhase, ReadinessGate, SnapshotConfig,
+    ClusterInstanceNetwork, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
+    HealthCheckConfig, LeasePhase, ReadinessGate, SnapshotConfig,
 };
+use crate::pool::cidr_alloc;
 use crate::velero::VeleroCoordinator;
 
 pub struct InstanceContext<B: ClusterBackend> {
@@ -119,6 +120,72 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
 
     match status.phase {
         ClusterInstancePhase::Creating if !status.provisioned => {
+            // ── Phase 0: allocate network CIDRs if not yet recorded ─────
+            //
+            // Two-phase split intentional: persist the allocation BEFORE
+            // any backend resource is created. If the operator crashes
+            // between allocation and provisioning, the persisted slot is
+            // still ours — re-reconciling reads it and skips re-allocation.
+            // If we instead allocated + provisioned in one pass and the
+            // status patch failed mid-flight, we'd risk leaking backend
+            // resources whose slot the next reconcile would re-allocate
+            // (collision with the very resources we just created).
+            //
+            // Backends that own their own network plane (k3s, k0s) need
+            // CIDRs that don't collide with the host cluster (10.43/10.42
+            // are k3s/rke2/kubeadm defaults — leasing pools used to silently
+            // route in-pod kubernetes.default.svc to the HOST apiserver
+            // because of iptables overlap). Backends that reuse the host
+            // network (vkobe) ignore the field. Allocation runs uniformly
+            // for all backends; vkobe just doesn't read it.
+            let network = match &status.network {
+                Some(n) => n.clone(),
+                None => match allocate_network_for_instance(&instances_api).await {
+                    Ok(net) => {
+                        info!(
+                            instance = %name,
+                            service_cidr = %net.service_cidr,
+                            cluster_cidr = %net.cluster_cidr,
+                            "Allocated network CIDRs"
+                        );
+                        patch_instance_status(
+                            &instances_api,
+                            &name,
+                            ClusterInstanceStatus {
+                                phase: ClusterInstancePhase::Creating,
+                                provisioned: false,
+                                bootstrapped: false,
+                                lease_ref: status.lease_ref.clone(),
+                                active_bootstrap: None,
+                                idle_since: status.idle_since.clone(),
+                                state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                health_failures: status.health_failures,
+                                spec_hash: status.spec_hash.clone(),
+                                network: Some(net.clone()),
+                            },
+                        )
+                        .await?;
+                        // Requeue to let the next pass actually provision
+                        // — keeps the "persist allocation, then create
+                        // resources" boundary explicit even if it costs
+                        // one extra reconcile.
+                        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                    }
+                    Err(e) => {
+                        error!(instance = %name, error = %format!("{e:#}"),
+                               "Failed to allocate network CIDRs");
+                        return Err(InstanceError::Lifecycle(
+                            e.context("network allocation failed"),
+                        ));
+                    }
+                },
+            };
+
+            // Thread the allocated network into the resolved cluster
+            // config so the backend reads it from a single place.
+            let mut config = config;
+            config.cluster.allocated_network = Some(network);
+
             info!(instance = %name, owner = %owner, "Provisioning backend resources");
             match provision_instance(&ctx, &config, &name, &ns).await {
                 Ok(()) => {
@@ -135,6 +202,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
                             spec_hash: status.spec_hash.clone(),
+                            ..Default::default()
                         },
                     )
                     .await?;
@@ -155,6 +223,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
                             spec_hash: status.spec_hash.clone(),
+                            ..Default::default()
                         },
                     )
                     .await?;
@@ -180,6 +249,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 state_since: status.state_since,
                                 health_failures: 0,
                                 spec_hash: status.spec_hash.clone(),
+                                ..Default::default()
                             },
                         )
                         .await?;
@@ -199,6 +269,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: 0,
                                 spec_hash: status.spec_hash.clone(),
+                                ..Default::default()
                             },
                         )
                         .await?;
@@ -219,6 +290,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: status.health_failures,
                                 spec_hash: status.spec_hash.clone(),
+                                ..Default::default()
                             },
                         )
                         .await?;
@@ -276,6 +348,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                 health_failures: status.health_failures,
                 spec_hash: status.spec_hash.clone(),
+                ..Default::default()
             },
         )
         .await?;
@@ -312,6 +385,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                         state_since: Some(chrono::Utc::now().to_rfc3339()),
                         health_failures: status.health_failures,
                         spec_hash: status.spec_hash.clone(),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -341,6 +415,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: status.health_failures,
                     spec_hash: status.spec_hash.clone(),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -501,6 +576,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                         state_since: status.state_since.clone(),
                         health_failures: 0,
                         spec_hash: status.spec_hash.clone(),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -539,6 +615,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: failures,
                     spec_hash: status.spec_hash.clone(),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -877,6 +954,45 @@ async fn check_instance_readiness_gate<B: ClusterBackend + Clone>(
     }
 }
 
+/// Pick the next free network slot by reading the CIDRs already in use
+/// across sibling ClusterInstances in this namespace.
+///
+/// Stateless allocator: the live CRD inventory IS the source of truth.
+/// On every call we list peers, collect their `status.network.serviceCidr`
+/// values, and ask `cidr_alloc::allocate_slot` for the lowest unused
+/// slot. This means a brand-new operator (or one that lost in-memory
+/// state) can resume allocation deterministically — there is no global
+/// counter to seed.
+///
+/// Returns an error if all `MAX_SLOTS` are occupied. In practice that
+/// implies more than 128 simultaneous pool members; bumping the cap
+/// would mean reserving a wider parent CIDR (currently `10.240.0.0/12`).
+async fn allocate_network_for_instance(
+    instances_api: &Api<ClusterInstance>,
+) -> Result<ClusterInstanceNetwork, anyhow::Error> {
+    let inventory = instances_api
+        .list(&kube::api::ListParams::default())
+        .await
+        .context("Failed to list ClusterInstances for CIDR allocation")?;
+
+    let used: Vec<String> = inventory
+        .items
+        .into_iter()
+        .filter_map(|inst| inst.status.and_then(|s| s.network.map(|n| n.service_cidr)))
+        .collect();
+
+    let (_slot, net) = cidr_alloc::allocate_slot(used).ok_or_else(|| {
+        anyhow::anyhow!(
+            "All {} CIDR slots in 10.240.0.0/12 are taken; \
+             either some clusters need to be released or the parent \
+             range needs to grow",
+            cidr_alloc::MAX_SLOTS
+        )
+    })?;
+
+    Ok(net)
+}
+
 async fn patch_instance_status(
     instances_api: &Api<ClusterInstance>,
     name: &str,
@@ -958,7 +1074,17 @@ mod tests {
                     "phase": phase,
                     "provisioned": provisioned,
                     "leaseRef": null,
-                    "healthFailures": health_failures
+                    "healthFailures": health_failures,
+                    // Pre-populate the network slot so reconcile skips
+                    // the allocation phase. The allocator is exercised
+                    // by `pool::cidr_alloc::tests` and (separately) by
+                    // a focused reconciler test that mocks the list
+                    // endpoint; this fixture is for testing downstream
+                    // behaviour assuming allocation already happened.
+                    "network": {
+                        "serviceCidr": "10.240.0.0/20",
+                        "clusterCidr": "10.248.0.0/20"
+                    }
                 }
             }))
             .unwrap(),

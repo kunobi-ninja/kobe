@@ -75,6 +75,29 @@ pub enum ClusterInstancePhase {
     Failed,
 }
 
+/// Network ranges reserved for one ClusterInstance.
+///
+/// Allocated once at create time by the instance controller and recorded
+/// on `status.network` so two pool members never claim the same IP space
+/// — the operator picks the next free slot by reading the CIDRs already
+/// in use across sibling ClusterInstances. This makes peer-to-peer
+/// networking between leased clusters possible without manual CIDR
+/// override and prevents the host-cluster routing collision that
+/// silently broke CoreDNS in early k3s pools (the `kubernetes` Service
+/// IP overlapping with the host's iptables rules → in-cluster
+/// `kubernetes.default.svc` resolved to the host apiserver, not the
+/// leased one).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterInstanceNetwork {
+    /// CIDR for in-cluster Service ClusterIPs (`--service-cidr` to k3s,
+    /// `serviceCIDR` to k0s, etc.).
+    pub service_cidr: String,
+    /// CIDR for in-cluster pod IPs (`--cluster-cidr` to k3s,
+    /// `podCIDR` to k0s, etc.).
+    pub cluster_cidr: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterInstanceStatus {
@@ -134,4 +157,13 @@ pub struct ClusterInstanceStatus {
     /// value" — closing the race regardless of which controller wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_hash: Option<String>,
+
+    /// Network ranges reserved for this instance (service + cluster CIDRs).
+    /// Allocated once before the backend StatefulSet/Deployment is built;
+    /// `None` until the instance controller's first reconcile picks a
+    /// free slot. Backends that own their own network plane (k3s, k0s)
+    /// MUST consume these values rather than hardcoded defaults.
+    /// Backends that reuse the host's network (vkobe) ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<ClusterInstanceNetwork>,
 }

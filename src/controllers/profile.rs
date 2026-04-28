@@ -32,6 +32,11 @@ pub struct ProfileContext {
     /// When set, `backend_for(profile)` is used instead of `self.backend`
     /// for create/delete operations.
     pub factory: Option<BackendFactory>,
+    /// Operator-level config that affects rendered backend resources
+    /// (currently the kobe-sync sidecar image). Folded into
+    /// `profile_spec_hash` so a sidecar bump triggers vkobe pool
+    /// recycling automatically. See `pool::manager::RenderContext`.
+    pub render_ctx: crate::pool::RenderContext,
 }
 
 #[cfg(test)]
@@ -54,6 +59,7 @@ mod cluster_instance_tests {
             pools,
             velero: None,
             factory: None,
+            render_ctx: crate::pool::RenderContext::with_kobe_sync_image("zondax/kobe-sync:test"),
         });
         (ctx, server)
     }
@@ -221,6 +227,7 @@ pub async fn run_profile_controller(
     pools: Arc<RwLock<HashMap<String, PoolState>>>,
     velero: Option<VeleroCoordinator>,
     factory: Option<BackendFactory>,
+    render_ctx: crate::pool::RenderContext,
     shutdown: CancellationToken,
 ) {
     let profiles: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
@@ -233,6 +240,7 @@ pub async fn run_profile_controller(
         pools,
         velero,
         factory,
+        render_ctx,
     });
 
     info!("Starting profile controller");
@@ -389,14 +397,40 @@ async fn reconcile_profile(
     }
 
     let now = chrono::Utc::now();
-    let actions = compute_pool_actions(&profile, &pool_state, now);
+
+    // Resolve every BootstrapConfig CR this pool references so the
+    // hash captures their CONTENT, not just their names. A user
+    // editing a bootstrap (new flux install manifest, different
+    // shell script, …) without touching the pool spec would
+    // otherwise silently apply only to NEW pool members, leaving
+    // existing idle ones running stale logic. Failures here are
+    // logged and skipped — a missing bootstrap maps to an
+    // "<unresolved>" sentinel inside the hasher, so the hash flips
+    // deterministically rather than depending on whether the lookup
+    // happened to succeed at this exact reconcile.
+    let bootstrap_specs = resolve_bootstrap_specs(&ctx.client, &ns, &profile).await;
+
+    let actions = compute_pool_actions(
+        &profile,
+        &pool_state,
+        now,
+        &ctx.render_ctx,
+        &bootstrap_specs,
+    );
 
     for action in &actions {
         match action {
             PoolAction::Create(cluster_name) => {
                 info!(profile = %name, cluster = %cluster_name, "Creating cluster");
                 let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
-                ensure_cluster_instance(&instances_api, &profile, cluster_name).await?;
+                ensure_cluster_instance(
+                    &instances_api,
+                    &profile,
+                    cluster_name,
+                    &ctx.render_ctx,
+                    &bootstrap_specs,
+                )
+                .await?;
                 pool_state.clusters.insert(
                     cluster_name.clone(),
                     ClusterEntry {
@@ -404,7 +438,11 @@ async fn reconcile_profile(
                         idle_since: None,
                         health_failures: 0,
                         state_since: Some(chrono::Utc::now()),
-                        spec_hash: Some(crate::pool::profile_spec_hash(&profile)),
+                        spec_hash: Some(crate::pool::profile_spec_hash(
+                            &profile,
+                            &ctx.render_ctx,
+                            &bootstrap_specs,
+                        )),
                     },
                 );
             }
@@ -430,6 +468,7 @@ async fn reconcile_profile(
                         state_since: Some(chrono::Utc::now().to_rfc3339()),
                         health_failures: current.health_failures,
                         spec_hash: current.spec_hash,
+                        ..Default::default()
                     },
                 )
                 .await;
@@ -583,6 +622,51 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
     PoolState { clusters }
 }
 
+/// Resolve every `BootstrapConfig` referenced by `profile.spec.bootstraps`,
+/// returning a name → spec map suitable for feeding into
+/// `pool::profile_spec_hash`.
+///
+/// Best-effort: if a referenced BootstrapConfig is missing or
+/// unreadable, it's omitted from the result and the caller will see
+/// the `<unresolved>` sentinel inside the hasher (see
+/// `pool::profile_spec_hash`). This means a transient lookup failure
+/// produces a *different* hash than a successful resolution — drift is
+/// detected once the bootstrap reappears, recycle happens, problem
+/// solved. The alternative (failing the entire reconcile) would block
+/// every other pool action behind a missing CRD.
+async fn resolve_bootstrap_specs(
+    client: &Client,
+    namespace: &str,
+    profile: &ClusterPool,
+) -> std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec> {
+    use crate::crd::BootstrapConfig;
+    use kube::ResourceExt;
+
+    let mut specs = std::collections::BTreeMap::new();
+    if profile.spec.bootstraps.is_empty() {
+        return specs;
+    }
+
+    let api: Api<BootstrapConfig> = Api::namespaced(client.clone(), namespace);
+    for bs_ref in &profile.spec.bootstraps {
+        match api.get(&bs_ref.name).await {
+            Ok(cr) => {
+                specs.insert(cr.name_any(), cr.spec);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    profile = %profile.name_any(),
+                    bootstrap = %bs_ref.name,
+                    error = %e,
+                    "Failed to resolve BootstrapConfig for spec-hash; \
+                     drift detection will treat it as unresolved"
+                );
+            }
+        }
+    }
+    specs
+}
+
 fn error_policy(
     _profile: Arc<ClusterPool>,
     error: &ProfileError,
@@ -596,6 +680,8 @@ async fn ensure_cluster_instance(
     instances_api: &Api<ClusterInstance>,
     profile: &ClusterPool,
     cluster_name: &str,
+    render_ctx: &crate::pool::RenderContext,
+    bootstrap_specs: &std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec>,
 ) -> Result<(), ProfileError> {
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/pool".to_string(), profile.name_any());
@@ -609,7 +695,12 @@ async fn ensure_cluster_instance(
         idle_since: None,
         state_since: Some(chrono::Utc::now().to_rfc3339()),
         health_failures: 0,
-        spec_hash: Some(crate::pool::profile_spec_hash(profile)),
+        spec_hash: Some(crate::pool::profile_spec_hash(
+            profile,
+            render_ctx,
+            bootstrap_specs,
+        )),
+        ..Default::default()
     };
 
     let instance = ClusterInstance {
@@ -718,6 +809,7 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
                 // the sync would clobber that hash to null and break drift
                 // detection until a manual ClusterInstance delete.
                 spec_hash: current.spec_hash.or_else(|| entry.spec_hash.clone()),
+                ..Default::default()
             },
         )
         .await;

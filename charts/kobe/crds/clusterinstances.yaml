@@ -1,6 +1,773 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  name: clusterpools.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: ClusterPool
+    plural: clusterpools
+    shortNames:
+    - cp
+    singular: clusterpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: integer
+    - jsonPath: .status.leased
+      name: Leased
+      type: integer
+    - jsonPath: .status.creating
+      name: Creating
+      type: integer
+    - jsonPath: .status.consecutiveFailures
+      name: Failures
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClusterPoolSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              ClusterPool defines a pool of pre-warmed virtual clusters.
+
+              Each pool specifies cluster configuration, addons to install,
+              resource limits, health checks, readiness gates, scaling behavior,
+              and optional diagnostic capture settings.
+            properties:
+              addons:
+                default: []
+                description: Addons to install after cluster is running.
+                items:
+                  properties:
+                    manifest:
+                      description: Inline Kubernetes manifest YAML to apply after vcluster is ready.
+                      nullable: true
+                      type: string
+                    name:
+                      description: Human-readable name for the addon.
+                      type: string
+                    url:
+                      description: URL to fetch manifest from (alternative to inline).
+                      nullable: true
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              backend:
+                default:
+                  capi: null
+                  datastore: null
+                  type: k3s
+                  vkobe: null
+                description: Backend configuration for provisioning clusters.
+                properties:
+                  capi:
+                    description: CAPI backend configuration (capi backend only).
+                    nullable: true
+                    properties:
+                      infrastructureApiVersion:
+                        description: API version of the infrastructure CRD (e.g. "infrastructure.cluster.x-k8s.io/v1alpha1").
+                        type: string
+                      infrastructureKind:
+                        description: Kind of the infrastructure CRD (e.g. "VCluster", "K0smotronCluster").
+                        type: string
+                      infrastructurePlural:
+                        description: |-
+                          Optional explicit plural form for the infrastructure CRD resource name.
+                          If not set, derived automatically by lowercasing the kind and appending "s".
+                          Use this for kinds with irregular plurals (e.g. "ingresses" for "Ingress").
+                        nullable: true
+                        type: string
+                      infrastructureSpec:
+                        description: |-
+                          Raw JSON/YAML spec to embed in the infrastructure resource.
+                          This is provider-specific and passed through as-is.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    required:
+                    - infrastructureApiVersion
+                    - infrastructureKind
+                    type: object
+                  datastore:
+                    description: Shared PostgreSQL datastore configuration (k3s/k0s backends only).
+                    nullable: true
+                    properties:
+                      goldenTemplates:
+                        default: false
+                        description: Enable golden images via PostgreSQL template databases.
+                        type: boolean
+                      secretKey:
+                        default: connection-url
+                        description: 'Key in the Secret (default: "connection-url").'
+                        type: string
+                      secretRef:
+                        description: Name of the Secret containing the PostgreSQL connection URL.
+                        type: string
+                    required:
+                    - secretRef
+                    type: object
+                  type:
+                    default: k3s
+                    description: Backend type.
+                    enum:
+                    - k3s
+                    - k0s
+                    - capi
+                    - vkobe
+                    type: string
+                  vkobe:
+                    description: vkobe backend configuration (vkobe backend only).
+                    nullable: true
+                    properties:
+                      dataStoreRef:
+                        description: Reference to the KobeStore CRD that this cluster connects to.
+                        properties:
+                          name:
+                            description: Name of the KobeStore resource in the same namespace.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      kcm:
+                        description: Optional KCM (kube-controller-manager) configuration.
+                        nullable: true
+                        properties:
+                          controllers:
+                            default:
+                            - deployment
+                            - replicaset
+                            - statefulset
+                            - daemonset
+                            - job
+                            - cronjob
+                            - namespace
+                            - serviceaccount
+                            - garbagecollector
+                            description: Which controllers to enable in the virtual KCM.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      metricsPort:
+                        default: 9090
+                        description: 'Port for health/metrics endpoints (default: 9090).'
+                        format: uint16
+                        maximum: 65535.0
+                        minimum: 0.0
+                        type: integer
+                      proxyPort:
+                        default: 8443
+                        description: 'Port for the virtual API server proxy (default: 8443).'
+                        format: uint16
+                        maximum: 65535.0
+                        minimum: 0.0
+                        type: integer
+                      syncers:
+                        default:
+                        - pods
+                        - services
+                        - configmaps
+                        - secrets
+                        - endpoints
+                        - ingresses
+                        description: Which resource syncers to enable. Defaults to core set.
+                        items:
+                          type: string
+                        type: array
+                      version:
+                        default: '1.32'
+                        description: Kubernetes version for the virtual kube-apiserver (e.g. "1.32").
+                        type: string
+                    required:
+                    - dataStoreRef
+                    type: object
+                type: object
+              bootstraps:
+                default: []
+                description: Reusable host-cluster bootstrap bundles to apply into each cluster.
+                items:
+                  properties:
+                    name:
+                      description: Name of the BootstrapConfig resource in the same namespace.
+                      type: string
+                    params:
+                      additionalProperties:
+                        type: string
+                      default: {}
+                      description: Optional renderer-specific parameters for this bootstrap.
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              cluster:
+                description: Cluster configuration.
+                properties:
+                  agents:
+                    description: |-
+                      Number of k3s agent replicas (k3s backend only).
+                      When set, creates a separate agent Deployment that joins the server.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  expose:
+                    description: Expose config (ingress/LoadBalancer/NodePort).
+                    nullable: true
+                    properties:
+                      exposeType:
+                        description: 'Expose type: "ingress", "NodePort", "LoadBalancer".'
+                        type: string
+                      ingressClassName:
+                        description: Ingress class name (when expose_type="ingress").
+                        nullable: true
+                        type: string
+                      nodePort:
+                        description: NodePort number (when expose_type="NodePort").
+                        format: int32
+                        nullable: true
+                        type: integer
+                    required:
+                    - exposeType
+                    type: object
+                  persistence:
+                    description: Persistence config.
+                    nullable: true
+                    properties:
+                      storageClassName:
+                        description: Storage class name for dynamic provisioning.
+                        nullable: true
+                        type: string
+                      storageRequestSize:
+                        description: Storage request size (e.g., "10Gi").
+                        nullable: true
+                        type: string
+                      storageType:
+                        description: 'Storage type: "emptyDir", "dynamic", etc.'
+                        nullable: true
+                        type: string
+                    type: object
+                  serverArgs:
+                    default: []
+                    description: Extra k3s server args.
+                    items:
+                      type: string
+                    type: array
+                  servers:
+                    default: 1
+                    description: Number of control plane servers.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  taints:
+                    description: |-
+                      Node taints applied to the cluster's control-plane node(s).
+
+                      Semantics:
+                      - **Field omitted** — backend default applies (e.g. k0s adds
+                        `node-role.kubernetes.io/master:NoSchedule` when running
+                        `controller --enable-worker`). Backward compatible.
+                      - **Empty list `[]`** — no taints applied; any backend default is
+                        suppressed. Useful for single-node CI/dev clusters where pods
+                        need to schedule on the control-plane node.
+                      - **Non-empty list** — exactly these taints are applied; backend
+                        defaults are suppressed.
+
+                      Currently honored by the k0s backend; other backends will gain
+                      support over time.
+                    items:
+                      description: A single taint applied to cluster nodes. Mirrors `core/v1.Taint`.
+                      properties:
+                        effect:
+                          description: Taint effect.
+                          enum:
+                          - NoSchedule
+                          - PreferNoSchedule
+                          - NoExecute
+                          type: string
+                        key:
+                          description: Taint key (e.g. `dedicated`).
+                          type: string
+                        value:
+                          description: Optional taint value (e.g. `gpu`).
+                          nullable: true
+                          type: string
+                      required:
+                      - effect
+                      - key
+                      type: object
+                    nullable: true
+                    type: array
+                  version:
+                    description: k3s version (e.g., "v1.31.3+k3s1").
+                    type: string
+                required:
+                - version
+                type: object
+              diagnostics:
+                description: Diagnostic bundle capture on claim release/expiry.
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: Enable diagnostic capture on claim release/expiry.
+                    type: boolean
+                  includeSecrets:
+                    default: false
+                    description: Never capture secrets by default.
+                    type: boolean
+                  logLines:
+                    default: 1000
+                    description: Number of log lines to capture per container.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  retentionDays:
+                    default: 7
+                    description: How long to keep diagnostic bundles.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  storage:
+                    description: S3 bucket URI (e.g. "s3://kunobi-diagnostics/").
+                    type: string
+                required:
+                - storage
+                type: object
+              healthCheck:
+                description: |-
+                  Health check configuration for warm clusters.
+                  Unhealthy clusters are automatically recycled.
+                nullable: true
+                properties:
+                  failureThreshold:
+                    default: 3
+                    description: Consecutive failures before recycling a cluster.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  intervalSeconds:
+                    default: 30
+                    description: How often to probe warm clusters, in seconds.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              readinessGates:
+                default: []
+                description: |-
+                  Readiness gates that must pass before a cluster enters the warm pool.
+                  Clusters stay in Creating phase until all gates are satisfied.
+                items:
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    type:
+                      enum:
+                      - CRDExists
+                      - DeploymentReady
+                      - DaemonSetReady
+                      - URLHealthy
+                      type: string
+                    url:
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              resources:
+                description: Resource limits per cluster.
+                nullable: true
+                properties:
+                  limits:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                  requests:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                type: object
+              scaling:
+                description: Autoscaling configuration. When set, overrides fixed `size`.
+                nullable: true
+                properties:
+                  failureBackoff:
+                    description: |-
+                      Exponential backoff policy on consecutive provision failures.
+                      When unset, sensible defaults apply (base 5s, multiplier 2, max 2m).
+                      A broken pool that never reaches `Ready` caps at ~30 retries/hour.
+                    nullable: true
+                    properties:
+                      base:
+                        default: 5s
+                        description: |-
+                          Base delay before retrying after the first failure. Format: "5s", "30s", "2m".
+                          Defaults to "5s" when unset.
+                        type: string
+                      max:
+                        default: 2m
+                        description: |-
+                          Upper bound on the backoff delay. Prevents the retry interval from
+                          growing unbounded on sustained failure. Format: "2m", "10m".
+                          Defaults to "2m" when unset.
+                        type: string
+                      multiplier:
+                        default: 2
+                        description: |-
+                          Exponential multiplier applied to the delay on each consecutive failure.
+                          Defaults to 2 (binary exponential).
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                    type: object
+                  maxClusters:
+                    default: 8
+                    description: Hard ceiling on total clusters (warm + leased + creating).
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  minReady:
+                    default: 1
+                    description: Minimum number of warm (ready) clusters to maintain.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  queueTimeout:
+                    default: 5m
+                    description: |-
+                      Queue timeout for claims waiting when at max capacity.
+                      Claims pending longer than this get 503. Format: "5m".
+                    type: string
+                  scaleDownAfter:
+                    default: 5m
+                    description: |-
+                      Delete idle clusters after this duration if above `min_ready`.
+                      Format: "30m", "1h", etc.
+                    type: string
+                  scaleUpThreshold:
+                    default: 0
+                    description: Scale up when ready clusters fall to this threshold.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                type: object
+              size:
+                default: 3
+                description: |-
+                  Desired number of warm (idle + creating) clusters in the pool.
+                  Ignored when `scaling` is set — use `scaling.min_ready` instead.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              snapshot:
+                description: |-
+                  Velero golden image snapshot configuration.
+                  When enabled, the operator maintains a Velero backup of a golden cluster
+                  and restores new pool members from it for faster provisioning.
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: Enable golden image snapshotting via Velero.
+                    type: boolean
+                  goldenPrefix:
+                    default: golden
+                    description: Prefix for the golden backup name (e.g. "golden-<profile>").
+                    type: string
+                  refreshOn:
+                    default: ProfileChange
+                    description: When to refresh the golden image.
+                    enum:
+                    - ProfileChange
+                    - Manual
+                    type: string
+                  storageLocation:
+                    default: default
+                    description: Velero BackupStorageLocation name to use.
+                    type: string
+                  ttl:
+                    default: 720h
+                    description: How long the Velero backup should be retained (e.g. "720h").
+                    type: string
+                  veleroNamespace:
+                    default: velero
+                    description: Namespace where the Velero server is installed.
+                    type: string
+                type: object
+              ttl:
+                default: 2h
+                description: Default TTL for claims against this pool (e.g. "2h", "30m").
+                type: string
+            required:
+            - cluster
+            type: object
+          status:
+            nullable: true
+            properties:
+              consecutiveFailures:
+                default: 0
+                description: |-
+                  Number of consecutive provision attempts that failed before any
+                  instance reached `Ready`. Resets to 0 when any instance reaches `Ready`.
+                  Drives the exponential backoff that slows down broken-pool create loops
+                  so one misconfigured pool cannot hammer the API at full speed.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              creating:
+                default: 0
+                description: Number of clusters being created.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              goldenBackup:
+                description: Name of the current golden Velero backup (e.g. "golden-myprofile-3").
+                nullable: true
+                type: string
+              goldenGeneration:
+                description: |-
+                  The profile generation that the golden backup was created from.
+                  Used to detect when a new snapshot is needed after spec changes.
+                format: int64
+                nullable: true
+                type: integer
+              goldenTemplateDb:
+                description: Name of the PostgreSQL template database for golden images (k3s backend).
+                nullable: true
+                type: string
+              lastFailureReason:
+                description: |-
+                  Short description of the last provision failure, for operator
+                  observability. Typically the first line of the error chain.
+                nullable: true
+                type: string
+              lastReadyMaxIndex:
+                default: 0
+                description: |-
+                  Highest cluster index that has ever reached `Ready` in this pool's
+                  lifetime. Sticky across reconciles. `consecutive_failures` is then
+                  derived as `max_attempted_index - last_ready_max_index`, which
+                  correctly counts failed attempts even during rapid churn.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              leased:
+                default: 0
+                description: Number of clusters currently leased.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              maxAttemptedIndex:
+                default: 0
+                description: |-
+                  High-water mark of the highest cluster index this pool has ever
+                  attempted to provision. Sticky across reconciles. Used together with
+                  `last_ready_max_index` to detect rapid create→recycle churn that
+                  would otherwise hide failures from `consecutive_failures` (which
+                  only increments on a stable "all recycling, none creating" state —
+                  a state that fast churn never produces because the next attempt
+                  has already started).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              nextAttemptAt:
+                description: |-
+                  Earliest time the pool manager may emit another `Create` action for
+                  this pool (RFC3339). Set when `consecutive_failures > 0`. Cleared on
+                  success or by explicit operator reset.
+                nullable: true
+                type: string
+              phase:
+                description: |-
+                  High-level human-readable summary of a pool's current state.
+
+                  Derived from the other status counts + backoff fields each reconcile.
+                  Serves as the primary at-a-glance health indicator in `kubectl get
+                  clusterpools` and in dashboards — prefer parsing specific fields (like
+                  `ready`, `consecutiveFailures`) for programmatic decisions.
+                enum:
+                - Healthy
+                - ScalingUp
+                - ScalingDown
+                - Backoff
+                - Failing
+                - Idle
+                nullable: true
+                type: string
+              queueDepth:
+                default: 0
+                description: Current queue depth (claims waiting for clusters).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              ready:
+                default: 0
+                description: Number of idle clusters ready for claims.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              recycling:
+                default: 0
+                description: Number of clusters currently being recycled.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              unhealthy:
+                default: 0
+                description: Number of clusters currently unhealthy and being recycled.
+                format: uint32
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: ClusterPool
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterleases.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: ClusterLease
+    plural: clusterleases
+    shortNames:
+    - cl
+    singular: clusterlease
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClusterLeaseSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              ClusterLease is the internal representation of a cluster lease.
+
+              Created when a user/CI leases a cluster via the HTTP API.
+              The lease controller binds it to a warm cluster, tracks TTL,
+              and handles release/expiry/recycling.
+            properties:
+              poolRef:
+                description: Which profile's pool to lease from.
+                type: string
+              priority:
+                default: 50
+                description: |-
+                  Lease priority for queue ordering.
+                  Higher values are served first.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              requester:
+                description: Identity of the requester.
+                properties:
+                  identity:
+                    description: |-
+                      Identity string (e.g. "repo:org/repo:ref:refs/heads/main" for GitHub,
+                      or user ID for Clerk).
+                    type: string
+                  type:
+                    description: 'Type of requester: "{provider}:{role}" (e.g. "github-actions:ci", "clerk:admin").'
+                    type: string
+                required:
+                - identity
+                - type
+                type: object
+              ttl:
+                description: Requested TTL (e.g. "1h", "30m").
+                type: string
+            required:
+            - poolRef
+            - requester
+            - ttl
+            type: object
+          status:
+            nullable: true
+            properties:
+              boundAt:
+                description: When the lease was bound to a vcluster.
+                nullable: true
+                type: string
+              clusterName:
+                description: Name of the bound cluster (set when phase=Bound).
+                nullable: true
+                type: string
+              diagnosticsUrl:
+                description: URL to the diagnostic bundle captured on release.
+                nullable: true
+                type: string
+              expiresAt:
+                description: When the lease expires (TTL deadline).
+                nullable: true
+                type: string
+              extensionsCount:
+                default: 0
+                description: Number of TTL extensions granted for this lease.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              maxExtensions:
+                default: 0
+                description: Maximum number of extensions allowed (from policy).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              phase:
+                default: Pending
+                description: Current phase of the lease lifecycle.
+                enum:
+                - Pending
+                - Bound
+                - Released
+                - Expired
+                - Recycling
+                type: string
+              queuePosition:
+                default: 0
+                description: Position in the priority queue (0 = not queued, 1 = next).
+                format: uint32
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: ClusterLease
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
   name: clusterinstances.kobe.kunobi.ninja
 spec:
   group: kobe.kunobi.ninja
@@ -406,6 +1173,30 @@ spec:
                 required:
                 - name
                 type: object
+              network:
+                description: |-
+                  Network ranges reserved for this instance (service + cluster CIDRs).
+                  Allocated once before the backend StatefulSet/Deployment is built;
+                  `None` until the instance controller's first reconcile picks a
+                  free slot. Backends that own their own network plane (k3s, k0s)
+                  MUST consume these values rather than hardcoded defaults.
+                  Backends that reuse the host's network (vkobe) ignore this field.
+                nullable: true
+                properties:
+                  clusterCidr:
+                    description: |-
+                      CIDR for in-cluster pod IPs (`--cluster-cidr` to k3s,
+                      `podCIDR` to k0s, etc.).
+                    type: string
+                  serviceCidr:
+                    description: |-
+                      CIDR for in-cluster Service ClusterIPs (`--service-cidr` to k3s,
+                      `serviceCIDR` to k0s, etc.).
+                    type: string
+                required:
+                - clusterCidr
+                - serviceCidr
+                type: object
               phase:
                 default: Creating
                 enum:
@@ -455,6 +1246,387 @@ spec:
         required:
         - spec
         title: ClusterInstance
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: accesspolicies.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: AccessPolicy
+    plural: accesspolicies
+    shortNames:
+    - ap
+    singular: accesspolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for AccessPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              AccessPolicy configures authentication and authorization for cluster lease requests.
+
+              Each AccessPolicy represents one authentication method (OIDC provider, static token,
+              or Kubernetes ServiceAccount) with associated authorization rules.
+            properties:
+              auth:
+                description: Authentication method configuration.
+                properties:
+                  oidc:
+                    description: OIDC provider (JWT-based) authentication.
+                    nullable: true
+                    properties:
+                      algorithms:
+                        default:
+                        - RS256
+                        description: Allowed JWT signing algorithms. Defaults to `["RS256"]`.
+                        items:
+                          type: string
+                        type: array
+                      audience:
+                        default: []
+                        description: Expected audience (`aud` claim). Empty = skip validation.
+                        items:
+                          type: string
+                        type: array
+                      authorizedParties:
+                        default: []
+                        description: Expected authorized parties (`azp` claim). Empty = skip validation.
+                        items:
+                          type: string
+                        type: array
+                      issuer:
+                        description: OIDC issuer URL (must match `iss` claim).
+                        type: string
+                      jwksUrl:
+                        description: JWKS URL for key fetching. Defaults to `{issuer}/.well-known/jwks.json`.
+                        nullable: true
+                        type: string
+                    required:
+                    - issuer
+                    type: object
+                  serviceAccount:
+                    description: Kubernetes ServiceAccount authentication.
+                    nullable: true
+                    properties:
+                      name:
+                        description: ServiceAccount name.
+                        type: string
+                      namespace:
+                        description: ServiceAccount namespace.
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  ssh:
+                    description: SSH Ed25519 public key authentication.
+                    nullable: true
+                    properties:
+                      authorizedKeys:
+                        description: Public keys in OpenSSH authorized_keys format.
+                        items:
+                          type: string
+                        type: array
+                      revokedKeys:
+                        default: []
+                        description: Revoked public keys (same format). Takes precedence over authorized_keys.
+                        items:
+                          type: string
+                        type: array
+                    required:
+                    - authorizedKeys
+                    type: object
+                  token:
+                    description: Static bearer token authentication.
+                    nullable: true
+                    properties:
+                      secretRef:
+                        description: 'Name of the Secret containing the token (key: "token").'
+                        type: string
+                    required:
+                    - secretRef
+                    type: object
+                type: object
+              identity:
+                default: '{sub}'
+                description: |-
+                  Identity template for OIDC providers.
+                  Uses `{claim_name}` syntax to interpolate JWT claims.
+                  Supports dot-path traversal (e.g., `{private_metadata.role}`).
+                  Defaults to `"{sub}"`. Ignored for token and serviceAccount auth.
+                type: string
+              rules:
+                description: |-
+                  Authorization rules. First matching rule wins for OIDC with match clauses.
+                  For token and serviceAccount auth, rules without match clauses apply directly.
+                items:
+                  description: Authorization rule — what an authenticated caller can do.
+                  properties:
+                    match:
+                      description: |-
+                        Optional claim-based match for multi-role OIDC policies.
+                        When set, this rule only applies if the JWT claim matches.
+                      nullable: true
+                      properties:
+                        claim:
+                          description: JWT claim path (supports dot-path like `private_metadata.role`).
+                          type: string
+                        value:
+                          description: Value to match.
+                          type: string
+                      required:
+                      - claim
+                      - value
+                      type: object
+                    maxConcurrentLeases:
+                      description: Maximum concurrent active leases for this identity.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    maxExtensions:
+                      default: 2
+                      description: Maximum TTL extensions per lease.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    maxTtl:
+                      description: Maximum TTL for leases (e.g., "1h", "30m").
+                      type: string
+                    pools:
+                      description: |-
+                        Pool name patterns this rule allows (e.g., `["ci-*"]`).
+                        Supports `*` suffix wildcard and literal `*` for all pools.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - maxConcurrentLeases
+                  - maxTtl
+                  - pools
+                  type: object
+                type: array
+            required:
+            - auth
+            - rules
+            type: object
+        required:
+        - spec
+        title: AccessPolicy
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: bootstrapconfigs.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: BootstrapConfig
+    plural: bootstrapconfigs
+    shortNames:
+    - bc
+    singular: bootstrapconfig
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BootstrapConfigSpec via `CustomResource`
+        properties:
+          spec:
+            description: BootstrapConfig stores a reusable bootstrap bundle in the host cluster.
+            properties:
+              files:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: |-
+                  Bundle files keyed by file name.
+
+                  The initial MVP treats all `*.yaml` / `*.yml` entries as manifests and
+                  applies them in lexical order. This keeps the API ready for richer
+                  renderers later while already supporting built-in and custom bundles.
+                type: object
+              job:
+                description: |-
+                  Optional bootstrap runner job configuration.
+
+                  When set, the operator runs a host-cluster Job that targets the leased
+                  cluster using its generated kubeconfig Secret. This is useful for
+                  tool-driven installs like `flux install`, `helm upgrade --install`, or
+                  `kustomize build | kubectl apply`.
+                nullable: true
+                properties:
+                  args:
+                    default: []
+                    description: Arguments for the runner container.
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    default: []
+                    description: Entrypoint command for the runner container.
+                    items:
+                      type: string
+                    type: array
+                  env:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    description: Extra environment variables passed to the runner.
+                    type: object
+                  image:
+                    description: Container image for the bootstrap runner.
+                    type: string
+                  imagePullPolicy:
+                    description: Optional image pull policy.
+                    nullable: true
+                    type: string
+                required:
+                - image
+                type: object
+            type: object
+        required:
+        - spec
+        title: BootstrapConfig
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kobestores.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: KobeStore
+    plural: kobestores
+    shortNames:
+    - ks
+    singular: kobestore
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.driver
+      name: Driver
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .status.currentClusters
+      name: Clusters
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KobeStoreSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              KobeStore represents an external storage backend (etcd or kine-sqlite)
+              that virtual cluster kube-apiservers connect to via `--etcd-servers`
+              and `--etcd-prefix`.
+            properties:
+              capacity:
+                description: Capacity limits.
+                properties:
+                  maxClusters:
+                    description: Maximum number of virtual clusters this KobeStore can serve.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                required:
+                - maxClusters
+                type: object
+              driver:
+                description: Storage driver type.
+                enum:
+                - etcd
+                - kine-sqlite
+                type: string
+              endpoints:
+                description: Endpoints to connect to (e.g. ["https://etcd-0:2379"]).
+                items:
+                  type: string
+                type: array
+              replicas:
+                description: Number of replicas for the storage backend (relevant for etcd).
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              tls:
+                description: Optional TLS configuration for the connection.
+                nullable: true
+                properties:
+                  secretRef:
+                    description: |-
+                      Name of the Kubernetes Secret containing TLS credentials
+                      (ca.crt, tls.crt, tls.key).
+                    type: string
+                required:
+                - secretRef
+                type: object
+            required:
+            - capacity
+            - driver
+            - endpoints
+            type: object
+          status:
+            description: Runtime status of a KobeStore.
+            nullable: true
+            properties:
+              currentClusters:
+                default: 0
+                description: Number of virtual clusters currently using this KobeStore.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              ready:
+                default: false
+                description: Whether the KobeStore is reachable and healthy.
+                type: boolean
+              usedBy:
+                default: []
+                description: List of virtual clusters using this KobeStore.
+                items:
+                  description: Identifies a virtual cluster using this KobeStore.
+                  properties:
+                    name:
+                      description: Name of the virtual cluster.
+                      type: string
+                    namespace:
+                      description: Namespace of the virtual cluster.
+                      type: string
+                  required:
+                  - name
+                  - namespace
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        title: KobeStore
         type: object
     served: true
     storage: true

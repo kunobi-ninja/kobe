@@ -248,7 +248,12 @@ pub struct BackendConfig {
 }
 
 /// Backend-agnostic cluster configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// `Default` is derived so `..Default::default()` can be used to fill
+/// runtime-only fields like `allocated_network` without re-listing every
+/// CRD-spec field at construction sites; it is not intended to produce a
+/// usable cluster configuration on its own (`version` becomes empty).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterConfig {
     /// k3s version (e.g., "v1.31.3+k3s1").
@@ -291,6 +296,27 @@ pub struct ClusterConfig {
     /// support over time.
     #[serde(default)]
     pub taints: Option<Vec<NodeTaint>>,
+
+    /// Network ranges allocated for this cluster instance. **Operator-
+    /// internal**: not part of the CRD spec users write — populated by
+    /// the instance reconciler from `ClusterInstance.status.network`
+    /// before invoking `ClusterBackend::create`. Backends that own
+    /// their own network plane (k3s, k0s) consume this for their
+    /// `--service-cidr` / `--cluster-cidr` flags; backends that reuse
+    /// the host's network (vkobe) ignore it.
+    ///
+    /// `#[serde(skip)]` keeps the field out of every wire format
+    /// (CRD spec round-trip, `kobe config import/export`, the
+    /// operator's reconciliation Patch) — it lives only inside an
+    /// in-memory `ResolvedInstanceConfig`.
+    // `#[allow(dead_code)]` keeps the `crdgen` binary happy: it imports
+    // this struct purely to walk the JSON schema and never reads
+    // runtime-only fields, so clippy flags this as dead from crdgen's
+    // perspective. The operator binary DOES read the field, so the
+    // attribute is just shielding the cross-binary visibility quirk.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    pub allocated_network: Option<crate::crd::ClusterInstanceNetwork>,
 }
 
 /// A single taint applied to cluster nodes. Mirrors `core/v1.Taint`.

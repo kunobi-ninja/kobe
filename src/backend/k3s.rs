@@ -201,12 +201,38 @@ impl K3sBackend {
     ) -> Container {
         let image = k3s_image(&config.version);
 
+        // Service & pod CIDRs MUST differ from the host cluster's — k3s,
+        // rke2, and kubeadm all default to 10.43.0.0/16 for services and
+        // 10.42.0.0/16 for pods. When a leased k3s pool member runs as a
+        // pod inside a host RKE2/k3s cluster, in-pod kube-proxy iptables
+        // for 10.43.0.1 collide with the host cluster's identical rule:
+        // pods inside the leased k3s reach for their own apiserver via
+        // 10.43.0.1 but get routed to the HOST's apiserver, which serves
+        // a cert signed by a different CA than the SA token bundle they
+        // mounted. CoreDNS fails its readiness probe with
+        //   `x509: certificate signed by unknown authority`
+        // and every other in-cluster controller breaks the same way.
+        //
+        // The instance reconciler allocates a unique pair of /20 ranges
+        // per ClusterInstance (see `pool::cidr_alloc`) and stuffs them
+        // into `config.allocated_network` before this backend runs. We
+        // honor those allocations directly. The fallback below applies
+        // only to standalone test paths and CLI-built configs that
+        // bypass the operator — production reconciliation always sets
+        // `allocated_network`.
+        let (service_cidr, cluster_cidr) = match &config.allocated_network {
+            Some(net) => (net.service_cidr.clone(), net.cluster_cidr.clone()),
+            None => ("10.243.0.0/20".to_string(), "10.248.0.0/20".to_string()),
+        };
+
         let mut args = vec![
             "server".to_string(),
             format!("--tls-san={name}-server.{namespace}.svc"),
             "--token-file=/var/lib/k3s/token/token".to_string(),
             "--write-kubeconfig=/output/kubeconfig".to_string(),
             "--write-kubeconfig-mode=644".to_string(),
+            format!("--service-cidr={service_cidr}"),
+            format!("--cluster-cidr={cluster_cidr}"),
         ];
 
         if let Some(endpoint) = datastore_endpoint {
@@ -760,6 +786,7 @@ mod tests {
             persistence: None,
             expose: None,
             taints: None,
+            ..Default::default()
         }
     }
 
@@ -788,6 +815,75 @@ mod tests {
         // Verify no datastore-endpoint arg
         let args = server.args.as_ref().unwrap();
         assert!(!args.iter().any(|a| a.contains("datastore-endpoint")));
+    }
+
+    /// Regression: the leased k3s pool member MUST advertise service +
+    /// cluster CIDRs that don't collide with the host cluster's. K3s,
+    /// RKE2, and kubeadm all default to 10.43.0.0/16 (services) and
+    /// 10.42.0.0/16 (pods); leaving k3s on its own defaults caused
+    /// CoreDNS to fail TLS verification against the host's apiserver
+    /// (in-pod 10.43.0.1 routes via host iptables → host apiserver →
+    /// `x509: certificate signed by unknown authority`).
+    ///
+    /// The fallback path below covers standalone-test / CLI builds that
+    /// bypass the reconciler. Production reconciliation always passes
+    /// an `allocated_network` (see `pool::cidr_alloc`); a separate test
+    /// covers that path.
+    #[test]
+    fn test_server_args_fallback_cidrs_avoid_host_defaults() {
+        let config = base_config();
+        assert!(
+            config.allocated_network.is_none(),
+            "base_config must leave allocation to the reconciler; got {:?}",
+            config.allocated_network
+        );
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
+            .args
+            .clone()
+            .unwrap();
+        let svc = args
+            .iter()
+            .find(|a| a.starts_with("--service-cidr="))
+            .expect("service-cidr arg must be present");
+        let pod = args
+            .iter()
+            .find(|a| a.starts_with("--cluster-cidr="))
+            .expect("cluster-cidr arg must be present");
+        assert!(
+            !svc.contains("10.43.") && !svc.contains("10.96."),
+            "service CIDR must avoid k3s/rke2/kubeadm defaults; got {svc}"
+        );
+        assert!(
+            !pod.contains("10.42."),
+            "cluster CIDR must avoid k3s/rke2 default 10.42.0.0/16; got {pod}"
+        );
+    }
+
+    /// Regression: when the operator allocates a network slot, the
+    /// backend MUST emit those CIDRs verbatim instead of falling back
+    /// to the standalone defaults.
+    #[test]
+    fn test_server_args_honor_allocated_network() {
+        use crate::crd::ClusterInstanceNetwork;
+        let mut config = base_config();
+        config.allocated_network = Some(ClusterInstanceNetwork {
+            service_cidr: "10.245.32.0/20".to_string(),
+            cluster_cidr: "10.253.32.0/20".to_string(),
+        });
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
+            .args
+            .clone()
+            .unwrap();
+        assert!(
+            args.contains(&"--service-cidr=10.245.32.0/20".to_string()),
+            "must use allocated service CIDR; got {args:?}"
+        );
+        assert!(
+            args.contains(&"--cluster-cidr=10.253.32.0/20".to_string()),
+            "must use allocated cluster CIDR; got {args:?}"
+        );
     }
 
     #[test]

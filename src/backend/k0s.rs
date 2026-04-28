@@ -117,9 +117,18 @@ impl K0sBackend {
     /// When `datastore_endpoint` is `Some`, configures kine with a PostgreSQL
     /// data source. Otherwise, uses the default etcd storage backend.
     /// Any `extra_args` are appended to the `spec.api.extraArgs` map.
+    ///
+    /// `network` carries the operator-allocated service + cluster
+    /// CIDRs from `pool::cidr_alloc`. `None` falls back to the
+    /// standalone defaults below — covers test paths and CLI builds
+    /// that bypass the reconciler. Production paths always pass an
+    /// allocated network so two leased k0s pool members never share
+    /// service CIDRs (see the same regression note in the k3s backend
+    /// for the CoreDNS-vs-host-iptables collision rationale).
     pub fn build_k0s_config_yaml(
         datastore_endpoint: Option<&str>,
         extra_args: &[String],
+        network: Option<&crate::crd::ClusterInstanceNetwork>,
     ) -> String {
         let storage_section = if let Some(endpoint) = datastore_endpoint {
             format!(
@@ -145,6 +154,14 @@ impl K0sBackend {
             section
         };
 
+        let (pod_cidr, service_cidr) = match network {
+            Some(n) => (n.cluster_cidr.clone(), n.service_cidr.clone()),
+            None => (
+                DEFAULT_K0S_POD_CIDR.to_string(),
+                DEFAULT_K0S_SERVICE_CIDR.to_string(),
+            ),
+        };
+
         let mut yaml = format!(
             r#"apiVersion: k0s.k0sproject.io/v1beta1
 kind: ClusterConfig
@@ -154,8 +171,8 @@ spec:
   storage:
 {storage_section}
   network:
-    podCIDR: {DEFAULT_K0S_POD_CIDR}
-    serviceCIDR: {DEFAULT_K0S_SERVICE_CIDR}
+    podCIDR: {pod_cidr}
+    serviceCIDR: {service_cidr}
     provider: kuberouter
 "#
         );
@@ -227,7 +244,11 @@ spec:
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
     ) -> Result<()> {
-        let config_yaml = Self::build_k0s_config_yaml(datastore_endpoint, &config.server_args);
+        let config_yaml = Self::build_k0s_config_yaml(
+            datastore_endpoint,
+            &config.server_args,
+            config.allocated_network.as_ref(),
+        );
         let cm = Self::build_k0s_config_configmap(name, namespace, &config_yaml);
 
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
@@ -974,6 +995,7 @@ mod tests {
             persistence: None,
             expose: None,
             taints: None,
+            ..Default::default()
         }
     }
 
@@ -998,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_no_pg() {
-        let yaml = K0sBackend::build_k0s_config_yaml(None, &[]);
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], None);
         assert!(
             yaml.contains("type: etcd"),
             "Should use etcd when no PG: {yaml}"
@@ -1019,6 +1041,7 @@ mod tests {
         let yaml = K0sBackend::build_k0s_config_yaml(
             Some("postgres://user:pass@pg:5432/k0s_my_cluster"),
             &[],
+            None,
         );
         assert!(
             yaml.contains("type: kine"),
@@ -1033,10 +1056,37 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_with_extra_args() {
-        let yaml = K0sBackend::build_k0s_config_yaml(None, &["--tls-san=example.com".to_string()]);
+        let yaml =
+            K0sBackend::build_k0s_config_yaml(None, &["--tls-san=example.com".to_string()], None);
         assert!(
             yaml.contains("tls-san: \"example.com\""),
             "Should include extra args: {yaml}"
+        );
+    }
+
+    /// Regression: when the operator allocates a network slot, the
+    /// k0s.yaml template MUST emit those CIDRs verbatim instead of
+    /// falling back to the standalone defaults. Same rationale as the
+    /// k3s backend's analogous test (see comments there).
+    #[test]
+    fn test_build_k0s_config_yaml_honors_allocated_network() {
+        use crate::crd::ClusterInstanceNetwork;
+        let net = ClusterInstanceNetwork {
+            service_cidr: "10.245.32.0/20".to_string(),
+            cluster_cidr: "10.253.32.0/20".to_string(),
+        };
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], Some(&net));
+        assert!(
+            yaml.contains("podCIDR: 10.253.32.0/20"),
+            "must use allocated cluster_cidr; got: {yaml}"
+        );
+        assert!(
+            yaml.contains("serviceCIDR: 10.245.32.0/20"),
+            "must use allocated service_cidr; got: {yaml}"
+        );
+        assert!(
+            !yaml.contains("10.248.0.0/16") && !yaml.contains("10.128.0.0/16"),
+            "default CIDRs must NOT appear when allocator provided values; got: {yaml}"
         );
     }
 
