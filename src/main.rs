@@ -194,6 +194,18 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    // Start IPAM controller. Reconciles `CIDRClaim`s against the
+    // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller
+    // creates one claim per `ClusterInstance` (with ownerReference);
+    // IPAM binds the claim; instance reads back `claim.status` and
+    // provisions the backend. See `controllers::ipam` for the design.
+    let ipam_client = client.clone();
+    let ipam_ns = namespace.clone();
+    let ipam_shutdown = shutdown.clone();
+    let ipam_handle = tokio::spawn(async move {
+        controllers::ipam::run_ipam_controller(ipam_client, &ipam_ns, ipam_shutdown).await;
+    });
+
     // Monitor all tasks — if any dies, trigger shutdown
     let controller_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -220,6 +232,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("Lease controller exited unexpectedly"),
                     Err(e) => error!("Lease controller panicked: {e}"),
+                }
+            }
+            result = ipam_handle => {
+                match result {
+                    Ok(()) => warn!("IPAM controller exited unexpectedly"),
+                    Err(e) => error!("IPAM controller panicked: {e}"),
                 }
             }
         }

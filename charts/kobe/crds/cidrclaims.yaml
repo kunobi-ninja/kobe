@@ -1,0 +1,82 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cidrclaims.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: CIDRClaim
+    plural: cidrclaims
+    shortNames:
+    - cclaim
+    singular: cidrclaim
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CIDRClaimSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Namespaced claim against the operator's IPAM space. Created by
+              whatever consumer needs a CIDR slice (today: the instance
+              controller, one per `ClusterInstance`).
+            properties:
+              requestedClusterCidr:
+                description: Pin the cluster CIDR to this exact slice. Same rules as above.
+                nullable: true
+                type: string
+              requestedServiceCidr:
+                description: |-
+                  Pin the service CIDR to this exact slice. Must be aligned to
+                  the operator's `service_prefix` and inside the configured
+                  service block. If the slice is free, the claim becomes
+                  `Bound`; if it's already allocated, the claim becomes
+                  `Conflict`. Set together with `requested_cluster_cidr` for
+                  static reservations.
+                nullable: true
+                type: string
+            type: object
+          status:
+            nullable: true
+            properties:
+              boundAt:
+                description: RFC3339 timestamp of the binding.
+                nullable: true
+                type: string
+              clusterCidr:
+                description: Cluster (pod) CIDR assigned to this claim. `None` until `phase == Bound`.
+                nullable: true
+                type: string
+              message:
+                description: |-
+                  Human-readable detail. Carries the conflict reason when
+                  `phase == Conflict` (e.g. "10.240.0.0/20 already bound to
+                  kobe/k3s-pool-abc123") or the validation error when the spec
+                  itself is malformed.
+                nullable: true
+                type: string
+              phase:
+                default: Pending
+                description: Current state of the claim.
+                enum:
+                - Pending
+                - Bound
+                - Conflict
+                type: string
+              serviceCidr:
+                description: Service CIDR assigned to this claim. `None` until `phase == Bound`.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: CIDRClaim
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

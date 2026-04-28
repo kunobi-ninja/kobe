@@ -1,0 +1,31 @@
+{{- /*
+Static IPAM reservations: CIDRClaim resources that pin specific
+slices of the operator's hardcoded address space (10.240.0.0/13 +
+10.248.0.0/13, /20 slots) so the IPAM controller never assigns them
+to a guest cluster.
+
+Use case: a corporate VPN, an external peer cluster, or any other
+network namespace that already lives on a slice the operator would
+otherwise hand out.
+
+Reservations carry no ownerReference and use `helm.sh/resource-policy: keep`
+so they survive helm uninstalls — that's the point of a static
+reservation. Drop the entry from values.yaml AND `kubectl delete cidrclaim <name>`
+when you actually want the slice released back into the rotation.
+*/}}
+{{- range $r := .Values.cidrReservations }}
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: CIDRClaim
+metadata:
+  name: {{ $r.name | quote }}
+  namespace: {{ $.Values.operatorNamespace | quote }}
+  labels:
+    {{- include "kobe.labels" $ | nindent 4 }}
+    kobe.kunobi.ninja/reservation: "true"
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  requestedServiceCidr: {{ $r.serviceCidr | quote }}
+  requestedClusterCidr: {{ $r.clusterCidr | quote }}
+---
+{{- end }}

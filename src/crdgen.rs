@@ -31,6 +31,10 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::KobeStore::crd()).unwrap()
         ),
+        "cidrclaims" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::CIDRClaim::crd()).unwrap()
+        ),
         _ => {
             print!(
                 "{}",
@@ -60,6 +64,11 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::KobeStore::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::CIDRClaim::crd()).unwrap()
             );
         }
     }

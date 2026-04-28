@@ -1,5 +1,6 @@
 pub mod access_policy;
 pub mod bootstrap_config;
+pub mod cidr;
 #[allow(dead_code)]
 pub mod datastore;
 pub mod instance;
@@ -8,6 +9,7 @@ pub mod profile;
 
 pub use access_policy::*;
 pub use bootstrap_config::*;
+pub use cidr::*;
 #[allow(unused_imports)]
 pub use datastore::*;
 pub use instance::*;

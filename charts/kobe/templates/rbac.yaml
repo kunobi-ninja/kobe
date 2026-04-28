@@ -38,6 +38,8 @@ rules:
       - bootstrapconfigs
       - kobestores
       - kobestores/status
+      - cidrclaims
+      - cidrclaims/status
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]

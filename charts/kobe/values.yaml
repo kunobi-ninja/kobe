@@ -188,4 +188,29 @@ kine:
 # -----------------------------------------------------------------------------
 kobeStores: []
 
+# -----------------------------------------------------------------------------
+# Static IPAM reservations.
+#
+# kobe's IPAM allocator hands `/20` slices to each leased k3s/k0s guest from
+# the hardcoded `10.240.0.0/13` (service) + `10.248.0.0/13` (cluster) space.
+# This list lets you pin specific slices out of the rotation — the IPAM
+# controller will never assign them to a guest. Each entry renders as a
+# CIDRClaim with `helm.sh/resource-policy: keep`, so reservations survive
+# helm uninstalls (drop them here AND `kubectl delete cidrclaim <name>` to
+# release back into the rotation).
+#
+# Use case: corporate VPN, external peer clusters, legacy bare-metal
+# deployments — anything already living in the IPAM block.
+#
+# Both CIDRs MUST be aligned to /20 boundaries inside the parent blocks; an
+# unaligned reservation lands in `Conflict` and is logged.
+#
+# Example:
+#   cidrReservations:
+#     - name: reserved-corp-vpn
+#       serviceCidr: 10.240.32.0/20
+#       clusterCidr: 10.248.32.0/20
+# -----------------------------------------------------------------------------
+cidrReservations: []
+
 

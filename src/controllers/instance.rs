@@ -22,11 +22,11 @@ use crate::backend::{
     resolve_bootstrap_jobs,
 };
 use crate::crd::{
-    Addon, BackendConfig, BackendType, BootstrapRef, ClusterConfig, ClusterInstance,
-    ClusterInstanceNetwork, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
-    HealthCheckConfig, LeasePhase, ReadinessGate, SnapshotConfig,
+    Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
+    ClusterConfig, ClusterInstance, ClusterInstanceNetwork, ClusterInstancePhase,
+    ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig, LeasePhase, ReadinessGate,
+    SnapshotConfig,
 };
-use crate::pool::cidr_alloc;
 use crate::velero::VeleroCoordinator;
 
 pub struct InstanceContext<B: ClusterBackend> {
@@ -138,15 +138,23 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             // because of iptables overlap). Backends that reuse the host
             // network (vkobe) ignore the field. Allocation runs uniformly
             // for all backends; vkobe just doesn't read it.
+            //
+            // The IP space itself is governed by `CIDRPool` resources
+            // and per-instance allocation goes through a `CIDRClaim`
+            // owned by this `ClusterInstance`. We create the claim once
+            // (idempotent), wait for the IPAM controller to bind it,
+            // copy the result to `status.network`, and let provisioning
+            // proceed. See `controllers::ipam` for the allocation logic
+            // and `crd::cidr` for the CRD shapes.
             let network = match &status.network {
                 Some(n) => n.clone(),
-                None => match allocate_network_for_instance(&instances_api).await {
-                    Ok(net) => {
+                None => match ensure_claim_bound(&ctx.client, &ns, &instance).await? {
+                    ClaimResolution::Bound(net) => {
                         info!(
                             instance = %name,
                             service_cidr = %net.service_cidr,
                             cluster_cidr = %net.cluster_cidr,
-                            "Allocated network CIDRs"
+                            "CIDRClaim bound; copying CIDRs to ClusterInstance.status.network"
                         );
                         patch_instance_status(
                             &instances_api,
@@ -171,12 +179,20 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         // one extra reconcile.
                         return Ok(Action::requeue(std::time::Duration::from_secs(1)));
                     }
-                    Err(e) => {
-                        error!(instance = %name, error = %format!("{e:#}"),
-                               "Failed to allocate network CIDRs");
-                        return Err(InstanceError::Lifecycle(
-                            e.context("network allocation failed"),
-                        ));
+                    ClaimResolution::Pending => {
+                        debug!(
+                            instance = %name,
+                            "CIDRClaim is Pending; waiting for IPAM controller"
+                        );
+                        return Ok(Action::requeue(std::time::Duration::from_secs(2)));
+                    }
+                    ClaimResolution::Conflict(msg) => {
+                        warn!(
+                            instance = %name,
+                            reason = %msg,
+                            "CIDRClaim is in Conflict; provisioning blocked"
+                        );
+                        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
                     }
                 },
             };
@@ -954,43 +970,107 @@ async fn check_instance_readiness_gate<B: ClusterBackend + Clone>(
     }
 }
 
-/// Pick the next free network slot by reading the CIDRs already in use
-/// across sibling ClusterInstances in this namespace.
+/// Outcome of resolving a `CIDRClaim` for a `ClusterInstance`.
+enum ClaimResolution {
+    /// The IPAM controller has bound the claim. The instance can now be
+    /// provisioned with these CIDRs.
+    Bound(ClusterInstanceNetwork),
+    /// The claim exists (we may have just created it) but isn't bound
+    /// yet. The IPAM controller is the next mover; we requeue.
+    Pending,
+    /// The IPAM controller decided the request can't be satisfied
+    /// (pool full, requested CIDR overlapping, malformed pool spec).
+    /// Carries the human-readable reason for log surfacing.
+    Conflict(String),
+}
+
+/// Ensure a `CIDRClaim` exists for `instance` and return its current
+/// resolution.
 ///
-/// Stateless allocator: the live CRD inventory IS the source of truth.
-/// On every call we list peers, collect their `status.network.serviceCidr`
-/// values, and ask `cidr_alloc::allocate_slot` for the lowest unused
-/// slot. This means a brand-new operator (or one that lost in-memory
-/// state) can resume allocation deterministically — there is no global
-/// counter to seed.
-///
-/// Returns an error if all `MAX_SLOTS` are occupied. In practice that
-/// implies more than 128 simultaneous pool members; bumping the cap
-/// would mean reserving a wider parent CIDR (currently `10.240.0.0/12`).
-async fn allocate_network_for_instance(
-    instances_api: &Api<ClusterInstance>,
-) -> Result<ClusterInstanceNetwork, anyhow::Error> {
-    let inventory = instances_api
-        .list(&kube::api::ListParams::default())
-        .await
-        .context("Failed to list ClusterInstances for CIDR allocation")?;
+/// Idempotent: the claim's name is fixed at the instance's name, so a
+/// retry after a partially-applied create is safe. Owner reference is
+/// set to the instance, so kube GC tears the claim down when the
+/// instance is deleted — the IPAM controller doesn't need a finalizer
+/// because deleting the claim IS releasing the slot.
+async fn ensure_claim_bound(
+    client: &Client,
+    namespace: &str,
+    instance: &ClusterInstance,
+) -> Result<ClaimResolution, InstanceError> {
+    let claims_api: Api<CIDRClaim> = Api::namespaced(client.clone(), namespace);
+    let name = instance.name_any();
 
-    let used: Vec<String> = inventory
-        .items
-        .into_iter()
-        .filter_map(|inst| inst.status.and_then(|s| s.network.map(|n| n.service_cidr)))
-        .collect();
+    // Fast path: claim already exists, look at its phase.
+    match claims_api.get(&name).await {
+        Ok(claim) => {
+            return Ok(claim_resolution(&claim));
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            // Fall through to create.
+        }
+        Err(e) => return Err(InstanceError::Kube(e)),
+    }
 
-    let (_slot, net) = cidr_alloc::allocate_slot(used).ok_or_else(|| {
-        anyhow::anyhow!(
-            "All {} CIDR slots in 10.240.0.0/12 are taken; \
-             either some clusters need to be released or the parent \
-             range needs to grow",
-            cidr_alloc::MAX_SLOTS
-        )
-    })?;
+    let owner = instance.controller_owner_ref(&()).map(|o| vec![o]);
+    let mut labels = BTreeMap::new();
+    if let Some(pool) = instance.spec.pool_ref.as_ref() {
+        labels.insert("kobe.kunobi.ninja/pool".to_string(), pool.name.clone());
+    }
+    let claim = CIDRClaim {
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: owner,
+            labels: if labels.is_empty() {
+                None
+            } else {
+                Some(labels)
+            },
+            ..Default::default()
+        },
+        spec: CIDRClaimSpec {
+            requested_service_cidr: None,
+            requested_cluster_cidr: None,
+        },
+        status: None,
+    };
 
-    Ok(net)
+    match claims_api.create(&PostParams::default(), &claim).await {
+        Ok(_) => {
+            info!(instance = %name, "Created CIDRClaim");
+            Ok(ClaimResolution::Pending)
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+            // Lost a race; refetch and read its phase.
+            let claim = claims_api.get(&name).await?;
+            Ok(claim_resolution(&claim))
+        }
+        Err(e) => Err(InstanceError::Kube(e)),
+    }
+}
+
+fn claim_resolution(claim: &CIDRClaim) -> ClaimResolution {
+    let Some(status) = claim.status.as_ref() else {
+        return ClaimResolution::Pending;
+    };
+    match &status.phase {
+        CIDRClaimPhase::Bound => match (&status.service_cidr, &status.cluster_cidr) {
+            (Some(svc), Some(cls)) => ClaimResolution::Bound(ClusterInstanceNetwork {
+                service_cidr: svc.clone(),
+                cluster_cidr: cls.clone(),
+            }),
+            // Phase says Bound but CIDRs missing — treat as Pending so
+            // the IPAM controller has a chance to repair.
+            _ => ClaimResolution::Pending,
+        },
+        CIDRClaimPhase::Conflict => ClaimResolution::Conflict(
+            status
+                .message
+                .clone()
+                .unwrap_or_else(|| "unspecified conflict".to_string()),
+        ),
+        CIDRClaimPhase::Pending => ClaimResolution::Pending,
+    }
 }
 
 async fn patch_instance_status(
