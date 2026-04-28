@@ -686,6 +686,26 @@ async fn ensure_cluster_instance(
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/pool".to_string(), profile.name_any());
 
+    // Stamp provenance on the initial status. `created_with` is set
+    // here once and never overwritten — every subsequent
+    // `patch_instance_status` constructs a fresh status with
+    // `created_with: None` (via `..Default::default()`), and the field's
+    // `skip_serializing_if = "Option::is_none"` keeps JSON Merge Patch
+    // from clobbering the on-disk write. See the field doc comment in
+    // `crd::instance::ClusterInstanceStatus`.
+    //
+    // `kobe_sync_image` is stamped only for vkobe pools — other
+    // backends don't run the sync sidecar, so the field would be
+    // misleading noise.
+    let provenance = crate::crd::ClusterInstanceProvenance {
+        operator_version: env!("CARGO_PKG_VERSION").to_string(),
+        kobe_sync_image: matches!(
+            profile.spec.backend.backend_type,
+            crate::crd::BackendType::Vkobe
+        )
+        .then(|| render_ctx.kobe_sync_image.clone()),
+    };
+
     let initial_status = ClusterInstanceStatus {
         phase: ClusterInstancePhase::Creating,
         provisioned: false,
@@ -700,6 +720,7 @@ async fn ensure_cluster_instance(
             render_ctx,
             bootstrap_specs,
         )),
+        created_with: Some(provenance),
         ..Default::default()
     };
 

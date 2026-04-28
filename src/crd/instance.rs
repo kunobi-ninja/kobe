@@ -166,4 +166,54 @@ pub struct ClusterInstanceStatus {
     /// Backends that reuse the host's network (vkobe) ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<ClusterInstanceNetwork>,
+
+    /// Provenance: which version of kobe stamped this `ClusterInstance`
+    /// at creation time. Set once by the profile controller in
+    /// `ensure_cluster_instance` and never overwritten. Future logic
+    /// (rolling upgrade, drift detection by version, manual recycle
+    /// triggers, …) compares this against the running operator's
+    /// version to decide whether the instance is "stale".
+    ///
+    /// `None` for instances created by kobe < 0.17 — consumers should
+    /// treat the absence as "unknown / pre-provenance" and decide
+    /// per-policy whether to migrate or leave alone.
+    ///
+    /// `skip_serializing_if = "Option::is_none"` is critical here, same
+    /// pattern as `spec_hash` above: every status patch from the
+    /// instance controller constructs a fresh `ClusterInstanceStatus`
+    /// where this field defaults to `None`. Without `skip_serializing_if`,
+    /// the JSON Merge Patch would carry `"createdWith": null` and wipe
+    /// the on-disk value (RFC 7396). Skipping the field on `None`
+    /// preserves the original write through every subsequent patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_with: Option<ClusterInstanceProvenance>,
+}
+
+/// Provenance stamp written once at create time on
+/// `ClusterInstanceStatus.created_with`. Captures the components of the
+/// operator that produced this instance, so future reconcile logic can
+/// detect "instance was created by an older kobe" without re-deriving
+/// the answer from a complex hash.
+///
+/// Why not roll this into `spec_hash`?  The spec hash detects drift in
+/// the user-facing config (`ClusterPool.spec`, render-context image,
+/// referenced `BootstrapConfig` content). Provenance is orthogonal: it
+/// captures the *operator* identity at create time, which can change
+/// without any spec drift (e.g. `helm upgrade` to a kobe minor that
+/// adds a new runtime requirement). Keeping them separate means each
+/// can evolve without the other.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterInstanceProvenance {
+    /// Semver of the kobe-operator binary that created this instance,
+    /// taken from `env!("CARGO_PKG_VERSION")` at create time. Example:
+    /// `"0.17.0"`.
+    pub operator_version: String,
+
+    /// kobe-sync sidecar image used at create time. Recorded for
+    /// `Vkobe` backends only (other backends don't run kobe-sync).
+    /// Format matches the operator's `KOBE_SYNC_IMAGE` env var, e.g.
+    /// `"zondax/kobe-sync:v0.16.0"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kobe_sync_image: Option<String>,
 }

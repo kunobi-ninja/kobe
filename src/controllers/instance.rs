@@ -170,6 +170,12 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 health_failures: status.health_failures,
                                 spec_hash: status.spec_hash.clone(),
                                 network: Some(net.clone()),
+                                // `created_with: None` lets `skip_serializing_if`
+                                // omit the field from the JSON Merge Patch, so
+                                // the on-disk provenance written at create time
+                                // is preserved (we never want to overwrite it
+                                // from an instance-controller patch).
+                                created_with: None,
                             },
                         )
                         .await?;
