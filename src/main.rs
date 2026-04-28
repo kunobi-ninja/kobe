@@ -268,6 +268,7 @@ async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
         "accesspolicies.kobe.kunobi.ninja",
         "bootstrapconfigs.kobe.kunobi.ninja",
         "kobestores.kobe.kunobi.ninja",
+        "cidrclaims.kobe.kunobi.ninja",
     ];
 
     let crd_api: kube::api::Api<CustomResourceDefinition> = kube::api::Api::all(client.clone());
