@@ -697,8 +697,18 @@ async fn ensure_cluster_instance(
     // `kobe_sync_image` is stamped only for vkobe pools — other
     // backends don't run the sync sidecar, so the field would be
     // misleading noise.
+    //
+    // We read `BUILD_VERSION` (stamped by `build.rs` from the
+    // CI-injected env var, falling back to `CARGO_PKG_VERSION` then
+    // `"dev"`), NOT `CARGO_PKG_VERSION` directly. `Cargo.toml` keeps
+    // `version = "0.0.0"` as a deliberate placeholder so the same
+    // workspace builds for every release tag without manual edits;
+    // CI sets `BUILD_VERSION=v0.17.0` (etc.) to override. Reading
+    // `CARGO_PKG_VERSION` here would always stamp `"0.0.0"`, defeating
+    // the entire point of provenance. Same env var that
+    // `kobe --version` prints, so the two surfaces stay in sync.
     let provenance = crate::crd::ClusterInstanceProvenance {
-        operator_version: env!("CARGO_PKG_VERSION").to_string(),
+        operator_version: env!("BUILD_VERSION").to_string(),
         kobe_sync_image: matches!(
             profile.spec.backend.backend_type,
             crate::crd::BackendType::Vkobe
