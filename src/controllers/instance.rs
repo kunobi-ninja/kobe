@@ -29,6 +29,79 @@ use crate::crd::{
 };
 use crate::velero::VeleroCoordinator;
 
+// ─────────────────────────────────────────────────────────────────────
+// Metrics helpers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Seconds elapsed since the `ClusterInstance` was created.
+/// Used as the duration value for `kobe_instance_create_duration_seconds`
+/// at terminal phase transitions. Returns `0.0` when
+/// `creation_timestamp` is missing (shouldn't happen — any instance
+/// reaching a terminal phase was Created at some point).
+fn instance_age_seconds(instance: &ClusterInstance) -> f64 {
+    instance
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| {
+            let created_ms = t.0.as_millisecond();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            ((now_ms - created_ms).max(0) as f64) / 1000.0
+        })
+        .unwrap_or(0.0)
+}
+
+/// Stable string label for a backend type. Closed enum, no
+/// allocations — keeps Prometheus label cardinality fixed.
+fn backend_label(backend: &BackendType) -> &'static str {
+    match backend {
+        BackendType::K3s => "k3s",
+        BackendType::K0s => "k0s",
+        BackendType::Capi => "capi",
+        BackendType::Vkobe => "vkobe",
+    }
+}
+
+/// Profile label, with `"standalone"` for instances not managed by a
+/// pool. Used as the `profile` label on per-instance metrics so the
+/// label set is stable across pool-managed and standalone instances.
+fn profile_label(instance: &ClusterInstance) -> &str {
+    instance
+        .spec
+        .pool_ref
+        .as_ref()
+        .map(|r| r.name.as_str())
+        .unwrap_or("standalone")
+}
+
+/// Record an instance create-attempt outcome: histogram observation +
+/// counter increment. Called when phase transitions to a terminal
+/// state (`Ready`, `Failed`) for the first time.
+fn observe_instance_create(
+    instance: &ClusterInstance,
+    backend: &BackendType,
+    outcome: crate::metrics::InstanceCreateOutcome,
+) {
+    let elapsed = instance_age_seconds(instance);
+    let profile = profile_label(instance);
+    let backend_str = backend_label(backend);
+    crate::metrics::INSTANCE_CREATE_DURATION
+        .with_label_values(&[profile, backend_str, outcome.as_str()])
+        .observe(elapsed);
+    crate::metrics::INSTANCE_CREATES_TOTAL
+        .with_label_values(&[profile, backend_str, outcome.as_str()])
+        .inc();
+}
+
+/// Increment the recycle counter with a typed reason. The Recycling
+/// transition itself is performed by the caller; this only records
+/// the metric.
+fn observe_recycle(instance: &ClusterInstance, reason: crate::metrics::RecycleReason) {
+    crate::metrics::INSTANCE_RECYCLES_TOTAL
+        .with_label_values(&[profile_label(instance), reason.as_str()])
+        .inc();
+}
+
 pub struct InstanceContext<B: ClusterBackend> {
     pub client: Client,
     pub backend: B,
@@ -232,6 +305,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 }
                 Err(e) => {
                     warn!(instance = %name, error = %format!("{e:#}"), "Provisioning failed");
+                    observe_instance_create(
+                        &instance,
+                        &config.backend.backend_type,
+                        crate::metrics::InstanceCreateOutcome::Failed,
+                    );
                     patch_instance_status(
                         &instances_api,
                         &name,
@@ -278,6 +356,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         Ok(Action::requeue(std::time::Duration::from_secs(5)))
                     }
                     Ok(None) => {
+                        observe_instance_create(
+                            &instance,
+                            &config.backend.backend_type,
+                            crate::metrics::InstanceCreateOutcome::Ready,
+                        );
                         patch_instance_status(
                             &instances_api,
                             &name,
@@ -299,6 +382,30 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     }
                     Err(e) => {
                         warn!(instance = %name, error = %format!("{e:#}"), "Bootstrap failed");
+                        observe_instance_create(
+                            &instance,
+                            &config.backend.backend_type,
+                            crate::metrics::InstanceCreateOutcome::Failed,
+                        );
+                        // Bootstrap-specific counter so an alert can
+                        // distinguish "bootstrap failure" from generic
+                        // "create failure" without having to
+                        // disambiguate via duration buckets.
+                        let bootstrap_label =
+                            status.active_bootstrap.as_deref().unwrap_or("unknown");
+                        crate::metrics::BOOTSTRAP_FAILURES_TOTAL
+                            .with_label_values(&[
+                                profile_label(&instance),
+                                bootstrap_label,
+                                // Reason classification deferred — needs Job
+                                // status inspection to differentiate
+                                // ExitNonZero vs Timeout vs BackoffLimit. For
+                                // now we tag everything as backoff_limit
+                                // because that's what the wrapping Job
+                                // ultimately reports.
+                                crate::metrics::BootstrapFailureReason::BackoffLimit.as_str(),
+                            ])
+                            .inc();
                         patch_instance_status(
                             &instances_api,
                             &name,
@@ -328,7 +435,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             Ok(next)
         }
         ClusterInstancePhase::Leased => {
-            let next = evaluate_leased_instance(&ctx, &name, &ns, &status).await?;
+            let next = evaluate_leased_instance(&ctx, &instance, &name, &ns, &status).await?;
             Ok(next)
         }
         ClusterInstancePhase::Recycling => {
@@ -350,12 +457,14 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
 
 async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
     name: &str,
     namespace: &str,
     status: &ClusterInstanceStatus,
 ) -> Result<Action, InstanceError> {
     let Some(lease_ref) = &status.lease_ref else {
         warn!(instance = %name, "Leased instance is missing lease_ref, recycling");
+        observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
         let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
         patch_instance_status(
             &instances_api,
@@ -392,6 +501,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                     phase = %lease_status.phase,
                     "Lease is terminating, recycling instance"
                 );
+                observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
                 let instances_api: Api<ClusterInstance> =
                     Api::namespaced(ctx.client.clone(), namespace);
                 patch_instance_status(
@@ -422,6 +532,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 lease = %lease_ref.name,
                 "Lease CR not found for leased instance, recycling"
             );
+            observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
             let instances_api: Api<ClusterInstance> =
                 Api::namespaced(ctx.client.clone(), namespace);
             patch_instance_status(

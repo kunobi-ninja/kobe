@@ -381,10 +381,14 @@ async fn write_health_condition(
         _ => Some(Utc::now().to_rfc3339()),
     };
 
+    let store_name = store.name_any();
+    let prev_status = prev_healthy.map(|c| c.status.as_str()).unwrap_or("Unknown");
+    let new_status = eval.status; // &'static str: True/False/Unknown
+
     new_conditions.push(KobeStoreCondition {
         condition_type: "Healthy".to_string(),
-        status: eval.status.to_string(),
-        reason: eval.reason,
+        status: new_status.to_string(),
+        reason: eval.reason.clone(),
         message: eval.message,
         last_transition_time,
     });
@@ -405,12 +409,39 @@ async fn write_health_condition(
     });
     stores
         .patch_status(
-            &store.name_any(),
+            &store_name,
             &PatchParams::apply("kobe-operator-health"),
             &Patch::Merge(&patch),
         )
         .await?;
+
+    // Phase 3 metrics: gauge mirror of the condition + transition
+    // counter. Done after a successful patch so the gauge reflects
+    // observable state (and not a state we tried to write but
+    // couldn't).
+    let gauge_value = healthy_status_to_gauge(new_status);
+    crate::metrics::KOBESTORE_HEALTHY
+        .with_label_values(&[store_name.as_str(), eval.reason.as_str()])
+        .set(gauge_value);
+    if prev_status != new_status {
+        crate::metrics::KOBESTORE_CONDITION_TRANSITIONS_TOTAL
+            .with_label_values(&[store_name.as_str(), prev_status, new_status])
+            .inc();
+    }
+
     Ok(())
+}
+
+/// Map `Healthy` condition status to gauge integer:
+/// `True` → 1, `False` → 0, `Unknown` (or anything else) → -1.
+/// Tri-state gauge is unusual but lets PromQL distinguish "operator
+/// can't observe" (`-1`) from "operator observed and it's bad" (`0`).
+fn healthy_status_to_gauge(status: &str) -> i64 {
+    match status {
+        "True" => 1,
+        "False" => 0,
+        _ => -1,
+    }
 }
 
 /// Convenience: read the current `Healthy` reason for a store, used by

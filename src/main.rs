@@ -32,6 +32,16 @@ async fn main() -> anyhow::Result<()> {
     let _otel_provider = telemetry::init()?;
 
     metrics::init();
+
+    // Set the IPAM pool capacity gauge once at startup. The plan is a
+    // Rust constant today (see `pool::cidr_alloc::ipam_plan`), so the
+    // capacity is fixed for the lifetime of this process. If the plan
+    // ever moves to runtime config (a `CIDRPool` CRD), this should be
+    // re-evaluated on every spec change instead of once-at-startup.
+    metrics::IPAM_POOL_CAPACITY
+        .with_label_values::<&str>(&[])
+        .set(pool::cidr_alloc::ipam_plan().capacity() as i64);
+
     info!("Starting kobe-operator");
 
     let client = Client::try_default().await?;

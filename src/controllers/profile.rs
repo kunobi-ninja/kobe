@@ -479,6 +479,19 @@ async fn reconcile_profile(
                 if let Some(entry) = pool_state.clusters.get_mut(cluster_name) {
                     entry.state = ClusterState::Recycling;
                 }
+                // `PoolAction::Delete` bundles scale-down, drift-recycle,
+                // and post-lease recycle without a reason axis on the
+                // action itself; we tag everything as `SpecDrift` here
+                // because that's the most common cause and also what an
+                // operator sees in `kobectl get clusterinstance` (the
+                // spec_hash mismatched). When `PoolAction` gains a
+                // typed reason, this label can be split apart.
+                crate::metrics::INSTANCE_RECYCLES_TOTAL
+                    .with_label_values(&[
+                        name.as_str(),
+                        crate::metrics::RecycleReason::SpecDrift.as_str(),
+                    ])
+                    .inc();
                 let current = get_cluster_instance_status(&ctx.client, &ns, cluster_name)
                     .await
                     .unwrap_or_default();
@@ -517,6 +530,28 @@ async fn reconcile_profile(
     sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
 
     let counts = count_states(&pool_state);
+
+    // Phase 3 state gauges: per-pool size by dimension.
+    // `min`/`max` come from the spec; the rest are observed phase
+    // counts. Single emit per reconcile, capacity ~10 series per pool
+    // — well within Prometheus's comfort zone.
+    let pool_size_set = |dim: &str, val: u32| {
+        crate::metrics::POOL_SIZE
+            .with_label_values(&[name.as_str(), dim])
+            .set(val as i64);
+    };
+    // `desired` is the size target (legacy field) OR the scaling.min_ready
+    // floor. `max` is unset for non-scaling pools (gauge stays at default).
+    pool_size_set("desired", profile.spec.size);
+    if let Some(scaling) = profile.spec.scaling.as_ref() {
+        pool_size_set("min", scaling.min_ready);
+        pool_size_set("max", scaling.max_clusters);
+    }
+    pool_size_set("creating", counts.creating);
+    pool_size_set("ready", counts.ready);
+    pool_size_set("leased", counts.leased);
+    pool_size_set("unhealthy", counts.unhealthy);
+    pool_size_set("recycling", counts.recycling);
 
     let queue_depth = {
         let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);

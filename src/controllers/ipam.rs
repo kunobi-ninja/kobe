@@ -328,6 +328,25 @@ async fn set_bound(
             &Patch::Merge(&patch),
         )
         .await?;
+    // Phase 1 + 2 metric emission: bind duration histogram + outcome
+    // counter. Uses `claim.metadata.creation_timestamp` as the start
+    // of the Pending→Bound clock, which is precise enough for this
+    // controller's reconcile cadence (sub-second to a few seconds).
+    let kind = if claim.spec.requested_service_cidr.is_some() {
+        crate::metrics::IpamClaimKind::Reservation
+    } else {
+        crate::metrics::IpamClaimKind::Dynamic
+    };
+    let elapsed = claim_age_seconds(claim);
+    crate::metrics::IPAM_BIND_DURATION
+        .with_label_values(&[crate::metrics::IpamClaimOutcome::Bound.as_str()])
+        .observe(elapsed);
+    crate::metrics::IPAM_CLAIMS_TOTAL
+        .with_label_values(&[
+            crate::metrics::IpamClaimOutcome::Bound.as_str(),
+            kind.as_str(),
+        ])
+        .inc();
     Ok(())
 }
 
@@ -352,9 +371,44 @@ async fn set_conflict(
         )
         .await?;
     warn!(claim = %claim.name_any(), reason = %message, "CIDRClaim conflict");
+    // Same metric instrumentation as the Bound path. Conflict counts
+    // are the most actionable IPAM signal — a sudden spike means
+    // either the pool is filling up or someone's repeatedly creating
+    // claims with bad pinned CIDRs.
+    let kind = if claim.spec.requested_service_cidr.is_some() {
+        crate::metrics::IpamClaimKind::Reservation
+    } else {
+        crate::metrics::IpamClaimKind::Dynamic
+    };
+    let elapsed = claim_age_seconds(claim);
+    crate::metrics::IPAM_BIND_DURATION
+        .with_label_values(&[crate::metrics::IpamClaimOutcome::Conflict.as_str()])
+        .observe(elapsed);
+    crate::metrics::IPAM_CLAIMS_TOTAL
+        .with_label_values(&[
+            crate::metrics::IpamClaimOutcome::Conflict.as_str(),
+            kind.as_str(),
+        ])
+        .inc();
     // Slow requeue so a conflict caused by an in-flight competitor
     // (e.g. our requested CIDR was just released) eventually retries.
     Ok(Action::requeue(std::time::Duration::from_secs(60)))
+}
+
+/// Seconds elapsed since the claim was created. Mirrors
+/// `instance_age_seconds` in `controllers::instance` — same chrono
+/// ↔ jiff conversion pattern.
+fn claim_age_seconds(claim: &CIDRClaim) -> f64 {
+    claim
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| {
+            let created_ms = t.0.as_millisecond();
+            let now_ms = Utc::now().timestamp_millis();
+            ((now_ms - created_ms).max(0) as f64) / 1000.0
+        })
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
