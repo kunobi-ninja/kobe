@@ -118,6 +118,21 @@ impl K0sBackend {
     /// data source. Otherwise, uses the default etcd storage backend.
     /// Any `extra_args` are appended to the `spec.api.extraArgs` map.
     ///
+    /// `sans` populates `spec.api.sans` — the additional DNS names / IPs
+    /// embedded as Subject Alternative Names on the apiserver TLS cert.
+    /// Production paths MUST include the host-cluster Service DNS
+    /// (`<name>-server.<namespace>.svc`) here, otherwise any client
+    /// dialing the cluster via that hostname (e.g. the chart-shipped
+    /// flux bootstrap Job) gets `x509: certificate is valid for ... not
+    /// <service-dns>` and the bootstrap fails before it can install
+    /// anything. The k3s backend solves the same problem inline via
+    /// `--tls-san=...`; k0s reads its SAN list from the YAML config
+    /// instead, which is why this is a separate parameter rather than
+    /// being smuggled into `extra_args` (a `tls-san` key under
+    /// `extraArgs` would be passed to kube-apiserver as a flag, where
+    /// it does not exist — the k0s wrapper only honours
+    /// `spec.api.sans`).
+    ///
     /// `network` carries the operator-allocated service + cluster
     /// CIDRs from `pool::cidr_alloc`. `None` falls back to the
     /// standalone defaults below — covers test paths and CLI builds
@@ -128,6 +143,7 @@ impl K0sBackend {
     pub fn build_k0s_config_yaml(
         datastore_endpoint: Option<&str>,
         extra_args: &[String],
+        sans: &[String],
         network: Option<&crate::crd::ClusterInstanceNetwork>,
     ) -> String {
         let storage_section = if let Some(endpoint) = datastore_endpoint {
@@ -140,15 +156,28 @@ impl K0sBackend {
             "    type: etcd".to_string()
         };
 
-        let extra_args_section = if extra_args.is_empty() {
+        // `spec.api` holds both `sans` (Subject Alternative Names on the
+        // apiserver TLS cert) and `extraArgs` (kube-apiserver flags).
+        // Emit a single `api:` block when either is non-empty so the
+        // YAML stays valid k0s ClusterConfig.
+        let api_section = if sans.is_empty() && extra_args.is_empty() {
             String::new()
         } else {
-            let mut section = String::from("  api:\n    extraArgs:\n");
-            for arg in extra_args {
-                // Parse --key=value format
-                let stripped = arg.strip_prefix("--").unwrap_or(arg);
-                if let Some((key, value)) = stripped.split_once('=') {
-                    section.push_str(&format!("      {key}: \"{value}\"\n"));
+            let mut section = String::from("  api:\n");
+            if !sans.is_empty() {
+                section.push_str("    sans:\n");
+                for san in sans {
+                    section.push_str(&format!("      - {san}\n"));
+                }
+            }
+            if !extra_args.is_empty() {
+                section.push_str("    extraArgs:\n");
+                for arg in extra_args {
+                    // Parse --key=value format
+                    let stripped = arg.strip_prefix("--").unwrap_or(arg);
+                    if let Some((key, value)) = stripped.split_once('=') {
+                        section.push_str(&format!("      {key}: \"{value}\"\n"));
+                    }
                 }
             }
             section
@@ -177,8 +206,8 @@ spec:
 "#
         );
 
-        if !extra_args_section.is_empty() {
-            yaml.push_str(&extra_args_section);
+        if !api_section.is_empty() {
+            yaml.push_str(&api_section);
         }
 
         yaml
@@ -244,9 +273,23 @@ spec:
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
     ) -> Result<()> {
+        // The chart-shipped flux bootstrap Job (and any in-cluster
+        // client that dials the host-side Service for this k0s pool
+        // member) connects to `<name>-server.<namespace>.svc:6443`.
+        // The apiserver TLS cert MUST list that DNS name as a SAN —
+        // k0s only emits the generic kubernetes.* + localhost names by
+        // default, so the bootstrap pod's TLS verify fails with
+        // `x509: certificate is valid for kubernetes, ...
+        // kubernetes.svc.cluster.local, localhost, not
+        // <name>-server.<namespace>.svc`. The k3s backend solves this
+        // inline (see `--tls-san=` at the top of the k3s server
+        // container args); for k0s the equivalent is `spec.api.sans`
+        // in the ClusterConfig YAML.
+        let api_sans = vec![format!("{name}-server.{namespace}.svc")];
         let config_yaml = Self::build_k0s_config_yaml(
             datastore_endpoint,
             &config.server_args,
+            &api_sans,
             config.allocated_network.as_ref(),
         );
         let cm = Self::build_k0s_config_configmap(name, namespace, &config_yaml);
@@ -1020,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_no_pg() {
-        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], None);
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], &[], None);
         assert!(
             yaml.contains("type: etcd"),
             "Should use etcd when no PG: {yaml}"
@@ -1041,6 +1084,7 @@ mod tests {
         let yaml = K0sBackend::build_k0s_config_yaml(
             Some("postgres://user:pass@pg:5432/k0s_my_cluster"),
             &[],
+            &[],
             None,
         );
         assert!(
@@ -1056,11 +1100,109 @@ mod tests {
 
     #[test]
     fn test_build_k0s_config_yaml_with_extra_args() {
-        let yaml =
-            K0sBackend::build_k0s_config_yaml(None, &["--tls-san=example.com".to_string()], None);
+        let yaml = K0sBackend::build_k0s_config_yaml(
+            None,
+            &["--tls-san=example.com".to_string()],
+            &[],
+            None,
+        );
         assert!(
             yaml.contains("tls-san: \"example.com\""),
             "Should include extra args: {yaml}"
+        );
+    }
+
+    /// Regression: when `sans` is non-empty, the YAML must contain
+    /// `spec.api.sans` listing each entry. Without this, the chart-
+    /// shipped flux bootstrap Job (and any other in-cluster client
+    /// dialing the host-side Service for the pool member) gets
+    /// `x509: certificate is valid for kubernetes, ... not
+    /// <name>-server.<namespace>.svc` and the bootstrap fails before
+    /// any flux component is installed.
+    #[test]
+    fn test_build_k0s_config_yaml_emits_sans() {
+        let yaml = K0sBackend::build_k0s_config_yaml(
+            None,
+            &[],
+            &["pool-foo-server.kobe-system.svc".to_string()],
+            None,
+        );
+        assert!(
+            yaml.contains("api:"),
+            "yaml must include spec.api block when sans is non-empty: {yaml}"
+        );
+        assert!(
+            yaml.contains("    sans:"),
+            "yaml must include spec.api.sans key: {yaml}"
+        );
+        assert!(
+            yaml.contains("- pool-foo-server.kobe-system.svc"),
+            "yaml must list the service DNS as a SAN entry: {yaml}"
+        );
+    }
+
+    /// Regression: `sans` and `extra_args` must coexist under a single
+    /// `spec.api:` block. A naive implementation that emits two
+    /// separate `api:` keys produces invalid YAML where the second
+    /// silently overrides the first, dropping the SANs.
+    #[test]
+    fn test_build_k0s_config_yaml_sans_and_extra_args_coexist() {
+        let yaml = K0sBackend::build_k0s_config_yaml(
+            None,
+            &["--service-node-port-range=30000-32767".to_string()],
+            &["pool-bar-server.kobe-system.svc".to_string()],
+            None,
+        );
+        let api_count = yaml.matches("\n  api:\n").count();
+        assert_eq!(
+            api_count, 1,
+            "spec.api: block must appear exactly once even when both sans and extraArgs are set; got {api_count} occurrences in: {yaml}"
+        );
+        assert!(
+            yaml.contains("    sans:"),
+            "sans must appear under api: {yaml}"
+        );
+        assert!(
+            yaml.contains("- pool-bar-server.kobe-system.svc"),
+            "service DNS must appear in sans list: {yaml}"
+        );
+        assert!(
+            yaml.contains("    extraArgs:"),
+            "extraArgs must appear under api: {yaml}"
+        );
+        assert!(
+            yaml.contains("service-node-port-range: \"30000-32767\""),
+            "extra arg must be parsed into extraArgs map: {yaml}"
+        );
+    }
+
+    /// Invariant: the production path that builds the k0s ConfigMap
+    /// (the one applied to the host cluster for every pool member)
+    /// MUST always include the host-side Service DNS in
+    /// `spec.api.sans`. Mirrors how the k3s backend hard-codes
+    /// `--tls-san=<name>-server.<namespace>.svc` inline; the test
+    /// exists so a refactor that drops the SAN never re-introduces
+    /// the silent flux-bootstrap failure mode (issue surfaced via
+    /// `ci-k0s-flux` triage pool, April 2026).
+    #[test]
+    fn test_k0s_configmap_always_includes_service_dns_san() {
+        let cluster_name = "pool-ci-k0s-flux-42";
+        let namespace = "kobe-system";
+        let expected_san = format!("{cluster_name}-server.{namespace}.svc");
+
+        // Mirror exactly what `create_k0s_config_configmap` builds.
+        let api_sans = vec![expected_san.clone()];
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], &api_sans, None);
+        let cm = K0sBackend::build_k0s_config_configmap(cluster_name, namespace, &yaml);
+
+        let stored = cm
+            .data
+            .as_ref()
+            .and_then(|d| d.get("k0s.yaml"))
+            .expect("ConfigMap must contain k0s.yaml key");
+        assert!(
+            stored.contains(&format!("- {expected_san}")),
+            "k0s ConfigMap MUST embed `{expected_san}` as a SAN; otherwise flux bootstrap (and any in-cluster client dialing the Service DNS) will fail TLS verify. Got:\n{stored}"
         );
     }
 
@@ -1075,7 +1217,7 @@ mod tests {
             service_cidr: "10.245.32.0/20".to_string(),
             cluster_cidr: "10.253.32.0/20".to_string(),
         };
-        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], Some(&net));
+        let yaml = K0sBackend::build_k0s_config_yaml(None, &[], &[], Some(&net));
         assert!(
             yaml.contains("podCIDR: 10.253.32.0/20"),
             "must use allocated cluster_cidr; got: {yaml}"
