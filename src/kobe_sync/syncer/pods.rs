@@ -14,11 +14,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
 
 // ===========================================================================
-// v2: Pod syncer (virtual -> host)
+// Pod syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual Pod into a host Pod ready for creation on the host
@@ -46,7 +46,7 @@ pub fn translate_pod_to_host(
     //    Also remove projected SA token volumes and track their names.
     let dropped_volumes: HashSet<String>;
     if let Some(ref volumes) = spec.volumes {
-        let (translated_vols, dropped) = translate_volumes_v2(volumes, translator, virtual_ns);
+        let (translated_vols, dropped) = translate_volumes(volumes, translator, virtual_ns);
         translated_spec.volumes = Some(translated_vols);
         dropped_volumes = dropped;
     } else {
@@ -62,9 +62,9 @@ pub fn translate_pod_to_host(
 
     // 4. Translate containers (env vars, envFrom, volume mounts).
     translated_spec.containers =
-        translate_containers_v2(&spec.containers, translator, virtual_ns, &dropped_volumes);
+        translate_containers(&spec.containers, translator, virtual_ns, &dropped_volumes);
     if let Some(ref init_containers) = spec.init_containers {
-        translated_spec.init_containers = Some(translate_containers_v2(
+        translated_spec.init_containers = Some(translate_containers(
             init_containers,
             translator,
             virtual_ns,
@@ -101,7 +101,7 @@ pub fn translate_pod_to_host(
     })
 }
 
-/// Translate volume sources for v2 (uses `NameTranslator` directly).
+/// Translate volume sources (uses `NameTranslator` directly).
 ///
 /// ConfigMap, Secret, and PVC volume references are translated. Projected
 /// volumes containing service account tokens are removed (replaced by the
@@ -111,7 +111,7 @@ pub fn translate_pod_to_host(
 /// - The translated volumes (with names/references rewritten).
 /// - The **set of original volume names** that were dropped, so callers can
 ///   consistently filter out the corresponding volume mounts.
-fn translate_volumes_v2(
+fn translate_volumes(
     volumes: &[Volume],
     translator: &NameTranslator,
     virtual_ns: &str,
@@ -174,8 +174,8 @@ fn translate_volumes_v2(
     (translated_volumes, dropped_names)
 }
 
-/// Translate environment variable references for v2 (uses `NameTranslator` directly).
-fn translate_env_vars_v2(
+/// Translate environment variable references (uses `NameTranslator` directly).
+fn translate_env_vars(
     env: &[EnvVar],
     translator: &NameTranslator,
     virtual_ns: &str,
@@ -217,12 +217,12 @@ fn translate_env_vars_v2(
         .collect()
 }
 
-/// Translate containers for v2 (env vars, envFrom, volume mounts).
+/// Translate containers (env vars, envFrom, volume mounts).
 ///
 /// `dropped_volumes` is the set of volume names that were removed during
 /// volume translation. Any volume mount whose `name` is in this set is
 /// silently removed so we never produce a pod spec with a dangling mount.
-fn translate_containers_v2(
+fn translate_containers(
     containers: &[Container],
     translator: &NameTranslator,
     virtual_ns: &str,
@@ -235,7 +235,7 @@ fn translate_containers_v2(
 
             // Translate env vars.
             if let Some(ref env) = container.env {
-                translated.env = Some(translate_env_vars_v2(env, translator, virtual_ns));
+                translated.env = Some(translate_env_vars(env, translator, virtual_ns));
             }
 
             // Translate envFrom sources.
@@ -293,46 +293,46 @@ fn translate_containers_v2(
 }
 
 // ---------------------------------------------------------------------------
-// PodSyncerV2 -- ResourceSyncer implementation
+// PodSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Pod syncer: watches the virtual kube-apiserver for Pods and creates
+/// Pod syncer: watches the virtual kube-apiserver for Pods and creates
 /// translated Pods on the host cluster.
-pub struct PodSyncerV2;
+pub struct PodSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for PodSyncerV2 {
+impl ResourceSyncer for PodSyncer {
     fn name(&self) -> &str {
         "pods"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<Pod> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<Pod> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("PodSyncerV2: starting watch on virtual apiserver");
+        info!("PodSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("PodSyncerV2: shutdown signal received");
+                    info!("PodSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_pod_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "PodSyncerV2: error handling event");
+                                warn!(error = %e, "PodSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "PodSyncerV2: watcher error");
+                            warn!(error = %e, "PodSyncer: watcher error");
                         }
                         None => {
-                            info!("PodSyncerV2: watcher stream ended");
+                            info!("PodSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -345,7 +345,7 @@ impl ResourceSyncer for PodSyncerV2 {
 /// Handle a single watcher event for the Pod syncer.
 async fn handle_pod_event(
     event: &Event<Pod>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<Pod>,
 ) -> anyhow::Result<()> {
     match event {
@@ -361,7 +361,7 @@ async fn handle_pod_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "PodSyncerV2: translating pod"
+                "PodSyncer: translating pod"
             );
 
             let host_pod = translate_pod_to_host(pod, &ctx.translator, &virtual_ns)?;
@@ -372,11 +372,11 @@ async fn handle_pod_event(
             // Only create new pods.
             match host_api.get_opt(host_name).await? {
                 Some(_existing) => {
-                    debug!(name = %host_name, "PodSyncerV2: host pod already exists, skipping (immutable spec)");
+                    debug!(name = %host_name, "PodSyncer: host pod already exists, skipping (immutable spec)");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_pod).await?;
-                    debug!(name = %host_name, "PodSyncerV2: created host pod");
+                    debug!(name = %host_name, "PodSyncer: created host pod");
                 }
             }
         }
@@ -391,24 +391,24 @@ async fn handle_pod_event(
 
             debug!(
                 name = %host_name,
-                "PodSyncerV2: deleting host pod"
+                "PodSyncer: deleting host pod"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "PodSyncerV2: deleted host pod");
+                    debug!(name = %host_name, "PodSyncer: deleted host pod");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "PodSyncerV2: host pod already gone");
+                    debug!(name = %host_name, "PodSyncer: host pod already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("PodSyncerV2: watcher init bookmark");
+            debug!("PodSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("PodSyncerV2: initial list complete");
+            info!("PodSyncer: initial list complete");
         }
     }
 
@@ -416,11 +416,11 @@ async fn handle_pod_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::{
         ConfigMapEnvSource, ConfigMapKeySelector, ConfigMapVolumeSource, Container, EnvFromSource,

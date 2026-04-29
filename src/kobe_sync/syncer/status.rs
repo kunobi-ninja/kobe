@@ -15,7 +15,7 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::LABEL_MANAGED;
 
 // ---------------------------------------------------------------------------
@@ -163,7 +163,7 @@ pub async fn bind_virtual_pod(
                 pod = pod_name,
                 namespace = namespace,
                 node = node_name,
-                "StatusSyncerV2: bound virtual pod to node"
+                "StatusSyncer: bound virtual pod to node"
             );
             Ok(())
         }
@@ -172,7 +172,7 @@ pub async fn bind_virtual_pod(
             debug!(
                 pod = pod_name,
                 namespace = namespace,
-                "StatusSyncerV2: virtual pod already bound, skipping"
+                "StatusSyncer: virtual pod already bound, skipping"
             );
             Ok(())
         }
@@ -181,7 +181,7 @@ pub async fn bind_virtual_pod(
                 pod = pod_name,
                 namespace = namespace,
                 error = %e,
-                "StatusSyncerV2: failed to bind virtual pod"
+                "StatusSyncer: failed to bind virtual pod"
             );
             Err(e.into())
         }
@@ -189,48 +189,48 @@ pub async fn bind_virtual_pod(
 }
 
 // ---------------------------------------------------------------------------
-// StatusSyncerV2 -- ResourceSyncer implementation
+// StatusSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Status syncer: watches host Pods with `LABEL_MANAGED=true` and syncs
+/// Status syncer: watches host Pods with `LABEL_MANAGED=true` and syncs
 /// their status back to the corresponding virtual Pod.
 ///
 /// Direction: host -> virtual.
-pub struct StatusSyncerV2;
+pub struct StatusSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for StatusSyncerV2 {
+impl ResourceSyncer for StatusSyncer {
     fn name(&self) -> &str {
         "status"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         // Watch host Pods that are managed by kobe-sync.
         let host_pod_api: Api<Pod> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default().labels(&format!("{}=true", LABEL_MANAGED));
         let mut stream = std::pin::pin!(watcher::watcher(host_pod_api, watcher_config));
 
-        info!("StatusSyncerV2: starting watch on host pods");
+        info!("StatusSyncer: starting watch on host pods");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("StatusSyncerV2: shutdown signal received");
+                    info!("StatusSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_status_event(&ev, &ctx).await {
-                                warn!(error = %e, "StatusSyncerV2: error handling event");
+                                warn!(error = %e, "StatusSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "StatusSyncerV2: watcher error");
+                            warn!(error = %e, "StatusSyncer: watcher error");
                         }
                         None => {
-                            info!("StatusSyncerV2: watcher stream ended");
+                            info!("StatusSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -241,7 +241,7 @@ impl ResourceSyncer for StatusSyncerV2 {
 }
 
 /// Handle a single watcher event for the status syncer.
-async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyhow::Result<()> {
+async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContext) -> anyhow::Result<()> {
     match event {
         Event::Apply(pod) | Event::InitApply(pod) => {
             let host_name = pod.name_any();
@@ -252,7 +252,7 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
                 None => {
                     debug!(
                         host_name = %host_name,
-                        "StatusSyncerV2: could not reverse-translate host pod name, skipping"
+                        "StatusSyncer: could not reverse-translate host pod name, skipping"
                     );
                     return Ok(());
                 }
@@ -264,7 +264,7 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
                 None => {
                     debug!(
                         host_name = %host_name,
-                        "StatusSyncerV2: host pod has no status, skipping"
+                        "StatusSyncer: host pod has no status, skipping"
                     );
                     return Ok(());
                 }
@@ -275,7 +275,7 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
                 virtual_name = %virtual_name,
                 virtual_ns = %virtual_ns,
                 phase = ?host_status.phase,
-                "StatusSyncerV2: syncing status to virtual pod"
+                "StatusSyncer: syncing status to virtual pod"
             );
 
             let patch_value = build_status_patch(host_status);
@@ -295,7 +295,7 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
             debug!(
                 virtual_name = %virtual_name,
                 virtual_ns = %virtual_ns,
-                "StatusSyncerV2: patched virtual pod status"
+                "StatusSyncer: patched virtual pod status"
             );
 
             // If the host pod has been scheduled (spec.nodeName set), bind the
@@ -319,7 +319,7 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
                         error = %e,
                         virtual_name = %virtual_name,
                         virtual_ns = %virtual_ns,
-                        "StatusSyncerV2: failed to bind virtual pod"
+                        "StatusSyncer: failed to bind virtual pod"
                     );
                 }
             }
@@ -330,14 +330,14 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContextV2) -> anyho
             // we just log here.
             debug!(
                 pod = %pod.name_any(),
-                "StatusSyncerV2: host pod deleted, no status action needed"
+                "StatusSyncer: host pod deleted, no status action needed"
             );
         }
         Event::Init => {
-            debug!("StatusSyncerV2: watcher init bookmark");
+            debug!("StatusSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("StatusSyncerV2: initial list complete");
+            info!("StatusSyncer: initial list complete");
         }
     }
 

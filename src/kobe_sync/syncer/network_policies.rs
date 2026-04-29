@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: NetworkPolicy syncer (virtual -> host)
+// NetworkPolicy syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual NetworkPolicy into a host NetworkPolicy ready for
@@ -35,20 +35,20 @@ pub fn translate_network_policy_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// NetworkPolicySyncerV2 -- ResourceSyncer implementation
+// NetworkPolicySyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 NetworkPolicy syncer: watches the virtual kube-apiserver for
+/// NetworkPolicy syncer: watches the virtual kube-apiserver for
 /// NetworkPolicies and creates translated NetworkPolicies on the host cluster.
-pub struct NetworkPolicySyncerV2;
+pub struct NetworkPolicySyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for NetworkPolicySyncerV2 {
+impl ResourceSyncer for NetworkPolicySyncer {
     fn name(&self) -> &str {
         "network_policies"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<NetworkPolicy> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<NetworkPolicy> =
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
@@ -56,26 +56,26 @@ impl ResourceSyncer for NetworkPolicySyncerV2 {
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("NetworkPolicySyncerV2: starting watch on virtual apiserver");
+        info!("NetworkPolicySyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("NetworkPolicySyncerV2: shutdown signal received");
+                    info!("NetworkPolicySyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_network_policy_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "NetworkPolicySyncerV2: error handling event");
+                                warn!(error = %e, "NetworkPolicySyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "NetworkPolicySyncerV2: watcher error");
+                            warn!(error = %e, "NetworkPolicySyncer: watcher error");
                         }
                         None => {
-                            info!("NetworkPolicySyncerV2: watcher stream ended");
+                            info!("NetworkPolicySyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -88,7 +88,7 @@ impl ResourceSyncer for NetworkPolicySyncerV2 {
 /// Handle a single watcher event for the NetworkPolicy syncer.
 async fn handle_network_policy_event(
     event: &Event<NetworkPolicy>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<NetworkPolicy>,
 ) -> anyhow::Result<()> {
     match event {
@@ -102,7 +102,7 @@ async fn handle_network_policy_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "NetworkPolicySyncerV2: translating network policy"
+                "NetworkPolicySyncer: translating network policy"
             );
 
             let host_np = translate_network_policy_to_host(np, &ctx.translator, &virtual_ns)?;
@@ -114,11 +114,11 @@ async fn handle_network_policy_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "NetworkPolicySyncerV2: patched host network policy");
+                    debug!(name = %host_name, "NetworkPolicySyncer: patched host network policy");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_np).await?;
-                    debug!(name = %host_name, "NetworkPolicySyncerV2: created host network policy");
+                    debug!(name = %host_name, "NetworkPolicySyncer: created host network policy");
                 }
             }
         }
@@ -133,24 +133,24 @@ async fn handle_network_policy_event(
 
             debug!(
                 name = %host_name,
-                "NetworkPolicySyncerV2: deleting host network policy"
+                "NetworkPolicySyncer: deleting host network policy"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "NetworkPolicySyncerV2: deleted host network policy");
+                    debug!(name = %host_name, "NetworkPolicySyncer: deleted host network policy");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "NetworkPolicySyncerV2: host network policy already gone");
+                    debug!(name = %host_name, "NetworkPolicySyncer: host network policy already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("NetworkPolicySyncerV2: watcher init bookmark");
+            debug!("NetworkPolicySyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("NetworkPolicySyncerV2: initial list complete");
+            info!("NetworkPolicySyncer: initial list complete");
         }
     }
 
@@ -158,11 +158,11 @@ async fn handle_network_policy_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::networking::v1::{

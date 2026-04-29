@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: Service syncer (virtual -> host)
+// Service syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual Service into a host Service ready for creation on the
@@ -52,46 +52,46 @@ pub fn translate_service_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// ServiceSyncerV2 -- ResourceSyncer implementation
+// ServiceSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Service syncer: watches the virtual kube-apiserver for Services and
+/// Service syncer: watches the virtual kube-apiserver for Services and
 /// creates translated Services on the host cluster.
-pub struct ServiceSyncerV2;
+pub struct ServiceSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for ServiceSyncerV2 {
+impl ResourceSyncer for ServiceSyncer {
     fn name(&self) -> &str {
         "services"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<Service> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<Service> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("ServiceSyncerV2: starting watch on virtual apiserver");
+        info!("ServiceSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("ServiceSyncerV2: shutdown signal received");
+                    info!("ServiceSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_service_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "ServiceSyncerV2: error handling event");
+                                warn!(error = %e, "ServiceSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "ServiceSyncerV2: watcher error");
+                            warn!(error = %e, "ServiceSyncer: watcher error");
                         }
                         None => {
-                            info!("ServiceSyncerV2: watcher stream ended");
+                            info!("ServiceSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -104,7 +104,7 @@ impl ResourceSyncer for ServiceSyncerV2 {
 /// Handle a single watcher event for the Service syncer.
 async fn handle_service_event(
     event: &Event<Service>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<Service>,
 ) -> anyhow::Result<()> {
     match event {
@@ -118,7 +118,7 @@ async fn handle_service_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "ServiceSyncerV2: translating service"
+                "ServiceSyncer: translating service"
             );
 
             let host_svc = translate_service_to_host(svc, &ctx.translator, &virtual_ns)?;
@@ -130,11 +130,11 @@ async fn handle_service_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "ServiceSyncerV2: patched host service");
+                    debug!(name = %host_name, "ServiceSyncer: patched host service");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_svc).await?;
-                    debug!(name = %host_name, "ServiceSyncerV2: created host service");
+                    debug!(name = %host_name, "ServiceSyncer: created host service");
                 }
             }
         }
@@ -149,24 +149,24 @@ async fn handle_service_event(
 
             debug!(
                 name = %host_name,
-                "ServiceSyncerV2: deleting host service"
+                "ServiceSyncer: deleting host service"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "ServiceSyncerV2: deleted host service");
+                    debug!(name = %host_name, "ServiceSyncer: deleted host service");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "ServiceSyncerV2: host service already gone");
+                    debug!(name = %host_name, "ServiceSyncer: host service already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("ServiceSyncerV2: watcher init bookmark");
+            debug!("ServiceSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("ServiceSyncerV2: initial list complete");
+            info!("ServiceSyncer: initial list complete");
         }
     }
 
@@ -174,11 +174,11 @@ async fn handle_service_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};

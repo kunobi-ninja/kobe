@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: ConfigMap syncer (virtual -> host)
+// ConfigMap syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual ConfigMap into a host ConfigMap ready for creation on the
@@ -36,20 +36,20 @@ pub fn translate_configmap_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// ConfigMapSyncerV2 -- ResourceSyncer implementation
+// ConfigMapSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 ConfigMap syncer: watches the virtual kube-apiserver for ConfigMaps and
+/// ConfigMap syncer: watches the virtual kube-apiserver for ConfigMaps and
 /// creates translated ConfigMaps on the host cluster.
-pub struct ConfigMapSyncerV2;
+pub struct ConfigMapSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for ConfigMapSyncerV2 {
+impl ResourceSyncer for ConfigMapSyncer {
     fn name(&self) -> &str {
         "configmaps"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<ConfigMap> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<ConfigMap> =
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
@@ -57,26 +57,26 @@ impl ResourceSyncer for ConfigMapSyncerV2 {
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("ConfigMapSyncerV2: starting watch on virtual apiserver");
+        info!("ConfigMapSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("ConfigMapSyncerV2: shutdown signal received");
+                    info!("ConfigMapSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_configmap_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "ConfigMapSyncerV2: error handling event");
+                                warn!(error = %e, "ConfigMapSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "ConfigMapSyncerV2: watcher error");
+                            warn!(error = %e, "ConfigMapSyncer: watcher error");
                         }
                         None => {
-                            info!("ConfigMapSyncerV2: watcher stream ended");
+                            info!("ConfigMapSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -89,7 +89,7 @@ impl ResourceSyncer for ConfigMapSyncerV2 {
 /// Handle a single watcher event for the ConfigMap syncer.
 async fn handle_configmap_event(
     event: &Event<ConfigMap>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<ConfigMap>,
 ) -> anyhow::Result<()> {
     match event {
@@ -103,7 +103,7 @@ async fn handle_configmap_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "ConfigMapSyncerV2: translating configmap"
+                "ConfigMapSyncer: translating configmap"
             );
 
             let host_cm = translate_configmap_to_host(cm, &ctx.translator, &virtual_ns)?;
@@ -115,11 +115,11 @@ async fn handle_configmap_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "ConfigMapSyncerV2: patched host configmap");
+                    debug!(name = %host_name, "ConfigMapSyncer: patched host configmap");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_cm).await?;
-                    debug!(name = %host_name, "ConfigMapSyncerV2: created host configmap");
+                    debug!(name = %host_name, "ConfigMapSyncer: created host configmap");
                 }
             }
         }
@@ -134,24 +134,24 @@ async fn handle_configmap_event(
 
             debug!(
                 name = %host_name,
-                "ConfigMapSyncerV2: deleting host configmap"
+                "ConfigMapSyncer: deleting host configmap"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "ConfigMapSyncerV2: deleted host configmap");
+                    debug!(name = %host_name, "ConfigMapSyncer: deleted host configmap");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "ConfigMapSyncerV2: host configmap already gone");
+                    debug!(name = %host_name, "ConfigMapSyncer: host configmap already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("ConfigMapSyncerV2: watcher init bookmark");
+            debug!("ConfigMapSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("ConfigMapSyncerV2: initial list complete");
+            info!("ConfigMapSyncer: initial list complete");
         }
     }
 
@@ -159,11 +159,11 @@ async fn handle_configmap_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::core::v1::ConfigMap;

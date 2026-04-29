@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: PVC syncer (virtual -> host)
+// PVC syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual PersistentVolumeClaim into a host PVC ready for creation
@@ -36,20 +36,20 @@ pub fn translate_pvc_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// PvcSyncerV2 -- ResourceSyncer implementation
+// PvcSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 PVC syncer: watches the virtual kube-apiserver for PersistentVolumeClaims
+/// PVC syncer: watches the virtual kube-apiserver for PersistentVolumeClaims
 /// and creates translated PVCs on the host cluster.
-pub struct PvcSyncerV2;
+pub struct PvcSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for PvcSyncerV2 {
+impl ResourceSyncer for PvcSyncer {
     fn name(&self) -> &str {
         "pvcs"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<PersistentVolumeClaim> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<PersistentVolumeClaim> =
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
@@ -57,26 +57,26 @@ impl ResourceSyncer for PvcSyncerV2 {
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("PvcSyncerV2: starting watch on virtual apiserver");
+        info!("PvcSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("PvcSyncerV2: shutdown signal received");
+                    info!("PvcSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_pvc_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "PvcSyncerV2: error handling event");
+                                warn!(error = %e, "PvcSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "PvcSyncerV2: watcher error");
+                            warn!(error = %e, "PvcSyncer: watcher error");
                         }
                         None => {
-                            info!("PvcSyncerV2: watcher stream ended");
+                            info!("PvcSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -89,7 +89,7 @@ impl ResourceSyncer for PvcSyncerV2 {
 /// Handle a single watcher event for the PVC syncer.
 async fn handle_pvc_event(
     event: &Event<PersistentVolumeClaim>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<PersistentVolumeClaim>,
 ) -> anyhow::Result<()> {
     match event {
@@ -103,7 +103,7 @@ async fn handle_pvc_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "PvcSyncerV2: translating pvc"
+                "PvcSyncer: translating pvc"
             );
 
             let host_pvc = translate_pvc_to_host(pvc, &ctx.translator, &virtual_ns)?;
@@ -115,11 +115,11 @@ async fn handle_pvc_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "PvcSyncerV2: patched host pvc");
+                    debug!(name = %host_name, "PvcSyncer: patched host pvc");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_pvc).await?;
-                    debug!(name = %host_name, "PvcSyncerV2: created host pvc");
+                    debug!(name = %host_name, "PvcSyncer: created host pvc");
                 }
             }
         }
@@ -134,24 +134,24 @@ async fn handle_pvc_event(
 
             debug!(
                 name = %host_name,
-                "PvcSyncerV2: deleting host pvc"
+                "PvcSyncer: deleting host pvc"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "PvcSyncerV2: deleted host pvc");
+                    debug!(name = %host_name, "PvcSyncer: deleted host pvc");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "PvcSyncerV2: host pvc already gone");
+                    debug!(name = %host_name, "PvcSyncer: host pvc already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("PvcSyncerV2: watcher init bookmark");
+            debug!("PvcSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("PvcSyncerV2: initial list complete");
+            info!("PvcSyncer: initial list complete");
         }
     }
 
@@ -159,11 +159,11 @@ async fn handle_pvc_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::core::v1::{

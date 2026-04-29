@@ -1,12 +1,12 @@
-//! kobe-sync v2 binary entry point.
+//! kobe-sync binary entry point.
 //!
 //! This is the main entry point for the kobe-sync virtual cluster runtime.
-//! In v2, the kube-apiserver and KCM run as separate containers in the same
+//! The kube-apiserver and KCM run as separate containers in the same
 //! pod. kobe-sync's job is to:
 //!
 //! 1. Wait for the local kube-apiserver to be healthy
 //! 2. Build a kube client for the virtual apiserver (localhost)
-//! 3. Start v2 resource syncers (virtual -> host)
+//! 3. Start resource syncers (virtual -> host)
 //! 4. Start the TLS reverse proxy
 //! 5. Serve until shutdown
 //!
@@ -26,9 +26,9 @@ use tracing::{error, info};
 
 use kobe_sync::certs::CertificateManager;
 use kobe_sync::config::KobeSyncRuntimeConfig;
-use kobe_sync::proxy::{ProxyConfigV2, VirtualClusterProxyV2};
+use kobe_sync::proxy::{ProxyConfig, VirtualClusterProxy};
 use kobe_sync::syncer::translator::NameTranslator;
-use kobe_sync::syncer::{self, SyncerContextV2};
+use kobe_sync::syncer::{self, SyncerContext};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
-    info!("Starting kobe-sync v2 virtual cluster runtime");
+    info!("Starting kobe-sync virtual cluster runtime");
 
     // 2. Load configuration
     let config = KobeSyncRuntimeConfig::load_from_env()
@@ -106,9 +106,9 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to build virtual cluster kube client")?;
 
-    // 7. Build v2 syncer context (dual-client: virtual + host)
+    // 7. Build syncer context (dual-client: virtual + host)
     let translator = Arc::new(NameTranslator::new(config.host_namespace.clone()));
-    let ctx = Arc::new(SyncerContextV2 {
+    let ctx = Arc::new(SyncerContext {
         virtual_client,
         host_client: host_client.clone(),
         translator: translator.clone(),
@@ -118,19 +118,19 @@ async fn main() -> Result<()> {
 
     let shutdown = CancellationToken::new();
 
-    // 8. Start v2 resource syncers
+    // 8. Start resource syncers
     let syncer_handles =
-        syncer::start_syncers_v2(ctx.clone(), &config.enabled_syncers, shutdown.clone());
-    info!(count = syncer_handles.len(), "v2 resource syncers started");
+        syncer::start_syncers(ctx.clone(), &config.enabled_syncers, shutdown.clone());
+    info!(count = syncer_handles.len(), "resource syncers started");
 
     // 9. Start always-on syncers (fake nodes, status) -- these run regardless
     //    of the enabled_syncers config since they are essential for cluster health.
     let always_on = vec!["fake_nodes".to_string(), "status".to_string()];
-    let always_on_handles = syncer::start_syncers_v2(ctx.clone(), &always_on, shutdown.clone());
+    let always_on_handles = syncer::start_syncers(ctx.clone(), &always_on, shutdown.clone());
     info!(count = always_on_handles.len(), "Always-on syncers started");
 
-    // 10. Start TLS proxy (V2: front-proxy gateway)
-    //     V2 terminates client TLS, validates client certs against the
+    // 10. Start TLS proxy (front-proxy gateway)
+    //     The proxy terminates client TLS, validates client certs against the
     //     cluster CA, and forwards requests to the LOCAL kube-apiserver
     //     sidecar via mTLS using the front-proxy-client cert. The original
     //     caller's identity is carried in X-Remote-User / X-Remote-Group
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
         })?
         .to_string();
 
-    let proxy_config = ProxyConfigV2 {
+    let proxy_config = ProxyConfig {
         tls_config,
         apiserver_url: config.virtual_api_url.clone(),
         apiserver_ca_pem: cert_manager.ca_cert_pem().to_string(),
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
     };
 
     let proxy =
-        Arc::new(VirtualClusterProxyV2::new(proxy_config).context("Failed to create V2 proxy")?);
+        Arc::new(VirtualClusterProxy::new(proxy_config).context("Failed to create proxy")?);
 
     let proxy_handle = tokio::spawn({
         let proxy = proxy.clone();
@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
     info!(
         proxy_port = config.proxy_port,
         metrics_port = config.metrics_port,
-        "kobe-sync v2 is ready"
+        "kobe-sync is ready"
     );
 
     // 11. Wait for shutdown signal
@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    info!("kobe-sync v2 shutdown complete");
+    info!("kobe-sync shutdown complete");
     Ok(())
 }
 

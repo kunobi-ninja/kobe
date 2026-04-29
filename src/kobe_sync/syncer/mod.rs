@@ -12,7 +12,7 @@ pub mod secrets;
 pub mod services;
 pub mod status;
 
-pub use traits::{ResourceSyncer, SyncerContextV2};
+pub use traits::{ResourceSyncer, SyncerContext};
 pub use translator::NameTranslator;
 
 use std::sync::Arc;
@@ -22,18 +22,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
-// v2 start function
+// Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Start all enabled v2 syncer controllers.
+/// Start all enabled syncer controllers.
 ///
 /// Each string in `enabled` selects a syncer by name. Unknown names are logged
-/// and skipped. The actual syncer implementations (PodSyncerV2, etc.) will be
+/// and skipped. The actual syncer implementations (PodSyncer, etc.) will be
 /// registered here as they are added in Tasks 5-7.
 ///
 /// Returns `JoinHandle`s for each spawned controller task.
-pub fn start_syncers_v2(
-    ctx: Arc<SyncerContextV2>,
+pub fn start_syncers(
+    ctx: Arc<SyncerContext>,
     enabled: &[String],
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
@@ -41,32 +41,32 @@ pub fn start_syncers_v2(
 
     for name in enabled {
         // Match syncer names to implementations.
-        // Actual syncer structs (PodSyncerV2, etc.) will be added in Tasks 5-7.
+        // Actual syncer structs (PodSyncer, etc.) will be added in Tasks 5-7.
         let syncer: Option<Box<dyn ResourceSyncer>> = match name.as_str() {
-            "pods" => Some(Box::new(pods::PodSyncerV2)),
-            "configmaps" => Some(Box::new(configmaps::ConfigMapSyncerV2)),
-            "secrets" => Some(Box::new(secrets::SecretSyncerV2)),
-            "services" => Some(Box::new(services::ServiceSyncerV2)),
-            "endpoints" => Some(Box::new(endpoints::EndpointSyncerV2)),
-            "ingresses" => Some(Box::new(ingresses::IngressSyncerV2)),
-            "pvcs" => Some(Box::new(pvcs::PvcSyncerV2)),
-            "network_policies" => Some(Box::new(network_policies::NetworkPolicySyncerV2)),
-            "fake_nodes" => Some(Box::new(fake_nodes::FakeNodeSyncerV2::new())),
-            "status" => Some(Box::new(status::StatusSyncerV2)),
+            "pods" => Some(Box::new(pods::PodSyncer)),
+            "configmaps" => Some(Box::new(configmaps::ConfigMapSyncer)),
+            "secrets" => Some(Box::new(secrets::SecretSyncer)),
+            "services" => Some(Box::new(services::ServiceSyncer)),
+            "endpoints" => Some(Box::new(endpoints::EndpointSyncer)),
+            "ingresses" => Some(Box::new(ingresses::IngressSyncer)),
+            "pvcs" => Some(Box::new(pvcs::PvcSyncer)),
+            "network_policies" => Some(Box::new(network_policies::NetworkPolicySyncer)),
+            "fake_nodes" => Some(Box::new(fake_nodes::FakeNodeSyncer::new())),
+            "status" => Some(Box::new(status::StatusSyncer)),
             other => {
-                warn!(syncer = %other, "Unknown v2 syncer name, skipping");
+                warn!(syncer = %other, "Unknown syncer name, skipping");
                 None
             }
         };
 
         if let Some(s) = syncer {
             let syncer_name = s.name().to_string();
-            info!(syncer = %syncer_name, "Starting v2 syncer");
+            info!(syncer = %syncer_name, "Starting syncer");
             let ctx = ctx.clone();
             let shutdown = shutdown.clone();
             handles.push(tokio::spawn(async move {
                 s.run(ctx, shutdown).await;
-                info!(syncer = %syncer_name, "v2 syncer exited");
+                info!(syncer = %syncer_name, "syncer exited");
             }));
         }
     }
@@ -78,10 +78,10 @@ pub fn start_syncers_v2(
 mod tests {
     use super::*;
 
-    /// Verify that start_syncers_v2 handles unknown syncer names gracefully
+    /// Verify that start_syncers handles unknown syncer names gracefully
     /// (logs a warning and returns no handles).
     #[tokio::test]
-    async fn start_syncers_v2_unknown_names_returns_empty() {
+    async fn start_syncers_unknown_names_returns_empty() {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Build a minimal kubeconfig for constructing dummy clients.
@@ -124,7 +124,7 @@ mod tests {
 
         let translator = Arc::new(NameTranslator::new("test-ns".to_string()));
 
-        let ctx = Arc::new(SyncerContextV2 {
+        let ctx = Arc::new(SyncerContext {
             virtual_client,
             host_client,
             translator,
@@ -138,7 +138,7 @@ mod tests {
             "also_not_real".to_string(),
         ];
 
-        let handles = start_syncers_v2(ctx, &enabled, shutdown);
+        let handles = start_syncers(ctx, &enabled, shutdown);
 
         // No syncers are registered yet, so all names are unknown.
         assert!(handles.is_empty());

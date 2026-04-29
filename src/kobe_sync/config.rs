@@ -337,7 +337,7 @@ mod tests {
 
         // SAFETY: test-only, single-threaded
         unsafe {
-            // --- Scenario 2: explicit v2 fields ---
+            // --- Scenario 2: explicit fields ---
             std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-ns");
             std::env::set_var("KOBE_SYNC_CLUSTER_NAME", "cluster-1");
             std::env::set_var("KOBE_SYNC_VIRTUAL_API_URL", "https://10.0.0.1:6443");
@@ -350,7 +350,7 @@ mod tests {
 
         // SAFETY: test-only, single-threaded
         unsafe {
-            // --- Scenario 3: defaults for v2 fields ---
+            // --- Scenario 3: defaults ---
             std::env::set_var("KOBE_SYNC_HOST_NAMESPACE", "pool-defaults");
             std::env::set_var("KOBE_SYNC_CLUSTER_NAME", "defaults-test-cluster");
             std::env::remove_var("KOBE_SYNC_VIRTUAL_API_URL");

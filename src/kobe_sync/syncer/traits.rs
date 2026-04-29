@@ -6,16 +6,16 @@ use tokio_util::sync::CancellationToken;
 use super::translator::NameTranslator;
 
 // ---------------------------------------------------------------------------
-// v2 types
+// Types
 // ---------------------------------------------------------------------------
 
-/// Shared context for v2 syncer controllers.
+/// Shared context for syncer controllers.
 ///
-/// The key difference from the old v1 SyncerContext: v2 syncers have **two**
+/// Syncer controllers have **two**
 /// clients -- one pointed at the virtual kube-apiserver (where workloads are
 /// watched) and one pointed at the host cluster (where translated resources
 /// are created).
-pub struct SyncerContextV2 {
+pub struct SyncerContext {
     /// kube client pointed at the virtual kube-apiserver (localhost).
     pub virtual_client: Client,
     /// kube client pointed at the host cluster (in-cluster).
@@ -28,7 +28,7 @@ pub struct SyncerContextV2 {
     pub skip_namespaces: Vec<String>,
 }
 
-/// Trait that all v2 resource syncers implement.
+/// Trait that all resource syncers implement.
 ///
 /// Each syncer watches a specific resource kind on the virtual kube-apiserver
 /// and creates/updates/deletes the corresponding translated resource on the
@@ -39,14 +39,14 @@ pub trait ResourceSyncer: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Run the syncer until the cancellation token fires.
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken);
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verify SyncerContextV2 can be constructed.
+    /// Verify SyncerContext can be constructed.
     ///
     /// We cannot easily create real `kube::Client` instances without a running
     /// cluster, so we use `kube::Client::try_default()` in a way that will
@@ -54,7 +54,7 @@ mod tests {
     /// can be instantiated with the correct field types by using
     /// `Client::try_from` with a dummy kubeconfig.
     #[tokio::test]
-    async fn syncer_context_v2_compiles_and_can_be_constructed() {
+    async fn syncer_context_compiles_and_can_be_constructed() {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Build a minimal kubeconfig that points to a dummy server.
@@ -97,7 +97,7 @@ mod tests {
 
         let translator = Arc::new(NameTranslator::new("test-host-ns".to_string()));
 
-        let ctx = SyncerContextV2 {
+        let ctx = SyncerContext {
             virtual_client,
             host_client,
             translator: translator.clone(),
@@ -122,7 +122,7 @@ mod tests {
                 "dummy"
             }
 
-            async fn run(&self, _ctx: Arc<SyncerContextV2>, _shutdown: CancellationToken) {
+            async fn run(&self, _ctx: Arc<SyncerContext>, _shutdown: CancellationToken) {
                 // no-op for testing
             }
         }

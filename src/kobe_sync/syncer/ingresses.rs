@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: Ingress syncer (virtual -> host)
+// Ingress syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual Ingress into a host Ingress ready for creation on the
@@ -80,46 +80,46 @@ pub fn translate_ingress_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// IngressSyncerV2 -- ResourceSyncer implementation
+// IngressSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Ingress syncer: watches the virtual kube-apiserver for Ingresses and
+/// Ingress syncer: watches the virtual kube-apiserver for Ingresses and
 /// creates translated Ingresses on the host cluster.
-pub struct IngressSyncerV2;
+pub struct IngressSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for IngressSyncerV2 {
+impl ResourceSyncer for IngressSyncer {
     fn name(&self) -> &str {
         "ingresses"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<Ingress> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<Ingress> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("IngressSyncerV2: starting watch on virtual apiserver");
+        info!("IngressSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("IngressSyncerV2: shutdown signal received");
+                    info!("IngressSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_ingress_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "IngressSyncerV2: error handling event");
+                                warn!(error = %e, "IngressSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "IngressSyncerV2: watcher error");
+                            warn!(error = %e, "IngressSyncer: watcher error");
                         }
                         None => {
-                            info!("IngressSyncerV2: watcher stream ended");
+                            info!("IngressSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -132,7 +132,7 @@ impl ResourceSyncer for IngressSyncerV2 {
 /// Handle a single watcher event for the Ingress syncer.
 async fn handle_ingress_event(
     event: &Event<Ingress>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<Ingress>,
 ) -> anyhow::Result<()> {
     match event {
@@ -146,7 +146,7 @@ async fn handle_ingress_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "IngressSyncerV2: translating ingress"
+                "IngressSyncer: translating ingress"
             );
 
             let host_ing = translate_ingress_to_host(ing, &ctx.translator, &virtual_ns)?;
@@ -158,11 +158,11 @@ async fn handle_ingress_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "IngressSyncerV2: patched host ingress");
+                    debug!(name = %host_name, "IngressSyncer: patched host ingress");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_ing).await?;
-                    debug!(name = %host_name, "IngressSyncerV2: created host ingress");
+                    debug!(name = %host_name, "IngressSyncer: created host ingress");
                 }
             }
         }
@@ -177,24 +177,24 @@ async fn handle_ingress_event(
 
             debug!(
                 name = %host_name,
-                "IngressSyncerV2: deleting host ingress"
+                "IngressSyncer: deleting host ingress"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "IngressSyncerV2: deleted host ingress");
+                    debug!(name = %host_name, "IngressSyncer: deleted host ingress");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "IngressSyncerV2: host ingress already gone");
+                    debug!(name = %host_name, "IngressSyncer: host ingress already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("IngressSyncerV2: watcher init bookmark");
+            debug!("IngressSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("IngressSyncerV2: initial list complete");
+            info!("IngressSyncer: initial list complete");
         }
     }
 
@@ -202,11 +202,11 @@ async fn handle_ingress_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::networking::v1::{

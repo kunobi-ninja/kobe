@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: Secret syncer (virtual -> host)
+// Secret syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual Secret into a host Secret ready for creation on the host
@@ -37,46 +37,46 @@ pub fn translate_secret_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// SecretSyncerV2 -- ResourceSyncer implementation
+// SecretSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Secret syncer: watches the virtual kube-apiserver for Secrets and creates
+/// Secret syncer: watches the virtual kube-apiserver for Secrets and creates
 /// translated Secrets on the host cluster.
-pub struct SecretSyncerV2;
+pub struct SecretSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for SecretSyncerV2 {
+impl ResourceSyncer for SecretSyncer {
     fn name(&self) -> &str {
         "secrets"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<Secret> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<Secret> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
 
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("SecretSyncerV2: starting watch on virtual apiserver");
+        info!("SecretSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("SecretSyncerV2: shutdown signal received");
+                    info!("SecretSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_secret_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "SecretSyncerV2: error handling event");
+                                warn!(error = %e, "SecretSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "SecretSyncerV2: watcher error");
+                            warn!(error = %e, "SecretSyncer: watcher error");
                         }
                         None => {
-                            info!("SecretSyncerV2: watcher stream ended");
+                            info!("SecretSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -89,7 +89,7 @@ impl ResourceSyncer for SecretSyncerV2 {
 /// Handle a single watcher event for the Secret syncer.
 async fn handle_secret_event(
     event: &Event<Secret>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<Secret>,
 ) -> anyhow::Result<()> {
     match event {
@@ -103,7 +103,7 @@ async fn handle_secret_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "SecretSyncerV2: translating secret"
+                "SecretSyncer: translating secret"
             );
 
             let host_secret = translate_secret_to_host(secret, &ctx.translator, &virtual_ns)?;
@@ -115,13 +115,13 @@ async fn handle_secret_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "SecretSyncerV2: patched host secret");
+                    debug!(name = %host_name, "SecretSyncer: patched host secret");
                 }
                 None => {
                     host_api
                         .create(&PostParams::default(), &host_secret)
                         .await?;
-                    debug!(name = %host_name, "SecretSyncerV2: created host secret");
+                    debug!(name = %host_name, "SecretSyncer: created host secret");
                 }
             }
         }
@@ -136,24 +136,24 @@ async fn handle_secret_event(
 
             debug!(
                 name = %host_name,
-                "SecretSyncerV2: deleting host secret"
+                "SecretSyncer: deleting host secret"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "SecretSyncerV2: deleted host secret");
+                    debug!(name = %host_name, "SecretSyncer: deleted host secret");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "SecretSyncerV2: host secret already gone");
+                    debug!(name = %host_name, "SecretSyncer: host secret already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("SecretSyncerV2: watcher init bookmark");
+            debug!("SecretSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("SecretSyncerV2: initial list complete");
+            info!("SecretSyncer: initial list complete");
         }
     }
 
@@ -161,11 +161,11 @@ async fn handle_secret_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::core::v1::Secret;

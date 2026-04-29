@@ -9,11 +9,11 @@ use kube::runtime::watcher::Event;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::NameTranslator;
 
 // ===========================================================================
-// v2: Endpoints syncer (virtual -> host)
+// Endpoints syncer (virtual -> host)
 // ===========================================================================
 
 /// Translate a virtual Endpoints object into a host Endpoints ready for creation
@@ -94,20 +94,20 @@ pub fn translate_endpoints_to_host(
 }
 
 // ---------------------------------------------------------------------------
-// EndpointSyncerV2 -- ResourceSyncer implementation
+// EndpointSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Endpoints syncer: watches the virtual kube-apiserver for Endpoints and
+/// Endpoints syncer: watches the virtual kube-apiserver for Endpoints and
 /// creates translated Endpoints on the host cluster.
-pub struct EndpointSyncerV2;
+pub struct EndpointSyncer;
 
 #[async_trait::async_trait]
-impl ResourceSyncer for EndpointSyncerV2 {
+impl ResourceSyncer for EndpointSyncer {
     fn name(&self) -> &str {
         "endpoints"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         let virtual_api: Api<Endpoints> = Api::all(ctx.virtual_client.clone());
         let host_api: Api<Endpoints> =
             Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
@@ -115,26 +115,26 @@ impl ResourceSyncer for EndpointSyncerV2 {
         let watcher_config = watcher::Config::default();
         let mut stream = std::pin::pin!(watcher::watcher(virtual_api, watcher_config));
 
-        info!("EndpointSyncerV2: starting watch on virtual apiserver");
+        info!("EndpointSyncer: starting watch on virtual apiserver");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("EndpointSyncerV2: shutdown signal received");
+                    info!("EndpointSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
                     match event {
                         Some(Ok(ev)) => {
                             if let Err(e) = handle_endpoints_event(&ev, &ctx, &host_api).await {
-                                warn!(error = %e, "EndpointSyncerV2: error handling event");
+                                warn!(error = %e, "EndpointSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "EndpointSyncerV2: watcher error");
+                            warn!(error = %e, "EndpointSyncer: watcher error");
                         }
                         None => {
-                            info!("EndpointSyncerV2: watcher stream ended");
+                            info!("EndpointSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -147,7 +147,7 @@ impl ResourceSyncer for EndpointSyncerV2 {
 /// Handle a single watcher event for the Endpoints syncer.
 async fn handle_endpoints_event(
     event: &Event<Endpoints>,
-    ctx: &SyncerContextV2,
+    ctx: &SyncerContext,
     host_api: &Api<Endpoints>,
 ) -> anyhow::Result<()> {
     match event {
@@ -161,7 +161,7 @@ async fn handle_endpoints_event(
             debug!(
                 name = %virtual_name,
                 ns = %virtual_ns,
-                "EndpointSyncerV2: translating endpoints"
+                "EndpointSyncer: translating endpoints"
             );
 
             let host_ep = translate_endpoints_to_host(ep, &ctx.translator, &virtual_ns)?;
@@ -173,11 +173,11 @@ async fn handle_endpoints_event(
                     host_api
                         .patch(host_name, &PatchParams::apply("kobe-sync").force(), &patch)
                         .await?;
-                    debug!(name = %host_name, "EndpointSyncerV2: patched host endpoints");
+                    debug!(name = %host_name, "EndpointSyncer: patched host endpoints");
                 }
                 None => {
                     host_api.create(&PostParams::default(), &host_ep).await?;
-                    debug!(name = %host_name, "EndpointSyncerV2: created host endpoints");
+                    debug!(name = %host_name, "EndpointSyncer: created host endpoints");
                 }
             }
         }
@@ -192,24 +192,24 @@ async fn handle_endpoints_event(
 
             debug!(
                 name = %host_name,
-                "EndpointSyncerV2: deleting host endpoints"
+                "EndpointSyncer: deleting host endpoints"
             );
 
             match host_api.delete(&host_name, &DeleteParams::default()).await {
                 Ok(_) => {
-                    debug!(name = %host_name, "EndpointSyncerV2: deleted host endpoints");
+                    debug!(name = %host_name, "EndpointSyncer: deleted host endpoints");
                 }
                 Err(kube::Error::Api(err)) if err.code == 404 => {
-                    debug!(name = %host_name, "EndpointSyncerV2: host endpoints already gone");
+                    debug!(name = %host_name, "EndpointSyncer: host endpoints already gone");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         Event::Init => {
-            debug!("EndpointSyncerV2: watcher init bookmark");
+            debug!("EndpointSyncer: watcher init bookmark");
         }
         Event::InitDone => {
-            info!("EndpointSyncerV2: initial list complete");
+            info!("EndpointSyncer: initial list complete");
         }
     }
 
@@ -217,11 +217,11 @@ async fn handle_endpoints_event(
 }
 
 // ===========================================================================
-// v2 tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::super::translator::{LABEL_MANAGED, LABEL_VNS, NameTranslator};
     use super::*;
     use k8s_openapi::api::core::v1::{

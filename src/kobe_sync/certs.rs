@@ -458,7 +458,7 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    // ---- v2 PKI tests (delegate to shared pki module) ----
+    // ---- PKI tests (delegate to shared pki module) ----
 
     #[test]
     fn test_generate_full_pki() {

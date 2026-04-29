@@ -397,7 +397,7 @@ pub fn translate_subresource_to_host(
 }
 
 // ===========================================================================
-// VirtualClusterProxyV2 — front-proxy gateway for vkobe virtual clusters
+// VirtualClusterProxy — front-proxy gateway for vkobe virtual clusters
 // ===========================================================================
 //
 // The proxy presents the virtual cluster's TLS endpoint to clients (kubectl,
@@ -508,8 +508,8 @@ pub fn extract_peer_identity_from_der(cert_der: &[u8]) -> Option<PeerIdentity> {
     Some(PeerIdentity { username, groups })
 }
 
-/// Configuration for [`VirtualClusterProxyV2`].
-pub struct ProxyConfigV2 {
+/// Configuration for [`VirtualClusterProxy`].
+pub struct ProxyConfig {
     /// TLS server configuration (validates incoming client certs against
     /// the cluster CA via `WebPkiClientVerifier`).
     pub tls_config: Arc<rustls::ServerConfig>,
@@ -539,7 +539,7 @@ pub struct ProxyConfigV2 {
 }
 
 /// Front-proxy gateway in front of a vkobe local kube-apiserver.
-pub struct VirtualClusterProxyV2 {
+pub struct VirtualClusterProxy {
     tls_acceptor: TlsAcceptor,
     apiserver_url: String,
     /// reqwest client pre-configured with mTLS (front-proxy-client identity)
@@ -562,9 +562,9 @@ pub struct VirtualClusterProxyV2 {
     metrics_port: u16,
 }
 
-impl VirtualClusterProxyV2 {
-    /// Build a new V2 proxy from the given configuration.
-    pub fn new(config: ProxyConfigV2) -> Result<Self> {
+impl VirtualClusterProxy {
+    /// Build a new proxy from the given configuration.
+    pub fn new(config: ProxyConfig) -> Result<Self> {
         // mTLS client to local apiserver: present front-proxy-client cert,
         // verify the apiserver's serving cert against the cluster CA.
         let mut identity_pem = config.front_proxy_client_cert_pem.clone().into_bytes();
@@ -635,14 +635,14 @@ impl VirtualClusterProxyV2 {
             .await
             .with_context(|| format!("Failed to bind proxy listener on {addr}"))?;
 
-        info!(addr = %addr, "Virtual API server (V2) listening (mTLS front-proxy)");
+        info!(addr = %addr, "Virtual API server listening (mTLS front-proxy)");
 
         let builder = ServerBuilder::new(TokioExecutor::new());
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("Proxy V2 shutdown signal received");
+                    info!("Proxy shutdown signal received");
                     break;
                 }
                 result = listener.accept() => {
@@ -719,7 +719,7 @@ impl VirtualClusterProxyV2 {
             .await
             .with_context(|| format!("Failed to bind metrics listener on {addr}"))?;
 
-        info!(addr = %addr, "Metrics/health server (V2) listening (HTTP)");
+        info!(addr = %addr, "Metrics/health server listening (HTTP)");
 
         let builder = ServerBuilder::new(TokioExecutor::new());
 
@@ -1043,11 +1043,11 @@ impl VirtualClusterProxyV2 {
 }
 
 // ===========================================================================
-// V2 Tests
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
-mod tests_v2 {
+mod tests {
     use super::*;
 
     // -- parse_subresource tests --
@@ -1178,7 +1178,7 @@ mod tests_v2 {
     // -- extract_peer_identity_from_der tests --
     //
     // These exercise the front-proxy auth path: a client connects to the
-    // V2 proxy with a TLS client cert; the proxy must extract Subject CN
+    // The proxy with a TLS client cert; the proxy must extract Subject CN
     // (username) and Subject O (groups) and forward them as
     // X-Remote-User / X-Remote-Group impersonation headers.
 

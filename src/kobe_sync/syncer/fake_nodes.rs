@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::traits::{ResourceSyncer, SyncerContextV2};
+use super::traits::{ResourceSyncer, SyncerContext};
 use super::translator::LABEL_MANAGED;
 
 // ---------------------------------------------------------------------------
@@ -74,22 +74,22 @@ pub fn synthesize_fake_node(host_node: &Node) -> Node {
 }
 
 // ---------------------------------------------------------------------------
-// FakeNodeSyncerV2 -- ResourceSyncer implementation
+// FakeNodeSyncer -- ResourceSyncer implementation
 // ---------------------------------------------------------------------------
 
-/// v2 Fake Node syncer: watches host Pods with `LABEL_MANAGED=true` and
+/// Fake Node syncer: watches host Pods with `LABEL_MANAGED=true` and
 /// synthesizes corresponding Node objects in the virtual kube-apiserver.
 ///
 /// Uses reference counting so that a virtual node is deleted only when the
 /// last pod referencing it is removed.
 ///
 /// Direction: host -> virtual.
-pub struct FakeNodeSyncerV2 {
+pub struct FakeNodeSyncer {
     /// Track how many managed pods reference each host node name.
     node_refs: Arc<Mutex<HashMap<String, usize>>>,
 }
 
-impl FakeNodeSyncerV2 {
+impl FakeNodeSyncer {
     pub fn new() -> Self {
         Self {
             node_refs: Arc::new(Mutex::new(HashMap::new())),
@@ -107,19 +107,19 @@ impl FakeNodeSyncerV2 {
     }
 }
 
-impl Default for FakeNodeSyncerV2 {
+impl Default for FakeNodeSyncer {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait::async_trait]
-impl ResourceSyncer for FakeNodeSyncerV2 {
+impl ResourceSyncer for FakeNodeSyncer {
     fn name(&self) -> &str {
         "fake_nodes"
     }
 
-    async fn run(&self, ctx: Arc<SyncerContextV2>, shutdown: CancellationToken) {
+    async fn run(&self, ctx: Arc<SyncerContext>, shutdown: CancellationToken) {
         // Watch host Pods that are managed by kobe-sync.
         let host_pod_api: Api<Pod> = Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
         let host_node_api: Api<Node> = Api::all(ctx.host_client.clone());
@@ -128,12 +128,12 @@ impl ResourceSyncer for FakeNodeSyncerV2 {
         let watcher_config = watcher::Config::default().labels(&format!("{}=true", LABEL_MANAGED));
         let mut stream = std::pin::pin!(watcher::watcher(host_pod_api, watcher_config));
 
-        info!("FakeNodeSyncerV2: starting watch on host pods");
+        info!("FakeNodeSyncer: starting watch on host pods");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    info!("FakeNodeSyncerV2: shutdown signal received");
+                    info!("FakeNodeSyncer: shutdown signal received");
                     break;
                 }
                 event = stream.next() => {
@@ -142,14 +142,14 @@ impl ResourceSyncer for FakeNodeSyncerV2 {
                             if let Err(e) = self.handle_event(
                                 &ev, &ctx, &host_node_api, &virtual_node_api,
                             ).await {
-                                warn!(error = %e, "FakeNodeSyncerV2: error handling event");
+                                warn!(error = %e, "FakeNodeSyncer: error handling event");
                             }
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "FakeNodeSyncerV2: watcher error");
+                            warn!(error = %e, "FakeNodeSyncer: watcher error");
                         }
                         None => {
-                            info!("FakeNodeSyncerV2: watcher stream ended");
+                            info!("FakeNodeSyncer: watcher stream ended");
                             break;
                         }
                     }
@@ -159,7 +159,7 @@ impl ResourceSyncer for FakeNodeSyncerV2 {
     }
 }
 
-impl FakeNodeSyncerV2 {
+impl FakeNodeSyncer {
     /// Handle a single watcher event for host pods.
     ///
     /// * **Apply** -- increment the ref-count for the pod's `nodeName` and
@@ -169,7 +169,7 @@ impl FakeNodeSyncerV2 {
     async fn handle_event(
         &self,
         event: &Event<Pod>,
-        _ctx: &SyncerContextV2,
+        _ctx: &SyncerContext,
         host_node_api: &Api<Node>,
         virtual_node_api: &Api<Node>,
     ) -> anyhow::Result<()> {
@@ -188,7 +188,7 @@ impl FakeNodeSyncerV2 {
                             node = %node_name,
                             ref_count = *count,
                             pod = %pod.name_any(),
-                            "FakeNodeSyncerV2: incremented node ref count"
+                            "FakeNodeSyncer: incremented node ref count"
                         );
                         *count == 1
                     };
@@ -212,20 +212,20 @@ impl FakeNodeSyncerV2 {
                                                 &patch,
                                             )
                                             .await?;
-                                        debug!(node = %node_name, "FakeNodeSyncerV2: updated virtual node");
+                                        debug!(node = %node_name, "FakeNodeSyncer: updated virtual node");
                                     }
                                     None => {
                                         virtual_node_api
                                             .create(&PostParams::default(), &fake_node)
                                             .await?;
-                                        debug!(node = %node_name, "FakeNodeSyncerV2: created virtual node");
+                                        debug!(node = %node_name, "FakeNodeSyncer: created virtual node");
                                     }
                                 }
                             }
                             Err(kube::Error::Api(err)) if err.code == 404 => {
                                 warn!(
                                     node = %node_name,
-                                    "FakeNodeSyncerV2: host node not found, skipping"
+                                    "FakeNodeSyncer: host node not found, skipping"
                                 );
                             }
                             Err(e) => return Err(e.into()),
@@ -245,7 +245,7 @@ impl FakeNodeSyncerV2 {
                                 node = %node_name,
                                 ref_count = *count,
                                 pod = %pod.name_any(),
-                                "FakeNodeSyncerV2: decremented node ref count"
+                                "FakeNodeSyncer: decremented node ref count"
                             );
                             *count == 0
                         } else {
@@ -262,13 +262,13 @@ impl FakeNodeSyncerV2 {
                             Ok(_) => {
                                 info!(
                                     node = %node_name,
-                                    "FakeNodeSyncerV2: deleted virtual node (no more pods)"
+                                    "FakeNodeSyncer: deleted virtual node (no more pods)"
                                 );
                             }
                             Err(kube::Error::Api(err)) if err.code == 404 => {
                                 debug!(
                                     node = %node_name,
-                                    "FakeNodeSyncerV2: virtual node already gone"
+                                    "FakeNodeSyncer: virtual node already gone"
                                 );
                             }
                             Err(e) => return Err(e.into()),
@@ -279,15 +279,15 @@ impl FakeNodeSyncerV2 {
                 } else {
                     debug!(
                         pod = %pod.name_any(),
-                        "FakeNodeSyncerV2: pod deleted without node assignment"
+                        "FakeNodeSyncer: pod deleted without node assignment"
                     );
                 }
             }
             Event::Init => {
-                debug!("FakeNodeSyncerV2: watcher init bookmark");
+                debug!("FakeNodeSyncer: watcher init bookmark");
             }
             Event::InitDone => {
-                info!("FakeNodeSyncerV2: initial list complete");
+                info!("FakeNodeSyncer: initial list complete");
             }
         }
 
@@ -477,13 +477,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_ref_count_starts_at_zero() {
-        let syncer = FakeNodeSyncerV2::new();
+        let syncer = FakeNodeSyncer::new();
         assert_eq!(syncer.ref_count("node-1").await, 0);
     }
 
     #[tokio::test]
     async fn test_ref_count_default_trait() {
-        let syncer = FakeNodeSyncerV2::default();
+        let syncer = FakeNodeSyncer::default();
         assert_eq!(syncer.ref_count("node-1").await, 0);
     }
 
