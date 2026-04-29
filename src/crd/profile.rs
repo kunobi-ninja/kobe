@@ -297,6 +297,14 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub taints: Option<Vec<NodeTaint>>,
 
+    /// Node placement strategy for the cluster's pods. When omitted, the
+    /// scheduler picks any eligible node independently for each pod.
+    ///
+    /// Currently meaningful for the k3s backend, which has split server
+    /// and agent pods. For single-pod backends (vkobe) this is a no-op.
+    #[serde(default)]
+    pub node_placement: Option<NodePlacement>,
+
     /// Network ranges allocated for this cluster instance. **Operator-
     /// internal**: not part of the CRD spec users write — populated by
     /// the instance reconciler from `ClusterInstance.status.network`
@@ -372,6 +380,32 @@ impl NodeTaint {
             None => format!("{}:{}", self.key, self.effect),
         }
     }
+}
+
+/// Node placement strategy for cluster pods (server + agents).
+///
+/// Wrapped in a struct so future extensions (custom topology key,
+/// additional knobs) can be added next to `mode` without breaking
+/// existing manifests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePlacement {
+    /// Placement mode.
+    pub mode: NodePlacementMode,
+}
+
+/// Placement mode for `NodePlacement`. New variants can be added without
+/// changing the parent struct's shape on disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum NodePlacementMode {
+    /// Scheduler picks any eligible node independently for each pod.
+    #[default]
+    Any,
+    /// Force agent pods to schedule on the same physical host as the
+    /// server, using a required `kubernetes.io/hostname` podAffinity.
+    /// Useful when cross-host pod routing on the underlying cluster is
+    /// unreliable.
+    SameHost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

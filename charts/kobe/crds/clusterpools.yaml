@@ -242,6 +242,24 @@ spec:
                     required:
                     - exposeType
                     type: object
+                  nodePlacement:
+                    description: |-
+                      Node placement strategy for the cluster's pods. When omitted, the
+                      scheduler picks any eligible node independently for each pod.
+
+                      Currently meaningful for the k3s backend, which has split server
+                      and agent pods. For single-pod backends (vkobe) this is a no-op.
+                    nullable: true
+                    properties:
+                      mode:
+                        description: Placement mode.
+                        enum:
+                        - Any
+                        - SameHost
+                        type: string
+                    required:
+                    - mode
+                    type: object
                   persistence:
                     description: Persistence config.
                     nullable: true

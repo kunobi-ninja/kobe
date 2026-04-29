@@ -15,8 +15,9 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Container, EnvVar, KeyToPath, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource,
-    Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Affinity, ConfigMap, Container, EnvVar, KeyToPath, PodAffinity, PodAffinityTerm, PodSpec,
+    PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -26,7 +27,7 @@ use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, ClusterConfig, ReadinessGate};
+use crate::crd::{Addon, ClusterConfig, NodePlacement, NodePlacementMode, ReadinessGate};
 
 use super::{
     ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
@@ -488,6 +489,32 @@ impl K3sBackend {
         }
     }
 
+    /// Build the agent pod affinity based on the configured placement.
+    /// Returns `None` for `Any` (default) so the rendered Deployment stays
+    /// byte-identical to clusters predating this field.
+    fn agent_affinity(name: &str, placement: Option<&NodePlacement>) -> Option<Affinity> {
+        let mode = placement.map(|p| p.mode).unwrap_or_default();
+        match mode {
+            NodePlacementMode::Any => None,
+            NodePlacementMode::SameHost => Some(Affinity {
+                pod_affinity: Some(PodAffinity {
+                    required_during_scheduling_ignored_during_execution: Some(vec![
+                        PodAffinityTerm {
+                            label_selector: Some(LabelSelector {
+                                match_labels: Some(Self::server_labels(name)),
+                                ..Default::default()
+                            }),
+                            topology_key: "kubernetes.io/hostname".to_string(),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
     /// Build the agent Deployment.
     fn build_agent_deployment(
         name: &str,
@@ -540,6 +567,7 @@ impl K3sBackend {
                     }),
                     spec: Some(PodSpec {
                         containers: vec![container],
+                        affinity: Self::agent_affinity(name, config.node_placement.as_ref()),
                         volumes: Some(vec![Volume {
                             name: "token".to_string(),
                             secret: Some(SecretVolumeSource {
@@ -1081,6 +1109,71 @@ mod tests {
             args.iter()
                 .any(|a| a == "--server=https://my-cluster-server.ns.svc:6443")
         );
+
+        // Default placement is Any → no affinity rendered, so the manifest
+        // stays byte-identical for clusters that predate this field.
+        assert!(pod_spec.affinity.is_none());
+    }
+
+    #[test]
+    fn test_build_agent_deployment_same_host_placement() {
+        let config = ClusterConfig {
+            node_placement: Some(NodePlacement {
+                mode: NodePlacementMode::SameHost,
+            }),
+            ..base_config()
+        };
+        let deploy = K3sBackend::build_agent_deployment("my-cluster", "ns", &config, 1);
+
+        let pod_spec = deploy
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap();
+        let affinity = pod_spec.affinity.as_ref().expect("affinity present");
+        let pod_aff = affinity
+            .pod_affinity
+            .as_ref()
+            .expect("pod_affinity present");
+        let terms = pod_aff
+            .required_during_scheduling_ignored_during_execution
+            .as_ref()
+            .expect("required terms present");
+        assert_eq!(terms.len(), 1);
+
+        let term = &terms[0];
+        assert_eq!(term.topology_key, "kubernetes.io/hostname");
+        let selector = term.label_selector.as_ref().unwrap();
+        let match_labels = selector.match_labels.as_ref().unwrap();
+        assert_eq!(
+            match_labels.get("kobe.kunobi.ninja/cluster"),
+            Some(&"my-cluster".to_string())
+        );
+        assert_eq!(
+            match_labels.get("kobe.kunobi.ninja/role"),
+            Some(&"server".to_string())
+        );
+
+        // Pod-anti-affinity stays unset — we only constrain co-location, not separation.
+        assert!(affinity.pod_anti_affinity.is_none());
+        assert!(affinity.node_affinity.is_none());
+    }
+
+    #[test]
+    fn test_build_agent_deployment_explicit_any_placement_renders_no_affinity() {
+        // Explicit `Any` should be indistinguishable from omitting the field.
+        let config = ClusterConfig {
+            node_placement: Some(NodePlacement {
+                mode: NodePlacementMode::Any,
+            }),
+            ..base_config()
+        };
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+        assert!(pod_spec.affinity.is_none());
     }
 
     #[test]
