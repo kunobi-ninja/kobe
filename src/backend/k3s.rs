@@ -46,16 +46,31 @@ fn k3s_image(version: &str) -> String {
     format!("rancher/k3s:{}", version.replace('+', "-"))
 }
 
+/// Default kubelet `--cluster-domain` value used by every mainstream
+/// distro (kubeadm, kind, k3s, RKE2, EKS/GKE/AKS).
+const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+
+/// Resolve the effective cluster DNS domain, falling back to the
+/// upstream default when the operator hasn't pinned a custom one.
+fn cluster_domain(config: &ClusterConfig) -> &str {
+    config
+        .cluster_domain
+        .as_deref()
+        .unwrap_or(DEFAULT_CLUSTER_DOMAIN)
+}
+
 /// The kubeconfig publisher sidecar script, mounted from a ConfigMap.
 ///
 /// Waits for k3s to write the kubeconfig, rewrites the server URL to the
-/// ClusterIP Service address, and creates/updates a Kubernetes Secret.
+/// FQDN of the ClusterIP Service, and creates/updates a Kubernetes
+/// Secret. The FQDN form (4 dots) skips the musl-libc `search`-domain
+/// fallback issue that breaks the short `.svc` form on Alpine images.
 const KUBECONFIG_PUBLISHER_SCRIPT: &str = r#"#!/bin/sh
 set -e
 echo "Waiting for kubeconfig to appear..."
 while [ ! -f /output/kubeconfig ]; do sleep 1; done
 echo "Kubeconfig found, rewriting server URL..."
-sed -i "s|https://127.0.0.1:6443|https://${CLUSTER_NAME}-server.${NAMESPACE}.svc:6443|" /output/kubeconfig
+sed -i "s|https://127.0.0.1:6443|https://${CLUSTER_NAME}-server.${NAMESPACE}.svc.${CLUSTER_DOMAIN}:6443|" /output/kubeconfig
 echo "Publishing kubeconfig as Secret..."
 kubectl create secret generic ${CLUSTER_NAME}-kubeconfig \
   --from-file=kubeconfig=/output/kubeconfig \
@@ -226,9 +241,14 @@ impl K3sBackend {
             None => ("10.243.0.0/20".to_string(), "10.248.0.0/20".to_string()),
         };
 
+        let domain = cluster_domain(config);
+        // Cert valid for both the short and FQDN forms — clients that
+        // already dial via the short name keep working while the agent
+        // and published kubeconfig switch over to the FQDN.
         let mut args = vec![
             "server".to_string(),
             format!("--tls-san={name}-server.{namespace}.svc"),
+            format!("--tls-san={name}-server.{namespace}.svc.{domain}"),
             "--token-file=/var/lib/k3s/token/token".to_string(),
             "--write-kubeconfig=/output/kubeconfig".to_string(),
             "--write-kubeconfig-mode=644".to_string(),
@@ -319,7 +339,12 @@ impl K3sBackend {
     }
 
     /// Build the kubeconfig publisher sidecar container.
-    fn build_publisher_sidecar(name: &str, namespace: &str, k3s_image: &str) -> Container {
+    fn build_publisher_sidecar(
+        name: &str,
+        namespace: &str,
+        k3s_image: &str,
+        cluster_domain: &str,
+    ) -> Container {
         Container {
             name: "kubeconfig-publisher".to_string(),
             image: Some(k3s_image.to_string()),
@@ -333,6 +358,11 @@ impl K3sBackend {
                 EnvVar {
                     name: "NAMESPACE".to_string(),
                     value: Some(namespace.to_string()),
+                    ..Default::default()
+                },
+                EnvVar {
+                    name: "CLUSTER_DOMAIN".to_string(),
+                    value: Some(cluster_domain.to_string()),
                     ..Default::default()
                 },
             ]),
@@ -415,7 +445,8 @@ impl K3sBackend {
 
         let server_container =
             Self::build_server_container(name, namespace, config, datastore_endpoint);
-        let publisher_sidecar = Self::build_publisher_sidecar(name, namespace, &image);
+        let publisher_sidecar =
+            Self::build_publisher_sidecar(name, namespace, &image, cluster_domain(config));
         let volumes = Self::build_server_volumes(name, config);
 
         StatefulSet {
@@ -524,14 +555,17 @@ impl K3sBackend {
     ) -> Deployment {
         let image = k3s_image(&config.version);
         let labels = Self::agent_labels(name);
+        let domain = cluster_domain(config);
 
         let container = Container {
             name: "k3s-agent".to_string(),
             image: Some(image),
             command: Some(vec!["k3s".to_string()]),
+            // FQDN avoids musl's broken `search`-domain fallback after
+            // an absolute NXDOMAIN — see `ClusterConfig::cluster_domain`.
             args: Some(vec![
                 "agent".to_string(),
-                format!("--server=https://{name}-server.{namespace}.svc:6443"),
+                format!("--server=https://{name}-server.{namespace}.svc.{domain}:6443"),
                 "--token-file=/var/lib/k3s/token/token".to_string(),
             ]),
             volume_mounts: Some(vec![VolumeMount {
@@ -1105,14 +1139,46 @@ mod tests {
         assert_eq!(agent.name, "k3s-agent");
 
         let args = agent.args.as_ref().unwrap();
+        // Default cluster domain is `cluster.local`, so the agent dials
+        // the server via the FQDN rather than the short `.svc` form.
         assert!(
             args.iter()
-                .any(|a| a == "--server=https://my-cluster-server.ns.svc:6443")
+                .any(|a| a == "--server=https://my-cluster-server.ns.svc.cluster.local:6443")
         );
 
         // Default placement is Any → no affinity rendered, so the manifest
         // stays byte-identical for clusters that predate this field.
         assert!(pod_spec.affinity.is_none());
+    }
+
+    #[test]
+    fn test_build_agent_deployment_honors_custom_cluster_domain() {
+        let config = ClusterConfig {
+            cluster_domain: Some("my.k8s.example".to_string()),
+            ..base_config()
+        };
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let args = deploy.spec.unwrap().template.spec.unwrap().containers[0]
+            .args
+            .clone()
+            .unwrap();
+        assert!(
+            args.iter()
+                .any(|a| a == "--server=https://c-server.ns.svc.my.k8s.example:6443"),
+            "args were: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_server_args_include_both_short_and_fqdn_tls_sans() {
+        // Cert must remain valid for both Service forms — the kubeconfig
+        // and clients that already dial the short name keep working
+        // while the agent + published kubeconfig switch to the FQDN.
+        let config = base_config();
+        let container = K3sBackend::build_server_container("my-cluster", "ns", &config, None);
+        let args = container.args.as_ref().unwrap();
+        assert!(args.contains(&"--tls-san=my-cluster-server.ns.svc".to_string()));
+        assert!(args.contains(&"--tls-san=my-cluster-server.ns.svc.cluster.local".to_string()));
     }
 
     #[test]
@@ -1204,8 +1270,12 @@ mod tests {
 
     #[test]
     fn test_publisher_sidecar_has_correct_env() {
-        let sidecar =
-            K3sBackend::build_publisher_sidecar("my-cluster", "ns", "rancher/k3s:v1.31.3+k3s1");
+        let sidecar = K3sBackend::build_publisher_sidecar(
+            "my-cluster",
+            "ns",
+            "rancher/k3s:v1.31.3+k3s1",
+            "cluster.local",
+        );
         let env = sidecar.env.as_ref().unwrap();
         assert!(
             env.iter()
@@ -1215,11 +1285,20 @@ mod tests {
             env.iter()
                 .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns"))
         );
+        assert!(
+            env.iter()
+                .any(|e| e.name == "CLUSTER_DOMAIN" && e.value.as_deref() == Some("cluster.local"))
+        );
     }
 
     #[test]
     fn test_publisher_sidecar_mounts() {
-        let sidecar = K3sBackend::build_publisher_sidecar("c", "ns", "rancher/k3s:v1.31.3+k3s1");
+        let sidecar = K3sBackend::build_publisher_sidecar(
+            "c",
+            "ns",
+            "rancher/k3s:v1.31.3+k3s1",
+            "cluster.local",
+        );
         let mounts = sidecar.volume_mounts.as_ref().unwrap();
         assert!(mounts.iter().any(|m| m.name == "output"));
         assert!(mounts.iter().any(|m| m.name == "publisher-script"));

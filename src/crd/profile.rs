@@ -305,6 +305,20 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub node_placement: Option<NodePlacement>,
 
+    /// Kubernetes cluster DNS domain (defaults to `cluster.local`).
+    /// Used to build the FQDN of the cluster's API Service for the
+    /// agent's `--server` URL, the apiserver TLS SANs, and the
+    /// published kubeconfig.
+    ///
+    /// Why this matters: the short name `{svc}.{ns}.svc` has 2 dots,
+    /// matching the typical `ndots:2` in resolv.conf. Resolvers then
+    /// query it as absolute first; Alpine/musl-based k3s and k0s
+    /// images don't fall back to `search` domains after that returns
+    /// NXDOMAIN and the agent's join silently fails. Using the FQDN
+    /// (4 dots) sidesteps the search-domain dance entirely.
+    #[serde(default)]
+    pub cluster_domain: Option<String>,
+
     /// Network ranges allocated for this cluster instance. **Operator-
     /// internal**: not part of the CRD spec users write — populated by
     /// the instance reconciler from `ClusterInstance.status.network`

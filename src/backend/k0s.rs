@@ -45,6 +45,10 @@ const MANAGED_BY: &str = "kobe-operator";
 const DEFAULT_K0S_POD_CIDR: &str = "10.248.0.0/16";
 const DEFAULT_K0S_SERVICE_CIDR: &str = "10.128.0.0/16";
 
+/// Default kubelet `--cluster-domain` value used by every mainstream
+/// distro. Mirrors the k3s backend's constant.
+const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+
 /// Convert a k0s semver version to a valid Docker image reference.
 ///
 /// k0s releases use `+` for build metadata (e.g. `v1.30.1+k0s.0`), but `+` is
@@ -267,6 +271,16 @@ spec:
     }
 
     /// Create the ConfigMap containing the k0s.yaml cluster configuration.
+    /// Build the apiserver TLS SAN list emitted into `spec.api.sans`.
+    /// Includes both the short Service form and the FQDN so existing
+    /// clients dialing either form keep working.
+    fn build_api_sans(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
+        vec![
+            format!("{name}-server.{namespace}.svc"),
+            format!("{name}-server.{namespace}.svc.{cluster_domain}"),
+        ]
+    }
+
     async fn create_k0s_config_configmap(
         &self,
         name: &str,
@@ -276,17 +290,28 @@ spec:
     ) -> Result<()> {
         // The chart-shipped flux bootstrap Job (and any in-cluster
         // client that dials the host-side Service for this k0s pool
-        // member) connects to `<name>-server.<namespace>.svc:6443`.
-        // The apiserver TLS cert MUST list that DNS name as a SAN —
-        // k0s only emits the generic kubernetes.* + localhost names by
+        // member) connects to `<name>-server.<namespace>.svc:6443` or
+        // its FQDN. The apiserver TLS cert MUST list both forms — k0s
+        // only emits the generic kubernetes.* + localhost names by
         // default, so the bootstrap pod's TLS verify fails with
         // `x509: certificate is valid for kubernetes, ...
         // kubernetes.svc.cluster.local, localhost, not
         // <name>-server.<namespace>.svc`. The k3s backend solves this
-        // inline (see `--tls-san=` at the top of the k3s server
-        // container args); for k0s the equivalent is `spec.api.sans`
-        // in the ClusterConfig YAML.
-        let api_sans = vec![format!("{name}-server.{namespace}.svc")];
+        // inline (see `--tls-san=` in `build_server_container`); for
+        // k0s the equivalent is `spec.api.sans` in the ClusterConfig
+        // YAML.
+        //
+        // The FQDN form is what the published kubeconfig uses (avoids
+        // the musl `search`-domain bug — see
+        // `ClusterConfig::cluster_domain`).
+        let api_sans = Self::build_api_sans(
+            name,
+            namespace,
+            config
+                .cluster_domain
+                .as_deref()
+                .unwrap_or(DEFAULT_CLUSTER_DOMAIN),
+        );
         let config_yaml = Self::build_k0s_config_yaml(
             datastore_endpoint,
             &config.server_args,
@@ -414,7 +439,7 @@ spec:
     }
 
     /// Build the kubeconfig publisher sidecar container.
-    fn build_publisher_sidecar(name: &str, namespace: &str) -> Container {
+    fn build_publisher_sidecar(name: &str, namespace: &str, cluster_domain: &str) -> Container {
         let image = std::env::var("KUBECONFIG_PUBLISHER_IMAGE")
             .unwrap_or_else(|_| "zondax/kobe-operator:latest".to_string());
 
@@ -431,6 +456,11 @@ spec:
                 EnvVar {
                     name: "NAMESPACE".to_string(),
                     value: Some(namespace.to_string()),
+                    ..Default::default()
+                },
+                EnvVar {
+                    name: "CLUSTER_DOMAIN".to_string(),
+                    value: Some(cluster_domain.to_string()),
                     ..Default::default()
                 },
                 EnvVar {
@@ -524,7 +554,14 @@ spec:
         let _ = datastore_endpoint; // used to select kine vs etcd in the config
 
         let server_container = Self::build_server_container(name, namespace, config);
-        let publisher_sidecar = Self::build_publisher_sidecar(name, namespace);
+        let publisher_sidecar = Self::build_publisher_sidecar(
+            name,
+            namespace,
+            config
+                .cluster_domain
+                .as_deref()
+                .unwrap_or(DEFAULT_CLUSTER_DOMAIN),
+        );
         let volumes = Self::build_server_volumes(name, config);
 
         StatefulSet {
@@ -1206,20 +1243,21 @@ mod tests {
 
     /// Invariant: the production path that builds the k0s ConfigMap
     /// (the one applied to the host cluster for every pool member)
-    /// MUST always include the host-side Service DNS in
-    /// `spec.api.sans`. Mirrors how the k3s backend hard-codes
-    /// `--tls-san=<name>-server.<namespace>.svc` inline; the test
-    /// exists so a refactor that drops the SAN never re-introduces
-    /// the silent flux-bootstrap failure mode (issue surfaced via
-    /// `ci-k0s-flux` triage pool, April 2026).
+    /// MUST always include both the short and FQDN forms of the host-
+    /// side Service DNS in `spec.api.sans`. Mirrors how the k3s backend
+    /// hard-codes both `--tls-san=...svc` and `--tls-san=...svc.{domain}`
+    /// inline; the test exists so a refactor that drops either entry
+    /// never re-introduces the silent flux-bootstrap failure mode
+    /// (issue surfaced via `ci-k0s-flux` triage pool, April 2026).
     #[test]
     fn test_k0s_configmap_always_includes_service_dns_san() {
         let cluster_name = "pool-ci-k0s-flux-42";
         let namespace = "kobe-system";
-        let expected_san = format!("{cluster_name}-server.{namespace}.svc");
+        let expected_short = format!("{cluster_name}-server.{namespace}.svc");
+        let expected_fqdn = format!("{expected_short}.cluster.local");
 
         // Mirror exactly what `create_k0s_config_configmap` builds.
-        let api_sans = vec![expected_san.clone()];
+        let api_sans = K0sBackend::build_api_sans(cluster_name, namespace, "cluster.local");
         let yaml = K0sBackend::build_k0s_config_yaml(None, &[], &api_sans, None);
         let cm = K0sBackend::build_k0s_config_configmap(cluster_name, namespace, &yaml);
 
@@ -1229,9 +1267,25 @@ mod tests {
             .and_then(|d| d.get("k0s.yaml"))
             .expect("ConfigMap must contain k0s.yaml key");
         assert!(
-            stored.contains(&format!("- {expected_san}")),
-            "k0s ConfigMap MUST embed `{expected_san}` as a SAN; otherwise flux bootstrap (and any in-cluster client dialing the Service DNS) will fail TLS verify. Got:\n{stored}"
+            stored.contains(&format!("- {expected_short}")),
+            "k0s ConfigMap MUST embed `{expected_short}` as a SAN; otherwise flux bootstrap fails TLS verify. Got:\n{stored}"
         );
+        assert!(
+            stored.contains(&format!("- {expected_fqdn}")),
+            "k0s ConfigMap MUST embed FQDN `{expected_fqdn}` as a SAN — needed by the published kubeconfig (which uses the FQDN to dodge the musl `search`-domain bug). Got:\n{stored}"
+        );
+    }
+
+    /// Custom `clusterDomain` flows through to the SAN list, so an
+    /// operator running on a non-default cluster (e.g.
+    /// `--cluster-domain=internal.example`) still gets a cert valid
+    /// for the kubeconfig's FQDN.
+    #[test]
+    fn test_build_api_sans_honors_custom_cluster_domain() {
+        let sans = K0sBackend::build_api_sans("c", "ns", "internal.example");
+        assert_eq!(sans.len(), 2);
+        assert!(sans.contains(&"c-server.ns.svc".to_string()));
+        assert!(sans.contains(&"c-server.ns.svc.internal.example".to_string()));
     }
 
     /// Regression: when the operator allocates a network slot, the
@@ -1583,7 +1637,7 @@ mod tests {
 
     #[test]
     fn test_publisher_sidecar_has_correct_env_and_mounts() {
-        let sidecar = K0sBackend::build_publisher_sidecar("my-cluster", "ns");
+        let sidecar = K0sBackend::build_publisher_sidecar("my-cluster", "ns", "cluster.local");
         let env = sidecar.env.as_ref().unwrap();
         let mounts = sidecar.volume_mounts.as_ref().unwrap();
 
@@ -1599,6 +1653,10 @@ mod tests {
         assert!(
             env.iter()
                 .any(|e| e.name == "NAMESPACE" && e.value.as_deref() == Some("ns"))
+        );
+        assert!(
+            env.iter()
+                .any(|e| e.name == "CLUSTER_DOMAIN" && e.value.as_deref() == Some("cluster.local"))
         );
         assert!(env.iter().any(|e| {
             e.name == "KUBECONFIG_PATH" && e.value.as_deref() == Some("/var/lib/k0s/pki/admin.conf")

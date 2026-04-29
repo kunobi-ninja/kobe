@@ -8,9 +8,21 @@ use std::collections::BTreeMap;
 use tracing::info;
 
 const DEFAULT_KUBECONFIG_PATH: &str = "/var/lib/k0s/pki/admin.conf";
+const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
-fn rewrite_kubeconfig_server(cluster_name: &str, namespace: &str, kubeconfig: &str) -> String {
-    let server = format!("https://{cluster_name}-server.{namespace}.svc:6443");
+/// Rewrite the kubeconfig's loopback server URL to the FQDN of the
+/// cluster's Service. The FQDN form (4 dots) avoids the musl libc
+/// resolver bug — Alpine images don't fall back to `search` domains
+/// after an absolute NXDOMAIN, so the short `.svc` form (2 dots,
+/// matching `ndots:2`) silently fails to resolve inside the leased
+/// cluster.
+fn rewrite_kubeconfig_server(
+    cluster_name: &str,
+    namespace: &str,
+    cluster_domain: &str,
+    kubeconfig: &str,
+) -> String {
+    let server = format!("https://{cluster_name}-server.{namespace}.svc.{cluster_domain}:6443");
     kubeconfig
         .replace("https://localhost:6443", &server)
         .replace("https://127.0.0.1:6443", &server)
@@ -75,12 +87,15 @@ async fn main() -> Result<()> {
 
     let cluster_name = std::env::var("CLUSTER_NAME").context("CLUSTER_NAME is required")?;
     let namespace = std::env::var("NAMESPACE").context("NAMESPACE is required")?;
+    let cluster_domain =
+        std::env::var("CLUSTER_DOMAIN").unwrap_or_else(|_| DEFAULT_CLUSTER_DOMAIN.to_string());
     let kubeconfig_path =
         std::env::var("KUBECONFIG_PATH").unwrap_or_else(|_| DEFAULT_KUBECONFIG_PATH.to_string());
 
     info!(cluster = %cluster_name, path = %kubeconfig_path, "Waiting for kubeconfig file");
     let kubeconfig = wait_for_kubeconfig(&kubeconfig_path).await?;
-    let kubeconfig = rewrite_kubeconfig_server(&cluster_name, &namespace, &kubeconfig);
+    let kubeconfig =
+        rewrite_kubeconfig_server(&cluster_name, &namespace, &cluster_domain, &kubeconfig);
 
     info!(cluster = %cluster_name, "Publishing kubeconfig Secret");
     publish_secret(&namespace, &cluster_name, &kubeconfig).await?;

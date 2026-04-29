@@ -181,8 +181,7 @@ async fn main() -> Result<()> {
         metrics_port: config.metrics_port,
     };
 
-    let proxy =
-        Arc::new(VirtualClusterProxy::new(proxy_config).context("Failed to create proxy")?);
+    let proxy = Arc::new(VirtualClusterProxy::new(proxy_config).context("Failed to create proxy")?);
 
     let proxy_handle = tokio::spawn({
         let proxy = proxy.clone();
