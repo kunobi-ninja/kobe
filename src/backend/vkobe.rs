@@ -13,12 +13,13 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, HTTPGetAction, PodSpec, PodTemplateSpec, Probe,
-    Secret, SecretVolumeSource, Service, ServiceAccount, ServicePort, ServiceSpec, Volume,
-    VolumeMount,
+    ResourceRequirements, Secret, SecretVolumeSource, Service, ServiceAccount, ServicePort,
+    ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::api::rbac::v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
@@ -992,6 +993,87 @@ pub fn build_config_map_v2(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Default resources for the 3 control-plane containers
+// ─────────────────────────────────────────────────────────────────────
+//
+// Why baked-in defaults instead of `Option<ResourceRequirements>` from
+// the spec? Because `BestEffort` QoS is fundamentally unsafe for these
+// workloads. Recap of the failure mode that motivated this:
+//
+//   1. Pod has no resource requests/limits → kernel throttles CPU
+//      aggressively under contention (BestEffort is the lowest-priority
+//      class, evicted/throttled before Burstable or Guaranteed).
+//   2. Under `flux install` load (200+ concurrent applies, watch
+//      streams, JSON encode/decode), the apiserver inside the pod
+//      can't keep up. Lease writes from KCM at `localhost:6443`
+//      time out (5s deadline).
+//   3. KCM loses the leader lease → exits 1 → kubelet back-off
+//      restart loop.
+//   4. Without KCM, `flux install` blocks indefinitely on
+//      ServiceAccount token generation → bootstrap Job hits its
+//      `BackoffLimit` → kobe recycles the ClusterInstance →
+//      next instance hits the same wall.
+//
+// The only sustainable answer is "always Burstable" — i.e., always
+// emit non-empty `requests`. The numbers below are the smallest set
+// that survived the 2026-04-29 vkobe-flux incident in staging:
+// apiserver gets the lion's share because it's the bottleneck during
+// bootstrap fanout; KCM is light but lease-renewal-sensitive;
+// kobe-sync sidecar is comparable to KCM in cost.
+//
+// These can later become opt-in overrides from `VkobeConfig` if a
+// pool needs different sizing, but the FALLBACK must always produce
+// a Burstable pod — never `resources: null`. A unit test
+// (`vkobe_pod_never_creates_besteffort_containers`) below enforces
+// this invariant.
+
+fn quantity(s: &str) -> Quantity {
+    Quantity(s.to_string())
+}
+
+fn default_apiserver_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("200m")),
+            ("memory".to_string(), quantity("256Mi")),
+        ])),
+        limits: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("1")),
+            ("memory".to_string(), quantity("1Gi")),
+        ])),
+        ..Default::default()
+    }
+}
+
+fn default_controller_manager_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("100m")),
+            ("memory".to_string(), quantity("128Mi")),
+        ])),
+        limits: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("500m")),
+            ("memory".to_string(), quantity("512Mi")),
+        ])),
+        ..Default::default()
+    }
+}
+
+fn default_kobe_sync_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("100m")),
+            ("memory".to_string(), quantity("128Mi")),
+        ])),
+        limits: Some(BTreeMap::from([
+            ("cpu".to_string(), quantity("500m")),
+            ("memory".to_string(), quantity("256Mi")),
+        ])),
+        ..Default::default()
+    }
+}
+
 /// Build the Deployment with 3 containers: kube-apiserver, kube-controller-manager, and vkobe.
 ///
 /// The Deployment is stateless — all
@@ -1085,6 +1167,7 @@ pub fn build_deployment(
         // (see below), which only serves traffic after `wait_for_apiserver`
         // confirms the local apiserver is up — so kobe-sync ready ⇒
         // apiserver ready.
+        resources: Some(default_apiserver_resources()),
         ..Default::default()
     };
 
@@ -1115,6 +1198,7 @@ pub fn build_deployment(
                 ..Default::default()
             },
         ]),
+        resources: Some(default_controller_manager_resources()),
         ..Default::default()
     };
 
@@ -1181,6 +1265,7 @@ pub fn build_deployment(
             period_seconds: Some(5),
             ..Default::default()
         }),
+        resources: Some(default_kobe_sync_resources()),
         ..Default::default()
     };
 
@@ -1354,6 +1439,110 @@ mod tests {
         assert!(names.contains(&"kube-apiserver"));
         assert!(names.contains(&"kube-controller-manager"));
         assert!(names.contains(&"vkobe"));
+    }
+
+    /// Invariant: every container the operator launches in a vkobe pod
+    /// MUST carry both `requests` and `limits`. Any container without
+    /// resources lands in QoS=BestEffort, and on a busy node the
+    /// kernel will throttle CPU aggressively — under flux install
+    /// fanout the apiserver becomes unresponsive, KCM lease writes
+    /// time out (`Put .../leases/kube-controller-manager?timeout=5s:
+    /// context deadline exceeded`), KCM exits with `leaderelection
+    /// lost`, ServiceAccount tokens stop being generated, flux install
+    /// hangs at "verifying installation", the bootstrap Job hits
+    /// `BackoffLimitExceeded`, the ClusterInstance recycles, and the
+    /// next instance hits the same wall — the bug observed in
+    /// production on 2026-04-29.
+    ///
+    /// This test fails if anyone removes a container's resources or
+    /// adds a new container without setting them. The defaults live
+    /// in this file (`default_*_resources`); tune them by editing
+    /// those, never by removing them.
+    #[test]
+    fn vkobe_pod_containers_must_not_be_besteffort() {
+        let config = test_kobe_sync_config();
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
+        let containers = &dep
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers;
+        assert!(
+            !containers.is_empty(),
+            "Deployment must have at least one container"
+        );
+        for c in containers {
+            let resources = c.resources.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "Container `{}` has no resources — that's QoS=BestEffort and \
+                     will deadlock under flux install load. See \
+                     `default_{}_resources` for the expected defaults.",
+                    c.name,
+                    match c.name.as_str() {
+                        "kube-apiserver" => "apiserver",
+                        "kube-controller-manager" => "controller_manager",
+                        "vkobe" => "kobe_sync",
+                        other => other,
+                    }
+                )
+            });
+            assert!(
+                resources.requests.as_ref().is_some_and(|r| !r.is_empty()),
+                "Container `{}` has resources but `requests` is empty — needs \
+                 at least cpu+memory requests to land in QoS=Burstable.",
+                c.name
+            );
+            assert!(
+                resources.limits.as_ref().is_some_and(|l| !l.is_empty()),
+                "Container `{}` has resources but `limits` is empty — without \
+                 limits the kernel can't enforce a ceiling.",
+                c.name
+            );
+        }
+    }
+
+    /// Concrete check that the apiserver gets the heaviest budget,
+    /// since it's the proven bottleneck during bootstrap fanout.
+    #[test]
+    fn vkobe_apiserver_resources_match_documented_defaults() {
+        let config = test_kobe_sync_config();
+        let dep = build_deployment(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "http://etcd.pool-prod.svc:2379",
+            "test-image:latest",
+        );
+        let containers = &dep
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers;
+        let api = containers
+            .iter()
+            .find(|c| c.name == "kube-apiserver")
+            .unwrap();
+        let r = api.resources.as_ref().unwrap();
+        let req = r.requests.as_ref().unwrap();
+        let lim = r.limits.as_ref().unwrap();
+        assert_eq!(req["cpu"], quantity("200m"));
+        assert_eq!(req["memory"], quantity("256Mi"));
+        assert_eq!(lim["cpu"], quantity("1"));
+        assert_eq!(lim["memory"], quantity("1Gi"));
     }
 
     #[test]
