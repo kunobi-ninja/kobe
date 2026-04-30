@@ -374,6 +374,33 @@ impl CertificateManager {
     ) -> Result<String> {
         crate::pki::generate_kcm_kubeconfig(ca_cert, ca_key, server_url)
     }
+
+    /// Generate a kobe-sync runtime kubeconfig (CN=`system:kobe-sync`,
+    /// O=`system:kobe-sync`). Requires the `kobe-sync` ClusterRole +
+    /// ClusterRoleBinding to exist on the apiserver — bootstrap them via
+    /// [`crate::kobe_sync::bootstrap::ensure_rbac`] first.
+    ///
+    /// Delegates to [`crate::pki::generate_sync_kubeconfig`].
+    pub fn generate_sync_kubeconfig(
+        ca_cert: &str,
+        ca_key: &str,
+        server_url: &str,
+    ) -> Result<String> {
+        crate::pki::generate_sync_kubeconfig(ca_cert, ca_key, server_url)
+    }
+
+    /// Generate a one-shot kobe-sync bootstrap kubeconfig
+    /// (CN=`system:kobe-sync-bootstrap`, O=`system:masters`). Used
+    /// exactly once at startup to install the kobe-sync RBAC.
+    ///
+    /// Delegates to [`crate::pki::generate_sync_bootstrap_kubeconfig`].
+    pub fn generate_sync_bootstrap_kubeconfig(
+        ca_cert: &str,
+        ca_key: &str,
+        server_url: &str,
+    ) -> Result<String> {
+        crate::pki::generate_sync_bootstrap_kubeconfig(ca_cert, ca_key, server_url)
+    }
 }
 
 #[cfg(test)]

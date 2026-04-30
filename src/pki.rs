@@ -153,29 +153,28 @@ impl VirtualClusterPki {
 }
 
 // ---------------------------------------------------------------------------
-// KCM kubeconfig generation
+// Kubeconfig generation
 // ---------------------------------------------------------------------------
 
-/// Generate a KCM (kube-controller-manager) kubeconfig.
-///
-/// Creates a client certificate with CN=system:kube-controller-manager
-/// signed by the provided CA, and builds a kubeconfig YAML with embedded
-/// base64-encoded certificates.
-pub fn generate_kcm_kubeconfig(ca_cert: &str, ca_key: &str, server_url: &str) -> Result<String> {
-    let (client_cert, client_key) = generate_signed_cert(
-        ca_cert,
-        ca_key,
-        "system:kube-controller-manager",
-        "system:kube-controller-manager",
-        vec![],
-    )?;
+/// Build a kubeconfig YAML with embedded base64-encoded CA cert + a fresh
+/// client cert signed by that CA. The Subject of the client cert is
+/// `CN=<cn>, O=<org>` — kube-apiserver maps that to `username=cn` and
+/// `group=org`.
+fn build_kubeconfig(
+    ca_cert: &str,
+    ca_key: &str,
+    server_url: &str,
+    cn: &str,
+    org: &str,
+) -> Result<String> {
+    let (client_cert, client_key) = generate_signed_cert(ca_cert, ca_key, cn, org, vec![])?;
 
     let b64 = base64::engine::general_purpose::STANDARD;
     let ca_b64 = b64.encode(ca_cert.as_bytes());
     let cert_b64 = b64.encode(client_cert.as_bytes());
     let key_b64 = b64.encode(client_key.as_bytes());
 
-    let kubeconfig = format!(
+    Ok(format!(
         r#"apiVersion: v1
 kind: Config
 clusters:
@@ -186,18 +185,99 @@ clusters:
 contexts:
 - context:
     cluster: default
-    user: system:kube-controller-manager
+    user: {cn}
   name: default
 current-context: default
 users:
-- name: system:kube-controller-manager
+- name: {cn}
   user:
     client-certificate-data: {cert_b64}
     client-key-data: {key_b64}
 "#
-    );
+    ))
+}
 
+/// Generate a KCM (kube-controller-manager) kubeconfig.
+///
+/// Client cert Subject: `CN=system:kube-controller-manager,
+/// O=system:kube-controller-manager`. Used by the kube-controller-manager
+/// container in the vkobe pod to talk to the local kube-apiserver.
+pub fn generate_kcm_kubeconfig(ca_cert: &str, ca_key: &str, server_url: &str) -> Result<String> {
+    let kubeconfig = build_kubeconfig(
+        ca_cert,
+        ca_key,
+        server_url,
+        "system:kube-controller-manager",
+        "system:kube-controller-manager",
+    )?;
     debug!("Generated KCM kubeconfig");
+    Ok(kubeconfig)
+}
+
+/// Generate a kobe-sync **runtime** kubeconfig.
+///
+/// Client cert Subject: `CN=system:kobe-sync, O=system:kobe-sync`. The
+/// `system:kobe-sync` group is just a string — kube-apiserver treats it
+/// as an ordinary group with NO built-in privileges.
+///
+/// For this kubeconfig to actually authorize anything on the virtual
+/// apiserver, the **kobe-sync ClusterRole + ClusterRoleBinding** must
+/// already exist there (see [`crate::kobe_sync::bootstrap::ensure_rbac`]).
+/// The bootstrap step is a one-shot call made via
+/// [`generate_sync_bootstrap_kubeconfig`] just after the apiserver comes
+/// up; once it succeeds, the runtime kubeconfig is what every syncer
+/// uses for the rest of the process lifetime.
+///
+/// Splitting bootstrap and runtime identities like this means the
+/// long-lived syncer connection only ever holds least-privilege RBAC —
+/// the `system:masters` cert is minted, used once, and dropped.
+pub fn generate_sync_kubeconfig(ca_cert: &str, ca_key: &str, server_url: &str) -> Result<String> {
+    let kubeconfig = build_kubeconfig(
+        ca_cert,
+        ca_key,
+        server_url,
+        "system:kobe-sync",
+        "system:kobe-sync",
+    )?;
+    debug!("Generated kobe-sync runtime kubeconfig");
+    Ok(kubeconfig)
+}
+
+/// Generate a kobe-sync **bootstrap** kubeconfig.
+///
+/// Client cert Subject: `CN=system:kobe-sync-bootstrap, O=system:masters`.
+/// The `system:masters` group is hard-coded in kube-apiserver as a
+/// superuser short-circuit that bypasses RBAC entirely — it's the same
+/// group kubeadm puts in the cluster-admin kubeconfig.
+///
+/// This kubeconfig is used **exactly once** at kobe-sync startup, to
+/// apply the kobe-sync ClusterRole + ClusterRoleBinding on the freshly
+/// started virtual apiserver. After that the bootstrap client is
+/// dropped and every subsequent connection uses
+/// [`generate_sync_kubeconfig`] (the non-masters runtime identity bound
+/// to the role we just installed).
+///
+/// Why a separate identity for bootstrap: the runtime cert (CN
+/// `system:kobe-sync`) cannot create the binding that gives it its own
+/// permissions — chicken and egg. The vkobe virtual apiserver also does
+/// not run the standard RBAC bootstrap that creates `cluster-admin` and
+/// other built-in roles, so we cannot rely on those existing either.
+/// `system:masters` is the only identity guaranteed to work without any
+/// pre-existing roles or bindings, and we hold it for as little time as
+/// possible.
+pub fn generate_sync_bootstrap_kubeconfig(
+    ca_cert: &str,
+    ca_key: &str,
+    server_url: &str,
+) -> Result<String> {
+    let kubeconfig = build_kubeconfig(
+        ca_cert,
+        ca_key,
+        server_url,
+        "system:kobe-sync-bootstrap",
+        "system:masters",
+    )?;
+    debug!("Generated kobe-sync bootstrap kubeconfig");
     Ok(kubeconfig)
 }
 
@@ -438,6 +518,121 @@ mod tests {
         assert!(
             kubeconfig.contains("system:kube-controller-manager"),
             "kubeconfig missing KCM user name"
+        );
+    }
+
+    /// The runtime kubeconfig that every long-lived syncer connection
+    /// uses MUST advertise `system:kobe-sync`, NOT
+    /// `system:kube-controller-manager` (that was the bug — kobe-sync
+    /// was reusing the KCM cert and getting 403'd on every list) and
+    /// NOT `system:masters` (that group bypasses RBAC and would defeat
+    /// the whole point of the dedicated kobe-sync ClusterRole).
+    #[test]
+    fn test_generate_sync_kubeconfig_is_kobe_sync_user_no_masters() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_cert, ca_key) = generate_named_ca("test-ca", "test CA", "test").unwrap();
+        let kubeconfig =
+            generate_sync_kubeconfig(&ca_cert, &ca_key, "https://10.0.0.1:6443").unwrap();
+
+        assert!(kubeconfig.contains("certificate-authority-data:"));
+        assert!(kubeconfig.contains("client-certificate-data:"));
+        assert!(kubeconfig.contains("client-key-data:"));
+        assert!(kubeconfig.contains("https://10.0.0.1:6443"));
+        assert!(
+            kubeconfig.contains("system:kobe-sync"),
+            "runtime kubeconfig must use system:kobe-sync as user; got:\n{kubeconfig}"
+        );
+        assert!(
+            !kubeconfig.contains("system:kube-controller-manager"),
+            "runtime kubeconfig must NOT carry the KCM identity; got:\n{kubeconfig}"
+        );
+    }
+
+    /// Decode the embedded base64 client cert in the runtime kubeconfig
+    /// and assert the X.509 Subject contains `O=system:kobe-sync` and
+    /// CN=`system:kobe-sync` — and crucially does NOT contain
+    /// `O=system:masters`. The runtime cert authenticates against an
+    /// explicit ClusterRoleBinding installed by `ensure_rbac`; if a
+    /// future refactor accidentally drops the kobe-sync group or shifts
+    /// it to masters, the privilege model the rest of the system
+    /// assumes silently breaks.
+    #[test]
+    fn test_sync_runtime_cert_subject_is_kobe_sync_not_masters() {
+        use base64::Engine;
+        use x509_parser::pem::parse_x509_pem;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_cert, ca_key) = generate_named_ca("test-ca", "test CA", "test").unwrap();
+        let kubeconfig =
+            generate_sync_kubeconfig(&ca_cert, &ca_key, "https://10.0.0.1:6443").unwrap();
+
+        let line = kubeconfig
+            .lines()
+            .find(|l| l.trim_start().starts_with("client-certificate-data:"))
+            .expect("kubeconfig should have client-certificate-data");
+        let b64 = line.split_once(':').unwrap().1.trim();
+        let pem_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let (_, pem_block) = parse_x509_pem(&pem_bytes).unwrap();
+        let cert = pem_block.parse_x509().unwrap();
+        let subject = cert.subject().to_string();
+
+        assert!(
+            subject.contains("CN=system:kobe-sync"),
+            "runtime cert Subject must include CN=system:kobe-sync; got `{subject}`"
+        );
+        assert!(
+            subject.contains("O=system:kobe-sync"),
+            "runtime cert Subject must include O=system:kobe-sync; got `{subject}`"
+        );
+        assert!(
+            !subject.contains("system:masters"),
+            "runtime cert Subject MUST NOT include system:masters — that defeats the dedicated RBAC. Got `{subject}`"
+        );
+    }
+
+    /// The bootstrap kubeconfig is the only place `system:masters` is
+    /// supposed to appear. It is used exactly once, on startup, to
+    /// install the kobe-sync RBAC; see
+    /// `crate::kobe_sync::bootstrap::ensure_rbac`. Verifying both the
+    /// CN and the masters group is on the cert keeps that contract
+    /// honest.
+    #[test]
+    fn test_sync_bootstrap_cert_subject_is_system_masters() {
+        use base64::Engine;
+        use x509_parser::pem::parse_x509_pem;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_cert, ca_key) = generate_named_ca("test-ca", "test CA", "test").unwrap();
+        let kubeconfig =
+            generate_sync_bootstrap_kubeconfig(&ca_cert, &ca_key, "https://10.0.0.1:6443").unwrap();
+
+        // user name in the kubeconfig YAML
+        assert!(
+            kubeconfig.contains("system:kobe-sync-bootstrap"),
+            "bootstrap kubeconfig must use system:kobe-sync-bootstrap as user; got:\n{kubeconfig}"
+        );
+
+        let line = kubeconfig
+            .lines()
+            .find(|l| l.trim_start().starts_with("client-certificate-data:"))
+            .expect("kubeconfig should have client-certificate-data");
+        let b64 = line.split_once(':').unwrap().1.trim();
+        let pem_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let (_, pem_block) = parse_x509_pem(&pem_bytes).unwrap();
+        let cert = pem_block.parse_x509().unwrap();
+        let subject = cert.subject().to_string();
+
+        assert!(
+            subject.contains("CN=system:kobe-sync-bootstrap"),
+            "bootstrap cert Subject must include CN=system:kobe-sync-bootstrap; got `{subject}`"
+        );
+        assert!(
+            subject.contains("O=system:masters"),
+            "bootstrap cert Subject MUST include O=system:masters — that is the apiserver's hardcoded superuser short-circuit, and the only identity guaranteed to work before any RBAC exists on the virtual apiserver. Got `{subject}`"
         );
     }
 

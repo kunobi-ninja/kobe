@@ -101,6 +101,46 @@ async fn main() -> Result<()> {
     wait_for_apiserver(&config.virtual_api_url).await?;
     info!("Virtual kube-apiserver is ready");
 
+    // 5b. Bootstrap kobe-sync RBAC on the virtual apiserver.
+    //
+    //    The vkobe virtual apiserver does not run the standard RBAC
+    //    bootstrap that creates `system:kube-controller-manager`,
+    //    `system:basic-user`, `system:discovery`, etc. — every watcher
+    //    authenticating as one of those subjects dies on first list with
+    //    `clusterrole "..." not found`. Rather than depend on those
+    //    built-in roles, we install our own kobe-sync ClusterRole +
+    //    ClusterRoleBinding here using a one-shot bootstrap kubeconfig
+    //    issued under O=system:masters (the apiserver's hard-coded
+    //    superuser short-circuit). The bootstrap client is dropped
+    //    immediately after the apply succeeds; from this point on, every
+    //    connection uses the runtime kubeconfig (CN=system:kobe-sync,
+    //    O=system:kobe-sync) bound only to the role we just installed.
+    //
+    //    See `crate::kobe_sync::bootstrap::ensure_rbac` for the rule set.
+    {
+        let bootstrap_kubeconfig_yaml = CertificateManager::generate_sync_bootstrap_kubeconfig(
+            cert_manager.ca_cert_pem(),
+            cert_manager.ca_key_pem(),
+            &config.virtual_api_url,
+        )
+        .context("Failed to mint kobe-sync bootstrap kubeconfig")?;
+        let bootstrap_kubeconfig = kube::config::Kubeconfig::from_yaml(&bootstrap_kubeconfig_yaml)?;
+        let bootstrap_kube_config =
+            kube::Config::from_custom_kubeconfig(bootstrap_kubeconfig, &Default::default()).await?;
+        let bootstrap_client = kube::Client::try_from(bootstrap_kube_config)
+            .context("Failed to build kobe-sync bootstrap client")?;
+
+        kobe_sync::bootstrap::ensure_rbac(&bootstrap_client)
+            .await
+            .context("Failed to bootstrap kobe-sync RBAC on virtual apiserver")?;
+
+        // bootstrap_client (and the system:masters cert it carries) is
+        // dropped here — the runtime client built below uses the
+        // system:kobe-sync identity that the binding above just gave
+        // proper permissions.
+    }
+    info!("kobe-sync RBAC bootstrap complete");
+
     // 6. Build virtual cluster client (connects to localhost apiserver)
     let virtual_client = build_virtual_client(&config.virtual_api_url, &cert_manager)
         .await
@@ -296,16 +336,21 @@ async fn wait_for_apiserver(url: &str) -> Result<()> {
 // Helper: build virtual cluster client
 // ---------------------------------------------------------------------------
 
-/// Build a `kube::Client` that talks to the local virtual kube-apiserver.
+/// Build a `kube::Client` that talks to the local virtual kube-apiserver
+/// using the kobe-sync **runtime** identity (CN=`system:kobe-sync`,
+/// O=`system:kobe-sync`). The cluster RBAC bound to that identity is
+/// installed by `kobe_sync::bootstrap::ensure_rbac` earlier in startup,
+/// so this client is least-privilege from the moment it is created.
 ///
-/// Uses `CertificateManager::generate_kcm_kubeconfig()` to produce a
-/// kubeconfig with embedded client certificates signed by the cluster CA,
-/// then constructs a `kube::Client` from it.
+/// Earlier revisions reused `generate_kcm_kubeconfig` here, which gave
+/// the syncer the `system:kube-controller-manager` identity — that
+/// fails on the vkobe virtual apiserver because the standard RBAC
+/// bootstrap roles are not present, and the watcher 403'd forever.
 async fn build_virtual_client(
     url: &str,
     cert_manager: &CertificateManager,
 ) -> Result<kube::Client> {
-    let kubeconfig_yaml = CertificateManager::generate_kcm_kubeconfig(
+    let kubeconfig_yaml = CertificateManager::generate_sync_kubeconfig(
         cert_manager.ca_cert_pem(),
         cert_manager.ca_key_pem(),
         url,
