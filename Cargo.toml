@@ -2,7 +2,7 @@
 name = "kobe-operator"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.94.1"
 license = "Apache-2.0"
 description = "Cluster pool operator for instant CI/dev cluster provisioning (k3k, k3s, k0s, CAPI)"
 
@@ -96,8 +96,8 @@ base64 = "0.22"
 async-trait = "0.1"
 
 # CLI
-kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "v0.4.0" }
-kunobi-ha = { git = "https://github.com/kunobi-ninja/kunobi-ha.git", tag = "v0.4.0" }
+kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "v0.5.0" }
+kunobi-ha = { git = "https://github.com/kunobi-ninja/kunobi-ha.git", tag = "v0.5.0" }
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = "0.28"
