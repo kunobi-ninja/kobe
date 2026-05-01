@@ -529,7 +529,10 @@ async fn reconcile_profile(
         .insert(name.clone(), pool_state.clone());
     sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
 
-    let counts = count_states(&pool_state);
+    // Phase metrics here only need the base state taxonomy — pass
+    // `None` for `current_hash` so the drift-aware buckets stay 0.
+    // `compute_pool_actions` above does its own hash-aware count.
+    let counts = count_states(&pool_state, None);
 
     // Phase 3 state gauges: per-pool size by dimension.
     // `min`/`max` come from the spec; the rest are observed phase

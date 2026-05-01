@@ -1035,6 +1035,7 @@ mod tests {
             health_check: None,
             readiness_gates: vec![],
             scaling: None,
+            upgrade_policy: None,
             diagnostics: None,
             snapshot: Some(snapshot.clone()),
         };

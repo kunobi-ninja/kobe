@@ -548,6 +548,35 @@ spec:
                 default: 2h
                 description: Default TTL for claims against this pool (e.g. "2h", "30m").
                 type: string
+              upgradePolicy:
+                description: |-
+                  Rolling-upgrade policy for drift recycling. When unset, a
+                  conservative default applies: `maxRecycling=1, maxSurge=1`,
+                  floor on `ready_clean` is `min_ready` (or `spec.size` for fixed
+                  pools). See [`crate::pool::manager::compute_pool_actions`] for
+                  the algorithm and `docs/guides/upgrade-policy.md` for the
+                  operator-facing tuning guide.
+                nullable: true
+                properties:
+                  maxRecycling:
+                    default: 1
+                    description: Maximum drifted instances to recycle per reconcile. Set to 0 to pause drift recycling. Default 1.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  maxSurge:
+                    default: 1
+                    description: Extra clusters allowed above min_ready during rolling upgrade. Enables zero-downtime upgrade for size-1 pools. Default 1.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  minReadyDuringUpgrade:
+                    description: Floor on total Ready instances during upgrade. Defaults to min_ready (or spec.size). Set to 0 to recycle without a floor.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
             required:
             - cluster
             type: object

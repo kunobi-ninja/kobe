@@ -212,6 +212,15 @@ pub struct ClusterPoolSpec {
     #[serde(default)]
     pub scaling: Option<ScalingConfig>,
 
+    /// Rolling-upgrade policy for drift recycling. When unset, a
+    /// conservative default applies: `maxRecycling=1, maxSurge=1`,
+    /// floor on `ready_clean` is `min_ready` (or `spec.size` for fixed
+    /// pools). See [`crate::pool::manager::compute_pool_actions`] for
+    /// the algorithm and `docs/guides/upgrade-policy.md` for the
+    /// operator-facing tuning guide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_policy: Option<UpgradePolicy>,
+
     /// Diagnostic bundle capture on claim release/expiry.
     #[serde(default)]
     pub diagnostics: Option<DiagnosticsConfig>,
@@ -603,6 +612,97 @@ pub struct FailureBackoffConfig {
     /// Defaults to "2m" when unset.
     #[serde(default = "default_backoff_max")]
     pub max: String,
+}
+
+// --- Enhancement: Rolling-upgrade policy ---
+
+/// Rolling-upgrade policy for replacing pool members whose `spec_hash`
+/// no longer matches the current profile hash (drift).
+///
+/// Drift comes from one of three places (see
+/// [`crate::pool::profile_spec_hash`]): the user-visible ClusterPool
+/// spec, an operator-level `RenderContext` bump (e.g.
+/// `KOBE_SYNC_IMAGE`), or the resolved CONTENT of a referenced
+/// `BootstrapConfig`. On each reconcile, instances whose recorded hash
+/// differs are eligible for recycle; this policy bounds HOW MANY may
+/// be recycled at once (`max_recycling`) and HOW MUCH temporary
+/// surge above `min_ready` is acceptable (`max_surge`) so that even a
+/// size-1 pool can upgrade with zero downtime.
+///
+/// Defaults preserve "rolling" semantics for any pool that did not
+/// previously declare an explicit policy:
+/// `max_recycling = 1`, `max_surge = 1`, `min_ready_during_upgrade =
+/// min_ready` (or `spec.size`).
+///
+/// Unhealthy instances are NOT bounded by this policy — they are
+/// always recycled immediately because they contribute zero capacity.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradePolicy {
+    /// Maximum number of drifted instances to recycle in a single
+    /// reconcile pass. Recycle order is oldest-first
+    /// (`state_since` ascending) so the longest-lived stale instances
+    /// rotate out first. Set to **0 to pause** drift recycling
+    /// entirely — drift is still detected and surfaced in metrics
+    /// but no `Delete` actions are emitted. Useful as a kill switch
+    /// when a bad upgrade is in progress and you want to stop the
+    /// rollout without redeploying the operator. Default 1.
+    #[schemars(
+        description = "Maximum drifted instances to recycle per reconcile. Set to 0 to pause drift recycling. Default 1."
+    )]
+    #[serde(default = "default_max_recycling")]
+    pub max_recycling: u32,
+
+    /// Temporary capacity surge allowed above `min_ready` (or
+    /// `spec.size`) while a rolling upgrade is in progress. The
+    /// scale-up branch will overshoot the warm target by up to this
+    /// many extra clusters when at least one drifted Ready candidate
+    /// is in flight, so a size-1 pool can stand up the replacement
+    /// BEFORE deleting the old member. Default 1.
+    #[schemars(
+        description = "Extra clusters allowed above min_ready during rolling upgrade. Enables zero-downtime upgrade for size-1 pools. Default 1."
+    )]
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u32,
+
+    /// Floor on **total Ready** (instances accepting claims, regardless
+    /// of whether they're on the current or stale `spec_hash`)
+    /// maintained during drift recycling. The recycle step refuses
+    /// to emit a `Delete` when doing so would drop total Ready below
+    /// this floor.
+    ///
+    /// "Total Ready" matches k8s `Deployment.maxUnavailable`
+    /// semantics — a drifted Ready still serves claims, so the
+    /// metric the operator should preserve during an upgrade is
+    /// "clusters available right now," not "clusters on the latest
+    /// version." Counting against current-hash-only would deadlock
+    /// size-2 pools where `max_surge=1` only lands 1 clean
+    /// replacement per cycle.
+    ///
+    /// When unset, defaults to `min_ready` (from `scaling.min_ready`,
+    /// or `spec.size` for fixed pools): "never drop available
+    /// capacity below the warm target."
+    ///
+    /// Set to `0` to recycle as fast as `max_recycling` allows
+    /// regardless of available capacity — appropriate for pools that
+    /// can tolerate brief downtime, or for emergency upgrades where
+    /// speed matters more than capacity preservation.
+    ///
+    /// Setting this **higher** than `min_ready` is allowed but
+    /// achieves nothing useful: the recycler will simply never act
+    /// because the floor cannot be satisfied with the existing pool.
+    #[schemars(
+        description = "Floor on total Ready instances during upgrade. Defaults to min_ready (or spec.size). Set to 0 to recycle without a floor."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_ready_during_upgrade: Option<u32>,
+}
+
+fn default_max_recycling() -> u32 {
+    1
+}
+fn default_max_surge() -> u32 {
+    1
 }
 
 // --- Enhancement: Diagnostics ---

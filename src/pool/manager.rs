@@ -1,3 +1,54 @@
+//! Pool-state evaluation: drift detection, state taxonomy, and
+//! action emission.
+//!
+//! # Layers, in order of evaluation
+//!
+//! [`compute_pool_actions`] evaluates each layer in turn. Earlier
+//! layers' decisions feed counters consumed by later layers.
+//!
+//! 1. **Unhealthy recycle** — broken instances always Deleted.
+//!    Unbounded by policy; never violates a floor (broken instances
+//!    contribute zero capacity).
+//! 2. **Backoff early-return** — if `backoff_active`, drift recycle
+//!    and scale-up are both suppressed. Stuck-Creating timeout still
+//!    runs (it doesn't consume create budget).
+//! 3. **Drifted Creating recycle** — Deleted immediately, no rate
+//!    cap, no surge cost. They contribute zero ready capacity, so
+//!    finishing them on the old version is wasted boot time.
+//! 4. **Drifted Ready rolling recycle** — at most
+//!    [`crate::crd::UpgradePolicy::max_recycling`] Deletes per
+//!    reconcile, gated by `min_ready_during_upgrade`. The post-Delete
+//!    total Ready must remain `>= floor`. Order: oldest
+//!    `state_since` first.
+//! 5. **Stuck Creating timeout** — Creating instances older than
+//!    10min are Deleted (independent of drift; covers wedged
+//!    bootstraps even when the hash matches).
+//! 6. **Scale-up** — refill toward `min_ready` plus surge if drift
+//!    remains. The surge target is `min_ready + min(max_surge,
+//!    drift_in_flight)`; only fires when there's drift to absorb so
+//!    a fresh pool boot doesn't overshoot.
+//! 7. **Scale-down** — skipped while drift upgrade in progress;
+//!    otherwise reaps idle Ready past `scale_down_after`.
+//!
+//! # Drift sources
+//!
+//! See [`profile_spec_hash`]. Three inputs flow into the hash; any
+//! change flips it and makes existing instances drift-eligible:
+//!
+//! - User-visible `ClusterPool` spec (cluster config, addons,
+//!   bootstrap *names*).
+//! - [`RenderContext`] — operator-level config (e.g.
+//!   `KOBE_SYNC_IMAGE`). Vkobe pools only.
+//! - Resolved CONTENT of each referenced
+//!   [`crate::crd::BootstrapConfig`] — editing the install manifest
+//!   without renaming the bootstrap still triggers recycle.
+//!
+//! # Rolling-upgrade policy
+//!
+//! See [`crate::crd::UpgradePolicy`] for the user-facing knobs and
+//! `docs/guides/upgrade-policy.md` for tuning guidance per pool
+//! shape.
+
 use std::collections::HashMap;
 
 use crate::crd::ClusterPool;
@@ -153,6 +204,51 @@ pub fn profile_spec_hash(
     format!("{:016x}", hasher.finish())
 }
 
+/// Fully-populated rolling-upgrade policy values, as consumed by
+/// [`compute_pool_actions`]. Every `Option` from
+/// [`crate::crd::UpgradePolicy`] (or the absence of the whole struct
+/// on a pool) is folded into a concrete value here so the algorithm
+/// doesn't have to thread `Option` chains through the recycle logic.
+///
+/// This is the only place that knows the default values. Tests live
+/// alongside `compute_pool_actions` and construct `ResolvedUpgradePolicy`
+/// directly to pin algorithm invariants without coupling to the CRD
+/// shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedUpgradePolicy {
+    /// See [`crate::crd::UpgradePolicy::max_recycling`].
+    pub max_recycling: u32,
+    /// See [`crate::crd::UpgradePolicy::max_surge`].
+    pub max_surge: u32,
+    /// Floor on `ready_clean` during upgrade. Defaulted to `min_ready`
+    /// (or `spec.size`) when [`crate::crd::UpgradePolicy::min_ready_during_upgrade`]
+    /// is `None`.
+    pub min_ready_during_upgrade: u32,
+}
+
+/// Resolve the rolling-upgrade policy for a profile, folding in
+/// per-field and whole-struct defaults so the caller gets a
+/// [`ResolvedUpgradePolicy`] with every field populated.
+///
+/// `min_ready` is the value used as the fallback floor when
+/// [`crate::crd::UpgradePolicy::min_ready_during_upgrade`] is `None`.
+/// Callers compute it once from `scaling.min_ready` (or `spec.size`)
+/// and pass it through.
+pub fn resolved_upgrade_policy(profile: &ClusterPool, min_ready: u32) -> ResolvedUpgradePolicy {
+    match &profile.spec.upgrade_policy {
+        Some(p) => ResolvedUpgradePolicy {
+            max_recycling: p.max_recycling,
+            max_surge: p.max_surge,
+            min_ready_during_upgrade: p.min_ready_during_upgrade.unwrap_or(min_ready),
+        },
+        None => ResolvedUpgradePolicy {
+            max_recycling: 1,
+            max_surge: 1,
+            min_ready_during_upgrade: min_ready,
+        },
+    }
+}
+
 /// Tracks the state of each cluster in a profile's pool.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClusterState {
@@ -203,13 +299,82 @@ pub enum PoolAction {
     MarkUnhealthy(String),
 }
 
-/// Computes the desired pool actions given current state and profile config.
+/// Compute the desired `PoolAction`s for one reconcile pass.
 ///
-/// This is the core autoscaling logic:
-/// - Scale up when ready + creating clusters < desired floor
-/// - Scale down when idle clusters > min_ready and idle too long
-/// - Respect max_clusters ceiling
-/// - Cap creation burst to avoid thundering herd
+/// Pure: takes immutable state and `now`, returns a list of actions
+/// the controller will issue. No I/O. The reconciler in
+/// `controllers::profile` owns all side effects.
+///
+/// # Order of evaluation
+///
+/// Each step's outcome feeds the next via local counters, but each
+/// step only inspects `state` and the running `actions` list — no
+/// global state.
+///
+/// 1. **Unhealthy → `Delete`** (unbounded).
+///    Broken instances contribute zero capacity; removing them is
+///    pure win and never violates any floor. Not gated by
+///    `max_recycling`, the failure backoff, or the upgrade policy.
+///
+/// 2. **Backoff early-return.**
+///    If `backoff_active`, drift recycling and scale-up are both
+///    suppressed (Deleting drifted Ready when we can't create the
+///    replacement would just bleed capacity). Unhealthy `Delete`s
+///    from step 1 still ship — they don't consume create budget.
+///
+/// 3. **Drifted Creating → `Delete` (immediate, unbounded).**
+///    A Creating instance with a stamped `spec_hash != current_hash`
+///    contributes zero ready capacity; letting it finish on the old
+///    version just wastes the create cost. Skipped when the entry
+///    has no stamped hash yet (initial-status patch race).
+///
+/// 4. **Drifted Ready → `Delete` (rolling, capped).**
+///    At most `policy.max_recycling` per reconcile. Each Delete is
+///    gated on the post-Delete `ready_clean` count still being
+///    `>= policy.min_ready_during_upgrade`. Recycle order is
+///    `state_since` ascending — the oldest Ready first. The required
+///    `ready_clean` headroom is what `policy.max_surge` purchases via
+///    the scale-up step below: surge runs FIRST in earlier reconciles,
+///    landing fresh `ready_clean` instances that this step can then
+///    recycle without dipping under the floor.
+///
+/// 5. **Stuck Creating timeout (10 min).**
+///    `Delete` Creating instances whose `state_since` is older than
+///    the timeout. Independent of drift — covers the case where a
+///    Creating is *clean* (current hash) but the bootstrap is wedged.
+///    Deduplicated against step 3 (no double-Delete).
+///
+/// 6. **Scale-up.**
+///    Refill toward `min_ready`, plus up to `policy.max_surge` extras
+///    when there is at least one drifted Ready remaining (the surge
+///    only fires when there is drift to absorb; otherwise the warm
+///    target stays at `min_ready` and a fresh pool boot doesn't
+///    overshoot). Capped by `MAX_BURST` per reconcile and by
+///    `max_clusters`. Also gated by `backoff_active`.
+///
+/// 7. **Scale-down.**
+///    SKIPPED entirely while a drift upgrade is in progress (any
+///    drifted Ready or drifted Creating remaining). Without this
+///    gate, a fresh replacement that just landed would be reaped as
+///    "excess idle past min_ready" the moment `ready_clean` exceeds
+///    `min_ready` — destroying exactly the capacity the surge was
+///    meant to provide. When no drift remains, scale-down resumes
+///    its usual idle-trim behavior.
+///
+/// # Invariants pinned by tests
+///
+/// - Every reconcile preserves `ready_clean >= policy.min_ready_during_upgrade`
+///   (modulo entry conditions where the floor was already violated).
+/// - At most `policy.max_recycling` Deletes against drifted Ready
+///   per call.
+/// - Unhealthy Deletes are never bounded by `max_recycling`.
+/// - Leased instances are never Deleted, regardless of drift.
+/// - `backoff_active` suppresses drift recycle AND scale-up
+///   symmetrically.
+///
+/// See [`UpgradePolicy`](crate::crd::UpgradePolicy) for the knobs and
+/// `docs/guides/upgrade-policy.md` for the operator-facing tuning
+/// guide.
 pub fn compute_pool_actions(
     profile: &ClusterPool,
     state: &PoolState,
@@ -219,45 +384,21 @@ pub fn compute_pool_actions(
 ) -> Vec<PoolAction> {
     let spec = &profile.spec;
     let mut actions = Vec::new();
+    // Names already scheduled for Delete this reconcile, used to
+    // suppress double-emits across the drift / stuck-Creating /
+    // unhealthy paths.
+    let mut deleting: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // --- Recycle Unhealthy clusters ---
+    // === 1. Unhealthy: always Delete (unbounded). ===
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Unhealthy {
             actions.push(PoolAction::Delete(name.clone()));
+            deleting.insert(name.clone());
         }
     }
 
-    // --- Recycle unclaimed clusters with stale spec ---
-    let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
-    for (name, entry) in &state.clusters {
-        if entry.state == ClusterState::Ready
-            && let Some(hash) = &entry.spec_hash
-            && hash != &current_hash
-        {
-            tracing::info!(
-                cluster = %name,
-                "Cluster spec differs from profile, scheduling recreation"
-            );
-            actions.push(PoolAction::Delete(name.clone()));
-        }
-    }
-
-    // --- Timeout stuck Creating clusters (>10 minutes) ---
-    let creating_timeout = chrono::Duration::minutes(10);
-    for (name, entry) in &state.clusters {
-        if entry.state == ClusterState::Creating
-            && let Some(since) = entry.state_since
-            && now - since > creating_timeout
-        {
-            actions.push(PoolAction::Delete(name.clone()));
-        }
-    }
-
-    let counts = count_states(state);
-    let total =
-        counts.creating + counts.ready + counts.leased + counts.unhealthy + counts.recycling;
-
-    // Determine target from scaling config or fixed size
+    // Determine the warm-target ceiling now so the policy resolver and
+    // the rest of the function share the same `min_ready`.
     let (min_ready, max_clusters, _scale_up_threshold, scale_down_after) =
         if let Some(scaling) = &spec.scaling {
             (
@@ -267,27 +408,161 @@ pub fn compute_pool_actions(
                 parse_duration(&scaling.scale_down_after),
             )
         } else {
-            // Fixed pool: size is both min and max ready
+            // Fixed pool: size is both min and max ready.
             (spec.size, spec.size + 10, 0, None) // no scale-down for fixed pools
         };
 
-    // --- Scale Up ---
-    // We want at least `min_ready` clusters available or on the way.
-    // Refill whenever ready + creating drops below the warm target.
+    let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
+    let counts = count_states(state, Some(&current_hash));
+    let total =
+        counts.creating + counts.ready + counts.leased + counts.unhealthy + counts.recycling;
+    let policy = resolved_upgrade_policy(profile, min_ready);
+
+    // === 2. Backoff early-return for drift recycle and scale-up. ===
     //
-    // Guard with failure backoff: if the pool has had consecutive provision
-    // failures, respect the computed next_attempt_at window. This prevents
-    // a misconfigured pool (missing KobeStore, bad backend config, etc.)
-    // from turning into a create-recycle loop that hammers the API.
-    if counts.ready + counts.creating < min_ready
-        && total < max_clusters
-        && !backoff_active(profile, now)
-    {
-        let deficit = min_ready.saturating_sub(counts.ready + counts.creating);
+    // If the pool's create-attempts are in their backoff window, the
+    // replacement we'd Create after a drift Delete won't actually
+    // be Created (the scale-up gate also reads `backoff_active`).
+    // Recycling without create capacity would just bleed `ready_clean`
+    // — break out and wait for the window to elapse.
+    //
+    // Unhealthy Deletes (step 1) and stuck-Creating Deletes (step 5)
+    // still happen — they don't consume create budget and shouldn't
+    // be held hostage by a transient backoff.
+    if backoff_active(profile, now) {
+        // Stuck-Creating timeout still applies during backoff —
+        // a Creating that's been Creating for >10min is wedged
+        // independently of any provision-failure counter.
+        let creating_timeout = chrono::Duration::minutes(10);
+        for (name, entry) in &state.clusters {
+            if entry.state == ClusterState::Creating
+                && !deleting.contains(name)
+                && let Some(since) = entry.state_since
+                && now - since > creating_timeout
+            {
+                actions.push(PoolAction::Delete(name.clone()));
+                deleting.insert(name.clone());
+            }
+        }
+        return actions;
+    }
+
+    // === 3. Drifted Creating → Delete immediately (unbounded). ===
+    //
+    // No surge cost: a Creating instance is not part of `ready_clean`,
+    // so deleting it never violates the floor. Skip entries whose
+    // `spec_hash` is `None` — that's the brief window after
+    // `ensure_cluster_instance` patched the entry's status but before
+    // the patch round-tripped back into our local `PoolState`. Those
+    // count as clean per `count_states`'s convention.
+    for (name, entry) in &state.clusters {
+        if entry.state == ClusterState::Creating
+            && !deleting.contains(name)
+            && let Some(stamped) = &entry.spec_hash
+            && stamped != &current_hash
+        {
+            tracing::info!(
+                cluster = %name,
+                "Drifted Creating: recycling without waiting for timeout"
+            );
+            actions.push(PoolAction::Delete(name.clone()));
+            deleting.insert(name.clone());
+        }
+    }
+
+    // === 4. Drifted Ready: rolling recycle, capped + floor-protected. ===
+    //
+    // Sort by `state_since` ascending so the longest-Ready stale
+    // instance recycles first. The fallback by name keeps ordering
+    // deterministic across reconciles when timestamps are missing
+    // or equal — important because tests depend on it and the
+    // controller calls this function multiple times per upgrade.
+    let mut drifted_ready: Vec<(&String, &ClusterEntry)> = state
+        .clusters
+        .iter()
+        .filter(|(name, e)| {
+            e.state == ClusterState::Ready
+                && !deleting.contains(*name)
+                && e.spec_hash.as_ref().is_some_and(|h| h != &current_hash)
+        })
+        .collect();
+    drifted_ready.sort_by(|a, b| {
+        a.1.state_since
+            .cmp(&b.1.state_since)
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    // The floor protects total Ready capacity (clean + drifted),
+    // matching k8s Deployment's `maxUnavailable` convention. A
+    // drifted Ready still serves claims — what the user is paying
+    // attention to is "how many clusters are available right now,"
+    // not "how many are on the latest version." Counting against
+    // `ready_clean` would deadlock size-2 pools where `max_surge=1`
+    // can only land 1 clean replacement before the next reconcile,
+    // making the floor unreachable.
+    //
+    // Invariant: after this Delete lands, total Ready is still
+    // `>= policy.min_ready_during_upgrade`. The surge in step 6
+    // restores capacity on subsequent reconciles when this loop
+    // breaks early.
+    //
+    // `.take(max_recycling)` caps the per-reconcile rate; the floor
+    // check inside the loop handles the early-break case.
+    let mut remaining_ready = counts.ready;
+    for (name, _entry) in drifted_ready.iter().take(policy.max_recycling as usize) {
+        if remaining_ready <= policy.min_ready_during_upgrade {
+            // Floor would be violated. Wait for the surge create
+            // (step 6) to land on a future reconcile and bump
+            // total Ready before recycling another one.
+            tracing::debug!(
+                cluster = %name,
+                ready = remaining_ready,
+                floor = policy.min_ready_during_upgrade,
+                "Holding drift recycle: floor would be violated"
+            );
+            break;
+        }
+        tracing::info!(
+            cluster = %name,
+            "Drifted Ready: rolling recycle"
+        );
+        actions.push(PoolAction::Delete((*name).clone()));
+        deleting.insert((*name).clone());
+        remaining_ready -= 1;
+    }
+
+    // === 5. Stuck Creating timeout. ===
+    let creating_timeout = chrono::Duration::minutes(10);
+    for (name, entry) in &state.clusters {
+        if entry.state == ClusterState::Creating
+            && !deleting.contains(name)
+            && let Some(since) = entry.state_since
+            && now - since > creating_timeout
+        {
+            actions.push(PoolAction::Delete(name.clone()));
+            deleting.insert(name.clone());
+        }
+    }
+
+    // === 6. Scale-up: warm target + surge if drift remains. ===
+    //
+    // Surge only fires when there's drift to absorb. A fresh pool
+    // boot (no drift) refills exactly to `min_ready`, never above —
+    // so existing tests for clean pools see byte-identical behavior.
+    let drift_in_flight = counts.ready_drifted; // not creating_drifted —
+    // those got Deleted in step 3 so they're already accounted for in
+    // the deficit calculation.
+    let warm_target = if drift_in_flight > 0 {
+        min_ready + policy.max_surge.min(drift_in_flight)
+    } else {
+        min_ready
+    };
+
+    if counts.ready + counts.creating < warm_target && total < max_clusters {
+        let deficit = warm_target.saturating_sub(counts.ready + counts.creating);
         let room = max_clusters.saturating_sub(total);
         let to_create = deficit.min(room).min(MAX_BURST);
 
-        // Find the highest existing index to avoid name collisions from gaps
         let profile_name = profile.metadata.name.clone().unwrap_or_default();
         let max_index = max_existing_index(state, &profile_name);
 
@@ -297,31 +572,32 @@ pub fn compute_pool_actions(
         }
     }
 
-    // --- Scale Down ---
-    // Delete idle clusters above min_ready that have been idle too long.
-    if let Some(idle_max) = scale_down_after {
+    // === 7. Scale-down: skip while upgrading. ===
+    //
+    // `drift_in_flight > 0` (Ready drift) OR `creating_drifted > 0`
+    // (which we already Deleted but might re-appear if the controller
+    // hasn't applied yet) means the pool is mid-upgrade. Reaping a
+    // fresh replacement as "excess idle" would undo the surge.
+    let upgrade_in_progress = drift_in_flight > 0 || counts.creating_drifted > 0;
+    if !upgrade_in_progress && let Some(idle_max) = scale_down_after {
         let mut idle_candidates: Vec<(&String, &ClusterEntry)> = state
             .clusters
             .iter()
-            .filter(|(_, e)| e.state == ClusterState::Ready)
+            .filter(|(name, e)| e.state == ClusterState::Ready && !deleting.contains(*name))
             .collect();
-
-        // Sort by idle_since ascending (oldest idle first)
         idle_candidates.sort_by_key(|(_, e)| e.idle_since);
 
         let excess = counts.ready.saturating_sub(min_ready);
-        let mut deleted = 0u32;
-
+        let mut deleted_excess = 0u32;
         for (name, entry) in idle_candidates {
-            if deleted >= excess {
+            if deleted_excess >= excess {
                 break;
             }
-            if let Some(idle_since) = entry.idle_since {
-                let idle_duration = now - idle_since;
-                if idle_duration > idle_max {
-                    actions.push(PoolAction::Delete(name.clone()));
-                    deleted += 1;
-                }
+            if let Some(idle_since) = entry.idle_since
+                && now - idle_since > idle_max
+            {
+                actions.push(PoolAction::Delete(name.clone()));
+                deleted_excess += 1;
             }
         }
     }
@@ -422,6 +698,7 @@ pub fn backoff_delay(consecutive_failures: u32) -> Option<chrono::Duration> {
             health_check: None,
             readiness_gates: vec![],
             scaling: None,
+            upgrade_policy: None,
             diagnostics: None,
             snapshot: None,
         },
@@ -531,6 +808,26 @@ fn max_existing_index(state: &PoolState, profile_name: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Tally of cluster states for a pool, with optional drift partitioning.
+///
+/// The base counters (`creating`, `ready`, `leased`, `unhealthy`,
+/// `recycling`) always sum to the pool size. The hash-aware buckets
+/// (`ready_clean` / `ready_drifted`, `creating_clean` / `creating_drifted`,
+/// `leased_drifted`) are populated only when [`count_states`] is called
+/// with a `current_hash` argument; otherwise they remain 0 and callers
+/// that don't reason about drift can ignore them.
+///
+/// **Invariants** (when `current_hash` was provided):
+/// - `ready_clean + ready_drifted == ready`
+/// - `creating_clean + creating_drifted == creating`
+/// - `leased_drifted <= leased` (the unidrifted Leased count isn't
+///   tracked because the rolling-upgrade algorithm never acts on it —
+///   Leased instances are only recycled post-release).
+///
+/// An entry whose `spec_hash` is `None` (initial-status patch race) is
+/// counted as **clean**, not drifted: pretending an unstamped instance
+/// is drift-eligible would loop the recycler against the still-running
+/// patch in `ensure_cluster_instance`.
 #[derive(Debug, Default)]
 pub struct StateCounts {
     pub creating: u32,
@@ -538,9 +835,35 @@ pub struct StateCounts {
     pub leased: u32,
     pub unhealthy: u32,
     pub recycling: u32,
+    /// Ready instances whose `spec_hash` matches `current_hash`. Zero
+    /// when `count_states` was called without a `current_hash`.
+    pub ready_clean: u32,
+    /// Ready instances whose `spec_hash` is set and differs from
+    /// `current_hash`. Zero when `count_states` was called without a
+    /// `current_hash`. Entries with `spec_hash == None` count as clean.
+    pub ready_drifted: u32,
+    /// Creating instances whose `spec_hash` matches `current_hash`.
+    pub creating_clean: u32,
+    /// Creating instances whose `spec_hash` is set and differs from
+    /// `current_hash`. Used by the rolling-upgrade algorithm to recycle
+    /// drifted Creating instances immediately (they contribute zero
+    /// capacity, so deleting them doesn't violate any floor).
+    pub creating_drifted: u32,
+    /// Leased instances whose `spec_hash` is set and differs from
+    /// `current_hash`. Informational — never acted upon directly,
+    /// since Leased instances are only recycled after release.
+    pub leased_drifted: u32,
 }
 
-pub fn count_states(state: &PoolState) -> StateCounts {
+/// Tally a pool's cluster states.
+///
+/// When `current_hash` is `Some(h)`, also partitions Ready / Creating /
+/// Leased into drift-aware buckets (see [`StateCounts`] for the
+/// invariants). When `None`, the drift fields remain 0 and the
+/// behavior is identical to a pre-rolling-upgrade caller — useful for
+/// call sites (like `compute_pool_phase`) that only need the base
+/// state taxonomy.
+pub fn count_states(state: &PoolState, current_hash: Option<&SpecHash>) -> StateCounts {
     let mut c = StateCounts::default();
     for entry in state.clusters.values() {
         match entry.state {
@@ -549,6 +872,28 @@ pub fn count_states(state: &PoolState) -> StateCounts {
             ClusterState::Leased => c.leased += 1,
             ClusterState::Unhealthy => c.unhealthy += 1,
             ClusterState::Recycling => c.recycling += 1,
+        }
+        // Only an entry with both a `current_hash` to compare against
+        // AND its own stamped hash can drift. Unstamped entries
+        // (`spec_hash == None`) count as clean — see type-level doc.
+        if let (Some(curr), Some(entry_hash)) = (current_hash, &entry.spec_hash) {
+            let drifted = entry_hash != curr;
+            match (&entry.state, drifted) {
+                (ClusterState::Ready, true) => c.ready_drifted += 1,
+                (ClusterState::Ready, false) => c.ready_clean += 1,
+                (ClusterState::Creating, true) => c.creating_drifted += 1,
+                (ClusterState::Creating, false) => c.creating_clean += 1,
+                (ClusterState::Leased, true) => c.leased_drifted += 1,
+                _ => {}
+            }
+        } else if current_hash.is_some() {
+            // current_hash provided but entry unstamped → clean bucket.
+            // Keeps `ready_clean + ready_drifted == ready` invariant.
+            match entry.state {
+                ClusterState::Ready => c.ready_clean += 1,
+                ClusterState::Creating => c.creating_clean += 1,
+                _ => {}
+            }
         }
     }
     c
@@ -729,11 +1074,78 @@ mod tests {
         );
 
         let state = PoolState { clusters };
-        let counts = count_states(&state);
+        let counts = count_states(&state, None);
 
         assert_eq!(counts.ready, 1);
         assert_eq!(counts.leased, 1);
         assert_eq!(counts.creating, 1);
+        // Without a current_hash, drift buckets stay at 0.
+        assert_eq!(counts.ready_clean, 0);
+        assert_eq!(counts.ready_drifted, 0);
+    }
+
+    /// `count_states` with a `current_hash` partitions Ready/Creating
+    /// into clean vs drifted, preserving `clean + drifted == total`.
+    /// Entries without a stamped `spec_hash` count as clean to avoid
+    /// looping the recycler against the initial-status patch race.
+    #[test]
+    fn count_states_partitions_ready_into_clean_and_drifted_by_hash() {
+        let current = "cccc111122223333".to_string();
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "ready-clean".into(),
+            ClusterEntry {
+                state: ClusterState::Ready,
+                idle_since: None,
+                health_failures: 0,
+                state_since: None,
+                spec_hash: Some(current.clone()),
+            },
+        );
+        clusters.insert(
+            "ready-drifted".into(),
+            ClusterEntry {
+                state: ClusterState::Ready,
+                idle_since: None,
+                health_failures: 0,
+                state_since: None,
+                spec_hash: Some("ddddffffffffffff".to_string()),
+            },
+        );
+        clusters.insert(
+            "ready-unstamped".into(),
+            ClusterEntry {
+                state: ClusterState::Ready,
+                idle_since: None,
+                health_failures: 0,
+                state_since: None,
+                spec_hash: None,
+            },
+        );
+        clusters.insert(
+            "creating-drifted".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: None,
+                spec_hash: Some("ddddffffffffffff".to_string()),
+            },
+        );
+        let state = PoolState { clusters };
+        let counts = count_states(&state, Some(&current));
+
+        assert_eq!(counts.ready, 3);
+        assert_eq!(counts.ready_clean, 2, "stamped-clean + unstamped");
+        assert_eq!(counts.ready_drifted, 1);
+        assert_eq!(
+            counts.ready_clean + counts.ready_drifted,
+            counts.ready,
+            "clean + drifted must sum to ready"
+        );
+        assert_eq!(counts.creating, 1);
+        assert_eq!(counts.creating_drifted, 1);
+        assert_eq!(counts.creating_clean, 0);
     }
 
     // --- K8s name validation ---
@@ -815,6 +1227,7 @@ mod tests {
                 health_check: None,
                 readiness_gates: vec![],
                 scaling,
+                upgrade_policy: None,
                 diagnostics: None,
                 snapshot: None,
             },
@@ -1073,7 +1486,20 @@ mod tests {
 
     #[test]
     fn test_spec_drift_triggers_recreation_of_unclaimed_clusters() {
-        let profile = make_profile(2, None);
+        // Drift detection still triggers Delete for unclaimed (Ready)
+        // members and leaves Leased alone — that invariant predates
+        // the rolling-upgrade policy. With the new policy in place,
+        // we explicitly set `min_ready_during_upgrade = 0` so this
+        // test keeps pinning the basic drift signal without being
+        // bottlenecked by the default floor (= size = 2). The
+        // floor's behavior is pinned by separate rolling-upgrade
+        // tests (see `rolling_drift_holds_recycle_when_floor_would_be_violated`).
+        let mut profile = make_profile(2, None);
+        profile.spec.upgrade_policy = Some(crate::crd::UpgradePolicy {
+            max_recycling: 1,
+            max_surge: 1,
+            min_ready_during_upgrade: Some(0),
+        });
         let stale_hash = format!(
             "{}-stale",
             profile_spec_hash(&profile, &test_render_ctx(), &Default::default())
@@ -1111,7 +1537,7 @@ mod tests {
             &Default::default(),
         );
 
-        // Only the Ready (unclaimed) cluster should be deleted
+        // Only the Ready (unclaimed) cluster should be deleted.
         let deletes: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, PoolAction::Delete(_)))
@@ -1496,6 +1922,9 @@ mod tests {
             creating,
             recycling,
             unhealthy: 0,
+            // `compute_pool_phase` doesn't read drift fields, so leave
+            // them at the Default zeros.
+            ..StateCounts::default()
         }
     }
 
@@ -1588,5 +2017,602 @@ mod tests {
         // not something phase computation should paper over. Document the ordering.
         let phase = compute_pool_phase(&p, &counts(1, 0, 0, 0), 5, None, chrono::Utc::now());
         assert_eq!(phase, crate::crd::ClusterPoolPhase::Failing);
+    }
+
+    // --- Rolling-upgrade policy: algorithm invariants ---
+    //
+    // Each test pins one invariant of the rolling-recycle algorithm
+    // implemented in `compute_pool_actions`. Test names mirror the
+    // invariant per AGENTS.md "Pin invariants with tests; the test
+    // name should mirror the invariant."
+
+    /// Helper: build a profile with `size` and an explicit upgrade
+    /// policy. The policy is `Some` even when fields are at their
+    /// default values so tests don't depend on the inheritance
+    /// behavior of `resolved_upgrade_policy` (separately tested).
+    fn make_profile_with_upgrade(
+        size: u32,
+        max_recycling: u32,
+        max_surge: u32,
+        min_ready_during_upgrade: Option<u32>,
+    ) -> crate::crd::ClusterPool {
+        let mut p = make_profile(size, None);
+        p.spec.upgrade_policy = Some(crate::crd::UpgradePolicy {
+            max_recycling,
+            max_surge,
+            min_ready_during_upgrade,
+        });
+        p
+    }
+
+    /// Helper: stamp an entry with a stale or current hash relative to
+    /// `profile`. `state_since` is set so the recycle ordering test
+    /// gets a deterministic order.
+    fn drifted_entry(state: ClusterState, age_seconds: i64) -> ClusterEntry {
+        ClusterEntry {
+            state,
+            idle_since: Some(chrono::Utc::now()),
+            health_failures: 0,
+            state_since: Some(chrono::Utc::now() - chrono::Duration::seconds(age_seconds)),
+            spec_hash: Some("ddddffffffffffff".to_string()), // never matches the real current hash
+        }
+    }
+
+    fn clean_entry(state: ClusterState, current_hash: SpecHash) -> ClusterEntry {
+        ClusterEntry {
+            state,
+            idle_since: Some(chrono::Utc::now()),
+            health_failures: 0,
+            state_since: Some(chrono::Utc::now()),
+            spec_hash: Some(current_hash),
+        }
+    }
+
+    /// Pool with 4 drifted Ready, `max_recycling=1`, floor=2:
+    /// exactly 1 Delete per reconcile (the rate cap), with surge to
+    /// keep capacity above the floor. Bypasses scale-up's MAX_BURST
+    /// in this single-step assertion by checking just the Delete count.
+    #[test]
+    fn rolling_drift_recycles_one_at_a_time_when_max_recycling_is_one() {
+        let profile = make_profile_with_upgrade(4, 1, 1, Some(2));
+        let mut clusters = HashMap::new();
+        for i in 1..=4 {
+            clusters.insert(
+                format!("pool-test-profile-{i}"),
+                drifted_entry(ClusterState::Ready, i * 100),
+            );
+        }
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .collect();
+        assert_eq!(
+            deletes.len(),
+            1,
+            "max_recycling=1 caps drift recycle to exactly 1 Delete per reconcile"
+        );
+    }
+
+    /// Pool of size=2, 1 clean Ready + 1 drifted Ready, floor=2.
+    /// Even though `max_recycling=1` would allow a Delete, the floor
+    /// check holds it back: post-Delete total Ready would be 1, below
+    /// the floor of 2. Surge fires instead.
+    #[test]
+    fn rolling_drift_holds_recycle_when_floor_would_be_violated() {
+        let profile = make_profile_with_upgrade(2, 1, 1, Some(2));
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            clean_entry(ClusterState::Ready, current),
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            drifted_entry(ClusterState::Ready, 200),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .collect();
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(
+            deletes.len(),
+            0,
+            "floor=2 with ready=2 forbids any Delete on this reconcile"
+        );
+        assert_eq!(
+            creates.len(),
+            1,
+            "surge fires to grow ready toward warm_target=3 so a future reconcile can recycle"
+        );
+    }
+
+    /// Size=1 fixed pool, the only Ready is drifted. Two-step
+    /// upgrade: T0 surges (Create only, no Delete) so capacity
+    /// doesn't dip below 1; T1 (after the surge becomes Ready)
+    /// recycles the drifted original.
+    #[test]
+    fn size_one_pool_with_surge_one_upgrades_with_zero_downtime() {
+        let profile = make_profile_with_upgrade(1, 1, 1, None); // floor defaults to size=1
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+
+        // T0: 1 drifted Ready, no clean.
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Ready, 100),
+        );
+        let actions_t0 = compute_pool_actions(
+            &profile,
+            &PoolState {
+                clusters: clusters.clone(),
+            },
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        assert_eq!(
+            actions_t0
+                .iter()
+                .filter(|a| matches!(a, PoolAction::Delete(_)))
+                .count(),
+            0,
+            "T0: no Delete — original drifted Ready is the only available capacity"
+        );
+        assert_eq!(
+            actions_t0
+                .iter()
+                .filter(|a| matches!(a, PoolAction::Create(_)))
+                .count(),
+            1,
+            "T0: surge Create lands the replacement before recycling the original"
+        );
+
+        // T1 simulation: surge produced "pool-test-profile-2" Ready.
+        // Original (drifted) is still Ready.
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            clean_entry(ClusterState::Ready, current),
+        );
+        let actions_t1 = compute_pool_actions(
+            &profile,
+            &PoolState { clusters },
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes_t1: Vec<_> = actions_t1
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes_t1,
+            vec!["pool-test-profile-1"],
+            "T1: original drifted Ready is recycled now that ready=2 satisfies floor=1 post-Delete"
+        );
+        assert_eq!(
+            actions_t1
+                .iter()
+                .filter(|a| matches!(a, PoolAction::Create(_)))
+                .count(),
+            0,
+            "T1: no further Creates — already at warm_target=2"
+        );
+    }
+
+    /// A drifted Creating instance contributes zero capacity. The
+    /// algorithm Deletes it immediately, regardless of the floor or
+    /// `max_recycling` budget — letting it finish on the old version
+    /// just wastes the create cost.
+    #[test]
+    fn drifted_creating_instances_are_recycled_immediately_without_surge_cost() {
+        let profile = make_profile_with_upgrade(2, 1, 1, Some(2));
+        let mut clusters = HashMap::new();
+        // No Ready instances — only a drifted Creating.
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Creating, 50),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["pool-test-profile-1"],
+            "drifted Creating Deleted on this reconcile, not after the 10min timeout"
+        );
+        // It was NOT counted toward `max_recycling=1`, but the budget
+        // is still 1 here because there are no drifted Ready candidates.
+    }
+
+    /// Unhealthy instances are recycled aggressively without
+    /// consuming the `max_recycling` budget — they're broken anyway,
+    /// so removing them is pure win and never violates a floor.
+    #[test]
+    fn unhealthy_instances_recycle_without_consuming_max_recycling_budget() {
+        let profile = make_profile_with_upgrade(4, 1, 1, Some(1));
+        let mut clusters = HashMap::new();
+        // 1 Unhealthy + 3 drifted Ready.
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Unhealthy, 400),
+        );
+        for i in 2..=4 {
+            clusters.insert(
+                format!("pool-test-profile-{i}"),
+                drifted_entry(ClusterState::Ready, i * 100),
+            );
+        }
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes.len(),
+            2,
+            "Unhealthy + 1 drifted Ready (1× max_recycling) — Unhealthy doesn't consume the budget"
+        );
+        assert!(
+            deletes.contains(&"pool-test-profile-1".to_string()),
+            "Unhealthy was Deleted"
+        );
+    }
+
+    /// When multiple drifted Ready exist with different `state_since`
+    /// timestamps, the oldest goes first. This is what the operator
+    /// expects intuitively — the longest-stale instance rotates out
+    /// before fresher ones — and what tests of cluster behavior over
+    /// multiple reconciles depend on.
+    #[test]
+    fn oldest_drifted_ready_is_recycled_first() {
+        let profile = make_profile_with_upgrade(3, 1, 1, Some(0)); // floor=0 so we just observe ordering
+        let mut clusters = HashMap::new();
+        // Ages: -1 = 1000s ago, -2 = 100s, -3 = 10s.
+        // Oldest is "-1" (state_since farthest in the past).
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Ready, 1000),
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            drifted_entry(ClusterState::Ready, 100),
+        );
+        clusters.insert(
+            "pool-test-profile-3".into(),
+            drifted_entry(ClusterState::Ready, 10),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["pool-test-profile-1"],
+            "oldest state_since (1000s ago) recycles first"
+        );
+    }
+
+    /// Scale-down is gated on `drift_in_flight == 0`. While even a
+    /// single drifted Ready remains, we must not reap fresh
+    /// replacements as "excess idle past min_ready" — that would
+    /// undo the surge.
+    #[test]
+    fn scale_down_is_skipped_while_drift_upgrade_is_in_progress() {
+        // Scaling pool: min_ready=2, max_clusters=8, scale_down_after=1m.
+        let mut profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 2,
+                max_clusters: 8,
+                scale_up_threshold: 0,
+                scale_down_after: "1m".to_string(),
+                queue_timeout: "5m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        profile.spec.upgrade_policy = Some(crate::crd::UpgradePolicy {
+            max_recycling: 1,
+            max_surge: 1,
+            min_ready_during_upgrade: Some(2),
+        });
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+
+        // 3 Ready: 1 drifted + 2 clean. Above min_ready=2 with one
+        // long-idle clean cluster — would normally scale-down.
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Ready, 200),
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            ClusterEntry {
+                state: ClusterState::Ready,
+                idle_since: Some(chrono::Utc::now() - chrono::Duration::minutes(10)),
+                health_failures: 0,
+                state_since: Some(chrono::Utc::now() - chrono::Duration::minutes(10)),
+                spec_hash: Some(current.clone()),
+            },
+        );
+        clusters.insert(
+            "pool-test-profile-3".into(),
+            clean_entry(ClusterState::Ready, current),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        // pool-test-profile-1 (drifted) is a candidate for drift recycle,
+        // but neither -2 nor -3 (clean, idle, above min_ready) should
+        // be Deleted as scale-down — that's gated.
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !deletes.contains(&"pool-test-profile-2".to_string())
+                && !deletes.contains(&"pool-test-profile-3".to_string()),
+            "scale-down gated while drift upgrade in progress: deletes={deletes:?}"
+        );
+    }
+
+    // --- Rolling-upgrade policy: edge cases ---
+
+    /// Leased instances are never Deleted, regardless of drift.
+    /// They might be drifted (`leased_drifted` informational), but
+    /// the recycle path only acts on Ready/Creating. Post-release
+    /// recycling (in the lease controller) puts the instance back
+    /// into Ready, where the next reconcile picks it up via the
+    /// Ready drift path.
+    #[test]
+    fn leased_instances_are_never_recycled_for_drift() {
+        let profile = make_profile_with_upgrade(2, 2, 2, Some(0));
+        let mut clusters = HashMap::new();
+        // 2 Leased + 0 Ready, all drifted.
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Leased, 100),
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            drifted_entry(ClusterState::Leased, 200),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Delete(_)))
+            .collect();
+        assert_eq!(
+            deletes.len(),
+            0,
+            "Leased instances are never Deleted by drift recycle: {actions:?}"
+        );
+    }
+
+    /// When the pool's failure backoff window is open, drift recycle
+    /// AND scale-up are both suppressed: Deleting a drifted Ready we
+    /// can't replace would just bleed available capacity. Unhealthy
+    /// recycle still ships (it doesn't consume create budget).
+    #[test]
+    fn backoff_window_suppresses_drift_recycling_and_surge() {
+        // Build a pool whose status indicates an active backoff window.
+        let mut profile = make_profile_with_upgrade(2, 1, 1, Some(0));
+        profile.status = Some(crate::crd::ClusterPoolStatus {
+            phase: Some(crate::crd::ClusterPoolPhase::Backoff),
+            consecutive_failures: 2,
+            // ~10s into the future so `now < t` and backoff_active is true.
+            next_attempt_at: Some(
+                (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339(),
+            ),
+            ..Default::default()
+        });
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Ready, 100),
+        );
+        // Plus an Unhealthy to confirm it still recycles.
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            drifted_entry(ClusterState::Unhealthy, 200),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+
+        assert_eq!(
+            deletes,
+            vec!["pool-test-profile-2".to_string()],
+            "Unhealthy still ships during backoff; drift recycle suppressed"
+        );
+        assert_eq!(
+            creates.len(),
+            0,
+            "Scale-up suppressed during backoff (matches existing scale-up gate)"
+        );
+    }
+
+    /// Setting `max_recycling=0` is the documented kill switch:
+    /// drift detection still runs (logs, future metric increments)
+    /// but no Deletes ship for drift. Unhealthy recycling continues
+    /// independent of this knob — it's not part of the upgrade
+    /// pipeline.
+    #[test]
+    fn max_recycling_zero_pauses_drift_upgrade_but_not_unhealthy_recycle() {
+        let profile = make_profile_with_upgrade(3, 0, 1, Some(0));
+        let mut clusters = HashMap::new();
+        // 1 Unhealthy + 2 drifted Ready.
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            drifted_entry(ClusterState::Unhealthy, 300),
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            drifted_entry(ClusterState::Ready, 200),
+        );
+        clusters.insert(
+            "pool-test-profile-3".into(),
+            drifted_entry(ClusterState::Ready, 100),
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["pool-test-profile-1".to_string()],
+            "Only the Unhealthy is recycled when max_recycling=0"
+        );
+    }
+
+    // --- ResolvedUpgradePolicy ---
+
+    /// When a pool has no `upgrade_policy` field set, the resolver
+    /// produces the conservative defaults (`maxRecycling=1, maxSurge=1,
+    /// minReadyDuringUpgrade=min_ready`) so existing pools get rolling
+    /// behavior automatically without a CR edit.
+    #[test]
+    fn resolved_upgrade_policy_falls_back_to_conservative_defaults_when_unset() {
+        let profile = make_profile(2, None); // fixed pool, size=2
+        let resolved = resolved_upgrade_policy(&profile, /* min_ready = */ 2);
+        assert_eq!(resolved.max_recycling, 1);
+        assert_eq!(resolved.max_surge, 1);
+        assert_eq!(
+            resolved.min_ready_during_upgrade, 2,
+            "absent UpgradePolicy uses min_ready as the floor"
+        );
+    }
+
+    /// When `min_ready_during_upgrade` is left out of an explicit
+    /// `UpgradePolicy`, the resolver fills it from the caller-provided
+    /// `min_ready` rather than 0, so an operator who sets only the
+    /// rate knobs still gets capacity preserved during upgrade.
+    #[test]
+    fn resolved_upgrade_policy_inherits_min_ready_when_floor_field_omitted() {
+        let mut profile = make_profile(4, None);
+        profile.spec.upgrade_policy = Some(crate::crd::UpgradePolicy {
+            max_recycling: 2,
+            max_surge: 2,
+            min_ready_during_upgrade: None,
+        });
+        let resolved = resolved_upgrade_policy(&profile, /* min_ready = */ 4);
+        assert_eq!(resolved.max_recycling, 2);
+        assert_eq!(resolved.max_surge, 2);
+        assert_eq!(resolved.min_ready_during_upgrade, 4);
+    }
+
+    /// An explicit `min_ready_during_upgrade: Some(0)` is honored —
+    /// this is the documented "recycle without a floor" mode for
+    /// pools that can tolerate brief downtime.
+    #[test]
+    fn resolved_upgrade_policy_honors_explicit_zero_floor() {
+        let mut profile = make_profile(2, None);
+        profile.spec.upgrade_policy = Some(crate::crd::UpgradePolicy {
+            max_recycling: 1,
+            max_surge: 1,
+            min_ready_during_upgrade: Some(0),
+        });
+        let resolved = resolved_upgrade_policy(&profile, /* min_ready = */ 2);
+        assert_eq!(resolved.min_ready_during_upgrade, 0);
     }
 }
