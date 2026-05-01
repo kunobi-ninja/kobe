@@ -1011,14 +1011,36 @@ fn build_rbac(
 /// Build the host kube-system RoleBinding that grants the vkobe
 /// sidecar read access to `extension-apiserver-authentication`.
 ///
-/// The binding lives in `kube-system` (not the pool namespace), but
-/// it's still a namespaced resource so an OwnerReference to the
-/// parent ClusterInstance works. We pass the SA's namespace
-/// separately because the binding itself is in `kube-system`.
+/// **Cannot carry an OwnerReference.** The previous version of this
+/// builder stamped the parent ClusterInstance's OwnerRef on the
+/// binding's metadata under the (incorrect) assumption that k8s GC
+/// resolves cross-namespace owners by UID. It does not — k8s
+/// explicitly disallows cross-namespace OwnerRefs from a namespaced
+/// child to a namespaced parent. The apiserver accepts the create
+/// (the validation isn't immediate), then within seconds the GC
+/// scans the binding's namespace (`kube-system`) for the named
+/// parent UID, finds nothing, and **deletes the binding as
+/// orphaned**.
+///
+/// This was the regression in PR #69 / v0.22.0 that caused KCM in
+/// every newly-created vkobe pod to crashloop with
+/// `configmaps "extension-apiserver-authentication" is forbidden`:
+/// the operator created the binding, GC reaped it 1-2s later, KCM
+/// woke up, found no permission, exited 1, repeat.
+///
+/// The `owner_ref` parameter is accepted for signature parity with
+/// the other builders but **deliberately ignored** here. Cleanup of
+/// this specific binding falls back to the explicit `delete()`
+/// path, same as the cluster-scoped `ClusterRole` and
+/// `ClusterRoleBinding`.
+///
+/// `namespace` is the namespace where the SA lives (the pool
+/// namespace), used to populate the binding's subject. The binding
+/// itself is always in `kube-system`.
 fn build_host_auth_reader_role_binding(
     name: &str,
     namespace: &str,
-    owner_ref: Option<&OwnerReference>,
+    _owner_ref: Option<&OwnerReference>,
 ) -> RoleBinding {
     let binding_name = format!("{name}-vkobe-auth-reader");
     let sa_name = format!("{name}-vkobe");
@@ -1028,11 +1050,10 @@ fn build_host_auth_reader_role_binding(
             name: Some(binding_name),
             namespace: Some("kube-system".to_string()),
             labels: Some(VkobeBackend::cluster_labels(name)),
-            // Note: GC follows OwnerRef even across namespaces — the
-            // ClusterInstance lives in the pool namespace, this
-            // binding lives in kube-system, but the apiserver
-            // resolves the OwnerRef by uid not by location.
-            owner_references: owner_ref.cloned().map(|o| vec![o]),
+            // owner_references intentionally None — see fn doc.
+            // Cross-namespace OwnerRef = silent GC of this binding =
+            // KCM crashloop on every new vkobe pod.
+            owner_references: None,
             ..Default::default()
         },
         role_ref: RoleRef {
@@ -1573,11 +1594,47 @@ mod tests {
             "RoleBinding missing OwnerRef"
         );
 
+        // host_rb is intentionally NOT in this assertion set — it
+        // crosses namespaces (binding lives in kube-system, parent
+        // CR lives in the pool namespace). See the dedicated
+        // regression test
+        // `build_host_auth_reader_role_binding_omits_cross_namespace_owner_reference`
+        // for why and what happens when this rule is broken.
+    }
+
+    /// The host kube-system auth-reader RoleBinding **must not**
+    /// carry the parent ClusterInstance's OwnerRef, even though it
+    /// is itself a namespaced resource and the call site supplies
+    /// `Some(owner_ref)` for parity with other builders.
+    ///
+    /// Cross-namespace OwnerRefs from a namespaced child to a
+    /// namespaced parent are accepted by the apiserver at create
+    /// time (validation is async), then silently reaped by the GC
+    /// loop within seconds when it scans the child's namespace
+    /// looking for the named parent UID and finds nothing.
+    ///
+    /// This is the regression that shipped in PR #69 / v0.22.0 and
+    /// caused KCM in every newly-created vkobe pod to crashloop
+    /// with `configmaps "extension-apiserver-authentication" is
+    /// forbidden` — the binding got created, GC reaped it 1-2s
+    /// later, KCM started, hit the missing permission, exited 1,
+    /// repeat. Manual `kubectl get rolebinding ...-auth-reader -n
+    /// kube-system` returned `NotFound` despite the operator
+    /// reporting successful create.
+    ///
+    /// Pinned here so a future "let's stamp OwnerRefs everywhere"
+    /// refactor can't reintroduce the same bug.
+    #[test]
+    fn build_host_auth_reader_role_binding_omits_cross_namespace_owner_reference() {
+        let owner = test_owner_ref();
         let host_rb = build_host_auth_reader_role_binding("c", "ns", Some(&owner));
-        assert_eq!(
-            host_rb.metadata.owner_references.as_deref(),
-            Some(std::slice::from_ref(&owner)),
-            "host kube-system auth-reader RoleBinding missing OwnerRef"
+        assert!(
+            host_rb.metadata.owner_references.is_none(),
+            "host kube-system auth-reader RoleBinding must NOT carry \
+             a cross-namespace OwnerRef. The k8s GC reaps it within \
+             seconds, leaving KCM unable to read \
+             `extension-apiserver-authentication` and crashlooping. \
+             See fn doc on `build_host_auth_reader_role_binding`."
         );
     }
 
