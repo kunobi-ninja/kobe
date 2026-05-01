@@ -58,6 +58,14 @@ fn default_virtual_api_url() -> String {
     "https://localhost:6443".to_string()
 }
 
+/// Default user-configurable syncer list — workload-shaped resources
+/// the user could reasonably opt out of for a stripped-down pool.
+///
+/// **Does NOT include the always-on syncers** (`fake_nodes`,
+/// `status`, `service_accounts`). Those are unconditionally started
+/// by `kobe_sync_bin::main` regardless of this list because vkobe
+/// is structurally non-functional without them — see the always-on
+/// block in `kobe_sync_bin.rs` for the rationale per syncer.
 fn default_syncers() -> Vec<String> {
     vec![
         "pods".into(),
@@ -66,13 +74,6 @@ fn default_syncers() -> Vec<String> {
         "secrets".into(),
         "endpoints".into(),
         "ingresses".into(),
-        // Required for any pod that references a non-default
-        // ServiceAccount (flux's source-controller, kunobi-ci's
-        // various controllers, basically everything realistic).
-        // Without this, projected pods get rejected by the host
-        // apiserver at admission with `serviceaccount "<name>" not
-        // found`, breaking the chain that materializes fake nodes.
-        "service_accounts".into(),
     ]
 }
 
@@ -285,24 +286,28 @@ mod tests {
         assert!(syncers.contains(&"secrets".to_string()));
         assert!(syncers.contains(&"endpoints".to_string()));
         assert!(syncers.contains(&"ingresses".to_string()));
-        assert!(syncers.contains(&"service_accounts".to_string()));
     }
 
     /// The runtime sidecar default must match exactly the same list
     /// as the operator-side `crd::default_vkobe_syncers`. The two
     /// modules live in separate binaries (`kobe-sync` and
     /// `kobe-operator`), so they can't share a constant directly;
-    /// instead, both pin against this hardcoded canonical list. Drift
-    /// regressed in v0.22.0 (only the runtime side was updated to
-    /// add `service_accounts`, the CRD-side default was forgotten,
-    /// the operator wrote the old list to the ConfigMap, and the
-    /// sidecar read it from there — `ServiceAccountSyncer` silently
-    /// never ran on freshly-created clusters).
+    /// instead, both pin against this hardcoded canonical list.
+    ///
+    /// **`service_accounts`, `fake_nodes`, and `status` are
+    /// deliberately absent** from this list — they are infrastructural
+    /// always-on syncers started unconditionally by
+    /// `kobe_sync_bin::main` regardless of the user's
+    /// `enabled_syncers`. Including them here would cause double-spawn
+    /// (the always-on path AND the configurable path would each
+    /// register the syncer), which the dedup in `kobe_sync_bin`
+    /// catches and logs but is cleaner to avoid by keeping them out
+    /// of the configurable default in the first place.
     ///
     /// The mirror assertion lives at
     /// `crd::profile::tests::default_vkobe_syncers_matches_canonical_list`.
     /// Update both lists together when adding a syncer to the
-    /// default set.
+    /// configurable default set.
     #[test]
     fn runtime_default_syncers_match_canonical() {
         const CANONICAL: &[&str] = &[
@@ -312,7 +317,6 @@ mod tests {
             "secrets",
             "endpoints",
             "ingresses",
-            "service_accounts",
         ];
         let actual = default_syncers();
         let expected: Vec<String> = CANONICAL.iter().map(|s| (*s).to_string()).collect();
@@ -320,8 +324,8 @@ mod tests {
             actual, expected,
             "runtime default_syncers drifted from the canonical list. \
              Update both kobe_sync/config.rs and crd/profile.rs's \
-             default_vkobe_syncers — drift silently disables a \
-             syncer on every new instance."
+             default_vkobe_syncers — drift silently disables or \
+             double-spawns a syncer."
         );
     }
 

@@ -158,16 +158,67 @@ async fn main() -> Result<()> {
 
     let shutdown = CancellationToken::new();
 
-    // 8. Start resource syncers
-    let syncer_handles =
-        syncer::start_syncers(ctx.clone(), &config.enabled_syncers, shutdown.clone());
-    info!(count = syncer_handles.len(), "resource syncers started");
-
-    // 9. Start always-on syncers (fake nodes, status) -- these run regardless
-    //    of the enabled_syncers config since they are essential for cluster health.
-    let always_on = vec!["fake_nodes".to_string(), "status".to_string()];
+    // 8. Start always-on syncers — these are *infrastructural*, not
+    //    workload-shaped. They run regardless of the user's
+    //    `enabled_syncers` because vkobe simply cannot function for
+    //    realistic workloads without them:
+    //
+    //      - `fake_nodes`: virtual cluster has no scheduler running
+    //        inside; FakeNodeSyncer mirrors host nodes into the
+    //        virtual apiserver so the operator's StatusSyncer can
+    //        bind virtual pods to a node-name that exists.
+    //      - `status`: virtual pods need their `.status` patched from
+    //        the projected host-side counterpart so users see real
+    //        Pending/Running/etc.
+    //      - `service_accounts`: any pod referencing a custom SA
+    //        (flux's controllers, kunobi-ci's controllers, basically
+    //        every realistic workload) gets rejected by the host
+    //        apiserver at admission with `serviceaccount "<name>" not
+    //        found` if the SA isn't mirrored. That breaks the chain
+    //        that materializes fake nodes (`FakeNodeSyncer` is
+    //        reactive on host pods → no host pods → no fake nodes →
+    //        nothing schedules).
+    //
+    //    This list grew to include `service_accounts` after a v0.22.x
+    //    series of regressions where user-supplied
+    //    `spec.backend.vkobe.syncers` lists silently omitted it,
+    //    leaving production vkobe clusters silently nodeless. Making
+    //    it always-on means a stale manifest can never reintroduce
+    //    that failure mode.
+    let always_on = vec![
+        "fake_nodes".to_string(),
+        "status".to_string(),
+        "service_accounts".to_string(),
+    ];
     let always_on_handles = syncer::start_syncers(ctx.clone(), &always_on, shutdown.clone());
     info!(count = always_on_handles.len(), "Always-on syncers started");
+
+    // 9. Start configurable resource syncers — anything in the
+    //    user's `enabled_syncers` list that isn't already started by
+    //    step 8. The dedup is important: starting the same syncer
+    //    twice would put two watchers on the same virtual-apiserver
+    //    stream, racing to handle each event and potentially
+    //    double-applying or thrashing on patch conflicts.
+    let configurable_syncers: Vec<String> = config
+        .enabled_syncers
+        .iter()
+        .filter(|name| !always_on.contains(name))
+        .cloned()
+        .collect();
+    let suppressed: Vec<&String> = config
+        .enabled_syncers
+        .iter()
+        .filter(|name| always_on.contains(name))
+        .collect();
+    if !suppressed.is_empty() {
+        info!(
+            ?suppressed,
+            "Skipping configurable syncers already started as always-on"
+        );
+    }
+    let syncer_handles =
+        syncer::start_syncers(ctx.clone(), &configurable_syncers, shutdown.clone());
+    info!(count = syncer_handles.len(), "resource syncers started");
 
     // 10. Start TLS proxy (front-proxy gateway)
     //     The proxy terminates client TLS, validates client certs against the

@@ -86,6 +86,23 @@ pub fn default_kcm_controllers() -> Vec<String> {
     ]
 }
 
+/// Default user-configurable syncer list — workload-shaped resources
+/// the user could reasonably opt out of for a stripped-down pool.
+///
+/// **Does NOT include the always-on syncers** (`fake_nodes`,
+/// `status`, `service_accounts`). Those are unconditionally started
+/// by `kobe_sync_bin::main` regardless of this list because vkobe
+/// is structurally non-functional without them — see the always-on
+/// block in `kobe_sync_bin.rs`. Including them here would cause
+/// double-spawn (caught by the kobe-sync dedup but cleaner to avoid).
+///
+/// **Must match `crate::kobe_sync::config::default_syncers`** — the
+/// operator writes this list into the per-cluster ConfigMap, and the
+/// sidecar reads from there first. The two lists encode the same
+/// intent but live in separate binaries, so they can't share a
+/// constant directly. Pinned by
+/// `default_vkobe_syncers_matches_canonical_list` in this module's
+/// tests; the mirror lives in `kobe_sync::config::tests`.
 pub fn default_vkobe_syncers() -> Vec<String> {
     vec![
         "pods".into(),
@@ -94,26 +111,6 @@ pub fn default_vkobe_syncers() -> Vec<String> {
         "secrets".into(),
         "endpoints".into(),
         "ingresses".into(),
-        // Required for any pod that references a non-default
-        // ServiceAccount (flux's source-controller, kunobi-ci's
-        // various controllers, etc.). Without this, projected pods
-        // get rejected by the host apiserver at admission with
-        // `serviceaccount "<name>" not found`.
-        //
-        // **Must match `crate::kobe_sync::config`'s `default_syncers`**
-        // — the operator writes its choice into the per-cluster
-        // ConfigMap, and the sidecar reads from there first. The two
-        // lists encode the same intent ("what does a freshly-defaulted
-        // pool need to function") but live in separate modules. Drift
-        // between them silently disables a syncer on every new
-        // instance: this exact bug shipped in v0.22.0 between PR #70
-        // and the live deploy — only the runtime fallback was bumped,
-        // not this CRD-side default, so v0.22.0 ConfigMaps still
-        // listed the original 6 syncers and `ServiceAccountSyncer`
-        // never ran. Pinned by
-        // `default_vkobe_syncers_matches_runtime_default` in this
-        // module's tests.
-        "service_accounts".into(),
     ]
 }
 
@@ -989,22 +986,28 @@ fn default_backup_ttl() -> String {
 mod tests {
     use super::*;
 
-    /// The canonical default syncer list. Both `default_vkobe_syncers`
-    /// (this module — operator writes it into the per-cluster
-    /// ConfigMap) and `kobe_sync::config::default_syncers` (runtime
-    /// sidecar fallback) must produce exactly this list. The two live
-    /// in separate binaries (`kobe-operator` and `kobe-sync`) so they
-    /// can't share a constant directly; instead, both modules
-    /// independently assert against this hardcoded source-of-truth in
-    /// their own tests.
+    /// The canonical user-configurable syncer list. Both
+    /// `default_vkobe_syncers` (this module — operator writes it into
+    /// the per-cluster ConfigMap) and
+    /// `kobe_sync::config::default_syncers` (runtime sidecar fallback)
+    /// must produce exactly this list. The two live in separate
+    /// binaries (`kobe-operator` and `kobe-sync`) so they can't share
+    /// a constant directly; instead, both modules independently
+    /// assert against this hardcoded source-of-truth in their own
+    /// tests.
     ///
-    /// This pinning was added after the v0.22.0 regression where
-    /// PR #70 updated only the sidecar fallback to include
-    /// `service_accounts`, leaving this CRD-side default missing it.
-    /// The operator kept writing the old 6-syncer list into every
-    /// new ConfigMap, the sidecar read from there, and `ServiceAccountSyncer`
-    /// silently never ran on freshly-created clusters even though
-    /// the code was deployed.
+    /// **`fake_nodes`, `status`, and `service_accounts` are NOT in
+    /// this list** — they're infrastructural always-on syncers
+    /// started unconditionally by `kobe_sync_bin::main`. Including
+    /// them here would cause double-spawn (caught by the dedup in
+    /// kobe-sync but cleaner to avoid).
+    ///
+    /// This pinning exists because of v0.22.0/v0.22.1 incidents
+    /// where defaults drifted between the two modules and the
+    /// operator silently shipped ConfigMaps missing `service_accounts`.
+    /// Promoting `service_accounts` to always-on (PR #73) made the
+    /// configurable default smaller again, and these tests were
+    /// updated to match.
     pub(super) const CANONICAL_DEFAULT_VKOBE_SYNCERS: &[&str] = &[
         "pods",
         "services",
@@ -1012,7 +1015,6 @@ mod tests {
         "secrets",
         "endpoints",
         "ingresses",
-        "service_accounts",
     ];
 
     /// CRD-side default matches the canonical list. Mirror in
