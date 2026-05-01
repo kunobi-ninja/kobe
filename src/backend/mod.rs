@@ -9,6 +9,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, Patch, PatchParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
@@ -49,12 +50,13 @@ impl ClusterBackend for BackendDispatch {
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
+        owner_ref: Option<&OwnerReference>,
     ) -> Result<()> {
         match self {
-            Self::K3s(b) => b.create(name, namespace, config, addons).await,
-            Self::K0s(b) => b.create(name, namespace, config, addons).await,
-            Self::Capi(b) => b.create(name, namespace, config, addons).await,
-            Self::Vkobe(b) => b.create(name, namespace, config, addons).await,
+            Self::K3s(b) => b.create(name, namespace, config, addons, owner_ref).await,
+            Self::K0s(b) => b.create(name, namespace, config, addons, owner_ref).await,
+            Self::Capi(b) => b.create(name, namespace, config, addons, owner_ref).await,
+            Self::Vkobe(b) => b.create(name, namespace, config, addons, owner_ref).await,
         }
     }
 
@@ -180,12 +182,27 @@ impl BackendFactory {
 /// from the underlying technology.
 pub trait ClusterBackend: Send + Sync {
     /// Create a virtual cluster with the given name and config.
+    ///
+    /// `owner_ref` should be the parent `ClusterInstance`'s
+    /// [`OwnerReference`]. When supplied, backends MUST stamp it on
+    /// every namespaced child resource they create so that k8s
+    /// garbage collection reaps the children if the parent CR is
+    /// deleted out-of-band — defense in depth on top of the
+    /// explicit `delete` path. Cluster-scoped resources cannot have
+    /// a namespaced owner; backends fall back to the explicit
+    /// delete path for those.
+    ///
+    /// Pass `None` from contexts where the parent CR isn't
+    /// available (test mocks, ad-hoc tools). Backends that consult
+    /// the field treat `None` as "skip the OwnerRef" — no GC fallback,
+    /// but the explicit delete still works.
     fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
+        owner_ref: Option<&OwnerReference>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Delete a virtual cluster.

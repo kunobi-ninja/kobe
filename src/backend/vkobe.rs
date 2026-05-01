@@ -20,7 +20,7 @@ use k8s_openapi::api::rbac::v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
@@ -106,6 +106,7 @@ impl VkobeBackend {
         namespace: &str,
         pki_material: &pki::VirtualClusterPki,
         kcm_kubeconfig: &str,
+        owner_ref: Option<&OwnerReference>,
     ) -> Result<()> {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-certs");
@@ -119,11 +120,16 @@ impl VkobeBackend {
                 );
                 Ok(())
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                pki::create_pki_secret(&self.client, name, namespace, pki_material, kcm_kubeconfig)
-                    .await
-                    .context("Failed to create PKI secret")
-            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => pki::create_pki_secret(
+                &self.client,
+                name,
+                namespace,
+                pki_material,
+                kcm_kubeconfig,
+                owner_ref,
+            )
+            .await
+            .context("Failed to create PKI secret"),
             Err(e) => Err(e).context("Failed to check vkobe PKI secret"),
         }
     }
@@ -192,10 +198,16 @@ impl VkobeBackend {
     }
 
     /// Build the API Service for the vkobe proxy.
+    ///
+    /// `owner_ref` (when `Some`) is stamped on `metadata.owner_references`
+    /// so the Service is reaped by k8s GC if the parent ClusterInstance
+    /// CR is deleted out-of-band — defense-in-depth on top of the
+    /// explicit `delete()` cleanup path.
     fn build_service(
         name: &str,
         namespace: &str,
         kobe_sync_config: Option<&VkobeConfig>,
+        owner_ref: Option<&OwnerReference>,
     ) -> Service {
         let proxy_port = kobe_sync_config.map(|c| c.proxy_port).unwrap_or(8443);
 
@@ -204,6 +216,7 @@ impl VkobeBackend {
                 name: Some(format!("{name}-api")),
                 namespace: Some(namespace.to_string()),
                 labels: Some(Self::cluster_labels(name)),
+                owner_references: owner_ref.cloned().map(|o| vec![o]),
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
@@ -286,7 +299,13 @@ users:
     }
 
     /// Store the kubeconfig as a Secret.
-    async fn store_kubeconfig(&self, name: &str, namespace: &str, kubeconfig: &str) -> Result<()> {
+    async fn store_kubeconfig(
+        &self,
+        name: &str,
+        namespace: &str,
+        kubeconfig: &str,
+        owner_ref: Option<&OwnerReference>,
+    ) -> Result<()> {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-kubeconfig");
 
@@ -295,6 +314,7 @@ users:
                 name: Some(secret_name.clone()),
                 namespace: Some(namespace.to_string()),
                 labels: Some(Self::cluster_labels(name)),
+                owner_references: owner_ref.cloned().map(|o| vec![o]),
                 ..Default::default()
             },
             data: Some({
@@ -339,6 +359,18 @@ impl ClusterBackend for VkobeBackend {
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
+        // Stamped on every namespaced child resource (ConfigMap,
+        // Service, Secrets, ServiceAccount, Role, RoleBinding,
+        // host-namespace auth-reader RoleBinding, Deployment) so
+        // k8s GC reaps them when the parent ClusterInstance CR is
+        // deleted out-of-band — defense in depth on top of the
+        // explicit `delete()` path. The two cluster-scoped children
+        // (ClusterRole, ClusterRoleBinding) cannot reference a
+        // namespaced parent (the apiserver rejects cross-scope
+        // OwnerRefs) and rely on the explicit cleanup path; the
+        // matching `delete()` change makes that path fail loudly so
+        // a partial cleanup retries.
+        owner_ref: Option<&OwnerReference>,
     ) -> Result<()> {
         info!(cluster = name, namespace, "Creating vkobe virtual cluster");
 
@@ -361,7 +393,13 @@ impl ClusterBackend for VkobeBackend {
 
         // 1. Create ConfigMap (v2 — includes etcd connection info)
         let config_maps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
-        let cm = build_config_map_v2(name, namespace, &kobe_sync_config, &etcd_endpoints);
+        let cm = build_config_map_v2(
+            name,
+            namespace,
+            &kobe_sync_config,
+            &etcd_endpoints,
+            owner_ref,
+        );
         match config_maps.create(&PostParams::default(), &cm).await {
             Ok(_) => debug!(cluster = name, "ConfigMap created"),
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -372,7 +410,7 @@ impl ClusterBackend for VkobeBackend {
 
         // 2. Create Service
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc = Self::build_service(name, namespace, Some(&kobe_sync_config));
+        let svc = Self::build_service(name, namespace, Some(&kobe_sync_config), owner_ref);
         match services.create(&PostParams::default(), &svc).await {
             Ok(_) => debug!(cluster = name, "Service created"),
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -417,14 +455,15 @@ impl ClusterBackend for VkobeBackend {
         .context("Failed to generate KCM kubeconfig")?;
 
         // Create the PKI Secret containing all certs + KCM kubeconfig.
-        self.ensure_pki_secret(name, namespace, &pki_material, &kcm_kubeconfig)
+        self.ensure_pki_secret(name, namespace, &pki_material, &kcm_kubeconfig, owner_ref)
             .await?;
 
         info!(cluster = name, "PKI secret created before Deployment");
 
         // 4. Create RBAC resources for vkobe sidecar
-        let (sa, role, rb, cr, crb) = build_rbac(name, namespace);
-        let host_auth_reader_binding = build_host_auth_reader_role_binding(name, namespace);
+        let (sa, role, rb, cr, crb) = build_rbac(name, namespace, owner_ref);
+        let host_auth_reader_binding =
+            build_host_auth_reader_role_binding(name, namespace, owner_ref);
 
         // ServiceAccount
         let sa_api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
@@ -499,6 +538,7 @@ impl ClusterBackend for VkobeBackend {
             &kobe_sync_config,
             &etcd_endpoints,
             &kobe_sync_image,
+            owner_ref,
         );
         match deployments.create(&PostParams::default(), &dep).await {
             Ok(_) => debug!(cluster = name, "Deployment created"),
@@ -510,7 +550,8 @@ impl ClusterBackend for VkobeBackend {
 
         // 6. Build and store kubeconfig
         let kubeconfig = self.build_kubeconfig(name, namespace).await?;
-        self.store_kubeconfig(name, namespace, &kubeconfig).await?;
+        self.store_kubeconfig(name, namespace, &kubeconfig, owner_ref)
+            .await?;
 
         // 7. Wait until the virtual API is actually serving discovery.
         self.wait_ready(name, namespace).await?;
@@ -532,141 +573,173 @@ impl ClusterBackend for VkobeBackend {
         Ok(())
     }
 
+    /// Delete every resource produced by [`Self::create`] for this
+    /// cluster.
+    ///
+    /// **Fail-loud semantics.** Each child delete is attempted
+    /// independently — we do *not* short-circuit on the first
+    /// failure, so a flaky apiserver doesn't strand resources whose
+    /// turn comes after the flake. Successes and "already-gone" 404s
+    /// are logged at debug. Real errors are accumulated and a single
+    /// `Err` is returned at the end summarizing what failed.
+    ///
+    /// The instance controller treats any `Err` from this function as
+    /// "retry the recycle" (see
+    /// [`crate::controllers::instance`] — the `Recycling` arm only
+    /// removes the parent ClusterInstance CR when this returns Ok),
+    /// so a partial cleanup correctly *blocks* CR removal and
+    /// re-attempts on the next reconcile. Without this, the previous
+    /// `warn!`-and-continue behavior could leak the resources whose
+    /// individual deletes failed: the warning fired, the function
+    /// returned Ok, the CR was deleted, and (since the OwnerRef on
+    /// cluster-scoped resources cannot reference a namespaced parent)
+    /// k8s GC had no anchor to reap the rest.
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
         info!(cluster = name, namespace, "Deleting vkobe virtual cluster");
 
-        // Delete Deployment
-        let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
-        let dep_name = format!("{name}-vkobe");
-        match dep_api.delete(&dep_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(cluster = name, "Deployment deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "Deployment already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete Deployment"),
-        }
+        // Tracks (kind, name) pairs whose delete failed with a real
+        // error (not 404). The function returns Err if non-empty.
+        let mut failures: Vec<String> = Vec::new();
 
-        // Delete Service
-        let svc_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc_name = format!("{name}-api");
-        match svc_api.delete(&svc_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(cluster = name, "Service deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "Service already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete Service"),
-        }
-
-        // Delete ConfigMap
-        let cm_api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
-        let cm_name = format!("{name}-config");
-        match cm_api.delete(&cm_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(cluster = name, "ConfigMap deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "ConfigMap already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete ConfigMap"),
-        }
-
-        // Delete Secrets (certs + kubeconfig)
-        let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        for suffix in &["certs", "kubeconfig"] {
-            let secret_name = format!("{name}-{suffix}");
-            match secret_api
-                .delete(&secret_name, &DeleteParams::default())
-                .await
-            {
-                Ok(_) => debug!(cluster = name, secret = %secret_name, "Secret deleted"),
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-                Err(e) => warn!(
-                    cluster = name,
-                    secret = %secret_name,
-                    error = %e,
-                    "Failed to delete Secret"
-                ),
+        // Helper to record one delete attempt's outcome. `kind` and
+        // `resource_name` are descriptive labels used in logs and the
+        // aggregated error.
+        async fn try_delete<K>(
+            api: &Api<K>,
+            cluster: &str,
+            kind: &str,
+            resource_name: &str,
+            failures: &mut Vec<String>,
+        ) where
+            K: kube::Resource<DynamicType = ()>
+                + Clone
+                + serde::de::DeserializeOwned
+                + std::fmt::Debug,
+        {
+            match api.delete(resource_name, &DeleteParams::default()).await {
+                Ok(_) => debug!(cluster, kind, resource_name, "deleted"),
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    debug!(cluster, kind, resource_name, "already gone");
+                }
+                Err(e) => {
+                    warn!(cluster, kind, resource_name, error = %e, "delete failed");
+                    failures.push(format!("{kind}/{resource_name}: {e}"));
+                }
             }
         }
 
-        // Delete RBAC — cluster-scoped first, then namespaced
         let rbac_name = format!("{name}-vkobe");
         let cluster_role_name = format!("{name}-vkobe-nodes");
-
-        // ClusterRoleBinding (cluster-scoped)
-        let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
-        match crb_api
-            .delete(&cluster_role_name, &DeleteParams::default())
-            .await
-        {
-            Ok(_) => debug!(cluster = name, "ClusterRoleBinding deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "ClusterRoleBinding already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete ClusterRoleBinding"),
-        }
-
-        // ClusterRole (cluster-scoped)
-        let cr_api: Api<ClusterRole> = Api::all(self.client.clone());
-        match cr_api
-            .delete(&cluster_role_name, &DeleteParams::default())
-            .await
-        {
-            Ok(_) => debug!(cluster = name, "ClusterRole deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "ClusterRole already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete ClusterRole"),
-        }
-
-        // RoleBinding (namespaced)
-        let rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), namespace);
-        match rb_api.delete(&rbac_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(cluster = name, "RoleBinding deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "RoleBinding already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete RoleBinding"),
-        }
-
-        // Host kube-system RoleBinding
         let host_rb_name = format!("{name}-vkobe-auth-reader");
+
+        // Order roughly matches reverse-create so dependents go before
+        // their dependencies (Deployment before its mounted Secret /
+        // SA, etc.). Each step is idempotent and order-tolerant in
+        // practice, but matching reverse-create is friendlier to
+        // observers reading kubectl events.
+
+        let dep_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        try_delete(
+            &dep_api,
+            name,
+            "Deployment",
+            &format!("{name}-vkobe"),
+            &mut failures,
+        )
+        .await;
+
+        let svc_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        try_delete(
+            &svc_api,
+            name,
+            "Service",
+            &format!("{name}-api"),
+            &mut failures,
+        )
+        .await;
+
+        let cm_api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        try_delete(
+            &cm_api,
+            name,
+            "ConfigMap",
+            &format!("{name}-config"),
+            &mut failures,
+        )
+        .await;
+
+        let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        for suffix in &["certs", "kubeconfig"] {
+            try_delete(
+                &secret_api,
+                name,
+                "Secret",
+                &format!("{name}-{suffix}"),
+                &mut failures,
+            )
+            .await;
+        }
+
+        // RBAC — cluster-scoped first (no OwnerRef anchor, must be
+        // explicitly deleted), then namespaced (which would survive
+        // via OwnerRef-GC even if this delete fails).
+        let crb_api: Api<ClusterRoleBinding> = Api::all(self.client.clone());
+        try_delete(
+            &crb_api,
+            name,
+            "ClusterRoleBinding",
+            &cluster_role_name,
+            &mut failures,
+        )
+        .await;
+
+        let cr_api: Api<ClusterRole> = Api::all(self.client.clone());
+        try_delete(
+            &cr_api,
+            name,
+            "ClusterRole",
+            &cluster_role_name,
+            &mut failures,
+        )
+        .await;
+
+        let rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), namespace);
+        try_delete(&rb_api, name, "RoleBinding", &rbac_name, &mut failures).await;
+
         let host_rb_api: Api<RoleBinding> = Api::namespaced(self.client.clone(), "kube-system");
-        match host_rb_api
-            .delete(&host_rb_name, &DeleteParams::default())
-            .await
-        {
-            Ok(_) => debug!(cluster = name, "Host auth RoleBinding deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "Host auth RoleBinding already gone");
-            }
-            Err(e) => warn!(
-                cluster = name,
-                error = %e,
-                "Failed to delete host auth RoleBinding"
-            ),
-        }
+        try_delete(
+            &host_rb_api,
+            name,
+            "RoleBinding (kube-system auth-reader)",
+            &host_rb_name,
+            &mut failures,
+        )
+        .await;
 
-        // Role (namespaced)
         let role_api: Api<Role> = Api::namespaced(self.client.clone(), namespace);
-        match role_api.delete(&rbac_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(cluster = name, "Role deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "Role already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete Role"),
-        }
+        try_delete(&role_api, name, "Role", &rbac_name, &mut failures).await;
 
-        // ServiceAccount (namespaced)
         let sa_api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
-        match sa_api.delete(&rbac_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(cluster = name, "ServiceAccount deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(cluster = name, "ServiceAccount already gone");
-            }
-            Err(e) => warn!(cluster = name, error = %e, "Failed to delete ServiceAccount"),
-        }
+        try_delete(&sa_api, name, "ServiceAccount", &rbac_name, &mut failures).await;
 
-        info!(cluster = name, "vkobe virtual cluster deleted");
-        Ok(())
+        if failures.is_empty() {
+            info!(cluster = name, "vkobe virtual cluster deleted");
+            Ok(())
+        } else {
+            // Aggregated error → controller retries the recycle.
+            // Each failure entry is `"<kind>/<name>: <error>"`.
+            let summary = failures.join("; ");
+            warn!(
+                cluster = name,
+                count = failures.len(),
+                summary = %summary,
+                "vkobe delete partial; controller will retry"
+            );
+            anyhow::bail!(
+                "partial vkobe delete for cluster {name}: {} failure(s): {summary}",
+                failures.len()
+            )
+        }
     }
 
     async fn check_health(&self, name: &str, namespace: &str) -> Result<bool> {
@@ -779,9 +852,20 @@ fn normalize_kube_component_version(version: &str) -> String {
 /// (pods, services, configmaps, secrets, endpoints, PVCs, ingresses,
 /// networkpolicies, plus the pods/status subresource). The ClusterRole grants
 /// cluster-scoped read/watch on Nodes for the fake-node syncer.
+/// Build the five RBAC resources for a vkobe sidecar.
+///
+/// Namespaced ones (ServiceAccount, Role, RoleBinding) get
+/// `owner_ref` stamped on them so k8s GC reaps them with the parent
+/// ClusterInstance CR. Cluster-scoped ones (ClusterRole,
+/// ClusterRoleBinding) **cannot** reference a namespaced owner
+/// (k8s rejects the OwnerRef as invalid), so they fall back to the
+/// explicit cleanup path in [`VkobeBackend::delete`]. Pair this
+/// with the fail-loud delete change so a partial cleanup propagates
+/// to the controller's retry loop.
 fn build_rbac(
     name: &str,
     namespace: &str,
+    owner_ref: Option<&OwnerReference>,
 ) -> (
     ServiceAccount,
     Role,
@@ -791,6 +875,7 @@ fn build_rbac(
 ) {
     let sa_name = format!("{name}-vkobe");
     let labels = VkobeBackend::cluster_labels(name);
+    let namespaced_owner = owner_ref.cloned().map(|o| vec![o]);
 
     // ServiceAccount
     let sa = ServiceAccount {
@@ -798,6 +883,7 @@ fn build_rbac(
             name: Some(sa_name.clone()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels.clone()),
+            owner_references: namespaced_owner.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -809,6 +895,7 @@ fn build_rbac(
             name: Some(sa_name.clone()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels.clone()),
+            owner_references: namespaced_owner.clone(),
             ..Default::default()
         },
         rules: Some(vec![
@@ -863,6 +950,7 @@ fn build_rbac(
             name: Some(sa_name.clone()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels.clone()),
+            owner_references: namespaced_owner.clone(),
             ..Default::default()
         },
         role_ref: RoleRef {
@@ -878,7 +966,9 @@ fn build_rbac(
         }]),
     };
 
-    // ClusterRole — cluster-scoped node read/watch for fake node syncer
+    // ClusterRole — cluster-scoped: cannot reference a namespaced
+    // ClusterInstance as owner (k8s would reject the OwnerRef).
+    // Cleanup falls back to the explicit `delete()` path.
     let cluster_role_name = format!("{name}-vkobe-nodes");
     let cluster_role = ClusterRole {
         metadata: ObjectMeta {
@@ -918,7 +1008,18 @@ fn build_rbac(
     (sa, role, role_binding, cluster_role, cluster_role_binding)
 }
 
-fn build_host_auth_reader_role_binding(name: &str, namespace: &str) -> RoleBinding {
+/// Build the host kube-system RoleBinding that grants the vkobe
+/// sidecar read access to `extension-apiserver-authentication`.
+///
+/// The binding lives in `kube-system` (not the pool namespace), but
+/// it's still a namespaced resource so an OwnerReference to the
+/// parent ClusterInstance works. We pass the SA's namespace
+/// separately because the binding itself is in `kube-system`.
+fn build_host_auth_reader_role_binding(
+    name: &str,
+    namespace: &str,
+    owner_ref: Option<&OwnerReference>,
+) -> RoleBinding {
     let binding_name = format!("{name}-vkobe-auth-reader");
     let sa_name = format!("{name}-vkobe");
 
@@ -927,6 +1028,11 @@ fn build_host_auth_reader_role_binding(name: &str, namespace: &str) -> RoleBindi
             name: Some(binding_name),
             namespace: Some("kube-system".to_string()),
             labels: Some(VkobeBackend::cluster_labels(name)),
+            // Note: GC follows OwnerRef even across namespaces — the
+            // ClusterInstance lives in the pool namespace, this
+            // binding lives in kube-system, but the apiserver
+            // resolves the OwnerRef by uid not by location.
+            owner_references: owner_ref.cloned().map(|o| vec![o]),
             ..Default::default()
         },
         role_ref: RoleRef {
@@ -954,6 +1060,7 @@ pub fn build_config_map_v2(
     namespace: &str,
     kobe_sync_config: &VkobeConfig,
     etcd_endpoints: &str,
+    owner_ref: Option<&OwnerReference>,
 ) -> ConfigMap {
     let config_data = serde_json::json!({
         "host_namespace": namespace,
@@ -982,6 +1089,7 @@ pub fn build_config_map_v2(
             name: Some(format!("{name}-config")),
             namespace: Some(namespace.to_string()),
             labels: Some(labels),
+            owner_references: owner_ref.cloned().map(|o| vec![o]),
             ..Default::default()
         },
         data: Some({
@@ -1092,6 +1200,7 @@ pub fn build_deployment(
     kobe_sync_config: &VkobeConfig,
     etcd_endpoints: &str,
     kobe_sync_image: &str,
+    owner_ref: Option<&OwnerReference>,
 ) -> Deployment {
     let version = normalize_kube_component_version(&kobe_sync_config.version);
     let proxy_port = kobe_sync_config.proxy_port;
@@ -1302,6 +1411,7 @@ pub fn build_deployment(
             name: Some(format!("{name}-vkobe")),
             namespace: Some(namespace.to_string()),
             labels: Some(labels.clone()),
+            owner_references: owner_ref.cloned().map(|o| vec![o]),
             ..Default::default()
         },
         spec: Some(DeploymentSpec {
@@ -1393,10 +1503,135 @@ mod tests {
 
     #[test]
     fn test_build_service() {
-        let svc = VkobeBackend::build_service("test-cluster", "test-ns", None);
+        let svc = VkobeBackend::build_service("test-cluster", "test-ns", None, None);
         assert_eq!(svc.metadata.name.as_deref(), Some("test-cluster-api"));
         let ports = svc.spec.unwrap().ports.unwrap();
         assert_eq!(ports[0].port, 443);
+    }
+
+    /// Helper: a synthetic OwnerReference for testing the OwnerRef
+    /// stamping. The real value comes from
+    /// `instance.controller_owner_ref(&())` at the call site; tests
+    /// just need a value distinguishable from `None`.
+    fn test_owner_ref() -> OwnerReference {
+        OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
+            kind: "ClusterInstance".to_string(),
+            name: "pool-test-cluster".to_string(),
+            uid: "fake-uid-1234".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }
+    }
+
+    /// Every namespaced child resource produced by the vkobe
+    /// builders must carry the parent ClusterInstance's
+    /// OwnerReference so k8s GC reaps it when the parent is deleted.
+    /// This test covers all 6 namespaced builders in one place to
+    /// catch a future regression where someone adds a builder and
+    /// forgets to plumb owner_ref.
+    #[test]
+    fn build_namespaced_resources_carry_owner_reference() {
+        let owner = test_owner_ref();
+        let cfg = test_kobe_sync_config();
+
+        let svc = VkobeBackend::build_service("c", "ns", None, Some(&owner));
+        assert_eq!(
+            svc.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "Service missing OwnerRef"
+        );
+
+        let cm = build_config_map_v2("c", "ns", &cfg, "http://etcd:2379", Some(&owner));
+        assert_eq!(
+            cm.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "ConfigMap missing OwnerRef"
+        );
+
+        let dep = build_deployment("c", "ns", &cfg, "http://etcd:2379", "img", Some(&owner));
+        assert_eq!(
+            dep.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "Deployment missing OwnerRef"
+        );
+
+        let (sa, role, rb, _cr, _crb) = build_rbac("c", "ns", Some(&owner));
+        assert_eq!(
+            sa.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "ServiceAccount missing OwnerRef"
+        );
+        assert_eq!(
+            role.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "Role missing OwnerRef"
+        );
+        assert_eq!(
+            rb.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "RoleBinding missing OwnerRef"
+        );
+
+        let host_rb = build_host_auth_reader_role_binding("c", "ns", Some(&owner));
+        assert_eq!(
+            host_rb.metadata.owner_references.as_deref(),
+            Some(std::slice::from_ref(&owner)),
+            "host kube-system auth-reader RoleBinding missing OwnerRef"
+        );
+    }
+
+    /// Cluster-scoped resources cannot reference a namespaced
+    /// `ClusterInstance` parent (the apiserver rejects the OwnerRef
+    /// as `cross-namespace owner references are disallowed`). The
+    /// builders explicitly drop `owner_ref` for those two resources
+    /// — the explicit `delete()` cleanup path handles them, and the
+    /// fail-loud delete change ensures partial cleanup propagates
+    /// to the controller's retry loop.
+    #[test]
+    fn build_cluster_scoped_rbac_omits_owner_reference() {
+        let owner = test_owner_ref();
+        let (_sa, _role, _rb, cr, crb) = build_rbac("c", "ns", Some(&owner));
+        assert!(
+            cr.metadata.owner_references.is_none(),
+            "ClusterRole must NOT carry the OwnerRef (cross-scope rejection)"
+        );
+        assert!(
+            crb.metadata.owner_references.is_none(),
+            "ClusterRoleBinding must NOT carry the OwnerRef (cross-scope rejection)"
+        );
+    }
+
+    /// When `owner_ref` is `None`, builders produce resources without
+    /// an OwnerReference — preserves the legacy behavior for callers
+    /// that don't have a parent CR (e.g. velero's golden-image
+    /// coordinator, ad-hoc tools, tests).
+    #[test]
+    fn build_namespaced_resources_with_no_owner_ref_omit_field() {
+        let cfg = test_kobe_sync_config();
+        let svc = VkobeBackend::build_service("c", "ns", None, None);
+        let cm = build_config_map_v2("c", "ns", &cfg, "http://etcd:2379", None);
+        let dep = build_deployment("c", "ns", &cfg, "http://etcd:2379", "img", None);
+        let (sa, role, rb, _, _) = build_rbac("c", "ns", None);
+        let host_rb = build_host_auth_reader_role_binding("c", "ns", None);
+
+        for (label, refs) in [
+            ("Service", svc.metadata.owner_references),
+            ("ConfigMap", cm.metadata.owner_references),
+            ("Deployment", dep.metadata.owner_references),
+            ("ServiceAccount", sa.metadata.owner_references),
+            ("Role", role.metadata.owner_references),
+            ("RoleBinding", rb.metadata.owner_references),
+            (
+                "host auth-reader RoleBinding",
+                host_rb.metadata.owner_references,
+            ),
+        ] {
+            assert!(
+                refs.is_none(),
+                "{label} must have no OwnerRef when owner_ref=None"
+            );
+        }
     }
 
     // ── v2 Deployment tests ─────────────────────────────────────────
@@ -1424,6 +1659,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1467,6 +1703,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1522,6 +1759,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1554,6 +1792,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1598,6 +1837,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1638,6 +1878,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let apiserver = dep
             .spec
@@ -1681,6 +1922,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1723,6 +1965,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let containers = &dep
             .spec
@@ -1757,6 +2000,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let template = &dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         // No PVCs — stateless pod
@@ -1771,7 +2015,13 @@ mod tests {
     #[test]
     fn test_build_config_map_v2_has_etcd_info() {
         let config = test_kobe_sync_config();
-        let cm = build_config_map_v2("cluster-1", "pool-prod", &config, "https://etcd-0:2379");
+        let cm = build_config_map_v2(
+            "cluster-1",
+            "pool-prod",
+            &config,
+            "https://etcd-0:2379",
+            None,
+        );
         assert_eq!(cm.metadata.name.as_deref(), Some("cluster-1-config"));
         let data = cm.data.unwrap();
         let config_json = data.get("config.json").unwrap();
@@ -1788,6 +2038,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let volumes = dep
             .spec
@@ -1816,6 +2067,7 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
         let annotations = dep
             .spec
@@ -1842,7 +2094,7 @@ mod tests {
 
     #[test]
     fn test_build_rbac_creates_correct_names() {
-        let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns");
+        let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns", None);
 
         assert_eq!(sa.metadata.name.as_deref(), Some("test-cluster-vkobe"));
         assert_eq!(sa.metadata.namespace.as_deref(), Some("test-ns"));
@@ -1867,8 +2119,9 @@ mod tests {
             &config,
             "http://etcd.pool-prod.svc:2379",
             "test-image:latest",
+            None,
         );
-        let (sa, ..) = build_rbac("cluster-1", "pool-prod");
+        let (sa, ..) = build_rbac("cluster-1", "pool-prod", None);
 
         let sa_name_on_dep = dep
             .spec
@@ -1886,7 +2139,7 @@ mod tests {
 
     #[test]
     fn test_rbac_role_has_all_required_verbs() {
-        let (_, role, ..) = build_rbac("test-cluster", "test-ns");
+        let (_, role, ..) = build_rbac("test-cluster", "test-ns", None);
         let rules = role.rules.as_ref().unwrap();
 
         // Check core API group rule (pods, services, configmaps, etc.)
@@ -1956,7 +2209,7 @@ mod tests {
 
     #[test]
     fn test_rbac_cluster_role_has_node_permissions() {
-        let (.., cr, _) = build_rbac("test-cluster", "test-ns");
+        let (.., cr, _) = build_rbac("test-cluster", "test-ns", None);
         let rules = cr.rules.as_ref().unwrap();
 
         assert_eq!(rules.len(), 1, "ClusterRole should have exactly one rule");
@@ -1984,7 +2237,7 @@ mod tests {
 
     #[test]
     fn test_rbac_resources_have_correct_labels() {
-        let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns");
+        let (sa, role, rb, cr, crb) = build_rbac("test-cluster", "test-ns", None);
         let expected_labels = VkobeBackend::cluster_labels("test-cluster");
 
         assert_eq!(sa.metadata.labels.as_ref().unwrap(), &expected_labels);
@@ -1996,7 +2249,7 @@ mod tests {
 
     #[test]
     fn test_rbac_role_binding_references_correct_role() {
-        let (_, _, rb, ..) = build_rbac("test-cluster", "test-ns");
+        let (_, _, rb, ..) = build_rbac("test-cluster", "test-ns", None);
 
         assert_eq!(rb.role_ref.kind, "Role");
         assert_eq!(rb.role_ref.name, "test-cluster-vkobe");
@@ -2010,7 +2263,7 @@ mod tests {
 
     #[test]
     fn test_rbac_cluster_role_binding_references_correct_cluster_role() {
-        let (.., crb) = build_rbac("test-cluster", "test-ns");
+        let (.., crb) = build_rbac("test-cluster", "test-ns", None);
 
         assert_eq!(crb.role_ref.kind, "ClusterRole");
         assert_eq!(crb.role_ref.name, "test-cluster-vkobe-nodes");
@@ -2024,7 +2277,7 @@ mod tests {
 
     #[test]
     fn test_host_auth_reader_role_binding_references_builtin_role() {
-        let rb = build_host_auth_reader_role_binding("test-cluster", "test-ns");
+        let rb = build_host_auth_reader_role_binding("test-cluster", "test-ns", None);
 
         assert_eq!(
             rb.metadata.name.as_deref(),

@@ -282,7 +282,12 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             config.cluster.allocated_network = Some(network);
 
             info!(instance = %name, owner = %owner, "Provisioning backend resources");
-            match provision_instance(&ctx, &config, &name, &ns).await {
+            // Build the OwnerReference once so backends can stamp it on
+            // every namespaced child resource — defense-in-depth GC for
+            // the explicit `delete()` cleanup path. See `ClusterBackend::create`
+            // for the contract.
+            let owner_ref = instance.controller_owner_ref(&());
+            match provision_instance(&ctx, &config, &name, &ns, owner_ref.as_ref()).await {
                 Ok(()) => {
                     patch_instance_status(
                         &instances_api,
@@ -607,6 +612,7 @@ async fn provision_instance<B: ClusterBackend + Clone>(
     config: &ResolvedInstanceConfig,
     name: &str,
     namespace: &str,
+    owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
 ) -> Result<(), InstanceError> {
     let is_k3s = matches!(config.backend.backend_type, BackendType::K3s);
 
@@ -639,7 +645,7 @@ async fn provision_instance<B: ClusterBackend + Clone>(
         }
     }
 
-    create_instance_backend(ctx, config, name, namespace).await?;
+    create_instance_backend(ctx, config, name, namespace, owner_ref).await?;
     crate::metrics::PROVISION_METHOD
         .with_label_values(&[config.owner_name.as_str(), "fresh"])
         .inc();
@@ -1027,6 +1033,7 @@ async fn create_instance_backend<B: ClusterBackend + Clone>(
     config: &ResolvedInstanceConfig,
     name: &str,
     namespace: &str,
+    owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
 ) -> Result<(), anyhow::Error> {
     let mut addons = config.addons.clone();
     addons.extend(resolve_bootstrap_addons(&ctx.client, namespace, &config.bootstraps).await?);
@@ -1034,11 +1041,11 @@ async fn create_instance_backend<B: ClusterBackend + Clone>(
     if ctx.factory.is_some() {
         let backend = backend_dispatch_for_config(ctx, config)?;
         backend
-            .create(name, namespace, &config.cluster, &addons)
+            .create(name, namespace, &config.cluster, &addons, owner_ref)
             .await
     } else {
         ctx.backend
-            .create(name, namespace, &config.cluster, &addons)
+            .create(name, namespace, &config.cluster, &addons, owner_ref)
             .await
     }
 }

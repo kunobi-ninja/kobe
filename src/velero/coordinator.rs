@@ -67,7 +67,11 @@ impl VeleroCoordinator {
 
         // Create the temporary cluster; on any subsequent failure we must clean it up.
         if let Err(e) = backend
-            .create(&cluster_name, &ns, &spec.cluster, &spec.addons)
+            // Velero's golden-image coordinator creates an *ephemeral*
+            // cluster and immediately deletes it after snapshotting; no
+            // persistent ClusterInstance CR exists to own its children.
+            // Pass `None` — the explicit cleanup path is what we rely on.
+            .create(&cluster_name, &ns, &spec.cluster, &spec.addons, None)
             .await
         {
             error!(

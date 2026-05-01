@@ -682,13 +682,17 @@ impl K3sBackend {
 }
 
 impl ClusterBackend for K3sBackend {
-    #[tracing::instrument(skip(self, config, addons), fields(cluster = name, namespace))]
+    #[tracing::instrument(skip(self, config, addons, _owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
+        // k3s pool members are themselves k8s resources owned via labels +
+        // explicit cleanup; the OwnerRef plumbing is for vkobe's child
+        // resources where defense-in-depth GC matters more.
+        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<()> {
         info!(cluster = name, "Creating k3s cluster");
 
@@ -1431,7 +1435,7 @@ mod tests {
 
         let config = base_config();
         let result = backend
-            .create("test-cluster", "test-ns", &config, &[])
+            .create("test-cluster", "test-ns", &config, &[], None)
             .await;
         assert!(result.is_ok(), "create should succeed: {result:?}");
     }

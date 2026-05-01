@@ -301,6 +301,7 @@ pub async fn create_pki_secret(
     namespace: &str,
     pki: &VirtualClusterPki,
     kcm_kubeconfig: &str,
+    owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
 ) -> Result<()> {
     use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::Secret;
@@ -332,6 +333,7 @@ pub async fn create_pki_secret(
             name: Some(secret_name.clone()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels),
+            owner_references: owner_ref.cloned().map(|o| vec![o]),
             ..Default::default()
         },
         data: Some(data),

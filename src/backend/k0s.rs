@@ -929,13 +929,16 @@ spec:
 }
 
 impl ClusterBackend for K0sBackend {
-    #[tracing::instrument(skip(self, config, addons), fields(cluster = name, namespace))]
+    #[tracing::instrument(skip(self, config, addons, _owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
+        // k0s pool members are owned via labels + explicit cleanup;
+        // see VkobeBackend::create for where the OwnerRef is consumed.
+        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<()> {
         info!(
             cluster = name,
@@ -1799,7 +1802,7 @@ mod tests {
 
         let config = base_config();
         let result = backend
-            .create("test-cluster", "test-ns", &config, &[])
+            .create("test-cluster", "test-ns", &config, &[], None)
             .await;
         assert!(result.is_ok(), "create should succeed: {result:?}");
     }

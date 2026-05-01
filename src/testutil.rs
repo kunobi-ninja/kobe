@@ -155,6 +155,7 @@ impl ClusterBackend for MockBackend {
         namespace: &str,
         _config: &ClusterConfig,
         _addons: &[Addon],
+        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<()> {
         self.inner.calls.lock().unwrap().push(MockCall::Create {
             name: name.to_string(),
@@ -301,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn mock_backend_default_create_succeeds() {
         let mock = MockBackend::new();
-        let result = mock.create("c1", "ns", &sample_config(), &[]).await;
+        let result = mock.create("c1", "ns", &sample_config(), &[], None).await;
         assert!(result.is_ok());
     }
 
@@ -332,7 +333,7 @@ mod tests {
     async fn mock_backend_fail_create_returns_error() {
         let mock = MockBackend::new();
         mock.fail_create("boom");
-        let result = mock.create("c1", "ns", &sample_config(), &[]).await;
+        let result = mock.create("c1", "ns", &sample_config(), &[], None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("boom"));
     }
@@ -369,11 +370,11 @@ mod tests {
     #[tokio::test]
     async fn mock_backend_records_create_and_delete() {
         let mock = MockBackend::new();
-        mock.create("c1", "ns1", &sample_config(), &[])
+        mock.create("c1", "ns1", &sample_config(), &[], None)
             .await
             .unwrap();
         mock.delete("c2", "ns2").await.unwrap();
-        mock.create("c3", "ns3", &sample_config(), &[])
+        mock.create("c3", "ns3", &sample_config(), &[], None)
             .await
             .unwrap();
 

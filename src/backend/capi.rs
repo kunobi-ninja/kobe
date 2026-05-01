@@ -209,13 +209,16 @@ impl CapiBackend {
 }
 
 impl ClusterBackend for CapiBackend {
-    #[tracing::instrument(skip(self, config, addons), fields(cluster = name, namespace))]
+    #[tracing::instrument(skip(self, config, addons, _owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
+        // CAPI clusters create k8s resources owned via labels; see
+        // VkobeBackend::create for where the OwnerRef is consumed.
+        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<()> {
         info!(
             cluster = name,
@@ -636,7 +639,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = backend.create("my-vc", "test-ns", &config, &[]).await;
+        let result = backend.create("my-vc", "test-ns", &config, &[], None).await;
         assert!(result.is_ok(), "create should succeed: {result:?}");
     }
 
