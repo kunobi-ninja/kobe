@@ -426,6 +426,132 @@ pub async fn check_readiness_gate_impl(vc_client: &Client, gate: &ReadinessGate)
                 .with_context(|| format!("URL health check failed for {url}"))?;
             Ok(resp.status().is_success())
         }
+        ReadinessGate::SchedulingProbe { namespace } => {
+            check_scheduling_probe(vc_client, namespace.as_deref()).await
+        }
+    }
+}
+
+/// Default namespace for the scheduling-probe pod.
+const PROBE_NAMESPACE_DEFAULT: &str = "kube-system";
+
+/// Deterministic name for the probe pod — readiness-gate evaluations
+/// are idempotent, so subsequent calls observe the same pod.
+const PROBE_POD_NAME: &str = "kobe-readiness-probe";
+
+/// Probe image: a tiny, versioned pause that any kube cluster can
+/// pull (registry.k8s.io is built into the kubelet's default
+/// allowlist; pause is ~700KB).
+const PROBE_IMAGE: &str = "registry.k8s.io/pause:3.10";
+
+/// Field manager attribution for SSA on the probe pod.
+const PROBE_FIELD_MANAGER: &str = "kobe-operator/scheduling-probe";
+
+/// Run the [`ReadinessGate::SchedulingProbe`] check against a
+/// virtual cluster.
+///
+/// Returns `true` once the probe pod has been observed `Running`,
+/// which proves the cluster is end-to-end usable: scheduler can
+/// place the pod, a (fake or real) node accepts it, the kubelet
+/// pulls + starts pause, and the apiserver flows status back. A
+/// vkobe pool with `service_accounts` syncing broken or no fake
+/// nodes can never satisfy this gate, so it stays `Creating` until
+/// the existing stuck-Creating timeout recycles it.
+///
+/// Lifecycle, called once per reconcile while the instance is in
+/// `Creating` phase:
+/// - probe pod absent → create it, return `false` (controller
+///   requeues). On the next call we observe the pod's status.
+/// - probe pod exists, phase != `Running` → return `false`.
+/// - probe pod exists, phase == `Running` → delete it (best
+///   effort), return `true`. The instance flips to `Ready`; the
+///   gate is no longer evaluated until the next recycle.
+///
+/// Idempotent: repeated calls with the pod absent re-create it
+/// (the previous run's delete completed). Repeated calls with the
+/// pod present and not-yet-Running just re-poll status.
+async fn check_scheduling_probe(vc_client: &Client, namespace: Option<&str>) -> Result<bool> {
+    use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::api::{DeleteParams, PatchParams};
+
+    let ns = namespace.unwrap_or(PROBE_NAMESPACE_DEFAULT);
+    let pods: Api<Pod> = Api::namespaced(vc_client.clone(), ns);
+
+    match pods.get(PROBE_POD_NAME).await {
+        Ok(pod) => {
+            let phase = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("");
+            if phase == "Running" {
+                debug!(
+                    namespace = ns,
+                    "scheduling probe Running — gate satisfied, cleaning up"
+                );
+                // Best-effort delete: failure here doesn't break the
+                // gate (the pod is harmless once we've observed
+                // Running, and the next recycle of the cluster
+                // tears the whole virtual apiserver down anyway).
+                if let Err(e) = pods.delete(PROBE_POD_NAME, &DeleteParams::default()).await {
+                    debug!(
+                        error = %e,
+                        "scheduling probe cleanup failed; non-fatal"
+                    );
+                }
+                Ok(true)
+            } else {
+                debug!(
+                    namespace = ns,
+                    phase = phase,
+                    "scheduling probe not yet Running"
+                );
+                Ok(false)
+            }
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            // Create the probe pod via SSA so concurrent reconciles
+            // don't 409 on each other.
+            let probe = Pod {
+                metadata: ObjectMeta {
+                    name: Some(PROBE_POD_NAME.to_string()),
+                    namespace: Some(ns.to_string()),
+                    labels: Some(BTreeMap::from_iter([(
+                        "app.kubernetes.io/managed-by".to_string(),
+                        "kobe-operator".to_string(),
+                    )])),
+                    ..Default::default()
+                },
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "pause".to_string(),
+                        image: Some(PROBE_IMAGE.to_string()),
+                        ..Default::default()
+                    }],
+                    // Tolerations / nodeSelector / SA all default.
+                    // The probe is meant to be the simplest pod the
+                    // cluster could possibly schedule — any of those
+                    // knobs would risk this passing while a slightly
+                    // less default workload still failed.
+                    ..Default::default()
+                }),
+                status: None,
+            };
+            pods.patch(
+                PROBE_POD_NAME,
+                &PatchParams::apply(PROBE_FIELD_MANAGER).force(),
+                &kube::api::Patch::Apply(&probe),
+            )
+            .await
+            .with_context(|| format!("Failed to create scheduling-probe pod in namespace {ns}"))?;
+            debug!(
+                namespace = ns,
+                "scheduling probe pod created — re-check on next reconcile"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1023,5 +1149,157 @@ current-context: default
     #[test]
     fn test_validate_url_rejects_link_local() {
         assert!(validate_url("https://169.254.169.254/latest/meta-data/").is_err());
+    }
+
+    // === SchedulingProbe gate ===
+
+    /// First call: probe pod absent → operator creates it via SSA
+    /// (PATCH with field-manager) and returns `false` so the
+    /// controller requeues.
+    #[tokio::test]
+    async fn scheduling_probe_creates_pod_and_returns_false_when_absent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        // GET /api/v1/namespaces/<ns>/pods/<probe> → 404
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "code": 404,
+                "message": "pods \"kobe-readiness-probe\" not found"
+            })))
+            .mount(&server)
+            .await;
+
+        // PATCH (apply) creates the pod
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "kobe-readiness-probe",
+                    "namespace": "kube-system"
+                },
+                "spec": { "containers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let result = check_scheduling_probe(&client, None).await.unwrap();
+        assert!(
+            !result,
+            "first call must return false — pod created, status not yet observable"
+        );
+    }
+
+    /// Pod exists but phase != "Running" → return false. The
+    /// controller will keep requeueing while the pod boots.
+    #[tokio::test]
+    async fn scheduling_probe_returns_false_when_pod_pending() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kube-system/pods/kobe-readiness-probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "kobe-readiness-probe", "namespace": "kube-system" },
+                "spec": { "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10" }] },
+                "status": { "phase": "Pending" }
+            })))
+            .mount(&server)
+            .await;
+
+        let result = check_scheduling_probe(&client, None).await.unwrap();
+        assert!(
+            !result,
+            "Pending pod must not satisfy the gate — only Running counts as proof of scheduling"
+        );
+    }
+
+    /// Pod has reached Running → gate returns `true` and the
+    /// operator best-effort-deletes the probe so it doesn't sit
+    /// idle in the cluster forever.
+    #[tokio::test]
+    async fn scheduling_probe_returns_true_and_cleans_up_when_running() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kube-system/pods/kobe-readiness-probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "kobe-readiness-probe", "namespace": "kube-system" },
+                "spec": { "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10" }] },
+                "status": { "phase": "Running" }
+            })))
+            .mount(&server)
+            .await;
+
+        // DELETE — must be called as part of cleanup. We assert via
+        // the wiremock expectations check below.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "status": "Success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = check_scheduling_probe(&client, None).await.unwrap();
+        assert!(
+            result,
+            "Running pod proves the cluster is scheduling end-to-end → gate satisfied"
+        );
+    }
+
+    /// Custom namespace flows through to the apiserver path. The
+    /// default is `kube-system`, but the user can override per gate.
+    #[tokio::test]
+    async fn scheduling_probe_honors_custom_namespace() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/probe-ns/pods/kobe-readiness-probe",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/namespaces/probe-ns/pods/kobe-readiness-probe",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": { "name": "kobe-readiness-probe", "namespace": "probe-ns" },
+                "spec": { "containers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        // Wiremock will fail the test if the operator hits a
+        // different path (e.g. kube-system instead of probe-ns).
+        let result = check_scheduling_probe(&client, Some("probe-ns"))
+            .await
+            .unwrap();
+        assert!(!result);
     }
 }

@@ -53,12 +53,32 @@ pub fn translate_pod_to_host(
         dropped_volumes = HashSet::new();
     }
 
-    // 2. Disable automountServiceAccountToken -- host Pod should not mount
-    //    the host cluster's SA token.
+    // 2. Disable automountServiceAccountToken — the host SA's token
+    //    would be the host cluster's RBAC, not the virtual cluster's.
+    //    The virtual cluster's projected SA tokens flow through the
+    //    pod's projected-volume sources at mount time and don't
+    //    depend on this flag.
     translated_spec.automount_service_account_token = Some(false);
 
-    // 3. Clear service_account_name -- not meaningful on host.
-    translated_spec.service_account_name = None;
+    // 3. Translate `service_account_name` to the host SA materialized
+    //    by `ServiceAccountSyncer` for this virtual SA. Without this
+    //    translation, the host apiserver rejects pod creation with
+    //    `error looking up service account <ns>/<sa>: serviceaccount
+    //    "<sa>" not found` because the virtual SA's name (e.g.
+    //    `source-controller`) doesn't exist verbatim on the host.
+    //    Translating to `<sa>-x-<vns>-x-vc` makes it line up with the
+    //    host SA the syncer creates.
+    //
+    //    Both the canonical field and the deprecated alias
+    //    (`service_account`) are translated — k8s validation looks at
+    //    both, so missing the deprecated field on its own is enough to
+    //    fail admission even when the modern field looks correct.
+    if let Some(sa) = spec.service_account_name.as_ref() {
+        translated_spec.service_account_name = Some(translator.to_host_name(sa, virtual_ns));
+    }
+    if let Some(sa) = spec.service_account.as_ref() {
+        translated_spec.service_account = Some(translator.to_host_name(sa, virtual_ns));
+    }
 
     // 4. Translate containers (env vars, envFrom, volume mounts).
     translated_spec.containers =
@@ -827,21 +847,60 @@ mod tests {
         );
     }
 
+    /// `service_account_name` is **translated**, not cleared, so the
+    /// host pod references the host SA materialized by
+    /// `ServiceAccountSyncer`. Translating (rather than clearing)
+    /// preserves identity isolation per virtual SA — without it, every
+    /// projected pod would run as the host namespace's `default` SA.
     #[test]
-    fn test_translate_clears_service_account_name() {
+    fn translate_pod_rewrites_service_account_name_to_host_form() {
         let translator = make_translator();
         let spec = PodSpec {
             containers: vec![Container {
                 name: "app".to_string(),
                 ..Default::default()
             }],
-            service_account_name: Some("my-sa".to_string()),
+            service_account_name: Some("source-controller".to_string()),
             ..Default::default()
         };
-        let pod = make_pod("test", "default", spec);
+        let pod = make_pod("p", "flux-system", spec);
+
+        let result = translate_pod_to_host(&pod, &translator, "flux-system").unwrap();
+        let translated_spec = result.spec.unwrap();
+        assert_eq!(
+            translated_spec.service_account_name.as_deref(),
+            Some("source-controller-x-flux-system-x-vc"),
+            "service_account_name must be translated, not cleared"
+        );
+    }
+
+    /// The deprecated `service_account` field is translated alongside
+    /// the canonical `service_account_name`. Older controllers
+    /// (or hand-rolled YAML) that set the deprecated field would
+    /// otherwise hit `serviceaccount "<name>" not found` at host
+    /// admission even when the canonical field looks correct, since
+    /// k8s validation reads both.
+    #[test]
+    fn translate_pod_rewrites_deprecated_service_account_alias() {
+        let translator = make_translator();
+        let spec = PodSpec {
+            containers: vec![Container {
+                name: "app".to_string(),
+                ..Default::default()
+            }],
+            // Note: setting only the deprecated alias, not the modern
+            // field. This is what some older clients do.
+            service_account: Some("legacy-sa".to_string()),
+            ..Default::default()
+        };
+        let pod = make_pod("p", "default", spec);
 
         let result = translate_pod_to_host(&pod, &translator, "default").unwrap();
-        assert_eq!(result.spec.unwrap().service_account_name, None);
+        assert_eq!(
+            result.spec.unwrap().service_account.as_deref(),
+            Some("legacy-sa-x-default-x-vc"),
+            "deprecated service_account alias must be translated"
+        );
     }
 
     #[test]

@@ -111,6 +111,24 @@ pub fn build_cluster_role() -> ClusterRole {
             verbs: vec![s("get"), s("list"), s("watch")],
             ..Default::default()
         },
+        // ServiceAccountSyncer materializes virtual SAs as host SAs
+        // so projected pods that reference custom SAs (flux, etc.)
+        // pass host-apiserver admission. Needs full CRUD because the
+        // virtual side may create / patch / delete SAs at any time.
+        PolicyRule {
+            api_groups: Some(vec![s("")]),
+            resources: Some(vec![s("serviceaccounts")]),
+            verbs: vec![
+                s("get"),
+                s("list"),
+                s("watch"),
+                s("create"),
+                s("update"),
+                s("patch"),
+                s("delete"),
+            ],
+            ..Default::default()
+        },
         // StatusSyncer patches the virtual Pod's status subresource (so
         // the user sees real Pending/Running/etc.) and binds virtual
         // pods to fake nodes (no scheduler runs inside the virtual
@@ -258,6 +276,14 @@ mod tests {
             "networking.k8s.io/ingresses:get",
             "networking.k8s.io/ingresses:list",
             "networking.k8s.io/ingresses:watch",
+            // ServiceAccountSyncer (full CRUD)
+            "/serviceaccounts:get",
+            "/serviceaccounts:list",
+            "/serviceaccounts:watch",
+            "/serviceaccounts:create",
+            "/serviceaccounts:update",
+            "/serviceaccounts:patch",
+            "/serviceaccounts:delete",
             // StatusSyncer subresources
             "/pods/status:get",
             "/pods/status:patch",

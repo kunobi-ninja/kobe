@@ -9,6 +9,7 @@ pub mod network_policies;
 pub mod pods;
 pub mod pvcs;
 pub mod secrets;
+pub mod service_accounts;
 pub mod services;
 pub mod status;
 
@@ -51,6 +52,7 @@ pub fn start_syncers(
             "ingresses" => Some(Box::new(ingresses::IngressSyncer)),
             "pvcs" => Some(Box::new(pvcs::PvcSyncer)),
             "network_policies" => Some(Box::new(network_policies::NetworkPolicySyncer)),
+            "service_accounts" => Some(Box::new(service_accounts::ServiceAccountSyncer)),
             "fake_nodes" => Some(Box::new(fake_nodes::FakeNodeSyncer::new())),
             "status" => Some(Box::new(status::StatusSyncer)),
             other => {

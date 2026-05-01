@@ -369,6 +369,7 @@ spec:
                       - DeploymentReady
                       - DaemonSetReady
                       - URLHealthy
+                      - SchedulingProbe
                       type: string
                     url:
                       type: string

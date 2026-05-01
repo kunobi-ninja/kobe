@@ -563,6 +563,28 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     }
 }
 
+/// For vkobe pools that didn't declare any readiness gates, inject
+/// a default `SchedulingProbe` so a cluster that responds at the
+/// apiserver but can't actually schedule workloads stays in
+/// `Creating` until the stuck-Creating timeout recycles it instead
+/// of silently passing as `Ready`.
+///
+/// Triggered only when the user-supplied list is **empty**. Any
+/// non-empty list is treated as "user knows what they want" and
+/// passed through unchanged — including a list that contains its
+/// own explicit `SchedulingProbe` (e.g. with a non-default
+/// namespace), which we'd otherwise duplicate.
+fn apply_default_readiness_gates(
+    backend_type: BackendType,
+    gates: Vec<ReadinessGate>,
+) -> Vec<ReadinessGate> {
+    if gates.is_empty() && backend_type == BackendType::Vkobe {
+        vec![ReadinessGate::SchedulingProbe { namespace: None }]
+    } else {
+        gates
+    }
+}
+
 async fn resolve_instance_config(
     client: &Client,
     instance: &ClusterInstance,
@@ -572,6 +594,7 @@ async fn resolve_instance_config(
         let Some(profile) = get_profile(client, &pool_ref.name, namespace).await else {
             return Err(anyhow::anyhow!("Owning pool {} not found", pool_ref.name).into());
         };
+        let backend_type = profile.spec.backend.backend_type.clone();
         return Ok(ResolvedInstanceConfig {
             owner_name: profile.name_any(),
             backend: profile.spec.backend,
@@ -579,7 +602,10 @@ async fn resolve_instance_config(
             addons: profile.spec.addons,
             bootstraps: profile.spec.bootstraps,
             health_check: profile.spec.health_check,
-            readiness_gates: profile.spec.readiness_gates,
+            readiness_gates: apply_default_readiness_gates(
+                backend_type,
+                profile.spec.readiness_gates,
+            ),
             snapshot: profile.spec.snapshot,
         });
     }
@@ -595,6 +621,7 @@ async fn resolve_instance_config(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Standalone ClusterInstance missing spec.cluster"))?;
 
+    let backend_type = backend.backend_type.clone();
     Ok(ResolvedInstanceConfig {
         owner_name: instance.name_any(),
         backend,
@@ -602,7 +629,10 @@ async fn resolve_instance_config(
         addons: instance.spec.addons.clone(),
         bootstraps: instance.spec.bootstraps.clone(),
         health_check: instance.spec.health_check.clone(),
-        readiness_gates: instance.spec.readiness_gates.clone(),
+        readiness_gates: apply_default_readiness_gates(
+            backend_type,
+            instance.spec.readiness_gates.clone(),
+        ),
         snapshot: instance.spec.snapshot.clone(),
     })
 }
@@ -1565,5 +1595,53 @@ mod tests {
         let calls = backend.call_count();
         assert_eq!(calls.check_health, 0);
         assert_eq!(calls.delete, 0);
+    }
+
+    // === apply_default_readiness_gates ===
+
+    /// vkobe pool with no user-supplied gates gets a default
+    /// SchedulingProbe injected. Without this, every default
+    /// vkobe pool would silently report Healthy with zero
+    /// schedulable nodes — the bug `ci-vkobe-flux` was hiding
+    /// behind for 7 days on an internal cluster.
+    #[test]
+    fn vkobe_pool_with_no_gates_gets_default_scheduling_probe() {
+        let gates = apply_default_readiness_gates(BackendType::Vkobe, vec![]);
+        assert_eq!(gates.len(), 1);
+        assert!(matches!(
+            gates[0],
+            ReadinessGate::SchedulingProbe { namespace: None }
+        ));
+    }
+
+    /// k3s/k0s/capi pools do **not** get the default — those backends
+    /// run real kubelets so a usable apiserver implies a usable
+    /// cluster (modulo whatever readiness gates the user separately
+    /// declares for their workloads). The probe is vkobe-specific
+    /// because vkobe's no-real-kubelet design is what makes the
+    /// silent-no-nodes failure mode possible.
+    #[test]
+    fn non_vkobe_backends_do_not_get_default_scheduling_probe() {
+        for backend in [BackendType::K3s, BackendType::K0s, BackendType::Capi] {
+            let gates = apply_default_readiness_gates(backend, vec![]);
+            assert!(
+                gates.is_empty(),
+                "non-vkobe backend should not gain a default gate"
+            );
+        }
+    }
+
+    /// User explicitly declares any non-empty `readiness_gates` list
+    /// → don't inject the default. The user knows what they want; a
+    /// default added on top would surprise them and slow their pool.
+    /// They can still get the probe by adding it to their list.
+    #[test]
+    fn user_supplied_gates_are_passed_through_unchanged() {
+        let user_gates = vec![ReadinessGate::CrdExists {
+            name: "kustomizations.kustomize.toolkit.fluxcd.io".to_string(),
+        }];
+        let result = apply_default_readiness_gates(BackendType::Vkobe, user_gates.clone());
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], ReadinessGate::CrdExists { .. }));
     }
 }

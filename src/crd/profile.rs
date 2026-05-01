@@ -530,6 +530,24 @@ pub enum ReadinessGate {
     /// HTTP GET returns 2xx.
     #[serde(rename = "URLHealthy")]
     UrlHealthy { url: String },
+
+    /// End-to-end scheduling probe: lands a tiny pause Pod into the
+    /// virtual cluster, waits for it to reach Running, then deletes
+    /// it. Verifies the cluster is *usable* — not just that the
+    /// apiserver responds — by exercising the full chain that any
+    /// realistic workload depends on (scheduler → fake-node syncer
+    /// → projected pod → host scheduler → host kubelet → status
+    /// syncer). Catches the silent failure mode where a vkobe
+    /// virtual cluster reports Healthy with zero schedulable nodes.
+    ///
+    /// `namespace` defaults to `kube-system` if unset — chosen because
+    /// it's guaranteed to exist on every kube cluster and has its own
+    /// `default` SA that pause needs to bind to.
+    #[serde(rename = "SchedulingProbe")]
+    SchedulingProbe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
 }
 
 // Manual JsonSchema impl — Kubernetes CRD structural schemas require that
@@ -547,7 +565,13 @@ impl JsonSchema for ReadinessGate {
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["CRDExists", "DeploymentReady", "DaemonSetReady", "URLHealthy"]
+                    "enum": [
+                        "CRDExists",
+                        "DeploymentReady",
+                        "DaemonSetReady",
+                        "URLHealthy",
+                        "SchedulingProbe"
+                    ]
                 },
                 "name": { "type": "string" },
                 "namespace": { "type": "string" },

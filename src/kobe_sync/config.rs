@@ -66,6 +66,13 @@ fn default_syncers() -> Vec<String> {
         "secrets".into(),
         "endpoints".into(),
         "ingresses".into(),
+        // Required for any pod that references a non-default
+        // ServiceAccount (flux's source-controller, kunobi-ci's
+        // various controllers, basically everything realistic).
+        // Without this, projected pods get rejected by the host
+        // apiserver at admission with `serviceaccount "<name>" not
+        // found`, breaking the chain that materializes fake nodes.
+        "service_accounts".into(),
     ]
 }
 
