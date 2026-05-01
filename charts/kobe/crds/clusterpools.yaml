@@ -182,6 +182,7 @@ spec:
                         - secrets
                         - endpoints
                         - ingresses
+                        - service_accounts
                         description: Which resource syncers to enable. Defaults to core set.
                         items:
                           type: string

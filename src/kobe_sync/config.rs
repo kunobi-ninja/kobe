@@ -285,6 +285,44 @@ mod tests {
         assert!(syncers.contains(&"secrets".to_string()));
         assert!(syncers.contains(&"endpoints".to_string()));
         assert!(syncers.contains(&"ingresses".to_string()));
+        assert!(syncers.contains(&"service_accounts".to_string()));
+    }
+
+    /// The runtime sidecar default must match exactly the same list
+    /// as the operator-side `crd::default_vkobe_syncers`. The two
+    /// modules live in separate binaries (`kobe-sync` and
+    /// `kobe-operator`), so they can't share a constant directly;
+    /// instead, both pin against this hardcoded canonical list. Drift
+    /// regressed in v0.22.0 (only the runtime side was updated to
+    /// add `service_accounts`, the CRD-side default was forgotten,
+    /// the operator wrote the old list to the ConfigMap, and the
+    /// sidecar read it from there — `ServiceAccountSyncer` silently
+    /// never ran on freshly-created clusters).
+    ///
+    /// The mirror assertion lives at
+    /// `crd::profile::tests::default_vkobe_syncers_matches_canonical_list`.
+    /// Update both lists together when adding a syncer to the
+    /// default set.
+    #[test]
+    fn runtime_default_syncers_match_canonical() {
+        const CANONICAL: &[&str] = &[
+            "pods",
+            "services",
+            "configmaps",
+            "secrets",
+            "endpoints",
+            "ingresses",
+            "service_accounts",
+        ];
+        let actual = default_syncers();
+        let expected: Vec<String> = CANONICAL.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            actual, expected,
+            "runtime default_syncers drifted from the canonical list. \
+             Update both kobe_sync/config.rs and crd/profile.rs's \
+             default_vkobe_syncers — drift silently disables a \
+             syncer on every new instance."
+        );
     }
 
     #[test]
