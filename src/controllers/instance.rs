@@ -698,7 +698,18 @@ async fn evaluate_instance_readiness<B: ClusterBackend + Clone>(
                 return Ok(false);
             }
             Err(e) => {
-                warn!(instance = %name, gate = ?gate, error = %e, "Readiness gate check failed");
+                // Use `{e:#}` (anyhow alternate Display) to surface the
+                // full error chain — every `with_context(|| ...)` wrap
+                // and the underlying root cause. The plain `{e}` only
+                // shows the outermost message, which buried the actual
+                // SSA / API error during the v0.22.x debug session and
+                // forced reproduction work to recover the chain.
+                warn!(
+                    instance = %name,
+                    gate = ?gate,
+                    error = %format!("{e:#}"),
+                    "Readiness gate check failed"
+                );
                 return Ok(false);
             }
         }
@@ -708,7 +719,11 @@ async fn evaluate_instance_readiness<B: ClusterBackend + Clone>(
         Ok(true) => Ok(true),
         Ok(false) => Ok(false),
         Err(e) => {
-            warn!(instance = %name, error = %e, "Health probe failed during readiness evaluation");
+            warn!(
+                instance = %name,
+                error = %format!("{e:#}"),
+                "Health probe failed during readiness evaluation"
+            );
             Ok(false)
         }
     }
@@ -793,7 +808,11 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
             )))
         }
         Err(e) => {
-            warn!(instance = %name, error = %e, "Health probe errored for ready instance");
+            warn!(
+                instance = %name,
+                error = %format!("{e:#}"),
+                "Health probe errored for ready instance"
+            );
             Ok(Action::requeue(std::time::Duration::from_secs(
                 interval_secs.into(),
             )))
