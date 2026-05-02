@@ -908,6 +908,22 @@ fn build_rbac(
                     "secrets".into(),
                     "endpoints".into(),
                     "persistentvolumeclaims".into(),
+                    // ServiceAccountSyncer (always-on per kobe_sync_bin)
+                    // mirrors virtual SAs into the host namespace as
+                    // `<sa>-x-<vns>-x-vc`. Without this resource here,
+                    // the sidecar's host-side SA gets 403 on every
+                    // attempt: `serviceaccounts "..." is forbidden:
+                    // User "system:serviceaccount:<ns>:<cluster>-vkobe"
+                    // cannot get resource "serviceaccounts" in API
+                    // group "" in the namespace "<ns>"`. Observed live
+                    // on an internal cluster after v0.22.3 deploy.
+                    //
+                    // The matching virtual-side ClusterRole rule
+                    // (which lets the syncer LIST/WATCH virtual SAs)
+                    // lives in `crate::kobe_sync::bootstrap::build_cluster_role`.
+                    // Both rules need to grow together when adding
+                    // any new always-on syncer.
+                    "serviceaccounts".into(),
                 ]),
                 verbs: vec![
                     "get".into(),
@@ -2231,6 +2247,13 @@ mod tests {
             "secrets",
             "endpoints",
             "persistentvolumeclaims",
+            // serviceaccounts is required for the always-on
+            // ServiceAccountSyncer to project virtual SAs to the
+            // host namespace. Pinned here as a regression guard
+            // after v0.22.3 shipped without it and every
+            // ServiceAccountSyncer event hit `serviceaccounts is
+            // forbidden` on the host.
+            "serviceaccounts",
         ] {
             assert!(
                 core_resources.contains(&resource.to_string()),
