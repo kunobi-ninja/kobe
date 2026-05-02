@@ -281,13 +281,30 @@ async fn handle_status_event(event: &Event<Pod>, ctx: &SyncerContext) -> anyhow:
             let patch_value = build_status_patch(host_status);
 
             // Patch the virtual Pod's /status subresource.
+            //
+            // Important: `PatchParams::default()` + `Patch::Merge`, NOT
+            // `apply().force() + Merge`. kube-rs validates that
+            // `force=true` is only legal with `Patch::Apply`
+            // (server-side apply) and rejects with `PatchParams::force
+            // only works with Patch::Apply` otherwise. The previous
+            // shape silently broke every status sync after our 0.22.x
+            // refactor — fake nodes existed, host pods ran, but the
+            // virtual probe pod never bound to a node because the
+            // status patch failed at the kube-rs validation layer
+            // before ever reaching the apiserver. End result: every
+            // SchedulingProbe gate stayed Pending forever.
+            //
+            // We don't need SSA semantics here — there's no conflict
+            // resolution on status fields, kobe-sync owns the status
+            // mirror exclusively. Merge is the right choice and the
+            // simpler path.
             let virtual_pod_api: Api<Pod> =
                 Api::namespaced(ctx.virtual_client.clone(), &virtual_ns);
 
             virtual_pod_api
                 .patch_status(
                     &virtual_name,
-                    &PatchParams::apply("kobe-sync").force(),
+                    &PatchParams::default(),
                     &Patch::Merge(&patch_value),
                 )
                 .await?;
