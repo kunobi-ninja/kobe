@@ -757,7 +757,7 @@ impl ClusterBackend for VkobeBackend {
         gate: &ReadinessGate,
     ) -> Result<bool> {
         let vc_client = self.virtual_client(name, namespace).await?;
-        check_readiness_gate_impl(&vc_client, gate).await
+        check_readiness_gate_impl(&vc_client, gate, name).await
     }
 
     async fn apply_addon(&self, name: &str, namespace: &str, addon: &Addon) -> Result<()> {

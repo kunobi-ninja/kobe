@@ -369,7 +369,19 @@ async fn probe_virtual_path(vc_client: &Client, path: &str, cluster_name: &str) 
 }
 
 /// Evaluate a readiness gate against a virtual cluster.
-pub async fn check_readiness_gate_impl(vc_client: &Client, gate: &ReadinessGate) -> Result<bool> {
+///
+/// `instance_name` is the parent ClusterInstance's name (e.g.
+/// `pool-ci-vkobe-flux-409`). Currently used only by the
+/// [`ReadinessGate::SchedulingProbe`] branch to scope the probe Pod
+/// name per-instance — a fixed pod name collides on the host
+/// namespace when multiple vkobe instances each project their own
+/// `kube-system/kobe-readiness-probe` to the shared host pool
+/// namespace under the standard `<name>-x-<vns>-x-vc` translation.
+pub async fn check_readiness_gate_impl(
+    vc_client: &Client,
+    gate: &ReadinessGate,
+    instance_name: &str,
+) -> Result<bool> {
     match gate {
         ReadinessGate::CrdExists { name: crd_name, .. } => {
             let crds: Api<k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition> =
@@ -427,7 +439,7 @@ pub async fn check_readiness_gate_impl(vc_client: &Client, gate: &ReadinessGate)
             Ok(resp.status().is_success())
         }
         ReadinessGate::SchedulingProbe { namespace } => {
-            check_scheduling_probe(vc_client, namespace.as_deref()).await
+            check_scheduling_probe(vc_client, namespace.as_deref(), instance_name).await
         }
     }
 }
@@ -435,9 +447,16 @@ pub async fn check_readiness_gate_impl(vc_client: &Client, gate: &ReadinessGate)
 /// Default namespace for the scheduling-probe pod.
 const PROBE_NAMESPACE_DEFAULT: &str = "kube-system";
 
-/// Deterministic name for the probe pod — readiness-gate evaluations
-/// are idempotent, so subsequent calls observe the same pod.
-const PROBE_POD_NAME: &str = "kobe-readiness-probe";
+/// Probe pod name prefix. The full name is
+/// `kobe-readiness-probe-<instance_name>` so each ClusterInstance's
+/// virtual probe projects to a unique host-side name under the
+/// standard `<name>-x-<vns>-x-vc` translation. A fixed name collides
+/// on the host namespace when multiple instances project the same
+/// `kube-system/kobe-readiness-probe` virtual pod, leaving an orphan
+/// host pod indefinitely (observed live on an internal cluster: a
+/// `kobe-readiness-probe-x-kube-system-x-vc` host pod alive 2.5h
+/// while the source virtual instance had been recycled long ago).
+const PROBE_POD_NAME_PREFIX: &str = "kobe-readiness-probe";
 
 /// Probe image: a tiny, versioned pause that any kube cluster can
 /// pull (registry.k8s.io is built into the kubelet's default
@@ -470,15 +489,30 @@ const PROBE_FIELD_MANAGER: &str = "kobe-operator/scheduling-probe";
 /// Idempotent: repeated calls with the pod absent re-create it
 /// (the previous run's delete completed). Repeated calls with the
 /// pod present and not-yet-Running just re-poll status.
-async fn check_scheduling_probe(vc_client: &Client, namespace: Option<&str>) -> Result<bool> {
+async fn check_scheduling_probe(
+    vc_client: &Client,
+    namespace: Option<&str>,
+    instance_name: &str,
+) -> Result<bool> {
     use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use kube::api::{DeleteParams, PatchParams};
 
     let ns = namespace.unwrap_or(PROBE_NAMESPACE_DEFAULT);
+    // Per-instance probe name. The standard host-side translation
+    // `<name>-x-<vns>-x-vc` (see kobe_sync's PodSyncer) takes the
+    // virtual pod name verbatim, so a fixed virtual name produces a
+    // shared host name across every vkobe instance in the same pool
+    // namespace. Embedding the cluster instance gives unique host
+    // pods like `kobe-readiness-probe-<instance>-x-kube-system-x-vc`,
+    // avoiding the orphan-pod accumulation observed live (a host
+    // probe pod alive 2.5h while its source virtual instance had
+    // long since been recycled, blocking any new instance's probe
+    // from projecting cleanly).
+    let probe_pod_name = format!("{PROBE_POD_NAME_PREFIX}-{instance_name}");
     let pods: Api<Pod> = Api::namespaced(vc_client.clone(), ns);
 
-    match pods.get(PROBE_POD_NAME).await {
+    match pods.get(&probe_pod_name).await {
         Ok(pod) => {
             let phase = pod
                 .status
@@ -488,13 +522,14 @@ async fn check_scheduling_probe(vc_client: &Client, namespace: Option<&str>) -> 
             if phase == "Running" {
                 debug!(
                     namespace = ns,
+                    probe = %probe_pod_name,
                     "scheduling probe Running — gate satisfied, cleaning up"
                 );
                 // Best-effort delete: failure here doesn't break the
                 // gate (the pod is harmless once we've observed
                 // Running, and the next recycle of the cluster
                 // tears the whole virtual apiserver down anyway).
-                if let Err(e) = pods.delete(PROBE_POD_NAME, &DeleteParams::default()).await {
+                if let Err(e) = pods.delete(&probe_pod_name, &DeleteParams::default()).await {
                     debug!(
                         error = %e,
                         "scheduling probe cleanup failed; non-fatal"
@@ -504,6 +539,7 @@ async fn check_scheduling_probe(vc_client: &Client, namespace: Option<&str>) -> 
             } else {
                 debug!(
                     namespace = ns,
+                    probe = %probe_pod_name,
                     phase = phase,
                     "scheduling probe not yet Running"
                 );
@@ -515,7 +551,7 @@ async fn check_scheduling_probe(vc_client: &Client, namespace: Option<&str>) -> 
             // don't 409 on each other.
             let probe = Pod {
                 metadata: ObjectMeta {
-                    name: Some(PROBE_POD_NAME.to_string()),
+                    name: Some(probe_pod_name.clone()),
                     namespace: Some(ns.to_string()),
                     labels: Some(BTreeMap::from_iter([(
                         "app.kubernetes.io/managed-by".to_string(),
@@ -538,18 +574,51 @@ async fn check_scheduling_probe(vc_client: &Client, namespace: Option<&str>) -> 
                 }),
                 status: None,
             };
-            pods.patch(
-                PROBE_POD_NAME,
-                &PatchParams::apply(PROBE_FIELD_MANAGER).force(),
-                &kube::api::Patch::Apply(&probe),
-            )
-            .await
-            .with_context(|| format!("Failed to create scheduling-probe pod in namespace {ns}"))?;
-            debug!(
-                namespace = ns,
-                "scheduling probe pod created — re-check on next reconcile"
-            );
-            Ok(false)
+            match pods
+                .patch(
+                    &probe_pod_name,
+                    &PatchParams::apply(PROBE_FIELD_MANAGER).force(),
+                    &kube::api::Patch::Apply(&probe),
+                )
+                .await
+            {
+                Ok(_) => {
+                    debug!(
+                        namespace = ns,
+                        probe = %probe_pod_name,
+                        "scheduling probe pod created — re-check on next reconcile"
+                    );
+                    Ok(false)
+                }
+                Err(kube::Error::Api(ae))
+                    if ae.code == 403
+                        && ae.message.contains("serviceaccount")
+                        && ae.message.contains("not found") =>
+                {
+                    // Race: the virtual KCM hasn't yet created the
+                    // namespace's `default` ServiceAccount that pod
+                    // admission validates. KCM's serviceaccount
+                    // controller runs ~30-60s after a fresh apiserver
+                    // comes up; the operator's gate evaluation can fire
+                    // before then. Treat as transient — the next
+                    // reconcile retries and eventually succeeds once
+                    // the SA exists. Error chain captured live on
+                    // an internal cluster: every fresh ci-vkobe-flux
+                    // instance hit this for the first ~30s of its
+                    // lifetime, blocking the gate even though it would
+                    // pass naturally a moment later.
+                    debug!(
+                        namespace = ns,
+                        probe = %probe_pod_name,
+                        message = %ae.message,
+                        "scheduling probe waiting for default SA — retry next reconcile"
+                    );
+                    Ok(false)
+                }
+                Err(e) => Err(anyhow::Error::from(e)).with_context(|| {
+                    format!("Failed to create scheduling-probe pod in namespace {ns}")
+                }),
+            }
         }
         Err(e) => Err(e.into()),
     }
@@ -1165,7 +1234,7 @@ current-context: default
         // GET /api/v1/namespaces/<ns>/pods/<probe> → 404
         Mock::given(method("GET"))
             .and(path(
-                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe",
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance",
             ))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "kind": "Status",
@@ -1178,13 +1247,13 @@ current-context: default
         // PATCH (apply) creates the pod
         Mock::given(method("PATCH"))
             .and(path(
-                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe",
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {
-                    "name": "kobe-readiness-probe",
+                    "name": "kobe-readiness-probe-test-instance",
                     "namespace": "kube-system"
                 },
                 "spec": { "containers": [] }
@@ -1192,7 +1261,9 @@ current-context: default
             .mount(&server)
             .await;
 
-        let result = check_scheduling_probe(&client, None).await.unwrap();
+        let result = check_scheduling_probe(&client, None, "test-instance")
+            .await
+            .unwrap();
         assert!(
             !result,
             "first call must return false — pod created, status not yet observable"
@@ -1208,18 +1279,20 @@ current-context: default
         let client = crate::testutil::mock_k8s_client(&server);
 
         Mock::given(method("GET"))
-            .and(path("/api/v1/namespaces/kube-system/pods/kobe-readiness-probe"))
+            .and(path("/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
-                "metadata": { "name": "kobe-readiness-probe", "namespace": "kube-system" },
+                "metadata": { "name": "kobe-readiness-probe-test-instance", "namespace": "kube-system" },
                 "spec": { "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10" }] },
                 "status": { "phase": "Pending" }
             })))
             .mount(&server)
             .await;
 
-        let result = check_scheduling_probe(&client, None).await.unwrap();
+        let result = check_scheduling_probe(&client, None, "test-instance")
+            .await
+            .unwrap();
         assert!(
             !result,
             "Pending pod must not satisfy the gate — only Running counts as proof of scheduling"
@@ -1236,11 +1309,11 @@ current-context: default
         let client = crate::testutil::mock_k8s_client(&server);
 
         Mock::given(method("GET"))
-            .and(path("/api/v1/namespaces/kube-system/pods/kobe-readiness-probe"))
+            .and(path("/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
-                "metadata": { "name": "kobe-readiness-probe", "namespace": "kube-system" },
+                "metadata": { "name": "kobe-readiness-probe-test-instance", "namespace": "kube-system" },
                 "spec": { "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10" }] },
                 "status": { "phase": "Running" }
             })))
@@ -1251,7 +1324,7 @@ current-context: default
         // the wiremock expectations check below.
         Mock::given(method("DELETE"))
             .and(path(
-                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe",
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "kind": "Status",
@@ -1261,7 +1334,9 @@ current-context: default
             .mount(&server)
             .await;
 
-        let result = check_scheduling_probe(&client, None).await.unwrap();
+        let result = check_scheduling_probe(&client, None, "test-instance")
+            .await
+            .unwrap();
         assert!(
             result,
             "Running pod proves the cluster is scheduling end-to-end → gate satisfied"
@@ -1278,18 +1353,18 @@ current-context: default
 
         Mock::given(method("GET"))
             .and(path(
-                "/api/v1/namespaces/probe-ns/pods/kobe-readiness-probe",
+                "/api/v1/namespaces/probe-ns/pods/kobe-readiness-probe-test-instance",
             ))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
             .and(path(
-                "/api/v1/namespaces/probe-ns/pods/kobe-readiness-probe",
+                "/api/v1/namespaces/probe-ns/pods/kobe-readiness-probe-test-instance",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "v1", "kind": "Pod",
-                "metadata": { "name": "kobe-readiness-probe", "namespace": "probe-ns" },
+                "metadata": { "name": "kobe-readiness-probe-test-instance", "namespace": "probe-ns" },
                 "spec": { "containers": [] }
             })))
             .mount(&server)
@@ -1297,9 +1372,54 @@ current-context: default
 
         // Wiremock will fail the test if the operator hits a
         // different path (e.g. kube-system instead of probe-ns).
-        let result = check_scheduling_probe(&client, Some("probe-ns"))
+        let result = check_scheduling_probe(&client, Some("probe-ns"), "test-instance")
             .await
             .unwrap();
         assert!(!result);
+    }
+
+    /// When the apiserver rejects probe-pod creation with a 403 +
+    /// "serviceaccount ... not found" message, the gate must return
+    /// `Ok(false)` (transient — retry next reconcile) rather than
+    /// `Err`. The KCM serviceaccount-controller takes 30-60s after a
+    /// fresh apiserver to populate every namespace's `default` SA;
+    /// the gate evaluating in that window otherwise crashed every
+    /// vkobe instance for its first ~30s of life until the eventual
+    /// stuck-Creating timeout recycled it.
+    #[tokio::test]
+    async fn scheduling_probe_tolerates_default_sa_not_yet_created() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        // GET → 404, then PATCH → 403 with the exact message k8s
+        // emits when the namespace's default SA hasn't been created
+        // by KCM's serviceaccount-controller yet.
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/pods/kobe-readiness-probe-test-instance",
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "status": "Failure",
+                "code": 403,
+                "reason": "Forbidden",
+                "message": "pods \"kobe-readiness-probe-test-instance\" is forbidden: error looking up service account kube-system/default: serviceaccount \"default\" not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = check_scheduling_probe(&client, None, "test-instance").await;
+        assert!(
+            matches!(result, Ok(false)),
+            "SA-not-yet-created 403 must return Ok(false) (transient), got {result:?}"
+        );
     }
 }
