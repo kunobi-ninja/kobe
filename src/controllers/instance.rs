@@ -59,6 +59,7 @@ fn backend_label(backend: &BackendType) -> &'static str {
         BackendType::K0s => "k0s",
         BackendType::Capi => "capi",
         BackendType::Vkobe => "vkobe",
+        BackendType::Vcluster => "vcluster",
     }
 }
 
@@ -855,6 +856,12 @@ fn backend_dispatch_for_config<B: ClusterBackend + Clone>(
             }
             crate::crd::BackendType::Vkobe => Ok(crate::backend::BackendDispatch::Vkobe(
                 crate::backend::VkobeBackend::new(ctx.client.clone(), config.backend.vkobe.clone()),
+            )),
+            crate::crd::BackendType::Vcluster => Ok(crate::backend::BackendDispatch::Vcluster(
+                crate::backend::VclusterBackend::new(
+                    ctx.client.clone(),
+                    config.backend.vcluster.clone(),
+                ),
             )),
         }
     }

@@ -70,6 +70,7 @@ spec:
                   capi: null
                   datastore: null
                   type: k3s
+                  vcluster: null
                   vkobe: null
                 description: Backend configuration for provisioning clusters.
                 properties:
@@ -126,7 +127,29 @@ spec:
                     - k0s
                     - capi
                     - vkobe
+                    - vcluster
                     type: string
+                  vcluster:
+                    description: vcluster backend configuration (vcluster backend only).
+                    nullable: true
+                    properties:
+                      chartVersion:
+                        description: |-
+                          Helm chart version of `loft-sh/vcluster` to deploy. If unset, the
+                          operator's pinned default applies.
+                        nullable: true
+                        type: string
+                      values:
+                        description: |-
+                          Inline Helm values (YAML) merged on top of the operator's defaults.
+                          Use this to enable / disable features per pool (sync targets,
+                          expose mode, resource limits, etc).
+
+                          Schema: free-form YAML matching vcluster's chart values
+                          (see https://www.vcluster.com/docs/configure/vcluster-yaml).
+                        nullable: true
+                        type: string
+                    type: object
                   vkobe:
                     description: vkobe backend configuration (vkobe backend only).
                     nullable: true

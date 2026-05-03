@@ -18,9 +18,17 @@ pub enum BackendType {
     /// Use Cluster API (CAPI) with a pluggable infrastructure provider.
     #[serde(rename = "capi")]
     Capi,
-    /// Use vkobe virtual cluster runtime (lightweight proxy-based).
+    /// Use the in-house vkobe virtual cluster runtime (deprecated — see
+    /// `docs/architecture/virtual-cluster-strategy.md` for migration path
+    /// to the `vcluster` backend).
     #[serde(rename = "vkobe")]
     Vkobe,
+    /// Use upstream loft-sh/vcluster (Apache 2.0) as the virtual cluster
+    /// runtime. Replaces the in-house vkobe backend. The operator deploys
+    /// a vcluster instance per `ClusterInstance` via the official Helm
+    /// chart, into a dedicated per-instance namespace.
+    #[serde(rename = "vcluster")]
+    Vcluster,
 }
 
 /// Reference to a KobeStore CRD by name (same namespace).
@@ -271,6 +279,35 @@ pub struct BackendConfig {
     /// vkobe backend configuration (vkobe backend only).
     #[serde(default)]
     pub vkobe: Option<VkobeConfig>,
+
+    /// vcluster backend configuration (vcluster backend only).
+    #[serde(default)]
+    pub vcluster: Option<VclusterConfig>,
+}
+
+/// vcluster backend configuration.
+///
+/// The kobe operator deploys vcluster instances via the upstream Helm
+/// chart (https://charts.loft.sh / `loft-sh/vcluster`). Each
+/// `ClusterInstance` gets its own dedicated host namespace named after
+/// the instance, isolating projection scope per instance and making
+/// teardown trivially correct (`helm uninstall` + `kubectl delete ns`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VclusterConfig {
+    /// Helm chart version of `loft-sh/vcluster` to deploy. If unset, the
+    /// operator's pinned default applies.
+    #[serde(default)]
+    pub chart_version: Option<String>,
+
+    /// Inline Helm values (YAML) merged on top of the operator's defaults.
+    /// Use this to enable / disable features per pool (sync targets,
+    /// expose mode, resource limits, etc).
+    ///
+    /// Schema: free-form YAML matching vcluster's chart values
+    /// (see https://www.vcluster.com/docs/configure/vcluster-yaml).
+    #[serde(default)]
+    pub values: Option<String>,
 }
 
 /// Backend-agnostic cluster configuration.

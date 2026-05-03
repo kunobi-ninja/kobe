@@ -2,6 +2,7 @@ pub mod capi;
 pub mod datastore;
 pub mod k0s;
 pub mod k3s;
+pub mod vcluster;
 pub mod vkobe;
 
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ use crate::crd::{
 pub use capi::CapiBackend;
 pub use k0s::K0sBackend;
 pub use k3s::K3sBackend;
+pub use vcluster::VclusterBackend;
 pub use vkobe::VkobeBackend;
 
 /// Allowed URL schemes for addon manifests and readiness probes.
@@ -41,6 +43,7 @@ pub enum BackendDispatch {
     K0s(K0sBackend),
     Capi(CapiBackend),
     Vkobe(VkobeBackend),
+    Vcluster(VclusterBackend),
 }
 
 impl ClusterBackend for BackendDispatch {
@@ -57,6 +60,7 @@ impl ClusterBackend for BackendDispatch {
             Self::K0s(b) => b.create(name, namespace, config, addons, owner_ref).await,
             Self::Capi(b) => b.create(name, namespace, config, addons, owner_ref).await,
             Self::Vkobe(b) => b.create(name, namespace, config, addons, owner_ref).await,
+            Self::Vcluster(b) => b.create(name, namespace, config, addons, owner_ref).await,
         }
     }
 
@@ -66,6 +70,7 @@ impl ClusterBackend for BackendDispatch {
             Self::K0s(b) => b.delete(name, namespace).await,
             Self::Capi(b) => b.delete(name, namespace).await,
             Self::Vkobe(b) => b.delete(name, namespace).await,
+            Self::Vcluster(b) => b.delete(name, namespace).await,
         }
     }
 
@@ -75,6 +80,7 @@ impl ClusterBackend for BackendDispatch {
             Self::K0s(b) => b.check_health(name, namespace).await,
             Self::Capi(b) => b.check_health(name, namespace).await,
             Self::Vkobe(b) => b.check_health(name, namespace).await,
+            Self::Vcluster(b) => b.check_health(name, namespace).await,
         }
     }
 
@@ -84,6 +90,7 @@ impl ClusterBackend for BackendDispatch {
             Self::K0s(b) => b.extract_kubeconfig(name, namespace).await,
             Self::Capi(b) => b.extract_kubeconfig(name, namespace).await,
             Self::Vkobe(b) => b.extract_kubeconfig(name, namespace).await,
+            Self::Vcluster(b) => b.extract_kubeconfig(name, namespace).await,
         }
     }
 
@@ -98,6 +105,7 @@ impl ClusterBackend for BackendDispatch {
             Self::K0s(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::Capi(b) => b.check_readiness_gate(name, namespace, gate).await,
             Self::Vkobe(b) => b.check_readiness_gate(name, namespace, gate).await,
+            Self::Vcluster(b) => b.check_readiness_gate(name, namespace, gate).await,
         }
     }
 
@@ -107,6 +115,7 @@ impl ClusterBackend for BackendDispatch {
             Self::K0s(b) => b.apply_addon(name, namespace, addon).await,
             Self::Capi(b) => b.apply_addon(name, namespace, addon).await,
             Self::Vkobe(b) => b.apply_addon(name, namespace, addon).await,
+            Self::Vcluster(b) => b.apply_addon(name, namespace, addon).await,
         }
     }
 }
@@ -164,6 +173,10 @@ impl BackendFactory {
             BackendType::Vkobe => Ok(BackendDispatch::Vkobe(VkobeBackend::new(
                 self.client.clone(),
                 profile.spec.backend.vkobe.clone(),
+            ))),
+            BackendType::Vcluster => Ok(BackendDispatch::Vcluster(VclusterBackend::new(
+                self.client.clone(),
+                profile.spec.backend.vcluster.clone(),
             ))),
         }
     }
