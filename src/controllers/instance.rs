@@ -447,6 +447,14 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             info!(instance = %name, owner = %owner, "Deleting backend resources");
             match delete_instance_backend(&ctx, &config, &name, &ns).await {
                 Ok(()) => {
+                    // Best-effort cleanup of host-side resources that the
+                    // backend's own delete() doesn't own. See
+                    // cleanup_orphan_projected_resources() for the rationale —
+                    // this prevents the orphan-leak pattern that took down
+                    // an internal cluster (~700 leaked probe pods + ~170 leaked
+                    // projected workload pods over 8 days of cycling).
+                    cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
+
                     instances_api.delete(&name, &Default::default()).await?;
                     Ok(Action::await_change())
                 }
@@ -1110,6 +1118,159 @@ async fn delete_instance_backend<B: ClusterBackend + Clone>(
         backend.delete(name, namespace).await
     } else {
         ctx.backend.delete(name, namespace).await
+    }
+}
+
+/// Best-effort cleanup of host-side resources that a backend's `delete()`
+/// doesn't own and that lack an `OwnerReference` Kubernetes GC can follow.
+///
+/// # Why this exists
+///
+/// The in-house vkobe backend ships a `kobe-sync` sidecar that **projects**
+/// virtual-cluster resources to host pods in the operator's namespace. Two
+/// classes of host objects are created without an `OwnerReference` linking
+/// back to the parent `ClusterInstance` (or to any object that
+/// `delete_instance_backend()` tears down):
+///
+/// 1. **Readiness-probe pods** — created in the *virtual* `kube-system` as
+///    `kobe-readiness-probe`, projected by `PodSyncer` to host as
+///    `kobe-readiness-probe-{instance}-x-kube-system-x-vc`. When the
+///    instance is recycled, the apiserver Deployment + its kine PVC are
+///    destroyed but this projected pod is orphaned.
+///
+/// 2. **User workload pods** projected from virtual namespaces (e.g.
+///    Flux controllers) — naming convention `<name>-x-<vns>-x-vc`. Same
+///    leak pattern.
+///
+/// At `an internal cluster` over 8 days of failed `ci-vkobe-flux` cycling we
+/// accumulated ~700 leaked probes + ~170 leaked projected workloads; their
+/// CPU/RAM resource requests eventually exhausted cluster capacity and
+/// blocked new instances from scheduling, manifesting as
+/// `FailedScheduling: 0/8 nodes are available: Insufficient cpu`.
+///
+/// # What this does
+///
+/// Best-effort delete of:
+/// - the well-known probe pod by deterministic name (cheap, targeted)
+/// - any pod in the instance's host namespace whose name matches the
+///   projection suffix `*-x-{vns}-x-vc` for the well-known virtual
+///   namespaces (`flux-system`, `default`, `kube-system`,
+///   `cert-manager`, `flux-system`). This is a heuristic: kobe-sync does
+///   not label projected pods with the owner instance, so we cannot
+///   identify them precisely. The heuristic is safe because:
+///     - the matching only happens in the operator's host namespace
+///     - the suffix is unique to projected pods (no user-created pod
+///       follows that exact pattern)
+///     - if a pod is genuinely shared between two pools (which kobe-sync
+///       does not currently do), the next reconcile of the surviving
+///       instance will re-project it
+///
+/// # Why best-effort
+///
+/// Failure here is intentionally non-fatal: the instance CR delete must
+/// still proceed. Leaks reappearing is a regression we can detect and
+/// alert on; failing to delete the CR would block the pool from
+/// recovering. A cleanup failure is logged as `warn!` so it surfaces to
+/// the operator's log but doesn't poison the recycle loop.
+///
+/// # Backends with self-contained delete
+///
+/// Backends that scope projection to a per-instance namespace (the
+/// proposed `vcluster` backend does this via `helm install --namespace
+/// <instance>`) handle cleanup natively when the namespace is deleted.
+/// For those backends this function is a no-op (404s on every probe).
+async fn cleanup_orphan_projected_resources(client: &Client, instance_name: &str, host_ns: &str) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::{DeleteParams, ListParams};
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), host_ns);
+
+    // 1. Targeted delete of the readiness-probe pod (deterministic name).
+    let probe_name = format!("kobe-readiness-probe-{instance_name}-x-kube-system-x-vc");
+    match pods.delete(&probe_name, &DeleteParams::default()).await {
+        Ok(_) => debug!(
+            instance = %instance_name,
+            probe = %probe_name,
+            "cleaned up legacy projected probe pod"
+        ),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            // expected: backend doesn't project here, or gate never fired,
+            // or another reconcile already cleaned it up
+        }
+        Err(e) => warn!(
+            instance = %instance_name,
+            probe = %probe_name,
+            error = %format!("{e:#}"),
+            "legacy probe pod cleanup failed (non-fatal)"
+        ),
+    }
+
+    // 2. Heuristic delete of orphaned workload projections from
+    //    well-known virtual namespaces. We list pods (un-filtered — kobe-sync
+    //    does not label projections by owner) and match the projection name
+    //    pattern: `*-x-{vns}-x-vc` where vns is one of the known virtual
+    //    namespaces a vkobe-style pool's bootstrap touches.
+    //
+    //    Conservative filter: we only match if the pod's name *also* contains
+    //    the instance name as a substring. This is loose — a pod named
+    //    `mysvc-x-flux-system-x-vc` from a different instance won't match
+    //    unless its hash collides with `instance_name` — but pod names from
+    //    Kubernetes ReplicaSets always include the RS hash, so this works for
+    //    Deployments. Bare pods or StatefulSets may slip through; we accept
+    //    that as the cost of a heuristic.
+    //
+    //    Production traces show ~170 such orphans across 8 days. Even if this
+    //    heuristic catches only 80%, leak rate becomes manageable.
+    const PROJECTED_VIRTUAL_NAMESPACES: &[&str] = &[
+        "flux-system",
+        "default",
+        "kube-system",
+        "cert-manager",
+        "monitoring",
+    ];
+
+    let list = match pods.list(&ListParams::default()).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                instance = %instance_name,
+                error = %format!("{e:#}"),
+                "could not list pods for orphan cleanup (non-fatal)"
+            );
+            return;
+        }
+    };
+
+    for pod in list.items {
+        let Some(pod_name) = pod.metadata.name.as_ref() else {
+            continue;
+        };
+        // Filter: name must end with one of the projection suffixes AND
+        // contain the instance name as substring.
+        let suffix_match = PROJECTED_VIRTUAL_NAMESPACES
+            .iter()
+            .any(|vns| pod_name.ends_with(&format!("-x-{vns}-x-vc")));
+        if !suffix_match {
+            continue;
+        }
+        if !pod_name.contains(instance_name) {
+            continue;
+        }
+
+        match pods.delete(pod_name, &DeleteParams::default()).await {
+            Ok(_) => debug!(
+                instance = %instance_name,
+                pod = %pod_name,
+                "cleaned up orphaned projected workload pod"
+            ),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => warn!(
+                instance = %instance_name,
+                pod = %pod_name,
+                error = %format!("{e:#}"),
+                "orphan workload cleanup failed (non-fatal)"
+            ),
+        }
     }
 }
 
