@@ -22,6 +22,11 @@ const DEMO_VKOBE_KINE_POOL = "e2e-vkobe-kine-sqlite";
 const DEMO_VKOBE_KINE_BOOTSTRAP_POOL = "e2e-vkobe-kine-sqlite-bootstrap";
 const DEMO_VKOBE_KINE_STORE = "e2e-vkobe-store-kine-sqlite";
 const DEMO_VKOBE_KINE_BACKEND = "e2e-vkobe-kine-sqlite";
+// vcluster backend: upstream loft-sh/vcluster deployed via Helm
+// per-instance. Each instance gets its own host namespace
+// `vcluster-<instance>`, which is the cleanup boundary.
+const DEMO_VCLUSTER_POOL = "e2e-vcluster";
+const DEMO_VCLUSTER_BOOTSTRAP_POOL = "e2e-vcluster-bootstrap";
 const DEMO_BOOTSTRAP_CONFIG = "e2e-basic-bootstrap";
 const DEMO_BOOTSTRAP_NAMESPACE = "default";
 const DEMO_BOOTSTRAP_CONFIGMAP = "bootstrap-marker";
@@ -807,6 +812,77 @@ spec:
     limits:
       cpu: "500m"
       memory: "512Mi"
+---
+# vcluster backend: bare pool. The operator runs
+# `helm upgrade --install loft-sh/vcluster` per ClusterInstance into
+# its own host namespace (vcluster-<instance>), so unlike the vkobe
+# pools above this needs no KobeStore reference and no syncer list.
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ${DEMO_VCLUSTER_POOL}
+  namespace: ${namespace}
+spec:
+  size: 1
+  ttl: "1h"
+  backend:
+    type: vcluster
+    # Empty vcluster block means "use operator defaults": chart version
+    # pinned in src/backend/vcluster.rs (DEFAULT_CHART_VERSION),
+    # exportKubeConfig.server set to the in-cluster DNS form.
+    vcluster: {}
+  cluster:
+    version: "1.34"
+    servers: 1
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 0
+    maxClusters: 2
+    scaleUpThreshold: 0
+    scaleDownAfter: "5m"
+    queueTimeout: "5m"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+---
+# vcluster backend with Flux bootstrap. End-to-end smoke that the
+# vcluster instance is genuinely usable for the same workload that
+# the legacy in-house vkobe backend struggled with for 8 days at
+# an internal cluster (Bug A: SA token volume not propagated → Flux
+# controllers CrashLoopBackOff). vcluster handles SA token projection
+# natively, so this pool should reach Healthy on the first attempt.
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ${DEMO_VCLUSTER_BOOTSTRAP_POOL}
+  namespace: ${namespace}
+spec:
+  size: 1
+  ttl: "1h"
+  backend:
+    type: vcluster
+    vcluster: {}
+  cluster:
+    version: "1.34"
+    servers: 1
+  bootstraps:
+    - name: ${DEMO_FLUX_BOOTSTRAP_CONFIG}
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 0
+    maxClusters: 2
+    scaleUpThreshold: 0
+    scaleDownAfter: "5m"
+    queueTimeout: "30m"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
 `;
 }
 
@@ -843,7 +919,15 @@ kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespac
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_KINE_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
-kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VCLUSTER_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VCLUSTER_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
+# vcluster instances each live in their own host namespace
+# (vcluster-<name>); reap the namespaces directly so any orphan
+# Helm release / projected resource is gone.
+for ns in $(kubectl --context "$CTX" get namespace -l kobe.kunobi.ninja/backend=vcluster -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
+  kubectl --context "$CTX" delete namespace "$ns" --ignore-not-found >/dev/null 2>&1 || true
+done
+kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} ${DEMO_VCLUSTER_POOL} ${DEMO_VCLUSTER_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete kobestore.kobe.kunobi.ninja -n ${namespace} ${DEMO_VKOBE_ETCD_STORE} ${DEMO_VKOBE_KINE_STORE} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete service -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true
@@ -884,7 +968,7 @@ async function printContext(cluster: string, namespace: string): Promise<void> {
   info(`Context: kind-${cluster}`);
   info(`Namespace: ${namespace}`);
   info(
-    `Demo pools: ${DEMO_K0S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_BOOTSTRAP_POOL}, ${DEMO_VKOBE_KINE_POOL}, ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}`,
+    `Demo pools: ${DEMO_K0S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_BOOTSTRAP_POOL}, ${DEMO_VKOBE_KINE_POOL}, ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}, ${DEMO_VCLUSTER_POOL}, ${DEMO_VCLUSTER_BOOTSTRAP_POOL}`,
   );
   info(`Demo vkobe stores: ${DEMO_VKOBE_ETCD_STORE} -> ${DEMO_VKOBE_ETCD_BACKEND}, ${DEMO_VKOBE_KINE_STORE} -> ${DEMO_VKOBE_KINE_BACKEND}`);
   info(`Demo bootstrap: ${DEMO_BOOTSTRAP_CONFIG} -> ${DEMO_BOOTSTRAP_NAMESPACE}/${DEMO_BOOTSTRAP_CONFIGMAP}`);

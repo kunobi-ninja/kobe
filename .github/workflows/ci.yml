@@ -10,6 +10,7 @@ on:
       - "Cargo.lock"
       - "docker/**"
       - "docker-bake.hcl"
+      - "hack/**"
       - ".github/workflows/ci.yml"
   push:
     branches: [main]
@@ -20,6 +21,7 @@ on:
       - "Cargo.lock"
       - "docker/**"
       - "docker-bake.hcl"
+      - "hack/**"
       - ".github/workflows/ci.yml"
   release:
     types: [published]
