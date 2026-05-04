@@ -315,6 +315,37 @@ spec:
                         nullable: true
                         type: string
                     type: object
+                  registryMirrors:
+                    additionalProperties:
+                      items:
+                        type: string
+                      type: array
+                    description: |-
+                      Container registry mirrors for the leased cluster's container
+                      runtime. Maps source registry hostname (e.g. `docker.io`,
+                      `quay.io`) to a list of mirror endpoint URLs the runtime should
+                      try before the source.
+
+                      Currently honored by the k3s backend, which writes the map into
+                      `/etc/rancher/k3s/registries.yaml` on every node — k3s reads it
+                      at startup and configures containerd accordingly.
+                      (https://docs.k3s.io/installation/private-registry).
+
+                      Why this matters: leased clusters running inside a host cluster
+                      with restricted egress can't reach upstream registries directly.
+                      Without a mirror config, every Pod that pulls e.g. `busybox:1.36`
+                      hits `ImagePullBackOff` because the leased cluster's containerd
+                      goes straight to `docker.io`. Setting a mirror redirects the
+                      pull through an in-network proxy (Harbor, Sonatype, an Artifact
+                      Registry mirror, etc.) that the host cluster CAN reach.
+
+                      Example:
+                        registryMirrors:
+                          docker.io:
+                            - https://registry.example.com
+                            - https://docker-mirror.example.com
+                    nullable: true
+                    type: object
                   serverArgs:
                     default: []
                     description: Extra k3s server args.

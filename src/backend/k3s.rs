@@ -80,6 +80,40 @@ echo "Kubeconfig Secret published, sleeping..."
 sleep infinity
 "#;
 
+/// Path k3s reads its container-runtime registry config from on every node.
+/// (https://docs.k3s.io/installation/private-registry)
+const REGISTRIES_YAML_PATH: &str = "/etc/rancher/k3s/registries.yaml";
+
+/// True iff the ClusterConfig declares a non-empty registry_mirrors map.
+fn has_registry_mirrors(config: &ClusterConfig) -> bool {
+    config
+        .registry_mirrors
+        .as_ref()
+        .is_some_and(|m| !m.is_empty())
+}
+
+/// Render the contents of `registries.yaml` from a mirrors map.
+///
+/// The map is `source registry → list of mirror endpoints` (e.g.
+/// `"docker.io" → ["https://registry.example.com"]`). k3s reads
+/// only `mirrors` here — `configs` (auth, TLS) is left for a future
+/// extension. Returns `None` for an empty map so callers can short-
+/// circuit ConfigMap creation and volume mounting.
+fn render_registries_yaml(mirrors: &BTreeMap<String, Vec<String>>) -> Option<String> {
+    if mirrors.is_empty() {
+        return None;
+    }
+    let mut out = String::from("mirrors:\n");
+    for (source, endpoints) in mirrors {
+        out.push_str(&format!("  {source}:\n"));
+        out.push_str("    endpoint:\n");
+        for ep in endpoints {
+            out.push_str(&format!("      - {ep:?}\n"));
+        }
+    }
+    Some(out)
+}
+
 /// Direct k3s backend — manages k3s clusters via raw Kubernetes resources.
 #[derive(Clone)]
 pub struct K3sBackend {
@@ -208,6 +242,54 @@ impl K3sBackend {
         Ok(())
     }
 
+    /// Create the ConfigMap holding `registries.yaml` for the leased
+    /// cluster's container runtime, when registry_mirrors is set.
+    /// Returns `Ok(true)` when a ConfigMap was created (so callers can
+    /// decide whether to mount it), `Ok(false)` when there's nothing
+    /// to do.
+    async fn create_registries_configmap(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> Result<bool> {
+        let Some(mirrors) = &config.registry_mirrors else {
+            return Ok(false);
+        };
+        let Some(yaml) = render_registries_yaml(mirrors) else {
+            return Ok(false);
+        };
+
+        let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let cm_name = format!("{name}-registries");
+
+        let cm = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some(cm_name.clone()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(Self::cluster_labels(name)),
+                ..Default::default()
+            },
+            data: Some({
+                let mut data = BTreeMap::new();
+                data.insert("registries.yaml".to_string(), yaml);
+                data
+            }),
+            ..Default::default()
+        };
+
+        cms.patch(
+            &cm_name,
+            &PatchParams::apply("kobe-operator").force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+        .with_context(|| format!("Failed to apply registries ConfigMap {cm_name}"))?;
+
+        debug!(cluster = name, "Registries ConfigMap applied");
+        Ok(true)
+    }
+
     /// Build the k3s server container.
     fn build_server_container(
         name: &str,
@@ -294,6 +376,18 @@ impl K3sBackend {
             volume_mounts.push(VolumeMount {
                 name: "data".to_string(),
                 mount_path: "/var/lib/rancher/k3s".to_string(),
+                ..Default::default()
+            });
+        }
+
+        // Optional registries.yaml mount — points at the file k3s
+        // reads at startup to configure containerd mirrors.
+        if has_registry_mirrors(config) {
+            volume_mounts.push(VolumeMount {
+                name: "registries-config".to_string(),
+                mount_path: REGISTRIES_YAML_PATH.to_string(),
+                sub_path: Some("registries.yaml".to_string()),
+                read_only: Some(true),
                 ..Default::default()
             });
         }
@@ -430,6 +524,19 @@ impl K3sBackend {
             });
         }
 
+        // Optional registries.yaml ConfigMap — only mounted when
+        // registry_mirrors was set on the ClusterConfig.
+        if has_registry_mirrors(config) {
+            volumes.push(Volume {
+                name: "registries-config".to_string(),
+                config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                    name: format!("{name}-registries"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
         volumes
     }
 
@@ -557,6 +664,22 @@ impl K3sBackend {
         let labels = Self::agent_labels(name);
         let domain = cluster_domain(config);
 
+        let mut volume_mounts = vec![VolumeMount {
+            name: "token".to_string(),
+            mount_path: "/var/lib/k3s/token".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        }];
+        if has_registry_mirrors(config) {
+            volume_mounts.push(VolumeMount {
+                name: "registries-config".to_string(),
+                mount_path: REGISTRIES_YAML_PATH.to_string(),
+                sub_path: Some("registries.yaml".to_string()),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
+
         let container = Container {
             name: "k3s-agent".to_string(),
             image: Some(image),
@@ -568,18 +691,37 @@ impl K3sBackend {
                 format!("--server=https://{name}-server.{namespace}.svc.{domain}:6443"),
                 "--token-file=/var/lib/k3s/token/token".to_string(),
             ]),
-            volume_mounts: Some(vec![VolumeMount {
-                name: "token".to_string(),
-                mount_path: "/var/lib/k3s/token".to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            }]),
+            volume_mounts: Some(volume_mounts),
             security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
                 privileged: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
         };
+
+        let mut volumes = vec![Volume {
+            name: "token".to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(format!("{name}-token")),
+                items: Some(vec![KeyToPath {
+                    key: "token".to_string(),
+                    path: "token".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        if has_registry_mirrors(config) {
+            volumes.push(Volume {
+                name: "registries-config".to_string(),
+                config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                    name: format!("{name}-registries"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
 
         Deployment {
             metadata: ObjectMeta {
@@ -602,19 +744,7 @@ impl K3sBackend {
                     spec: Some(PodSpec {
                         containers: vec![container],
                         affinity: Self::agent_affinity(name, config.node_placement.as_ref()),
-                        volumes: Some(vec![Volume {
-                            name: "token".to_string(),
-                            secret: Some(SecretVolumeSource {
-                                secret_name: Some(format!("{name}-token")),
-                                items: Some(vec![KeyToPath {
-                                    key: "token".to_string(),
-                                    path: "token".to_string(),
-                                    ..Default::default()
-                                }]),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }]),
+                        volumes: Some(volumes),
                         ..Default::default()
                     }),
                 },
@@ -701,6 +831,10 @@ impl ClusterBackend for K3sBackend {
 
         // 2. Create publisher ConfigMap
         self.create_publisher_configmap(name, namespace).await?;
+
+        // 2b. Optionally create registries.yaml ConfigMap (k3s containerd mirrors)
+        self.create_registries_configmap(name, namespace, config)
+            .await?;
 
         // 3. If PostgreSQL configured, create per-cluster database
         let datastore_endpoint =
@@ -1153,6 +1287,151 @@ mod tests {
         // Default placement is Any → no affinity rendered, so the manifest
         // stays byte-identical for clusters that predate this field.
         assert!(pod_spec.affinity.is_none());
+
+        // Without registry_mirrors, no registries volume/mount is emitted.
+        let mounts = agent.volume_mounts.as_ref().unwrap();
+        assert!(mounts.iter().all(|m| m.name != "registries-config"));
+        let vols = pod_spec.volumes.as_ref().unwrap();
+        assert!(vols.iter().all(|v| v.name != "registries-config"));
+    }
+
+    // =================================================================
+    // Registry mirrors (registries.yaml ConfigMap + volume mount)
+    // =================================================================
+
+    #[test]
+    fn test_render_registries_yaml_empty_returns_none() {
+        let mirrors = std::collections::BTreeMap::<String, Vec<String>>::new();
+        assert!(render_registries_yaml(&mirrors).is_none());
+    }
+
+    #[test]
+    fn test_render_registries_yaml_single_source_single_endpoint() {
+        let mut mirrors = std::collections::BTreeMap::new();
+        mirrors.insert(
+            "docker.io".to_string(),
+            vec!["https://registry.example.com".to_string()],
+        );
+        let yaml = render_registries_yaml(&mirrors).unwrap();
+        // Lex-stable ordering (BTreeMap) makes the rendered output predictable.
+        assert_eq!(
+            yaml,
+            "mirrors:\n  docker.io:\n    endpoint:\n      - \"https://registry.example.com\"\n"
+        );
+    }
+
+    #[test]
+    fn test_render_registries_yaml_multiple_sources_and_endpoints() {
+        let mut mirrors = std::collections::BTreeMap::new();
+        mirrors.insert(
+            "docker.io".to_string(),
+            vec![
+                "https://primary.example.com".to_string(),
+                "https://fallback.example.com".to_string(),
+            ],
+        );
+        mirrors.insert(
+            "quay.io".to_string(),
+            vec!["https://quay-mirror.example.com".to_string()],
+        );
+        let yaml = render_registries_yaml(&mirrors).unwrap();
+        // BTreeMap iterates lexicographically: docker.io before quay.io.
+        // Endpoint list preserves insertion order.
+        let expected = concat!(
+            "mirrors:\n",
+            "  docker.io:\n",
+            "    endpoint:\n",
+            "      - \"https://primary.example.com\"\n",
+            "      - \"https://fallback.example.com\"\n",
+            "  quay.io:\n",
+            "    endpoint:\n",
+            "      - \"https://quay-mirror.example.com\"\n",
+        );
+        assert_eq!(yaml, expected);
+    }
+
+    /// When registry_mirrors is set, the agent Deployment gets the
+    /// extra ConfigMap volume + a /etc/rancher/k3s/registries.yaml
+    /// subPath mount on the k3s-agent container.
+    #[test]
+    fn test_build_agent_deployment_mounts_registries_when_configured() {
+        let mut mirrors = std::collections::BTreeMap::new();
+        mirrors.insert(
+            "docker.io".to_string(),
+            vec!["https://registry.example.com".to_string()],
+        );
+        let config = ClusterConfig {
+            registry_mirrors: Some(mirrors),
+            ..base_config()
+        };
+
+        let deploy = K3sBackend::build_agent_deployment("my-cluster", "ns", &config, 1);
+        let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+        let agent = &pod_spec.containers[0];
+        let mount = agent
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "registries-config")
+            .expect("registries-config volume mount missing");
+        assert_eq!(mount.mount_path, REGISTRIES_YAML_PATH);
+        assert_eq!(mount.sub_path.as_deref(), Some("registries.yaml"));
+        assert_eq!(mount.read_only, Some(true));
+
+        let vol = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "registries-config")
+            .expect("registries-config volume missing");
+        let cm = vol.config_map.as_ref().expect("config_map source missing");
+        assert_eq!(cm.name, "my-cluster-registries");
+    }
+
+    /// Same coverage on the server StatefulSet pod template — the
+    /// k3s-server container reads registries.yaml at startup, so the
+    /// mount has to be there too (not just on the agent).
+    #[test]
+    fn test_build_server_statefulset_mounts_registries_when_configured() {
+        let mut mirrors = std::collections::BTreeMap::new();
+        mirrors.insert(
+            "docker.io".to_string(),
+            vec!["https://registry.example.com".to_string()],
+        );
+        let config = ClusterConfig {
+            registry_mirrors: Some(mirrors),
+            ..base_config()
+        };
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+
+        let server = pod_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .unwrap();
+        let mount = server
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "registries-config")
+            .expect("registries-config volume mount missing on server container");
+        assert_eq!(mount.mount_path, REGISTRIES_YAML_PATH);
+        assert_eq!(mount.sub_path.as_deref(), Some("registries.yaml"));
+
+        let vol = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "registries-config")
+            .expect("registries-config volume missing on server pod template");
+        assert_eq!(vol.config_map.as_ref().unwrap().name, "c-registries");
     }
 
     #[test]
