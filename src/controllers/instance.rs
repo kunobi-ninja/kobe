@@ -446,7 +446,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         }
         ClusterInstancePhase::Recycling => {
             info!(instance = %name, owner = %owner, "Deleting backend resources");
-            match delete_instance_backend(&ctx, &config, &name, &ns).await {
+            match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
                 Ok(()) => {
                     // Best-effort cleanup of host-side resources that the
                     // backend's own delete() doesn't own. See
@@ -1117,11 +1117,43 @@ async fn create_instance_backend<B: ClusterBackend + Clone>(
 async fn delete_instance_backend<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     config: &ResolvedInstanceConfig,
+    instance: &ClusterInstance,
     name: &str,
     namespace: &str,
 ) -> Result<(), anyhow::Error> {
     if ctx.factory.is_some() {
-        let backend = backend_dispatch_for_config(ctx, config)?;
+        // Backend pinning: when the instance's status records a
+        // `created_with.backend_type`, dispatch via that backend rather
+        // than the pool's *current* spec. Otherwise a pool-level
+        // backend migration (e.g., vkobe→vcluster) would route the
+        // delete through the wrong backend, leaving the original
+        // resources orphaned and the new backend hitting "release not
+        // found" / "namespace doesn't exist" errors in a tight loop.
+        //
+        // Fallback to pool-spec backend for instances created by
+        // kobe < 0.23.1 (when this field was introduced).
+        let pinned = instance
+            .status
+            .as_ref()
+            .and_then(|s| s.created_with.as_ref())
+            .and_then(|cw| cw.backend_type.as_ref());
+        let backend = if let Some(pinned_type) = pinned
+            && *pinned_type != config.backend.backend_type
+        {
+            // Pool spec drifted; construct a config with the pinned
+            // backend type so the dispatch picks the right backend.
+            let mut overridden = config.clone();
+            overridden.backend.backend_type = pinned_type.clone();
+            tracing::debug!(
+                instance = %name,
+                pinned = ?pinned_type,
+                pool_backend = ?config.backend.backend_type,
+                "delete using pinned backend (overrides pool spec backend)"
+            );
+            backend_dispatch_for_config(ctx, &overridden)?
+        } else {
+            backend_dispatch_for_config(ctx, config)?
+        };
         backend.delete(name, namespace).await
     } else {
         ctx.backend.delete(name, namespace).await

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 // --- Backend Selection ---
 
 /// Which backend to use for cluster provisioning.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub enum BackendType {
     /// Manage k3s StatefulSets directly, optionally with a shared PostgreSQL datastore.
     #[default]

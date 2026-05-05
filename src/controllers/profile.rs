@@ -812,6 +812,10 @@ async fn ensure_cluster_instance(
             crate::crd::BackendType::Vkobe
         )
         .then(|| render_ctx.kobe_sync_image.clone()),
+        // Pin the backend that created this instance so future
+        // delete / health / addon dispatches use the right backend
+        // even after a pool-level backend migration.
+        backend_type: Some(profile.spec.backend.backend_type.clone()),
     };
 
     let initial_status = ClusterInstanceStatus {

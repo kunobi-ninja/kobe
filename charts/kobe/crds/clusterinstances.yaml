@@ -496,6 +496,16 @@ spec:
                   preserves the original write through every subsequent patch.
                 nullable: true
                 properties:
+                  backendType:
+                    description: Which backend to use for cluster provisioning.
+                    enum:
+                    - k3s
+                    - k0s
+                    - capi
+                    - vkobe
+                    - vcluster
+                    nullable: true
+                    type: string
                   kobeSyncImage:
                     description: |-
                       kobe-sync sidecar image used at create time. Recorded for

@@ -216,4 +216,21 @@ pub struct ClusterInstanceProvenance {
     /// `"zondax/kobe-sync:v0.16.0"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kobe_sync_image: Option<String>,
+
+    /// Backend type the instance was provisioned with. Pinned at
+    /// create time and never overwritten, so backend operations on the
+    /// instance (delete, health probe, kubeconfig extraction, addon
+    /// apply) always use the same backend that created the underlying
+    /// host resources — even if `ClusterPool.spec.backend.type` drifts
+    /// to a different backend mid-lifecycle (e.g., a vkobe→vcluster
+    /// migration leaves existing vkobe-style instances with vkobe
+    /// resources that must be torn down via the vkobe backend, not
+    /// the new pool-level vcluster backend).
+    ///
+    /// `None` for instances created by kobe < 0.23.1 — consumers
+    /// should fall back to `ClusterPool.spec.backend.type` for
+    /// backward compatibility (the prior behavior). New instances
+    /// always have this field populated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_type: Option<crate::crd::BackendType>,
 }
