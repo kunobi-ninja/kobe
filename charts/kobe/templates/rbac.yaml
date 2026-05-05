@@ -45,6 +45,15 @@ rules:
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Namespaces — the `vcluster` backend creates a per-instance host
+  # namespace `vcluster-<instance>` (via SSA at create) and deletes it
+  # at recycle to reap the entire vcluster Helm release in one shot.
+  # Without `delete` here, the operator's recycle loop fails with 403
+  # Forbidden and the pool gets stuck — observed at an internal cluster
+  # during the first vkobe→vcluster migration attempt.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses", "networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

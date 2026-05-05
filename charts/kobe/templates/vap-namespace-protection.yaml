@@ -1,0 +1,69 @@
+{{- if .Values.clusterPolicies.namespaceDeletionRestriction.enabled }}
+# ValidatingAdmissionPolicy: restrict the kobe-operator's namespace
+# deletion permission to namespaces matching `vcluster-*`.
+#
+# # Why this exists
+#
+# The operator's ClusterRole grants `delete` on `namespaces` cluster-wide
+# because the `vcluster` backend (`src/backend/vcluster.rs`) tears down
+# the per-instance host namespace `vcluster-<instance>` at recycle time.
+# Kubernetes RBAC has no native mechanism to pattern-match resource
+# names, so the verb-level grant is necessarily broad.
+#
+# This policy adds an admission-time check, complementary to the
+# in-process guard in `VclusterBackend::delete()`. Even if the operator
+# code path were bypassed (e.g., a kubeconfig leak that uses the
+# operator SA), the apiserver would still reject any `DELETE
+# /api/v1/namespaces/<not-vcluster-*>` request issued under the
+# operator's identity.
+#
+# # Failure mode
+#
+# `failurePolicy: Fail` means a misconfigured policy fails-closed: if
+# the policy is broken, deletes are rejected. This is the safer default
+# for a security control.
+#
+# # Compatibility
+#
+# Requires Kubernetes ≥ 1.30 (where ValidatingAdmissionPolicy is GA).
+# On older clusters, set
+# `clusterPolicies.namespaceDeletionRestriction.enabled: false` (the
+# default) — the in-process guard alone is still in effect.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "kobe.fullname" . }}-namespace-deletion-restriction
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["namespaces"]
+        operations: ["DELETE"]
+  matchConditions:
+    # Apply only to deletes issued by the kobe-operator ServiceAccount.
+    # Other principals (cluster admins, controllers, etc.) are
+    # unaffected — they go through the standard RBAC path.
+    - name: only-kobe-operator-sa
+      expression: >
+        request.userInfo.username ==
+        "system:serviceaccount:{{ .Release.Namespace }}:{{ include "kobe.serviceAccountName" . }}"
+  validations:
+    - expression: 'object.metadata.name.startsWith("vcluster-")'
+      message: "kobe-operator may only delete namespaces matching vcluster-*"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "kobe.fullname" . }}-namespace-deletion-restriction
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "kobe.fullname" . }}-namespace-deletion-restriction
+  validationActions:
+    - Deny
+{{- end }}

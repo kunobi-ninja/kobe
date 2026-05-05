@@ -345,6 +345,29 @@ impl ClusterBackend for VclusterBackend {
     #[tracing::instrument(skip(self), fields(cluster = name, namespace))]
     async fn delete(&self, name: &str, _namespace: &str) -> Result<()> {
         let host_ns = self.host_namespace(name);
+
+        // Defense-in-depth guard. The host namespace name is computed
+        // deterministically by `host_namespace()` as `vcluster-{name}`,
+        // so under correct operation `host_ns` always carries the
+        // `vcluster-` prefix. This explicit assertion prevents an
+        // accidental code-path bug (empty `name`, malformed override
+        // from a future config change, etc.) from issuing a delete
+        // against `default`, `kube-system`, or any other non-vcluster
+        // namespace via the operator's broad `namespaces:delete` RBAC.
+        //
+        // The chart's optional ValidatingAdmissionPolicy adds a
+        // cluster-side check on top of this — see
+        // `charts/kobe/templates/vap-namespace-protection.yaml`.
+        if !host_ns.starts_with("vcluster-") {
+            return Err(anyhow!(
+                "refusing to delete namespace {host_ns} — \
+                 vcluster backend only manages namespaces with the \
+                 `vcluster-` prefix; aborting before issuing a \
+                 destructive request that could affect cluster-wide \
+                 namespaces (cluster instance: {name})"
+            ));
+        }
+
         info!(cluster = name, host_ns = %host_ns, "Deleting vcluster instance");
 
         // helm uninstall — non-fatal if release doesn't exist (e.g. partial

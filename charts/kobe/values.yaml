@@ -50,6 +50,22 @@ containerSecurityContext:
     drop:
       - ALL
 
+# Cluster-side defense-in-depth policies. These are opt-in because they
+# require Kubernetes features that may not be available in every cluster
+# (ValidatingAdmissionPolicy is GA in K8s 1.30+).
+clusterPolicies:
+  # Restricts the operator's namespace deletion permission (granted
+  # broadly by the ClusterRole, since RBAC cannot pattern-match names)
+  # to namespaces matching `vcluster-*`. Defense-in-depth on top of the
+  # in-process guard in `VclusterBackend::delete()`.
+  #
+  # Disabled by default to avoid breaking installs on clusters that
+  # don't have the `admissionregistration.k8s.io/v1` VAP API (K8s
+  # < 1.30). Cluster admins on supported versions should set
+  # `clusterPolicies.namespaceDeletionRestriction.enabled: true`.
+  namespaceDeletionRestriction:
+    enabled: false
+
 service:
   type: ClusterIP
   port: 8080
