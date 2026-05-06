@@ -1,0 +1,19 @@
+kobe-demo installed in namespace kobe-system.
+
+The ./demo script wraps every step below — you don't need to remember them.
+
+1. Wait for the pool to be ready (1-3 min):
+   ./demo status     (or: kubectl -n kobe-system get clusterpool {{ .Values.pool.name }} -w)
+
+2. Forward the kobe API:
+   ./demo forward    (or: kubectl -n kobe-system port-forward svc/kobe-demo 8080:8080)
+
+3. Configure the kobe CLI (one-time):
+   kobe config set demo --endpoint http://localhost:8080 --auth ssh
+   kobe config use demo
+
+4. Lease one:
+   ./demo lease      (or: kobe lease {{ .Values.pool.name }} --ttl 30m)
+
+5. Drive the same flow from Kunobi desktop:
+   open the app, point at http://localhost:8080, auth: ssh.

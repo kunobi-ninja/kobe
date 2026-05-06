@@ -1,0 +1,46 @@
+# REQUIRED: identity that the kobe operator will accept on its HTTP API.
+# Set via: helm install ... --set sshPublicKey="ssh-ed25519 AAA..."
+# (`./demo up` auto-reads ~/.ssh/id_ed25519.pub if present and passes it.)
+#
+# IMPORTANT: kobe operator only accepts Ed25519 keys — RSA is rejected with
+# "Unauthorized: only Ed25519 keys are accepted". Generate one with:
+#   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C "you@example.com"
+sshPublicKey: ""
+
+pool:
+  name: demo-k3s-small
+  size: 2                       # warm-pool target
+  minReady: 1
+  maxClusters: 3
+  ttl: 1h
+  maxTtlPerLease: 2h
+  maxConcurrentLeases: 5
+  k3s:
+    version: v1.31.3+k3s1
+    servers: 1
+    agents: 1
+
+localPath:
+  enabled: true
+  setAsDefault: true            # SKS may not ship a default StorageClass
+
+# Pass-through to the kobe subchart.
+kobe:
+  replicas: 1                   # demo doesn't need HA
+  # The kobe chart's default operatorNamespace is "kunobi-pool". Override
+  # to match where we deploy ("kobe-system") so the operator's namespace
+  # watches resolve. Production HelmRelease does the same.
+  operatorNamespace: kobe-system
+  # zondax/kobe-operator + zondax/kobe-sync are private Docker Hub repos.
+  # The demo creates a `regcred` docker-registry secret via:
+  #   ./demo pull-secret <docker-hub-user> <docker-hub-token>
+  imagePullSecrets:
+    - name: regcred
+  kine:
+    enabled: false              # k3s pool doesn't need it
+  ingress:
+    enabled: false              # port-forward in the demo
+  serviceMonitor:
+    enabled: false              # no Prometheus on a fresh SKS
+  # image.tag and kobeSync.image.tag inherit from the chart's appVersion when
+  # left unset — pin here only if you need to override.

@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-ubuntu
+  namespace: demo-workloads
+  labels:
+    app.kubernetes.io/name: demo-ubuntu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-ubuntu
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-ubuntu
+    spec:
+      containers:
+        - name: ubuntu
+          image: ubuntu:24.04
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          # tty + stdin so `kubectl exec -it ... -- bash` gets a real shell
+          # and doesn't immediately close on EOF.
+          tty: true
+          stdin: true
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }

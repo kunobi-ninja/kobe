@@ -1,0 +1,34 @@
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: {{ .Values.pool.name }}
+  namespace: kobe-system
+spec:
+  size: {{ .Values.pool.size }}
+  ttl: {{ .Values.pool.ttl | quote }}
+  backend:
+    type: k3s
+  cluster:
+    version: {{ .Values.pool.k3s.version | quote }}
+    servers: {{ .Values.pool.k3s.servers }}
+    agents:  {{ .Values.pool.k3s.agents }}
+    serverArgs:
+      - "--disable=traefik"
+      - "--disable=metrics-server"
+      - "--disable=local-storage"
+      - "--kubelet-arg=cgroup-driver=cgroupfs"
+      - "--kubelet-arg=cgroups-per-qos=false"
+      - "--kubelet-arg=enforce-node-allocatable="
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 5
+  scaling:
+    minReady: {{ .Values.pool.minReady }}
+    maxClusters: {{ .Values.pool.maxClusters }}
+    scaleUpThreshold: 0
+    scaleDownAfter: 30m
+    queueTimeout: 5m
+  resources:
+    limits:
+      cpu: "1"
+      memory: 1Gi
