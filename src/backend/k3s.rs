@@ -925,6 +925,12 @@ impl ClusterBackend for K3sBackend {
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&cms, &format!("{name}-kubeconfig-publisher")).await?;
 
+        // Delete registries ConfigMap. Created conditionally in step 2b of
+        // create() when ClusterConfig::registry_mirrors is set; harmless 404
+        // when not. Without this, every recycled k3s instance leaks one
+        // `{name}-registries` CM — observed as ~230 stale CMs on an internal cluster.
+        Self::delete_ignoring_not_found(&cms, &format!("{name}-registries")).await?;
+
         // Delete secrets: token and kubeconfig
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-token")).await?;
