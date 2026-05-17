@@ -37,6 +37,9 @@ pub struct AppState<B: ClusterBackend> {
     pub namespace: String,
     pub backend: B,
     pub factory: Option<BackendFactory>,
+    /// Shared PostgreSQL pool when one is configured; `None` in
+    /// embedded-datastore mode. Consulted by the `/readyz` probe.
+    pub pg_pool: Option<sqlx::PgPool>,
 }
 
 /// Implement kunobi-auth's AuthnProvider so that RequiredAuth/OptionalAuth extractors work.
@@ -93,7 +96,7 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 /// Build the axum router with all API routes.
 ///
 /// API routes have a concurrency limit for DoS protection.
-/// Infrastructure routes (/healthz, /metrics) are exempt.
+/// Infrastructure routes (/livez, /readyz, /healthz, /metrics) are exempt.
 pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> Router {
     // Concurrency-limited API routes
     let api_routes = Router::new()
@@ -117,7 +120,11 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .merge(api_routes)
         .merge(connect_routes)
         .route("/v1/status", get(status::<B>))
-        .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz::<B>))
+        // Back-compat alias for liveness — kept so external monitoring
+        // pointed at the old path keeps working. New probes use /livez.
+        .route("/healthz", get(livez))
         .route("/metrics", get(metrics_handler::<B>))
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
@@ -163,7 +170,10 @@ async fn request_logging(mut request: axum::extract::Request, next: Next) -> Res
     let latency_ms = started.elapsed().as_millis() as u64;
     let status = response.status();
 
-    if !matches!(path.as_str(), "/healthz" | "/metrics") {
+    if !matches!(
+        path.as_str(),
+        "/livez" | "/readyz" | "/healthz" | "/metrics"
+    ) {
         if status.is_server_error() {
             warn!(
                 request_id = %request_id,
@@ -1710,8 +1720,67 @@ fn pool_matches(pool: &str, pattern: &str) -> bool {
     pool == pattern
 }
 
-async fn healthz() -> StatusCode {
+/// Liveness + startup probe target — answers only "is the process
+/// wedged? restart it." Unconditionally `200` and cheap: it must NOT
+/// check external dependencies. If it did, a dependency blip would fail
+/// liveness on every replica, the kubelet would kill them all, and the
+/// restart storm would crashloop while the dependency stayed down.
+///
+/// `/healthz` is wired to this same handler as a back-compat alias.
+async fn livez() -> StatusCode {
     StatusCode::OK
+}
+
+/// Per-check timeout for `/readyz`, so a hung dependency yields a `503`
+/// instead of blocking the probe until the kubelet's own timeout fires.
+const READYZ_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Readiness probe target — answers "can this pod serve right now?" by
+/// checking the dependencies kobe needs to do useful work. On failure it
+/// returns `503` so the pod is pulled out of the Service (traffic stops)
+/// without being restarted; a restart would not fix an external outage.
+async fn readyz<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response {
+    let mut failures = Vec::new();
+
+    // Kubernetes API — kobe is an operator; no request path works without it.
+    if let Err(e) = readyz_check_kubernetes(&state.client).await {
+        failures.push(format!("kubernetes: {e}"));
+    }
+
+    // PostgreSQL — only when a pool is configured. In embedded-datastore
+    // mode `pg_pool` is `None` and there is nothing to check.
+    if let Some(pool) = &state.pg_pool
+        && let Err(e) = readyz_check_postgres(pool).await
+    {
+        failures.push(format!("postgres: {e}"));
+    }
+
+    if failures.is_empty() {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        let detail = failures.join("; ");
+        warn!(detail = %detail, "Readiness check failed");
+        (StatusCode::SERVICE_UNAVAILABLE, detail).into_response()
+    }
+}
+
+/// Probe the Kubernetes API with a cheap `GET /version`.
+async fn readyz_check_kubernetes(client: &Client) -> Result<(), String> {
+    match tokio::time::timeout(READYZ_CHECK_TIMEOUT, client.apiserver_version()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("timed out".to_string()),
+    }
+}
+
+/// Probe PostgreSQL with a `SELECT 1` round-trip.
+async fn readyz_check_postgres(pool: &sqlx::PgPool) -> Result<(), String> {
+    let ping = sqlx::query("SELECT 1").execute(pool);
+    match tokio::time::timeout(READYZ_CHECK_TIMEOUT, ping).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("timed out".to_string()),
+    }
 }
 
 async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response {
@@ -1957,6 +2026,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
+            pg_pool: None,
         };
 
         (build_router(state), server)
@@ -2025,6 +2095,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_healthz_returns_200() {
+        // Back-compat alias — still serves liveness unconditionally.
         let (app, _server) = test_app().await;
 
         let req = http::Request::builder()
@@ -2034,6 +2105,67 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_livez_returns_200() {
+        let (app, _server) = test_app().await;
+
+        let req = http::Request::builder()
+            .uri("/livez")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_ok_when_kubernetes_reachable() {
+        let (app, server) = test_app().await;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "major": "1",
+                "minor": "31",
+                "gitVersion": "v1.31.3",
+                "gitCommit": "abcdef",
+                "gitTreeState": "clean",
+                "buildDate": "2026-01-01T00:00:00Z",
+                "goVersion": "go1.22",
+                "compiler": "gc",
+                "platform": "linux/amd64"
+            })))
+            .mount(&server)
+            .await;
+
+        let req = http::Request::builder()
+            .uri("/readyz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // No pg_pool configured, so only the Kubernetes check runs.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readyz_503_when_kubernetes_unreachable() {
+        // `/version` is left unmocked: wiremock answers 404, the kube
+        // client surfaces an error, and readiness must report 503.
+        let (app, _server) = test_app().await;
+
+        let req = http::Request::builder()
+            .uri("/readyz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response_text(resp).await.contains("kubernetes"));
     }
 
     #[tokio::test]
@@ -2086,6 +2218,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
+            pg_pool: None,
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -2158,6 +2291,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
+            pg_pool: None,
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -2226,6 +2360,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
+            pg_pool: None,
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(

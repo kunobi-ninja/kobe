@@ -75,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let factory = BackendFactory::new(client.clone(), pg_pool.clone(), pg_base_url.clone());
-    let backend = BackendDispatch::K3s(K3sBackend::new(client.clone(), pg_pool, pg_base_url));
+    let backend = BackendDispatch::K3s(K3sBackend::new(
+        client.clone(),
+        pg_pool.clone(),
+        pg_base_url,
+    ));
     let shutdown = CancellationToken::new();
     let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let ssh_namespace =
@@ -89,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         namespace: namespace.clone(),
         backend: backend.clone(),
         factory: Some(factory.clone()),
+        pg_pool,
     };
 
     let app = build_router(state);
