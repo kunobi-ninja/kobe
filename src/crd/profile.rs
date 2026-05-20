@@ -428,6 +428,25 @@ pub struct ClusterConfig {
     #[serde(skip)]
     #[allow(dead_code)]
     pub allocated_network: Option<crate::crd::ClusterInstanceNetwork>,
+
+    /// Resource requirements applied to each container the backend creates
+    /// for this cluster (k3s server + agent today). **Operator-internal**:
+    /// not part of the CRD spec users write — populated by the instance
+    /// reconciler from `ClusterPool.spec.resources` before invoking
+    /// `ClusterBackend::create`.
+    ///
+    /// Why this lives on `ClusterConfig` and not on a backend trait param:
+    /// the existing precedent (`allocated_network`) already uses this
+    /// pattern for pool-level inputs the backend needs at provisioning
+    /// time, and threading it here avoids touching the
+    /// [`crate::backend::ClusterBackend`] signature and every backend
+    /// implementation.
+    ///
+    /// `#[serde(skip)]` keeps it out of the CRD schema — users still set
+    /// limits via the pool-level [`ClusterPoolSpec::resources`] field.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    pub resources: Option<ResourceRequirements>,
 }
 
 /// A single taint applied to cluster nodes. Mirrors `core/v1.Taint`.
@@ -574,6 +593,42 @@ pub struct ResourceRequirements {
 
     #[serde(default)]
     pub requests: BTreeMap<String, String>,
+}
+
+impl ResourceRequirements {
+    /// Convert to the `k8s_openapi` shape expected by Container specs.
+    ///
+    /// `None` is returned when both maps are empty — that lets the
+    /// caller use `..Default::default()` semantics (no `resources:` field
+    /// emitted) instead of producing `{limits: {}, requests: {}}`.
+    // `#[allow(dead_code)]` keeps the `crdgen` binary happy: it imports
+    // this module purely to walk the JSON schema and never invokes
+    // runtime-only methods (same reason `allocated_network` carries the
+    // attribute one struct up).
+    #[allow(dead_code)]
+    pub fn to_k8s(&self) -> Option<k8s_openapi::api::core::v1::ResourceRequirements> {
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        if self.limits.is_empty() && self.requests.is_empty() {
+            return None;
+        }
+        let to_map = |m: &BTreeMap<String, String>| -> Option<BTreeMap<String, Quantity>> {
+            if m.is_empty() {
+                None
+            } else {
+                Some(
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), Quantity(v.clone())))
+                        .collect(),
+                )
+            }
+        };
+        Some(k8s_openapi::api::core::v1::ResourceRequirements {
+            limits: to_map(&self.limits),
+            requests: to_map(&self.requests),
+            ..Default::default()
+        })
+    }
 }
 
 // --- Enhancement: Health Probes ---

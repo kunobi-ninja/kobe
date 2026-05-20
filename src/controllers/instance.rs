@@ -604,18 +604,24 @@ async fn resolve_instance_config(
             return Err(anyhow::anyhow!("Owning pool {} not found", pool_ref.name).into());
         };
         let backend_type = profile.spec.backend.backend_type.clone();
+        let owner_name = profile.name_any();
+        let spec = profile.spec;
+        // Thread the pool-level `spec.resources` into the per-instance
+        // `ClusterConfig` so the backend can stamp it onto every container
+        // it creates. Without this, pool-level limits are silently dropped
+        // and pods land as BestEffort — the first thing kubelet evicts
+        // under host pressure.
+        let mut cluster = spec.cluster;
+        cluster.resources = spec.resources;
         return Ok(ResolvedInstanceConfig {
-            owner_name: profile.name_any(),
-            backend: profile.spec.backend,
-            cluster: profile.spec.cluster,
-            addons: profile.spec.addons,
-            bootstraps: profile.spec.bootstraps,
-            health_check: profile.spec.health_check,
-            readiness_gates: apply_default_readiness_gates(
-                backend_type,
-                profile.spec.readiness_gates,
-            ),
-            snapshot: profile.spec.snapshot,
+            owner_name,
+            backend: spec.backend,
+            cluster,
+            addons: spec.addons,
+            bootstraps: spec.bootstraps,
+            health_check: spec.health_check,
+            readiness_gates: apply_default_readiness_gates(backend_type, spec.readiness_gates),
+            snapshot: spec.snapshot,
         });
     }
 
@@ -880,7 +886,7 @@ fn synthetic_profile(config: &ResolvedInstanceConfig) -> ClusterPool {
             cluster: config.cluster.clone(),
             addons: config.addons.clone(),
             bootstraps: config.bootstraps.clone(),
-            resources: None,
+            resources: config.cluster.resources.clone(),
             health_check: config.health_check.clone(),
             readiness_gates: config.readiness_gates.clone(),
             scaling: None,

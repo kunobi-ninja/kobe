@@ -398,6 +398,12 @@ impl K3sBackend {
             command: Some(vec!["k3s".to_string()]),
             args: Some(args),
             volume_mounts: Some(volume_mounts),
+            // Honors `ClusterPool.spec.resources`. Without requests/limits
+            // the pod is `BestEffort` and the kubelet evicts it first under
+            // host memory pressure — which is what made `ci-k3s-kunobi`
+            // members stack on whichever host had the most slack and then
+            // CrashLoopBackOff together.
+            resources: config.resources.as_ref().and_then(|r| r.to_k8s()),
             ports: Some(vec![k8s_openapi::api::core::v1::ContainerPort {
                 container_port: 6443,
                 name: Some("api".to_string()),
@@ -692,6 +698,11 @@ impl K3sBackend {
                 "--token-file=/var/lib/k3s/token/token".to_string(),
             ]),
             volume_mounts: Some(volume_mounts),
+            // Mirror the server container's resource block so server and
+            // agent share the same QoS class — otherwise the agent could
+            // be evicted while the server keeps running and the cluster
+            // ends up only-control-plane.
+            resources: config.resources.as_ref().and_then(|r| r.to_k8s()),
             security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
                 privileged: Some(true),
                 ..Default::default()
@@ -1825,5 +1836,76 @@ mod tests {
         let result = backend.check_health("new-cluster", "test-ns").await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    /// Regression: `ClusterPool.spec.resources` must reach the k3s-server
+    /// container. Before this fix, the field was declared in the CRD but
+    /// silently dropped by the reconciler/backend, leaving pods as
+    /// BestEffort and first-to-evict under host pressure — see
+    /// `kunobi-ninja/kobe#NN` (ci-k3s-kunobi pool stuck Failing 2026-05-20).
+    #[test]
+    fn test_build_server_container_propagates_resources() {
+        use crate::crd::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let mut config = base_config();
+        config.resources = Some(ResourceRequirements {
+            limits: [("cpu".to_string(), "1".to_string())].into(),
+            requests: [("memory".to_string(), "512Mi".to_string())].into(),
+        });
+
+        let container = K3sBackend::build_server_container("c", "ns", &config, None);
+        let r = container
+            .resources
+            .as_ref()
+            .expect("k3s-server container must carry resources when pool sets them");
+        assert_eq!(
+            r.limits.as_ref().unwrap().get("cpu"),
+            Some(&Quantity("1".to_string())),
+        );
+        assert_eq!(
+            r.requests.as_ref().unwrap().get("memory"),
+            Some(&Quantity("512Mi".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_build_agent_deployment_propagates_resources() {
+        use crate::crd::ResourceRequirements;
+
+        let mut config = base_config();
+        config.resources = Some(ResourceRequirements {
+            limits: [("memory".to_string(), "1Gi".to_string())].into(),
+            requests: BTreeMap::new(),
+        });
+
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let pod = deploy.spec.unwrap().template.spec.unwrap();
+        let agent = &pod.containers[0];
+        let r = agent
+            .resources
+            .as_ref()
+            .expect("k3s-agent container must carry resources when pool sets them");
+        assert!(
+            r.limits.as_ref().unwrap().contains_key("memory"),
+            "memory limit must propagate to agent; got {r:?}"
+        );
+    }
+
+    /// Regression: when no resources are set on the pool, the backend
+    /// must NOT emit an empty `resources: {}` block — that would still
+    /// land the pod as BestEffort but with a noisier manifest. Behavior
+    /// must stay byte-identical to clusters created before the
+    /// propagation fix.
+    #[test]
+    fn test_build_server_container_no_resources_stays_none() {
+        let config = base_config();
+        assert!(config.resources.is_none());
+        let container = K3sBackend::build_server_container("c", "ns", &config, None);
+        assert!(
+            container.resources.is_none(),
+            "absent pool.spec.resources must yield no resources block; got {:?}",
+            container.resources
+        );
     }
 }
