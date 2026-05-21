@@ -9,15 +9,18 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use k8s_openapi::api::core::v1::{
+    NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PodAffinityTerm,
+    PodAntiAffinity, Secret, WeightedPodAffinityTerm,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use kube::api::{Api, Patch, PatchParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crd::{
     Addon, BackendType, BootstrapConfig, BootstrapJobSpec, BootstrapRef, ClusterConfig,
-    ClusterPool, ReadinessGate,
+    ClusterPool, InterInstanceSpread, ReadinessGate, SpreadStrength,
 };
 
 pub use capi::CapiBackend;
@@ -28,6 +31,115 @@ pub use vkobe::VkobeBackend;
 
 /// Allowed URL schemes for addon manifests and readiness probes.
 const ALLOWED_SCHEMES: &[&str] = &["https"];
+
+/// Label value identifying resources managed by the kobe-operator.
+/// Mirrored in the per-backend modules; kept here so the
+/// inter-instance anti-affinity selector below is consistent across
+/// backends.
+const MANAGED_BY: &str = "kobe-operator";
+
+// ─────────────────────────────────────────────────────────────────────
+// Placement rendering helpers shared by k3s and k0s backends.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Convert a [`LabelSelector`] from `placement.node.selector` into the
+/// equivalent `nodeAffinity.required` block.
+///
+/// `matchLabels` entries become `In`-operator [`NodeSelectorRequirement`]s
+/// and merge with `matchExpressions` into a single [`NodeSelectorTerm`]
+/// (logical AND across all requirements). Returns `None` for an
+/// empty/absent selector so callers don't emit an empty
+/// `nodeAffinity:` block.
+pub(crate) fn node_affinity_from_selector(
+    selector: Option<&LabelSelector>,
+) -> Option<NodeAffinity> {
+    let sel = selector?;
+    let mut requirements: Vec<NodeSelectorRequirement> = Vec::new();
+    if let Some(labels) = sel.match_labels.as_ref() {
+        for (k, v) in labels {
+            requirements.push(NodeSelectorRequirement {
+                key: k.clone(),
+                operator: "In".to_string(),
+                values: Some(vec![v.clone()]),
+            });
+        }
+    }
+    if let Some(exprs) = sel.match_expressions.as_ref() {
+        for e in exprs {
+            requirements.push(NodeSelectorRequirement {
+                key: e.key.clone(),
+                operator: e.operator.clone(),
+                values: e.values.clone(),
+            });
+        }
+    }
+    if requirements.is_empty() {
+        return None;
+    }
+    Some(NodeAffinity {
+        required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+            node_selector_terms: vec![NodeSelectorTerm {
+                match_expressions: Some(requirements),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    })
+}
+
+/// Build the `podAntiAffinity` used for inter-instance pool-member
+/// spread. The selector scopes to siblings of the SAME pool when
+/// `pool_name` is provided (the normal pool-managed case), and falls
+/// back to all kobe-operator-managed server pods when `None` (standalone
+/// instances that opt into spread — there's no pool to anti-affine
+/// against, so the soft fallback is the only sensible behavior).
+///
+/// Pool-scoping matters for `SpreadStrength::Required`: without it,
+/// setting `Required` on two pools sharing a host cluster causes
+/// cross-pool anti-affinity that can deadlock scheduling.
+///
+/// Rendering is identical for k3s and k0s backends, which is why this
+/// lives in the shared module.
+pub(crate) fn server_anti_affinity_terms(
+    spread: Option<&InterInstanceSpread>,
+    pool_name: Option<&str>,
+) -> Option<PodAntiAffinity> {
+    let s = spread?;
+    let mut selector_labels = std::collections::BTreeMap::new();
+    selector_labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        MANAGED_BY.to_string(),
+    );
+    selector_labels.insert("kobe.kunobi.ninja/role".to_string(), "server".to_string());
+    if let Some(p) = pool_name {
+        selector_labels.insert("kobe.kunobi.ninja/pool".to_string(), p.to_string());
+    }
+
+    let term = PodAffinityTerm {
+        label_selector: Some(LabelSelector {
+            match_labels: Some(selector_labels),
+            ..Default::default()
+        }),
+        topology_key: s.topology_key.clone(),
+        ..Default::default()
+    };
+
+    Some(match s.strength {
+        SpreadStrength::Preferred => PodAntiAffinity {
+            preferred_during_scheduling_ignored_during_execution: Some(vec![
+                WeightedPodAffinityTerm {
+                    weight: 100,
+                    pod_affinity_term: term,
+                },
+            ]),
+            ..Default::default()
+        },
+        SpreadStrength::Required => PodAntiAffinity {
+            required_during_scheduling_ignored_during_execution: Some(vec![term]),
+            ..Default::default()
+        },
+    })
+}
 
 // ---------------------------------------------------------------------------
 // BackendDispatch — enum dispatch for ClusterBackend implementations

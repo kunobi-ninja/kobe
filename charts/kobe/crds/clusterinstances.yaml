@@ -258,31 +258,6 @@ spec:
                     required:
                     - exposeType
                     type: object
-                  nodePlacement:
-                    description: |-
-                      Node placement strategy for the cluster's pods. When omitted, the
-                      scheduler picks any eligible node independently for each pod.
-
-                      Currently meaningful for the k3s backend, which has split server
-                      and agent pods. For single-pod backends (vkobe) this is a no-op.
-                    nullable: true
-                    properties:
-                      mode:
-                        description: Placement mode.
-                        enum:
-                        - Any
-                        - SameHost
-                        type: string
-                      spread:
-                        description: Strength of the inter-instance spread constraint.
-                        enum:
-                        - Preferred
-                        - Required
-                        nullable: true
-                        type: string
-                    required:
-                    - mode
-                    type: object
                   persistence:
                     description: Persistence config.
                     nullable: true
@@ -299,6 +274,149 @@ spec:
                         description: 'Storage type: "emptyDir", "dynamic", etc.'
                         nullable: true
                         type: string
+                    type: object
+                  placement:
+                    description: |-
+                      Node placement strategy for the cluster's pods. When omitted, the
+                      scheduler picks any eligible node independently for each pod.
+
+                      The block splits placement into orthogonal concerns:
+                      - `placement.node` — per-pod node selection (label selector +
+                        tolerations). Affects which Kubernetes nodes the pods can land
+                        on at all.
+                      - `placement.intraInstance` — co-location within ONE
+                        `ClusterInstance` (server pod ↔ agent pods of the same cluster).
+                      - `placement.interInstance` — spread across DIFFERENT
+                        `ClusterInstance`s (pool members relative to each other).
+
+                      Currently meaningful for the k3s and k0s backends, which have
+                      split server and agent pods. The vcluster and vkobe backends
+                      ignore placement (they reuse the host cluster's pod plane).
+                    nullable: true
+                    properties:
+                      interInstance:
+                        description: Inter-instance spread of pool members across hosts.
+                        nullable: true
+                        properties:
+                          spread:
+                            description: |-
+                              Anti-affinity spread configuration. When omitted, no
+                              inter-instance constraint is rendered.
+                            nullable: true
+                            properties:
+                              strength:
+                                description: Strength of the spread constraint — soft hint vs. hard requirement.
+                                enum:
+                                - Preferred
+                                - Required
+                                type: string
+                              topologyKey:
+                                default: kubernetes.io/hostname
+                                description: |-
+                                  Topology domain to spread across. Defaults to
+                                  `kubernetes.io/hostname` when omitted (host-level spread). Set
+                                  to a rack/zone/region label to spread across a coarser domain.
+                                type: string
+                            required:
+                            - strength
+                            type: object
+                        type: object
+                      intraInstance:
+                        description: |-
+                          Intra-instance co-location of pods within ONE `ClusterInstance`
+                          (server vs agent of the same cluster).
+                        nullable: true
+                        properties:
+                          mode:
+                            description: |-
+                              Co-location mode for the instance's pods.
+
+                              - `Any` (default): scheduler picks each pod's node independently.
+                              - `SameHost`: agent pods are forced onto the server pod's node
+                                via a required `kubernetes.io/hostname` podAffinity, used to
+                                side-step host clusters with broken cross-node pod routing.
+                            enum:
+                            - Any
+                            - SameHost
+                            type: string
+                        required:
+                        - mode
+                        type: object
+                      node:
+                        description: |-
+                          Per-pod node selection: which nodes can host the cluster's pods,
+                          and which taints those pods tolerate. Rendered to `nodeAffinity`
+                          and `tolerations` on EVERY pod the backend creates (server
+                          StatefulSet and agent Deployment).
+                        nullable: true
+                        properties:
+                          selector:
+                            description: |-
+                              Label selector restricting which nodes may host the cluster's
+                              pods. Rendered into `spec.affinity.nodeAffinity.requiredDuring
+                              SchedulingIgnoredDuringExecution` on every pod. When omitted,
+                              no node-selector constraint is emitted.
+
+                              Both `matchLabels` and `matchExpressions` are honored.
+                              `matchLabels` entries become `In`-operator `NodeSelectorRequirement`s
+                              and merge with `matchExpressions` into a single `NodeSelectorTerm`
+                              (a logical AND across all requirements).
+                            nullable: true
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                          tolerations:
+                            description: |-
+                              Tolerations applied verbatim to every pod the backend creates.
+                              Shape matches `core/v1.Toleration` (key/operator/value/effect/
+                              tolerationSeconds).
+                            items:
+                              description: The pod this Toleration is attached to tolerates any taint that matches the triple <key,value,effect> using the matching operator <operator>.
+                              properties:
+                                effect:
+                                  description: Effect indicates the taint effect to match. Empty means match all taint effects. When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                                  type: string
+                                key:
+                                  description: Key is the taint key that the toleration applies to. Empty means match all taint keys. If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                                  type: string
+                                operator:
+                                  description: Operator represents a key's relationship to the value. Valid operators are Exists and Equal. Defaults to Equal. Exists is equivalent to wildcard for value, so that a pod can tolerate all taints of a particular category.
+                                  type: string
+                                tolerationSeconds:
+                                  description: TolerationSeconds represents the period of time the toleration (which must be of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default, it is not set, which means tolerate the taint forever (do not evict). Zero and negative values will be treated as 0 (evict immediately) by the system.
+                                  format: int64
+                                  type: integer
+                                value:
+                                  description: Value is the taint value the toleration matches to. If the operator is Exists, the value should be empty, otherwise just a regular string.
+                                  type: string
+                              type: object
+                            type: array
+                        type: object
                     type: object
                   registryMirrors:
                     additionalProperties:

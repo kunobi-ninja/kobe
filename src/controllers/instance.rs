@@ -687,6 +687,12 @@ async fn resolve_instance_config(
         // under host pressure.
         let mut cluster = spec.cluster;
         cluster.resources = spec.resources;
+        // Stamp the owning pool name so the backend can apply a
+        // `kobe.kunobi.ninja/pool=<name>` label on every pod it creates.
+        // Lets the inter-instance spread anti-affinity scope to
+        // siblings of the SAME pool rather than every kobe-managed
+        // server pod on the host cluster.
+        cluster.pool_name = Some(owner_name.clone());
         return Ok(ResolvedInstanceConfig {
             owner_name,
             backend: spec.backend,

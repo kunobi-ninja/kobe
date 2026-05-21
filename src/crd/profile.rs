@@ -363,10 +363,20 @@ pub struct ClusterConfig {
     /// Node placement strategy for the cluster's pods. When omitted, the
     /// scheduler picks any eligible node independently for each pod.
     ///
-    /// Currently meaningful for the k3s backend, which has split server
-    /// and agent pods. For single-pod backends (vkobe) this is a no-op.
+    /// The block splits placement into orthogonal concerns:
+    /// - `placement.node` — per-pod node selection (label selector +
+    ///   tolerations). Affects which Kubernetes nodes the pods can land
+    ///   on at all.
+    /// - `placement.intraInstance` — co-location within ONE
+    ///   `ClusterInstance` (server pod ↔ agent pods of the same cluster).
+    /// - `placement.interInstance` — spread across DIFFERENT
+    ///   `ClusterInstance`s (pool members relative to each other).
+    ///
+    /// Currently meaningful for the k3s and k0s backends, which have
+    /// split server and agent pods. The vcluster and vkobe backends
+    /// ignore placement (they reuse the host cluster's pod plane).
     #[serde(default)]
-    pub node_placement: Option<NodePlacement>,
+    pub placement: Option<Placement>,
 
     /// Kubernetes cluster DNS domain (defaults to `cluster.local`).
     /// Used to build the FQDN of the cluster's API Service for the
@@ -447,6 +457,25 @@ pub struct ClusterConfig {
     #[serde(skip)]
     #[allow(dead_code)]
     pub resources: Option<ResourceRequirements>,
+
+    /// Name of the `ClusterPool` that owns this instance — operator-
+    /// internal, populated by the reconciler from
+    /// `ClusterInstance.spec.poolRef.name` before invoking
+    /// `ClusterBackend::create`. `None` for standalone instances.
+    ///
+    /// Used to stamp `kobe.kunobi.ninja/pool=<name>` onto every pod
+    /// the backend creates, so the inter-instance spread anti-affinity
+    /// selector can scope to siblings of the SAME pool rather than
+    /// every kobe-managed server pod on the host cluster. Cross-pool
+    /// anti-affinity would deadlock multi-pool clusters when
+    /// `spread.strength: Required` is set on more than one pool.
+    ///
+    /// Same `#[serde(skip)]` precedent as `allocated_network` and
+    /// `resources`: kept out of every wire format; lives only inside
+    /// in-memory `ResolvedInstanceConfig`.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    pub pool_name: Option<String>,
 }
 
 /// A single taint applied to cluster nodes. Mirrors `core/v1.Taint`.
@@ -504,47 +533,93 @@ impl NodeTaint {
     }
 }
 
-/// Node placement strategy for cluster pods (server + agents).
-///
-/// Wrapped in a struct so future extensions (custom topology key,
-/// additional knobs) can be added next to `mode` without breaking
-/// existing manifests.
-///
-/// `mode` and `spread` are orthogonal:
-/// - `mode` controls **intra-instance** placement (server ↔ agent of the
-///   same cluster), used to side-step broken cross-host pod routing.
-/// - `spread` controls **inter-instance** placement (pool members of
-///   different ClusterInstances relative to each other), used to keep
-///   one busy host from collecting every pool member.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct NodePlacement {
-    /// Placement mode.
-    pub mode: NodePlacementMode,
+// ─────────────────────────────────────────────────────────────────────
+// Placement API — v0.26 (closes #96)
+//
+// The shape below mirrors RFC #96. Three orthogonal sub-blocks let an
+// operator choose node-level constraints (selector + tolerations),
+// intra-instance co-location (server ↔ agent of ONE cluster), and
+// inter-instance spread (pool members across DIFFERENT clusters)
+// independently. Backends read `cluster.placement` directly — there is
+// no internal canonicalization step.
+// ─────────────────────────────────────────────────────────────────────
 
-    /// Inter-instance spread across physical hosts. Controls the
-    /// `podAntiAffinity` rendered on the server StatefulSet so multiple
-    /// pool members don't pile onto the same node.
-    ///
-    /// When omitted, no anti-affinity is emitted — manifests stay
-    /// byte-identical to clusters created before this field existed.
-    ///
-    /// Selector matches sibling kobe-operator-managed k3s servers on the
-    /// host (label `app.kubernetes.io/managed-by=kobe-operator` AND
-    /// `kobe.kunobi.ninja/role=server`). On a multi-pool host cluster
-    /// this spreads across *all* k3s server pods — usually still the
-    /// desired effect; if you ever need pool-scoped spread, the agent's
-    /// existing `SameHost` co-location keeps each pool member's
-    /// server+agent paired regardless.
+/// Placement strategy for the cluster's pods.
+///
+/// Three independent levers, each scoped to a different topology level:
+///
+/// | Field | Topology level | Effect |
+/// |-------|----------------|--------|
+/// | `node` | per-pod | Restricts the set of nodes any pod of this cluster may land on (selector) and which taints those pods tolerate. |
+/// | `intraInstance` | server ↔ agent of ONE cluster | Forces agents onto the same host as their server (e.g. when cross-host pod routing on the host is broken). |
+/// | `interInstance` | pool member ↔ pool member | Spreads `ClusterInstance`s of the same backend type across distinct hosts so one busy node doesn't collect every pool member. |
+///
+/// All fields are optional and orthogonal — populating one does not
+/// imply anything about the others.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Placement {
+    /// Per-pod node selection: which nodes can host the cluster's pods,
+    /// and which taints those pods tolerate. Rendered to `nodeAffinity`
+    /// and `tolerations` on EVERY pod the backend creates (server
+    /// StatefulSet and agent Deployment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spread: Option<InstanceSpread>,
+    pub node: Option<NodePlacement>,
+
+    /// Intra-instance co-location of pods within ONE `ClusterInstance`
+    /// (server vs agent of the same cluster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intra_instance: Option<IntraInstancePlacement>,
+
+    /// Inter-instance spread of pool members across hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inter_instance: Option<InterInstancePlacement>,
 }
 
-/// Placement mode for `NodePlacement`. New variants can be added without
-/// changing the parent struct's shape on disk.
+/// Per-pod node selection. Mirrors the Kubernetes `nodeAffinity` /
+/// `tolerations` pair on a PodSpec, scoped to all pods the backend
+/// creates for one `ClusterInstance`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePlacement {
+    /// Label selector restricting which nodes may host the cluster's
+    /// pods. Rendered into `spec.affinity.nodeAffinity.requiredDuring
+    /// SchedulingIgnoredDuringExecution` on every pod. When omitted,
+    /// no node-selector constraint is emitted.
+    ///
+    /// Both `matchLabels` and `matchExpressions` are honored.
+    /// `matchLabels` entries become `In`-operator `NodeSelectorRequirement`s
+    /// and merge with `matchExpressions` into a single `NodeSelectorTerm`
+    /// (a logical AND across all requirements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector>,
+
+    /// Tolerations applied verbatim to every pod the backend creates.
+    /// Shape matches `core/v1.Toleration` (key/operator/value/effect/
+    /// tolerationSeconds).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
+}
+
+/// Co-location of pods that belong to the SAME `ClusterInstance`
+/// (server pod and its agent pods).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IntraInstancePlacement {
+    /// Co-location mode for the instance's pods.
+    ///
+    /// - `Any` (default): scheduler picks each pod's node independently.
+    /// - `SameHost`: agent pods are forced onto the server pod's node
+    ///   via a required `kubernetes.io/hostname` podAffinity, used to
+    ///   side-step host clusters with broken cross-node pod routing.
+    pub mode: IntraPlacementMode,
+}
+
+/// Intra-instance placement mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum NodePlacementMode {
-    /// Scheduler picks any eligible node independently for each pod.
+pub enum IntraPlacementMode {
+    /// Scheduler picks any eligible node independently for each pod of
+    /// the instance. Default.
     #[default]
     Any,
     /// Force agent pods to schedule on the same physical host as the
@@ -554,19 +629,51 @@ pub enum NodePlacementMode {
     SameHost,
 }
 
+/// Spread of `ClusterInstance` pool members across hosts.
+///
+/// `strength` (Preferred|Required) lives inside a nested `spread` block
+/// to leave room for future spread knobs, and `topologyKey` is
+/// configurable (defaults to `kubernetes.io/hostname`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InterInstancePlacement {
+    /// Anti-affinity spread configuration. When omitted, no
+    /// inter-instance constraint is rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<InterInstanceSpread>,
+}
+
+/// Inter-instance spread parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InterInstanceSpread {
+    /// Strength of the spread constraint — soft hint vs. hard requirement.
+    pub strength: SpreadStrength,
+
+    /// Topology domain to spread across. Defaults to
+    /// `kubernetes.io/hostname` when omitted (host-level spread). Set
+    /// to a rack/zone/region label to spread across a coarser domain.
+    #[serde(default = "default_topology_key")]
+    pub topology_key: String,
+}
+
 /// Strength of the inter-instance spread constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum InstanceSpread {
+pub enum SpreadStrength {
     /// `preferredDuringSchedulingIgnoredDuringExecution` with weight=100.
     /// Soft hint — the scheduler tries to spread but falls back to
     /// co-location when no other host has capacity. Safe on single-host
     /// clusters (still schedules).
     Preferred,
     /// `requiredDuringSchedulingIgnoredDuringExecution`. Hard constraint:
-    /// at most one pool member per host. Pods stay Pending when the
-    /// number of eligible hosts is less than the pool size — only set
-    /// this when `hosts >= maxClusters`.
+    /// at most one pool member per topology domain. Pods stay Pending
+    /// when the number of eligible domains is less than the pool size —
+    /// only set this when `domains >= maxClusters`.
     Required,
+}
+
+fn default_topology_key() -> String {
+    "kubernetes.io/hostname".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

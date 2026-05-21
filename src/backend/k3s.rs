@@ -15,9 +15,9 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, Container, EnvVar, KeyToPath, PodAffinity, PodAffinityTerm,
-    PodAntiAffinity, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort,
-    ServiceSpec, Volume, VolumeMount, WeightedPodAffinityTerm,
+    Affinity, ConfigMap, Container, EnvVar, KeyToPath, PodAffinity, PodAffinityTerm, PodSpec,
+    PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration,
+    Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -27,13 +27,12 @@ use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{
-    Addon, ClusterConfig, InstanceSpread, NodePlacement, NodePlacementMode, ReadinessGate,
-};
+use crate::crd::{Addon, ClusterConfig, IntraPlacementMode, Placement, ReadinessGate};
 
 use super::{
     ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
-    read_kubeconfig_secret, virtual_client_from_kubeconfig,
+    node_affinity_from_selector, read_kubeconfig_secret, server_anti_affinity_terms,
+    virtual_client_from_kubeconfig,
 };
 
 /// Labels applied to all resources managed by this backend.
@@ -151,26 +150,35 @@ impl K3sBackend {
     }
 
     /// Standard labels for resources belonging to a cluster.
-    fn cluster_labels(name: &str) -> BTreeMap<String, String> {
+    ///
+    /// When `pool_name` is `Some`, also stamps
+    /// `kobe.kunobi.ninja/pool=<name>` so the inter-instance spread
+    /// anti-affinity selector can scope to siblings of the same pool
+    /// (`server_anti_affinity_terms` in [`crate::backend`]). Standalone
+    /// instances pass `None`.
+    fn cluster_labels(name: &str, pool_name: Option<&str>) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         labels.insert("kobe.kunobi.ninja/cluster".to_string(), name.to_string());
         labels.insert(
             "app.kubernetes.io/managed-by".to_string(),
             MANAGED_BY.to_string(),
         );
+        if let Some(p) = pool_name {
+            labels.insert("kobe.kunobi.ninja/pool".to_string(), p.to_string());
+        }
         labels
     }
 
     /// Labels for server pods specifically.
-    fn server_labels(name: &str) -> BTreeMap<String, String> {
-        let mut labels = Self::cluster_labels(name);
+    fn server_labels(name: &str, pool_name: Option<&str>) -> BTreeMap<String, String> {
+        let mut labels = Self::cluster_labels(name, pool_name);
         labels.insert("kobe.kunobi.ninja/role".to_string(), "server".to_string());
         labels
     }
 
     /// Labels for agent pods specifically.
-    fn agent_labels(name: &str) -> BTreeMap<String, String> {
-        let mut labels = Self::cluster_labels(name);
+    fn agent_labels(name: &str, pool_name: Option<&str>) -> BTreeMap<String, String> {
+        let mut labels = Self::cluster_labels(name, pool_name);
         labels.insert("kobe.kunobi.ninja/role".to_string(), "agent".to_string());
         labels
     }
@@ -185,7 +193,7 @@ impl K3sBackend {
             metadata: ObjectMeta {
                 name: Some(secret_name.clone()),
                 namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name)),
+                labels: Some(Self::cluster_labels(name, None)),
                 ..Default::default()
             },
             string_data: Some({
@@ -218,7 +226,7 @@ impl K3sBackend {
             metadata: ObjectMeta {
                 name: Some(cm_name.clone()),
                 namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name)),
+                labels: Some(Self::cluster_labels(name, None)),
                 ..Default::default()
             },
             data: Some({
@@ -269,7 +277,7 @@ impl K3sBackend {
             metadata: ObjectMeta {
                 name: Some(cm_name.clone()),
                 namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name)),
+                labels: Some(Self::cluster_labels(name, config.pool_name.as_deref())),
                 ..Default::default()
             },
             data: Some({
@@ -556,7 +564,8 @@ impl K3sBackend {
         datastore_endpoint: Option<&str>,
     ) -> StatefulSet {
         let image = k3s_image(&config.version);
-        let labels = Self::server_labels(name);
+        let pool = config.pool_name.as_deref();
+        let labels = Self::server_labels(name, pool);
 
         let server_container =
             Self::build_server_container(name, namespace, config, datastore_endpoint);
@@ -585,7 +594,8 @@ impl K3sBackend {
                     }),
                     spec: Some(PodSpec {
                         containers: vec![server_container, publisher_sidecar],
-                        affinity: Self::server_anti_affinity(config.node_placement.as_ref()),
+                        affinity: Self::server_affinity(config.placement.as_ref(), pool),
+                        tolerations: Self::pod_tolerations(config.placement.as_ref()),
                         volumes: Some(volumes),
                         service_account_name: Some(
                             std::env::var("POOL_SERVICE_ACCOUNT")
@@ -602,7 +612,8 @@ impl K3sBackend {
 
     /// Build the ClusterIP Service for the k3s API server.
     fn build_service(name: &str, namespace: &str, config: &ClusterConfig) -> Service {
-        let labels = Self::server_labels(name);
+        let pool = config.pool_name.as_deref();
+        let labels = Self::server_labels(name, pool);
 
         let service_type = config
             .expose
@@ -616,7 +627,7 @@ impl K3sBackend {
             metadata: ObjectMeta {
                 name: Some(format!("{name}-server")),
                 namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name)),
+                labels: Some(Self::cluster_labels(name, pool)),
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
@@ -636,81 +647,90 @@ impl K3sBackend {
         }
     }
 
-    /// Build the server pod anti-affinity for inter-instance spread.
+    /// Build the server pod affinity block from [`Placement`].
+    /// Combines, in one `Affinity`:
     ///
-    /// Returns `None` when `spread` is omitted, so the StatefulSet stays
-    /// byte-identical to clusters predating the field.
+    /// - `nodeAffinity` from `placement.node.selector`
+    /// - `podAntiAffinity` from `placement.interInstance.spread`
     ///
-    /// Selector matches all kobe-operator-managed k3s server pods on the
-    /// host (label `app.kubernetes.io/managed-by=kobe-operator` AND
-    /// `kobe.kunobi.ninja/role=server`), topology
-    /// `kubernetes.io/hostname`. The pod being scheduled doesn't match
-    /// itself (Kubernetes evaluates the selector against *other* pods),
-    /// so this is safe for the `replicas=1` server StatefulSet.
-    fn server_anti_affinity(placement: Option<&NodePlacement>) -> Option<Affinity> {
-        let spread = placement.and_then(|p| p.spread)?;
-
-        let mut selector_labels = BTreeMap::new();
-        selector_labels.insert(
-            "app.kubernetes.io/managed-by".to_string(),
-            MANAGED_BY.to_string(),
+    /// Returns `None` when neither would render anything, so the
+    /// StatefulSet stays byte-identical to clusters where placement was
+    /// untouched. The intra-instance `SameHost` mode is irrelevant for
+    /// the server (it's already the anchor pod the agents co-locate to).
+    fn server_affinity(placement: Option<&Placement>, pool_name: Option<&str>) -> Option<Affinity> {
+        let p = placement?;
+        let node_affinity =
+            node_affinity_from_selector(p.node.as_ref().and_then(|n| n.selector.as_ref()));
+        let pod_anti_affinity = server_anti_affinity_terms(
+            p.inter_instance.as_ref().and_then(|i| i.spread.as_ref()),
+            pool_name,
         );
-        selector_labels.insert("kobe.kunobi.ninja/role".to_string(), "server".to_string());
-
-        let term = PodAffinityTerm {
-            label_selector: Some(LabelSelector {
-                match_labels: Some(selector_labels),
-                ..Default::default()
-            }),
-            topology_key: "kubernetes.io/hostname".to_string(),
-            ..Default::default()
-        };
-
-        let anti = match spread {
-            InstanceSpread::Preferred => PodAntiAffinity {
-                preferred_during_scheduling_ignored_during_execution: Some(vec![
-                    WeightedPodAffinityTerm {
-                        weight: 100,
-                        pod_affinity_term: term,
-                    },
-                ]),
-                ..Default::default()
-            },
-            InstanceSpread::Required => PodAntiAffinity {
-                required_during_scheduling_ignored_during_execution: Some(vec![term]),
-                ..Default::default()
-            },
-        };
-
+        if node_affinity.is_none() && pod_anti_affinity.is_none() {
+            return None;
+        }
         Some(Affinity {
-            pod_anti_affinity: Some(anti),
+            node_affinity,
+            pod_anti_affinity,
             ..Default::default()
         })
     }
 
-    /// Build the agent pod affinity based on the configured placement.
-    /// Returns `None` for `Any` (default) so the rendered Deployment stays
-    /// byte-identical to clusters predating this field.
-    fn agent_affinity(name: &str, placement: Option<&NodePlacement>) -> Option<Affinity> {
-        let mode = placement.map(|p| p.mode).unwrap_or_default();
-        match mode {
-            NodePlacementMode::Any => None,
-            NodePlacementMode::SameHost => Some(Affinity {
-                pod_affinity: Some(PodAffinity {
-                    required_during_scheduling_ignored_during_execution: Some(vec![
-                        PodAffinityTerm {
-                            label_selector: Some(LabelSelector {
-                                match_labels: Some(Self::server_labels(name)),
-                                ..Default::default()
-                            }),
-                            topology_key: "kubernetes.io/hostname".to_string(),
-                            ..Default::default()
-                        },
-                    ]),
+    /// Build the agent pod affinity block from [`Placement`]. Combines:
+    ///
+    /// - `nodeAffinity` from `placement.node.selector`
+    /// - `podAffinity` (intra-instance co-location) when
+    ///   `placement.intraInstance.mode == SameHost`
+    ///
+    /// Returns `None` when none of the above renders anything, so the
+    /// Deployment stays byte-identical to clusters where placement was
+    /// untouched.
+    fn agent_affinity(
+        name: &str,
+        placement: Option<&Placement>,
+        pool_name: Option<&str>,
+    ) -> Option<Affinity> {
+        let p = placement?;
+        let node_affinity =
+            node_affinity_from_selector(p.node.as_ref().and_then(|n| n.selector.as_ref()));
+        let intra_mode = p
+            .intra_instance
+            .as_ref()
+            .map(|i| i.mode)
+            .unwrap_or_default();
+        let pod_affinity = match intra_mode {
+            IntraPlacementMode::Any => None,
+            IntraPlacementMode::SameHost => Some(PodAffinity {
+                required_during_scheduling_ignored_during_execution: Some(vec![PodAffinityTerm {
+                    label_selector: Some(LabelSelector {
+                        match_labels: Some(Self::server_labels(name, pool_name)),
+                        ..Default::default()
+                    }),
+                    topology_key: "kubernetes.io/hostname".to_string(),
                     ..Default::default()
-                }),
+                }]),
                 ..Default::default()
             }),
+        };
+        if node_affinity.is_none() && pod_affinity.is_none() {
+            return None;
+        }
+        Some(Affinity {
+            node_affinity,
+            pod_affinity,
+            ..Default::default()
+        })
+    }
+
+    /// Tolerations to stamp on every pod the backend creates. Returns
+    /// `None` when `placement.node.tolerations` is absent or empty so
+    /// no `tolerations:` block is emitted (byte-identical with old
+    /// manifests).
+    fn pod_tolerations(placement: Option<&Placement>) -> Option<Vec<Toleration>> {
+        let tols = placement?.node.as_ref().map(|n| &n.tolerations)?;
+        if tols.is_empty() {
+            None
+        } else {
+            Some(tols.clone())
         }
     }
 
@@ -722,7 +742,8 @@ impl K3sBackend {
         replicas: u32,
     ) -> Deployment {
         let image = k3s_image(&config.version);
-        let labels = Self::agent_labels(name);
+        let pool = config.pool_name.as_deref();
+        let labels = Self::agent_labels(name, pool);
         let domain = cluster_domain(config);
 
         let mut volume_mounts = vec![VolumeMount {
@@ -809,7 +830,8 @@ impl K3sBackend {
                     }),
                     spec: Some(PodSpec {
                         containers: vec![container],
-                        affinity: Self::agent_affinity(name, config.node_placement.as_ref()),
+                        affinity: Self::agent_affinity(name, config.placement.as_ref(), pool),
+                        tolerations: Self::pod_tolerations(config.placement.as_ref()),
                         volumes: Some(volumes),
                         ..Default::default()
                     }),
@@ -1536,13 +1558,20 @@ mod tests {
         assert!(args.contains(&"--tls-san=my-cluster-server.ns.svc.cluster.local".to_string()));
     }
 
+    /// `intraInstance.mode: SameHost` renders a required agent
+    /// podAffinity onto the server pod's host. Anchored to the
+    /// historical "same_host_placement" behavior name.
     #[test]
     fn test_build_agent_deployment_same_host_placement() {
-        let config = ClusterConfig {
-            node_placement: Some(NodePlacement {
-                mode: NodePlacementMode::SameHost,
-                ..Default::default()
+        use crate::crd::{IntraInstancePlacement, IntraPlacementMode, Placement};
+        let placement = Placement {
+            intra_instance: Some(IntraInstancePlacement {
+                mode: IntraPlacementMode::SameHost,
             }),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            placement: Some(placement),
             ..base_config()
         };
         let deploy = K3sBackend::build_agent_deployment("my-cluster", "ns", &config, 1);
@@ -1584,14 +1613,19 @@ mod tests {
         assert!(affinity.node_affinity.is_none());
     }
 
+    /// Explicit `intraInstance.mode: Any` (the default) stays
+    /// indistinguishable from omitting the field — no affinity rendered.
     #[test]
     fn test_build_agent_deployment_explicit_any_placement_renders_no_affinity() {
-        // Explicit `Any` should be indistinguishable from omitting the field.
-        let config = ClusterConfig {
-            node_placement: Some(NodePlacement {
-                mode: NodePlacementMode::Any,
-                ..Default::default()
+        use crate::crd::{IntraInstancePlacement, IntraPlacementMode, Placement};
+        let placement = Placement {
+            intra_instance: Some(IntraInstancePlacement {
+                mode: IntraPlacementMode::Any,
             }),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            placement: Some(placement),
             ..base_config()
         };
         let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
@@ -1601,7 +1635,7 @@ mod tests {
 
     #[test]
     fn test_cluster_labels() {
-        let labels = K3sBackend::cluster_labels("my-cluster");
+        let labels = K3sBackend::cluster_labels("my-cluster", None);
         assert_eq!(
             labels.get("kobe.kunobi.ninja/cluster").unwrap(),
             "my-cluster"
@@ -1610,18 +1644,35 @@ mod tests {
             labels.get("app.kubernetes.io/managed-by").unwrap(),
             MANAGED_BY
         );
+        assert!(
+            !labels.contains_key("kobe.kunobi.ninja/pool"),
+            "pool label must be absent when pool_name is None (standalone case)"
+        );
+    }
+
+    /// Regression: setting `pool_name` stamps the pool label so the
+    /// inter-instance spread anti-affinity selector can scope to
+    /// siblings of the same pool. Without this, cross-pool anti-affinity
+    /// can deadlock multi-pool clusters running `spread.strength: Required`.
+    #[test]
+    fn test_cluster_labels_stamps_pool_when_set() {
+        let labels = K3sBackend::cluster_labels("pool-ci-k3s-kunobi-42", Some("ci-k3s-kunobi"));
+        assert_eq!(
+            labels.get("kobe.kunobi.ninja/pool").unwrap(),
+            "ci-k3s-kunobi"
+        );
     }
 
     #[test]
     fn test_server_labels_include_role() {
-        let labels = K3sBackend::server_labels("c1");
+        let labels = K3sBackend::server_labels("c1", None);
         assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "server");
         assert!(labels.contains_key("kobe.kunobi.ninja/cluster"));
     }
 
     #[test]
     fn test_agent_labels_include_role() {
-        let labels = K3sBackend::agent_labels("c1");
+        let labels = K3sBackend::agent_labels("c1", None);
         assert_eq!(labels.get("kobe.kunobi.ninja/role").unwrap(), "agent");
     }
 
@@ -2065,28 +2116,32 @@ mod tests {
         );
     }
 
-    /// Regression: without `nodePlacement.spread`, the server StatefulSet
+    /// Regression: without any placement set, the server StatefulSet
     /// renders no `affinity` block — manifests stay byte-identical to
-    /// clusters created before the field existed.
+    /// clusters created before placement existed.
     #[test]
     fn test_build_server_statefulset_no_spread_renders_no_affinity() {
         let config = base_config();
-        assert!(config.node_placement.is_none());
+        assert!(config.placement.is_none());
         let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(pod_spec.affinity.is_none());
     }
 
-    /// `NodePlacement { mode: SameHost, spread: None }` must NOT cause the
-    /// server StatefulSet to grow an `affinity` block — `spread` and
-    /// `mode` are independent, and `mode` is an agent-deployment concern.
+    /// `intraInstance.mode: SameHost` alone must NOT cause the server
+    /// StatefulSet to grow an `affinity` block — intra-instance is an
+    /// agent-deployment concern, the server is the anchor pod.
     #[test]
     fn test_build_server_statefulset_samehost_alone_renders_no_affinity() {
-        let config = ClusterConfig {
-            node_placement: Some(NodePlacement {
-                mode: NodePlacementMode::SameHost,
-                spread: None,
+        use crate::crd::{IntraInstancePlacement, IntraPlacementMode, Placement};
+        let placement = Placement {
+            intra_instance: Some(IntraInstancePlacement {
+                mode: IntraPlacementMode::SameHost,
             }),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            placement: Some(placement),
             ..base_config()
         };
         let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
@@ -2094,15 +2149,23 @@ mod tests {
         assert!(pod_spec.affinity.is_none());
     }
 
-    /// `spread: Preferred` emits a soft `podAntiAffinity` selecting all
-    /// kobe-operator-managed k3s server pods on the host.
+    /// `interInstance.spread.strength: Preferred` emits a soft
+    /// `podAntiAffinity` selecting all kobe-operator-managed k3s server
+    /// pods on the topology key.
     #[test]
     fn test_build_server_statefulset_spread_preferred_emits_anti_affinity() {
-        let config = ClusterConfig {
-            node_placement: Some(NodePlacement {
-                mode: NodePlacementMode::SameHost,
-                spread: Some(InstanceSpread::Preferred),
+        use crate::crd::{InterInstancePlacement, InterInstanceSpread, Placement, SpreadStrength};
+        let placement = Placement {
+            inter_instance: Some(InterInstancePlacement {
+                spread: Some(InterInstanceSpread {
+                    strength: SpreadStrength::Preferred,
+                    topology_key: "kubernetes.io/hostname".to_string(),
+                }),
             }),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            placement: Some(placement),
             ..base_config()
         };
         let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
@@ -2148,16 +2211,87 @@ mod tests {
             !match_labels.contains_key("kobe.kunobi.ninja/cluster"),
             "selector must match across pool members, not self only",
         );
+        // Standalone case (pool_name=None) — selector is host-wide.
+        assert!(
+            !match_labels.contains_key("kobe.kunobi.ninja/pool"),
+            "pool label must be absent on the selector when pool_name is None",
+        );
     }
 
-    /// `spread: Required` emits a hard `podAntiAffinity` term.
+    /// Regression: when `pool_name` is set on `ClusterConfig` (the
+    /// pool-managed case), the inter-instance anti-affinity selector
+    /// scopes to siblings of the SAME pool. Without this, a multi-pool
+    /// host cluster running `Required` spread on two pools deadlocks
+    /// scheduling (cross-pool anti-affinity collapses placement).
+    #[test]
+    fn test_spread_selector_is_pool_scoped_when_pool_name_set() {
+        use crate::crd::{InterInstancePlacement, InterInstanceSpread, Placement, SpreadStrength};
+        let placement = Placement {
+            inter_instance: Some(InterInstancePlacement {
+                spread: Some(InterInstanceSpread {
+                    strength: SpreadStrength::Required,
+                    topology_key: "kubernetes.io/hostname".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            placement: Some(placement),
+            pool_name: Some("ci-k3s-kunobi".to_string()),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("pool-ci-k3s-kunobi-7", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let anti = pod_spec.affinity.unwrap().pod_anti_affinity.unwrap();
+        let term = &anti
+            .required_during_scheduling_ignored_during_execution
+            .expect("required term present")[0];
+        let match_labels = term
+            .label_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            match_labels.get("kobe.kunobi.ninja/pool"),
+            Some(&"ci-k3s-kunobi".to_string()),
+            "spread selector must include pool label to scope to same-pool siblings",
+        );
+        assert_eq!(
+            match_labels.get("kobe.kunobi.ninja/role"),
+            Some(&"server".to_string()),
+        );
+
+        // The pod template itself must also carry the pool label so the
+        // selector can find it (selector → label match on the target pods).
+        let pod_labels = sts
+            .metadata
+            .labels
+            .as_ref()
+            .expect("pod template labels present");
+        assert_eq!(
+            pod_labels.get("kobe.kunobi.ninja/pool"),
+            Some(&"ci-k3s-kunobi".to_string()),
+        );
+    }
+
+    /// `interInstance.spread.strength: Required` emits a hard
+    /// `podAntiAffinity` term.
     #[test]
     fn test_build_server_statefulset_spread_required_emits_required_term() {
-        let config = ClusterConfig {
-            node_placement: Some(NodePlacement {
-                mode: NodePlacementMode::Any,
-                spread: Some(InstanceSpread::Required),
+        use crate::crd::{InterInstancePlacement, InterInstanceSpread, Placement, SpreadStrength};
+        let placement = Placement {
+            inter_instance: Some(InterInstancePlacement {
+                spread: Some(InterInstanceSpread {
+                    strength: SpreadStrength::Required,
+                    topology_key: "kubernetes.io/hostname".to_string(),
+                }),
             }),
+            ..Default::default()
+        };
+        let config = ClusterConfig {
+            placement: Some(placement),
             ..base_config()
         };
         let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
@@ -2173,5 +2307,125 @@ mod tests {
             .expect("required terms present");
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].topology_key, "kubernetes.io/hostname");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Placement API tests — additional coverage (selector + tolerations
+    // + custom topology key)
+    // ─────────────────────────────────────────────────────────────────
+
+    fn config_with_placement(placement: crate::crd::Placement) -> ClusterConfig {
+        ClusterConfig {
+            placement: Some(placement),
+            ..base_config()
+        }
+    }
+
+    #[test]
+    fn test_placement_node_selector_renders_node_affinity_on_server_and_agent() {
+        use crate::crd::{NodePlacement as NewNodePlacement, Placement};
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "topology.kubernetes.io/zone".to_string(),
+            "us-east-1a".to_string(),
+        );
+        let placement = Placement {
+            node: Some(NewNodePlacement {
+                selector: Some(LabelSelector {
+                    match_labels: Some(labels),
+                    ..Default::default()
+                }),
+                tolerations: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let config = config_with_placement(placement);
+
+        // Server StatefulSet
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let na = pod
+            .affinity
+            .expect("affinity present")
+            .node_affinity
+            .expect("node_affinity present");
+        let term = &na
+            .required_during_scheduling_ignored_during_execution
+            .unwrap()
+            .node_selector_terms[0];
+        let reqs = term.match_expressions.as_ref().unwrap();
+        assert_eq!(reqs[0].key, "topology.kubernetes.io/zone");
+        assert_eq!(reqs[0].operator, "In");
+        assert_eq!(reqs[0].values.as_ref().unwrap()[0], "us-east-1a");
+
+        // Agent Deployment
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let pod = deploy.spec.unwrap().template.spec.unwrap();
+        let na = pod
+            .affinity
+            .expect("affinity present")
+            .node_affinity
+            .expect("agent node_affinity present");
+        assert!(
+            na.required_during_scheduling_ignored_during_execution
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_placement_node_tolerations_propagate_to_server_and_agent() {
+        use crate::crd::{NodePlacement as NewNodePlacement, Placement};
+        let tol = Toleration {
+            key: Some("dedicated".to_string()),
+            operator: Some("Equal".to_string()),
+            value: Some("gpu".to_string()),
+            effect: Some("NoSchedule".to_string()),
+            ..Default::default()
+        };
+        let placement = Placement {
+            node: Some(NewNodePlacement {
+                selector: None,
+                tolerations: vec![tol.clone()],
+            }),
+            ..Default::default()
+        };
+        let config = config_with_placement(placement);
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let tols = pod.tolerations.expect("server tolerations present");
+        assert_eq!(tols.len(), 1);
+        assert_eq!(tols[0].key.as_deref(), Some("dedicated"));
+
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let pod = deploy.spec.unwrap().template.spec.unwrap();
+        let tols = pod.tolerations.expect("agent tolerations present");
+        assert_eq!(tols.len(), 1);
+        assert_eq!(tols[0].effect.as_deref(), Some("NoSchedule"));
+    }
+
+    #[test]
+    fn test_placement_inter_instance_spread_custom_topology_key_is_honored() {
+        use crate::crd::{InterInstancePlacement, InterInstanceSpread, Placement, SpreadStrength};
+        let placement = Placement {
+            inter_instance: Some(InterInstancePlacement {
+                spread: Some(InterInstanceSpread {
+                    strength: SpreadStrength::Preferred,
+                    topology_key: "topology.kubernetes.io/zone".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let config = config_with_placement(placement);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let anti = pod.affinity.unwrap().pod_anti_affinity.unwrap();
+        let term = &anti
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap()[0];
+        assert_eq!(
+            term.pod_affinity_term.topology_key,
+            "topology.kubernetes.io/zone"
+        );
     }
 }
