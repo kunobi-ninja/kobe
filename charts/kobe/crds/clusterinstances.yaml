@@ -258,6 +258,35 @@ spec:
                     required:
                     - exposeType
                     type: object
+                  kubeletSharedMount:
+                    description: |-
+                      Shared kubelet mount opt-in. When `None` (default) the field is
+                      omitted from the rendered StatefulSet/Deployment and behavior is
+                      unchanged. When `Some(...)` the k3s backend emits an extra
+                      hostPath volume + a Bidirectional VolumeMount at `/var/lib/kubelet`
+                      inside the selected containers. See [`KubeletSharedMountConfig`]
+                      for fields. Honored only by the k3s backend.
+                    nullable: true
+                    properties:
+                      agents:
+                        default: true
+                        description: Apply the shared mount to the k3s agent container(s). Default true.
+                        type: boolean
+                      hostPathRoot:
+                        default: /var/lib/kobe/leases
+                        description: |-
+                          Host directory root under which per-cluster kubelet trees live.
+                          **MUST be an absolute path** (the operator does not validate
+                          this — a relative path will produce a relative hostPath, which
+                          the kubelet refuses to mount). Final per-pod path becomes
+                          `<host_path_root>/<cluster-name>/kubelets/<pod-name>`. Default
+                          `/var/lib/kobe/leases`.
+                        type: string
+                      server:
+                        default: true
+                        description: Apply the shared mount to the k3s server container. Default true.
+                        type: boolean
+                    type: object
                   persistence:
                     description: Persistence config.
                     nullable: true

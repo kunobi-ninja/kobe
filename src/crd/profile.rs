@@ -310,6 +310,56 @@ pub struct VclusterConfig {
     pub values: Option<String>,
 }
 
+/// Per-pool toggle that exposes `/var/lib/kubelet` inside the k3s
+/// server and/or agent containers as a shared bind mount, so workloads
+/// running inside the lease can request `mountPropagation: Bidirectional`
+/// (CSI node-publishers, FUSE filesystems, node-problem-detector, etc).
+///
+/// Requires the management host's `/var/lib/` to be rshared (true on
+/// RKE2 / mainstream k3s hosts; not guaranteed on hardened distros,
+/// kind, or k3d). Honored only by the k3s backend.
+///
+/// **Operational note:** when enabled on agents, every Deployment
+/// rollout produces a fresh per-pod subdir under
+/// `<host_path_root>/<cluster>/kubelets/<pod-name>` on the management
+/// node. There is NO automatic garbage collection of these
+/// directories. If your pool is rolled out frequently, plan for an
+/// out-of-band janitor (per-node `tmpreaper` rule or a DaemonSet that
+/// prunes paths older than a TTL).
+///
+/// See `docs/superpowers/specs/2026-05-21-k3s-csi-kubelet-mount-propagation-design.md`
+/// and issue kunobi-ninja/kobe#98.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KubeletSharedMountConfig {
+    /// Apply the shared mount to the k3s server container. Default true.
+    #[serde(default = "default_true")]
+    pub server: bool,
+
+    /// Apply the shared mount to the k3s agent container(s). Default true.
+    #[serde(default = "default_true")]
+    pub agents: bool,
+
+    /// Host directory root under which per-cluster kubelet trees live.
+    /// **MUST be an absolute path** (the operator does not validate
+    /// this — a relative path will produce a relative hostPath, which
+    /// the kubelet refuses to mount). Final per-pod path becomes
+    /// `<host_path_root>/<cluster-name>/kubelets/<pod-name>`. Default
+    /// `/var/lib/kobe/leases`.
+    #[serde(default = "default_host_path_root")]
+    pub host_path_root: String,
+}
+
+impl Default for KubeletSharedMountConfig {
+    fn default() -> Self {
+        Self {
+            server: true,
+            agents: true,
+            host_path_root: default_host_path_root(),
+        }
+    }
+}
+
 /// Backend-agnostic cluster configuration.
 ///
 /// `Default` is derived so `..Default::default()` can be used to fill
@@ -417,6 +467,15 @@ pub struct ClusterConfig {
     ///       - https://docker-mirror.example.com
     #[serde(default)]
     pub registry_mirrors: Option<std::collections::BTreeMap<String, Vec<String>>>,
+
+    /// Shared kubelet mount opt-in. When `None` (default) the field is
+    /// omitted from the rendered StatefulSet/Deployment and behavior is
+    /// unchanged. When `Some(...)` the k3s backend emits an extra
+    /// hostPath volume + a Bidirectional VolumeMount at `/var/lib/kubelet`
+    /// inside the selected containers. See [`KubeletSharedMountConfig`]
+    /// for fields. Honored only by the k3s backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubelet_shared_mount: Option<KubeletSharedMountConfig>,
 
     /// Network ranges allocated for this cluster instance. **Operator-
     /// internal**: not part of the CRD spec users write — populated by
@@ -705,6 +764,14 @@ pub struct ExposeConfig {
 
 fn default_servers() -> u32 {
     1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_host_path_root() -> String {
+    "/var/lib/kobe/leases".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1297,5 +1364,42 @@ mod tests {
              — they're written by the operator and read by the \
              sidecar respectively, drift silently disables a syncer."
         );
+    }
+
+    #[test]
+    fn cluster_config_kubelet_shared_mount_absent_by_default() {
+        let json = serde_json::json!({ "version": "v1.31.3+k3s1" });
+        let cfg: ClusterConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.kubelet_shared_mount.is_none());
+    }
+
+    #[test]
+    fn cluster_config_kubelet_shared_mount_default_struct_enables_both() {
+        let json = serde_json::json!({
+            "version": "v1.31.3+k3s1",
+            "kubeletSharedMount": {}
+        });
+        let cfg: ClusterConfig = serde_json::from_value(json).unwrap();
+        let m = cfg.kubelet_shared_mount.expect("must deserialize");
+        assert!(m.server);
+        assert!(m.agents);
+        assert_eq!(m.host_path_root, "/var/lib/kobe/leases");
+    }
+
+    #[test]
+    fn cluster_config_kubelet_shared_mount_honors_explicit_fields() {
+        let json = serde_json::json!({
+            "version": "v1.31.3+k3s1",
+            "kubeletSharedMount": {
+                "server": true,
+                "agents": false,
+                "hostPathRoot": "/data/kobe/leases"
+            }
+        });
+        let cfg: ClusterConfig = serde_json::from_value(json).unwrap();
+        let m = cfg.kubelet_shared_mount.expect("must deserialize");
+        assert!(m.server);
+        assert!(!m.agents);
+        assert_eq!(m.host_path_root, "/data/kobe/leases");
     }
 }

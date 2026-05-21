@@ -912,7 +912,7 @@ fn render_bootstrap_config(config: &BootstrapConfig) -> Result<Option<String>> {
         .iter()
         .filter(|(name, _)| name.ends_with(".yaml") || name.ends_with(".yml"))
         .collect();
-    yaml_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    yaml_entries.sort_by_key(|(left, _)| *left);
 
     if yaml_entries.is_empty() {
         return Ok(None);

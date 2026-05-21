@@ -15,9 +15,9 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, Container, EnvVar, KeyToPath, PodAffinity, PodAffinityTerm, PodSpec,
-    PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration,
-    Volume, VolumeMount,
+    Affinity, ConfigMap, Container, EnvVar, EnvVarSource, HostPathVolumeSource, KeyToPath,
+    ObjectFieldSelector, PodAffinity, PodAffinityTerm, PodSpec, PodTemplateSpec, Secret,
+    SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -27,7 +27,9 @@ use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, ClusterConfig, IntraPlacementMode, Placement, ReadinessGate};
+use crate::crd::{
+    Addon, ClusterConfig, IntraPlacementMode, KubeletSharedMountConfig, Placement, ReadinessGate,
+};
 
 use super::{
     ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
@@ -124,6 +126,58 @@ pub struct K3sBackend {
     pg_pool: Option<PgPool>,
     /// Base PostgreSQL connection URL (before per-cluster DB rewriting).
     pg_base_url: Option<String>,
+}
+
+/// Build the (VolumeMount, EnvVar) pair for the shared kubelet mount.
+/// Returns None when the config is absent or the flag is off for this container.
+fn kubelet_shared_mount_attachments(
+    ksm: Option<&KubeletSharedMountConfig>,
+    enabled_for_container: impl FnOnce(&KubeletSharedMountConfig) -> bool,
+) -> Option<(VolumeMount, EnvVar)> {
+    let ksm = ksm?;
+    if !enabled_for_container(ksm) {
+        return None;
+    }
+    let mount = VolumeMount {
+        name: "kubelet-root".to_string(),
+        mount_path: "/var/lib/kubelet".to_string(),
+        mount_propagation: Some("Bidirectional".to_string()),
+        sub_path_expr: Some("$(POD_NAME)".to_string()),
+        ..Default::default()
+    };
+    let env = EnvVar {
+        name: "POD_NAME".to_string(),
+        value_from: Some(EnvVarSource {
+            field_ref: Some(ObjectFieldSelector {
+                field_path: "metadata.name".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Some((mount, env))
+}
+
+/// Build the hostPath Volume for the shared kubelet mount.
+/// Returns None when the config is absent or the flag is off for this container.
+fn kubelet_shared_mount_volume(
+    name: &str,
+    ksm: Option<&KubeletSharedMountConfig>,
+    enabled_for_container: impl FnOnce(&KubeletSharedMountConfig) -> bool,
+) -> Option<Volume> {
+    let ksm = ksm?;
+    if !enabled_for_container(ksm) {
+        return None;
+    }
+    Some(Volume {
+        name: "kubelet-root".to_string(),
+        host_path: Some(HostPathVolumeSource {
+            path: format!("{}/{name}/kubelets", ksm.host_path_root),
+            type_: Some("DirectoryOrCreate".to_string()),
+        }),
+        ..Default::default()
+    })
 }
 
 impl K3sBackend {
@@ -402,11 +456,22 @@ impl K3sBackend {
             });
         }
 
+        // Kubelet shared mount (CSI passthrough). See issue #98 and
+        // docs/superpowers/specs/2026-05-21-k3s-csi-kubelet-mount-propagation-design.md.
+        let mut env: Vec<EnvVar> = vec![];
+        if let Some((mount, env_var)) =
+            kubelet_shared_mount_attachments(config.kubelet_shared_mount.as_ref(), |c| c.server)
+        {
+            volume_mounts.push(mount);
+            env.push(env_var);
+        }
+
         Container {
             name: "k3s-server".to_string(),
             image: Some(image),
             command: Some(vec!["k3s".to_string()]),
             args: Some(args),
+            env: if env.is_empty() { None } else { Some(env) },
             volume_mounts: Some(volume_mounts),
             // Honors `ClusterPool.spec.resources`. Without requests/limits
             // the pod is `BestEffort` and the kubelet evicts it first under
@@ -551,6 +616,14 @@ impl K3sBackend {
                 }),
                 ..Default::default()
             });
+        }
+
+        // Kubelet shared mount (CSI passthrough) — host directory bound
+        // into the server container for shared-propagation kubelet workloads.
+        if let Some(vol) =
+            kubelet_shared_mount_volume(name, config.kubelet_shared_mount.as_ref(), |c| c.server)
+        {
+            volumes.push(vol);
         }
 
         volumes
@@ -761,6 +834,13 @@ impl K3sBackend {
                 ..Default::default()
             });
         }
+        let mut env: Vec<EnvVar> = vec![];
+        if let Some((mount, env_var)) =
+            kubelet_shared_mount_attachments(config.kubelet_shared_mount.as_ref(), |c| c.agents)
+        {
+            volume_mounts.push(mount);
+            env.push(env_var);
+        }
 
         let container = Container {
             name: "k3s-agent".to_string(),
@@ -773,6 +853,7 @@ impl K3sBackend {
                 format!("--server=https://{name}-server.{namespace}.svc.{domain}:6443"),
                 "--token-file=/var/lib/k3s/token/token".to_string(),
             ]),
+            env: if env.is_empty() { None } else { Some(env) },
             volume_mounts: Some(volume_mounts),
             // Mirror the server container's resource block so server and
             // agent share the same QoS class — otherwise the agent could
@@ -808,6 +889,11 @@ impl K3sBackend {
                 }),
                 ..Default::default()
             });
+        }
+        if let Some(vol) =
+            kubelet_shared_mount_volume(name, config.kubelet_shared_mount.as_ref(), |c| c.agents)
+        {
+            volumes.push(vol);
         }
 
         Deployment {
@@ -1069,7 +1155,7 @@ impl ClusterBackend for K3sBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{ClusterConfig, ExposeConfig, PersistenceConfig};
+    use crate::crd::{ClusterConfig, ExposeConfig, KubeletSharedMountConfig, PersistenceConfig};
 
     fn base_config() -> ClusterConfig {
         ClusterConfig {
@@ -2307,6 +2393,429 @@ mod tests {
             .expect("required terms present");
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].topology_key, "kubernetes.io/hostname");
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_server_emits_mount_volume_and_env() {
+        let config = ClusterConfig {
+            kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("my-cluster", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+
+        let server = pod_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .expect("k3s-server container present");
+
+        // 1. VolumeMount: /var/lib/kubelet, Bidirectional, subPathExpr $(POD_NAME)
+        let mount = server
+            .volume_mounts
+            .as_ref()
+            .expect("server has volume_mounts")
+            .iter()
+            .find(|m| m.name == "kubelet-root")
+            .expect("kubelet-root mount missing on server");
+        assert_eq!(mount.mount_path, "/var/lib/kubelet");
+        assert_eq!(mount.mount_propagation.as_deref(), Some("Bidirectional"));
+        assert_eq!(mount.sub_path_expr.as_deref(), Some("$(POD_NAME)"));
+
+        // 2. POD_NAME env wired via downward API from metadata.name
+        let env = server.env.as_ref().expect("server has env");
+        let pod_name = env
+            .iter()
+            .find(|e| e.name == "POD_NAME")
+            .expect("POD_NAME env missing on server");
+        let field_ref = pod_name
+            .value_from
+            .as_ref()
+            .and_then(|s| s.field_ref.as_ref())
+            .expect("POD_NAME must use fieldRef");
+        assert_eq!(field_ref.field_path, "metadata.name");
+
+        // 3. hostPath volume at the expected per-cluster path
+        let vol = pod_spec
+            .volumes
+            .as_ref()
+            .expect("pod has volumes")
+            .iter()
+            .find(|v| v.name == "kubelet-root")
+            .expect("kubelet-root volume missing on pod spec");
+        let hp = vol.host_path.as_ref().expect("must be hostPath");
+        assert_eq!(hp.path, "/var/lib/kobe/leases/my-cluster/kubelets");
+        assert_eq!(hp.type_.as_deref(), Some("DirectoryOrCreate"));
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_agent_emits_mount_volume_and_env() {
+        let config = ClusterConfig {
+            kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
+            ..base_config()
+        };
+        let deploy = K3sBackend::build_agent_deployment("my-cluster", "ns", &config, 2);
+        let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+        let agent = pod_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-agent")
+            .expect("k3s-agent container present");
+
+        // 1. VolumeMount
+        let mount = agent
+            .volume_mounts
+            .as_ref()
+            .expect("agent has volume_mounts")
+            .iter()
+            .find(|m| m.name == "kubelet-root")
+            .expect("kubelet-root mount missing on agent");
+        assert_eq!(mount.mount_path, "/var/lib/kubelet");
+        assert_eq!(mount.mount_propagation.as_deref(), Some("Bidirectional"));
+        assert_eq!(mount.sub_path_expr.as_deref(), Some("$(POD_NAME)"));
+
+        // 2. POD_NAME env via downward API
+        let env = agent.env.as_ref().expect("agent has env");
+        let field_ref = env
+            .iter()
+            .find(|e| e.name == "POD_NAME")
+            .and_then(|e| e.value_from.as_ref())
+            .and_then(|s| s.field_ref.as_ref())
+            .expect("POD_NAME via fieldRef missing on agent");
+        assert_eq!(field_ref.field_path, "metadata.name");
+
+        // 3. hostPath volume
+        let vol = pod_spec
+            .volumes
+            .as_ref()
+            .expect("pod has volumes")
+            .iter()
+            .find(|v| v.name == "kubelet-root")
+            .expect("kubelet-root volume missing on agent pod spec");
+        let hp = vol.host_path.as_ref().expect("hostPath");
+        assert_eq!(hp.path, "/var/lib/kobe/leases/my-cluster/kubelets");
+        assert_eq!(hp.type_.as_deref(), Some("DirectoryOrCreate"));
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_disabled_by_default() {
+        let config = base_config();
+        assert!(
+            config.kubelet_shared_mount.is_none(),
+            "guard for the rest of the test"
+        );
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let server_spec = sts.spec.unwrap().template.spec.unwrap();
+        let server = server_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .unwrap();
+        assert!(
+            server
+                .volume_mounts
+                .as_ref()
+                .map(|v| v.iter().all(|m| m.name != "kubelet-root"))
+                .unwrap_or(true),
+            "server must NOT have kubelet-root mount by default"
+        );
+        assert!(
+            server_spec
+                .volumes
+                .as_ref()
+                .map(|v| v.iter().all(|m| m.name != "kubelet-root"))
+                .unwrap_or(true),
+            "server pod must NOT have kubelet-root volume by default"
+        );
+        assert!(
+            server.env.is_none()
+                || server
+                    .env
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.name != "POD_NAME"),
+            "server must NOT have POD_NAME env by default"
+        );
+
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let agent_spec = deploy.spec.unwrap().template.spec.unwrap();
+        let agent = agent_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-agent")
+            .unwrap();
+        assert!(
+            agent
+                .volume_mounts
+                .as_ref()
+                .map(|v| v.iter().all(|m| m.name != "kubelet-root"))
+                .unwrap_or(true),
+            "agent must NOT have kubelet-root mount by default"
+        );
+        assert!(
+            agent_spec
+                .volumes
+                .as_ref()
+                .map(|v| v.iter().all(|m| m.name != "kubelet-root"))
+                .unwrap_or(true),
+            "agent pod must NOT have kubelet-root volume by default"
+        );
+        assert!(
+            agent.env.is_none()
+                || agent
+                    .env
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.name != "POD_NAME"),
+            "agent must NOT have POD_NAME env by default"
+        );
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_server_only() {
+        let config = ClusterConfig {
+            kubelet_shared_mount: Some(KubeletSharedMountConfig {
+                server: true,
+                agents: false,
+                ..KubeletSharedMountConfig::default()
+            }),
+            ..base_config()
+        };
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let server = sts.spec.unwrap().template.spec.unwrap();
+        let server_c = server
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .unwrap();
+        assert!(
+            server_c
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.name == "kubelet-root"),
+            "server mount expected"
+        );
+
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let agent_spec = deploy.spec.unwrap().template.spec.unwrap();
+        let agent = agent_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-agent")
+            .unwrap();
+        assert!(
+            agent
+                .volume_mounts
+                .as_ref()
+                .map(|v| v.iter().all(|m| m.name != "kubelet-root"))
+                .unwrap_or(true),
+            "agent mount must NOT be present when agents=false"
+        );
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_agents_only() {
+        let config = ClusterConfig {
+            kubelet_shared_mount: Some(KubeletSharedMountConfig {
+                server: false,
+                agents: true,
+                ..KubeletSharedMountConfig::default()
+            }),
+            ..base_config()
+        };
+
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let server_spec = sts.spec.unwrap().template.spec.unwrap();
+        let server_c = server_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .unwrap();
+        assert!(
+            server_c
+                .volume_mounts
+                .as_ref()
+                .map(|v| v.iter().all(|m| m.name != "kubelet-root"))
+                .unwrap_or(true),
+            "server mount must NOT be present when server=false"
+        );
+
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let agent_spec = deploy.spec.unwrap().template.spec.unwrap();
+        let agent = agent_spec
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-agent")
+            .unwrap();
+        assert!(
+            agent
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.name == "kubelet-root"),
+            "agent mount expected"
+        );
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_honors_host_path_root_override() {
+        let config = ClusterConfig {
+            kubelet_shared_mount: Some(KubeletSharedMountConfig {
+                host_path_root: "/data/kobe/leases".to_string(),
+                ..KubeletSharedMountConfig::default()
+            }),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "kubelet-root")
+            .unwrap();
+        assert_eq!(
+            vol.host_path.as_ref().unwrap().path,
+            "/data/kobe/leases/c/kubelets"
+        );
+
+        let deploy = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let apod = deploy.spec.unwrap().template.spec.unwrap();
+        let avol = apod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "kubelet-root")
+            .unwrap();
+        assert_eq!(
+            avol.host_path.as_ref().unwrap().path,
+            "/data/kobe/leases/c/kubelets"
+        );
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_path_includes_cluster_name() {
+        let config = ClusterConfig {
+            kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
+            ..base_config()
+        };
+        let sts1 = K3sBackend::build_server_statefulset("cluster-a", "ns", &config, None);
+        let sts2 = K3sBackend::build_server_statefulset("cluster-b", "ns", &config, None);
+
+        let p1 = sts1
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "kubelet-root")
+            .unwrap()
+            .host_path
+            .unwrap()
+            .path;
+        let p2 = sts2
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "kubelet-root")
+            .unwrap()
+            .host_path
+            .unwrap()
+            .path;
+
+        assert_ne!(p1, p2);
+        assert!(p1.contains("cluster-a"));
+        assert!(p2.contains("cluster-b"));
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_coexists_with_persistence() {
+        let config = ClusterConfig {
+            persistence: Some(PersistenceConfig {
+                storage_type: Some("dynamic".to_string()),
+                storage_class_name: None,
+                storage_request_size: Some("5Gi".to_string()),
+            }),
+            kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+
+        let server = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .unwrap();
+        let mounts = server.volume_mounts.as_ref().unwrap();
+        assert!(mounts.iter().any(|m| m.name == "data"), "data mount kept");
+        assert!(
+            mounts.iter().any(|m| m.name == "kubelet-root"),
+            "kubelet-root mount added"
+        );
+        let volumes = pod.volumes.as_ref().unwrap();
+        assert!(volumes.iter().any(|v| v.name == "data"), "data volume kept");
+        assert!(
+            volumes.iter().any(|v| v.name == "kubelet-root"),
+            "kubelet-root volume added"
+        );
+    }
+
+    #[test]
+    fn test_kubelet_shared_mount_coexists_with_registry_mirrors() {
+        let mut mirrors = std::collections::BTreeMap::new();
+        mirrors.insert(
+            "docker.io".to_string(),
+            vec!["https://registry.example.com".to_string()],
+        );
+        let config = ClusterConfig {
+            registry_mirrors: Some(mirrors),
+            kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let server = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "k3s-server")
+            .unwrap();
+        let mounts = server.volume_mounts.as_ref().unwrap();
+        assert!(
+            mounts.iter().any(|m| m.name == "registries-config"),
+            "registries mount kept"
+        );
+        assert!(
+            mounts.iter().any(|m| m.name == "kubelet-root"),
+            "kubelet-root mount added"
+        );
+        let volumes = pod.volumes.as_ref().unwrap();
+        assert!(
+            volumes.iter().any(|v| v.name == "registries-config"),
+            "registries-config volume kept"
+        );
+        assert!(
+            volumes.iter().any(|v| v.name == "kubelet-root"),
+            "kubelet-root volume added"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
