@@ -1871,6 +1871,105 @@ mod tests {
         assert!(result.is_ok(), "delete should succeed: {result:?}");
     }
 
+    /// Regression test for #95: `K3sBackend::delete()` MUST issue a DELETE
+    /// for every resource `create()` could have produced — including the
+    /// agent Deployment, server Service, server StatefulSet, both ConfigMaps
+    /// (publisher + registries), and both Secrets (token + kubeconfig).
+    ///
+    /// Uses `.expect(1)` on each mock so a regression that silently drops
+    /// any one DELETE — like the registries CM gap fixed in #87 or the
+    /// pre-#95 abnormal-path leaks — fails the test instead of silently
+    /// passing on wiremock's default 404.
+    #[tokio::test]
+    async fn test_delete_cluster_issues_every_expected_delete() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, None, None);
+
+        let expected_paths: &[(&str, &str)] = &[
+            (
+                "/apis/apps/v1/namespaces/test-ns/deployments/test-cluster-agent",
+                "Deployment",
+            ),
+            (
+                "/api/v1/namespaces/test-ns/services/test-cluster-server",
+                "Service",
+            ),
+            (
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/test-cluster-server",
+                "StatefulSet",
+            ),
+            (
+                "/api/v1/namespaces/test-ns/configmaps/test-cluster-kubeconfig-publisher",
+                "ConfigMap",
+            ),
+            (
+                "/api/v1/namespaces/test-ns/configmaps/test-cluster-registries",
+                "ConfigMap",
+            ),
+            (
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+                "Secret",
+            ),
+            (
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-kubeconfig",
+                "Secret",
+            ),
+        ];
+
+        for (path_str, kind) in expected_paths {
+            let api_version = match *kind {
+                "Deployment" | "StatefulSet" => "apps/v1",
+                _ => "v1",
+            };
+            // Derive the resource name from the trailing path segment so the
+            // returned body looks plausibly real to the kube client.
+            let name = path_str.rsplit('/').next().unwrap().to_string();
+            Mock::given(method("DELETE"))
+                .and(path(*path_str))
+                .respond_with(ResponseTemplate::new(200).set_body_json(generic_response(
+                    api_version,
+                    kind,
+                    &name,
+                    "test-ns",
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let result = backend.delete("test-cluster", "test-ns").await;
+        assert!(result.is_ok(), "delete should succeed: {result:?}");
+        // MockServer's Drop verifies the `.expect(1)` assertions — any
+        // missing DELETE call panics here.
+    }
+
+    /// Idempotency: re-running `delete()` on an instance whose resources
+    /// were already deleted (every backend resource returns 404) MUST
+    /// succeed. This is the operational case where the finalizer-driven
+    /// delete path retries after a partial failure.
+    #[tokio::test]
+    async fn test_delete_is_idempotent_when_all_resources_missing() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, None, None);
+
+        // Catch-all 404 for every DELETE the backend will issue.
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("resources", "test-cluster")),
+            )
+            .mount(&server)
+            .await;
+
+        let result = backend.delete("test-cluster", "test-ns").await;
+        assert!(
+            result.is_ok(),
+            "delete on already-deleted resources should be a no-op: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_check_health_not_ready() {
         let server = MockServer::start().await;

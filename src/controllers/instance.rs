@@ -29,6 +29,16 @@ use crate::crd::{
 };
 use crate::velero::VeleroCoordinator;
 
+/// Finalizer placed on every `ClusterInstance` so the operator gets a
+/// chance to tear down backend-owned resources (StatefulSet, Deployment,
+/// Service, Secrets, ConfigMaps) before the CR is removed from etcd.
+///
+/// Without this, a direct `kubectl delete clusterinstance ...` or any
+/// abnormal-path deletion (Creating/Unhealthy/Failed) drops the CR
+/// immediately and `K3sBackend::delete()` / `K0sBackend::delete()`
+/// never runs — leaking the entire backend resource set (see #95).
+const INSTANCE_FINALIZER: &str = "kobe.kunobi.ninja/instance-cleanup";
+
 // ─────────────────────────────────────────────────────────────────────
 // Metrics helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -191,6 +201,70 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
     let config = resolve_instance_config(&ctx.client, &instance, &ns).await?;
     let profile_name = instance.spec.pool_ref.as_ref().map(|r| r.name.clone());
     let owner = profile_name.as_deref().unwrap_or(name.as_str());
+
+    // ── Finalizer handling ──────────────────────────────────────────────
+    //
+    // Block etcd removal of the `ClusterInstance` until `backend.delete()`
+    // has run. Two cases:
+    //
+    // 1. `deletion_timestamp` is set: Kubernetes is trying to GC the CR
+    //    but our finalizer is blocking it. Run the backend teardown +
+    //    host-side orphan cleanup, then remove the finalizer so the API
+    //    server can complete the delete. This is what catches the
+    //    abnormal-path leak in #95: `kubectl delete clusterinstance`
+    //    while in Creating/Unhealthy/Failed (or any non-Ready) phase
+    //    used to drop the CR immediately and leak the entire backend
+    //    resource set.
+    //
+    // 2. No `deletion_timestamp` and finalizer not yet present: stamp
+    //    it on so future deletions are intercepted. Done idempotently
+    //    via JSON Merge Patch — re-running on an instance that already
+    //    has it is a no-op patch.
+    let has_finalizer = instance
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|x| x == INSTANCE_FINALIZER));
+
+    if instance.metadata.deletion_timestamp.is_some() {
+        if has_finalizer {
+            info!(
+                instance = %name,
+                owner = %owner,
+                phase = ?status.phase,
+                "ClusterInstance deletion requested; running backend cleanup before releasing finalizer"
+            );
+            match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
+                Ok(()) => {
+                    cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
+                    remove_finalizer(&instances_api, &instance, INSTANCE_FINALIZER).await?;
+                    return Ok(Action::await_change());
+                }
+                Err(e) => {
+                    warn!(
+                        instance = %name,
+                        error = %format!("{e:#}"),
+                        "Backend cleanup failed during finalizer-driven delete; will retry"
+                    );
+                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                }
+            }
+        }
+        // Deletion in progress and we already released our finalizer —
+        // wait for the API server to complete the delete. No requeue
+        // needed; the watch stream will stop emitting once the object
+        // is gone.
+        return Ok(Action::await_change());
+    }
+
+    if !has_finalizer {
+        add_finalizer(&instances_api, &instance, INSTANCE_FINALIZER).await?;
+        // Re-reconcile immediately so the rest of the state machine
+        // sees the updated metadata. The watch event from the patch
+        // will arrive on its own, but a tight requeue avoids a
+        // pointless idle gap on first reconcile.
+        return Ok(Action::requeue(std::time::Duration::from_secs(0)));
+    }
 
     match status.phase {
         ClusterInstancePhase::Creating if !status.provisioned => {
@@ -1453,6 +1527,68 @@ fn claim_resolution(claim: &CIDRClaim) -> ClaimResolution {
     }
 }
 
+/// Add `finalizer` to the instance's `metadata.finalizers` list, idempotently.
+///
+/// Uses a JSON Merge Patch that REPLACES the entire `finalizers` array with
+/// the existing values plus our finalizer. RFC 7396 specifies that arrays
+/// in a Merge Patch overwrite the target rather than merging element-wise,
+/// so we read-modify-write the whole list. The read is already done by the
+/// caller (the `instance` Arc), so there's no extra round-trip.
+async fn add_finalizer(
+    instances_api: &Api<ClusterInstance>,
+    instance: &ClusterInstance,
+    finalizer: &str,
+) -> Result<(), kube::Error> {
+    let mut finalizers = instance.metadata.finalizers.clone().unwrap_or_default();
+    if finalizers.iter().any(|f| f == finalizer) {
+        return Ok(());
+    }
+    finalizers.push(finalizer.to_string());
+    let patch = serde_json::json!({
+        "metadata": { "finalizers": finalizers }
+    });
+    instances_api
+        .patch(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Remove `finalizer` from the instance's `metadata.finalizers` list,
+/// idempotently. Same array-replace semantics as `add_finalizer`.
+async fn remove_finalizer(
+    instances_api: &Api<ClusterInstance>,
+    instance: &ClusterInstance,
+    finalizer: &str,
+) -> Result<(), kube::Error> {
+    let Some(existing) = instance.metadata.finalizers.as_ref() else {
+        return Ok(());
+    };
+    let remaining: Vec<String> = existing
+        .iter()
+        .filter(|f| f.as_str() != finalizer)
+        .cloned()
+        .collect();
+    if remaining.len() == existing.len() {
+        // Finalizer wasn't present — nothing to do, avoid a no-op patch.
+        return Ok(());
+    }
+    let patch = serde_json::json!({
+        "metadata": { "finalizers": remaining }
+    });
+    instances_api
+        .patch(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn patch_instance_status(
     instances_api: &Api<ClusterInstance>,
     name: &str,
@@ -1518,7 +1654,11 @@ mod tests {
                 "kind": "ClusterInstance",
                 "metadata": {
                     "name": name,
-                    "namespace": "test-ns"
+                    "namespace": "test-ns",
+                    // Pre-stamp the finalizer so the reconciler exits its
+                    // "add finalizer" short-circuit and proceeds to the
+                    // phase logic the test is actually exercising.
+                    "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
                     "backend": {
@@ -1634,7 +1774,8 @@ mod tests {
                 "kind": "ClusterInstance",
                 "metadata": {
                     "name": "standalone-3",
-                    "namespace": "test-ns"
+                    "namespace": "test-ns",
+                    "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
                     "backend": { "type": "k3s" },
@@ -1706,7 +1847,8 @@ mod tests {
                 "kind": "ClusterInstance",
                 "metadata": {
                     "name": "leased-1",
-                    "namespace": "test-ns"
+                    "namespace": "test-ns",
+                    "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
                     "backend": { "type": "k3s" },
@@ -1761,7 +1903,8 @@ mod tests {
                 "kind": "ClusterInstance",
                 "metadata": {
                     "name": "leased-2",
-                    "namespace": "test-ns"
+                    "namespace": "test-ns",
+                    "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
                     "backend": { "type": "k3s" },
@@ -1868,5 +2011,241 @@ mod tests {
         let result = apply_default_readiness_gates(BackendType::Vkobe, user_gates.clone());
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], ReadinessGate::CrdExists { .. }));
+    }
+
+    // === Finalizer (issue #95) ===
+
+    /// Helper: build an instance with optional `deletion_timestamp` and
+    /// `finalizers`. Status is intentionally minimal — the finalizer
+    /// branches in `reconcile_instance` run before the phase match and
+    /// must work regardless of phase / provisioned state.
+    fn instance_with_finalizer_state(
+        name: &str,
+        deletion_timestamp: Option<&str>,
+        finalizers: Vec<&str>,
+    ) -> Arc<ClusterInstance> {
+        let mut metadata = serde_json::json!({
+            "name": name,
+            "namespace": "test-ns",
+            "finalizers": finalizers,
+        });
+        if let Some(ts) = deletion_timestamp {
+            metadata["deletionTimestamp"] = serde_json::Value::String(ts.to_string());
+        }
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": metadata,
+                "spec": {
+                    "backend": { "type": "k3s" },
+                    "cluster": { "version": "v1.31.3+k3s1" },
+                    "addons": [],
+                    "readinessGates": []
+                },
+                "status": {
+                    "phase": "Creating",
+                    "provisioned": true,
+                    "network": {
+                        "serviceCidr": "10.240.0.0/20",
+                        "clusterCidr": "10.248.0.0/20"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// First-ever reconcile of a fresh `ClusterInstance` MUST stamp the
+    /// finalizer onto `metadata.finalizers`. Without this the abnormal-
+    /// path delete in #95 (kubectl delete clusterinstance while
+    /// Creating/Unhealthy/Failed) skips backend cleanup entirely.
+    #[tokio::test]
+    async fn reconcile_adds_finalizer_when_missing() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let instance = instance_with_finalizer_state("no-finalizer-1", None, vec![]);
+
+        // Expect exactly one Merge PATCH on the root object (NOT /status)
+        // adding our finalizer to the array.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/no-finalizer-1",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "metadata": { "finalizers": [INSTANCE_FINALIZER] }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("no-finalizer-1")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        // Tight re-reconcile so the next pass sees the updated metadata.
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(0)));
+        // Backend MUST NOT be touched on a finalizer-add-only reconcile.
+        let calls = backend.call_count();
+        assert_eq!(calls.create, 0);
+        assert_eq!(calls.delete, 0);
+        assert_eq!(calls.check_health, 0);
+    }
+
+    /// When `deletion_timestamp` is set AND our finalizer is present,
+    /// reconcile MUST run `backend.delete()` and then remove the
+    /// finalizer via a Merge PATCH. This is the path that fixes #95
+    /// for `kubectl delete clusterinstance` against a non-Ready instance.
+    #[tokio::test]
+    async fn reconcile_runs_backend_delete_then_removes_finalizer_on_deletion() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let instance = instance_with_finalizer_state(
+            "deleting-1",
+            Some("2026-05-21T10:00:00Z"),
+            vec![INSTANCE_FINALIZER],
+        );
+
+        // Expect the finalizer-removal PATCH. The body should contain an
+        // empty finalizers array (we filtered out our finalizer and there
+        // were no others).
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/deleting-1",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "metadata": { "finalizers": [] }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(instance_api_response("deleting-1")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // cleanup_orphan_projected_resources lists pods + targets a probe
+        // pod by name. The probe DELETE is best-effort; the LIST must
+        // succeed so we feed it an empty list.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/pods/kobe-readiness-probe-deleting-1-x-kube-system-x-vc",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(
+                crate::testutil::k8s_not_found("pods", "kobe-readiness-probe-deleting-1-x-kube-system-x-vc"),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::await_change());
+        let calls = backend.call_count();
+        assert_eq!(
+            calls.delete, 1,
+            "backend.delete() MUST run before the finalizer is released"
+        );
+    }
+
+    /// When `deletion_timestamp` is set but our finalizer was never
+    /// stamped (legacy CRs created pre-#95, or another controller
+    /// already removed it), reconcile just waits for the API server to
+    /// complete the delete. Backend cleanup is skipped — there's
+    /// nothing left to block on.
+    #[tokio::test]
+    async fn reconcile_no_op_when_deleting_without_our_finalizer() {
+        let (ctx, _server, backend) = test_instance_context().await;
+        let instance =
+            instance_with_finalizer_state("legacy-deleting", Some("2026-05-21T10:00:00Z"), vec![]);
+
+        let action = reconcile_instance(instance, ctx).await.unwrap();
+
+        assert_eq!(action, Action::await_change());
+        let calls = backend.call_count();
+        assert_eq!(calls.delete, 0);
+    }
+
+    /// `add_finalizer` MUST preserve any finalizers already on the
+    /// object (e.g. another controller's). The Merge PATCH body should
+    /// contain BOTH the existing finalizer and ours.
+    #[tokio::test]
+    async fn add_finalizer_preserves_existing_finalizers() {
+        let (ctx, server, _backend) = test_instance_context().await;
+        let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), "test-ns");
+        let instance =
+            instance_with_finalizer_state("multi-final", None, vec!["other-controller/finalizer"]);
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/multi-final",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "metadata": {
+                    "finalizers": ["other-controller/finalizer", INSTANCE_FINALIZER]
+                }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(instance_api_response("multi-final")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        add_finalizer(&instances_api, &instance, INSTANCE_FINALIZER)
+            .await
+            .unwrap();
+    }
+
+    /// `remove_finalizer` MUST preserve any finalizers other than ours.
+    #[tokio::test]
+    async fn remove_finalizer_preserves_other_finalizers() {
+        let (ctx, server, _backend) = test_instance_context().await;
+        let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), "test-ns");
+        let instance = instance_with_finalizer_state(
+            "multi-final-rm",
+            None,
+            vec!["other-controller/finalizer", INSTANCE_FINALIZER],
+        );
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/multi-final-rm",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "metadata": { "finalizers": ["other-controller/finalizer"] }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("multi-final-rm")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        remove_finalizer(&instances_api, &instance, INSTANCE_FINALIZER)
+            .await
+            .unwrap();
+    }
+
+    /// `add_finalizer` MUST be a no-op (zero API calls) when the
+    /// finalizer is already present. Without this guard, every
+    /// reconcile of a healthy instance would emit a useless PATCH and
+    /// double the API-server load.
+    #[tokio::test]
+    async fn add_finalizer_is_no_op_when_already_present() {
+        let (ctx, _server, _backend) = test_instance_context().await;
+        let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), "test-ns");
+        let instance =
+            instance_with_finalizer_state("already-final", None, vec![INSTANCE_FINALIZER]);
+
+        // No mock mounted — any PATCH would 404 from wiremock's default
+        // and fail the call. The fact that this succeeds proves no
+        // request was issued.
+        add_finalizer(&instances_api, &instance, INSTANCE_FINALIZER)
+            .await
+            .unwrap();
     }
 }
