@@ -15,9 +15,9 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, Container, EnvVar, KeyToPath, PodAffinity, PodAffinityTerm, PodSpec,
-    PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Volume,
-    VolumeMount,
+    Affinity, ConfigMap, Container, EnvVar, KeyToPath, PodAffinity, PodAffinityTerm,
+    PodAntiAffinity, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort,
+    ServiceSpec, Volume, VolumeMount, WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -27,7 +27,9 @@ use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::crd::{Addon, ClusterConfig, NodePlacement, NodePlacementMode, ReadinessGate};
+use crate::crd::{
+    Addon, ClusterConfig, InstanceSpread, NodePlacement, NodePlacementMode, ReadinessGate,
+};
 
 use super::{
     ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
@@ -583,6 +585,7 @@ impl K3sBackend {
                     }),
                     spec: Some(PodSpec {
                         containers: vec![server_container, publisher_sidecar],
+                        affinity: Self::server_anti_affinity(config.node_placement.as_ref()),
                         volumes: Some(volumes),
                         service_account_name: Some(
                             std::env::var("POOL_SERVICE_ACCOUNT")
@@ -631,6 +634,58 @@ impl K3sBackend {
             }),
             ..Default::default()
         }
+    }
+
+    /// Build the server pod anti-affinity for inter-instance spread.
+    ///
+    /// Returns `None` when `spread` is omitted, so the StatefulSet stays
+    /// byte-identical to clusters predating the field.
+    ///
+    /// Selector matches all kobe-operator-managed k3s server pods on the
+    /// host (label `app.kubernetes.io/managed-by=kobe-operator` AND
+    /// `kobe.kunobi.ninja/role=server`), topology
+    /// `kubernetes.io/hostname`. The pod being scheduled doesn't match
+    /// itself (Kubernetes evaluates the selector against *other* pods),
+    /// so this is safe for the `replicas=1` server StatefulSet.
+    fn server_anti_affinity(placement: Option<&NodePlacement>) -> Option<Affinity> {
+        let spread = placement.and_then(|p| p.spread)?;
+
+        let mut selector_labels = BTreeMap::new();
+        selector_labels.insert(
+            "app.kubernetes.io/managed-by".to_string(),
+            MANAGED_BY.to_string(),
+        );
+        selector_labels.insert("kobe.kunobi.ninja/role".to_string(), "server".to_string());
+
+        let term = PodAffinityTerm {
+            label_selector: Some(LabelSelector {
+                match_labels: Some(selector_labels),
+                ..Default::default()
+            }),
+            topology_key: "kubernetes.io/hostname".to_string(),
+            ..Default::default()
+        };
+
+        let anti = match spread {
+            InstanceSpread::Preferred => PodAntiAffinity {
+                preferred_during_scheduling_ignored_during_execution: Some(vec![
+                    WeightedPodAffinityTerm {
+                        weight: 100,
+                        pod_affinity_term: term,
+                    },
+                ]),
+                ..Default::default()
+            },
+            InstanceSpread::Required => PodAntiAffinity {
+                required_during_scheduling_ignored_during_execution: Some(vec![term]),
+                ..Default::default()
+            },
+        };
+
+        Some(Affinity {
+            pod_anti_affinity: Some(anti),
+            ..Default::default()
+        })
     }
 
     /// Build the agent pod affinity based on the configured placement.
@@ -1486,6 +1541,7 @@ mod tests {
         let config = ClusterConfig {
             node_placement: Some(NodePlacement {
                 mode: NodePlacementMode::SameHost,
+                ..Default::default()
             }),
             ..base_config()
         };
@@ -1534,6 +1590,7 @@ mod tests {
         let config = ClusterConfig {
             node_placement: Some(NodePlacement {
                 mode: NodePlacementMode::Any,
+                ..Default::default()
             }),
             ..base_config()
         };
@@ -1907,5 +1964,115 @@ mod tests {
             "absent pool.spec.resources must yield no resources block; got {:?}",
             container.resources
         );
+    }
+
+    /// Regression: without `nodePlacement.spread`, the server StatefulSet
+    /// renders no `affinity` block — manifests stay byte-identical to
+    /// clusters created before the field existed.
+    #[test]
+    fn test_build_server_statefulset_no_spread_renders_no_affinity() {
+        let config = base_config();
+        assert!(config.node_placement.is_none());
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(pod_spec.affinity.is_none());
+    }
+
+    /// `NodePlacement { mode: SameHost, spread: None }` must NOT cause the
+    /// server StatefulSet to grow an `affinity` block — `spread` and
+    /// `mode` are independent, and `mode` is an agent-deployment concern.
+    #[test]
+    fn test_build_server_statefulset_samehost_alone_renders_no_affinity() {
+        let config = ClusterConfig {
+            node_placement: Some(NodePlacement {
+                mode: NodePlacementMode::SameHost,
+                spread: None,
+            }),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(pod_spec.affinity.is_none());
+    }
+
+    /// `spread: Preferred` emits a soft `podAntiAffinity` selecting all
+    /// kobe-operator-managed k3s server pods on the host.
+    #[test]
+    fn test_build_server_statefulset_spread_preferred_emits_anti_affinity() {
+        let config = ClusterConfig {
+            node_placement: Some(NodePlacement {
+                mode: NodePlacementMode::SameHost,
+                spread: Some(InstanceSpread::Preferred),
+            }),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let affinity = pod_spec.affinity.expect("affinity present");
+        let anti = affinity
+            .pod_anti_affinity
+            .expect("pod_anti_affinity present");
+        assert!(
+            anti.required_during_scheduling_ignored_during_execution
+                .is_none(),
+            "Preferred must not emit required terms",
+        );
+        let terms = anti
+            .preferred_during_scheduling_ignored_during_execution
+            .expect("preferred terms present");
+        assert_eq!(terms.len(), 1);
+        let weighted = &terms[0];
+        assert_eq!(weighted.weight, 100);
+        assert_eq!(
+            weighted.pod_affinity_term.topology_key,
+            "kubernetes.io/hostname"
+        );
+        let match_labels = weighted
+            .pod_affinity_term
+            .label_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            match_labels.get("app.kubernetes.io/managed-by"),
+            Some(&MANAGED_BY.to_string()),
+        );
+        assert_eq!(
+            match_labels.get("kobe.kunobi.ninja/role"),
+            Some(&"server".to_string()),
+        );
+        // Must NOT carry the per-cluster label — that would match only
+        // the pod's own siblings (replicas=1) and never spread anything.
+        assert!(
+            !match_labels.contains_key("kobe.kunobi.ninja/cluster"),
+            "selector must match across pool members, not self only",
+        );
+    }
+
+    /// `spread: Required` emits a hard `podAntiAffinity` term.
+    #[test]
+    fn test_build_server_statefulset_spread_required_emits_required_term() {
+        let config = ClusterConfig {
+            node_placement: Some(NodePlacement {
+                mode: NodePlacementMode::Any,
+                spread: Some(InstanceSpread::Required),
+            }),
+            ..base_config()
+        };
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        let anti = pod_spec.affinity.unwrap().pod_anti_affinity.unwrap();
+        assert!(
+            anti.preferred_during_scheduling_ignored_during_execution
+                .is_none(),
+            "Required must not emit preferred terms",
+        );
+        let terms = anti
+            .required_during_scheduling_ignored_during_execution
+            .expect("required terms present");
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].topology_key, "kubernetes.io/hostname");
     }
 }

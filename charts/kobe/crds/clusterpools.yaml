@@ -295,6 +295,13 @@ spec:
                         - Any
                         - SameHost
                         type: string
+                      spread:
+                        description: Strength of the inter-instance spread constraint.
+                        enum:
+                        - Preferred
+                        - Required
+                        nullable: true
+                        type: string
                     required:
                     - mode
                     type: object

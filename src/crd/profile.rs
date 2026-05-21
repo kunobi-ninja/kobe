@@ -509,11 +509,35 @@ impl NodeTaint {
 /// Wrapped in a struct so future extensions (custom topology key,
 /// additional knobs) can be added next to `mode` without breaking
 /// existing manifests.
+///
+/// `mode` and `spread` are orthogonal:
+/// - `mode` controls **intra-instance** placement (server ↔ agent of the
+///   same cluster), used to side-step broken cross-host pod routing.
+/// - `spread` controls **inter-instance** placement (pool members of
+///   different ClusterInstances relative to each other), used to keep
+///   one busy host from collecting every pool member.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NodePlacement {
     /// Placement mode.
     pub mode: NodePlacementMode,
+
+    /// Inter-instance spread across physical hosts. Controls the
+    /// `podAntiAffinity` rendered on the server StatefulSet so multiple
+    /// pool members don't pile onto the same node.
+    ///
+    /// When omitted, no anti-affinity is emitted — manifests stay
+    /// byte-identical to clusters created before this field existed.
+    ///
+    /// Selector matches sibling kobe-operator-managed k3s servers on the
+    /// host (label `app.kubernetes.io/managed-by=kobe-operator` AND
+    /// `kobe.kunobi.ninja/role=server`). On a multi-pool host cluster
+    /// this spreads across *all* k3s server pods — usually still the
+    /// desired effect; if you ever need pool-scoped spread, the agent's
+    /// existing `SameHost` co-location keeps each pool member's
+    /// server+agent paired regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<InstanceSpread>,
 }
 
 /// Placement mode for `NodePlacement`. New variants can be added without
@@ -528,6 +552,21 @@ pub enum NodePlacementMode {
     /// Useful when cross-host pod routing on the underlying cluster is
     /// unreliable.
     SameHost,
+}
+
+/// Strength of the inter-instance spread constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum InstanceSpread {
+    /// `preferredDuringSchedulingIgnoredDuringExecution` with weight=100.
+    /// Soft hint — the scheduler tries to spread but falls back to
+    /// co-location when no other host has capacity. Safe on single-host
+    /// clusters (still schedules).
+    Preferred,
+    /// `requiredDuringSchedulingIgnoredDuringExecution`. Hard constraint:
+    /// at most one pool member per host. Pods stay Pending when the
+    /// number of eligible hosts is less than the pool size — only set
+    /// this when `hosts >= maxClusters`.
+    Required,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

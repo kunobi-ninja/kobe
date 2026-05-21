@@ -1577,6 +1577,7 @@ mod tests {
         let config = ClusterConfig {
             node_placement: Some(NodePlacement {
                 mode: NodePlacementMode::SameHost,
+                ..Default::default()
             }),
             ..base_config()
         };
@@ -1630,6 +1631,7 @@ mod tests {
         let config = ClusterConfig {
             node_placement: Some(NodePlacement {
                 mode: NodePlacementMode::Any,
+                ..Default::default()
             }),
             ..base_config()
         };
