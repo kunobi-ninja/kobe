@@ -85,15 +85,19 @@ spec:
           # versions for namespace labeling, so the version skew vs the
           # cluster is harmless.
           image: rancher/kubectl:v1.34.7
+          # `rancher/kubectl` is a minimal image with no shell — no `sh`,
+          # no `set -eu`, no PATH-rich userland. Just /bin/kubectl. So
+          # invoke kubectl directly as PID 1 (Pod `command` replaces the
+          # image's ENTRYPOINT). PATH includes /bin so the bare `kubectl`
+          # token resolves.
           command:
-            - sh
-            - -c
-            - |
-              set -eu
-              kubectl label namespace {{ .Release.Namespace }} \
-                pod-security.kubernetes.io/enforce=privileged \
-                pod-security.kubernetes.io/audit=privileged \
-                pod-security.kubernetes.io/warn=privileged \
-                --overwrite
+            - kubectl
+            - label
+            - namespace
+            - {{ .Release.Namespace }}
+            - pod-security.kubernetes.io/enforce=privileged
+            - pod-security.kubernetes.io/audit=privileged
+            - pod-security.kubernetes.io/warn=privileged
+            - --overwrite
 {{- end }}
 {{- end }}
