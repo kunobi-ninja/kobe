@@ -1066,6 +1066,10 @@ fn build_bootstrap_job(
             instance_name.clone(),
         ),
         ("kobe.kunobi.ninja/bootstrap".to_string(), plan.name.clone()),
+        (
+            "kobe.kunobi.ninja/cluster".to_string(),
+            instance_name.clone(),
+        ),
     ]);
 
     let mut env = vec![EnvVar {

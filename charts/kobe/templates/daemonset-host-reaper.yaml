@@ -1,0 +1,73 @@
+{{- if .Values.hostReaper.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kobe-host-reaper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kobe-host-reaper
+      {{- include "kobe.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kobe-host-reaper
+        {{- include "kobe.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: kobe-host-reaper
+      hostPID: true
+      {{- with .Values.hostReaper.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: reaper
+          image: "{{ .Values.hostReaper.image.repository | default .Values.image.repository }}:{{ .Values.hostReaper.image.tag | default .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Absolute path: the runtime image is distroless (no shell, no PATH
+          # lookup); the bin is copied to /kobe-host-reaper by operator.Dockerfile.
+          command: ["/kobe-host-reaper"]
+          args:
+            - --lease-root={{ .Values.hostReaper.leaseRoot }}
+            - --live-set-path=/etc/kobe/live/instances
+            - --reconcile-interval={{ .Values.hostReaper.reconcileInterval }}
+            - --mtime-skip={{ .Values.hostReaper.mtimeSkip }}
+            {{- if .Values.hostReaper.dryRun }}
+            - --dry-run
+            {{- end }}
+          env:
+            {{- if .Values.hostReaper.disable }}
+            - name: KOBE_REAPER_DISABLE
+              value: "1"
+            {{- end }}
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          resources:
+            {{- toYaml .Values.hostReaper.resources | nindent 12 }}
+          volumeMounts:
+            - name: lease-root
+              mountPath: {{ .Values.hostReaper.leaseRoot }}
+              # Bidirectional: the reaper calls `umount2(MNT_DETACH)` inside
+              # the container and that unmount must propagate to the host
+              # mount table — that is precisely the stuck-kubelet fix this
+              # DaemonSet exists to perform. HostToContainer only propagates
+              # host→container and would leave the host's leaked mounts in
+              # place. The reaper never CREATES mounts, so nothing else
+              # propagates back. Requires `privileged: true` on the container.
+              mountPropagation: Bidirectional
+            - name: live-set
+              mountPath: /etc/kobe/live
+              readOnly: true
+      volumes:
+        - name: lease-root
+          hostPath:
+            path: {{ .Values.hostReaper.leaseRoot }}
+            type: DirectoryOrCreate
+        - name: live-set
+          configMap:
+            name: kobe-live-instances
+{{- end }}

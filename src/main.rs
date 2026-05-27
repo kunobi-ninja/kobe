@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::try_default().await?;
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
+    let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
 
     info!(namespace = %namespace, "Connected to Kubernetes");
 
@@ -132,6 +133,21 @@ async fn main() -> anyhow::Result<()> {
         kunobi_ha::leader::LeaderElection::builder(client.clone(), &namespace, "kobe-operator")
             .build();
     let leader_guard = leader_election.acquire().await?;
+
+    // Live-set ConfigMap reconciler (writes kobe-system/kobe-live-instances).
+    // Leader-only; consumed by the kobe-host-reaper DaemonSet to decide
+    // which `/var/lib/kobe/leases/<name>/` directories are stale.
+    let live_set_client = client.clone();
+    let live_set_ns = pod_namespace.clone();
+    let live_set_shutdown = shutdown.clone();
+    let live_set_handle = tokio::spawn(async move {
+        controllers::live_set::run_live_set_controller(
+            live_set_client,
+            &live_set_ns,
+            live_set_shutdown,
+        )
+        .await;
+    });
 
     // Detect Velero CRDs for snapshot support
     let velero = detect_velero(&client).await;
@@ -278,6 +294,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("KobeStore health controller exited unexpectedly"),
                     Err(e) => error!("KobeStore health controller panicked: {e}"),
+                }
+            }
+            result = live_set_handle => {
+                match result {
+                    Ok(()) => warn!("Live-set controller exited unexpectedly"),
+                    Err(e) => error!("Live-set controller panicked: {e}"),
                 }
             }
         }

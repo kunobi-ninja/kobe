@@ -30,5 +30,5 @@ ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 COPY . .
-RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe --bin kubeconfig-publisher && \
-    ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe target/release/kubeconfig-publisher
+RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kobe --bin kubeconfig-publisher --bin kobe-host-reaper && \
+    ls -la target/release/kobe-operator target/release/kobe-sync target/release/kobe target/release/kubeconfig-publisher target/release/kobe-host-reaper

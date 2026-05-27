@@ -122,3 +122,43 @@ roleRef:
   kind: Role
   name: {{ include "kobe.fullname" . }}-pool-publisher
   apiGroup: rbac.authorization.k8s.io
+{{- if .Values.hostReaper.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kobe-host-reaper
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kobe.fullname" . }}-host-reaper
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["clusterinstances"]
+    # `list` (not `get`) because the reaper's final safety check uses a
+    # cluster-wide LIST with `fieldSelector=metadata.name=<name>`. A bare
+    # `get` against `Api::all<T>` for a namespaced T is unreliable —
+    # the cluster-scoped path 404s on namespaced resources.
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kobe.fullname" . }}-host-reaper
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kobe.fullname" . }}-host-reaper
+subjects:
+  - kind: ServiceAccount
+    name: kobe-host-reaper
+    namespace: {{ .Release.Namespace }}
+{{- end }}

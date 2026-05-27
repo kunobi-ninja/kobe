@@ -1,0 +1,94 @@
+{{- if .Values.hostReaper.enabled }}
+{{- if .Values.hostReaper.namespacePsaLabels }}
+{{- /*
+  PSA labels must be applied BEFORE the privileged kobe-host-reaper
+  DaemonSet is admitted, otherwise a namespace enforcing restricted/
+  baseline PSA rejects the DS pod before this Job can relax the labels.
+  So this entire bundle runs as `pre-install,pre-upgrade` hooks.
+
+  Pre-install runs before any chart resources are applied, so the Job
+  cannot reuse the operator's ServiceAccount (it doesn't exist yet).
+  Three companion resources (SA, ClusterRole, ClusterRoleBinding) are
+  defined here as pre-install hooks at weight -10 so they exist before
+  the Job (weight -5) runs.
+*/ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kobe-psa-labeler
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kobe.fullname" . }}-psa-labeler
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["{{ .Release.Namespace }}"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kobe.fullname" . }}-psa-labeler
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kobe.fullname" . }}-psa-labeler
+subjects:
+  - kind: ServiceAccount
+    name: kobe-psa-labeler
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kobe-psa-labels-{{ .Release.Revision }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: kobe-psa-labeler
+      containers:
+        - name: kubectl
+          image: bitnami/kubectl:1.31
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              kubectl label namespace {{ .Release.Namespace }} \
+                pod-security.kubernetes.io/enforce=privileged \
+                pod-security.kubernetes.io/audit=privileged \
+                pod-security.kubernetes.io/warn=privileged \
+                --overwrite
+{{- end }}
+{{- end }}

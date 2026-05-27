@@ -3,4 +3,5 @@ pub mod instance;
 pub mod ipam;
 pub mod kobestore_health;
 pub mod lease;
+pub mod live_set;
 pub mod profile;

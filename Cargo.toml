@@ -26,6 +26,10 @@ path = "src/cli/main.rs"
 name = "kubeconfig-publisher"
 path = "src/kubeconfig_publisher_bin.rs"
 
+[[bin]]
+name = "kobe-host-reaper"
+path = "src/host_reaper_bin.rs"
+
 [dependencies]
 # Kubernetes — kube 3.0 requires k8s-openapi 0.27 + schemars 1.x
 kube = { version = "3.0", features = ["runtime", "derive", "client", "ws"] }
@@ -114,6 +118,10 @@ hex = "0.4"
 url = "2"
 http = "1"
 
+libc = "0.2"
+regex = "1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 wiremock = "0.6"
+tempfile = "3"

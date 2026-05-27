@@ -986,6 +986,73 @@ spec:
 
         anyhow::bail!("resource {name} was not deleted within 60 seconds")
     }
+
+    /// Opportunistic force-delete of pods carrying
+    /// `kobe.kunobi.ninja/cluster=<cluster_name>`.
+    ///
+    /// Called at the end of [`K0sBackend::delete`] after all controller
+    /// objects (STS / Deployment / Service / Secret / ConfigMap) have been
+    /// removed.  This covers the normal recycle path where a pod's kubelet
+    /// would eventually finalize the delete on its own but hasn't had the
+    /// chance yet.  For pods that are *stuck* because the inner kubelet left
+    /// Bidirectional bind-mounts on the host, force-delete is a no-op at the
+    /// apiserver; the `kobe-host-reaper` DaemonSet handles that case by
+    /// unmounting the host paths first.
+    ///
+    /// All errors are non-fatal:
+    /// - 404 on an individual pod → `debug!` + continue (inherent race: a
+    ///   concurrent kubelet or operator may delete a pod between our `list()`
+    ///   and the per-pod `delete()`).
+    /// - Other per-pod errors → `warn!` + continue.
+    /// - `list()` itself fails → `warn!` + return early.
+    ///
+    /// Note: pods created after our `list()` (e.g. mid-teardown of the
+    /// StatefulSet) will be missed; this is acceptable because all controller
+    /// objects are already deleted by this point.
+    async fn force_delete_instance_pods(pods: &Api<Pod>, cluster_name: &str) {
+        let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/cluster={cluster_name}"));
+        let pod_list = match pods.list(&lp).await {
+            Ok(list) => list,
+            Err(e) => {
+                warn!(
+                    cluster = cluster_name,
+                    error = %e,
+                    "failed to list pods for force-delete (non-fatal)"
+                );
+                return;
+            }
+        };
+
+        let dp = DeleteParams {
+            grace_period_seconds: Some(0),
+            propagation_policy: Some(PropagationPolicy::Background),
+            ..DeleteParams::default()
+        };
+
+        for pod in pod_list.items {
+            let name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
+            match pods.delete(name, &dp).await {
+                Ok(_) => {
+                    debug!(cluster = cluster_name, pod = name, "force-deleted pod");
+                }
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    debug!(
+                        cluster = cluster_name,
+                        pod = name,
+                        "pod already gone (404), skipping"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        cluster = cluster_name,
+                        pod = name,
+                        error = %e,
+                        "failed to force-delete pod (non-fatal)"
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl ClusterBackend for K0sBackend {
@@ -1116,6 +1183,11 @@ impl ClusterBackend for K0sBackend {
         {
             warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
         }
+
+        // Force-delete any leftover pods carrying our cluster label.
+        // See doc-comment on force_delete_instance_pods for rationale.
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        Self::force_delete_instance_pods(&pods, name).await;
 
         info!(cluster = name, "k0s cluster deleted");
         Ok(())
@@ -2200,5 +2272,298 @@ mod tests {
         let result = backend.check_health("new-cluster", "test-ns").await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    // =================================================================
+    // force_delete_instance_pods tests
+    // =================================================================
+
+    /// Helper: build a minimal Pod JSON object with the cluster label set.
+    fn pod_json(name: &str, namespace: &str, cluster: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": {
+                    "kobe.kunobi.ninja/cluster": cluster,
+                    "kobe.kunobi.ninja/role": "server"
+                }
+            },
+            "spec": {
+                "containers": [{ "name": "k0s", "image": "k0sproject/k0s:v1.30.1-k0s.0" }]
+            },
+            "status": {}
+        })
+    }
+
+    /// Helper: build a Pod JSON object with a foreign finalizer.
+    fn pod_json_with_finalizer(name: &str, namespace: &str, cluster: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": {
+                    "kobe.kunobi.ninja/cluster": cluster,
+                    "kobe.kunobi.ninja/role": "server"
+                },
+                "finalizers": ["external/foo"]
+            },
+            "spec": {
+                "containers": [{ "name": "k0s", "image": "k0sproject/k0s:v1.30.1-k0s.0" }]
+            },
+            "status": {}
+        })
+    }
+
+    /// Helper: build a PodList JSON with the given pod values.
+    fn pod_list_json(pods: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": { "resourceVersion": "1" },
+            "items": pods
+        })
+    }
+
+    /// Happy path: LIST returns 3 pods, each DELETE succeeds.
+    /// Asserts that:
+    ///   - LIST request contains `labelSelector=kobe.kunobi.ninja/cluster=pool-test-1`
+    ///   - DELETE body carries `gracePeriodSeconds: 0` and `propagationPolicy: "Background"`
+    #[tokio::test]
+    async fn force_delete_instance_pods_issues_label_scoped_force_deletes() {
+        use wiremock::matchers::{body_partial_json, query_param};
+
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+        let pod_names = ["server-0", "agent-rs-pod", "bootstrap-job-pod"];
+
+        // Mock: GET (LIST) pods with labelSelector
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pod_list_json(
+                pod_names.iter().map(|n| pod_json(n, ns, cluster)).collect(),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Mock: DELETE each pod — assert the body carries gracePeriodSeconds=0 and
+        // propagationPolicy=Background.
+        for name in &pod_names {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/api/v1/namespaces/{ns}/pods/{name}")))
+                .and(body_partial_json(serde_json::json!({
+                    "gracePeriodSeconds": 0,
+                    "propagationPolicy": "Background"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pod_json(name, ns, cluster)))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, ns);
+        K0sBackend::force_delete_instance_pods(&pods, cluster).await;
+        // MockServer Drop validates .expect(1) for every mounted mock.
+    }
+
+    /// LIST returns empty 200 (no pods).  Zero DELETE requests must be
+    /// issued and the helper must return Ok.
+    #[tokio::test]
+    async fn force_delete_instance_pods_tolerates_empty_list() {
+        use wiremock::matchers::query_param;
+
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        // LIST returns empty
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pod_list_json(vec![])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // No DELETE mocks — any DELETE would be an unexpected request.
+
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, ns);
+        K0sBackend::force_delete_instance_pods(&pods, cluster).await;
+    }
+
+    /// 3 pods listed; the 2nd DELETE returns 500.  Helper returns Ok and
+    /// all 3 DELETE requests are still issued (partial failure does not
+    /// abort the loop).
+    #[tokio::test]
+    async fn force_delete_instance_pods_continues_on_partial_failure() {
+        use wiremock::matchers::query_param;
+
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+        let pod_names = ["server-0", "agent-rs-pod", "bootstrap-job-pod"];
+
+        // LIST returns 3 pods
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pod_list_json(
+                pod_names.iter().map(|n| pod_json(n, ns, cluster)).collect(),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 1st DELETE: success
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods/server-0")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pod_json("server-0", ns, cluster)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 2nd DELETE: 500 — non-fatal, loop continues
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods/agent-rs-pod")))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "Internal Server Error",
+                "code": 500
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 3rd DELETE: success — must still be issued
+        Mock::given(method("DELETE"))
+            .and(path(format!(
+                "/api/v1/namespaces/{ns}/pods/bootstrap-job-pod"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pod_json(
+                "bootstrap-job-pod",
+                ns,
+                cluster,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, ns);
+        K0sBackend::force_delete_instance_pods(&pods, cluster).await;
+        // MockServer Drop validates all three .expect(1) assertions.
+    }
+
+    /// A pod that has a foreign finalizer must receive a DELETE request
+    /// (force-delete sets deletionTimestamp) but no PATCH request (we must
+    /// NOT strip the finalizer ourselves).
+    #[tokio::test]
+    async fn force_delete_instance_pods_does_not_strip_foreign_finalizers() {
+        use wiremock::matchers::query_param;
+
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        // LIST returns 1 pod with a foreign finalizer
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pod_list_json(vec![
+                pod_json_with_finalizer("server-0", ns, cluster),
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // DELETE must be issued — foreign finalizer does not prevent the call
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods/server-0")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(pod_json_with_finalizer("server-0", ns, cluster)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PATCH must NOT be issued — we do not strip foreign finalizers.
+        // (wiremock returns 404 for unexpected requests; if a PATCH were sent
+        //  the DELETE mock would not consume it and the test would still pass
+        //  for the wrong reason — so we mount a PATCH mock with expect(0) to
+        //  make it an explicit failure if a PATCH is ever issued.)
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods/server-0")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pod_json("server-0", ns, cluster)),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, ns);
+        K0sBackend::force_delete_instance_pods(&pods, cluster).await;
+        // MockServer Drop: DELETE expect(1) + PATCH expect(0) are both verified.
+    }
+
+    /// LIST request carries `labelSelector=kobe.kunobi.ninja/cluster=pool-test-1`.
+    /// Wiremock's `query_param` matcher does the URL-encoded comparison.
+    #[tokio::test]
+    async fn force_delete_instance_pods_scopes_to_label() {
+        use wiremock::matchers::query_param;
+
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        // Only respond if the labelSelector is exactly scoped to our cluster.
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pod_list_json(vec![])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, ns);
+        K0sBackend::force_delete_instance_pods(&pods, cluster).await;
+        // MockServer Drop validates that the mock with the exact labelSelector
+        // was called exactly once — any different labelSelector would not match
+        // and the .expect(1) would fail.
     }
 }

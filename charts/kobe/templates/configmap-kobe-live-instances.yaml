@@ -1,0 +1,24 @@
+{{- if .Values.hostReaper.enabled }}
+{{- /*
+  Initial empty CM. Operator owns the content after install via SSA;
+  Helm never overwrites it on upgrade (resource-policy: keep + lookup-
+  guarded body). See:
+  docs/superpowers/specs/2026-05-26-kobe-host-reaper-design.md
+*/ -}}
+{{- $existing := lookup "v1" "ConfigMap" .Release.Namespace "kobe-live-instances" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kobe-live-instances
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+data:
+  {{- if $existing }}
+  instances: {{ index $existing.data "instances" | quote }}
+  {{- else }}
+  instances: ""
+  {{- end }}
+{{- end }}

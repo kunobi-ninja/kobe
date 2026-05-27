@@ -48,6 +48,9 @@ ENV BUILD_VERSION=${BUILD_VERSION}
 
 COPY --from=builder /app/target/release/kobe-operator /kobe-operator
 COPY --from=builder /app/target/release/kubeconfig-publisher /kubeconfig-publisher
+# kobe-host-reaper is invoked by the same-image kobe-host-reaper DaemonSet
+# (privileged, hostPID). The chart selects it via `command: [kobe-host-reaper]`.
+COPY --from=builder /app/target/release/kobe-host-reaper /kobe-host-reaper
 
 # helm CLI is invoked as a subprocess by the `vcluster` backend to
 # install/uninstall vcluster instances per ClusterInstance.

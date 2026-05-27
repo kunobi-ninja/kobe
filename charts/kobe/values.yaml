@@ -247,4 +247,33 @@ kobeStores: []
 # -----------------------------------------------------------------------------
 cidrReservations: []
 
-
+# -----------------------------------------------------------------------------
+# kobe-host-reaper DaemonSet. Always-on by default. Disable on clusters
+# where no ClusterPool uses `kubeletSharedMount`. Per-node DaemonSet that
+# unmounts and rm -rf's stale subtrees under `/var/lib/kobe/leases/`,
+# gated by the operator-written `kobe-live-instances` ConfigMap.
+# -----------------------------------------------------------------------------
+hostReaper:
+  enabled: true
+  # Override only if the operator image and the reaper image diverge.
+  image:
+    repository: ""  # falls back to .Values.image.repository
+    tag: ""        # falls back to .Values.image.tag
+  leaseRoot: /var/lib/kobe/leases
+  reconcileInterval: 30s
+  mtimeSkip: 120s
+  dryRun: false
+  # If true, the reaper container starts with KOBE_REAPER_DISABLE=1 set,
+  # turning the sweep loop into a no-op (logs once per interval).
+  # Operators can flip this in-place via `kubectl set env ds/...`.
+  disable: false
+  namespacePsaLabels: true
+  tolerations:
+    - operator: Exists
+  resources:
+    limits:
+      cpu: 100m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi
