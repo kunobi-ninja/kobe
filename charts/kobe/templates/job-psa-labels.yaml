@@ -79,7 +79,12 @@ spec:
       serviceAccountName: kobe-psa-labeler
       containers:
         - name: kubectl
-          image: bitnami/kubectl:1.31
+          # `bitnami/kubectl:1.31` returns 404 against docker.io — Bitnami's
+          # August 2025 image reorg dropped bare-minor tags. `rancher/kubectl`
+          # publishes stable tags; kubectl is API-compatible across minor
+          # versions for namespace labeling, so the version skew vs the
+          # cluster is harmless.
+          image: rancher/kubectl:v1.34.7
           command:
             - sh
             - -c
