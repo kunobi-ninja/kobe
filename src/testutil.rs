@@ -119,6 +119,7 @@ impl MockBackend {
     }
 
     /// Make subsequent `check_readiness_gate` calls return an error.
+    #[allow(dead_code)]
     pub fn fail_readiness(&self, msg: &str) {
         *self.inner.readiness_error.lock().unwrap() = Some(msg.to_string());
     }

@@ -650,6 +650,17 @@ spec:
                 description: Autoscaling configuration. When set, overrides fixed `size`.
                 nullable: true
                 properties:
+                  creatingTimeout:
+                    default: 10m
+                    description: |-
+                      Max time an instance can stay in `Creating` before the operator
+                      recycles it as wedged. Default 10m matches the operator's
+                      pre-CRD behavior. Bump this on clusters where the bootstrap
+                      (helm install, flux+argocd warm-up, etc.) genuinely takes
+                      longer than 10m — for example slow-disk bare-metal nodes whose
+                      sqlite WAL fsync runs 2-3× slower than agent VMs. Malformed
+                      values fall back to 10m. Format: "10m", "1h", "900s".
+                    type: string
                   failureBackoff:
                     description: |-
                       Exponential backoff policy on consecutive provision failures.

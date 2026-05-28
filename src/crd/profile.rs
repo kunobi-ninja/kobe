@@ -957,6 +957,16 @@ pub struct ScalingConfig {
     #[serde(default = "default_queue_timeout")]
     pub queue_timeout: String,
 
+    /// Max time an instance can stay in `Creating` before the operator
+    /// recycles it as wedged. Default 10m matches the operator's
+    /// pre-CRD behavior. Bump this on clusters where the bootstrap
+    /// (helm install, flux+argocd warm-up, etc.) genuinely takes
+    /// longer than 10m — for example slow-disk bare-metal nodes whose
+    /// sqlite WAL fsync runs 2-3× slower than agent VMs. Malformed
+    /// values fall back to 10m. Format: "10m", "1h", "900s".
+    #[serde(default = "default_creating_timeout")]
+    pub creating_timeout: String,
+
     /// Exponential backoff policy on consecutive provision failures.
     /// When unset, sensible defaults apply (base 5s, multiplier 2, max 2m).
     /// A broken pool that never reaches `Ready` caps at ~30 retries/hour.
@@ -1238,6 +1248,9 @@ fn default_scale_down_after() -> String {
 }
 fn default_queue_timeout() -> String {
     "5m".to_string()
+}
+fn default_creating_timeout() -> String {
+    "10m".to_string()
 }
 fn default_backoff_base() -> String {
     "5s".to_string()

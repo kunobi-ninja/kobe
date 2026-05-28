@@ -338,7 +338,7 @@ pub enum PoolAction {
 ///    landing fresh `ready_clean` instances that this step can then
 ///    recycle without dipping under the floor.
 ///
-/// 5. **Stuck Creating timeout (10 min).**
+/// 5. **Stuck Creating timeout (configurable, default 10 min).**
 ///    `Delete` Creating instances whose `state_since` is older than
 ///    the timeout. Independent of drift — covers the case where a
 ///    Creating is *clean* (current hash) but the bootstrap is wedged.
@@ -375,6 +375,30 @@ pub enum PoolAction {
 /// See [`UpgradePolicy`](crate::crd::UpgradePolicy) for the knobs and
 /// `docs/guides/upgrade-policy.md` for the operator-facing tuning
 /// guide.
+/// Resolve the per-pool stuck-Creating timeout. Falls back to the
+/// operator's pre-CRD default of 10 minutes when the field is missing
+/// (no `scaling` block) or malformed (`parse_duration` returns None).
+/// Logs a warning when the field is set but unparseable so typos
+/// don't silently keep the default.
+fn resolve_creating_timeout(profile: &crate::crd::ClusterPool) -> chrono::Duration {
+    let default = chrono::Duration::minutes(10);
+    let Some(scaling) = profile.spec.scaling.as_ref() else {
+        return default;
+    };
+    match parse_duration(&scaling.creating_timeout) {
+        Some(d) => d,
+        None => {
+            tracing::warn!(
+                profile = %profile.metadata.name.as_deref().unwrap_or("?"),
+                value = %scaling.creating_timeout,
+                "ScalingConfig.creatingTimeout is unparseable; falling back to 10m default. \
+                 Format: \"10m\", \"1h\", \"900s\"."
+            );
+            default
+        }
+    }
+}
+
 pub fn compute_pool_actions(
     profile: &ClusterPool,
     state: &PoolState,
@@ -431,9 +455,10 @@ pub fn compute_pool_actions(
     // be held hostage by a transient backoff.
     if backoff_active(profile, now) {
         // Stuck-Creating timeout still applies during backoff —
-        // a Creating that's been Creating for >10min is wedged
-        // independently of any provision-failure counter.
-        let creating_timeout = chrono::Duration::minutes(10);
+        // a Creating that's been Creating past the pool's
+        // creating_timeout (default 10m) is wedged independently
+        // of any provision-failure counter.
+        let creating_timeout = resolve_creating_timeout(profile);
         for (name, entry) in &state.clusters {
             if entry.state == ClusterState::Creating
                 && !deleting.contains(name)
@@ -532,7 +557,7 @@ pub fn compute_pool_actions(
     }
 
     // === 5. Stuck Creating timeout. ===
-    let creating_timeout = chrono::Duration::minutes(10);
+    let creating_timeout = resolve_creating_timeout(profile);
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Creating
             && !deleting.contains(name)
@@ -1255,6 +1280,7 @@ mod tests {
                 scale_up_threshold: 1,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1291,6 +1317,7 @@ mod tests {
                 scale_up_threshold: 1,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1321,6 +1348,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1355,6 +1383,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1386,6 +1415,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1440,6 +1470,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1751,6 +1782,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: Some(crate::crd::FailureBackoffConfig {
                     base: "2s".to_string(),
                     multiplier: 3,
@@ -1786,6 +1818,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: Some(crate::crd::FailureBackoffConfig {
                     base: "not-a-duration".to_string(),
                     multiplier: 0, // invalid — zero disables, fallback
@@ -1816,6 +1849,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -1937,6 +1971,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "30m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         )
@@ -2364,6 +2399,7 @@ mod tests {
                 scale_up_threshold: 0,
                 scale_down_after: "1m".to_string(),
                 queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
                 failure_backoff: None,
             }),
         );
@@ -2614,5 +2650,119 @@ mod tests {
         });
         let resolved = resolved_upgrade_policy(&profile, /* min_ready = */ 2);
         assert_eq!(resolved.min_ready_during_upgrade, 0);
+    }
+
+    #[test]
+    fn stuck_creating_timeout_is_configurable_via_scaling() {
+        // Pool sets creating_timeout = 20m. An instance Creating for 15m
+        // should NOT be deleted (under the new ceiling), but one for
+        // 25m should be.
+        let profile = make_profile(
+            6,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 6,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "20m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-young".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(15)),
+                spec_hash: None,
+            },
+        );
+        clusters.insert(
+            "pool-test-profile-old".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(25)),
+                spec_hash: None,
+            },
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !deletes.contains(&"pool-test-profile-young".to_string()),
+            "instance Creating for 15min should NOT be deleted with creating_timeout=20m; deletes={deletes:?}"
+        );
+        assert!(
+            deletes.contains(&"pool-test-profile-old".to_string()),
+            "instance Creating for 25min should be deleted with creating_timeout=20m; deletes={deletes:?}"
+        );
+    }
+
+    #[test]
+    fn stuck_creating_timeout_falls_back_to_10m_on_garbage() {
+        // Garbage value -> parse fails -> default 10m applies.
+        let profile = make_profile(
+            6,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 6,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "not-a-duration".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-12m".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(12)),
+                spec_hash: None,
+            },
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deletes.contains(&"pool-test-profile-12m".to_string()),
+            "instance Creating for 12min should be deleted because garbage falls back to 10m default; deletes={deletes:?}"
+        );
     }
 }

@@ -1887,10 +1887,7 @@ mod tests {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        assert!(
-            args.iter()
-                .any(|a| *a == "--etcd-servers=http://etcd.pool-prod.svc:2379")
-        );
+        assert!(args.contains(&"--etcd-servers=http://etcd.pool-prod.svc:2379"));
         assert!(
             args.iter()
                 .any(|a| a.starts_with("--etcd-prefix=/kobe/cluster-1/"))
