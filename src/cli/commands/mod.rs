@@ -1,5 +1,6 @@
 mod config;
 mod config_tui;
+mod extend;
 mod lease_create;
 mod leases;
 mod login;
@@ -7,6 +8,7 @@ mod picker;
 mod pools;
 mod purge;
 mod release;
+mod select;
 pub(crate) mod session;
 mod state;
 mod status;
@@ -20,6 +22,7 @@ pub use config::{
     config_show, config_use_target,
 };
 pub use config_tui::run_config_tui as config_interactive;
+pub use extend::extend;
 pub use lease_create::{LeaseCreateCommand, lease_create};
 pub use login::{login, logout};
 pub use purge::purge;

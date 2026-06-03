@@ -2,10 +2,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use super::config::CliConfig;
-use super::leases::{
-    LeaseSummary, fetch_leases_path, lease_cluster_label, lease_phase_label, lease_when_label,
-};
-use super::picker::{PickerItem, run_picker};
+use super::select::{OnAmbiguous, resolve_lease_id};
 use super::state::remove_kubeconfig;
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
 
@@ -24,9 +21,13 @@ pub async fn release(
 ) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
+    // An explicit id is used verbatim (the server handles 404 gracefully, so
+    // releasing a just-expired id still works). Otherwise resolve against the
+    // active leases, falling back to the first one in non-interactive mode to
+    // preserve the prior behavior.
     let selected_lease = match lease_id {
         Some(id) => id.to_string(),
-        None => select_lease_for_release(&config, output).await?,
+        None => resolve_lease_id(&config, None, output, OnAmbiguous::FirstActive).await?,
     };
     let endpoint = config.endpoint.as_str();
     let path = format!("/v1/leases/{selected_lease}");
@@ -78,51 +79,4 @@ pub async fn release(
     }
 
     Ok(())
-}
-
-async fn select_lease_for_release(
-    config: &super::config::ResolvedConfig,
-    output: OutputFormat,
-) -> Result<String> {
-    let leases = fetch_leases_path(config, "/v1/leases").await?;
-    let active_leases: Vec<LeaseSummary> = leases
-        .into_iter()
-        .filter(|lease| {
-            !lease.phase.eq_ignore_ascii_case("released")
-                && !lease.phase.eq_ignore_ascii_case("expired")
-                && !lease.phase.eq_ignore_ascii_case("recycling")
-        })
-        .collect();
-
-    if active_leases.is_empty() {
-        anyhow::bail!("No releasable leases found");
-    }
-
-    if output == OutputFormat::Json {
-        return Ok(active_leases[0].id.clone());
-    }
-
-    let items: Vec<PickerItem> = active_leases
-        .iter()
-        .map(|lease| PickerItem {
-            primary: format!(
-                "{}  {}  {}",
-                lease.id,
-                lease.profile,
-                lease_when_label(lease)
-            ),
-            secondary: format!(
-                "phase: {}   cluster: {}",
-                lease_phase_label(lease),
-                lease_cluster_label(lease)
-            ),
-        })
-        .collect();
-
-    let idx = run_picker(
-        "Release Lease",
-        "Use ↑/↓ and Enter. Press q or Esc to cancel.",
-        &items,
-    )?;
-    Ok(active_leases[idx].id.clone())
 }

@@ -66,6 +66,18 @@ enum Commands {
         #[arg(long = "kubeconfig", value_name = "PATH")]
         kubeconfig: Option<String>,
     },
+    /// Extend the TTL of an active lease
+    ///
+    /// TARGET selects the lease by id or pool. When omitted: if you hold a
+    /// single active lease it is used; otherwise you are prompted to pick one
+    /// (or, with `--output json`, the command errors and lists candidates).
+    Extend {
+        /// Lease id or pool to extend (optional when you hold one lease)
+        target: Option<String>,
+        /// Duration to add to the current expiry (e.g. 30m, 1h)
+        #[arg(long, default_value = "30m")]
+        ttl: String,
+    },
     /// Release a cluster lease
     Release {
         /// Lease ID
@@ -183,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
                 output,
             })
             .await
+        }
+        Commands::Extend { target: lease, ttl } => {
+            commands::extend(lease.as_deref(), &ttl, target, endpoint, output).await
         }
         Commands::Release { lease_id } => {
             commands::release(lease_id.as_deref(), target, endpoint, output).await
