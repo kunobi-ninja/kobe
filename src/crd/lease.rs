@@ -54,15 +54,18 @@ pub struct ClusterLeaseStatus {
     pub phase: LeasePhase,
 
     /// Name of the bound cluster (set when phase=Bound).
-    #[serde(default)]
+    // skip_serializing_if: never serialize None, so a controller doing
+    // pass-through preservation that momentarily reads it as None cannot erase it
+    // via a JSON-Merge-Patch null (RFC 7396). Only ever set, never cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_name: Option<String>,
 
     /// When the lease was bound to a vcluster.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_at: Option<String>,
 
     /// When the lease expires (TTL deadline).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
     /// Position in the priority queue (0 = not queued, 1 = next).
@@ -70,7 +73,7 @@ pub struct ClusterLeaseStatus {
     pub queue_position: u32,
 
     /// URL to the diagnostic bundle captured on release.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics_url: Option<String>,
 
     /// Number of TTL extensions granted for this lease.
@@ -113,4 +116,57 @@ impl std::fmt::Display for LeasePhase {
 /// Default priority: normal (50).
 fn default_priority() -> u32 {
     50
+}
+
+#[cfg(test)]
+mod json_safety_tests {
+    use super::*;
+
+    #[test]
+    fn status_omits_none_preserve_fields_so_merge_patch_cannot_erase_them() {
+        // With skip_serializing_if, a None preserve-field is OMITTED from the
+        // serialized status. A JSON Merge Patch (RFC 7396) then leaves the
+        // on-disk value untouched, instead of deleting it via an explicit null —
+        // so a controller doing pass-through preservation can't erase a field it
+        // momentarily read as None.
+        let none_status = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&none_status).unwrap();
+        assert!(
+            v.get("clusterName").is_none(),
+            "clusterName must be omitted when None"
+        );
+        assert!(
+            v.get("boundAt").is_none(),
+            "boundAt must be omitted when None"
+        );
+        assert!(
+            v.get("expiresAt").is_none(),
+            "expiresAt must be omitted when None"
+        );
+        assert!(
+            v.get("diagnosticsUrl").is_none(),
+            "diagnosticsUrl must be omitted when None"
+        );
+
+        // Set values are still serialized.
+        let set_status = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            cluster_name: Some("pool-x-0".into()),
+            bound_at: Some("2026-06-04T00:00:00Z".into()),
+            expires_at: Some("2026-06-04T01:00:00Z".into()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&set_status).unwrap();
+        assert_eq!(
+            v.get("clusterName").and_then(|x| x.as_str()),
+            Some("pool-x-0")
+        );
+        assert_eq!(
+            v.get("boundAt").and_then(|x| x.as_str()),
+            Some("2026-06-04T00:00:00Z")
+        );
+    }
 }

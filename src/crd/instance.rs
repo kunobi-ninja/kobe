@@ -117,7 +117,10 @@ pub struct ClusterInstanceStatus {
     pub lease_ref: Option<ResourceRef>,
 
     /// Bootstrap currently running for this instance, if any.
-    #[serde(default)]
+    // skip_serializing_if: informational only (read just for a failure-metric
+    // label; never for control flow), so omitting None protects it from
+    // cross-controller Merge-Patch erasure without affecting behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_bootstrap: Option<String>,
 
     /// When the instance became idle and eligible for scale-down.
