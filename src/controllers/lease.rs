@@ -458,7 +458,23 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 }
             }
 
-            Ok(Action::requeue(std::time::Duration::from_secs(30)))
+            // Requeue at this lease's expiry deadline (clamped to [1s, 30s])
+            // rather than a fixed 30s, so TTL expiry is detected promptly instead
+            // of up to ~30-60s late. (The 60s reaper remains a backstop.)
+            let until_expiry = status
+                .expires_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|e| e.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                .and_then(|d| d.to_std().ok())
+                .map(|d| {
+                    d.clamp(
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(30),
+                    )
+                })
+                .unwrap_or(std::time::Duration::from_secs(30));
+            Ok(Action::requeue(until_expiry))
         }
 
         LeasePhase::Released | LeasePhase::Expired => {
