@@ -241,7 +241,12 @@ pub(crate) async fn validate_lease_connect_token(
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let name = connect_secret_name(lease_id);
     match secrets.get(&name).await {
-        Ok(secret) => Ok(read_token(&secret)? == presented_token),
+        // Constant-time comparison: this gates connect-proxy access to the
+        // leased cluster, so the match must not leak a per-byte timing signal.
+        Ok(secret) => Ok(kunobi_auth::secret_eq(
+            &read_token(&secret)?,
+            presented_token,
+        )),
         Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
         Err(e) => Err(e).with_context(|| format!("Failed to read connect token {name}")),
     }

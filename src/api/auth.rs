@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use kunobi_auth::secret_eq;
 use kunobi_auth::server::ssh::{CompiledSshProvider, NonceTracker, ParsedAuthorizedKey};
-use reqwest::Client as HttpClient;
+use kunobi_auth::server::{JwksManager, verify_azp};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -12,37 +13,15 @@ use tracing::{debug, warn};
 use crate::crd::access_policy::{AccessPolicy, AccessRule, ClaimMatch};
 use crate::pool::parse_duration;
 
-/// JWKS cache entry.
-#[derive(Debug, Clone)]
-struct JwkSet {
-    keys: Vec<Jwk>,
-    fetched_at: std::time::Instant,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct Jwk {
-    kid: Option<String>,
-    kty: String,
-    n: Option<String>,
-    e: Option<String>,
-    x: Option<String>,
-    y: Option<String>,
-    crv: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct JwksResponse {
-    keys: Vec<Jwk>,
-}
-
 /// Generic JWT claims — captures all claims from any OIDC provider.
+///
+/// Built by deserializing the validated claim map returned by
+/// [`kunobi_auth::server::JwksManager::validate_jwt`], for kobe-specific rule
+/// matching and identity templating.
 #[derive(Debug, Deserialize)]
 struct GenericClaims {
     iss: String,
     sub: String,
-    #[serde(default)]
-    azp: Option<String>,
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
@@ -87,7 +66,9 @@ struct CompiledProvider {
     jwks_url: String,
     audience: Vec<String>,
     authorized_parties: Vec<String>,
-    algorithms: Vec<Algorithm>,
+    /// Allowed signing algorithms as their string names (e.g. `"RS256"`), passed
+    /// to [`JwksManager::validate_jwt`] which parses + enforces them.
+    algorithms: Vec<String>,
     identity_template: String,
     /// Flat rules list — first matching rule wins.
     rules: Vec<AccessRule>,
@@ -110,7 +91,9 @@ struct CompiledSshPolicyProvider {
 
 /// JWT authenticator supporting any OIDC provider via AccessPolicy CRDs.
 pub struct JwtAuthenticator {
-    http: HttpClient,
+    /// JWKS fetch/cache + JWT signature/iss/aud/exp/nbf/alg verification,
+    /// delegated to kunobi-auth so the rules stay shared across services.
+    jwks: JwksManager,
     /// Compiled OIDC providers from AccessPolicy CRDs.
     providers: RwLock<Vec<CompiledProvider>>,
     /// Compiled SSH providers from AccessPolicy CRDs.
@@ -119,29 +102,18 @@ pub struct JwtAuthenticator {
     token_providers: RwLock<Vec<CompiledTokenProvider>>,
     /// Nonce tracker for SSH replay protection.
     nonce_tracker: NonceTracker,
-    /// Cached JWKS per URL.
-    jwks_cache: RwLock<HashMap<String, JwkSet>>,
     /// SSHSIG namespace (e.g. "kobe-system").
     ssh_namespace: String,
 }
 
-/// Cache TTL for JWKS keys.
-const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
 impl JwtAuthenticator {
     pub fn new(ssh_namespace: String) -> Self {
-        let http = HttpClient::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("Failed to build HTTP client");
         Self {
-            http,
+            jwks: JwksManager::new(),
             providers: RwLock::new(Vec::new()),
             ssh_providers: RwLock::new(Vec::new()),
             token_providers: RwLock::new(Vec::new()),
             nonce_tracker: NonceTracker::new(std::time::Duration::from_secs(60)),
-            jwks_cache: RwLock::new(HashMap::new()),
             ssh_namespace,
         }
     }
@@ -180,10 +152,13 @@ impl JwtAuthenticator {
                     .jwks_url
                     .unwrap_or_else(|| format!("{}/.well-known/jwks.json", oidc.issuer));
 
-                let algorithms: Vec<Algorithm> = oidc
+                // Keep only algorithm names kunobi-auth can parse; it re-parses
+                // and enforces them in `validate_jwt`.
+                let algorithms: Vec<String> = oidc
                     .algorithms
                     .iter()
-                    .filter_map(|a| parse_algorithm(a))
+                    .filter(|a| parse_algorithm(a).is_some())
+                    .cloned()
                     .collect();
 
                 if algorithms.is_empty() {
@@ -192,6 +167,17 @@ impl JwtAuthenticator {
                         "No valid algorithms configured, skipping provider"
                     );
                     return None;
+                }
+
+                // `validate_jwt` refuses an empty audience (it is required for
+                // token-confusion safety). Warn at compile time so an operator
+                // sees the misconfiguration before tokens start being rejected.
+                if oidc.audience.is_empty() {
+                    warn!(
+                        provider = %policy_name,
+                        "OIDC provider has no audience configured; tokens will be \
+                         rejected until `audience` is set"
+                    );
                 }
 
                 Some(CompiledProvider {
@@ -427,7 +413,7 @@ impl JwtAuthenticator {
     pub async fn validate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
         {
             let token_providers = self.token_providers.read().await;
-            if let Some(provider) = token_providers.iter().find(|p| p.token == token) {
+            if let Some(provider) = token_providers.iter().find(|p| secret_eq(&p.token, token)) {
                 let rule = find_matching_rule(&provider.rules, None).ok_or_else(|| {
                     AuthError::InvalidToken(
                         "No access rule configured for static token provider".into(),
@@ -473,7 +459,7 @@ impl JwtAuthenticator {
 
         let mut last_error = String::new();
         for provider in matching {
-            match self.validate_with_provider(token, &header, provider).await {
+            match self.validate_with_provider(token, provider).await {
                 Ok(identity) => return Ok(identity),
                 Err(e) => {
                     last_error = e.to_string();
@@ -488,50 +474,40 @@ impl JwtAuthenticator {
     }
 
     /// Validate a token against a specific compiled provider.
+    ///
+    /// Delegates signature / issuer / audience / exp / nbf / algorithm checks to
+    /// [`JwksManager::validate_jwt`] (which fetches + caches JWKS and refuses an
+    /// empty audience), then enforces `azp` via the shared [`verify_azp`] helper,
+    /// before kobe-specific rule matching and identity templating.
     async fn validate_with_provider(
         &self,
         token: &str,
-        header: &jsonwebtoken::Header,
         provider: &CompiledProvider,
     ) -> Result<AuthIdentity, AuthError> {
-        let key = self
-            .get_decoding_key(&provider.jwks_url, header.kid.as_deref())
-            .await?;
-
-        // Use the first algorithm from the provider's list for validation
-        let mut validation = Validation::new(provider.algorithms[0]);
-        validation.algorithms = provider.algorithms.clone();
-
-        // Configure audience validation
-        if !provider.audience.is_empty() {
-            validation.set_audience(&provider.audience);
-        } else {
-            validation.validate_aud = false;
-        }
-
-        validation.set_issuer(&[&provider.issuer]);
-
-        let data = decode::<GenericClaims>(token, &key, &validation)
+        let claims_map = self
+            .jwks
+            .validate_jwt(
+                token,
+                &provider.jwks_url,
+                &provider.issuer,
+                &provider.audience,
+                &provider.algorithms,
+            )
+            .await
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
-        // Validate azp (Authorized Party) if configured
-        if !provider.authorized_parties.is_empty() {
-            match &data.claims.azp {
-                Some(azp) if provider.authorized_parties.iter().any(|p| p == azp) => {}
-                Some(azp) => {
-                    return Err(AuthError::InvalidToken(format!("Unauthorized azp: {azp}")));
-                }
-                None => {
-                    return Err(AuthError::InvalidToken("Missing azp claim in token".into()));
-                }
-            }
-        }
+        verify_azp(&claims_map, &provider.authorized_parties)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+
+        let claims: GenericClaims =
+            serde_json::from_value(serde_json::Value::Object(claims_map.into_iter().collect()))
+                .map_err(|e| AuthError::InvalidToken(format!("malformed claims: {e}")))?;
 
         // Find matching rule — iterate rules, check match clauses against claims
-        let (rule, matched_value) = find_matching_rule_with_claims(&provider.rules, &data.claims)?;
+        let (rule, matched_value) = find_matching_rule_with_claims(&provider.rules, &claims)?;
 
         // Format identity from template
-        let identity = format_identity(&provider.identity_template, &data.claims);
+        let identity = format_identity(&provider.identity_template, &claims);
 
         // Build requester_type: "{policy_name}" or "{policy_name}:{matched_value}"
         let requester_type = match &matched_value {
@@ -549,106 +525,9 @@ impl JwtAuthenticator {
         Ok(AuthIdentity {
             requester_type,
             identity,
-            issuer: data.claims.iss,
+            issuer: claims.iss,
             policy: access_rule_to_policy(rule),
         })
-    }
-
-    /// Fetch a decoding key from JWKS, with caching.
-    async fn get_decoding_key(
-        &self,
-        jwks_url: &str,
-        kid: Option<&str>,
-    ) -> Result<DecodingKey, AuthError> {
-        // Check cache
-        {
-            let cache = self.jwks_cache.read().await;
-            if let Some(cached) = cache.get(jwks_url)
-                && cached.fetched_at.elapsed() < JWKS_CACHE_TTL
-            {
-                return Self::find_key(&cached.keys, kid);
-            }
-        }
-
-        // Fetch fresh JWKS
-        let resp = self
-            .http
-            .get(jwks_url)
-            .send()
-            .await
-            .map_err(|e| AuthError::JwksFetchError(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(AuthError::JwksFetchError(format!(
-                "JWKS endpoint returned HTTP {}",
-                resp.status()
-            )));
-        }
-
-        let jwks: JwksResponse = resp
-            .json()
-            .await
-            .map_err(|e| AuthError::JwksFetchError(e.to_string()))?;
-
-        let jwk_set = JwkSet {
-            keys: jwks.keys.clone(),
-            fetched_at: std::time::Instant::now(),
-        };
-
-        // Check-lock-check: another task may have refreshed while we were fetching
-        let mut cache = self.jwks_cache.write().await;
-        if let Some(existing) = cache.get(jwks_url)
-            && existing.fetched_at.elapsed() < JWKS_CACHE_TTL
-        {
-            return Self::find_key(&existing.keys, kid);
-        }
-        cache.insert(jwks_url.to_string(), jwk_set);
-        drop(cache);
-
-        Self::find_key(&jwks.keys, kid)
-    }
-
-    fn find_key(keys: &[Jwk], kid: Option<&str>) -> Result<DecodingKey, AuthError> {
-        let kid = kid.ok_or_else(|| {
-            AuthError::InvalidToken("JWT header missing required 'kid' field".into())
-        })?;
-        let key = keys
-            .iter()
-            .find(|k| k.kid.as_deref() == Some(kid))
-            .ok_or_else(|| AuthError::KeyNotFound(kid.to_string()))?;
-
-        match key.kty.as_str() {
-            "RSA" => {
-                let n = key.n.as_ref().ok_or_else(|| {
-                    AuthError::InvalidToken("RSA key missing 'n' component".into())
-                })?;
-                let e = key.e.as_ref().ok_or_else(|| {
-                    AuthError::InvalidToken("RSA key missing 'e' component".into())
-                })?;
-                DecodingKey::from_rsa_components(n, e)
-                    .map_err(|e| AuthError::InvalidToken(e.to_string()))
-            }
-            "EC" => {
-                let x = key.x.as_ref().ok_or_else(|| {
-                    AuthError::InvalidToken("EC key missing 'x' component".into())
-                })?;
-                let y = key.y.as_ref().ok_or_else(|| {
-                    AuthError::InvalidToken("EC key missing 'y' component".into())
-                })?;
-                DecodingKey::from_ec_components(x, y)
-                    .map_err(|e| AuthError::InvalidToken(e.to_string()))
-            }
-            "OKP" => {
-                let x = key.x.as_ref().ok_or_else(|| {
-                    AuthError::InvalidToken("OKP key missing 'x' component".into())
-                })?;
-                DecodingKey::from_ed_components(x)
-                    .map_err(|e| AuthError::InvalidToken(e.to_string()))
-            }
-            other => Err(AuthError::InvalidToken(format!(
-                "Unsupported key type: {other}"
-            ))),
-        }
     }
 }
 
@@ -828,10 +707,6 @@ fn parse_algorithm(s: &str) -> Option<Algorithm> {
 pub enum AuthError {
     #[error("Invalid token: {0}")]
     InvalidToken(String),
-    #[error("Failed to fetch JWKS: {0}")]
-    JwksFetchError(String),
-    #[error("Key not found: {0}")]
-    KeyNotFound(String),
 }
 
 /// Axum extractor for AuthIdentity.
@@ -909,7 +784,6 @@ mod tests {
         GenericClaims {
             iss: "https://test.example.com".to_string(),
             sub: sub.to_string(),
-            azp: None,
             extra,
         }
     }
@@ -1184,129 +1058,6 @@ mod tests {
         let policy = access_rule_to_policy(&rule);
         assert_eq!(policy.allowed_pools, vec!["*"]);
         assert_eq!(policy.max_ttl, chrono::Duration::minutes(30));
-    }
-
-    // --- find_key tests ---
-
-    #[test]
-    fn test_find_key_no_keys() {
-        let keys: Vec<Jwk> = vec![];
-        let result = JwtAuthenticator::find_key(&keys, Some("kid-1"));
-        assert!(matches!(result, Err(AuthError::KeyNotFound(_))));
-    }
-
-    #[test]
-    fn test_find_key_kid_mismatch() {
-        let keys = vec![Jwk {
-            kid: Some("kid-A".to_string()),
-            kty: "RSA".to_string(),
-            n: Some("test-n".to_string()),
-            e: Some("test-e".to_string()),
-            x: None,
-            y: None,
-            crv: None,
-        }];
-        let result = JwtAuthenticator::find_key(&keys, Some("kid-B"));
-        assert!(matches!(result, Err(AuthError::KeyNotFound(_))));
-    }
-
-    #[test]
-    fn test_find_key_ec_unsupported_before_was_now_supported() {
-        let keys = vec![Jwk {
-            kid: Some("ec-kid".to_string()),
-            kty: "EC".to_string(),
-            n: None,
-            e: None,
-            x: Some("test-x".to_string()),
-            y: Some("test-y".to_string()),
-            crv: Some("P-256".to_string()),
-        }];
-        // EC keys are now supported — should not return "Unsupported key type"
-        let result = JwtAuthenticator::find_key(&keys, Some("ec-kid"));
-        // May fail due to invalid key data, but should NOT be "Unsupported key type"
-        match result {
-            Ok(_) => {} // valid key was constructed
-            Err(AuthError::InvalidToken(msg)) => {
-                assert!(
-                    !msg.contains("Unsupported key type"),
-                    "EC should be supported, got: {msg}"
-                );
-            }
-            Err(e) => panic!("Unexpected error type: {e:?}"),
-        }
-    }
-
-    #[test]
-    fn test_find_key_ec_missing_components() {
-        let keys = vec![Jwk {
-            kid: Some("ec-kid".to_string()),
-            kty: "EC".to_string(),
-            n: None,
-            e: None,
-            x: Some("test-x".to_string()),
-            y: None, // missing y
-            crv: Some("P-256".to_string()),
-        }];
-        let result = JwtAuthenticator::find_key(&keys, Some("ec-kid"));
-        assert!(
-            matches!(result, Err(AuthError::InvalidToken(msg)) if msg.contains("EC key missing 'y'"))
-        );
-    }
-
-    #[test]
-    fn test_find_key_okp_supported() {
-        let keys = vec![Jwk {
-            kid: Some("okp-kid".to_string()),
-            kty: "OKP".to_string(),
-            n: None,
-            e: None,
-            x: Some("test-x".to_string()),
-            y: None,
-            crv: Some("Ed25519".to_string()),
-        }];
-        let result = JwtAuthenticator::find_key(&keys, Some("okp-kid"));
-        match result {
-            Ok(_) => {}
-            Err(AuthError::InvalidToken(msg)) => {
-                assert!(
-                    !msg.contains("Unsupported key type"),
-                    "OKP should be supported, got: {msg}"
-                );
-            }
-            Err(e) => panic!("Unexpected error type: {e:?}"),
-        }
-    }
-
-    #[test]
-    fn test_find_key_okp_missing_x() {
-        let keys = vec![Jwk {
-            kid: Some("okp-kid".to_string()),
-            kty: "OKP".to_string(),
-            n: None,
-            e: None,
-            x: None, // missing x
-            y: None,
-            crv: Some("Ed25519".to_string()),
-        }];
-        let result = JwtAuthenticator::find_key(&keys, Some("okp-kid"));
-        assert!(
-            matches!(result, Err(AuthError::InvalidToken(msg)) if msg.contains("OKP key missing 'x'"))
-        );
-    }
-
-    #[test]
-    fn test_find_key_missing_kid_header() {
-        let keys = vec![Jwk {
-            kid: Some("kid-A".to_string()),
-            kty: "RSA".to_string(),
-            n: Some("test-n".to_string()),
-            e: Some("test-e".to_string()),
-            x: None,
-            y: None,
-            crv: None,
-        }];
-        let result = JwtAuthenticator::find_key(&keys, None);
-        assert!(matches!(result, Err(AuthError::InvalidToken(_))));
     }
 
     // --- JwtAuthenticator async tests ---
