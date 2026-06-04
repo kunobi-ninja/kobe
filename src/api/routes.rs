@@ -728,13 +728,17 @@ async fn get_lease<B: ClusterBackend>(
                             }
                         },
                         Err(_) => {
+                            // A missing/oddly-proxied Host header is a client/proxy
+                            // problem, not a server outage — no amount of retry
+                            // fixes it, so return 400 rather than 503 (which would
+                            // trip availability alerting and retry loops).
                             return (
-                                StatusCode::SERVICE_UNAVAILABLE,
+                                StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse {
                                     error: "Failed to determine public connect endpoint"
                                         .to_string(),
                                     detail: Some(
-                                        "The request did not include a usable host header"
+                                        "The request did not include a usable Host header"
                                             .to_string(),
                                     ),
                                 }),

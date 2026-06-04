@@ -421,7 +421,7 @@ async fn write_health_condition(
     // couldn't).
     let gauge_value = healthy_status_to_gauge(new_status);
     crate::metrics::KOBESTORE_HEALTHY
-        .with_label_values(&[store_name.as_str(), eval.reason.as_str()])
+        .with_label_values(&[store_name.as_str()])
         .set(gauge_value);
     if prev_status != new_status {
         crate::metrics::KOBESTORE_CONDITION_TRANSITIONS_TOTAL
