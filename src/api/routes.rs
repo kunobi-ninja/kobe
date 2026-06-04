@@ -346,6 +346,24 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
         .expect("connect error response")
 }
 
+/// Build an error response for an internal/infrastructure failure (kube API,
+/// transport, etc.). Logs the underlying error server-side (correlated with the
+/// request by `request_logging`) and returns ONLY a generic `message` to the
+/// caller — never the raw error, which leaks operator namespaces, in-cluster
+/// DNS/API endpoints, and CRD details to authenticated low-trust clients.
+/// Reserve a non-null `detail` for client-actionable validation messages.
+fn infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -> Response {
+    warn!(error = %err, "{message}");
+    (
+        status,
+        Json(ErrorResponse {
+            error: message.to_string(),
+            detail: None,
+        }),
+    )
+        .into_response()
+}
+
 fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
 }
@@ -538,14 +556,11 @@ async fn create_lease<B: ClusterBackend>(
     let active_count = match count_active_leases(&leases_api, &identity.identity).await {
         Ok(count) => count,
         Err(e) => {
-            return (
+            return infra_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "Unable to verify lease quota".to_string(),
-                    detail: Some(e.to_string()),
-                }),
-            )
-                .into_response();
+                "Unable to verify lease quota",
+                e,
+            );
         }
     };
     if active_count >= policy.max_concurrent_leases {
@@ -577,14 +592,11 @@ async fn create_lease<B: ClusterBackend>(
     );
 
     if let Err(e) = leases_api.create(&PostParams::default(), &lease).await {
-        return (
+        return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to create lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response();
+            "Failed to create lease",
+            e,
+        );
     }
 
     metrics::CLAIMS_TOTAL
@@ -650,14 +662,11 @@ async fn list_leases<B: ClusterBackend>(
 
             (StatusCode::OK, Json(my_claims)).into_response()
         }
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to list leases".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to list leases",
+            e,
+        ),
     }
 }
 
@@ -704,27 +713,20 @@ async fn get_lease<B: ClusterBackend>(
                                 ) {
                                     Ok(kubeconfig) => Some(kubeconfig),
                                     Err(err) => {
-                                        return (
+                                        return infra_error(
                                             StatusCode::INTERNAL_SERVER_ERROR,
-                                            Json(ErrorResponse {
-                                                error: "Failed to build lease kubeconfig"
-                                                    .to_string(),
-                                                detail: Some(err.to_string()),
-                                            }),
-                                        )
-                                            .into_response();
+                                            "Failed to build lease kubeconfig",
+                                            err,
+                                        );
                                     }
                                 }
                             }
                             Err(err) => {
-                                return (
+                                return infra_error(
                                     StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ErrorResponse {
-                                        error: "Failed to provision lease access token".to_string(),
-                                        detail: Some(err.to_string()),
-                                    }),
-                                )
-                                    .into_response();
+                                    "Failed to provision lease access token",
+                                    err,
+                                );
                             }
                         },
                         Err(_) => {
@@ -773,14 +775,7 @@ async fn get_lease<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to get lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+        Err(e) => infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e),
     }
 }
 
@@ -1281,14 +1276,7 @@ async fn release_lease<B: ClusterBackend>(
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Failed to get lease".to_string(),
-                    detail: Some(e.to_string()),
-                }),
-            )
-                .into_response();
+            return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
     };
 
@@ -1316,14 +1304,11 @@ async fn release_lease<B: ClusterBackend>(
         )
         .await
     {
-        return (
+        return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to release lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response();
+            "Failed to release lease",
+            e,
+        );
     }
 
     metrics::CLAIMS_TOTAL
@@ -1371,14 +1356,7 @@ async fn extend_lease<B: ClusterBackend>(
                 .into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Failed to get lease".to_string(),
-                    detail: Some(e.to_string()),
-                }),
-            )
-                .into_response();
+            return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
     }
 
@@ -1406,14 +1384,11 @@ async fn extend_lease<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(crate::controllers::lease::LeaseError::Kube(e)) => (
+        Err(crate::controllers::lease::LeaseError::Kube(e)) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to extend lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to extend lease",
+            e,
+        ),
     }
 }
 
@@ -1461,14 +1436,11 @@ async fn get_diagnostics<B: ClusterBackend>(
             }
         }
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to look up lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to look up lease",
+            e,
+        ),
     }
 }
 
@@ -1490,14 +1462,11 @@ async fn list_pools<B: ClusterBackend>(
 
             (StatusCode::OK, Json(response)).into_response()
         }
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to list profiles".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to list profiles",
+            e,
+        ),
     }
 }
 
@@ -1524,14 +1493,11 @@ async fn get_pool<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to get profile".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to get profile",
+            e,
+        ),
     }
 }
 
@@ -1575,14 +1541,11 @@ async fn list_pool_leases<B: ClusterBackend>(
 
             (StatusCode::OK, Json(summaries)).into_response()
         }
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to list pool leases".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to list pool leases",
+            e,
+        ),
     }
 }
 
