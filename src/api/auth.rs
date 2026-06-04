@@ -4,8 +4,8 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use kunobi_auth::secret_eq;
+use kunobi_auth::server::JwksManager;
 use kunobi_auth::server::ssh::{CompiledSshProvider, NonceTracker, ParsedAuthorizedKey};
-use kunobi_auth::server::{JwksManager, verify_azp};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -169,15 +169,17 @@ impl JwtAuthenticator {
                     return None;
                 }
 
-                // `validate_jwt` refuses an empty audience (it is required for
-                // token-confusion safety). Warn at compile time so an operator
-                // sees the misconfiguration before tokens start being rejected.
-                if oidc.audience.is_empty() {
+                // A provider must bind tokens by `audience` or `authorizedParties`
+                // (azp) — with neither, any validly-signed token from the issuer
+                // would be accepted (token confusion). validate_jwt_bound rejects
+                // that case, so skip such a provider with a clear warning.
+                if oidc.audience.is_empty() && oidc.authorized_parties.is_empty() {
                     warn!(
                         provider = %policy_name,
-                        "OIDC provider has no audience configured; tokens will be \
-                         rejected until `audience` is set"
+                        "OIDC provider sets neither audience nor authorizedParties; \
+                         skipping (tokens cannot be bound safely)"
                     );
+                    return None;
                 }
 
                 Some(CompiledProvider {
@@ -476,9 +478,10 @@ impl JwtAuthenticator {
     /// Validate a token against a specific compiled provider.
     ///
     /// Delegates signature / issuer / audience / exp / nbf / algorithm checks to
-    /// [`JwksManager::validate_jwt`] (which fetches + caches JWKS and refuses an
-    /// empty audience), then enforces `azp` via the shared [`verify_azp`] helper,
-    /// before kobe-specific rule matching and identity templating.
+    /// [`JwksManager::validate_jwt_bound`] (which fetches + caches JWKS, validates
+    /// the `aud` and/or `azp` binding — whichever the provider sets — and refuses
+    /// a token bound by neither), before kobe-specific rule matching and identity
+    /// templating.
     async fn validate_with_provider(
         &self,
         token: &str,
@@ -486,17 +489,15 @@ impl JwtAuthenticator {
     ) -> Result<AuthIdentity, AuthError> {
         let claims_map = self
             .jwks
-            .validate_jwt(
+            .validate_jwt_bound(
                 token,
                 &provider.jwks_url,
                 &provider.issuer,
                 &provider.audience,
+                &provider.authorized_parties,
                 &provider.algorithms,
             )
             .await
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
-
-        verify_azp(&claims_map, &provider.authorized_parties)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
         let claims: GenericClaims =
@@ -1117,7 +1118,7 @@ mod tests {
                 "auth": {
                     "oidc": {
                         "issuer": "https://issuer.example.com",
-                        "audience": [],
+                        "audience": ["test-aud"],
                         "algorithms": ["RS256"]
                     }
                 },
@@ -1148,6 +1149,51 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_azp_only_provider_is_compiled() {
+        // A provider bound by authorizedParties (azp) with no audience — e.g.
+        // Clerk — must still compile and be usable.
+        let auth = JwtAuthenticator::new("test".to_string());
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "AccessPolicy",
+            "metadata": { "name": "clerk" },
+            "spec": {
+                "auth": { "oidc": {
+                    "issuer": "https://clerk.example.com",
+                    "authorizedParties": ["https://app.example.com"],
+                    "algorithms": ["RS256"]
+                }},
+                "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }]
+            }
+        }))
+        .unwrap();
+        auth.update_policies(vec![policy], HashMap::new()).await;
+        assert!(auth.policy_for_requester_type("clerk").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_provider_without_aud_or_azp_is_skipped() {
+        // Neither audience nor authorizedParties → would accept any signed token
+        // from the issuer, so the provider is skipped at compile time.
+        let auth = JwtAuthenticator::new("test".to_string());
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "AccessPolicy",
+            "metadata": { "name": "unbound" },
+            "spec": {
+                "auth": { "oidc": {
+                    "issuer": "https://issuer.example.com",
+                    "algorithms": ["RS256"]
+                }},
+                "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }]
+            }
+        }))
+        .unwrap();
+        auth.update_policies(vec![policy], HashMap::new()).await;
+        assert!(auth.policy_for_requester_type("unbound").await.is_none());
     }
 
     #[tokio::test]
