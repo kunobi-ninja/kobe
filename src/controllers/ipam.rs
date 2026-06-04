@@ -36,7 +36,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures::StreamExt;
 use kube::api::{Api, ListParams, Patch, PatchParams};
-use kube::runtime::controller::{Action, Controller};
+use kube::runtime::controller::{Action, Config as ControllerConfig, Controller};
 use kube::runtime::watcher::Config;
 use kube::{Client, ResourceExt};
 use tokio_util::sync::CancellationToken;
@@ -76,7 +76,14 @@ pub async fn run_ipam_controller(client: Client, namespace: &str, shutdown: Canc
         "Starting IPAM controller"
     );
 
+    // Serialize allocation: a CIDRClaim binds the lowest free slot computed from
+    // the live set of bound claims, so two claims reconciled concurrently can
+    // both read the same in-use set and bind identical CIDRs. Capping the
+    // controller to one in-flight reconcile makes each binding visible to the
+    // next claim's `compute_used`, preventing duplicate allocation. Allocation
+    // is cheap and namespace-scoped, so single concurrency is not a bottleneck.
     let controller = Controller::new(claims, Config::default())
+        .with_config(ControllerConfig::default().concurrency(1))
         .run(reconcile_claim, error_policy, ctx)
         .for_each(|result| async move {
             match result {
