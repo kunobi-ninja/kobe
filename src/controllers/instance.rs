@@ -543,6 +543,21 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
     }
 }
 
+/// Whether a leased instance has held its reservation long enough (`state_since`
+/// older than `grace`) to be considered for orphaned-reservation release. A
+/// missing or unparseable `state_since` returns `false` — conservative, so a
+/// normal in-flight bind is never disturbed.
+fn reservation_grace_elapsed(
+    state_since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    state_since
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|since| now.signed_duration_since(since.with_timezone(&chrono::Utc)) >= grace)
+        .unwrap_or(false)
+}
+
 async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     instance: &ClusterInstance,
@@ -611,6 +626,58 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 .await?;
                 Ok(Action::requeue(std::time::Duration::from_secs(10)))
             } else {
+                // Detect an orphaned reservation. Binding is two steps — mark the
+                // instance Leased, then patch the lease to Bound+clusterName. If
+                // the operator dies between them, the instance is stuck Leased
+                // pointing at a lease that stays Pending with no clusterName, and
+                // nothing reclaims it (the pool/lease reapers don't cover this
+                // case) — the warm cluster is lost from the pool forever.
+                //
+                // After a grace window (the normal bind completes in ms), release
+                // such an instance back to Ready so the still-Pending lease can be
+                // re-bound. Only act when the lease is Pending AND not bound to us,
+                // so a normal in-flight bind is never disturbed.
+                let bound_to_us = lease_status.cluster_name.as_deref() == Some(name);
+                let reservation_orphaned =
+                    lease_status.phase == LeasePhase::Pending && !bound_to_us;
+                let grace = chrono::Duration::minutes(2);
+                if reservation_orphaned
+                    && reservation_grace_elapsed(
+                        status.state_since.as_deref(),
+                        chrono::Utc::now(),
+                        grace,
+                    )
+                {
+                    warn!(
+                        instance = %name,
+                        lease = %lease_ref.name,
+                        "Leased instance points at a lease that never finished binding; \
+                         releasing the reservation back to the pool"
+                    );
+                    let instances_api: Api<ClusterInstance> =
+                        Api::namespaced(ctx.client.clone(), namespace);
+                    patch_instance_status(
+                        &instances_api,
+                        name,
+                        ClusterInstanceStatus {
+                            // The cluster was reserved but never handed to a tenant
+                            // (the lease never reached Bound), so it is clean —
+                            // return it to Ready rather than recycling.
+                            phase: ClusterInstancePhase::Ready,
+                            provisioned: status.provisioned,
+                            bootstrapped: status.bootstrapped,
+                            lease_ref: None,
+                            active_bootstrap: None,
+                            idle_since: Some(chrono::Utc::now().to_rfc3339()),
+                            state_since: Some(chrono::Utc::now().to_rfc3339()),
+                            health_failures: status.health_failures,
+                            spec_hash: status.spec_hash.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                }
                 Ok(Action::requeue(std::time::Duration::from_secs(30)))
             }
         }
@@ -1635,6 +1702,21 @@ mod tests {
     use crate::testutil::MockBackend;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn reservation_grace_gates_orphan_release() {
+        let now = chrono::Utc::now();
+        let grace = chrono::Duration::minutes(2);
+        let recent = (now - chrono::Duration::seconds(10)).to_rfc3339();
+        let old = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        // In-flight bind (just became Leased): do not disturb.
+        assert!(!reservation_grace_elapsed(Some(&recent), now, grace));
+        // Long-stuck reservation: eligible for release.
+        assert!(reservation_grace_elapsed(Some(&old), now, grace));
+        // Unknown age: conservative — don't release.
+        assert!(!reservation_grace_elapsed(None, now, grace));
+        assert!(!reservation_grace_elapsed(Some("garbage"), now, grace));
+    }
 
     async fn test_instance_context() -> (Arc<InstanceContext<MockBackend>>, MockServer, MockBackend)
     {
