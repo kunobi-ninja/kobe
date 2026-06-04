@@ -539,7 +539,63 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 }
             }
         }
+        ClusterInstancePhase::Failed | ClusterInstancePhase::Unhealthy
+            if instance.spec.pool_ref.is_none() =>
+        {
+            // Standalone instances (no pool_ref) are invisible to the pool
+            // manager, so a terminal one would requeue forever and leak its
+            // backend resources — for k3s/k0s, the per-cluster Postgres database
+            // created before the failure plus any half-created k8s objects. After
+            // a short grace window (so an operator can inspect it), move it to
+            // Recycling, which runs delete_instance_backend + datastore cleanup.
+            let grace = chrono::Duration::minutes(5);
+            if !standalone_terminal_should_recycle(
+                status.state_since.as_deref(),
+                chrono::Utc::now(),
+                grace,
+            ) {
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
+            warn!(
+                instance = %name,
+                phase = ?status.phase,
+                "Standalone instance is terminal past the grace window; recycling to release backend resources"
+            );
+            patch_instance_status(
+                &instances_api,
+                &name,
+                ClusterInstanceStatus {
+                    phase: ClusterInstancePhase::Recycling,
+                    provisioned: status.provisioned,
+                    bootstrapped: status.bootstrapped,
+                    lease_ref: status.lease_ref.clone(),
+                    active_bootstrap: None,
+                    idle_since: None,
+                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                    health_failures: status.health_failures,
+                    spec_hash: status.spec_hash.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(Action::await_change())
+        }
         _ => Ok(Action::requeue(std::time::Duration::from_secs(30))),
+    }
+}
+
+/// Whether a terminal (Failed/Unhealthy) *standalone* instance has been in that
+/// state long enough to recycle — releasing its backend resources — rather than
+/// keep it for inspection. A missing or unparseable `state_since` returns `true`
+/// (recycle) so a malformed timestamp can never strand a leaking instance.
+fn standalone_terminal_should_recycle(
+    state_since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    match state_since.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(since) => now.signed_duration_since(since.with_timezone(&chrono::Utc)) >= grace,
+        None => true,
     }
 }
 
@@ -1635,6 +1691,30 @@ mod tests {
     use crate::testutil::MockBackend;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn standalone_terminal_recycle_respects_grace() {
+        let now = chrono::Utc::now();
+        let grace = chrono::Duration::minutes(5);
+        let recent = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        let old = (now - chrono::Duration::minutes(10)).to_rfc3339();
+
+        // Within the grace window: keep for inspection.
+        assert!(!standalone_terminal_should_recycle(
+            Some(&recent),
+            now,
+            grace
+        ));
+        // Past the grace window: recycle to release backend resources.
+        assert!(standalone_terminal_should_recycle(Some(&old), now, grace));
+        // Missing / unparseable state_since: recycle (never strand a leak).
+        assert!(standalone_terminal_should_recycle(None, now, grace));
+        assert!(standalone_terminal_should_recycle(
+            Some("nonsense"),
+            now,
+            grace
+        ));
+    }
 
     async fn test_instance_context() -> (Arc<InstanceContext<MockBackend>>, MockServer, MockBackend)
     {
