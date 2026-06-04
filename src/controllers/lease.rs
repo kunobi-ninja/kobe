@@ -673,7 +673,14 @@ async fn reserve_ready_instance(
             instance
                 .status
                 .as_ref()
-                .map(|s| s.phase == ClusterInstancePhase::Ready)
+                // A genuinely-free instance is Ready AND carries no leaseRef. The
+                // extra leaseRef check prevents a double-lease: if a stale write
+                // (e.g. the profile controller syncing an out-of-date in-memory
+                // phase) reverts an already-Leased instance to Ready while leaving
+                // its leaseRef set, selecting it here would bind the same cluster
+                // to a second tenant. Requiring leaseRef == None excludes that
+                // case while still admitting all genuinely-idle instances.
+                .map(|s| s.phase == ClusterInstancePhase::Ready && s.lease_ref.is_none())
                 .unwrap_or(false)
         })
         .collect();
@@ -916,6 +923,42 @@ mod tests {
             factory: None,
         });
         (ctx, server)
+    }
+
+    #[tokio::test]
+    async fn reserve_skips_ready_instance_with_stale_lease_ref() {
+        // A Ready instance that still carries a leaseRef (e.g. a stale phase
+        // write reverted it Leased->Ready without clearing leaseRef) must NOT be
+        // reserved, or the same cluster is double-leased to a second tenant.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": {
+                        "name": "pool-p-0",
+                        "namespace": "test-ns",
+                        "labels": { "kobe.kunobi.ninja/pool": "p" }
+                    },
+                    "spec": { "poolRef": { "name": "p" } },
+                    "status": { "phase": "Ready", "leaseRef": { "name": "lease-old" } }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        let result = reserve_ready_instance(&client, "test-ns", "p", "lease-new").await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a Ready instance still carrying a leaseRef must not be reserved, got {result:?}"
+        );
     }
 
     /// Build a `ClusterLease` CRD object in the given phase.
