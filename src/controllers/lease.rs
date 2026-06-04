@@ -466,26 +466,21 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
             remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
-            let patch = serde_json::json!({
-                "status": { "phase": "Recycling" }
-            });
-            leases_api
-                .patch_status(
-                    &name,
-                    &PatchParams::apply("kobe-operator"),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
-
+            // Capture diagnostics BEFORE flipping to Recycling: the cluster is
+            // still alive (we mark the instance recycling only after the patch
+            // below), and recording the URL in the SAME patch that advances the
+            // phase means a transient status-write failure is retried — via the
+            // `?` below, while the lease is still Released/Expired — instead of
+            // losing the URL (the Recycling arm never re-captures).
+            let mut diag_url: Option<String> = None;
             if let Some(cluster_name) = &status.cluster_name {
-                mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
                 let profile = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await;
                 if let Some(ref profile) = profile
                     && let Some(ref diag_config) = profile.spec.diagnostics
                     && diag_config.enabled
                 {
                     info!(lease = %name, "Capturing diagnostic bundle");
-                    let diag_url = match diagnostics::capture_bundle(
+                    match diagnostics::capture_bundle(
                         cluster_name,
                         &ns,
                         diag_config,
@@ -494,38 +489,30 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     )
                     .await
                     {
-                        Ok(url) => Some(url),
-                        Err(e) => {
-                            warn!(
-                                lease = %name,
-                                cluster = %cluster_name,
-                                "Failed to capture diagnostic bundle: {e:#}"
-                            );
-                            None
-                        }
-                    };
-
-                    if let Some(url) = &diag_url {
-                        let patch = serde_json::json!({
-                            "status": { "diagnosticsUrl": url }
-                        });
-                        if let Err(e) = leases_api
-                            .patch_status(
-                                &name,
-                                &PatchParams::apply("kobe-operator"),
-                                &Patch::Merge(&patch),
-                            )
-                            .await
-                        {
-                            error!(
-                                lease = %name,
-                                diagnostics_url = %url,
-                                "Failed to record diagnostics URL on lease status: {e}"
-                            );
-                        }
+                        Ok(url) => diag_url = Some(url),
+                        Err(e) => warn!(
+                            lease = %name,
+                            cluster = %cluster_name,
+                            "Failed to capture diagnostic bundle: {e:#}"
+                        ),
                     }
                 }
+            }
 
+            let mut status_fields = serde_json::json!({ "phase": "Recycling" });
+            if let Some(url) = &diag_url {
+                status_fields["diagnosticsUrl"] = serde_json::Value::String(url.clone());
+            }
+            leases_api
+                .patch_status(
+                    &name,
+                    &PatchParams::apply("kobe-operator"),
+                    &Patch::Merge(&serde_json::json!({ "status": status_fields })),
+                )
+                .await?;
+
+            if let Some(cluster_name) = &status.cluster_name {
+                mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
                 debug!(cluster = %cluster_name, "Marked ClusterInstance recycling");
             } else {
                 info!(lease = %name, "No cluster to recycle, lease will be cleaned up");
