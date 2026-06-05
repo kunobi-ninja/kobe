@@ -1175,16 +1175,20 @@ pub struct ClusterPoolStatus {
     pub queue_depth: u32,
 
     /// Name of the current golden Velero backup (e.g. "golden-myprofile-3").
-    #[serde(default)]
+    // skip_serializing_if: the async golden-backup task races the main profile
+    // reconcile, both doing pass-through preservation of this group. Never
+    // serializing None prevents whichever momentarily reads it as None from
+    // erasing it via a JSON-Merge-Patch null (RFC 7396).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden_backup: Option<String>,
 
     /// The profile generation that the golden backup was created from.
     /// Used to detect when a new snapshot is needed after spec changes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden_generation: Option<i64>,
 
     /// Name of the PostgreSQL template database for golden images (k3s backend).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden_template_db: Option<String>,
 
     /// Number of consecutive provision attempts that failed before any
