@@ -46,14 +46,15 @@
 //!
 //! kube-rs's `Controller` runtime gives us:
 //! - Watch on `KobeStore` (so spec edits trigger immediate reconcile)
-//! - Built-in workqueue + dedup (so a pod restart doesn't fan out into
-//!   N reconciles when N pods are restarting)
+//! - Built-in workqueue + dedup
 //! - Automatic backoff on transient errors via `error_policy`
 //!
-//! Reconcile cadence is set to 30s on success — the failure modes we
-//! care about (OOMKill) are observable immediately via the watch on
-//! `Pod` we set up via `Controller::watches`, so the periodic
-//! requeue is a defensive lower bound.
+//! The controller does **not** watch `Pod`s, so a backing-workload pod
+//! event (e.g. an OOMKill) is not reacted to immediately — it is picked
+//! up on the next reconcile, which is the 30s success requeue (plus any
+//! `KobeStore` spec edit). If sub-30s detection is needed, add a
+//! `Controller::watches::<Pod>(...)` that maps pods back to their
+//! `KobeStore` by the name/namespace convention below.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -421,7 +422,7 @@ async fn write_health_condition(
     // couldn't).
     let gauge_value = healthy_status_to_gauge(new_status);
     crate::metrics::KOBESTORE_HEALTHY
-        .with_label_values(&[store_name.as_str(), eval.reason.as_str()])
+        .with_label_values(&[store_name.as_str()])
         .set(gauge_value);
     if prev_status != new_status {
         crate::metrics::KOBESTORE_CONDITION_TRANSITIONS_TOTAL

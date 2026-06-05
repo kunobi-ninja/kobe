@@ -70,6 +70,20 @@ use super::{
     ClusterBackend, apply_addon_impl, check_readiness_gate_impl, virtual_client_from_kubeconfig,
 };
 
+/// Removes temporary Helm values files when dropped, so an early return (a
+/// failed write or a failed `helm` spawn) does not leak them. Best-effort and
+/// synchronous — these are small files under the OS temp dir.
+#[derive(Default)]
+struct TempValuesGuard(Vec<std::path::PathBuf>);
+
+impl Drop for TempValuesGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Read the vcluster kubeconfig from the `vc-<name>` Secret in the
 /// per-instance host namespace.
 ///
@@ -268,6 +282,12 @@ impl ClusterBackend for VclusterBackend {
         // user-supplied values (from `VclusterConfig.values`) as a
         // second `--values` source so user overrides take precedence
         // (Helm merges `--values` files left-to-right with later wins).
+        // A drop guard removes these temp files on every exit path — including an
+        // early `?` on a failed user-values write or helm spawn, which previously
+        // skipped the explicit cleanup below and leaked the defaults file (and,
+        // on a helm-spawn failure, the user file, which may hold secrets).
+        let mut temp_files = TempValuesGuard::default();
+
         let defaults_yaml = self.default_values_yaml(name, config);
         let defaults_path =
             std::env::temp_dir().join(format!("kobe-vcluster-{name}-defaults.yaml"));
@@ -279,6 +299,7 @@ impl ClusterBackend for VclusterBackend {
                     defaults_path.display()
                 )
             })?;
+        temp_files.0.push(defaults_path.clone());
 
         let mut user_values_path: Option<std::path::PathBuf> = None;
         if let Some(cfg) = &self.config
@@ -291,6 +312,7 @@ impl ClusterBackend for VclusterBackend {
                 .with_context(|| {
                     format!("failed to write user-supplied values to {}", p.display())
                 })?;
+            temp_files.0.push(p.clone());
             user_values_path = Some(p);
         }
 
@@ -317,12 +339,7 @@ impl ClusterBackend for VclusterBackend {
             .await
             .context("failed to spawn `helm upgrade --install`")?;
 
-        // Best-effort cleanup of temp files. Failure here is fine — `/tmp`
-        // is reaped by the OS.
-        let _ = tokio::fs::remove_file(&defaults_path).await;
-        if let Some(p) = &user_values_path {
-            let _ = tokio::fs::remove_file(p).await;
-        }
+        // Temp files are removed by `temp_files`' Drop on return (all paths).
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

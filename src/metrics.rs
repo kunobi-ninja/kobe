@@ -443,13 +443,16 @@ pub static KOBESTORE_CONDITION_TRANSITIONS_TOTAL: LazyLock<IntCounterVec> = Lazy
 /// preferred over a string label for dashboards (`min_over_time`,
 /// `last_over_time` work natively).
 ///
-/// Reason emitted as label so an alert can be specific:
-///   `kobe_kobestore_healthy{store="kobe-kine",reason="MemoryPressure"} == 0`
+/// Keyed on `store` only — NOT on the (mutable) condition reason. With a
+/// `reason` label, recovery emits a new `{store, reason="Stable"}` series while
+/// the prior `{store, reason="MemoryPressure"}=0` series lingers forever, so a
+/// natural `kobe_kobestore_healthy{store="X"} == 0` alert keeps firing on the
+/// stale child. The reason lives on the condition message instead.
 pub static KOBESTORE_HEALTHY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "kobe_kobestore_healthy",
         "KobeStore Healthy condition: 1=True, 0=False, -1=Unknown",
-        &["store", "reason"]
+        &["store"]
     )
     .unwrap()
 });

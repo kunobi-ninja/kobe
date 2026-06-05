@@ -12,11 +12,116 @@
 //! in double quotes.
 
 use anyhow::{Context, Result, bail};
+use kunobi_reload::{BoxError, Reloadable, watch};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 /// Maximum length for a PostgreSQL identifier (63 bytes).
 const MAX_IDENT_LEN: usize = 63;
+
+/// One live PostgreSQL connection: the pool plus the base URL it was built from
+/// (the URL carries the current credential, and per-cluster endpoints are
+/// derived from it).
+#[derive(Clone)]
+pub struct DatastoreConn {
+    pub pool: PgPool,
+    pub base_url: String,
+}
+
+impl DatastoreConn {
+    async fn connect(base_url: String) -> std::result::Result<Self, BoxError> {
+        let pool = PgPool::connect(&base_url).await?;
+        Ok(Self { pool, base_url })
+    }
+}
+
+/// The operator's optional shared PostgreSQL datastore (k3s/k0s golden
+/// templates). Three modes:
+///
+/// - `None` — no datastore configured; backends use the embedded SQLite store.
+/// - `Static` — URL from the frozen `POSTGRES_URL` env var (legacy). A Postgres
+///   password rotation requires an operator pod restart to pick up.
+/// - `Reloading` — URL re-read from a mounted Secret directory (`POSTGRES_URL_DIR`,
+///   a `url` file) via `kunobi-reload`. When the Secret rotates, the pool is
+///   rebuilt in place within milliseconds, no restart (#91).
+#[derive(Clone, Default)]
+pub enum SharedDatastore {
+    #[default]
+    None,
+    Static(DatastoreConn),
+    Reloading(Reloadable<DatastoreConn>),
+}
+
+impl SharedDatastore {
+    /// The current `(pool, base_url)`, cloned, if a datastore is configured and
+    /// connected. Cheap (a `PgPool` clone is an `Arc` clone); re-read on every
+    /// use so a rotation is observed without restarting.
+    pub fn current(&self) -> Option<(PgPool, String)> {
+        match self {
+            SharedDatastore::None => None,
+            SharedDatastore::Static(c) => Some((c.pool.clone(), c.base_url.clone())),
+            SharedDatastore::Reloading(r) => {
+                let c = r.borrow();
+                Some((c.pool.clone(), c.base_url.clone()))
+            }
+        }
+    }
+
+    /// Build from the environment:
+    /// - `POSTGRES_URL_DIR` set → watch that mounted-Secret dir's `url` file and
+    ///   hot-reload the pool on rotation;
+    /// - else `POSTGRES_URL` set → a static (non-reloading) connection;
+    /// - else → no datastore.
+    ///
+    /// A connection/watch failure logs and degrades to `None` (embedded store),
+    /// matching the previous best-effort behavior.
+    pub async fn from_env() -> Self {
+        if let Ok(dir) = std::env::var("POSTGRES_URL_DIR") {
+            match watch(&dir)
+                .spawn(|mount| async move {
+                    let url = mount.read_str("url")?.trim().to_string();
+                    DatastoreConn::connect(url).await
+                })
+                .await
+            {
+                Ok(reloadable) => {
+                    info!(
+                        dir = %dir,
+                        "PostgreSQL connected via mounted Secret — credential hot-reload enabled"
+                    );
+                    SharedDatastore::Reloading(reloadable)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dir = %dir,
+                        "Failed to start PostgreSQL credential watch; using embedded datastore"
+                    );
+                    SharedDatastore::None
+                }
+            }
+        } else if let Ok(url) = std::env::var("POSTGRES_URL") {
+            match DatastoreConn::connect(url).await {
+                Ok(conn) => {
+                    info!(
+                        "PostgreSQL connected — golden templates enabled (static; set \
+                         POSTGRES_URL_DIR to a mounted Secret to enable credential hot-reload)"
+                    );
+                    SharedDatastore::Static(conn)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to connect to PostgreSQL, backends will use embedded datastore"
+                    );
+                    SharedDatastore::None
+                }
+            }
+        } else {
+            SharedDatastore::None
+        }
+    }
+}
 
 /// Sanitize a cluster name into a safe PostgreSQL database name.
 ///
@@ -151,6 +256,13 @@ pub fn cluster_endpoint(base_url: &str, cluster_name: &str, prefix: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_datastore_none_is_default_and_returns_no_connection() {
+        let ds = SharedDatastore::default();
+        assert!(matches!(ds, SharedDatastore::None));
+        assert!(ds.current().is_none());
+    }
 
     // -- sanitize_db_name tests --
 

@@ -539,10 +539,91 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 }
             }
         }
+        ClusterInstancePhase::Failed | ClusterInstancePhase::Unhealthy
+            if instance.spec.pool_ref.is_none() =>
+        {
+            // Standalone instances (no pool_ref) are invisible to the pool
+            // manager, so a terminal one would requeue forever and leak its
+            // backend resources — for k3s/k0s, the per-cluster Postgres database
+            // created before the failure plus any half-created k8s objects. After
+            // a short grace window (so an operator can inspect it), move it to
+            // Recycling, which runs delete_instance_backend + datastore cleanup.
+            let grace = chrono::Duration::minutes(5);
+            if !standalone_terminal_should_recycle(
+                status.state_since.as_deref(),
+                chrono::Utc::now(),
+                grace,
+            ) {
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
+            warn!(
+                instance = %name,
+                phase = ?status.phase,
+                "Standalone instance is terminal past the grace window; recycling to release backend resources"
+            );
+            patch_instance_status(
+                &instances_api,
+                &name,
+                ClusterInstanceStatus {
+                    phase: ClusterInstancePhase::Recycling,
+                    provisioned: status.provisioned,
+                    bootstrapped: status.bootstrapped,
+                    lease_ref: status.lease_ref.clone(),
+                    active_bootstrap: None,
+                    idle_since: None,
+                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                    health_failures: status.health_failures,
+                    spec_hash: status.spec_hash.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(Action::await_change())
+        }
         _ => Ok(Action::requeue(std::time::Duration::from_secs(30))),
     }
 }
 
+/// Whether a terminal (Failed/Unhealthy) *standalone* instance has been in that
+/// state long enough to recycle — releasing its backend resources — rather than
+/// keep it for inspection. A missing or unparseable `state_since` returns `true`
+/// (recycle) so a malformed timestamp can never strand a leaking instance.
+fn standalone_terminal_should_recycle(
+    state_since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    match state_since.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(since) => now.signed_duration_since(since.with_timezone(&chrono::Utc)) >= grace,
+        None => true,
+    }
+}
+
+/// Whether a leased instance has held its reservation long enough (`state_since`
+/// older than `grace`) to be considered for orphaned-reservation release. A
+/// missing or unparseable `state_since` returns `false` — conservative, so a
+/// normal in-flight bind is never disturbed.
+fn reservation_grace_elapsed(
+    state_since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    state_since
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|since| now.signed_duration_since(since.with_timezone(&chrono::Utc)) >= grace)
+        .unwrap_or(false)
+}
+
+/// Evaluate a `Leased` instance.
+///
+/// Leased instances are **intentionally not health-probed**: once a cluster is
+/// handed to a tenant it is the tenant's for the lease TTL, and proactively
+/// recycling it out from under an active lease (or flapping its phase on a
+/// transient probe failure) would be far more disruptive than a tenant
+/// observing a degraded cluster they can release. So this only reacts to the
+/// lease's lifecycle — recycling when the lease is Released/Expired/Recycling or
+/// gone, and reclaiming an orphaned reservation (see below) — never to backend
+/// health. Health gating happens while the instance is `Ready` (pre-lease).
 async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     instance: &ClusterInstance,
@@ -611,6 +692,58 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 .await?;
                 Ok(Action::requeue(std::time::Duration::from_secs(10)))
             } else {
+                // Detect an orphaned reservation. Binding is two steps — mark the
+                // instance Leased, then patch the lease to Bound+clusterName. If
+                // the operator dies between them, the instance is stuck Leased
+                // pointing at a lease that stays Pending with no clusterName, and
+                // nothing reclaims it (the pool/lease reapers don't cover this
+                // case) — the warm cluster is lost from the pool forever.
+                //
+                // After a grace window (the normal bind completes in ms), release
+                // such an instance back to Ready so the still-Pending lease can be
+                // re-bound. Only act when the lease is Pending AND not bound to us,
+                // so a normal in-flight bind is never disturbed.
+                let bound_to_us = lease_status.cluster_name.as_deref() == Some(name);
+                let reservation_orphaned =
+                    lease_status.phase == LeasePhase::Pending && !bound_to_us;
+                let grace = chrono::Duration::minutes(2);
+                if reservation_orphaned
+                    && reservation_grace_elapsed(
+                        status.state_since.as_deref(),
+                        chrono::Utc::now(),
+                        grace,
+                    )
+                {
+                    warn!(
+                        instance = %name,
+                        lease = %lease_ref.name,
+                        "Leased instance points at a lease that never finished binding; \
+                         releasing the reservation back to the pool"
+                    );
+                    let instances_api: Api<ClusterInstance> =
+                        Api::namespaced(ctx.client.clone(), namespace);
+                    patch_instance_status(
+                        &instances_api,
+                        name,
+                        ClusterInstanceStatus {
+                            // The cluster was reserved but never handed to a tenant
+                            // (the lease never reached Bound), so it is clean —
+                            // return it to Ready rather than recycling.
+                            phase: ClusterInstancePhase::Ready,
+                            provisioned: status.provisioned,
+                            bootstrapped: status.bootstrapped,
+                            lease_ref: None,
+                            active_bootstrap: None,
+                            idle_since: Some(chrono::Utc::now().to_rfc3339()),
+                            state_since: Some(chrono::Utc::now().to_rfc3339()),
+                            health_failures: status.health_failures,
+                            spec_hash: status.spec_hash.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                }
                 Ok(Action::requeue(std::time::Duration::from_secs(30)))
             }
         }
@@ -732,6 +865,23 @@ async fn resolve_instance_config(
     })
 }
 
+/// Read the owning ClusterPool's `status.goldenGeneration` — the generation at
+/// which its golden backup was actually built. Returns `None` when the profile
+/// is absent (e.g. a standalone instance) or has no golden backup recorded yet,
+/// in which case a fresh create is the correct behavior.
+async fn golden_generation_for<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    owner_name: &str,
+) -> Option<i64> {
+    let pools: Api<ClusterPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    pools
+        .get(owner_name)
+        .await
+        .ok()
+        .and_then(|p| p.status)
+        .and_then(|s| s.golden_generation)
+}
+
 async fn provision_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     config: &ResolvedInstanceConfig,
@@ -745,10 +895,17 @@ async fn provision_instance<B: ClusterBackend + Clone>(
         && let (Some(velero), Some(snapshot)) = (&ctx.velero, &config.snapshot)
         && snapshot.enabled
     {
-        let generation = 1;
-        if let Ok(Some(backup_name)) = velero
-            .get_golden_backup(&config.owner_name, snapshot, generation)
-            .await
+        // The golden backup is built at the profile's metadata.generation and
+        // recorded in its status.goldenGeneration. Look the backup up at THAT
+        // generation rather than a hardcoded gen 1, which silently 404s (and so
+        // skips restore entirely) for any pool whose spec has ever been edited.
+        // `None` => no golden backup recorded yet, so fall through to a fresh
+        // create.
+        let generation = golden_generation_for(ctx, &config.owner_name).await;
+        if let Some(generation) = generation
+            && let Ok(Some(backup_name)) = velero
+                .get_golden_backup(&config.owner_name, snapshot, generation)
+                .await
         {
             info!(
                 instance = %name,
@@ -925,10 +1082,10 @@ fn backend_dispatch_for_config<B: ClusterBackend + Clone>(
     } else {
         match config.backend.backend_type {
             crate::crd::BackendType::K3s => Ok(crate::backend::BackendDispatch::K3s(
-                crate::backend::K3sBackend::new(ctx.client.clone(), None, None),
+                crate::backend::K3sBackend::new(ctx.client.clone(), Default::default()),
             )),
             crate::crd::BackendType::K0s => Ok(crate::backend::BackendDispatch::K0s(
-                crate::backend::K0sBackend::new(ctx.client.clone(), None, None),
+                crate::backend::K0sBackend::new(ctx.client.clone(), Default::default()),
             )),
             crate::crd::BackendType::Capi => {
                 let capi = config
@@ -1635,6 +1792,45 @@ mod tests {
     use crate::testutil::MockBackend;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn standalone_terminal_recycle_respects_grace() {
+        let now = chrono::Utc::now();
+        let grace = chrono::Duration::minutes(5);
+        let recent = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        let old = (now - chrono::Duration::minutes(10)).to_rfc3339();
+
+        // Within the grace window: keep for inspection.
+        assert!(!standalone_terminal_should_recycle(
+            Some(&recent),
+            now,
+            grace
+        ));
+        // Past the grace window: recycle to release backend resources.
+        assert!(standalone_terminal_should_recycle(Some(&old), now, grace));
+        // Missing / unparseable state_since: recycle (never strand a leak).
+        assert!(standalone_terminal_should_recycle(None, now, grace));
+        assert!(standalone_terminal_should_recycle(
+            Some("nonsense"),
+            now,
+            grace
+        ));
+    }
+
+    #[test]
+    fn reservation_grace_gates_orphan_release() {
+        let now = chrono::Utc::now();
+        let grace = chrono::Duration::minutes(2);
+        let recent = (now - chrono::Duration::seconds(10)).to_rfc3339();
+        let old = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        // In-flight bind (just became Leased): do not disturb.
+        assert!(!reservation_grace_elapsed(Some(&recent), now, grace));
+        // Long-stuck reservation: eligible for release.
+        assert!(reservation_grace_elapsed(Some(&old), now, grace));
+        // Unknown age: conservative — don't release.
+        assert!(!reservation_grace_elapsed(None, now, grace));
+        assert!(!reservation_grace_elapsed(Some("garbage"), now, grace));
+    }
 
     async fn test_instance_context() -> (Arc<InstanceContext<MockBackend>>, MockServer, MockBackend)
     {

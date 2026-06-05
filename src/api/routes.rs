@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use futures::TryStreamExt;
-use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST};
+use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
@@ -37,9 +37,9 @@ pub struct AppState<B: ClusterBackend> {
     pub namespace: String,
     pub backend: B,
     pub factory: Option<BackendFactory>,
-    /// Shared PostgreSQL pool when one is configured; `None` in
+    /// Shared PostgreSQL datastore when one is configured; empty in
     /// embedded-datastore mode. Consulted by the `/readyz` probe.
-    pub pg_pool: Option<sqlx::PgPool>,
+    pub datastore: crate::backend::datastore::SharedDatastore,
 }
 
 /// Implement kunobi-auth's AuthnProvider so that RequiredAuth/OptionalAuth extractors work.
@@ -346,6 +346,34 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
         .expect("connect error response")
 }
 
+/// Whether a lease's RFC3339 `expires_at` is in the past. A missing or
+/// unparseable timestamp is treated as not-expired (the phase gate still
+/// applies), so this can only tighten access, never loosen it.
+fn lease_is_expired(expires_at: Option<&str>) -> bool {
+    expires_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|expiry| chrono::Utc::now() > expiry)
+        .unwrap_or(false)
+}
+
+/// Build an error response for an internal/infrastructure failure (kube API,
+/// transport, etc.). Logs the underlying error server-side (correlated with the
+/// request by `request_logging`) and returns ONLY a generic `message` to the
+/// caller — never the raw error, which leaks operator namespaces, in-cluster
+/// DNS/API endpoints, and CRD details to authenticated low-trust clients.
+/// Reserve a non-null `detail` for client-actionable validation messages.
+fn infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -> Response {
+    warn!(error = %err, "{message}");
+    (
+        status,
+        Json(ErrorResponse {
+            error: message.to_string(),
+            detail: None,
+        }),
+    )
+        .into_response()
+}
+
 fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
 }
@@ -429,6 +457,31 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+/// True if these request headers negotiate an HTTP Upgrade (RFC 7230 §6.7):
+/// a `Connection: upgrade` token (case-insensitive list) *and* an `Upgrade`
+/// header. kubectl exec / attach / port-forward use this to switch to SPDY or
+/// websocket — which the buffered connect proxy cannot tunnel (see #85).
+fn headers_request_upgrade(headers: &HeaderMap) -> bool {
+    if !headers.contains_key(UPGRADE) {
+        return false;
+    }
+    headers
+        .get(CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// The requested upgrade protocol token (e.g. `spdy/3.1`, `websocket`),
+/// lowercased. None if the `Upgrade` header is absent or invalid UTF-8.
+fn requested_upgrade_protocol(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn should_skip_request_header(name: &HeaderName) -> bool {
@@ -538,14 +591,11 @@ async fn create_lease<B: ClusterBackend>(
     let active_count = match count_active_leases(&leases_api, &identity.identity).await {
         Ok(count) => count,
         Err(e) => {
-            return (
+            return infra_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "Unable to verify lease quota".to_string(),
-                    detail: Some(e.to_string()),
-                }),
-            )
-                .into_response();
+                "Unable to verify lease quota",
+                e,
+            );
         }
     };
     if active_count >= policy.max_concurrent_leases {
@@ -577,11 +627,32 @@ async fn create_lease<B: ClusterBackend>(
     );
 
     if let Err(e) = leases_api.create(&PostParams::default(), &lease).await {
-        return (
+        return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create lease",
+            e,
+        );
+    }
+
+    // The pre-create count check is advisory: N concurrent requests for one
+    // identity can each observe the same sub-limit count and all create,
+    // overshooting max_concurrent_leases. Re-list the identity's active leases in
+    // a deterministic order and self-delete this one if it ranks beyond the cap,
+    // so concurrent creates converge to exactly the cap instead of overshooting.
+    // (Bounded mitigation; the lease reconciler remains the authoritative quota
+    // enforcer for the residual list-cache race.)
+    if let Ok(active) = active_lease_names_sorted(&leases_api, &identity.identity).await
+        && lease_exceeds_quota(&active, &lease_id, policy.max_concurrent_leases)
+    {
+        let _ = leases_api.delete(&lease_id, &Default::default()).await;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorResponse {
-                error: "Failed to create lease".to_string(),
-                detail: Some(e.to_string()),
+                error: format!(
+                    "Concurrent lease limit ({}) reached",
+                    policy.max_concurrent_leases
+                ),
+                detail: Some("A concurrent request won the quota race; please retry".to_string()),
             }),
         )
             .into_response();
@@ -650,14 +721,11 @@ async fn list_leases<B: ClusterBackend>(
 
             (StatusCode::OK, Json(my_claims)).into_response()
         }
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to list leases".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to list leases",
+            e,
+        ),
     }
 }
 
@@ -704,37 +772,34 @@ async fn get_lease<B: ClusterBackend>(
                                 ) {
                                     Ok(kubeconfig) => Some(kubeconfig),
                                     Err(err) => {
-                                        return (
+                                        return infra_error(
                                             StatusCode::INTERNAL_SERVER_ERROR,
-                                            Json(ErrorResponse {
-                                                error: "Failed to build lease kubeconfig"
-                                                    .to_string(),
-                                                detail: Some(err.to_string()),
-                                            }),
-                                        )
-                                            .into_response();
+                                            "Failed to build lease kubeconfig",
+                                            err,
+                                        );
                                     }
                                 }
                             }
                             Err(err) => {
-                                return (
+                                return infra_error(
                                     StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ErrorResponse {
-                                        error: "Failed to provision lease access token".to_string(),
-                                        detail: Some(err.to_string()),
-                                    }),
-                                )
-                                    .into_response();
+                                    "Failed to provision lease access token",
+                                    err,
+                                );
                             }
                         },
                         Err(_) => {
+                            // A missing/oddly-proxied Host header is a client/proxy
+                            // problem, not a server outage — no amount of retry
+                            // fixes it, so return 400 rather than 503 (which would
+                            // trip availability alerting and retry loops).
                             return (
-                                StatusCode::SERVICE_UNAVAILABLE,
+                                StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse {
                                     error: "Failed to determine public connect endpoint"
                                         .to_string(),
                                     detail: Some(
-                                        "The request did not include a usable host header"
+                                        "The request did not include a usable Host header"
                                             .to_string(),
                                     ),
                                 }),
@@ -773,14 +838,7 @@ async fn get_lease<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to get lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+        Err(e) => infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e),
     }
 }
 
@@ -914,6 +972,20 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             StatusCode::CONFLICT,
             format!("Lease is not active (phase {})", status.phase),
         );
+    }
+
+    // Enforce TTL synchronously on the request path. The phase only flips to
+    // Expired on the next ~30s reconcile / 60s reaper sweep, so without this an
+    // expired holder retains full API access during the lag — in a multi-tenant
+    // pool the cluster may already be slated for recycle/handoff.
+    if lease_is_expired(status.expires_at.as_deref()) {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            expires_at = ?status.expires_at,
+            "Connect proxy rejected expired lease"
+        );
+        return connect_error(StatusCode::GONE, "Lease has expired");
     }
 
     let Some(cluster_name) = status.cluster_name.as_deref() else {
@@ -1073,6 +1145,37 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             return connect_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
         }
     };
+
+    // Streaming subprotocols (exec / attach / port-forward) negotiate an HTTP
+    // Upgrade (SPDY or websocket). This proxy is a buffered request/response
+    // reverse proxy — it cannot carry the 101 + hijacked socket through (it
+    // even strips the hop-by-hop `Upgrade` header, see should_skip_response_header),
+    // so forwarding such a request yields an opaque "Bad Request" at the client.
+    // Fail fast with an explicit, greppable error naming the protocol instead of
+    // letting consumers chase a phantom cert/auth bug. Full upgrade tunneling is
+    // tracked in #85.
+    if headers_request_upgrade(&headers) {
+        let protocol =
+            requested_upgrade_protocol(&headers).unwrap_or_else(|| "unknown".to_string());
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            cluster = %cluster_name,
+            method = %method,
+            path = %request_path,
+            protocol = %protocol,
+            "Connect proxy rejected HTTP upgrade (exec/attach/port-forward not supported)"
+        );
+        return connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "Streaming subprotocols (exec, attach, port-forward) are not supported \
+                 through the connect proxy: it cannot tunnel the HTTP upgrade to \
+                 '{protocol}'. Use the lease's direct kubeconfig for those operations. \
+                 Tracking: https://github.com/kunobi-ninja/kobe/issues/85"
+            ),
+        );
+    }
 
     info!(
         request_id = %request_id,
@@ -1281,14 +1384,7 @@ async fn release_lease<B: ClusterBackend>(
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Failed to get lease".to_string(),
-                    detail: Some(e.to_string()),
-                }),
-            )
-                .into_response();
+            return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
     };
 
@@ -1316,14 +1412,11 @@ async fn release_lease<B: ClusterBackend>(
         )
         .await
     {
-        return (
+        return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to release lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response();
+            "Failed to release lease",
+            e,
+        );
     }
 
     metrics::CLAIMS_TOTAL
@@ -1371,14 +1464,7 @@ async fn extend_lease<B: ClusterBackend>(
                 .into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Failed to get lease".to_string(),
-                    detail: Some(e.to_string()),
-                }),
-            )
-                .into_response();
+            return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
     }
 
@@ -1406,14 +1492,11 @@ async fn extend_lease<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(crate::controllers::lease::LeaseError::Kube(e)) => (
+        Err(crate::controllers::lease::LeaseError::Kube(e)) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to extend lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to extend lease",
+            e,
+        ),
     }
 }
 
@@ -1461,14 +1544,11 @@ async fn get_diagnostics<B: ClusterBackend>(
             }
         }
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to look up lease".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to look up lease",
+            e,
+        ),
     }
 }
 
@@ -1490,14 +1570,11 @@ async fn list_pools<B: ClusterBackend>(
 
             (StatusCode::OK, Json(response)).into_response()
         }
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to list profiles".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to list profiles",
+            e,
+        ),
     }
 }
 
@@ -1524,14 +1601,11 @@ async fn get_pool<B: ClusterBackend>(
             }),
         )
             .into_response(),
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to get profile".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to get profile",
+            e,
+        ),
     }
 }
 
@@ -1560,6 +1634,18 @@ async fn list_pool_leases<B: ClusterBackend>(
                 })
                 .map(|c| {
                     let status = c.status.clone().unwrap_or_default();
+                    // Only disclose the requester identity for the caller's OWN
+                    // leases. A pool can be shared across tenants (the shipped
+                    // GitHub policy grants every repo the `e2e-*` pattern), so
+                    // returning every requester would let any one tenant enumerate
+                    // the others' identities. The pool-utilization view (counts,
+                    // phases, expiries) is preserved; only foreign identities are
+                    // redacted.
+                    let requester = if c.spec.requester.identity == identity.identity {
+                        Some(c.spec.requester.identity.clone())
+                    } else {
+                        None
+                    };
                     LeaseSummary {
                         id: c.name_any(),
                         phase: status.phase.to_string(),
@@ -1568,21 +1654,18 @@ async fn list_pool_leases<B: ClusterBackend>(
                         expires_at: status.expires_at,
                         queue_position: status.queue_position,
                         diagnostics_url: None,
-                        requester: Some(c.spec.requester.identity.clone()),
+                        requester,
                     }
                 })
                 .collect();
 
             (StatusCode::OK, Json(summaries)).into_response()
         }
-        Err(e) => (
+        Err(e) => infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to list pool leases".to_string(),
-                detail: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+            "Failed to list pool leases",
+            e,
+        ),
     }
 }
 
@@ -1747,10 +1830,10 @@ async fn readyz<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response
         failures.push(format!("kubernetes: {e}"));
     }
 
-    // PostgreSQL — only when a pool is configured. In embedded-datastore
-    // mode `pg_pool` is `None` and there is nothing to check.
-    if let Some(pool) = &state.pg_pool
-        && let Err(e) = readyz_check_postgres(pool).await
+    // PostgreSQL — only when a datastore is configured. In embedded-datastore
+    // mode there is nothing to check.
+    if let Some((pool, _)) = state.datastore.current()
+        && let Err(e) = readyz_check_postgres(&pool).await
     {
         failures.push(format!("postgres: {e}"));
     }
@@ -1848,6 +1931,51 @@ async fn count_active_leases(
         .count() as u32)
 }
 
+/// Names of an identity's active (Pending|Bound) leases, in a deterministic
+/// order (oldest first, then by name). The order is stable across concurrent
+/// requests so they agree on which leases are "excess" over the quota.
+async fn active_lease_names_sorted(
+    leases_api: &Api<ClusterLease>,
+    identity: &str,
+) -> Result<Vec<String>, kube::Error> {
+    let label_hash = hash_identity(identity);
+    let lp =
+        ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
+    let leases = leases_api.list(&lp).await?;
+    let mut active: Vec<(String, String)> = leases
+        .iter()
+        .filter(|c| c.spec.requester.identity == identity)
+        .filter(|c| {
+            let status = c.status.clone().unwrap_or_default();
+            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
+        })
+        .map(|c| {
+            let ts = c
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.to_string())
+                .unwrap_or_default();
+            (ts, c.name_any())
+        })
+        .collect();
+    // RFC3339 timestamps sort chronologically as strings; the name (random lease
+    // id) breaks same-second ties consistently.
+    active.sort();
+    Ok(active.into_iter().map(|(_, name)| name).collect())
+}
+
+/// Whether `lease_id` ranks beyond the cap among the identity's deterministically
+/// ordered active leases — i.e. it lost a concurrent-create race and should
+/// self-delete. Unknown lease (not in the list) => not excess.
+fn lease_exceeds_quota(active_sorted: &[String], lease_id: &str, cap: u32) -> bool {
+    active_sorted
+        .iter()
+        .position(|n| n == lease_id)
+        .map(|rank| rank >= cap as usize)
+        .unwrap_or(false)
+}
+
 fn build_lease_crd(
     lease_id: &str,
     namespace: &str,
@@ -1900,6 +2028,35 @@ mod tests {
     use super::*;
 
     use base64::Engine;
+
+    #[test]
+    fn test_lease_is_expired() {
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(lease_is_expired(Some(&past)), "past expiry is expired");
+        assert!(!lease_is_expired(Some(&future)), "future expiry is live");
+        // Missing / unparseable timestamps must not be treated as expired (the
+        // phase gate still applies); fail-safe toward the existing behavior.
+        assert!(!lease_is_expired(None));
+        assert!(!lease_is_expired(Some("not-a-timestamp")));
+    }
+
+    #[test]
+    fn test_lease_exceeds_quota() {
+        let active = vec![
+            "lease-a".to_string(),
+            "lease-b".to_string(),
+            "lease-c".to_string(),
+        ];
+        // cap 2: ranks 0,1 survive; rank 2 (lease-c) is excess.
+        assert!(!lease_exceeds_quota(&active, "lease-a", 2));
+        assert!(!lease_exceeds_quota(&active, "lease-b", 2));
+        assert!(lease_exceeds_quota(&active, "lease-c", 2));
+        // cap >= len: nothing is excess.
+        assert!(!lease_exceeds_quota(&active, "lease-c", 3));
+        // unknown lease (e.g. already deleted): not excess.
+        assert!(!lease_exceeds_quota(&active, "lease-z", 1));
+    }
 
     #[test]
     fn test_hash_identity_deterministic() {
@@ -2026,7 +2183,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         (build_router(state), server)
@@ -2058,7 +2215,8 @@ mod tests {
             "status": {
                 "phase": phase,
                 "clusterName": cluster_name,
-                "expiresAt": "2026-04-13T18:00:00Z",
+                // Future expiry so the connect proxy's TTL gate treats it as live.
+                "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
                 "queuePosition": 0
             }
         })
@@ -2218,7 +2376,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -2291,7 +2449,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -2347,6 +2505,90 @@ mod tests {
         assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
     }
 
+    // #85: exec/attach/port-forward negotiate an HTTP upgrade the buffered proxy
+    // cannot tunnel. It must fail fast with an explicit 501 (naming the protocol)
+    // rather than forwarding into an opaque "Bad Request".
+    #[tokio::test]
+    async fn test_connect_proxy_rejects_http_upgrade_with_clear_error() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        backend.set_kubeconfig(&format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
+            server.uri()
+        ));
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+            factory: None,
+            datastore: Default::default(),
+        };
+
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "lease-abc",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+
+        // A SPDY exec request: Connection: Upgrade + Upgrade: SPDY/3.1.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer lease-token".parse().unwrap());
+        headers.insert(CONNECTION, "Upgrade".parse().unwrap());
+        headers.insert(UPGRADE, "SPDY/3.1".parse().unwrap());
+
+        let response = connect_proxy::<crate::testutil::MockBackend>(
+            State(state),
+            Path((
+                "lease-abc".to_string(),
+                "api/v1/namespaces/default/pods/foo/exec".to_string(),
+            )),
+            Method::GET,
+            headers,
+            RawQuery(None),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("exec"),
+            "error should name the subprotocols: {body}"
+        );
+        assert!(
+            body.contains("spdy/3.1"),
+            "error should echo the requested protocol: {body}"
+        );
+        assert!(
+            body.contains("issues/85"),
+            "error should point to the tracking issue: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn test_connect_proxy_requires_bearer_token() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2360,7 +2602,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(

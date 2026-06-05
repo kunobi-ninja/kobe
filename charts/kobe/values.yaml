@@ -17,7 +17,17 @@ operatorNamespace: "kunobi-pool"
 
 # Optional PostgreSQL connection for direct-k3s/k0s backends
 postgres:
+  # Static connection URL, injected as the POSTGRES_URL env var. Frozen at pod
+  # start — a Postgres password rotation requires an operator restart to pick up.
   url: ""
+  # Preferred: mount a Secret holding the connection URL and hot-reload it when
+  # the credential rotates, without restarting the operator (issue #91). Takes
+  # precedence over `url`. The operator watches `mountPath` (POSTGRES_URL_DIR)
+  # and reads the URL from a `url` file projected from `key`.
+  urlSecret:
+    name: ""               # Secret containing the connection URL (empty = disabled)
+    key: "connection-url"  # key in that Secret holding the URL
+    mountPath: "/etc/kobe/postgres"
 
 # kobe-sync sidecar image (used when operator creates virtual clusters)
 kobeSync:
@@ -246,6 +256,34 @@ kobeStores: []
 #       clusterCidr: 10.248.32.0/20
 # -----------------------------------------------------------------------------
 cidrReservations: []
+
+# -----------------------------------------------------------------------------
+# IPAM address plan (issue #42).
+#
+# kobe carves every guest k3s/k0s service+cluster CIDR out of two parent
+# supernets. The built-in default is 10.240.0.0/13 (service) + 10.248.0.0/13
+# (cluster), /20 slots — well clear of the common k8s ranges. Leave this block
+# empty to use that default (the case for almost every deployment).
+#
+# Set it only when the HOST cluster's own service range overlaps the default:
+# in that case a guest's in-pod 10.x.0.1 routes to the HOST apiserver and guest
+# CoreDNS fails with `x509: certificate signed by unknown authority`. Relocating
+# the supernets off the colliding range fixes it. When `serviceCidr` AND
+# `clusterCidr` are both set, the chart creates a `CIDRPool/default` the operator
+# reads at startup. Both supernets must be aligned to their prefix and must NOT
+# overlap the host cluster's ranges.
+#
+# Example (host cluster uses 10.240.0.0/13, so move kobe to 100.64.0.0/13):
+#   ipam:
+#     serviceCidr: 100.64.0.0/13
+#     serviceSlotPrefix: 20
+#     clusterCidr: 100.72.0.0/13
+#     clusterSlotPrefix: 20
+ipam:
+  serviceCidr: ""        # empty = built-in 10.240.0.0/13
+  serviceSlotPrefix: 20
+  clusterCidr: ""        # empty = built-in 10.248.0.0/13
+  clusterSlotPrefix: 20
 
 # -----------------------------------------------------------------------------
 # kobe-host-reaper DaemonSet. Always-on by default. Disable on clusters

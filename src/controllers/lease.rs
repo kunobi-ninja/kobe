@@ -458,7 +458,23 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 }
             }
 
-            Ok(Action::requeue(std::time::Duration::from_secs(30)))
+            // Requeue at this lease's expiry deadline (clamped to [1s, 30s])
+            // rather than a fixed 30s, so TTL expiry is detected promptly instead
+            // of up to ~30-60s late. (The 60s reaper remains a backstop.)
+            let until_expiry = status
+                .expires_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|e| e.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                .and_then(|d| d.to_std().ok())
+                .map(|d| {
+                    d.clamp(
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(30),
+                    )
+                })
+                .unwrap_or(std::time::Duration::from_secs(30));
+            Ok(Action::requeue(until_expiry))
         }
 
         LeasePhase::Released | LeasePhase::Expired => {
@@ -466,26 +482,21 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
             remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
-            let patch = serde_json::json!({
-                "status": { "phase": "Recycling" }
-            });
-            leases_api
-                .patch_status(
-                    &name,
-                    &PatchParams::apply("kobe-operator"),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
-
+            // Capture diagnostics BEFORE flipping to Recycling: the cluster is
+            // still alive (we mark the instance recycling only after the patch
+            // below), and recording the URL in the SAME patch that advances the
+            // phase means a transient status-write failure is retried — via the
+            // `?` below, while the lease is still Released/Expired — instead of
+            // losing the URL (the Recycling arm never re-captures).
+            let mut diag_url: Option<String> = None;
             if let Some(cluster_name) = &status.cluster_name {
-                mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
                 let profile = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await;
                 if let Some(ref profile) = profile
                     && let Some(ref diag_config) = profile.spec.diagnostics
                     && diag_config.enabled
                 {
                     info!(lease = %name, "Capturing diagnostic bundle");
-                    let diag_url = match diagnostics::capture_bundle(
+                    match diagnostics::capture_bundle(
                         cluster_name,
                         &ns,
                         diag_config,
@@ -494,38 +505,30 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     )
                     .await
                     {
-                        Ok(url) => Some(url),
-                        Err(e) => {
-                            warn!(
-                                lease = %name,
-                                cluster = %cluster_name,
-                                "Failed to capture diagnostic bundle: {e:#}"
-                            );
-                            None
-                        }
-                    };
-
-                    if let Some(url) = &diag_url {
-                        let patch = serde_json::json!({
-                            "status": { "diagnosticsUrl": url }
-                        });
-                        if let Err(e) = leases_api
-                            .patch_status(
-                                &name,
-                                &PatchParams::apply("kobe-operator"),
-                                &Patch::Merge(&patch),
-                            )
-                            .await
-                        {
-                            error!(
-                                lease = %name,
-                                diagnostics_url = %url,
-                                "Failed to record diagnostics URL on lease status: {e}"
-                            );
-                        }
+                        Ok(url) => diag_url = Some(url),
+                        Err(e) => warn!(
+                            lease = %name,
+                            cluster = %cluster_name,
+                            "Failed to capture diagnostic bundle: {e:#}"
+                        ),
                     }
                 }
+            }
 
+            let mut status_fields = serde_json::json!({ "phase": "Recycling" });
+            if let Some(url) = &diag_url {
+                status_fields["diagnosticsUrl"] = serde_json::Value::String(url.clone());
+            }
+            leases_api
+                .patch_status(
+                    &name,
+                    &PatchParams::apply("kobe-operator"),
+                    &Patch::Merge(&serde_json::json!({ "status": status_fields })),
+                )
+                .await?;
+
+            if let Some(cluster_name) = &status.cluster_name {
+                mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
                 debug!(cluster = %cluster_name, "Marked ClusterInstance recycling");
             } else {
                 info!(lease = %name, "No cluster to recycle, lease will be cleaned up");
@@ -616,18 +619,29 @@ pub async fn extend_lease_ttl(
             LeaseError::Lifecycle(anyhow::anyhow!("Lease has no valid bound_at timestamp"))
         })?;
 
+    // Fail closed: the bound_at + max_ttl ceiling is a hard cap, so a lease whose
+    // policy can no longer be resolved (e.g. the AuthPolicy was renamed/removed
+    // after the lease was minted) must NOT be extendable without a ceiling.
+    // Treating a missing policy as "no cap" would let a requester extend a Bound
+    // lease arbitrarily, up to max_extensions.
     let policy = authenticator
         .policy_for_requester_type(&lease.spec.requester.requester_type)
-        .await;
-    if let Some(policy) = &policy {
-        let max_expiry = bound_at + policy.max_ttl;
-        if new_expiry > max_expiry {
-            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-                "Extension would exceed maximum TTL ({}). Max expiry: {}",
-                crate::api::policy::format_duration(&policy.max_ttl),
-                max_expiry.to_rfc3339()
-            )));
-        }
+        .await
+        .ok_or_else(|| {
+            LeaseError::Lifecycle(anyhow::anyhow!(
+                "Cannot extend TTL: no policy resolves requester type '{}' \
+                 (the AuthPolicy may have been renamed or removed); refusing to \
+                 extend without a maximum-TTL ceiling",
+                lease.spec.requester.requester_type
+            ))
+        })?;
+    let max_expiry = bound_at + policy.max_ttl;
+    if new_expiry > max_expiry {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "Extension would exceed maximum TTL ({}). Max expiry: {}",
+            crate::api::policy::format_duration(&policy.max_ttl),
+            max_expiry.to_rfc3339()
+        )));
     }
 
     let patch = serde_json::json!({
@@ -673,7 +687,14 @@ async fn reserve_ready_instance(
             instance
                 .status
                 .as_ref()
-                .map(|s| s.phase == ClusterInstancePhase::Ready)
+                // A genuinely-free instance is Ready AND carries no leaseRef. The
+                // extra leaseRef check prevents a double-lease: if a stale write
+                // (e.g. the profile controller syncing an out-of-date in-memory
+                // phase) reverts an already-Leased instance to Ready while leaving
+                // its leaseRef set, selecting it here would bind the same cluster
+                // to a second tenant. Requiring leaseRef == None excludes that
+                // case while still admitting all genuinely-idle instances.
+                .map(|s| s.phase == ClusterInstancePhase::Ready && s.lease_ref.is_none())
                 .unwrap_or(false)
         })
         .collect();
@@ -916,6 +937,42 @@ mod tests {
             factory: None,
         });
         (ctx, server)
+    }
+
+    #[tokio::test]
+    async fn reserve_skips_ready_instance_with_stale_lease_ref() {
+        // A Ready instance that still carries a leaseRef (e.g. a stale phase
+        // write reverted it Leased->Ready without clearing leaseRef) must NOT be
+        // reserved, or the same cluster is double-leased to a second tenant.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": {
+                        "name": "pool-p-0",
+                        "namespace": "test-ns",
+                        "labels": { "kobe.kunobi.ninja/pool": "p" }
+                    },
+                    "spec": { "poolRef": { "name": "p" } },
+                    "status": { "phase": "Ready", "leaseRef": { "name": "lease-old" } }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        let result = reserve_ready_instance(&client, "test-ns", "p", "lease-new").await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a Ready instance still carrying a leaseRef must not be reserved, got {result:?}"
+        );
     }
 
     /// Build a `ClusterLease` CRD object in the given phase.
@@ -1540,6 +1597,28 @@ mod tests {
     async fn test_extend_lease_ttl_success() {
         let (ctx, server) = test_lease_context().await;
 
+        // A resolvable policy is required to extend (fail-closed max-TTL ceiling).
+        // max_ttl 4h comfortably covers bound_at + ~2h after the extension below.
+        let policy: crate::crd::access_policy::AccessPolicy =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "AccessPolicy",
+                "metadata": { "name": "test" },
+                "spec": {
+                    "auth": { "oidc": {
+                        "issuer": "https://issuer.example.com",
+                        "audience": ["test"],
+                        "algorithms": ["RS256"]
+                    }},
+                    "rules": [{ "pools": ["*"], "maxTtl": "4h",
+                                "maxConcurrentLeases": 5, "maxExtensions": 2 }]
+                }
+            }))
+            .unwrap();
+        ctx.authenticator
+            .update_policies(vec![policy], std::collections::HashMap::new())
+            .await;
+
         let future_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
         let bound_at = chrono::Utc::now() - chrono::Duration::minutes(30);
 
@@ -1555,7 +1634,7 @@ mod tests {
                 "spec": {
                     "poolRef": "test-profile",
                     "ttl": "1h",
-                    "requester": { "type": "test:admin", "identity": "u" },
+                    "requester": { "type": "test", "identity": "u" },
                     "priority": 50
                 },
                 "status": {
@@ -1601,6 +1680,56 @@ mod tests {
         // The returned string should be a valid RFC3339 timestamp.
         let new_expiry_str = result.unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(&new_expiry_str).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // extend_lease_ttl: fail-closed when the requester policy is unresolvable
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_extend_lease_ttl_denied_without_policy() {
+        // A Bound lease whose requester policy can no longer be resolved (e.g. the
+        // AuthPolicy was renamed/removed) must not be extendable — there is no
+        // max-TTL ceiling to enforce, so we deny rather than extend unbounded.
+        let (ctx, server) = test_lease_context().await;
+        // No policies configured on the authenticator.
+
+        let future_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+        let bound_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/extend-2",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "extend-2", "namespace": "test-ns" },
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
+                          "requester": {"type": "stale-provider:admin", "identity": "u"},
+                          "priority": 50 },
+                "status": {
+                    "phase": "Bound", "clusterName": "pool-test-1",
+                    "boundAt": bound_at.to_rfc3339(), "expiresAt": future_expiry.to_rfc3339(),
+                    "extensionsCount": 0, "maxExtensions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let result = extend_lease_ttl(
+            &ctx.client,
+            "test-ns",
+            "extend-2",
+            "30m",
+            &ctx.authenticator,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "extend must be denied when no policy resolves"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no policy resolves"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------

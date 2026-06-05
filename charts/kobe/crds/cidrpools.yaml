@@ -1,0 +1,108 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cidrpools.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: CIDRPool
+    plural: cidrpools
+    shortNames:
+    - cpool
+    singular: cidrpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CIDRPoolSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Operator-level IPAM address-space configuration. The IPAM allocator
+              carves every guest k3s/k0s service+cluster CIDR out of two parent
+              supernets; by default those are the built-in `10.240.0.0/13` (svc)
+              and `10.248.0.0/13` (cls), `/20` slots. That default is well clear
+              of the common k8s ranges (10.42/10.43/10.96), but a host cluster
+              whose OWN service range overlaps it makes every guest's in-pod
+              `10.x.0.1` route to the HOST apiserver — guest CoreDNS then fails
+              with `x509: certificate signed by unknown authority` (#42).
+
+              A `CIDRPool` named `default` in the operator namespace overrides the
+              built-in plan so operators can relocate the supernets off a colliding
+              host range. When absent, the built-in plan is used unchanged — so
+              this is purely opt-in and existing deployments are unaffected.
+
+              Singleton by convention: the allocator reads the one named `default`
+              and ignores others. The plan is resolved at operator startup; editing
+              the `CIDRPool` takes effect on the next restart (existing `CIDRClaim`s
+              that fall outside a narrowed plan are re-validated to `Conflict`).
+            properties:
+              clusterCidr:
+                description: |-
+                  Parent supernet for guest *cluster* (pod) CIDRs, e.g.
+                  `"10.248.0.0/13"`. Same alignment + non-overlap rules.
+                type: string
+              clusterSlotPrefix:
+                description: Prefix carved per guest from `cluster_cidr`, e.g. `20`.
+                format: uint8
+                maximum: 255.0
+                minimum: 0.0
+                type: integer
+              serviceCidr:
+                description: |-
+                  Parent supernet for guest *service* CIDRs, e.g. `"10.240.0.0/13"`.
+                  Must be aligned to its own prefix and must NOT overlap the host
+                  cluster's service range.
+                type: string
+              serviceSlotPrefix:
+                description: |-
+                  Prefix carved per guest from `service_cidr`, e.g. `20` (a `/20`
+                  slot = 4096 addresses). Must be >= the `service_cidr` prefix.
+                format: uint8
+                maximum: 255.0
+                minimum: 0.0
+                type: integer
+            required:
+            - clusterCidr
+            - clusterSlotPrefix
+            - serviceCidr
+            - serviceSlotPrefix
+            type: object
+          status:
+            nullable: true
+            properties:
+              capacity:
+                description: |-
+                  Number of paired (service, cluster) slots this plan yields.
+                  `None` until the allocator has evaluated it.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              message:
+                description: |-
+                  Validation error when `phase == Invalid` (malformed CIDR,
+                  misaligned block, slot prefix smaller than the block prefix, …).
+                  On `Invalid` the allocator falls back to the built-in default plan.
+                nullable: true
+                type: string
+              phase:
+                default: Pending
+                description: Whether the allocator accepted this pool as its active plan.
+                enum:
+                - Pending
+                - Active
+                - Invalid
+                type: string
+            type: object
+        required:
+        - spec
+        title: CIDRPool
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

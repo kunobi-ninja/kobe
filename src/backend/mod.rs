@@ -244,17 +244,12 @@ impl ClusterBackend for BackendDispatch {
 #[derive(Clone)]
 pub struct BackendFactory {
     client: Client,
-    pg_pool: Option<sqlx::PgPool>,
-    pg_base_url: Option<String>,
+    datastore: datastore::SharedDatastore,
 }
 
 impl BackendFactory {
-    pub fn new(client: Client, pg_pool: Option<sqlx::PgPool>, pg_base_url: Option<String>) -> Self {
-        Self {
-            client,
-            pg_pool,
-            pg_base_url,
-        }
+    pub fn new(client: Client, datastore: datastore::SharedDatastore) -> Self {
+        Self { client, datastore }
     }
 
     /// Produce the right backend for a pool based on its `spec.backend.backend_type`.
@@ -262,13 +257,11 @@ impl BackendFactory {
         match profile.spec.backend.backend_type {
             BackendType::K3s => Ok(BackendDispatch::K3s(K3sBackend::new(
                 self.client.clone(),
-                self.pg_pool.clone(),
-                self.pg_base_url.clone(),
+                self.datastore.clone(),
             ))),
             BackendType::K0s => Ok(BackendDispatch::K0s(K0sBackend::new(
                 self.client.clone(),
-                self.pg_pool.clone(),
-                self.pg_base_url.clone(),
+                self.datastore.clone(),
             ))),
             BackendType::Capi => {
                 let capi_config = profile.spec.backend.capi.clone().ok_or_else(|| {

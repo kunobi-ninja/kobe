@@ -58,11 +58,15 @@ pub async fn capture_bundle<B: ClusterBackend>(
     let bundle_json =
         serde_json::to_string_pretty(&bundle).context("Failed to serialize diagnostic bundle")?;
 
-    let url = upload_to_s3(&config.storage, lease_id, &bundle_json).await?;
+    let (url, object_uri) = upload_to_s3(&config.storage, lease_id, &bundle_json).await?;
 
+    // Do NOT log the presigned URL: it is a credential-free, multi-day download
+    // link to a bundle that can contain guest-cluster Secrets. Logs are typically
+    // far more widely readable than the bucket or the (owner-scoped) lease status.
+    // Log only the object location, which requires bucket credentials to read.
     info!(
         lease = lease_id,
-        url = %url,
+        object = %object_uri,
         "Diagnostic bundle uploaded"
     );
 
@@ -253,8 +257,14 @@ async fn capture_node_info(vc_client: &Client) -> String {
     }
 }
 
-/// Upload diagnostic bundle to S3 and return a presigned URL.
-async fn upload_to_s3(storage_uri: &str, lease_id: &str, content: &str) -> Result<String> {
+/// Upload diagnostic bundle to S3. Returns `(presigned_url, object_uri)` where
+/// `object_uri` is the non-sensitive `s3://bucket/key` location (safe to log;
+/// reading it requires bucket credentials, unlike the presigned URL).
+async fn upload_to_s3(
+    storage_uri: &str,
+    lease_id: &str,
+    content: &str,
+) -> Result<(String, String)> {
     let uri = storage_uri
         .strip_prefix("s3://")
         .context("Storage URI must start with s3://")?;
@@ -292,7 +302,7 @@ async fn upload_to_s3(storage_uri: &str, lease_id: &str, content: &str) -> Resul
         .await
         .context("Failed to generate presigned URL")?;
 
-    Ok(presigned.uri().to_string())
+    Ok((presigned.uri().to_string(), format!("s3://{bucket}/{key}")))
 }
 
 #[cfg(test)]
