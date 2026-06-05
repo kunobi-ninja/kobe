@@ -443,6 +443,11 @@ spec:
                 privileged: Some(true),
                 ..Default::default()
             }),
+            // Honors `ClusterPool.spec.resources`, matching the k3s backend.
+            // Without this the field was silently dropped on k0s server pods,
+            // leaving them with no requests/limits — the scheduler over-packs
+            // the node and the controller flaps under bootstrap load (#92).
+            resources: config.resources.as_ref().and_then(|r| r.to_k8s()),
             ..Default::default()
         }
     }
@@ -1804,6 +1809,36 @@ mod tests {
             placement: Some(placement),
             ..base_config()
         }
+    }
+
+    // #92: a k0s pool that sets `spec.resources` must stamp requests/limits onto
+    // the controller container. The field was previously dropped, leaving server
+    // pods unbounded and prone to flapping when the node is over-packed under
+    // bootstrap load — matching the k3s backend, which already propagates it.
+    #[test]
+    fn test_build_server_container_propagates_resources_k0s() {
+        use crate::crd::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+        let mut config = base_config();
+        config.resources = Some(ResourceRequirements {
+            limits: [("cpu".to_string(), "1".to_string())].into(),
+            requests: [("memory".to_string(), "512Mi".to_string())].into(),
+        });
+
+        let container = K0sBackend::build_server_container("c", "ns", &config);
+        let r = container
+            .resources
+            .as_ref()
+            .expect("k0s controller container must carry resources when the pool sets them");
+        assert_eq!(
+            r.limits.as_ref().unwrap().get("cpu"),
+            Some(&Quantity("1".to_string())),
+        );
+        assert_eq!(
+            r.requests.as_ref().unwrap().get("memory"),
+            Some(&Quantity("512Mi".to_string())),
+        );
     }
 
     #[test]
