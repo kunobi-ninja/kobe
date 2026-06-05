@@ -597,6 +597,30 @@ async fn create_lease<B: ClusterBackend>(
             .into_response();
     }
 
+    // The pre-create count check is advisory: N concurrent requests for one
+    // identity can each observe the same sub-limit count and all create,
+    // overshooting max_concurrent_leases. Re-list the identity's active leases in
+    // a deterministic order and self-delete this one if it ranks beyond the cap,
+    // so concurrent creates converge to exactly the cap instead of overshooting.
+    // (Bounded mitigation; the lease reconciler remains the authoritative quota
+    // enforcer for the residual list-cache race.)
+    if let Ok(active) = active_lease_names_sorted(&leases_api, &identity.identity).await
+        && lease_exceeds_quota(&active, &lease_id, policy.max_concurrent_leases)
+    {
+        let _ = leases_api.delete(&lease_id, &Default::default()).await;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: format!(
+                    "Concurrent lease limit ({}) reached",
+                    policy.max_concurrent_leases
+                ),
+                detail: Some("A concurrent request won the quota race; please retry".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
     metrics::CLAIMS_TOTAL
         .with_label_values(&[req.profile.as_str(), "created"])
         .inc();
@@ -1884,6 +1908,51 @@ async fn count_active_leases(
         .count() as u32)
 }
 
+/// Names of an identity's active (Pending|Bound) leases, in a deterministic
+/// order (oldest first, then by name). The order is stable across concurrent
+/// requests so they agree on which leases are "excess" over the quota.
+async fn active_lease_names_sorted(
+    leases_api: &Api<ClusterLease>,
+    identity: &str,
+) -> Result<Vec<String>, kube::Error> {
+    let label_hash = hash_identity(identity);
+    let lp =
+        ListParams::default().labels(&format!("kobe.kunobi.ninja/requester-hash={label_hash}"));
+    let leases = leases_api.list(&lp).await?;
+    let mut active: Vec<(String, String)> = leases
+        .iter()
+        .filter(|c| c.spec.requester.identity == identity)
+        .filter(|c| {
+            let status = c.status.clone().unwrap_or_default();
+            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
+        })
+        .map(|c| {
+            let ts = c
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.to_string())
+                .unwrap_or_default();
+            (ts, c.name_any())
+        })
+        .collect();
+    // RFC3339 timestamps sort chronologically as strings; the name (random lease
+    // id) breaks same-second ties consistently.
+    active.sort();
+    Ok(active.into_iter().map(|(_, name)| name).collect())
+}
+
+/// Whether `lease_id` ranks beyond the cap among the identity's deterministically
+/// ordered active leases — i.e. it lost a concurrent-create race and should
+/// self-delete. Unknown lease (not in the list) => not excess.
+fn lease_exceeds_quota(active_sorted: &[String], lease_id: &str, cap: u32) -> bool {
+    active_sorted
+        .iter()
+        .position(|n| n == lease_id)
+        .map(|rank| rank >= cap as usize)
+        .unwrap_or(false)
+}
+
 fn build_lease_crd(
     lease_id: &str,
     namespace: &str,
@@ -1947,6 +2016,23 @@ mod tests {
         // phase gate still applies); fail-safe toward the existing behavior.
         assert!(!lease_is_expired(None));
         assert!(!lease_is_expired(Some("not-a-timestamp")));
+    }
+
+    #[test]
+    fn test_lease_exceeds_quota() {
+        let active = vec![
+            "lease-a".to_string(),
+            "lease-b".to_string(),
+            "lease-c".to_string(),
+        ];
+        // cap 2: ranks 0,1 survive; rank 2 (lease-c) is excess.
+        assert!(!lease_exceeds_quota(&active, "lease-a", 2));
+        assert!(!lease_exceeds_quota(&active, "lease-b", 2));
+        assert!(lease_exceeds_quota(&active, "lease-c", 2));
+        // cap >= len: nothing is excess.
+        assert!(!lease_exceeds_quota(&active, "lease-c", 3));
+        // unknown lease (e.g. already deleted): not excess.
+        assert!(!lease_exceeds_quota(&active, "lease-z", 1));
     }
 
     #[test]
