@@ -98,6 +98,21 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# SigNoz metrics scraping (how kobe's Prometheus metrics reach SigNoz).
+#
+# Our clusters' SigNoz OTel collector discovers scrape targets by pod
+# annotations (signoz.io/scrape|port|path) — NOT by Prometheus ServiceMonitors
+# (there is no Prometheus to consume them). kobe always serves /metrics on the
+# http port (auth-exempt), so this is ON by default; the annotations are inert
+# on any cluster without a SigNoz collector watching for them.
+signoz:
+  scrape: true
+  path: /metrics
+  # port: defaults to service.port (the http port serving /metrics)
+
+# Prometheus-Operator ServiceMonitor. Only useful on clusters that actually run
+# a Prometheus selecting it; our SigNoz clusters use the `signoz.*` annotations
+# above instead, so leave this disabled there.
 serviceMonitor:
   enabled: false
   interval: 30s
