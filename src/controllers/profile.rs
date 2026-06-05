@@ -95,6 +95,56 @@ mod cluster_instance_tests {
         )
     }
 
+    fn profile_with_status(status: serde_json::Value) -> ClusterPool {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "metadata": { "name": "p", "namespace": "test-ns" },
+            "spec": {
+                "minSize": 2, "maxSize": 5,
+                "cluster": { "version": "v1.28.0", "serverCount": 1 },
+                "readinessGates": [], "addons": []
+            },
+            "status": status
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn backoff_populates_last_failure_reason_when_failing() {
+        // attempted up to index 3, only reached Ready at 1 → 2 failures.
+        let profile = profile_with_status(serde_json::json!({
+            "consecutiveFailures": 2, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 1
+        }));
+        let pool_state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let counts = crate::pool::manager::StateCounts::default();
+        let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+        assert!(backoff.consecutive_failures > 0);
+        let reason = backoff
+            .last_failure_reason
+            .expect("last_failure_reason must be populated while failing");
+        assert!(reason.contains("not reaching Ready"), "got: {reason}");
+        assert!(reason.contains("pool=p"), "got: {reason}");
+    }
+
+    #[test]
+    fn backoff_clears_last_failure_reason_on_recovery() {
+        // Every attempted index has reached Ready → caught up → reason cleared.
+        let profile = profile_with_status(serde_json::json!({
+            "consecutiveFailures": 0, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 3,
+            "lastFailureReason": "stale reason"
+        }));
+        let pool_state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let counts = crate::pool::manager::StateCounts::default();
+        let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert!(backoff.last_failure_reason.is_none());
+    }
+
     fn instance_response_json(
         name: &str,
         pool: &str,
@@ -1067,10 +1117,26 @@ fn compute_backoff_state(
         prev_next_attempt
     };
 
+    // Populate a triage-actionable reason from the signals we have (the
+    // per-instance error isn't carried in PoolState, so we point operators at
+    // the failing ClusterInstances rather than inventing detail). Previously
+    // this field was only ever carried forward or cleared, so it was always
+    // empty — defeating the status field's purpose.
+    let last_failure_reason = if new_failures > 0 {
+        Some(format!(
+            "{new_failures} instance(s) not reaching Ready (attempted up to index \
+             {new_max_attempted}, highest Ready {new_last_ready_max}); inspect the \
+             Failed/Unhealthy ClusterInstances (kubectl get ci -l \
+             kobe.kunobi.ninja/pool={profile_name}) and their pod logs/events"
+        ))
+    } else {
+        prev_reason
+    };
+
     BackoffState {
         consecutive_failures: new_failures,
         next_attempt_at: next_attempt,
-        last_failure_reason: prev_reason,
+        last_failure_reason,
         max_attempted_index: new_max_attempted,
         last_ready_max_index: new_last_ready_max,
     }
