@@ -346,6 +346,16 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
         .expect("connect error response")
 }
 
+/// Whether a lease's RFC3339 `expires_at` is in the past. A missing or
+/// unparseable timestamp is treated as not-expired (the phase gate still
+/// applies), so this can only tighten access, never loosen it.
+fn lease_is_expired(expires_at: Option<&str>) -> bool {
+    expires_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|expiry| chrono::Utc::now() > expiry)
+        .unwrap_or(false)
+}
+
 fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
 }
@@ -914,6 +924,20 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             StatusCode::CONFLICT,
             format!("Lease is not active (phase {})", status.phase),
         );
+    }
+
+    // Enforce TTL synchronously on the request path. The phase only flips to
+    // Expired on the next ~30s reconcile / 60s reaper sweep, so without this an
+    // expired holder retains full API access during the lag — in a multi-tenant
+    // pool the cluster may already be slated for recycle/handoff.
+    if lease_is_expired(status.expires_at.as_deref()) {
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            expires_at = ?status.expires_at,
+            "Connect proxy rejected expired lease"
+        );
+        return connect_error(StatusCode::GONE, "Lease has expired");
     }
 
     let Some(cluster_name) = status.cluster_name.as_deref() else {
@@ -1560,6 +1584,18 @@ async fn list_pool_leases<B: ClusterBackend>(
                 })
                 .map(|c| {
                     let status = c.status.clone().unwrap_or_default();
+                    // Only disclose the requester identity for the caller's OWN
+                    // leases. A pool can be shared across tenants (the shipped
+                    // GitHub policy grants every repo the `e2e-*` pattern), so
+                    // returning every requester would let any one tenant enumerate
+                    // the others' identities. The pool-utilization view (counts,
+                    // phases, expiries) is preserved; only foreign identities are
+                    // redacted.
+                    let requester = if c.spec.requester.identity == identity.identity {
+                        Some(c.spec.requester.identity.clone())
+                    } else {
+                        None
+                    };
                     LeaseSummary {
                         id: c.name_any(),
                         phase: status.phase.to_string(),
@@ -1568,7 +1604,7 @@ async fn list_pool_leases<B: ClusterBackend>(
                         expires_at: status.expires_at,
                         queue_position: status.queue_position,
                         diagnostics_url: None,
-                        requester: Some(c.spec.requester.identity.clone()),
+                        requester,
                     }
                 })
                 .collect();
@@ -1902,6 +1938,18 @@ mod tests {
     use base64::Engine;
 
     #[test]
+    fn test_lease_is_expired() {
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(lease_is_expired(Some(&past)), "past expiry is expired");
+        assert!(!lease_is_expired(Some(&future)), "future expiry is live");
+        // Missing / unparseable timestamps must not be treated as expired (the
+        // phase gate still applies); fail-safe toward the existing behavior.
+        assert!(!lease_is_expired(None));
+        assert!(!lease_is_expired(Some("not-a-timestamp")));
+    }
+
+    #[test]
     fn test_hash_identity_deterministic() {
         let id = "repo:zondax/kunobi:ref:refs/heads/main";
         let h1 = hash_identity(id);
@@ -2058,7 +2106,8 @@ mod tests {
             "status": {
                 "phase": phase,
                 "clusterName": cluster_name,
-                "expiresAt": "2026-04-13T18:00:00Z",
+                // Future expiry so the connect proxy's TTL gate treats it as live.
+                "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
                 "queuePosition": 0
             }
         })

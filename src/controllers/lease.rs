@@ -517,9 +517,10 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             )
                             .await
                         {
+                            // Don't log the presigned URL (credential-free,
+                            // multi-day link to secret-bearing bundle).
                             error!(
                                 lease = %name,
-                                diagnostics_url = %url,
                                 "Failed to record diagnostics URL on lease status: {e}"
                             );
                         }
