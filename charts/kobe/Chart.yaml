@@ -4,8 +4,8 @@ description: >-
   Kubernetes operator for instant cluster provisioning via warm pools.
   Supports multiple backends: k3s, k0s, CAPI, and kobe-sync.
 type: application
-version: 0.21.2
-appVersion: "0.30.1"
+version: 0.21.3
+appVersion: "0.31.0"
 keywords:
   - kubernetes
   - operator
