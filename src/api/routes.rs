@@ -2525,7 +2525,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};

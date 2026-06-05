@@ -1830,6 +1830,7 @@ mod tests {
         // Unknown age: conservative — don't release.
         assert!(!reservation_grace_elapsed(None, now, grace));
         assert!(!reservation_grace_elapsed(Some("garbage"), now, grace));
+    }
 
     async fn test_instance_context() -> (Arc<InstanceContext<MockBackend>>, MockServer, MockBackend)
     {
