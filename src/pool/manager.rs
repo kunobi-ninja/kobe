@@ -399,6 +399,37 @@ fn resolve_creating_timeout(profile: &crate::crd::ClusterPool) -> chrono::Durati
     }
 }
 
+/// Grace before an *unstamped* (`spec_hash == None`) cluster is treated as
+/// drift-eligible. Covers the brief create→`patch_status` round-trip where a
+/// fresh cluster legitimately has no recorded hash yet (sub-second in practice);
+/// 2 minutes is generous.
+const UNSTAMPED_RECYCLE_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// Whether a cluster entry should recycle for spec drift.
+///
+/// A *stamped* entry drifts when its hash differs from `current_hash`. An
+/// *unstamped* entry (`spec_hash == None`) is a pre-provenance legacy cluster —
+/// kobe < 0.12.2 never persisted the hash, so it can never be drift-detected and
+/// would survive forever as a blind spot. Treat it as drift-eligible once it has
+/// been in its current state longer than [`UNSTAMPED_RECYCLE_GRACE`], so future
+/// upgrades clean it up automatically instead of requiring a manual delete. The
+/// grace prevents a brand-new cluster (whose hash hasn't round-tripped yet) from
+/// self-destructing. (Safe only now that the `spec_hash` field is protected from
+/// Merge-Patch erasure — see #41 part A.)
+fn entry_drift_eligible(
+    spec_hash: Option<&SpecHash>,
+    state_since: Option<chrono::DateTime<chrono::Utc>>,
+    current_hash: &SpecHash,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    match spec_hash {
+        Some(h) => h != current_hash,
+        None => state_since
+            .map(|t| now - t >= UNSTAMPED_RECYCLE_GRACE)
+            .unwrap_or(false),
+    }
+}
+
 pub fn compute_pool_actions(
     profile: &ClusterPool,
     state: &PoolState,
@@ -475,11 +506,12 @@ pub fn compute_pool_actions(
     // === 3. Drifted Creating → Delete immediately (unbounded). ===
     //
     // No surge cost: a Creating instance is not part of `ready_clean`,
-    // so deleting it never violates the floor. Skip entries whose
-    // `spec_hash` is `None` — that's the brief window after
-    // `ensure_cluster_instance` patched the entry's status but before
-    // the patch round-tripped back into our local `PoolState`. Those
-    // count as clean per `count_states`'s convention.
+    // so deleting it never violates the floor. Only a *stamped*, drifted
+    // Creating recycles here; an UNSTAMPED Creating is the brief
+    // create→patch_status round-trip window (the hash hasn't round-tripped
+    // into our local `PoolState` yet) and is governed by the stuck-Creating
+    // timeout (step 5), not the unstamped-legacy rule — which applies to
+    // Ready clusters only.
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Creating
             && !deleting.contains(name)
@@ -508,7 +540,7 @@ pub fn compute_pool_actions(
         .filter(|(name, e)| {
             e.state == ClusterState::Ready
                 && !deleting.contains(*name)
-                && e.spec_hash.as_ref().is_some_and(|h| h != &current_hash)
+                && entry_drift_eligible(e.spec_hash.as_ref(), e.state_since, &current_hash, now)
         })
         .collect();
     drifted_ready.sort_by(|a, b| {
@@ -1715,6 +1747,41 @@ mod tests {
             profile_spec_hash(&profile, &ctx, &bs_a),
             "pool with no bootstraps must not be affected by unrelated entries in the resolved map"
         );
+    }
+
+    #[test]
+    fn entry_drift_eligible_recycles_unstamped_ready_after_grace() {
+        let now = chrono::Utc::now();
+        let current: SpecHash = "current-hash".to_string();
+
+        // Stamped + matching → not eligible.
+        assert!(!entry_drift_eligible(
+            Some(&current),
+            Some(now),
+            &current,
+            now
+        ));
+        // Stamped + differing → eligible (normal drift).
+        let old: SpecHash = "old-hash".to_string();
+        assert!(entry_drift_eligible(Some(&old), Some(now), &current, now));
+        // Unstamped + fresh (within grace) → NOT eligible: this is the
+        // create→patch_status round-trip window, not a legacy cluster.
+        assert!(!entry_drift_eligible(
+            None,
+            Some(now - chrono::Duration::minutes(1)),
+            &current,
+            now,
+        ));
+        // Unstamped + older than the grace → eligible: a pre-provenance legacy
+        // cluster that would otherwise survive forever as a drift blind spot.
+        assert!(entry_drift_eligible(
+            None,
+            Some(now - chrono::Duration::minutes(5)),
+            &current,
+            now,
+        ));
+        // Unstamped + no timestamp → not eligible (can't establish age).
+        assert!(!entry_drift_eligible(None, None, &current, now));
     }
 
     #[test]
