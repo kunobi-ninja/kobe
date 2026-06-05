@@ -23,7 +23,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
 use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PropagationPolicy};
-use sqlx::PgPool;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -122,10 +121,9 @@ fn render_registries_yaml(mirrors: &BTreeMap<String, Vec<String>>) -> Option<Str
 pub struct K3sBackend {
     /// Kubernetes client for the host cluster.
     client: Client,
-    /// Optional PostgreSQL connection pool for shared datastore.
-    pg_pool: Option<PgPool>,
-    /// Base PostgreSQL connection URL (before per-cluster DB rewriting).
-    pg_base_url: Option<String>,
+    /// Optional shared PostgreSQL datastore (pool + base URL), hot-reloadable
+    /// when the credential rotates.
+    datastore: crate::backend::datastore::SharedDatastore,
 }
 
 /// Build the (VolumeMount, EnvVar) pair for the shared kubelet mount.
@@ -181,12 +179,8 @@ fn kubelet_shared_mount_volume(
 }
 
 impl K3sBackend {
-    pub fn new(client: Client, pg_pool: Option<PgPool>, pg_base_url: Option<String>) -> Self {
-        Self {
-            client,
-            pg_pool,
-            pg_base_url,
-        }
+    pub fn new(client: Client, datastore: crate::backend::datastore::SharedDatastore) -> Self {
+        Self { client, datastore }
     }
 
     /// Build a kube Client targeting the virtual cluster's API server.
@@ -1077,15 +1071,15 @@ impl ClusterBackend for K3sBackend {
         self.create_registries_configmap(name, namespace, config)
             .await?;
 
-        // 3. If PostgreSQL configured, create per-cluster database
-        let datastore_endpoint =
-            if let (Some(pool), Some(base_url)) = (&self.pg_pool, &self.pg_base_url) {
-                datastore::create_database(pool, name, "k3s_").await?;
-                let endpoint = datastore::cluster_endpoint(base_url, name, "k3s_")?;
-                Some(endpoint)
-            } else {
-                None
-            };
+        // 3. If PostgreSQL configured, create per-cluster database. Read the
+        // current connection each time so a rotated credential is picked up.
+        let datastore_endpoint = if let Some((pool, base_url)) = self.datastore.current() {
+            datastore::create_database(&pool, name, "k3s_").await?;
+            let endpoint = datastore::cluster_endpoint(&base_url, name, "k3s_")?;
+            Some(endpoint)
+        } else {
+            None
+        };
 
         // 4. Create server StatefulSet
         let sts =
@@ -1178,8 +1172,8 @@ impl ClusterBackend for K3sBackend {
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-kubeconfig")).await?;
 
         // Drop database if PostgreSQL is configured
-        if let Some(pool) = &self.pg_pool
-            && let Err(e) = datastore::drop_database(pool, name, "k3s_").await
+        if let Some((pool, _)) = self.datastore.current()
+            && let Err(e) = datastore::drop_database(&pool, name, "k3s_").await
         {
             warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
         }
@@ -1926,7 +1920,7 @@ mod tests {
     async fn test_create_cluster_basic() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = K3sBackend::new(client, None, None);
+        let backend = K3sBackend::new(client, Default::default());
 
         // Mock: PATCH token secret (server-side apply)
         Mock::given(method("PATCH"))
@@ -2005,7 +1999,7 @@ mod tests {
     async fn test_delete_cluster_basic() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = K3sBackend::new(client, None, None);
+        let backend = K3sBackend::new(client, Default::default());
 
         // Mock: DELETE agent deployment (404 — doesn't exist, that's fine)
         Mock::given(method("DELETE"))
@@ -2092,7 +2086,7 @@ mod tests {
     async fn test_delete_cluster_issues_every_expected_delete() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = K3sBackend::new(client, None, None);
+        let backend = K3sBackend::new(client, Default::default());
 
         let expected_paths: &[(&str, &str)] = &[
             (
@@ -2160,7 +2154,7 @@ mod tests {
     async fn test_delete_is_idempotent_when_all_resources_missing() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = K3sBackend::new(client, None, None);
+        let backend = K3sBackend::new(client, Default::default());
 
         // Catch-all 404 for every DELETE the backend will issue.
         Mock::given(method("DELETE"))
@@ -2182,7 +2176,7 @@ mod tests {
     async fn test_check_health_not_ready() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
-        let backend = K3sBackend::new(client, None, None);
+        let backend = K3sBackend::new(client, Default::default());
 
         Mock::given(method("GET"))
             .and(path(

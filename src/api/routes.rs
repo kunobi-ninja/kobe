@@ -37,9 +37,9 @@ pub struct AppState<B: ClusterBackend> {
     pub namespace: String,
     pub backend: B,
     pub factory: Option<BackendFactory>,
-    /// Shared PostgreSQL pool when one is configured; `None` in
+    /// Shared PostgreSQL datastore when one is configured; empty in
     /// embedded-datastore mode. Consulted by the `/readyz` probe.
-    pub pg_pool: Option<sqlx::PgPool>,
+    pub datastore: crate::backend::datastore::SharedDatastore,
 }
 
 /// Implement kunobi-auth's AuthnProvider so that RequiredAuth/OptionalAuth extractors work.
@@ -1774,10 +1774,10 @@ async fn readyz<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response
         failures.push(format!("kubernetes: {e}"));
     }
 
-    // PostgreSQL — only when a pool is configured. In embedded-datastore
-    // mode `pg_pool` is `None` and there is nothing to check.
-    if let Some(pool) = &state.pg_pool
-        && let Err(e) = readyz_check_postgres(pool).await
+    // PostgreSQL — only when a datastore is configured. In embedded-datastore
+    // mode there is nothing to check.
+    if let Some((pool, _)) = state.datastore.current()
+        && let Err(e) = readyz_check_postgres(&pool).await
     {
         failures.push(format!("postgres: {e}"));
     }
@@ -2127,7 +2127,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         (build_router(state), server)
@@ -2320,7 +2320,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -2393,7 +2393,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -2462,7 +2462,7 @@ mod tests {
             namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
-            pg_pool: None,
+            datastore: Default::default(),
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(

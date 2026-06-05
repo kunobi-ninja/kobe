@@ -1082,10 +1082,10 @@ fn backend_dispatch_for_config<B: ClusterBackend + Clone>(
     } else {
         match config.backend.backend_type {
             crate::crd::BackendType::K3s => Ok(crate::backend::BackendDispatch::K3s(
-                crate::backend::K3sBackend::new(ctx.client.clone(), None, None),
+                crate::backend::K3sBackend::new(ctx.client.clone(), Default::default()),
             )),
             crate::crd::BackendType::K0s => Ok(crate::backend::BackendDispatch::K0s(
-                crate::backend::K0sBackend::new(ctx.client.clone(), None, None),
+                crate::backend::K0sBackend::new(ctx.client.clone(), Default::default()),
             )),
             crate::crd::BackendType::Capi => {
                 let capi = config

@@ -56,31 +56,12 @@ async fn main() -> anyhow::Result<()> {
     info!("Available backends: k3s, k0s, vkobe, capi");
 
     // Optional shared PostgreSQL datastore for k3s and k0s backends.
-    let pg_base_url = std::env::var("POSTGRES_URL").ok();
-    let pg_pool = if let Some(ref url) = pg_base_url {
-        match sqlx::PgPool::connect(url).await {
-            Ok(pool) => {
-                info!("PostgreSQL connected — golden templates enabled");
-                Some(pool)
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to connect to PostgreSQL, backends will use embedded datastore"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // `POSTGRES_URL_DIR` (a mounted Secret) enables credential hot-reload on
+    // rotation; `POSTGRES_URL` is the static legacy path. See SharedDatastore.
+    let datastore = crate::backend::datastore::SharedDatastore::from_env().await;
 
-    let factory = BackendFactory::new(client.clone(), pg_pool.clone(), pg_base_url.clone());
-    let backend = BackendDispatch::K3s(K3sBackend::new(
-        client.clone(),
-        pg_pool.clone(),
-        pg_base_url,
-    ));
+    let factory = BackendFactory::new(client.clone(), datastore.clone());
+    let backend = BackendDispatch::K3s(K3sBackend::new(client.clone(), datastore.clone()));
     let shutdown = CancellationToken::new();
     let pools = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let ssh_namespace =
@@ -94,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         namespace: namespace.clone(),
         backend: backend.clone(),
         factory: Some(factory.clone()),
-        pg_pool,
+        datastore: datastore.clone(),
     };
 
     let app = build_router(state);
