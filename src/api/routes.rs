@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use futures::TryStreamExt;
-use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST};
+use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
@@ -429,6 +429,31 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+/// True if these request headers negotiate an HTTP Upgrade (RFC 7230 §6.7):
+/// a `Connection: upgrade` token (case-insensitive list) *and* an `Upgrade`
+/// header. kubectl exec / attach / port-forward use this to switch to SPDY or
+/// websocket — which the buffered connect proxy cannot tunnel (see #85).
+fn headers_request_upgrade(headers: &HeaderMap) -> bool {
+    if !headers.contains_key(UPGRADE) {
+        return false;
+    }
+    headers
+        .get(CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// The requested upgrade protocol token (e.g. `spdy/3.1`, `websocket`),
+/// lowercased. None if the `Upgrade` header is absent or invalid UTF-8.
+fn requested_upgrade_protocol(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn should_skip_request_header(name: &HeaderName) -> bool {
@@ -1073,6 +1098,37 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             return connect_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
         }
     };
+
+    // Streaming subprotocols (exec / attach / port-forward) negotiate an HTTP
+    // Upgrade (SPDY or websocket). This proxy is a buffered request/response
+    // reverse proxy — it cannot carry the 101 + hijacked socket through (it
+    // even strips the hop-by-hop `Upgrade` header, see should_skip_response_header),
+    // so forwarding such a request yields an opaque "Bad Request" at the client.
+    // Fail fast with an explicit, greppable error naming the protocol instead of
+    // letting consumers chase a phantom cert/auth bug. Full upgrade tunneling is
+    // tracked in #85.
+    if headers_request_upgrade(&headers) {
+        let protocol =
+            requested_upgrade_protocol(&headers).unwrap_or_else(|| "unknown".to_string());
+        warn!(
+            request_id = %request_id,
+            lease_id = %lease_id,
+            cluster = %cluster_name,
+            method = %method,
+            path = %request_path,
+            protocol = %protocol,
+            "Connect proxy rejected HTTP upgrade (exec/attach/port-forward not supported)"
+        );
+        return connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "Streaming subprotocols (exec, attach, port-forward) are not supported \
+                 through the connect proxy: it cannot tunnel the HTTP upgrade to \
+                 '{protocol}'. Use the lease's direct kubeconfig for those operations. \
+                 Tracking: https://github.com/kunobi-ninja/kobe/issues/85"
+            ),
+        );
+    }
 
     info!(
         request_id = %request_id,
@@ -2345,6 +2401,90 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
+    }
+
+    // #85: exec/attach/port-forward negotiate an HTTP upgrade the buffered proxy
+    // cannot tunnel. It must fail fast with an explicit 501 (naming the protocol)
+    // rather than forwarding into an opaque "Bad Request".
+    #[tokio::test]
+    async fn test_connect_proxy_rejects_http_upgrade_with_clear_error() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        backend.set_kubeconfig(&format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
+            server.uri()
+        ));
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+            factory: None,
+            pg_pool: None,
+        };
+
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "lease-abc",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+
+        // A SPDY exec request: Connection: Upgrade + Upgrade: SPDY/3.1.
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer lease-token".parse().unwrap());
+        headers.insert(CONNECTION, "Upgrade".parse().unwrap());
+        headers.insert(UPGRADE, "SPDY/3.1".parse().unwrap());
+
+        let response = connect_proxy::<crate::testutil::MockBackend>(
+            State(state),
+            Path((
+                "lease-abc".to_string(),
+                "api/v1/namespaces/default/pods/foo/exec".to_string(),
+            )),
+            Method::GET,
+            headers,
+            RawQuery(None),
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("exec"),
+            "error should name the subprotocols: {body}"
+        );
+        assert!(
+            body.contains("spdy/3.1"),
+            "error should echo the requested protocol: {body}"
+        );
+        assert!(
+            body.contains("issues/85"),
+            "error should point to the tracking issue: {body}"
+        );
     }
 
     #[tokio::test]
