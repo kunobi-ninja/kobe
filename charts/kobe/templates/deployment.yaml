@@ -65,7 +65,10 @@ spec:
               value: {{ .Values.poolPublisherServiceAccount | default (printf "%s-pool-publisher" (include "kobe.fullname" .)) | quote }}
             - name: KUBECONFIG_PUBLISHER_IMAGE
               value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
-            {{- if .Values.postgres.url }}
+            {{- if .Values.postgres.urlSecret.name }}
+            - name: POSTGRES_URL_DIR
+              value: {{ .Values.postgres.urlSecret.mountPath | quote }}
+            {{- else if .Values.postgres.url }}
             - name: POSTGRES_URL
               value: {{ .Values.postgres.url | quote }}
             {{- end }}
@@ -88,12 +91,27 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.postgres.urlSecret.name }}
+            - name: postgres-url
+              mountPath: {{ .Values.postgres.urlSecret.mountPath | quote }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        {{- if .Values.postgres.urlSecret.name }}
+        # Connection URL projected to a `url` file so kunobi-reload (POSTGRES_URL_DIR)
+        # picks up a credential rotation without a pod restart.
+        - name: postgres-url
+          secret:
+            secretName: {{ .Values.postgres.urlSecret.name | quote }}
+            items:
+              - key: {{ .Values.postgres.urlSecret.key | quote }}
+                path: url
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

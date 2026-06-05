@@ -17,7 +17,17 @@ operatorNamespace: "kunobi-pool"
 
 # Optional PostgreSQL connection for direct-k3s/k0s backends
 postgres:
+  # Static connection URL, injected as the POSTGRES_URL env var. Frozen at pod
+  # start — a Postgres password rotation requires an operator restart to pick up.
   url: ""
+  # Preferred: mount a Secret holding the connection URL and hot-reload it when
+  # the credential rotates, without restarting the operator (issue #91). Takes
+  # precedence over `url`. The operator watches `mountPath` (POSTGRES_URL_DIR)
+  # and reads the URL from a `url` file projected from `key`.
+  urlSecret:
+    name: ""               # Secret containing the connection URL (empty = disabled)
+    key: "connection-url"  # key in that Secret holding the URL
+    mountPath: "/etc/kobe/postgres"
 
 # kobe-sync sidecar image (used when operator creates virtual clusters)
 kobeSync:

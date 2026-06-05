@@ -323,8 +323,7 @@ async fn reconcile_profile(
             } else {
                 crate::backend::BackendDispatch::K3s(crate::backend::K3sBackend::new(
                     ctx.client.clone(),
-                    None,
-                    None,
+                    Default::default(),
                 ))
             };
             let client = ctx.client.clone();
