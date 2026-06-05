@@ -213,12 +213,21 @@ pub(crate) async fn tunnel_upgrade(
         );
     }
 
-    // 8. We got 101. Mirror the backend-chosen Upgrade / Sec-WebSocket-Protocol
-    //    so the client negotiates with the backend's chosen protocol.
+    // 8. We got 101. Mirror the backend-chosen upgrade-response headers so the
+    //    client completes the handshake against the backend's negotiation.
     let upstream_upgrade_header = upstream_resp.headers().get(UPGRADE).cloned();
     let upstream_ws_protocol = upstream_resp
         .headers()
         .get("sec-websocket-protocol")
+        .cloned();
+    // Sec-WebSocket-Accept is computed by the apiserver from the client's
+    // Sec-WebSocket-Key (which we forwarded), so kubectl's websocket client
+    // REQUIRES it back or it rejects the handshake right after the 101. (SPDY
+    // has no such header — these are simply absent there.)
+    let upstream_ws_accept = upstream_resp.headers().get("sec-websocket-accept").cloned();
+    let upstream_ws_extensions = upstream_resp
+        .headers()
+        .get("sec-websocket-extensions")
         .cloned();
 
     let upstream_on_upgrade = hyper::upgrade::on(&mut upstream_resp);
@@ -246,6 +255,12 @@ pub(crate) async fn tunnel_upgrade(
     }
     if let Some(v) = upstream_ws_protocol {
         builder = builder.header("sec-websocket-protocol", v);
+    }
+    if let Some(v) = upstream_ws_accept {
+        builder = builder.header("sec-websocket-accept", v);
+    }
+    if let Some(v) = upstream_ws_extensions {
+        builder = builder.header("sec-websocket-extensions", v);
     }
     match builder.body(Body::empty()) {
         Ok(resp) => resp,
