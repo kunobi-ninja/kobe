@@ -4,7 +4,7 @@ use std::time::Instant;
 use anyhow::Context;
 use axum::body::{self, Body};
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post};
@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
 use crate::api::connect::{
-    backend_access_from_kubeconfig, build_connect_kubeconfig, ensure_lease_connect_token,
-    validate_lease_connect_token,
+    backend_access_from_kubeconfig, build_backend_tls_config, build_connect_kubeconfig,
+    ensure_lease_connect_token, validate_lease_connect_token,
 };
 use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
@@ -531,6 +531,33 @@ fn should_skip_response_header(name: &HeaderName) -> bool {
     )
 }
 
+/// Derive the upstream request path+query (everything after the backend
+/// authority) for the upgrade tunnel, which addresses the apiserver by
+/// path-and-query rather than a full URL.
+///
+/// Prefers parsing the already-built `request_url` (so it inherits any base
+/// path on the backend server URL). Falls back to reconstructing from the
+/// proxied path + raw query if the URL can't be parsed.
+fn upstream_path_and_query(
+    request_url: &str,
+    request_path: &str,
+    raw_query: &Option<String>,
+) -> String {
+    if let Ok(url) = url::Url::parse(request_url) {
+        let mut pq = url.path().to_string();
+        if let Some(q) = url.query() {
+            pq.push('?');
+            pq.push_str(q);
+        }
+        return pq;
+    }
+    // Fallback: request_path already starts with '/'.
+    match raw_query {
+        Some(q) if !q.is_empty() => format!("{request_path}?{q}"),
+        _ => request_path.to_string(),
+    }
+}
+
 fn backend_request_url(
     base_server: &str,
     proxied_path: &str,
@@ -971,35 +998,34 @@ async fn get_lease<B: ClusterBackend>(
 async fn connect_proxy_root<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     Path(id): Path<String>,
-    method: Method,
-    headers: HeaderMap,
-    raw_query: RawQuery,
-    body: Body,
+    request: axum::extract::Request,
 ) -> Response {
-    connect_proxy_inner(state, id, String::new(), method, headers, raw_query, body).await
+    connect_proxy_inner(state, id, String::new(), request).await
 }
 
 #[tracing::instrument(skip_all)]
 async fn connect_proxy<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     Path((id, path)): Path<(String, String)>,
-    method: Method,
-    headers: HeaderMap,
-    raw_query: RawQuery,
-    body: Body,
+    request: axum::extract::Request,
 ) -> Response {
-    connect_proxy_inner(state, id, path, method, headers, raw_query, body).await
+    connect_proxy_inner(state, id, path, request).await
 }
 
 async fn connect_proxy_inner<B: ClusterBackend>(
     state: AppState<B>,
     lease_id: String,
     path: String,
-    method: Method,
-    headers: HeaderMap,
-    raw_query: RawQuery,
-    body: Body,
+    request: axum::extract::Request,
 ) -> Response {
+    // Decompose the raw request: method / headers / query are needed by both
+    // the buffered and the upgrade path. The body / OnUpgrade live in
+    // `request`, which we keep intact and hand to `tunnel_upgrade` for the
+    // streaming case (it needs `hyper::upgrade::on(&mut request)`).
+    let method = request.method().clone();
+    let headers = request.headers().clone();
+    let raw_query = RawQuery(request.uri().query().map(str::to_string));
+
     let request_id = request_id_from_headers(&headers).unwrap_or("-");
     let request_path = if path.is_empty() {
         "/".to_string()
@@ -1283,34 +1309,46 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     };
 
     // Streaming subprotocols (exec / attach / port-forward) negotiate an HTTP
-    // Upgrade (SPDY or websocket). This proxy is a buffered request/response
-    // reverse proxy — it cannot carry the 101 + hijacked socket through (it
-    // even strips the hop-by-hop `Upgrade` header, see should_skip_response_header),
-    // so forwarding such a request yields an opaque "Bad Request" at the client.
-    // Fail fast with an explicit, greppable error naming the protocol instead of
-    // letting consumers chase a phantom cert/auth bug. Full upgrade tunneling is
-    // tracked in #85.
+    // Upgrade (SPDY or websocket). The buffered reqwest path below cannot carry
+    // the 101 + hijacked socket through, so these are handled by a dedicated
+    // tunnel that drives a raw hyper client over the backend TLS config and
+    // splices the upgraded sockets (see api::upgrade). All lease validation has
+    // already run above; from here we just need the backend's rustls config.
     if headers_request_upgrade(&headers) {
         let protocol =
             requested_upgrade_protocol(&headers).unwrap_or_else(|| "unknown".to_string());
-        warn!(
+        let upgrade_access = match build_backend_tls_config(&raw_kubeconfig) {
+            Ok(access) => access,
+            Err(err) => {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    cluster = %cluster_name,
+                    error = %err,
+                    "Connect proxy failed to build backend TLS config for upgrade"
+                );
+                return connect_infra_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to build backend TLS config",
+                    &err,
+                );
+            }
+        };
+        // The upstream path is everything after the backend authority — i.e.
+        // the already-resolved `request_url` minus its scheme+authority.
+        let path_and_query = upstream_path_and_query(&request_url, &request_path, &raw_query.0);
+        info!(
             request_id = %request_id,
             lease_id = %lease_id,
             cluster = %cluster_name,
+            backend = %chosen_backend,
+            upstream = %upgrade_access.server,
             method = %method,
             path = %request_path,
             protocol = %protocol,
-            "Connect proxy rejected HTTP upgrade (exec/attach/port-forward not supported)"
+            "Connect proxy tunneling HTTP upgrade (exec/attach/port-forward)"
         );
-        return connect_error(
-            StatusCode::NOT_IMPLEMENTED,
-            format!(
-                "Streaming subprotocols (exec, attach, port-forward) are not supported \
-                 through the connect proxy: it cannot tunnel the HTTP upgrade to \
-                 '{protocol}'. Use the lease's direct kubeconfig for those operations. \
-                 Tracking: https://github.com/kunobi-ninja/kobe/issues/85"
-            ),
-        );
+        return crate::api::upgrade::tunnel_upgrade(request, upgrade_access, &path_and_query).await;
     }
 
     info!(
@@ -1326,6 +1364,9 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         "Connect proxy forwarding request upstream"
     );
 
+    // Non-upgrade path: consume the body. `request` is still owned here (the
+    // upgrade branch above returns early, taking ownership for the tunnel).
+    let body = request.into_body();
     let body_bytes = match body::to_bytes(body, CONNECT_PROXY_MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -2225,6 +2266,7 @@ fn hash_identity(identity: &str) -> String {
 mod tests {
     use super::*;
 
+    use axum::http::Method;
     use base64::Engine;
 
     #[test]
@@ -2479,6 +2521,28 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// Build a raw `axum::extract::Request` for the connect-proxy handlers,
+    /// which now take the whole request (so they can hand it to the upgrade
+    /// tunnel). The URI here is irrelevant to the handler — it reads the path
+    /// from the `Path` extractor and the query from the request URI — but we
+    /// set the query so the buffered/upgrade paths see it.
+    fn connect_request(
+        method: Method,
+        headers: HeaderMap,
+        query: Option<&str>,
+        body: Body,
+    ) -> axum::extract::Request {
+        let uri = match query {
+            Some(q) => format!("/?{q}"),
+            None => "/".to_string(),
+        };
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        for (name, value) in &headers {
+            builder = builder.header(name, value);
+        }
+        builder.body(body).unwrap()
+    }
+
     #[tokio::test]
     async fn test_healthz_returns_200() {
         // Back-compat alias — still serves liveness unconditionally.
@@ -2722,10 +2786,7 @@ mod tests {
         let response = connect_proxy::<crate::testutil::MockBackend>(
             State(state),
             Path(("lease-abc".to_string(), "version".to_string())),
-            Method::GET,
-            headers,
-            RawQuery(None),
-            Body::empty(),
+            connect_request(Method::GET, headers, None, Body::empty()),
         )
         .await;
 
@@ -2733,11 +2794,15 @@ mod tests {
         assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
     }
 
-    // #85: exec/attach/port-forward negotiate an HTTP upgrade the buffered proxy
-    // cannot tunnel. It must fail fast with an explicit 501 (naming the protocol)
-    // rather than forwarding into an opaque "Bad Request".
+    // #85: exec/attach/port-forward negotiate an HTTP upgrade. The connect proxy
+    // now TUNNELS these (no longer a 501) by driving a raw hyper client over the
+    // backend TLS config. This test exercises the dispatch: lease validation
+    // passes, the upgrade branch is taken, and the tunnel is attempted. The
+    // wiremock backend speaks plain HTTP (no TLS, no 101), so the tunnel can't
+    // complete — we assert it is NOT the old 501 and that the error body is
+    // generic (no raw upstream / infra leak), per the redaction policy.
     #[tokio::test]
-    async fn test_connect_proxy_rejects_http_upgrade_with_clear_error() {
+    async fn test_connect_proxy_tunnels_http_upgrade_instead_of_501() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
@@ -2794,26 +2859,24 @@ mod tests {
                 "lease-abc".to_string(),
                 "api/v1/namespaces/default/pods/foo/exec".to_string(),
             )),
-            Method::GET,
-            headers,
-            RawQuery(None),
-            Body::empty(),
+            connect_request(Method::GET, headers, None, Body::empty()),
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        // The upgrade branch was taken (validation passed, tunnel attempted).
+        // It is no longer the old 501 NOT_IMPLEMENTED guard.
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "upgrade requests should be tunneled, not rejected with 501"
+        );
+        // wiremock can't complete a TLS upgrade -> generic gateway error.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = response_text(response).await;
+        // Body must be a short generic message, never a raw upstream/infra leak.
         assert!(
-            body.contains("exec"),
-            "error should name the subprotocols: {body}"
-        );
-        assert!(
-            body.contains("spdy/3.1"),
-            "error should echo the requested protocol: {body}"
-        );
-        assert!(
-            body.contains("issues/85"),
-            "error should point to the tracking issue: {body}"
+            !body.contains("127.0.0.1") && !body.contains(&server.uri()),
+            "upgrade error body must not leak backend address: {body}"
         );
     }
 
@@ -2836,10 +2899,7 @@ mod tests {
         let response = connect_proxy::<crate::testutil::MockBackend>(
             State(state),
             Path(("lease-abc".to_string(), "version".to_string())),
-            Method::GET,
-            HeaderMap::new(),
-            RawQuery(None),
-            Body::empty(),
+            connect_request(Method::GET, HeaderMap::new(), None, Body::empty()),
         )
         .await;
 
