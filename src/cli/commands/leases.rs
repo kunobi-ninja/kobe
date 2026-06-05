@@ -20,6 +20,9 @@ pub(crate) struct LeaseSummary {
     pub requester: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kubeconfig_path: Option<String>,
+    /// Caller-supplied alias (#107 P2), selectable interchangeably with the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +57,28 @@ pub(crate) async fn fetch_leases_path(
     }
 
     Ok(response.json().await?)
+}
+
+/// A lease is terminal once it no longer refers to a live/pending cluster.
+pub(crate) fn is_terminal_phase(phase: &str) -> bool {
+    matches!(
+        phase.to_ascii_lowercase().as_str(),
+        "released" | "expired" | "recycling"
+    )
+}
+
+/// Find the caller's single ACTIVE lease carrying `alias`, if any (#107 P3).
+/// Lists the caller's leases (server already scopes to identity) and filters
+/// client-side, so it shares the proven `/v1/leases` request path.
+pub(crate) async fn find_active_lease_by_alias(
+    config: &ResolvedConfig,
+    alias: &str,
+) -> Result<Option<LeaseSummary>> {
+    let found = fetch_leases_path(config, "/v1/leases")
+        .await?
+        .into_iter()
+        .find(|l| l.alias.as_deref() == Some(alias) && !is_terminal_phase(&l.phase));
+    Ok(found)
 }
 
 pub(crate) async fn fetch_lease(config: &ResolvedConfig, lease_id: &str) -> Result<LeaseDetail> {

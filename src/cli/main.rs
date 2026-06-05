@@ -65,6 +65,33 @@ enum Commands {
         /// Write kubeconfig to this path (default: ~/.kube/kobe-{pool}-{short-lease}.yaml)
         #[arg(long = "kubeconfig", value_name = "PATH")]
         kubeconfig: Option<String>,
+        /// Name this lease (#107 P2). Unique among your active leases, so you can
+        /// reference it by name later: `kobe extend pr-106 30m`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Idempotent (#107 P3): with --name, reuse the existing active lease of
+        /// that name (extending its TTL) instead of failing on the duplicate —
+        /// "lease again means renew". Safe to call unconditionally at job start.
+        #[arg(long, requires = "name")]
+        ensure: bool,
+        /// Heartbeat-extend the lease until interrupted (#107 P3). Re-extends by
+        /// `--ttl` at half-TTL intervals until Ctrl-C or the server ceiling.
+        #[arg(long, conflicts_with = "no_wait")]
+        keepalive: bool,
+    },
+    /// Run a command while holding a lease, auto-releasing on exit (#107 P3).
+    ///
+    /// Creates a lease, heartbeat-extends it for the command's lifetime, then
+    /// releases it (even on failure/signal). `kobe with-lease --ttl 1h -- kubectl get pods`.
+    WithLease {
+        /// Pool name (e.g. ci-small)
+        pool: Option<String>,
+        /// Lease TTL / heartbeat window
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// Command to run (after `--`), with the lease kubeconfig in KUBECONFIG.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
     },
     /// Extend the TTL of an active lease
     ///
@@ -183,6 +210,9 @@ async fn main() -> anyhow::Result<()> {
             no_wait,
             wait_timeout,
             kubeconfig,
+            name,
+            ensure,
+            keepalive,
         } => {
             commands::lease_create(commands::LeaseCreateCommand {
                 pool: pool.as_deref(),
@@ -190,6 +220,20 @@ async fn main() -> anyhow::Result<()> {
                 no_wait,
                 wait_timeout: wait_timeout.as_deref(),
                 kubeconfig_path: kubeconfig.as_deref(),
+                name: name.as_deref(),
+                ensure,
+                keepalive,
+                target_override: target,
+                endpoint_override: endpoint,
+                output,
+            })
+            .await
+        }
+        Commands::WithLease { pool, ttl, cmd } => {
+            commands::with_lease(commands::WithLeaseCommand {
+                pool: pool.as_deref(),
+                ttl: &ttl,
+                cmd: &cmd,
                 target_override: target,
                 endpoint_override: endpoint,
                 output,

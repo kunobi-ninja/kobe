@@ -55,15 +55,23 @@ fn select(
         if let Some(lease) = active.iter().find(|lease| lease.id == target) {
             return Ok(Selection::Resolved(lease.id.clone()));
         }
+        // #107 P2: an alias names exactly one active lease (server-enforced),
+        // so it resolves directly — `kobe extend pr-106 30m`.
+        if let Some(lease) = active
+            .iter()
+            .find(|lease| lease.alias.as_deref() == Some(target))
+        {
+            return Ok(Selection::Resolved(lease.id.clone()));
+        }
         let by_pool: Vec<&LeaseSummary> = active
             .iter()
             .filter(|lease| lease.profile == target)
             .collect();
         return match by_pool.as_slice() {
             [only] => Ok(Selection::Resolved(only.id.clone())),
-            [] => anyhow::bail!("No active lease matching '{target}' (by id or pool)"),
+            [] => anyhow::bail!("No active lease matching '{target}' (by id, alias, or pool)"),
             many => anyhow::bail!(
-                "'{target}' matches {} active leases by pool: {}. Specify a lease id.",
+                "'{target}' matches {} active leases by pool: {}. Specify a lease id or alias.",
                 many.len(),
                 join_ids(many.iter().copied()),
             ),
@@ -163,6 +171,7 @@ mod tests {
             queue_position: 0,
             requester: None,
             kubeconfig_path: None,
+            alias: None,
         }
     }
 
@@ -197,6 +206,40 @@ mod tests {
         ];
         let sel = select(active, Some("p2"), OutputFormat::Text, OnAmbiguous::Reject).unwrap();
         assert_eq!(resolved(sel), "lease-bbb");
+    }
+
+    #[test]
+    fn alias_match_resolves() {
+        // #107 P2: an alias selects its lease even though it's neither the id
+        // nor the pool name — `kobe extend pr-106`.
+        let mut tagged = lease("lease-aaa", "p1", "Bound");
+        tagged.alias = Some("pr-106".to_string());
+        let active = vec![tagged, lease("lease-bbb", "p2", "Bound")];
+        let sel = select(
+            active,
+            Some("pr-106"),
+            OutputFormat::Text,
+            OnAmbiguous::Reject,
+        )
+        .unwrap();
+        assert_eq!(resolved(sel), "lease-aaa");
+    }
+
+    #[test]
+    fn id_wins_over_alias_collision() {
+        // An exact id resolves even when another lease's alias equals that id —
+        // id is checked before alias.
+        let mut decoy = lease("lease-bbb", "p2", "Bound");
+        decoy.alias = Some("lease-aaa".to_string());
+        let active = vec![lease("lease-aaa", "p1", "Bound"), decoy];
+        let sel = select(
+            active,
+            Some("lease-aaa"),
+            OutputFormat::Text,
+            OnAmbiguous::Reject,
+        )
+        .unwrap();
+        assert_eq!(resolved(sel), "lease-aaa");
     }
 
     #[test]

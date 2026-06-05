@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::config::CliConfig;
+use super::extend::extend_lease;
 use super::leases::LeaseDetail;
 use super::picker::{PickerItem, run_picker};
 use super::pools::fetch_pools_for_config;
@@ -17,20 +18,26 @@ pub struct LeaseCreateCommand<'a> {
     pub no_wait: bool,
     pub wait_timeout: Option<&'a str>,
     pub kubeconfig_path: Option<&'a str>,
+    /// #107 P2: optional alias for the lease.
+    pub name: Option<&'a str>,
+    /// #107 P3: with `name`, reuse+extend an existing active lease of that name.
+    pub ensure: bool,
+    /// #107 P3: heartbeat-extend the lease until interrupted.
+    pub keepalive: bool,
     pub target_override: Option<&'a str>,
     pub endpoint_override: Option<&'a str>,
     pub output: OutputFormat,
 }
 
 #[derive(Deserialize)]
-struct LeaseAcceptedResponse {
-    id: String,
+pub(crate) struct LeaseAcceptedResponse {
+    pub(crate) id: String,
     phase: String,
-    profile: String,
+    pub(crate) profile: String,
     #[serde(default)]
     queue_position: u32,
     #[serde(default)]
-    effective_ttl: Option<String>,
+    pub(crate) effective_ttl: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -48,22 +55,25 @@ struct LeaseCreateOutput {
     kubeconfig_path: Option<String>,
 }
 
-pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
-    let config = CliConfig::load()?;
-    let config = config.resolve(command.target_override, command.endpoint_override)?;
+/// POST `/v1/leases` and return the accepted (Pending) lease. Shared by the
+/// `lease` command and `with-lease` (#107 P3). `alias` becomes the lease's
+/// `kobe.kunobi.ninja/alias` label server-side.
+pub(crate) async fn create_lease_request(
+    config: &super::config::ResolvedConfig,
+    pool: &str,
+    ttl: &str,
+    alias: Option<&str>,
+) -> Result<LeaseAcceptedResponse> {
     let endpoint = config.endpoint.as_str();
-    let pool = match command.pool {
-        Some(pool) => pool.to_string(),
-        None => select_pool_for_lease(&config, command.output).await?,
-    };
     let body_json = serde_json::json!({
         "profile": pool,
-        "ttl": command.ttl,
+        "ttl": ttl,
+        "alias": alias,
     });
     let body_bytes = serde_json::to_vec(&body_json)?;
     // Body signing not yet supported server-side (extractor doesn't have body access).
     // Sign with empty body for now.
-    let token = get_auth_header(&config, "POST", "/v1/leases", b"").await?;
+    let token = get_auth_header(config, "POST", "/v1/leases", b"").await?;
 
     let client = authed_client();
     let response = with_auth(client.post(format!("{endpoint}/v1/leases")), &token)
@@ -82,20 +92,50 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
         anyhow::bail!("Failed to lease cluster (HTTP {status}): {msg}");
     }
 
-    let accepted: LeaseAcceptedResponse = response.json().await?;
+    Ok(response.json().await?)
+}
 
-    if command.no_wait {
-        return emit_pending_output(&accepted, command.output);
-    }
+pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
+    let config = CliConfig::load()?;
+    let config = config.resolve(command.target_override, command.endpoint_override)?;
 
-    if command.output == OutputFormat::Text {
-        eprintln!("Waiting for lease {} to become ready...", accepted.id);
+    // Determine which lease to operate on: an existing active one (#107 P3
+    // `--ensure` idempotent renew), else a fresh create.
+    let (lease_id, profile, effective_ttl, renewed) = match ensure_existing(&config, &command)
+        .await?
+    {
+        Some((id, profile)) => {
+            // Reuse + extend instead of failing the duplicate alias.
+            let expires = extend_lease(&config, &id, command.ttl).await?;
+            if command.output == OutputFormat::Text {
+                eprintln!(
+                    "Lease '{}' already active as {id} — renewed (expires {expires})",
+                    command.name.unwrap_or_default()
+                );
+            }
+            (id, profile, None, true)
+        }
+        None => {
+            let pool = match command.pool {
+                Some(pool) => pool.to_string(),
+                None => select_pool_for_lease(&config, command.output).await?,
+            };
+            let accepted = create_lease_request(&config, &pool, command.ttl, command.name).await?;
+            if command.no_wait {
+                return emit_pending_output(&accepted, command.output);
+            }
+            (accepted.id, accepted.profile, accepted.effective_ttl, false)
+        }
+    };
+
+    if command.output == OutputFormat::Text && !renewed {
+        eprintln!("Waiting for lease {lease_id} to become ready...");
     }
 
     let ready = wait_for_usable_lease(
         &config,
-        &accepted.id,
-        accepted.effective_ttl.clone(),
+        &lease_id,
+        effective_ttl.clone(),
         command.wait_timeout,
     )
     .await?;
@@ -103,21 +143,53 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     let kubeconfig = ready
         .kubeconfig
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Lease {} became bound without kubeconfig", ready.id))?;
-    let path = write_kubeconfig(
-        &accepted.id,
-        &accepted.profile,
-        kubeconfig,
-        command.kubeconfig_path,
-    )?;
-    if let Err(err) = record_kubeconfig(&config.endpoint, &accepted.id, &path) {
-        eprintln!(
-            "Warning: failed to record local kubeconfig path for {}: {err}",
-            accepted.id
-        );
+        .ok_or_else(|| anyhow::anyhow!("Lease {lease_id} became bound without kubeconfig"))?;
+    let path = write_kubeconfig(&lease_id, &profile, kubeconfig, command.kubeconfig_path)?;
+    if let Err(err) = record_kubeconfig(&config.endpoint, &lease_id, &path) {
+        eprintln!("Warning: failed to record local kubeconfig path for {lease_id}: {err}");
     }
 
-    emit_ready_output(&ready, accepted.effective_ttl, path, command.output)
+    emit_ready_output(&ready, effective_ttl, path, command.output)?;
+
+    // #107 P3: heartbeat-extend until interrupted.
+    if command.keepalive {
+        if command.output == OutputFormat::Text {
+            eprintln!(
+                "Keeping lease {lease_id} alive (heartbeat ~every half-TTL). Press Ctrl-C to stop."
+            );
+        }
+        let stop = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        super::keepalive::heartbeat_until(
+            &config,
+            &lease_id,
+            command.ttl,
+            stop,
+            command.output == OutputFormat::Text,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// #107 P3: when `--ensure --name X` is set, look up the caller's existing
+/// active lease named `X`. Returns `(lease_id, profile)` to renew, or `None`
+/// to create fresh.
+async fn ensure_existing(
+    config: &super::config::ResolvedConfig,
+    command: &LeaseCreateCommand<'_>,
+) -> Result<Option<(String, String)>> {
+    if !command.ensure {
+        return Ok(None);
+    }
+    let Some(name) = command.name else {
+        return Ok(None);
+    };
+    Ok(super::leases::find_active_lease_by_alias(config, name)
+        .await?
+        .map(|l| (l.id, l.profile)))
 }
 
 async fn select_pool_for_lease(
@@ -227,7 +299,7 @@ fn emit_ready_output(
     Ok(())
 }
 
-async fn wait_for_usable_lease(
+pub(crate) async fn wait_for_usable_lease(
     config: &super::config::ResolvedConfig,
     lease_id: &str,
     effective_ttl: Option<String>,
@@ -387,7 +459,7 @@ fn rewrite_local_kubeconfig_names(kubeconfig: &str, alias: &str) -> Result<Strin
     Ok(serde_yaml_ng::to_string(&doc)?)
 }
 
-fn parse_cli_duration(s: &str) -> Option<Duration> {
+pub(crate) fn parse_cli_duration(s: &str) -> Option<Duration> {
     const MAX_SECONDS: u64 = 365 * 24 * 3600;
 
     let s = s.trim();

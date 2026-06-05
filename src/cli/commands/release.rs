@@ -1,10 +1,29 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use super::config::CliConfig;
+use super::config::{CliConfig, ResolvedConfig};
 use super::select::{OnAmbiguous, resolve_lease_id};
 use super::state::remove_kubeconfig;
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
+
+/// Release a lease by id over `DELETE /v1/leases/{id}`, treating 404 as success
+/// (already gone). Also drops the local kubeconfig record. Used by `with-lease`
+/// (#107 P3) for guaranteed cleanup on exit.
+pub(crate) async fn release_lease(config: &ResolvedConfig, lease_id: &str) -> Result<()> {
+    let endpoint = config.endpoint.as_str();
+    let path = format!("/v1/leases/{lease_id}");
+    let token = get_auth_header(config, "DELETE", &path, b"").await?;
+    let client = authed_client();
+    let response = with_auth(client.delete(format!("{endpoint}{path}")), &token)
+        .send()
+        .await?;
+    let _ = remove_kubeconfig(&config.endpoint, lease_id);
+    let status = response.status();
+    if !status.is_success() && status.as_u16() != 404 {
+        anyhow::bail!("Failed to release lease {lease_id} (HTTP {status})");
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

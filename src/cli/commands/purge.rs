@@ -272,6 +272,7 @@ mod tests {
             queue_position: 0,
             requester: None,
             kubeconfig_path: None,
+            alias: None,
         };
 
         assert!(is_active_lease(&base));
@@ -303,6 +304,7 @@ mod tests {
             queue_position: 0,
             requester: None,
             kubeconfig_path: None,
+            alias: None,
         };
         let leases = vec![
             LeaseSummary {

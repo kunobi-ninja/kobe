@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use axum::body::{self, Body};
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -211,6 +211,11 @@ struct CreateLeaseRequest {
     profile: String,
     #[serde(default)]
     ttl: Option<String>,
+    /// Optional caller-supplied alias (#107 P2). Stored as the label
+    /// `kobe.kunobi.ninja/alias`; unique among the requester's ACTIVE leases so
+    /// it can name "which lease" in scripts (`kobe extend pr-106 30m`).
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -230,6 +235,8 @@ struct LeaseResponse {
     diagnostics_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effective_ttl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -252,6 +259,18 @@ struct LeaseSummary {
     /// Requester identity (included in pool lease listings).
     #[serde(skip_serializing_if = "Option::is_none")]
     requester: Option<String>,
+    /// Caller-supplied alias, if any (#107 P2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+}
+
+/// Query parameters for `GET /v1/leases` (#107 P2).
+#[derive(Deserialize, Default)]
+struct ListLeasesParams {
+    /// Restrict to the lease carrying this alias (scoped to the caller's
+    /// identity by the handler). Lets scripts resolve "which lease" by name.
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -566,6 +585,25 @@ async fn create_lease<B: ClusterBackend>(
             .into_response();
     }
 
+    // #107 P2: validate the optional alias as a DNS label (a strict, safe subset
+    // of allowed k8s label values) so it can be carried as a label and echoed
+    // into scripts without injection surprises.
+    if let Some(alias) = req.alias.as_deref()
+        && !is_valid_k8s_name(alias)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid lease alias".to_string(),
+                detail: Some(
+                    "Alias must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars)"
+                        .to_string(),
+                ),
+            }),
+        )
+            .into_response();
+    }
+
     let ttl_str = req.ttl.as_deref().unwrap_or("1h");
     let requested_ttl = match parse_duration(ttl_str) {
         Some(d) => d,
@@ -612,6 +650,35 @@ async fn create_lease<B: ClusterBackend>(
             .into_response();
     }
 
+    // #107 P2: an alias names exactly one of the requester's active leases.
+    // Fast-fail if it's already taken (the post-create check below closes the
+    // concurrent-create race).
+    if let Some(alias) = req.alias.as_deref() {
+        match active_alias_holders_sorted(&leases_api, &identity.identity, alias).await {
+            Ok(holders) if !holders.is_empty() => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: format!("Alias '{alias}' is already in use by an active lease"),
+                        detail: Some(format!(
+                            "Lease '{}' already holds this alias; release it or extend that lease instead",
+                            holders[0]
+                        )),
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return infra_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unable to verify lease alias",
+                    e,
+                );
+            }
+        }
+    }
+
     let lease_id = format!(
         "lease-{}",
         &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
@@ -624,6 +691,7 @@ async fn create_lease<B: ClusterBackend>(
         &ttl_formatted,
         &identity,
         policy.default_priority,
+        req.alias.as_deref(),
     );
 
     if let Err(e) = leases_api.create(&PostParams::default(), &lease).await {
@@ -658,6 +726,26 @@ async fn create_lease<B: ClusterBackend>(
             .into_response();
     }
 
+    // #107 P2: alias-uniqueness concurrent-create race. Like the quota check
+    // above, the pre-check is advisory — two requests with the same alias can
+    // both pass it. Re-list the alias holders deterministically; if this lease
+    // isn't the oldest, it lost the race, so self-delete and 409.
+    if let Some(alias) = req.alias.as_deref()
+        && let Ok(holders) =
+            active_alias_holders_sorted(&leases_api, &identity.identity, alias).await
+        && holders.first().map(|n| n.as_str()) != Some(lease_id.as_str())
+    {
+        let _ = leases_api.delete(&lease_id, &Default::default()).await;
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("Alias '{alias}' is already in use by an active lease"),
+                detail: Some("A concurrent request won the alias race; please retry".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
     metrics::CLAIMS_TOTAL
         .with_label_values(&[req.profile.as_str(), "created"])
         .inc();
@@ -680,6 +768,7 @@ async fn create_lease<B: ClusterBackend>(
         queue_position: 0,
         diagnostics_url: None,
         effective_ttl: None,
+        alias: req.alias.clone(),
     };
 
     if was_clamped {
@@ -693,6 +782,7 @@ async fn create_lease<B: ClusterBackend>(
 async fn list_leases<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
+    Query(params): Query<ListLeasesParams>,
 ) -> Response {
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let label_hash = hash_identity(&identity.identity);
@@ -704,7 +794,13 @@ async fn list_leases<B: ClusterBackend>(
             let my_claims: Vec<LeaseSummary> = claims
                 .iter()
                 .filter(|c| c.spec.requester.identity == identity.identity)
+                // #107 P2: optional ?alias= filter (exact match on the alias label).
+                .filter(|c| match &params.alias {
+                    Some(alias) => lease_alias(c).as_deref() == Some(alias.as_str()),
+                    None => true,
+                })
                 .map(|c| {
+                    let alias = lease_alias(c);
                     let status = c.status.clone().unwrap_or_default();
                     LeaseSummary {
                         id: c.name_any(),
@@ -715,6 +811,7 @@ async fn list_leases<B: ClusterBackend>(
                         queue_position: status.queue_position,
                         diagnostics_url: status.diagnostics_url,
                         requester: None,
+                        alias,
                     }
                 })
                 .collect();
@@ -814,6 +911,7 @@ async fn get_lease<B: ClusterBackend>(
                 None
             };
 
+            let alias = lease_alias(&lease);
             (
                 StatusCode::OK,
                 Json(LeaseResponse {
@@ -826,6 +924,7 @@ async fn get_lease<B: ClusterBackend>(
                     queue_position: status.queue_position,
                     diagnostics_url: status.diagnostics_url,
                     effective_ttl: None,
+                    alias,
                 }),
             )
                 .into_response()
@@ -1641,11 +1740,11 @@ async fn list_pool_leases<B: ClusterBackend>(
                     // the others' identities. The pool-utilization view (counts,
                     // phases, expiries) is preserved; only foreign identities are
                     // redacted.
-                    let requester = if c.spec.requester.identity == identity.identity {
-                        Some(c.spec.requester.identity.clone())
-                    } else {
-                        None
-                    };
+                    let own = c.spec.requester.identity == identity.identity;
+                    let requester = own.then(|| c.spec.requester.identity.clone());
+                    // Scope the alias like the requester: never expose another
+                    // tenant's caller-chosen lease name.
+                    let alias = if own { lease_alias(c) } else { None };
                     LeaseSummary {
                         id: c.name_any(),
                         phase: status.phase.to_string(),
@@ -1655,6 +1754,7 @@ async fn list_pool_leases<B: ClusterBackend>(
                         queue_position: status.queue_position,
                         diagnostics_url: None,
                         requester,
+                        alias,
                     }
                 })
                 .collect();
@@ -1965,6 +2065,40 @@ async fn active_lease_names_sorted(
     Ok(active.into_iter().map(|(_, name)| name).collect())
 }
 
+/// Names of an identity's ACTIVE (Pending|Bound) leases carrying `alias`, in the
+/// same deterministic order as [`active_lease_names_sorted`] (oldest first, then
+/// by name). Used for alias-uniqueness enforcement (#107 P2): the first holder
+/// keeps the alias; any later concurrent claimant self-deletes. Filters by the
+/// alias label server-side, then by exact identity (two identities may reuse an
+/// alias) and active phase in-process.
+async fn active_alias_holders_sorted(
+    leases_api: &Api<ClusterLease>,
+    identity: &str,
+    alias: &str,
+) -> Result<Vec<String>, kube::Error> {
+    let lp = ListParams::default().labels(&format!("{ALIAS_LABEL}={alias}"));
+    let leases = leases_api.list(&lp).await?;
+    let mut active: Vec<(String, String)> = leases
+        .iter()
+        .filter(|c| c.spec.requester.identity == identity)
+        .filter(|c| {
+            let status = c.status.clone().unwrap_or_default();
+            matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
+        })
+        .map(|c| {
+            let ts = c
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.to_string())
+                .unwrap_or_default();
+            (ts, c.name_any())
+        })
+        .collect();
+    active.sort();
+    Ok(active.into_iter().map(|(_, name)| name).collect())
+}
+
 /// Whether `lease_id` ranks beyond the cap among the identity's deterministically
 /// ordered active leases — i.e. it lost a concurrent-create race and should
 /// self-delete. Unknown lease (not in the list) => not excess.
@@ -1976,6 +2110,16 @@ fn lease_exceeds_quota(active_sorted: &[String], lease_id: &str, cap: u32) -> bo
         .unwrap_or(false)
 }
 
+/// Label key carrying the caller-supplied lease alias (#107 P2). A label (not a
+/// spec field) so leases can be filtered server-side via the label selector and
+/// no CRD schema change is needed.
+const ALIAS_LABEL: &str = "kobe.kunobi.ninja/alias";
+
+/// Read the alias label off a lease, if present.
+fn lease_alias(lease: &ClusterLease) -> Option<String> {
+    lease.metadata.labels.as_ref()?.get(ALIAS_LABEL).cloned()
+}
+
 fn build_lease_crd(
     lease_id: &str,
     namespace: &str,
@@ -1983,6 +2127,7 @@ fn build_lease_crd(
     ttl: &str,
     identity: &AuthIdentity,
     priority: u32,
+    alias: Option<&str>,
 ) -> ClusterLease {
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/profile".to_string(), profile.to_string());
@@ -1990,6 +2135,9 @@ fn build_lease_crd(
         "kobe.kunobi.ninja/requester-hash".to_string(),
         hash_identity(&identity.identity),
     );
+    if let Some(alias) = alias {
+        labels.insert(ALIAS_LABEL.to_string(), alias.to_string());
+    }
 
     ClusterLease {
         metadata: ObjectMeta {
@@ -2105,7 +2253,15 @@ mod tests {
     #[test]
     fn test_build_lease_crd_basic() {
         let identity = test_identity();
-        let claim = build_lease_crd("lease-abc123", "test-ns", "e2e-basic", "1h", &identity, 80);
+        let claim = build_lease_crd(
+            "lease-abc123",
+            "test-ns",
+            "e2e-basic",
+            "1h",
+            &identity,
+            80,
+            None,
+        );
 
         assert_eq!(claim.spec.pool_ref, "e2e-basic");
         assert_eq!(claim.spec.ttl, "1h");
@@ -2119,12 +2275,34 @@ mod tests {
         // Metadata
         assert_eq!(claim.metadata.name.as_deref(), Some("lease-abc123"));
         assert_eq!(claim.metadata.namespace.as_deref(), Some("test-ns"));
+
+        // #107 P2: no alias label when none is supplied.
+        assert_eq!(lease_alias(&claim), None);
+    }
+
+    // #107 P2: an alias is stamped as the `kobe.kunobi.ninja/alias` label and
+    // round-trips through `lease_alias`, which is what the list filter and the
+    // uniqueness check key off.
+    #[test]
+    fn test_build_lease_crd_stamps_alias_label() {
+        let identity = test_identity();
+        let claim = build_lease_crd("lease-1", "ns", "p", "1h", &identity, 50, Some("pr-106"));
+        assert_eq!(
+            claim
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("kobe.kunobi.ninja/alias"))
+                .map(String::as_str),
+            Some("pr-106"),
+        );
+        assert_eq!(lease_alias(&claim).as_deref(), Some("pr-106"));
     }
 
     #[test]
     fn test_build_lease_crd_labels() {
         let identity = test_identity();
-        let claim = build_lease_crd("lease-xyz", "ns1", "e2e-full", "30m", &identity, 50);
+        let claim = build_lease_crd("lease-xyz", "ns1", "e2e-full", "30m", &identity, 50, None);
 
         let labels = claim
             .metadata
@@ -2146,7 +2324,7 @@ mod tests {
     #[test]
     fn test_build_lease_crd_status_is_none() {
         let identity = test_identity();
-        let claim = build_lease_crd("lease-001", "ns", "dev", "2h", &identity, 100);
+        let claim = build_lease_crd("lease-001", "ns", "dev", "2h", &identity, 100, None);
 
         // The CRD is created without status; the controller sets it later
         assert!(
@@ -2158,8 +2336,8 @@ mod tests {
     #[test]
     fn test_build_lease_crd_different_priority() {
         let identity = test_identity();
-        let claim_low = build_lease_crd("c1", "ns", "p", "1h", &identity, 10);
-        let claim_high = build_lease_crd("c2", "ns", "p", "1h", &identity, 200);
+        let claim_low = build_lease_crd("c1", "ns", "p", "1h", &identity, 10, None);
+        let claim_high = build_lease_crd("c2", "ns", "p", "1h", &identity, 200, None);
 
         assert_eq!(claim_low.spec.priority, 10);
         assert_eq!(claim_high.spec.priority, 200);
@@ -2943,6 +3121,71 @@ mod tests {
         let count = count_active_leases(&leases_api, identity).await.unwrap();
         // Only c1 (Pending) and c2 (Bound) for the matching identity
         assert_eq!(count, 2);
+    }
+
+    // #107 P2: alias-holder resolution keeps only the caller's ACTIVE leases and
+    // orders them oldest-first, so the first holder deterministically keeps the
+    // alias. (The alias-label match itself is a server-side label selector; here
+    // every claim carries the alias so we exercise the in-process identity /
+    // phase / ordering logic.)
+    #[tokio::test]
+    async fn test_active_alias_holders_sorted_filters_and_orders() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let identity = "repo:org/repo:ref:refs/heads/main";
+
+        let claim = |name: &str, ts: &str, phase: &str, id: &str| {
+            serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "creationTimestamp": ts,
+                    "labels": { "kobe.kunobi.ninja/alias": "pr-1" }
+                },
+                "spec": {
+                    "poolRef": "e2e-basic", "ttl": "1h",
+                    "requester": { "type": "github-actions:ci", "identity": id },
+                    "priority": 50
+                },
+                "status": { "phase": phase }
+            })
+        };
+        let claims = vec![
+            // Newer active holder.
+            claim("newer", "2026-01-02T00:00:00Z", "Bound", identity),
+            // Older active holder — should sort first.
+            claim("older", "2026-01-01T00:00:00Z", "Pending", identity),
+            // Terminal — excluded.
+            claim("gone", "2026-01-01T00:00:00Z", "Released", identity),
+            // Another identity — excluded.
+            claim(
+                "foreign",
+                "2026-01-01T00:00:00Z",
+                "Bound",
+                "repo:other:ref:x",
+            ),
+        ];
+
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let list_resp = crate::testutil::k8s_list_response(claims);
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&list_resp))
+            .mount(&server)
+            .await;
+
+        let leases_api: kube::api::Api<ClusterLease> =
+            kube::api::Api::namespaced(client, "test-ns");
+        let holders = active_alias_holders_sorted(&leases_api, identity, "pr-1")
+            .await
+            .unwrap();
+        assert_eq!(holders, vec!["older".to_string(), "newer".to_string()]);
     }
 
     // --- Unknown route returns 404 ---

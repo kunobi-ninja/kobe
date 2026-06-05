@@ -1,6 +1,7 @@
 mod config;
 mod config_tui;
 mod extend;
+mod keepalive;
 mod lease_create;
 mod leases;
 mod login;
@@ -13,6 +14,7 @@ pub(crate) mod session;
 mod state;
 mod status;
 mod version;
+mod with_lease;
 
 use clap::ValueEnum;
 use serde::Serialize;
@@ -29,6 +31,7 @@ pub use purge::purge;
 pub use release::release;
 pub use status::status;
 pub use version::version;
+pub use with_lease::{WithLeaseCommand, with_lease};
 
 use config::{AuthMode, ResolvedConfig};
 

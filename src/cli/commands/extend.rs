@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use super::config::CliConfig;
+use super::config::{CliConfig, ResolvedConfig};
 use super::leases::format_relative_time;
 use super::select::{OnAmbiguous, resolve_lease_id};
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
@@ -31,26 +31,20 @@ struct ExtendOutput<'a> {
     expires_at: &'a str,
 }
 
-pub async fn extend(
-    target: Option<&str>,
+/// Extend a specific lease by `by` over `PATCH /v1/leases/{id}`, returning the
+/// new `expires_at`. Shared by the `extend` command and by the #107 P3
+/// idempotent-renew (`--ensure`) and keepalive paths.
+pub(crate) async fn extend_lease(
+    config: &ResolvedConfig,
+    lease_id: &str,
     by: &str,
-    target_override: Option<&str>,
-    endpoint_override: Option<&str>,
-    output: OutputFormat,
-) -> Result<()> {
-    let config = CliConfig::load()?;
-    let config = config.resolve(target_override, endpoint_override)?;
-
-    // Mutating command: never act on an arbitrary lease when the choice is
-    // ambiguous and we cannot prompt.
-    let lease_id = resolve_lease_id(&config, target, output, OnAmbiguous::Reject).await?;
-
+) -> Result<String> {
     let endpoint = config.endpoint.as_str();
     let path = format!("/v1/leases/{lease_id}");
     let body = serde_json::to_vec(&ExtendRequest { extend_ttl: by })?;
     // Body signing is not yet supported server-side; sign with an empty body
     // for now (matches `lease_create`).
-    let token = get_auth_header(&config, "PATCH", &path, b"").await?;
+    let token = get_auth_header(config, "PATCH", &path, b"").await?;
 
     let client = authed_client();
     let response = with_auth(client.patch(format!("{endpoint}{path}")), &token)
@@ -70,15 +64,33 @@ pub async fn extend(
     }
 
     let extended: ExtendResponse = response.json().await?;
+    Ok(extended.expires_at)
+}
+
+pub async fn extend(
+    target: Option<&str>,
+    by: &str,
+    target_override: Option<&str>,
+    endpoint_override: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load()?;
+    let config = config.resolve(target_override, endpoint_override)?;
+
+    // Mutating command: never act on an arbitrary lease when the choice is
+    // ambiguous and we cannot prompt.
+    let lease_id = resolve_lease_id(&config, target, output, OnAmbiguous::Reject).await?;
+
+    let expires_at = extend_lease(&config, &lease_id, by).await?;
     match output {
         OutputFormat::Text => println!(
             "Extended lease {lease_id} — expires {} ({})",
-            extended.expires_at,
-            format_relative_time(&extended.expires_at),
+            expires_at,
+            format_relative_time(&expires_at),
         ),
         OutputFormat::Json => print_json(&ExtendOutput {
             lease_id: &lease_id,
-            expires_at: &extended.expires_at,
+            expires_at: &expires_at,
         })?,
     }
 
