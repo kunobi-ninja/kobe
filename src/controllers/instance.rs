@@ -614,6 +614,16 @@ fn reservation_grace_elapsed(
         .unwrap_or(false)
 }
 
+/// Evaluate a `Leased` instance.
+///
+/// Leased instances are **intentionally not health-probed**: once a cluster is
+/// handed to a tenant it is the tenant's for the lease TTL, and proactively
+/// recycling it out from under an active lease (or flapping its phase on a
+/// transient probe failure) would be far more disruptive than a tenant
+/// observing a degraded cluster they can release. So this only reacts to the
+/// lease's lifecycle — recycling when the lease is Released/Expired/Recycling or
+/// gone, and reclaiming an orphaned reservation (see below) — never to backend
+/// health. Health gating happens while the instance is `Ready` (pre-lease).
 async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     instance: &ClusterInstance,
