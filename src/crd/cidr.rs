@@ -16,15 +16,16 @@
 //!
 //! ## The whole API
 //!
-//! One namespaced CRD: `CIDRClaim`. The address space itself is a
-//! Rust constant — see `pool::cidr_alloc::ipam_plan`. There is
-//! deliberately no `CIDRPool` CRD and no per-deployment config. In
-//! every kobe deployment to date the historical `10.240.0.0/13` (svc)
-//! and `10.248.0.0/13` (cls) plan with `/20` slots has been the right
-//! answer, and adding configuration now would just be speculative
-//! flexibility we'd have to test, document, and support. If a future
-//! customer genuinely can't use that block, we promote `ipam_plan` to
-//! a `CIDRPool` CRD at that point — `CIDRClaim` stays unchanged.
+//! Two namespaced CRDs: `CIDRClaim` (one per consumer, a request for a
+//! slice) and `CIDRPool` (optional singleton, the address plan itself).
+//! The default address space is a Rust constant — see
+//! `pool::cidr_alloc::ipam_plan` — the historical `10.240.0.0/13` (svc)
+//! and `10.248.0.0/13` (cls) plan with `/20` slots, the right answer for
+//! every deployment whose host cluster doesn't overlap it. A deployment
+//! that DOES overlap (its own service range collides → guest CoreDNS
+//! x509 failures, #42) applies a `CIDRPool` named `default` to relocate
+//! the supernets; the allocator reads it at startup, else falls back to
+//! the constant. `CIDRClaim` is unchanged either way.
 //!
 //! ## Lifecycle
 //!
@@ -121,4 +122,83 @@ pub enum CIDRClaimPhase {
     /// is malformed (unaligned prefix, outside pool's parent block,
     /// unknown poolRef, etc.). `message` carries the reason.
     Conflict,
+}
+
+/// Operator-level IPAM address-space configuration. The IPAM allocator
+/// carves every guest k3s/k0s service+cluster CIDR out of two parent
+/// supernets; by default those are the built-in `10.240.0.0/13` (svc)
+/// and `10.248.0.0/13` (cls), `/20` slots. That default is well clear
+/// of the common k8s ranges (10.42/10.43/10.96), but a host cluster
+/// whose OWN service range overlaps it makes every guest's in-pod
+/// `10.x.0.1` route to the HOST apiserver — guest CoreDNS then fails
+/// with `x509: certificate signed by unknown authority` (#42).
+///
+/// A `CIDRPool` named `default` in the operator namespace overrides the
+/// built-in plan so operators can relocate the supernets off a colliding
+/// host range. When absent, the built-in plan is used unchanged — so
+/// this is purely opt-in and existing deployments are unaffected.
+///
+/// Singleton by convention: the allocator reads the one named `default`
+/// and ignores others. The plan is resolved at operator startup; editing
+/// the `CIDRPool` takes effect on the next restart (existing `CIDRClaim`s
+/// that fall outside a narrowed plan are re-validated to `Conflict`).
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "kobe.kunobi.ninja",
+    version = "v1alpha1",
+    kind = "CIDRPool",
+    plural = "cidrpools",
+    shortname = "cpool",
+    status = "CIDRPoolStatus",
+    namespaced
+)]
+#[serde(rename_all = "camelCase")]
+pub struct CIDRPoolSpec {
+    /// Parent supernet for guest *service* CIDRs, e.g. `"10.240.0.0/13"`.
+    /// Must be aligned to its own prefix and must NOT overlap the host
+    /// cluster's service range.
+    pub service_cidr: String,
+
+    /// Prefix carved per guest from `service_cidr`, e.g. `20` (a `/20`
+    /// slot = 4096 addresses). Must be >= the `service_cidr` prefix.
+    pub service_slot_prefix: u8,
+
+    /// Parent supernet for guest *cluster* (pod) CIDRs, e.g.
+    /// `"10.248.0.0/13"`. Same alignment + non-overlap rules.
+    pub cluster_cidr: String,
+
+    /// Prefix carved per guest from `cluster_cidr`, e.g. `20`.
+    pub cluster_slot_prefix: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CIDRPoolStatus {
+    /// Whether the allocator accepted this pool as its active plan.
+    #[serde(default)]
+    pub phase: CIDRPoolPhase,
+
+    /// Number of paired (service, cluster) slots this plan yields.
+    /// `None` until the allocator has evaluated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u32>,
+
+    /// Validation error when `phase == Invalid` (malformed CIDR,
+    /// misaligned block, slot prefix smaller than the block prefix, …).
+    /// On `Invalid` the allocator falls back to the built-in default plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+pub enum CIDRPoolPhase {
+    /// Created but not yet evaluated by the allocator (e.g. operator
+    /// not restarted since it was applied).
+    #[default]
+    Pending,
+    /// Accepted as the allocator's active address plan.
+    Active,
+    /// Rejected as malformed; the built-in default plan is in effect.
+    /// See `message`.
+    Invalid,
 }

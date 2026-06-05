@@ -98,6 +98,11 @@ impl Block {
         })
     }
 
+    /// The parent block as a CIDR string (e.g. `"10.240.0.0/13"`).
+    pub fn block_cidr(&self) -> String {
+        format!("{}/{}", Ipv4Addr::from(self.network), self.block_prefix)
+    }
+
     /// Total number of slots that fit in this block.
     pub fn capacity(&self) -> u32 {
         // `1 << (slot_prefix - block_prefix)`. Saturate at u32::MAX to
@@ -158,6 +163,16 @@ impl PoolPlan {
         std::cmp::min(self.service.capacity(), self.cluster.capacity())
     }
 
+    /// The service parent block as a CIDR string, for logging/status.
+    pub fn service_block_cidr(&self) -> String {
+        self.service.block_cidr()
+    }
+
+    /// The cluster parent block as a CIDR string, for logging/status.
+    pub fn cluster_block_cidr(&self) -> String {
+        self.cluster.block_cidr()
+    }
+
     /// Find the lowest-indexed slot whose service CIDR is not in
     /// `used_service` AND whose cluster CIDR is not in `used_cluster`.
     /// Returns `(slot, service_cidr, cluster_cidr)`.
@@ -215,18 +230,17 @@ fn parse_cidr(s: &str) -> Result<(u32, u8), PoolPlanError> {
     Ok((u32::from(addr), prefix))
 }
 
-/// The single, hardcoded IPAM plan kobe uses for guest k3s/k0s
-/// clusters. `10.240.0.0/13` for service CIDRs and `10.248.0.0/13` for
-/// cluster (pod) CIDRs, both carved into `/20` slots (4096 IPs each,
-/// 128 slots total).
+/// The built-in default IPAM plan for guest k3s/k0s clusters:
+/// `10.240.0.0/13` for service CIDRs and `10.248.0.0/13` for cluster
+/// (pod) CIDRs, both carved into `/20` slots (4096 IPs each, 128 slots
+/// total). Well outside every common k8s default (10.42/10.43/10.96).
 ///
-/// Why hardcoded? Because every kobe deployment to date has used this
-/// layout, the parent block is well outside every common k8s default
-/// (10.42/10.43/10.96), and adding configuration for a value that
-/// doesn't change in practice would be speculative flexibility we'd
-/// have to test, document, and support. If a future deployment
-/// genuinely needs a different layout, this becomes a `CIDRPool` CRD
-/// at that point — the `CIDRClaim` API is unchanged either way.
+/// This is the plan when no `CIDRPool/default` override is present —
+/// the case for almost every deployment. An operator whose host cluster
+/// service range overlaps this block (→ guest CoreDNS x509 failures,
+/// #42) relocates the supernets by applying a `CIDRPool`; the IPAM
+/// controller resolves that at startup via `resolve_ipam_plan` and only
+/// falls back here when it's absent or invalid.
 pub fn ipam_plan() -> PoolPlan {
     PoolPlan::new("10.240.0.0/13", 20, "10.248.0.0/13", 20)
         .expect("ipam_plan is a constant; arguments are valid by construction")
@@ -245,6 +259,25 @@ mod tests {
 
     /// Slot count of the default plan: 2^(20 - 13) = 128.
     const DEFAULT_SLOTS: u32 = 128;
+
+    #[test]
+    fn block_cidr_round_trips() {
+        let plan = default_plan();
+        assert_eq!(plan.service_block_cidr(), "10.240.0.0/13");
+        assert_eq!(plan.cluster_block_cidr(), "10.248.0.0/13");
+    }
+
+    // The CIDRPool override path (#42): an operator relocating off a
+    // host-colliding range gets a plan whose blocks + capacity reflect
+    // the override, not the built-in default.
+    #[test]
+    fn override_plan_reflects_custom_supernet() {
+        let plan = PoolPlan::new("100.64.0.0/13", 20, "100.72.0.0/13", 20).unwrap();
+        assert_eq!(plan.service_block_cidr(), "100.64.0.0/13");
+        assert_eq!(plan.cluster_block_cidr(), "100.72.0.0/13");
+        assert_eq!(plan.service.cidr_at(0), "100.64.0.0/20");
+        assert_eq!(plan.capacity(), DEFAULT_SLOTS); // same /13→/20 geometry
+    }
 
     #[test]
     fn parse_block_validates_prefix() {

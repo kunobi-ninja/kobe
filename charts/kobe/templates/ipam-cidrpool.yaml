@@ -1,0 +1,23 @@
+{{- /*
+IPAM address-plan override (issue #42). Renders a singleton CIDRPool/default
+ONLY when both parent supernets are set in values — otherwise the operator
+uses its built-in 10.240.0.0/13 + 10.248.0.0/13 plan and no CR is created, so
+existing deployments are unaffected.
+
+Distinct from cidrpool.yaml, which (despite its name) renders static
+CIDRClaim reservations, not the address plan itself.
+*/}}
+{{- if and .Values.ipam.serviceCidr .Values.ipam.clusterCidr }}
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: CIDRPool
+metadata:
+  name: default
+  namespace: {{ .Values.operatorNamespace | quote }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  serviceCidr: {{ .Values.ipam.serviceCidr | quote }}
+  serviceSlotPrefix: {{ .Values.ipam.serviceSlotPrefix }}
+  clusterCidr: {{ .Values.ipam.clusterCidr | quote }}
+  clusterSlotPrefix: {{ .Values.ipam.clusterSlotPrefix }}
+{{- end }}

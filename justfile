@@ -102,6 +102,7 @@ build-crdgen:
     cargo run --bin crdgen -- bootstrapconfigs > charts/kobe/crds/bootstrapconfigs.yaml
     cargo run --bin crdgen -- accesspolicies > charts/kobe/crds/accesspolicies.yaml
     cargo run --bin crdgen -- kobestores > charts/kobe/crds/kobestores.yaml
+    cargo run --bin crdgen -- cidrpools > charts/kobe/crds/cidrpools.yaml
 
 # Build Docker images locally (operator + kobe-sync)
 [group('docker')]

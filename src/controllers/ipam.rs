@@ -42,8 +42,15 @@ use kube::{Client, ResourceExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::crd::{CIDRClaim, CIDRClaimPhase, CIDRClaimStatus, ClusterInstance};
+use crate::crd::{
+    CIDRClaim, CIDRClaimPhase, CIDRClaimStatus, CIDRPool, CIDRPoolPhase, CIDRPoolStatus,
+    ClusterInstance,
+};
 use crate::pool::cidr_alloc::{PoolPlan, ipam_plan};
+
+/// Well-known name of the singleton `CIDRPool` the allocator reads to
+/// override the built-in address plan. See [`resolve_ipam_plan`].
+const CIDRPOOL_SINGLETON: &str = "default";
 
 pub struct IpamContext {
     pub client: Client,
@@ -59,9 +66,98 @@ pub enum IpamError {
     Kube(#[from] kube::Error),
 }
 
+/// Resolve the allocator's address plan at startup: the `CIDRPool`
+/// named `default` in `namespace` if it is present and valid, otherwise
+/// the built-in [`ipam_plan`]. Best-effort patches the pool's status so
+/// `kubectl get cidrpool` shows whether the override took effect. A
+/// present-but-malformed pool logs loudly, is marked `Invalid`, and
+/// falls back to the default (keeps provisioning alive rather than
+/// wedging the whole operator on a typo).
+async fn resolve_ipam_plan(client: &Client, namespace: &str) -> PoolPlan {
+    let pools: Api<CIDRPool> = Api::namespaced(client.clone(), namespace);
+    let pool = match pools.get_opt(CIDRPOOL_SINGLETON).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            info!(
+                service_block = "10.240.0.0/13",
+                cluster_block = "10.248.0.0/13",
+                slot_prefix = "/20",
+                "No CIDRPool/default found; using built-in IPAM plan"
+            );
+            return ipam_plan();
+        }
+        Err(err) => {
+            // Don't fail the operator over a transient API read — the
+            // default plan is correct for every deployment that hasn't
+            // opted into an override.
+            warn!(error = %err, "Failed to read CIDRPool/default; using built-in IPAM plan");
+            return ipam_plan();
+        }
+    };
+
+    let spec = &pool.spec;
+    match PoolPlan::new(
+        &spec.service_cidr,
+        spec.service_slot_prefix,
+        &spec.cluster_cidr,
+        spec.cluster_slot_prefix,
+    ) {
+        Ok(plan) => {
+            info!(
+                service_block = %spec.service_cidr,
+                cluster_block = %spec.cluster_cidr,
+                service_slot_prefix = spec.service_slot_prefix,
+                cluster_slot_prefix = spec.cluster_slot_prefix,
+                capacity = plan.capacity(),
+                "CIDRPool/default accepted as active IPAM plan"
+            );
+            patch_cidrpool_status(
+                &pools,
+                CIDRPoolStatus {
+                    phase: CIDRPoolPhase::Active,
+                    capacity: Some(plan.capacity()),
+                    message: None,
+                },
+            )
+            .await;
+            plan
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                "CIDRPool/default is invalid; falling back to the built-in IPAM plan. \
+                 Guest clusters will use 10.240.0.0/13 + 10.248.0.0/13 until this is fixed."
+            );
+            patch_cidrpool_status(
+                &pools,
+                CIDRPoolStatus {
+                    phase: CIDRPoolPhase::Invalid,
+                    capacity: None,
+                    message: Some(err.to_string()),
+                },
+            )
+            .await;
+            ipam_plan()
+        }
+    }
+}
+
+/// Best-effort status patch on the singleton CIDRPool. Failures are
+/// logged, never fatal — the resolved plan is already in hand.
+async fn patch_cidrpool_status(pools: &Api<CIDRPool>, status: CIDRPoolStatus) {
+    let patch = serde_json::json!({ "status": status });
+    let pp = PatchParams::default();
+    if let Err(err) = pools
+        .patch_status(CIDRPOOL_SINGLETON, &pp, &Patch::Merge(&patch))
+        .await
+    {
+        warn!(error = %err, "Failed to patch CIDRPool/default status (non-fatal)");
+    }
+}
+
 pub async fn run_ipam_controller(client: Client, namespace: &str, shutdown: CancellationToken) {
     let claims: Api<CIDRClaim> = Api::namespaced(client.clone(), namespace);
-    let plan = ipam_plan();
+    let plan = resolve_ipam_plan(&client, namespace).await;
     let ctx = Arc::new(IpamContext {
         client,
         namespace: namespace.to_string(),
@@ -70,9 +166,8 @@ pub async fn run_ipam_controller(client: Client, namespace: &str, shutdown: Canc
 
     info!(
         capacity = ctx.plan.capacity(),
-        service_block = "10.240.0.0/13",
-        cluster_block = "10.248.0.0/13",
-        slot_prefix = "/20",
+        service_block = %ctx.plan.service_block_cidr(),
+        cluster_block = %ctx.plan.cluster_block_cidr(),
         "Starting IPAM controller"
     );
 
@@ -495,5 +590,74 @@ mod tests {
             "u-1",
         );
         assert_eq!(c.status.as_ref().unwrap().phase, CIDRClaimPhase::Bound);
+    }
+
+    // #42: a missing CIDRPool/default must yield the built-in plan, so
+    // every existing deployment (which has no CIDRPool) is unaffected.
+    #[tokio::test]
+    async fn resolve_ipam_plan_falls_back_to_default_when_absent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/cidrpools/default",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let plan = resolve_ipam_plan(&client, "test-ns").await;
+        assert_eq!(plan.service_block_cidr(), "10.240.0.0/13");
+        assert_eq!(plan.cluster_block_cidr(), "10.248.0.0/13");
+    }
+
+    // #42: a valid CIDRPool/default relocates the allocator's supernets.
+    #[tokio::test]
+    async fn resolve_ipam_plan_uses_valid_override() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/cidrpools/default",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "CIDRPool",
+                "metadata": { "name": "default", "namespace": "test-ns" },
+                "spec": {
+                    "serviceCidr": "100.64.0.0/13",
+                    "serviceSlotPrefix": 20,
+                    "clusterCidr": "100.72.0.0/13",
+                    "clusterSlotPrefix": 20
+                }
+            })))
+            .mount(&server)
+            .await;
+        // Best-effort status patch (Active) — accept it so it isn't noisy.
+        Mock::given(method("PATCH"))
+            .and(path_regex(".*/cidrpools/default/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "CIDRPool",
+                "metadata": { "name": "default", "namespace": "test-ns" },
+                "spec": {
+                    "serviceCidr": "100.64.0.0/13", "serviceSlotPrefix": 20,
+                    "clusterCidr": "100.72.0.0/13", "clusterSlotPrefix": 20
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let plan = resolve_ipam_plan(&client, "test-ns").await;
+        assert_eq!(plan.service_block_cidr(), "100.64.0.0/13");
+        assert_eq!(plan.cluster_block_cidr(), "100.72.0.0/13");
     }
 }
