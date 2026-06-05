@@ -70,6 +70,8 @@ pub enum PoolPlanError {
     BlockPrefixTooBig(u8),
     #[error("CIDR `{0}` is not aligned to its prefix")]
     Unaligned(String),
+    #[error("service block `{0}` and cluster block `{1}` overlap; they must be disjoint")]
+    BlocksOverlap(String, String),
 }
 
 impl Block {
@@ -101,6 +103,21 @@ impl Block {
     /// The parent block as a CIDR string (e.g. `"10.240.0.0/13"`).
     pub fn block_cidr(&self) -> String {
         format!("{}/{}", Ipv4Addr::from(self.network), self.block_prefix)
+    }
+
+    /// Half-open address range `[network, network + size)` as u64 (size can be
+    /// 2^32 for a /0, which doesn't fit in u32).
+    fn range(&self) -> (u64, u64) {
+        let start = self.network as u64;
+        let size = 1u64 << (32 - self.block_prefix);
+        (start, start + size)
+    }
+
+    /// Whether this block's parent range intersects `other`'s.
+    pub fn overlaps(&self, other: &Block) -> bool {
+        let (a0, a1) = self.range();
+        let (b0, b1) = other.range();
+        a0 < b1 && b0 < a1
     }
 
     /// Total number of slots that fit in this block.
@@ -150,10 +167,19 @@ impl PoolPlan {
         cluster_block: &str,
         cluster_prefix: u8,
     ) -> Result<Self, PoolPlanError> {
-        Ok(Self {
-            service: Block::parse(service_block, service_prefix)?,
-            cluster: Block::parse(cluster_block, cluster_prefix)?,
-        })
+        let service = Block::parse(service_block, service_prefix)?;
+        let cluster = Block::parse(cluster_block, cluster_prefix)?;
+        // The two parent supernets MUST be disjoint: each guest gets slot N of
+        // BOTH, and overlapping ranges would hand out the same address as both a
+        // service and a pod CIDR (and a misconfigured override could silently
+        // collide). The built-in 10.240.0.0/13 vs 10.248.0.0/13 are disjoint.
+        if service.overlaps(&cluster) {
+            return Err(PoolPlanError::BlocksOverlap(
+                service.block_cidr(),
+                cluster.block_cidr(),
+            ));
+        }
+        Ok(Self { service, cluster })
     }
 
     /// Number of slots usable for a paired (service, cluster) allocation.
@@ -277,6 +303,22 @@ mod tests {
         assert_eq!(plan.cluster_block_cidr(), "100.72.0.0/13");
         assert_eq!(plan.service.cidr_at(0), "100.64.0.0/20");
         assert_eq!(plan.capacity(), DEFAULT_SLOTS); // same /13→/20 geometry
+    }
+
+    #[test]
+    fn overlapping_service_cluster_blocks_rejected() {
+        // Identical ranges overlap.
+        assert!(matches!(
+            PoolPlan::new("10.240.0.0/13", 20, "10.240.0.0/13", 20).unwrap_err(),
+            PoolPlanError::BlocksOverlap(_, _)
+        ));
+        // A /13 contains a nested /16 → overlap.
+        assert!(matches!(
+            PoolPlan::new("10.240.0.0/13", 20, "10.241.0.0/16", 20).unwrap_err(),
+            PoolPlanError::BlocksOverlap(_, _)
+        ));
+        // The built-in (and any disjoint) pair is accepted.
+        assert!(PoolPlan::new("10.240.0.0/13", 20, "10.248.0.0/13", 20).is_ok());
     }
 
     #[test]
@@ -419,10 +461,11 @@ mod tests {
 
     #[test]
     fn capacity_clamps_to_u32_max_for_huge_blocks() {
-        // /0 carved into /32 slots = 2^32 slots; doesn't fit in u32.
-        // We should saturate, not overflow.
-        let plan = PoolPlan::new("0.0.0.0/0", 32, "0.0.0.0/0", 32).unwrap();
-        assert_eq!(plan.capacity(), u32::MAX);
+        // /0 carved into /32 slots = 2^32 slots; doesn't fit in u32. We should
+        // saturate, not overflow. (Tested per-block: two /0 supernets can't form
+        // a PoolPlan, since they'd overlap.)
+        let block = Block::parse("0.0.0.0/0", 32).unwrap();
+        assert_eq!(block.capacity(), u32::MAX);
     }
 
     #[test]

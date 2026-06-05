@@ -11,8 +11,10 @@
 //! statements. We enforce a strict allowlist (`[a-zA-Z0-9_]`) and wrap names
 //! in double quotes.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
-use kunobi_reload::{BoxError, Reloadable, watch};
+use kunobi_reload::{BoxError, FromMount, Mount, ReloadStatus, Reloadable, watch};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
@@ -32,6 +34,22 @@ impl DatastoreConn {
     async fn connect(base_url: String) -> std::result::Result<Self, BoxError> {
         let pool = PgPool::connect(&base_url).await?;
         Ok(Self { pool, base_url })
+    }
+}
+
+impl FromMount for DatastoreConn {
+    async fn from_mount(mount: Mount) -> std::result::Result<Self, BoxError> {
+        let url = mount.read_str("url")?.trim().to_string();
+        Self::connect(url).await
+    }
+
+    /// Graceful teardown when a rotation swaps in a new pool: close the OLD pool
+    /// so its connections send Postgres `Terminate` and in-flight queries drain,
+    /// rather than being dropped abruptly (an async teardown `Drop` can't do).
+    /// `PgPool::close()` waits for connections borrowed by in-flight `current()`
+    /// clones to return first, so it composes safely.
+    async fn retire(self: Arc<Self>) {
+        self.pool.close().await;
     }
 }
 
@@ -67,6 +85,18 @@ impl SharedDatastore {
         }
     }
 
+    /// Reload health for the `Reloading` variant (`None` for the others). A
+    /// `Stale` result means the mounted credential changed but the new value
+    /// keeps failing to parse/connect — the operator is running on the previous
+    /// credential. Surfaced by `/readyz` so a persistently-stale rotation is
+    /// observable rather than silent.
+    pub fn reload_status(&self) -> Option<ReloadStatus> {
+        match self {
+            SharedDatastore::Reloading(r) => Some(r.reload_status()),
+            _ => None,
+        }
+    }
+
     /// Build from the environment:
     /// - `POSTGRES_URL_DIR` set → watch that mounted-Secret dir's `url` file and
     ///   hot-reload the pool on rotation;
@@ -77,13 +107,9 @@ impl SharedDatastore {
     /// matching the previous best-effort behavior.
     pub async fn from_env() -> Self {
         if let Ok(dir) = std::env::var("POSTGRES_URL_DIR") {
-            match watch(&dir)
-                .spawn(|mount| async move {
-                    let url = mount.read_str("url")?.trim().to_string();
-                    DatastoreConn::connect(url).await
-                })
-                .await
-            {
+            // The FromMount/reloadable path (not .spawn) runs DatastoreConn::retire
+            // on rotation, gracefully closing the superseded pool.
+            match watch(&dir).reloadable::<DatastoreConn>().await {
                 Ok(reloadable) => {
                     info!(
                         dir = %dir,

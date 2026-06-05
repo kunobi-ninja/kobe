@@ -14,7 +14,7 @@ use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use kube::api::{Api, ListParams, ObjectMeta, Patch as KubePatch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
 use crate::api::connect::{
@@ -363,6 +363,15 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
         .header("content-type", "text/plain; charset=utf-8")
         .body(Body::from(message.into()))
         .expect("connect error response")
+}
+
+/// Connect-proxy analogue of `infra_error`: logs the raw kube/transport error
+/// server-side and returns ONLY the generic `message` to the client, never the
+/// raw string (which leaks operator namespaces, in-cluster endpoints, and CRD
+/// details to a low-trust caller — possibly before lease-token validation).
+fn connect_infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -> Response {
+    warn!(error = %err, "{message}");
+    connect_error(status, message)
 }
 
 /// Whether a lease's RFC3339 `expires_at` is in the past. A missing or
@@ -735,7 +744,24 @@ async fn create_lease<B: ClusterBackend>(
             active_alias_holders_sorted(&leases_api, &identity.identity, alias).await
         && holders.first().map(|n| n.as_str()) != Some(lease_id.as_str())
     {
-        let _ = leases_api.delete(&lease_id, &Default::default()).await;
+        // This lease lost the race; remove it so it can't linger as a second
+        // active holder of the alias. There is NO alias reconciler backstop, so a
+        // swallowed delete error would leave an orphaned duplicate (breaking the
+        // uniqueness the CLI's `--ensure`/alias-select rely on). Surface a failed
+        // cleanup as a retryable error rather than a clean-looking 409.
+        if let Err(e) = leases_api.delete(&lease_id, &Default::default()).await {
+            error!(
+                lease_id = %lease_id,
+                alias = %alias,
+                error = %e,
+                "Failed to delete alias-race-loser lease; it may linger as a duplicate alias holder until its TTL expires"
+            );
+            return infra_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Lost the alias race and failed to clean up the duplicate; please retry",
+                e,
+            );
+        }
         return (
             StatusCode::CONFLICT,
             Json(ErrorResponse {
@@ -1016,9 +1042,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy failed to validate lease token"
             );
-            return connect_error(
+            return connect_infra_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to validate lease token: {err}"),
+                "Failed to validate lease token",
+                &err,
             );
         }
     };
@@ -1052,9 +1079,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy failed to load lease"
             );
-            return connect_error(
+            return connect_infra_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load lease: {err}"),
+                "Failed to load lease",
+                &err,
             );
         }
     };
@@ -1121,9 +1149,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                                 error = %err,
                                 "Connect proxy failed to extract backend kubeconfig"
                             );
-                            return connect_error(
+                            return connect_infra_error(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                format!("Failed to extract backend kubeconfig: {err}"),
+                                "Failed to extract backend kubeconfig",
+                                &err,
                             );
                         }
                     },
@@ -1151,9 +1180,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                                     error = %err,
                                     "Connect proxy failed to extract backend kubeconfig"
                                 );
-                                return connect_error(
+                                return connect_infra_error(
                                     StatusCode::SERVICE_UNAVAILABLE,
-                                    format!("Failed to extract backend kubeconfig: {err}"),
+                                    "Failed to extract backend kubeconfig",
+                                    &err,
                                 );
                             }
                         }
@@ -1183,9 +1213,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                             error = %err,
                             "Connect proxy failed to extract backend kubeconfig"
                         );
-                        return connect_error(
+                        return connect_infra_error(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!("Failed to extract backend kubeconfig: {err}"),
+                            "Failed to extract backend kubeconfig",
+                            &err,
                         );
                     }
                 }
@@ -1206,9 +1237,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     error = %err,
                     "Connect proxy failed to extract backend kubeconfig"
                 );
-                return connect_error(
+                return connect_infra_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to extract backend kubeconfig: {err}"),
+                    "Failed to extract backend kubeconfig",
+                    &err,
                 );
             }
         }
@@ -1224,9 +1256,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy failed to parse backend kubeconfig"
             );
-            return connect_error(
+            return connect_infra_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to parse backend kubeconfig: {err}"),
+                "Failed to parse backend kubeconfig",
+                &err,
             );
         }
     };
@@ -1241,7 +1274,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy failed to build backend request URL"
             );
-            return connect_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            return connect_infra_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build backend request",
+                &err,
+            );
         }
     };
 
@@ -1299,9 +1336,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy failed to read request body"
             );
-            return connect_error(
+            return connect_infra_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Failed to read request body: {err}"),
+                "Failed to read request body",
+                &err,
             );
         }
     };
@@ -1317,10 +1355,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy received unsupported HTTP method"
             );
-            return connect_error(
-                StatusCode::METHOD_NOT_ALLOWED,
-                format!("Unsupported method: {err}"),
-            );
+            return connect_infra_error(StatusCode::METHOD_NOT_ALLOWED, "Unsupported method", &err);
         }
     };
 
@@ -1351,9 +1386,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %error_chain(&err),
                 "Connect proxy failed to reach leased cluster"
             );
-            return connect_error(
+            return connect_infra_error(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to reach leased cluster: {err}"),
+                "Failed to reach leased cluster",
+                &err,
             );
         }
     };
@@ -1390,9 +1426,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     error = %err,
                     "Connect proxy failed to read leased cluster response"
                 );
-                return connect_error(
+                return connect_infra_error(
                     StatusCode::BAD_GATEWAY,
-                    format!("Failed to read leased cluster response: {err}"),
+                    "Failed to read leased cluster response",
+                    &err,
                 );
             }
         };
@@ -1936,6 +1973,19 @@ async fn readyz<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response
         && let Err(e) = readyz_check_postgres(&pool).await
     {
         failures.push(format!("postgres: {e}"));
+    }
+
+    // Surface a persistently-stale credential rotation: the mounted Secret
+    // changed but the new value keeps failing to load, so the operator is still
+    // on the previous credential. The postgres check above catches outright
+    // revocation; this warns *before* that, so an alert can fire on the gap.
+    if let Some(kunobi_reload::ReloadStatus::Stale { last_error, .. }) =
+        state.datastore.reload_status()
+    {
+        warn!(
+            last_error = %last_error,
+            "PostgreSQL credential reload is stale; running on the previous credential"
+        );
     }
 
     if failures.is_empty() {

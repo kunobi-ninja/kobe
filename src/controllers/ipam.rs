@@ -55,9 +55,17 @@ const CIDRPOOL_SINGLETON: &str = "default";
 pub struct IpamContext {
     pub client: Client,
     pub namespace: String,
-    /// Cached plan so reconciles don't reparse every time. The plan
-    /// itself is a Rust constant; this is just a convenience.
+    /// Cached plan so reconciles don't reparse every time.
     pub plan: PoolPlan,
+    /// True when a `CIDRPool/default` is present but INVALID. The operator
+    /// explicitly asked to override the address space (almost always because
+    /// the host cluster overlaps the built-in `10.240.0.0/13`), so silently
+    /// falling back to that default would re-introduce the very host/guest CIDR
+    /// collision the override was meant to avoid (guest CoreDNS x509, #42).
+    /// Instead we fail closed: refuse to bind claims until the pool is fixed,
+    /// so the misconfiguration is loud (pool members stuck) rather than silently
+    /// shipping broken-DNS guests.
+    pub blocked: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,14 +74,17 @@ pub enum IpamError {
     Kube(#[from] kube::Error),
 }
 
-/// Resolve the allocator's address plan at startup: the `CIDRPool`
-/// named `default` in `namespace` if it is present and valid, otherwise
-/// the built-in [`ipam_plan`]. Best-effort patches the pool's status so
-/// `kubectl get cidrpool` shows whether the override took effect. A
-/// present-but-malformed pool logs loudly, is marked `Invalid`, and
-/// falls back to the default (keeps provisioning alive rather than
-/// wedging the whole operator on a typo).
-async fn resolve_ipam_plan(client: &Client, namespace: &str) -> PoolPlan {
+/// Resolve the allocator's address plan at startup. Returns `(plan, blocked)`:
+/// - no `CIDRPool/default` (or a transient read error) → built-in [`ipam_plan`],
+///   not blocked (the default is correct for every deployment that didn't opt in);
+/// - a present + valid pool → that plan, not blocked;
+/// - a present but INVALID pool → built-in plan but **blocked = true**, so the
+///   controller fails closed (see [`IpamContext::blocked`]) rather than silently
+///   shipping guests on the host-colliding default.
+///
+/// Best-effort patches the pool's status so `kubectl get cidrpool` shows whether
+/// the override took effect.
+async fn resolve_ipam_plan(client: &Client, namespace: &str) -> (PoolPlan, bool) {
     let pools: Api<CIDRPool> = Api::namespaced(client.clone(), namespace);
     let pool = match pools.get_opt(CIDRPOOL_SINGLETON).await {
         Ok(Some(p)) => p,
@@ -84,14 +95,11 @@ async fn resolve_ipam_plan(client: &Client, namespace: &str) -> PoolPlan {
                 slot_prefix = "/20",
                 "No CIDRPool/default found; using built-in IPAM plan"
             );
-            return ipam_plan();
+            return (ipam_plan(), false);
         }
         Err(err) => {
-            // Don't fail the operator over a transient API read — the
-            // default plan is correct for every deployment that hasn't
-            // opted into an override.
             warn!(error = %err, "Failed to read CIDRPool/default; using built-in IPAM plan");
-            return ipam_plan();
+            return (ipam_plan(), false);
         }
     };
 
@@ -120,13 +128,15 @@ async fn resolve_ipam_plan(client: &Client, namespace: &str) -> PoolPlan {
                 },
             )
             .await;
-            plan
+            (plan, false)
         }
         Err(err) => {
             error!(
                 error = %err,
-                "CIDRPool/default is invalid; falling back to the built-in IPAM plan. \
-                 Guest clusters will use 10.240.0.0/13 + 10.248.0.0/13 until this is fixed."
+                "CIDRPool/default is invalid; IPAM is FAILING CLOSED — no guest CIDRs will be \
+                 allocated until it is fixed. (Falling back to the built-in 10.240.0.0/13 plan \
+                 was deliberately avoided: the override implies the host overlaps it, so the \
+                 default would re-introduce the guest CoreDNS x509 break, #42.)"
             );
             patch_cidrpool_status(
                 &pools,
@@ -137,39 +147,60 @@ async fn resolve_ipam_plan(client: &Client, namespace: &str) -> PoolPlan {
                 },
             )
             .await;
-            ipam_plan()
+            (ipam_plan(), true)
         }
     }
 }
 
-/// Best-effort status patch on the singleton CIDRPool. Failures are
-/// logged, never fatal — the resolved plan is already in hand.
+/// Status patch on the singleton CIDRPool, retried a few times before giving up
+/// (the status is the operator-visible record of which plan is live, so a single
+/// transient apiserver blip shouldn't silently leave it stale). Still non-fatal —
+/// the resolved plan is already in hand.
 async fn patch_cidrpool_status(pools: &Api<CIDRPool>, status: CIDRPoolStatus) {
     let patch = serde_json::json!({ "status": status });
     let pp = PatchParams::default();
-    if let Err(err) = pools
-        .patch_status(CIDRPOOL_SINGLETON, &pp, &Patch::Merge(&patch))
-        .await
-    {
-        warn!(error = %err, "Failed to patch CIDRPool/default status (non-fatal)");
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match pools
+            .patch_status(CIDRPOOL_SINGLETON, &pp, &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => return,
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                }
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        warn!(error = %err, "Failed to patch CIDRPool/default status after retries (non-fatal); the live plan may not match CIDRPool.status");
     }
 }
 
 pub async fn run_ipam_controller(client: Client, namespace: &str, shutdown: CancellationToken) {
     let claims: Api<CIDRClaim> = Api::namespaced(client.clone(), namespace);
-    let plan = resolve_ipam_plan(&client, namespace).await;
+    let (plan, blocked) = resolve_ipam_plan(&client, namespace).await;
     let ctx = Arc::new(IpamContext {
         client,
         namespace: namespace.to_string(),
         plan,
+        blocked,
     });
 
-    info!(
-        capacity = ctx.plan.capacity(),
-        service_block = %ctx.plan.service_block_cidr(),
-        cluster_block = %ctx.plan.cluster_block_cidr(),
-        "Starting IPAM controller"
-    );
+    if blocked {
+        error!(
+            "IPAM controller starting in FAIL-CLOSED mode (CIDRPool/default invalid); claims will be held in Conflict until it is fixed and the operator restarts"
+        );
+    } else {
+        info!(
+            capacity = ctx.plan.capacity(),
+            service_block = %ctx.plan.service_block_cidr(),
+            cluster_block = %ctx.plan.cluster_block_cidr(),
+            "Starting IPAM controller"
+        );
+    }
 
     // Serialize allocation: a CIDRClaim binds the lowest free slot computed from
     // the live set of bound claims, so two claims reconciled concurrently can
@@ -218,6 +249,20 @@ async fn reconcile_claim(
     let claim_name = claim.name_any();
     let claim_ns = claim.namespace().unwrap_or_else(|| ctx.namespace.clone());
     let claims_api: Api<CIDRClaim> = Api::namespaced(ctx.client.clone(), &claim_ns);
+
+    // #42 fail-closed: an invalid CIDRPool/default means we must NOT allocate
+    // from the built-in default (which the override implies the host overlaps).
+    // Hold every claim in Conflict — visibly stuck — until it's fixed.
+    if ctx.blocked {
+        return set_conflict(
+            &claims_api,
+            &claim,
+            "IPAM is failing closed: CIDRPool/default is invalid. No CIDRs will be \
+             allocated until it is corrected and the operator restarts."
+                .to_string(),
+        )
+        .await;
+    }
 
     // If already Bound and the bound CIDRs round-trip cleanly through
     // the plan, nothing to do. Re-validating each reconcile catches
@@ -610,7 +655,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let plan = resolve_ipam_plan(&client, "test-ns").await;
+        let (plan, blocked) = resolve_ipam_plan(&client, "test-ns").await;
+        assert!(!blocked, "absent pool must not block allocation");
         assert_eq!(plan.service_block_cidr(), "10.240.0.0/13");
         assert_eq!(plan.cluster_block_cidr(), "10.248.0.0/13");
     }
@@ -656,8 +702,48 @@ mod tests {
             .mount(&server)
             .await;
 
-        let plan = resolve_ipam_plan(&client, "test-ns").await;
+        let (plan, blocked) = resolve_ipam_plan(&client, "test-ns").await;
+        assert!(!blocked, "valid override must not block allocation");
         assert_eq!(plan.service_block_cidr(), "100.64.0.0/13");
         assert_eq!(plan.cluster_block_cidr(), "100.72.0.0/13");
+    }
+
+    // #42 fail-closed: a present-but-invalid CIDRPool must BLOCK (not silently
+    // fall back to the host-colliding built-in default).
+    #[tokio::test]
+    async fn resolve_ipam_plan_blocks_on_invalid_override() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/cidrpools/default",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "CIDRPool",
+                "metadata": { "name": "default", "namespace": "test-ns" },
+                // Unaligned service block (10.64.5.0 is not on a /13 boundary).
+                "spec": {
+                    "serviceCidr": "10.64.5.0/13", "serviceSlotPrefix": 20,
+                    "clusterCidr": "10.72.0.0/13", "clusterSlotPrefix": 20
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(".*/cidrpools/default/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (_plan, blocked) = resolve_ipam_plan(&client, "test-ns").await;
+        assert!(
+            blocked,
+            "invalid override must fail closed (block allocation)"
+        );
     }
 }

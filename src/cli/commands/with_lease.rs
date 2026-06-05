@@ -51,7 +51,7 @@ pub async fn with_lease(command: WithLeaseCommand<'_>) -> Result<()> {
     let accepted = create_lease_request(&config, pool, command.ttl, None).await?;
     let lease_id = accepted.id.clone();
 
-    // Everything past creation must release the lease, even on error.
+    // Everything past creation must release the lease, even on error or signal.
     let outcome = run_wrapped(
         &config,
         &lease_id,
@@ -68,9 +68,17 @@ pub async fn with_lease(command: WithLeaseCommand<'_>) -> Result<()> {
         eprintln!("Released lease {lease_id}");
     }
 
-    outcome
+    // Propagate the wrapped command's real exit code (the lease is already
+    // released and run_wrapped's TempFile dropped, so process::exit is safe).
+    match outcome {
+        Ok(0) => Ok(()),
+        Ok(code) => std::process::exit(code),
+        Err(e) => Err(e),
+    }
 }
 
+/// Runs the wrapped command and returns its exit code. The lease is released by
+/// the caller regardless of how this returns.
 async fn run_wrapped(
     config: &ResolvedConfig,
     lease_id: &str,
@@ -78,7 +86,7 @@ async fn run_wrapped(
     ttl: &str,
     cmd: &[String],
     verbose: bool,
-) -> Result<()> {
+) -> Result<i32> {
     let ready = wait_for_usable_lease(config, lease_id, effective_ttl, None).await?;
     let kubeconfig = ready
         .kubeconfig
@@ -106,7 +114,7 @@ async fn run_wrapped(
         .spawn()
         .with_context(|| format!("failed to spawn '{}'", cmd[0]))?;
 
-    // Heartbeat-extend in the background until the child exits.
+    // Heartbeat-extend in the background until the child exits (or a signal).
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let hb = tokio::spawn({
         let config = config.clone();
@@ -120,14 +128,62 @@ async fn run_wrapped(
         }
     });
 
-    let status = child.wait().await.context("waiting for wrapped command")?;
+    // Wait for the child OR a termination signal. On a signal we kill the child
+    // and fall through so the caller still releases the lease — without this,
+    // Ctrl-C / SIGTERM would orphan the lease and leak the temp kubeconfig.
+    let code = wait_for_child_or_signal(&mut child, verbose).await;
+
     let _ = stop_tx.send(());
     let _ = hb.await;
+    Ok(code)
+}
 
-    if !status.success() {
-        // Surface non-zero exit as an error so `kobe with-lease` itself fails
-        // (after releasing the lease above).
-        anyhow::bail!("command exited with status {}", status.code().unwrap_or(1));
+fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> i32 {
+    status.ok().and_then(|s| s.code()).unwrap_or(1)
+}
+
+/// Wait for the child to exit, or for SIGINT/SIGTERM. On a signal, kill the
+/// child and return the conventional `128 + signo` code; otherwise the child's
+/// own exit code. Returns even on a signal so the caller can release the lease.
+#[cfg(unix)]
+async fn wait_for_child_or_signal(child: &mut tokio::process::Child, verbose: bool) -> i32 {
+    use tokio::signal::unix::{SignalKind, signal};
+    // Signal arms only return a label+code; the kill runs AFTER the select so it
+    // doesn't fight the `child.wait()` borrow.
+    let signalled: Option<(&str, i32)> = match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => tokio::select! {
+            status = child.wait() => return exit_code(status),
+            _ = tokio::signal::ctrl_c() => Some(("SIGINT", 130)),
+            _ = sigterm.recv() => Some(("SIGTERM", 143)),
+        },
+        Err(_) => tokio::select! {
+            status = child.wait() => return exit_code(status),
+            _ = tokio::signal::ctrl_c() => Some(("SIGINT", 130)),
+        },
+    };
+    match signalled {
+        Some((name, code)) => {
+            if verbose {
+                eprintln!("{name} received; stopping command and releasing lease...");
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            code
+        }
+        None => 1,
     }
-    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_child_or_signal(child: &mut tokio::process::Child, verbose: bool) -> i32 {
+    tokio::select! {
+        status = child.wait() => return exit_code(status),
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    if verbose {
+        eprintln!("Interrupted; stopping command and releasing lease...");
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    130
 }
