@@ -37,6 +37,11 @@ pub struct ProfileContext {
     /// `profile_spec_hash` so a sidecar bump triggers vkobe pool
     /// recycling automatically. See `pool::manager::RenderContext`.
     pub render_ctx: crate::pool::RenderContext,
+    /// `(profile, generation)` pairs whose golden backup is currently being
+    /// built. A golden backup runs for minutes and only records its generation
+    /// on success, so without this guard every ~30s reconcile would respawn a
+    /// duplicate task that races on the same temp cluster + Velero Backup name.
+    pub golden_in_progress: Arc<std::sync::Mutex<std::collections::HashSet<(String, i64)>>>,
 }
 
 #[cfg(test)]
@@ -60,6 +65,7 @@ mod cluster_instance_tests {
             velero: None,
             factory: None,
             render_ctx: crate::pool::RenderContext::with_kobe_sync_image("zondax/kobe-sync:test"),
+            golden_in_progress: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         });
         (ctx, server)
     }
@@ -241,6 +247,7 @@ pub async fn run_profile_controller(
         velero,
         factory,
         render_ctx,
+        golden_in_progress: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
     info!("Starting profile controller");
@@ -307,92 +314,113 @@ async fn reconcile_profile(
             .unwrap_or(0);
 
         if profile_gen > golden_gen {
-            info!(
-                profile = %name,
-                profile_generation = profile_gen,
-                golden_generation = golden_gen,
-                "Profile generation changed, triggering golden backup rebuild"
-            );
-
-            let velero = velero.clone();
-            let snapshot = snapshot.clone();
-            let profile_name = name.clone();
-            let spec = profile.spec.clone();
-            let backend = if let Some(ref f) = ctx.factory {
-                f.backend_for(&profile)?
+            // Skip if a backup for this generation is already running. The guard
+            // is released by the spawned task on completion (success OR failure).
+            // status.goldenGeneration is only written on success, so without this
+            // every ~30s reconcile during the multi-minute backup would respawn a
+            // duplicate task racing on the same temp cluster + Velero Backup name.
+            let key = (name.clone(), profile_gen);
+            let newly_started = ctx.golden_in_progress.lock().unwrap().insert(key.clone());
+            if !newly_started {
+                debug!(
+                    profile = %name,
+                    generation = profile_gen,
+                    "Golden backup already in progress for this generation, not respawning"
+                );
             } else {
-                crate::backend::BackendDispatch::K3s(crate::backend::K3sBackend::new(
-                    ctx.client.clone(),
-                    None,
-                    None,
-                ))
-            };
-            let client = ctx.client.clone();
-            let ns = ns.clone();
+                info!(
+                    profile = %name,
+                    profile_generation = profile_gen,
+                    golden_generation = golden_gen,
+                    "Profile generation changed, triggering golden backup rebuild"
+                );
 
-            tokio::spawn(async move {
-                let generation = profile_gen;
-                match velero
-                    .create_golden_backup(&profile_name, &spec, &backend, &snapshot, generation)
-                    .await
-                {
-                    Ok(backup_name) => {
-                        info!(
-                            profile = %profile_name,
-                            backup = %backup_name,
-                            generation = profile_gen,
-                            "Golden backup created successfully"
-                        );
+                let velero = velero.clone();
+                let snapshot = snapshot.clone();
+                let profile_name = name.clone();
+                let spec = profile.spec.clone();
+                let backend = if let Some(ref f) = ctx.factory {
+                    f.backend_for(&profile)?
+                } else {
+                    crate::backend::BackendDispatch::K3s(crate::backend::K3sBackend::new(
+                        ctx.client.clone(),
+                        None,
+                        None,
+                    ))
+                };
+                let client = ctx.client.clone();
+                let ns = ns.clone();
+                let in_progress = ctx.golden_in_progress.clone();
 
-                        crate::metrics::GOLDEN_BACKUP_TOTAL
-                            .with_label_values(&[profile_name.as_str(), "ok"])
-                            .inc();
+                tokio::spawn(async move {
+                    let generation = profile_gen;
+                    match velero
+                        .create_golden_backup(&profile_name, &spec, &backend, &snapshot, generation)
+                        .await
+                    {
+                        Ok(backup_name) => {
+                            info!(
+                                profile = %profile_name,
+                                backup = %backup_name,
+                                generation = profile_gen,
+                                "Golden backup created successfully"
+                            );
 
-                        let profiles_api: Api<ClusterPool> = Api::namespaced(client.clone(), &ns);
-                        let status_patch = serde_json::json!({
-                            "status": {
-                                "goldenBackup": backup_name,
-                                "goldenGeneration": profile_gen,
+                            crate::metrics::GOLDEN_BACKUP_TOTAL
+                                .with_label_values(&[profile_name.as_str(), "ok"])
+                                .inc();
+
+                            let profiles_api: Api<ClusterPool> =
+                                Api::namespaced(client.clone(), &ns);
+                            let status_patch = serde_json::json!({
+                                "status": {
+                                    "goldenBackup": backup_name,
+                                    "goldenGeneration": profile_gen,
+                                }
+                            });
+                            if let Err(e) = profiles_api
+                                .patch_status(
+                                    &profile_name,
+                                    &PatchParams::apply("kobe-operator"),
+                                    &Patch::Merge(&status_patch),
+                                )
+                                .await
+                            {
+                                error!(
+                                    profile = %profile_name,
+                                    error = %e,
+                                    "Failed to patch profile status with golden backup info"
+                                );
                             }
-                        });
-                        if let Err(e) = profiles_api
-                            .patch_status(
-                                &profile_name,
-                                &PatchParams::apply("kobe-operator"),
-                                &Patch::Merge(&status_patch),
-                            )
-                            .await
-                        {
+
+                            if let Err(e) = velero
+                                .cleanup_old_backups(&profile_name, &snapshot, generation)
+                                .await
+                            {
+                                warn!(
+                                    profile = %profile_name,
+                                    error = %e,
+                                    "Failed to clean up old golden backups"
+                                );
+                            }
+                        }
+                        Err(e) => {
                             error!(
                                 profile = %profile_name,
                                 error = %e,
-                                "Failed to patch profile status with golden backup info"
+                                "Failed to create golden backup"
                             );
+                            crate::metrics::GOLDEN_BACKUP_TOTAL
+                                .with_label_values(&[profile_name.as_str(), "error"])
+                                .inc();
                         }
+                    }
 
-                        if let Err(e) = velero
-                            .cleanup_old_backups(&profile_name, &snapshot, generation)
-                            .await
-                        {
-                            warn!(
-                                profile = %profile_name,
-                                error = %e,
-                                "Failed to clean up old golden backups"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            profile = %profile_name,
-                            error = %e,
-                            "Failed to create golden backup"
-                        );
-                        crate::metrics::GOLDEN_BACKUP_TOTAL
-                            .with_label_values(&[profile_name.as_str(), "error"])
-                            .inc();
-                    }
-                }
-            });
+                    // Release the guard so a later generation (or a retry after
+                    // failure) can rebuild.
+                    in_progress.lock().unwrap().remove(&key);
+                });
+            }
         }
     }
 

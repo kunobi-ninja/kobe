@@ -732,6 +732,23 @@ async fn resolve_instance_config(
     })
 }
 
+/// Read the owning ClusterPool's `status.goldenGeneration` — the generation at
+/// which its golden backup was actually built. Returns `None` when the profile
+/// is absent (e.g. a standalone instance) or has no golden backup recorded yet,
+/// in which case a fresh create is the correct behavior.
+async fn golden_generation_for<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    owner_name: &str,
+) -> Option<i64> {
+    let pools: Api<ClusterPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    pools
+        .get(owner_name)
+        .await
+        .ok()
+        .and_then(|p| p.status)
+        .and_then(|s| s.golden_generation)
+}
+
 async fn provision_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     config: &ResolvedInstanceConfig,
@@ -745,10 +762,17 @@ async fn provision_instance<B: ClusterBackend + Clone>(
         && let (Some(velero), Some(snapshot)) = (&ctx.velero, &config.snapshot)
         && snapshot.enabled
     {
-        let generation = 1;
-        if let Ok(Some(backup_name)) = velero
-            .get_golden_backup(&config.owner_name, snapshot, generation)
-            .await
+        // The golden backup is built at the profile's metadata.generation and
+        // recorded in its status.goldenGeneration. Look the backup up at THAT
+        // generation rather than a hardcoded gen 1, which silently 404s (and so
+        // skips restore entirely) for any pool whose spec has ever been edited.
+        // `None` => no golden backup recorded yet, so fall through to a fresh
+        // create.
+        let generation = golden_generation_for(ctx, &config.owner_name).await;
+        if let Some(generation) = generation
+            && let Ok(Some(backup_name)) = velero
+                .get_golden_backup(&config.owner_name, snapshot, generation)
+                .await
         {
             info!(
                 instance = %name,
