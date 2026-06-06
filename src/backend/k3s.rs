@@ -31,9 +31,9 @@ use crate::crd::{
 };
 
 use super::{
-    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
-    node_affinity_from_selector, read_kubeconfig_secret, server_anti_affinity_terms,
-    virtual_client_from_kubeconfig,
+    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health,
+    data_volume_claim_template, datastore, node_affinity_from_selector, read_kubeconfig_secret,
+    server_anti_affinity_terms, virtual_client_from_kubeconfig,
 };
 
 /// Labels applied to all resources managed by this backend.
@@ -590,14 +590,12 @@ impl K3sBackend {
             },
         ];
 
-        // Data volume — PVC if persistence is configured, otherwise emptyDir
-        if config.persistence.is_some() {
-            volumes.push(Volume {
-                name: "data".to_string(),
-                empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
-                ..Default::default()
-            });
-        }
+        // Data volume. When persistence is configured the `data` volume is
+        // backed by a per-replica PVC declared in the StatefulSet's
+        // `volumeClaimTemplates` (see `build_server_statefulset`), so it is NOT
+        // listed here — adding a pod-level volume of the same name would shadow
+        // the claim template. Without persistence, no `data` volume is needed
+        // (the container mount is only added when persistence is set).
 
         // Optional registries.yaml ConfigMap — only mounted when
         // registry_mirrors was set on the ClusterConfig.
@@ -640,6 +638,15 @@ impl K3sBackend {
             Self::build_publisher_sidecar(name, namespace, &image, cluster_domain(config));
         let volumes = Self::build_server_volumes(name, config);
 
+        // When persistence is configured, back the `data` volume (mounted at
+        // k3s's real data dir `/var/lib/rancher/k3s`) with a per-replica PVC via
+        // `volumeClaimTemplates` instead of an emptyDir, so control-plane state
+        // survives reschedules. `None` ⇒ no template (no `data` mount either).
+        let volume_claim_templates = config
+            .persistence
+            .as_ref()
+            .map(|p| vec![data_volume_claim_template("data", p)]);
+
         StatefulSet {
             metadata: ObjectMeta {
                 name: Some(format!("{name}-server")),
@@ -671,6 +678,7 @@ impl K3sBackend {
                         ..Default::default()
                     }),
                 },
+                volume_claim_templates,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1356,18 +1364,102 @@ mod tests {
         config.persistence = Some(PersistenceConfig {
             storage_type: Some("dynamic".to_string()),
             storage_class_name: Some("local-path".to_string()),
-            storage_request_size: Some("10Gi".to_string()),
+            storage_request_size: Some("20Gi".to_string()),
         });
 
         let sts = K3sBackend::build_server_statefulset("p-cluster", "ns", &config, None);
+        let sts_spec = sts.spec.as_ref().unwrap();
+        let pod_spec = sts_spec.template.spec.as_ref().unwrap();
 
-        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
-        let volumes = pod_spec.volumes.as_ref().unwrap();
-        assert!(volumes.iter().any(|v| v.name == "data"));
+        // The `data` volume must NOT appear as a pod-level (emptyDir) volume —
+        // it is provisioned via volumeClaimTemplates instead.
+        if let Some(volumes) = pod_spec.volumes.as_ref() {
+            assert!(
+                !volumes.iter().any(|v| v.name == "data"),
+                "data must come from volumeClaimTemplates, not a pod volume"
+            );
+        }
 
+        // The container still mounts `data` at k3s's real data dir.
         let server = &pod_spec.containers[0];
         let mounts = server.volume_mounts.as_ref().unwrap();
-        assert!(mounts.iter().any(|m| m.name == "data"));
+        let data_mount = mounts
+            .iter()
+            .find(|m| m.name == "data")
+            .expect("data mount must exist");
+        assert_eq!(data_mount.mount_path, "/var/lib/rancher/k3s");
+
+        // A volumeClaimTemplate must back the `data` volume, honoring the
+        // PersistenceConfig storageClassName + size request.
+        let templates = sts_spec
+            .volume_claim_templates
+            .as_ref()
+            .expect("volumeClaimTemplates must be present when persistence is set");
+        let data_pvc = templates
+            .iter()
+            .find(|t| t.metadata.name.as_deref() == Some("data"))
+            .expect("a `data` volumeClaimTemplate must exist");
+        let pvc_spec = data_pvc.spec.as_ref().unwrap();
+        assert_eq!(pvc_spec.storage_class_name.as_deref(), Some("local-path"));
+        assert_eq!(
+            pvc_spec
+                .resources
+                .as_ref()
+                .unwrap()
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("storage")
+                .unwrap()
+                .0,
+            "20Gi"
+        );
+        assert_eq!(
+            pvc_spec.access_modes.as_deref(),
+            Some(&["ReadWriteOnce".to_string()][..])
+        );
+    }
+
+    /// persistence=None must NOT create a volumeClaimTemplate (k3s falls back
+    /// to its container filesystem, the unchanged legacy behavior).
+    #[test]
+    fn test_build_server_statefulset_no_persistence_has_no_pvc_template() {
+        let config = base_config();
+        assert!(config.persistence.is_none());
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        assert!(
+            sts.spec.unwrap().volume_claim_templates.is_none(),
+            "no persistence ⇒ no volumeClaimTemplates"
+        );
+    }
+
+    /// When persistence is set without an explicit size, the PVC request falls
+    /// back to the default.
+    #[test]
+    fn test_persistence_default_size_when_unset() {
+        let mut config = base_config();
+        config.persistence = Some(PersistenceConfig {
+            storage_type: Some("dynamic".to_string()),
+            storage_class_name: None,
+            storage_request_size: None,
+        });
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let templates = sts.spec.unwrap().volume_claim_templates.unwrap();
+        let pvc_spec = templates[0].spec.as_ref().unwrap();
+        assert!(pvc_spec.storage_class_name.is_none());
+        assert_eq!(
+            pvc_spec
+                .resources
+                .as_ref()
+                .unwrap()
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("storage")
+                .unwrap()
+                .0,
+            "10Gi"
+        );
     }
 
     #[test]
@@ -2823,7 +2915,8 @@ mod tests {
             ..base_config()
         };
         let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
-        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let sts_spec = sts.spec.unwrap();
+        let pod = sts_spec.template.spec.unwrap();
 
         let server = pod
             .containers
@@ -2836,11 +2929,23 @@ mod tests {
             mounts.iter().any(|m| m.name == "kubelet-root"),
             "kubelet-root mount added"
         );
+        // The `data` volume is now backed by a volumeClaimTemplate (PVC), not a
+        // pod-level emptyDir; only `kubelet-root` remains a pod volume.
         let volumes = pod.volumes.as_ref().unwrap();
-        assert!(volumes.iter().any(|v| v.name == "data"), "data volume kept");
+        assert!(
+            !volumes.iter().any(|v| v.name == "data"),
+            "data must be a PVC (volumeClaimTemplate), not a pod volume"
+        );
         assert!(
             volumes.iter().any(|v| v.name == "kubelet-root"),
             "kubelet-root volume added"
+        );
+        assert!(
+            sts_spec
+                .volume_claim_templates
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|p| p.metadata.name.as_deref() == Some("data"))),
+            "a `data` volumeClaimTemplate must back the persistence mount"
         );
     }
 

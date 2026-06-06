@@ -67,7 +67,7 @@ pub fn translate_service_account_to_host(
     translator: &NameTranslator,
     virtual_ns: &str,
 ) -> anyhow::Result<ServiceAccount> {
-    let translated_meta = translator.translate_object_meta(&sa.metadata, virtual_ns);
+    let translated_meta = translator.translate_object_meta(&sa.metadata, virtual_ns)?;
     Ok(ServiceAccount {
         metadata: translated_meta,
         automount_service_account_token: sa.automount_service_account_token,
@@ -174,7 +174,11 @@ async fn handle_service_account_event(
                 return Ok(());
             }
             let virtual_name = sa.name_any();
-            let host_name = ctx.translator.to_host_name(&virtual_name, &virtual_ns);
+            // If the name can't be translated (contains the `-x-` separator),
+            // the object was never synced to the host — nothing to delete.
+            let Ok(host_name) = ctx.translator.to_host_name(&virtual_name, &virtual_ns) else {
+                return Ok(());
+            };
 
             debug!(
                 name = %host_name,

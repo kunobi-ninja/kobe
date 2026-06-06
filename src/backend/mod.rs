@@ -10,17 +10,19 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{
-    NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PodAffinityTerm,
-    PodAntiAffinity, Secret, WeightedPodAffinityTerm,
+    NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, Secret,
+    VolumeResourceRequirements, WeightedPodAffinityTerm,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use kube::api::{Api, Patch, PatchParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crd::{
     Addon, BackendType, BootstrapConfig, BootstrapJobSpec, BootstrapRef, ClusterConfig,
-    ClusterPool, InterInstanceSpread, ReadinessGate, SpreadStrength,
+    ClusterPool, InterInstanceSpread, PersistenceConfig, ReadinessGate, SpreadStrength,
 };
 
 pub use capi::CapiBackend;
@@ -139,6 +141,57 @@ pub(crate) fn server_anti_affinity_terms(
             ..Default::default()
         },
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Persistence helper shared by k3s and k0s backends.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Default size for the control-plane data PVC when
+/// [`PersistenceConfig::storage_request_size`] is omitted.
+pub(crate) const DEFAULT_PERSISTENCE_SIZE: &str = "10Gi";
+
+/// Build the StatefulSet `volumeClaimTemplates` entry that backs the named
+/// control-plane data volume with a real PVC.
+///
+/// Maps [`PersistenceConfig`] onto a `ReadWriteOnce` PVC:
+/// - `storage_class_name` → `spec.storageClassName` (omitted ⇒ cluster default)
+/// - `storage_request_size` → `spec.resources.requests.storage`
+///   (omitted ⇒ [`DEFAULT_PERSISTENCE_SIZE`])
+///
+/// The template's `metadata.name` MUST match the pod's `VolumeMount.name` so
+/// the StatefulSet controller wires the per-replica PVC into the mount that
+/// sits at the distro's real data dir (`/var/lib/rancher/k3s` for k3s,
+/// `/var/lib/k0s` for k0s). Without this the data volume was an `emptyDir`
+/// and control-plane state was lost on every reschedule.
+pub(crate) fn data_volume_claim_template(
+    volume_name: &str,
+    persistence: &PersistenceConfig,
+) -> PersistentVolumeClaim {
+    let size = persistence
+        .storage_request_size
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PERSISTENCE_SIZE.to_string());
+
+    let mut requests = BTreeMap::new();
+    requests.insert("storage".to_string(), Quantity(size));
+
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(volume_name.to_string()),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            storage_class_name: persistence.storage_class_name.clone(),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 // ---------------------------------------------------------------------------

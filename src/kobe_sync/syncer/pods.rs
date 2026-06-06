@@ -33,7 +33,7 @@ pub fn translate_pod_to_host(
     virtual_ns: &str,
 ) -> anyhow::Result<Pod> {
     let virtual_meta = pod.metadata.clone();
-    let translated_meta = translator.translate_object_meta(&virtual_meta, virtual_ns);
+    let translated_meta = translator.translate_object_meta(&virtual_meta, virtual_ns)?;
 
     let spec = pod
         .spec
@@ -46,7 +46,7 @@ pub fn translate_pod_to_host(
     //    Also remove projected SA token volumes and track their names.
     let dropped_volumes: HashSet<String>;
     if let Some(ref volumes) = spec.volumes {
-        let (translated_vols, dropped) = translate_volumes(volumes, translator, virtual_ns);
+        let (translated_vols, dropped) = translate_volumes(volumes, translator, virtual_ns)?;
         translated_spec.volumes = Some(translated_vols);
         dropped_volumes = dropped;
     } else {
@@ -74,41 +74,38 @@ pub fn translate_pod_to_host(
     //    both, so missing the deprecated field on its own is enough to
     //    fail admission even when the modern field looks correct.
     if let Some(sa) = spec.service_account_name.as_ref() {
-        translated_spec.service_account_name = Some(translator.to_host_name(sa, virtual_ns));
+        translated_spec.service_account_name = Some(translator.to_host_name(sa, virtual_ns)?);
     }
     if let Some(sa) = spec.service_account.as_ref() {
-        translated_spec.service_account = Some(translator.to_host_name(sa, virtual_ns));
+        translated_spec.service_account = Some(translator.to_host_name(sa, virtual_ns)?);
     }
 
     // 4. Translate containers (env vars, envFrom, volume mounts).
     translated_spec.containers =
-        translate_containers(&spec.containers, translator, virtual_ns, &dropped_volumes);
+        translate_containers(&spec.containers, translator, virtual_ns, &dropped_volumes)?;
     if let Some(ref init_containers) = spec.init_containers {
         translated_spec.init_containers = Some(translate_containers(
             init_containers,
             translator,
             virtual_ns,
             &dropped_volumes,
-        ));
+        )?);
     }
 
     // 5. Translate imagePullSecrets.
     if let Some(ref pull_secrets) = spec.image_pull_secrets {
-        translated_spec.image_pull_secrets = Some(
-            pull_secrets
-                .iter()
-                .map(|lor| {
-                    let name = &lor.name;
-                    if !name.is_empty() && translator.to_virtual(name).is_none() {
-                        LocalObjectReference {
-                            name: translator.to_host_name(name, virtual_ns),
-                        }
-                    } else {
-                        lor.clone()
-                    }
-                })
-                .collect(),
-        );
+        let mut translated_pull_secrets = Vec::with_capacity(pull_secrets.len());
+        for lor in pull_secrets {
+            let name = &lor.name;
+            if !name.is_empty() && translator.to_virtual(name).is_none() {
+                translated_pull_secrets.push(LocalObjectReference {
+                    name: translator.to_host_name(name, virtual_ns)?,
+                });
+            } else {
+                translated_pull_secrets.push(lor.clone());
+            }
+        }
+        translated_spec.image_pull_secrets = Some(translated_pull_secrets);
     }
 
     // 6. Clear nodeName -- let the host scheduler place the Pod.
@@ -135,7 +132,7 @@ fn translate_volumes(
     volumes: &[Volume],
     translator: &NameTranslator,
     virtual_ns: &str,
-) -> (Vec<Volume>, HashSet<String>) {
+) -> anyhow::Result<(Vec<Volume>, HashSet<String>)> {
     let mut translated_volumes = Vec::new();
     let mut dropped_names: HashSet<String> = HashSet::new();
 
@@ -160,7 +157,7 @@ fn translate_volumes(
             let cm_name = &cm.name;
             if !cm_name.is_empty() && translator.to_virtual(cm_name).is_none() {
                 translated.config_map = Some(ConfigMapVolumeSource {
-                    name: translator.to_host_name(cm_name, virtual_ns),
+                    name: translator.to_host_name(cm_name, virtual_ns)?,
                     ..cm.clone()
                 });
             }
@@ -172,7 +169,7 @@ fn translate_volumes(
             && translator.to_virtual(secret_name).is_none()
         {
             translated.secret = Some(SecretVolumeSource {
-                secret_name: Some(translator.to_host_name(secret_name, virtual_ns)),
+                secret_name: Some(translator.to_host_name(secret_name, virtual_ns)?),
                 ..secret.clone()
             });
         }
@@ -182,7 +179,7 @@ fn translate_volumes(
             let claim_name = &pvc.claim_name;
             if translator.to_virtual(claim_name).is_none() {
                 translated.persistent_volume_claim = Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: translator.to_host_name(claim_name, virtual_ns),
+                    claim_name: translator.to_host_name(claim_name, virtual_ns)?,
                     ..pvc.clone()
                 });
             }
@@ -191,7 +188,7 @@ fn translate_volumes(
         translated_volumes.push(translated);
     }
 
-    (translated_volumes, dropped_names)
+    Ok((translated_volumes, dropped_names))
 }
 
 /// Translate environment variable references (uses `NameTranslator` directly).
@@ -199,42 +196,42 @@ fn translate_env_vars(
     env: &[EnvVar],
     translator: &NameTranslator,
     virtual_ns: &str,
-) -> Vec<EnvVar> {
-    env.iter()
-        .map(|var| {
-            let mut translated = var.clone();
+) -> anyhow::Result<Vec<EnvVar>> {
+    let mut out = Vec::with_capacity(env.len());
+    for var in env {
+        let mut translated = var.clone();
 
-            if let Some(ref value_from) = var.value_from {
-                let mut translated_vf = value_from.clone();
+        if let Some(ref value_from) = var.value_from {
+            let mut translated_vf = value_from.clone();
 
-                // configMapKeyRef
-                if let Some(ref cm_ref) = value_from.config_map_key_ref {
-                    let cm_name = &cm_ref.name;
-                    if !cm_name.is_empty() && translator.to_virtual(cm_name).is_none() {
-                        translated_vf.config_map_key_ref = Some(ConfigMapKeySelector {
-                            name: translator.to_host_name(cm_name, virtual_ns),
-                            ..cm_ref.clone()
-                        });
-                    }
+            // configMapKeyRef
+            if let Some(ref cm_ref) = value_from.config_map_key_ref {
+                let cm_name = &cm_ref.name;
+                if !cm_name.is_empty() && translator.to_virtual(cm_name).is_none() {
+                    translated_vf.config_map_key_ref = Some(ConfigMapKeySelector {
+                        name: translator.to_host_name(cm_name, virtual_ns)?,
+                        ..cm_ref.clone()
+                    });
                 }
-
-                // secretKeyRef
-                if let Some(ref secret_ref) = value_from.secret_key_ref {
-                    let secret_name = &secret_ref.name;
-                    if !secret_name.is_empty() && translator.to_virtual(secret_name).is_none() {
-                        translated_vf.secret_key_ref = Some(SecretKeySelector {
-                            name: translator.to_host_name(secret_name, virtual_ns),
-                            ..secret_ref.clone()
-                        });
-                    }
-                }
-
-                translated.value_from = Some(translated_vf);
             }
 
-            translated
-        })
-        .collect()
+            // secretKeyRef
+            if let Some(ref secret_ref) = value_from.secret_key_ref {
+                let secret_name = &secret_ref.name;
+                if !secret_name.is_empty() && translator.to_virtual(secret_name).is_none() {
+                    translated_vf.secret_key_ref = Some(SecretKeySelector {
+                        name: translator.to_host_name(secret_name, virtual_ns)?,
+                        ..secret_ref.clone()
+                    });
+                }
+            }
+
+            translated.value_from = Some(translated_vf);
+        }
+
+        out.push(translated);
+    }
+    Ok(out)
 }
 
 /// Translate containers (env vars, envFrom, volume mounts).
@@ -247,69 +244,63 @@ fn translate_containers(
     translator: &NameTranslator,
     virtual_ns: &str,
     dropped_volumes: &HashSet<String>,
-) -> Vec<Container> {
-    containers
-        .iter()
-        .map(|container| {
-            let mut translated = container.clone();
+) -> anyhow::Result<Vec<Container>> {
+    let mut out = Vec::with_capacity(containers.len());
+    for container in containers {
+        let mut translated = container.clone();
 
-            // Translate env vars.
-            if let Some(ref env) = container.env {
-                translated.env = Some(translate_env_vars(env, translator, virtual_ns));
+        // Translate env vars.
+        if let Some(ref env) = container.env {
+            translated.env = Some(translate_env_vars(env, translator, virtual_ns)?);
+        }
+
+        // Translate envFrom sources.
+        if let Some(ref env_from) = container.env_from {
+            let mut translated_env_from = Vec::with_capacity(env_from.len());
+            for ef in env_from {
+                let mut translated_ef = ef.clone();
+
+                if let Some(ref cm_ref) = ef.config_map_ref {
+                    let cm_name = &cm_ref.name;
+                    if !cm_name.is_empty() && translator.to_virtual(cm_name).is_none() {
+                        translated_ef.config_map_ref = Some(ConfigMapEnvSource {
+                            name: translator.to_host_name(cm_name, virtual_ns)?,
+                            ..cm_ref.clone()
+                        });
+                    }
+                }
+
+                if let Some(ref secret_ref) = ef.secret_ref {
+                    let secret_name = &secret_ref.name;
+                    if !secret_name.is_empty() && translator.to_virtual(secret_name).is_none() {
+                        translated_ef.secret_ref = Some(SecretEnvSource {
+                            name: translator.to_host_name(secret_name, virtual_ns)?,
+                            ..secret_ref.clone()
+                        });
+                    }
+                }
+
+                translated_env_from.push(translated_ef);
             }
+            translated.env_from = Some(translated_env_from);
+        }
 
-            // Translate envFrom sources.
-            if let Some(ref env_from) = container.env_from {
-                translated.env_from = Some(
-                    env_from
-                        .iter()
-                        .map(|ef| {
-                            let mut translated_ef = ef.clone();
+        // Remove volume mounts that reference dropped volumes (e.g. projected
+        // SA token volumes). Uses the exact set of dropped names rather than
+        // a fragile string-prefix heuristic.
+        if let Some(ref mounts) = container.volume_mounts {
+            translated.volume_mounts = Some(
+                mounts
+                    .iter()
+                    .filter(|m| !dropped_volumes.contains(&m.name))
+                    .cloned()
+                    .collect(),
+            );
+        }
 
-                            if let Some(ref cm_ref) = ef.config_map_ref {
-                                let cm_name = &cm_ref.name;
-                                if !cm_name.is_empty() && translator.to_virtual(cm_name).is_none() {
-                                    translated_ef.config_map_ref = Some(ConfigMapEnvSource {
-                                        name: translator.to_host_name(cm_name, virtual_ns),
-                                        ..cm_ref.clone()
-                                    });
-                                }
-                            }
-
-                            if let Some(ref secret_ref) = ef.secret_ref {
-                                let secret_name = &secret_ref.name;
-                                if !secret_name.is_empty()
-                                    && translator.to_virtual(secret_name).is_none()
-                                {
-                                    translated_ef.secret_ref = Some(SecretEnvSource {
-                                        name: translator.to_host_name(secret_name, virtual_ns),
-                                        ..secret_ref.clone()
-                                    });
-                                }
-                            }
-
-                            translated_ef
-                        })
-                        .collect(),
-                );
-            }
-
-            // Remove volume mounts that reference dropped volumes (e.g. projected
-            // SA token volumes). Uses the exact set of dropped names rather than
-            // a fragile string-prefix heuristic.
-            if let Some(ref mounts) = container.volume_mounts {
-                translated.volume_mounts = Some(
-                    mounts
-                        .iter()
-                        .filter(|m| !dropped_volumes.contains(&m.name))
-                        .cloned()
-                        .collect(),
-                );
-            }
-
-            translated
-        })
-        .collect()
+        out.push(translated);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +398,11 @@ async fn handle_pod_event(
             }
 
             let virtual_name = pod.name_any();
-            let host_name = ctx.translator.to_host_name(&virtual_name, &virtual_ns);
+            // If the name can't be translated (contains the `-x-` separator),
+            // the object was never synced to the host — nothing to delete.
+            let Ok(host_name) = ctx.translator.to_host_name(&virtual_name, &virtual_ns) else {
+                return Ok(());
+            };
 
             debug!(
                 name = %host_name,

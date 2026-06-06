@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::kobe_sync::syncer::translator::NameTranslator;
+use crate::kobe_sync::syncer::translator::{NameTranslator, TranslateError};
 
 // ---------------------------------------------------------------------------
 // Response body types
@@ -383,17 +383,23 @@ pub fn parse_subresource(path: &str) -> Option<SubresourceRequest> {
 ///
 /// Returns `(host_path, host_namespace)` where `host_path` is the full API path
 /// targeting the translated pod name in the host namespace.
+///
+/// # Errors
+///
+/// Propagates [`TranslateError`] when the virtual pod name or namespace
+/// contains the `-x-` separator token (such a pod was never synced to the
+/// host, so the request cannot be routed).
 pub fn translate_subresource_to_host(
     sub: &SubresourceRequest,
     translator: &NameTranslator,
-) -> (String, String) {
-    let host_name = translator.to_host_name(&sub.pod_name, &sub.namespace);
+) -> Result<(String, String), TranslateError> {
+    let host_name = translator.to_host_name(&sub.pod_name, &sub.namespace)?;
     let host_ns = translator.host_namespace().to_string();
     let host_path = format!(
         "/api/v1/namespaces/{}/pods/{}/{}",
         host_ns, host_name, sub.subresource
     );
-    (host_path, host_ns)
+    Ok((host_path, host_ns))
 }
 
 // ===========================================================================
@@ -952,7 +958,21 @@ impl VirtualClusterProxy {
         req: Request<Incoming>,
         sub: SubresourceRequest,
     ) -> Result<Response<ProxyBody>, hyper::Error> {
-        let (host_path, _host_ns) = translate_subresource_to_host(&sub, &self.translator);
+        let (host_path, _host_ns) = match translate_subresource_to_host(&sub, &self.translator) {
+            Ok(translated) => translated,
+            Err(e) => {
+                warn!(
+                    virtual_pod = %sub.pod_name,
+                    virtual_ns = %sub.namespace,
+                    error = %e,
+                    "Rejecting subresource request: pod name/namespace is not translatable"
+                );
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "pod name or namespace contains the reserved `-x-` separator",
+                ));
+            }
+        };
         let query = req
             .uri()
             .query()
@@ -1136,7 +1156,7 @@ mod tests {
             pod_name: "my-app".into(),
             subresource: "exec".into(),
         };
-        let (host_path, host_ns) = translate_subresource_to_host(&sub, &translator);
+        let (host_path, host_ns) = translate_subresource_to_host(&sub, &translator).unwrap();
         assert_eq!(
             host_path,
             "/api/v1/namespaces/pool-test/pods/my-app-x-default-x-vc/exec"
@@ -1152,7 +1172,7 @@ mod tests {
             pod_name: "coredns".into(),
             subresource: "portforward".into(),
         };
-        let (host_path, host_ns) = translate_subresource_to_host(&sub, &translator);
+        let (host_path, host_ns) = translate_subresource_to_host(&sub, &translator).unwrap();
         assert_eq!(
             host_path,
             "/api/v1/namespaces/pool-prod/pods/coredns-x-kube-system-x-vc/portforward"
@@ -1168,7 +1188,7 @@ mod tests {
             pod_name: "web-server".into(),
             subresource: "log".into(),
         };
-        let (host_path, _) = translate_subresource_to_host(&sub, &translator);
+        let (host_path, _) = translate_subresource_to_host(&sub, &translator).unwrap();
         assert_eq!(
             host_path,
             "/api/v1/namespaces/pool-dev/pods/web-server-x-staging-x-vc/log"

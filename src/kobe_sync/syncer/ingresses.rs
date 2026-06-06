@@ -27,50 +27,53 @@ pub fn translate_ingress_to_host(
     translator: &NameTranslator,
     virtual_ns: &str,
 ) -> anyhow::Result<Ingress> {
-    let translated_meta = translator.translate_object_meta(&ing.metadata, virtual_ns);
+    let translated_meta = translator.translate_object_meta(&ing.metadata, virtual_ns)?;
 
-    let translated_spec = ing.spec.as_ref().map(|spec| {
-        let mut new_spec = spec.clone();
+    let translated_spec = match ing.spec.as_ref() {
+        Some(spec) => {
+            let mut new_spec = spec.clone();
 
-        // Translate the default backend service name.
-        if let Some(ref mut default_backend) = new_spec.default_backend
-            && let Some(ref mut svc) = default_backend.service
-            && !svc.name.is_empty()
-            && translator.to_virtual(&svc.name).is_none()
-        {
-            svc.name = translator.to_host_name(&svc.name, virtual_ns);
-        }
+            // Translate the default backend service name.
+            if let Some(ref mut default_backend) = new_spec.default_backend
+                && let Some(ref mut svc) = default_backend.service
+                && !svc.name.is_empty()
+                && translator.to_virtual(&svc.name).is_none()
+            {
+                svc.name = translator.to_host_name(&svc.name, virtual_ns)?;
+            }
 
-        // Translate rule backend service names.
-        if let Some(ref mut rules) = new_spec.rules {
-            for rule in rules.iter_mut() {
-                if let Some(ref mut http) = rule.http {
-                    for path in &mut http.paths {
-                        if let Some(ref mut svc) = path.backend.service
-                            && !svc.name.is_empty()
-                            && translator.to_virtual(&svc.name).is_none()
-                        {
-                            svc.name = translator.to_host_name(&svc.name, virtual_ns);
+            // Translate rule backend service names.
+            if let Some(ref mut rules) = new_spec.rules {
+                for rule in rules.iter_mut() {
+                    if let Some(ref mut http) = rule.http {
+                        for path in &mut http.paths {
+                            if let Some(ref mut svc) = path.backend.service
+                                && !svc.name.is_empty()
+                                && translator.to_virtual(&svc.name).is_none()
+                            {
+                                svc.name = translator.to_host_name(&svc.name, virtual_ns)?;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Translate TLS secret names.
-        if let Some(ref mut tls_list) = new_spec.tls {
-            for tls in tls_list.iter_mut() {
-                if let Some(ref secret_name) = tls.secret_name.clone()
-                    && !secret_name.is_empty()
-                    && translator.to_virtual(secret_name).is_none()
-                {
-                    tls.secret_name = Some(translator.to_host_name(secret_name, virtual_ns));
+            // Translate TLS secret names.
+            if let Some(ref mut tls_list) = new_spec.tls {
+                for tls in tls_list.iter_mut() {
+                    if let Some(ref secret_name) = tls.secret_name.clone()
+                        && !secret_name.is_empty()
+                        && translator.to_virtual(secret_name).is_none()
+                    {
+                        tls.secret_name = Some(translator.to_host_name(secret_name, virtual_ns)?);
+                    }
                 }
             }
-        }
 
-        new_spec
-    });
+            Some(new_spec)
+        }
+        None => None,
+    };
 
     Ok(Ingress {
         metadata: translated_meta,
@@ -173,7 +176,11 @@ async fn handle_ingress_event(
             }
 
             let virtual_name = ing.name_any();
-            let host_name = ctx.translator.to_host_name(&virtual_name, &virtual_ns);
+            // If the name can't be translated (contains the `-x-` separator),
+            // the object was never synced to the host — nothing to delete.
+            let Ok(host_name) = ctx.translator.to_host_name(&virtual_name, &virtual_ns) else {
+                return Ok(());
+            };
 
             debug!(
                 name = %host_name,

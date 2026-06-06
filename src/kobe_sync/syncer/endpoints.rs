@@ -26,71 +26,64 @@ pub fn translate_endpoints_to_host(
     translator: &NameTranslator,
     virtual_ns: &str,
 ) -> anyhow::Result<Endpoints> {
-    let translated_meta = translator.translate_object_meta(&ep.metadata, virtual_ns);
+    let translated_meta = translator.translate_object_meta(&ep.metadata, virtual_ns)?;
 
-    let translated_subsets = ep.subsets.as_ref().map(|subsets| {
-        subsets
-            .iter()
-            .map(|subset| {
+    let translated_subsets = match ep.subsets.as_ref() {
+        Some(subsets) => {
+            let mut new_subsets = Vec::with_capacity(subsets.len());
+            for subset in subsets {
                 let mut new_subset = subset.clone();
 
                 // Translate addresses targetRef names.
                 if let Some(ref addresses) = subset.addresses {
-                    new_subset.addresses = Some(
-                        addresses
-                            .iter()
-                            .map(|addr| {
-                                let mut new_addr = addr.clone();
-                                if let Some(ref target_ref) = addr.target_ref
-                                    && let Some(ref pod_name) = target_ref.name
-                                    && translator.to_virtual(pod_name).is_none()
-                                {
-                                    let mut new_ref = target_ref.clone();
-                                    new_ref.name =
-                                        Some(translator.to_host_name(pod_name, virtual_ns));
-                                    new_ref.namespace =
-                                        Some(translator.host_namespace().to_string());
-                                    new_addr.target_ref = Some(new_ref);
-                                }
-                                new_addr
-                            })
-                            .collect(),
-                    );
+                    new_subset.addresses = Some(translate_endpoint_addresses(
+                        addresses, translator, virtual_ns,
+                    )?);
                 }
 
                 // Translate not_ready_addresses targetRef names.
                 if let Some(ref not_ready) = subset.not_ready_addresses {
-                    new_subset.not_ready_addresses = Some(
-                        not_ready
-                            .iter()
-                            .map(|addr| {
-                                let mut new_addr = addr.clone();
-                                if let Some(ref target_ref) = addr.target_ref
-                                    && let Some(ref pod_name) = target_ref.name
-                                    && translator.to_virtual(pod_name).is_none()
-                                {
-                                    let mut new_ref = target_ref.clone();
-                                    new_ref.name =
-                                        Some(translator.to_host_name(pod_name, virtual_ns));
-                                    new_ref.namespace =
-                                        Some(translator.host_namespace().to_string());
-                                    new_addr.target_ref = Some(new_ref);
-                                }
-                                new_addr
-                            })
-                            .collect(),
-                    );
+                    new_subset.not_ready_addresses = Some(translate_endpoint_addresses(
+                        not_ready, translator, virtual_ns,
+                    )?);
                 }
 
-                new_subset
-            })
-            .collect()
-    });
+                new_subsets.push(new_subset);
+            }
+            Some(new_subsets)
+        }
+        None => None,
+    };
 
     Ok(Endpoints {
         metadata: translated_meta,
         subsets: translated_subsets,
     })
+}
+
+/// Translate the `targetRef` pod name + namespace on each EndpointAddress to
+/// its host-side equivalent. Addresses whose targetRef is already a host name
+/// (or absent) are passed through unchanged.
+fn translate_endpoint_addresses(
+    addresses: &[k8s_openapi::api::core::v1::EndpointAddress],
+    translator: &NameTranslator,
+    virtual_ns: &str,
+) -> anyhow::Result<Vec<k8s_openapi::api::core::v1::EndpointAddress>> {
+    let mut out = Vec::with_capacity(addresses.len());
+    for addr in addresses {
+        let mut new_addr = addr.clone();
+        if let Some(ref target_ref) = addr.target_ref
+            && let Some(ref pod_name) = target_ref.name
+            && translator.to_virtual(pod_name).is_none()
+        {
+            let mut new_ref = target_ref.clone();
+            new_ref.name = Some(translator.to_host_name(pod_name, virtual_ns)?);
+            new_ref.namespace = Some(translator.host_namespace().to_string());
+            new_addr.target_ref = Some(new_ref);
+        }
+        out.push(new_addr);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +181,11 @@ async fn handle_endpoints_event(
             }
 
             let virtual_name = ep.name_any();
-            let host_name = ctx.translator.to_host_name(&virtual_name, &virtual_ns);
+            // If the name can't be translated (contains the `-x-` separator),
+            // the object was never synced to the host — nothing to delete.
+            let Ok(host_name) = ctx.translator.to_host_name(&virtual_name, &virtual_ns) else {
+                return Ok(());
+            };
 
             debug!(
                 name = %host_name,

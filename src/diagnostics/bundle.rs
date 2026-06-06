@@ -6,8 +6,18 @@ use kube::api::{Api, ListParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
+use std::time::Duration;
+
 use crate::backend::ClusterBackend;
 use crate::crd::DiagnosticsConfig;
+
+/// Lifetime of the presigned download URL for a diagnostics bundle.
+///
+/// The bundle can carry guest-cluster Secrets, and a presigned URL is a
+/// credential-free download link. The URL is fetched once by the owner shortly
+/// after capture, so we keep the window short (1h) rather than the previous
+/// 7-day exposure.
+const PRESIGN_EXPIRY: Duration = Duration::from_secs(3600);
 
 /// Capture a diagnostic bundle from a cluster and upload to S3.
 ///
@@ -60,10 +70,11 @@ pub async fn capture_bundle<B: ClusterBackend>(
 
     let (url, object_uri) = upload_to_s3(&config.storage, lease_id, &bundle_json).await?;
 
-    // Do NOT log the presigned URL: it is a credential-free, multi-day download
-    // link to a bundle that can contain guest-cluster Secrets. Logs are typically
-    // far more widely readable than the bucket or the (owner-scoped) lease status.
-    // Log only the object location, which requires bucket credentials to read.
+    // Do NOT log the presigned URL: it is a credential-free, time-limited
+    // download link to a bundle that can contain guest-cluster Secrets. Logs are
+    // typically far more widely readable than the bucket or the (owner-scoped)
+    // lease status. Log only the object location, which requires bucket
+    // credentials to read.
     info!(
         lease = lease_id,
         object = %object_uri,
@@ -290,7 +301,7 @@ async fn upload_to_s3(
         .context("Failed to upload diagnostic bundle to S3")?;
 
     let presigning_config = aws_sdk_s3::presigning::PresigningConfig::builder()
-        .expires_in(std::time::Duration::from_secs(7 * 24 * 3600))
+        .expires_in(PRESIGN_EXPIRY)
         .build()
         .context("Failed to build presigning config")?;
 
@@ -766,6 +777,17 @@ mod tests {
             format!("{prefix}/{lease_id}/diagnostics.json")
         };
         assert_eq!(key, "some/prefix/lease-1/diagnostics.json");
+    }
+
+    #[test]
+    fn presign_expiry_is_short() {
+        // The presigned URL grants credential-free access to a secret-bearing
+        // bundle; keep the window short (1h) — never the previous 7 days.
+        assert_eq!(PRESIGN_EXPIRY, std::time::Duration::from_secs(3600));
+        assert!(
+            PRESIGN_EXPIRY <= std::time::Duration::from_secs(24 * 3600),
+            "presign expiry must stay well under a day"
+        );
     }
 
     #[test]

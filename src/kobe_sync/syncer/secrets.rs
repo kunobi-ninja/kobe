@@ -25,7 +25,7 @@ pub fn translate_secret_to_host(
     translator: &NameTranslator,
     virtual_ns: &str,
 ) -> anyhow::Result<Secret> {
-    let translated_meta = translator.translate_object_meta(&secret.metadata, virtual_ns);
+    let translated_meta = translator.translate_object_meta(&secret.metadata, virtual_ns)?;
 
     Ok(Secret {
         metadata: translated_meta,
@@ -132,7 +132,11 @@ async fn handle_secret_event(
             }
 
             let virtual_name = secret.name_any();
-            let host_name = ctx.translator.to_host_name(&virtual_name, &virtual_ns);
+            // If the name can't be translated (contains the `-x-` separator),
+            // the object was never synced to the host — nothing to delete.
+            let Ok(host_name) = ctx.translator.to_host_name(&virtual_name, &virtual_ns) else {
+                return Ok(());
+            };
 
             debug!(
                 name = %host_name,

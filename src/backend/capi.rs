@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, ObjectMeta, Patch, PatchParams, TypeMeta};
 use kube::discovery::ApiResource;
@@ -66,7 +67,16 @@ impl CapiBackend {
     ///
     /// Creates a `cluster.x-k8s.io/v1beta1/Cluster` resource with an
     /// `infrastructureRef` pointing to the provider-specific infrastructure resource.
-    pub fn build_cluster_object(name: &str, namespace: &str, capi: &CapiConfig) -> DynamicObject {
+    ///
+    /// `owner_ref` (when `Some`) is stamped on `metadata.ownerReferences` so
+    /// k8s GC reaps the Cluster when the owning ClusterInstance is deleted, even
+    /// if the explicit `delete()` path never runs.
+    pub fn build_cluster_object(
+        name: &str,
+        namespace: &str,
+        capi: &CapiConfig,
+        owner_ref: Option<&OwnerReference>,
+    ) -> DynamicObject {
         let data = serde_json::json!({
             "spec": {
                 "infrastructureRef": {
@@ -94,6 +104,7 @@ impl CapiBackend {
                     .into_iter()
                     .collect(),
                 ),
+                owner_references: owner_ref.cloned().map(|o| vec![o]),
                 ..Default::default()
             },
             data,
@@ -104,10 +115,15 @@ impl CapiBackend {
     ///
     /// Creates an infrastructure resource (e.g., VCluster, K0smotronCluster)
     /// with the apiVersion, kind, and spec from the CapiConfig.
+    ///
+    /// `owner_ref` (when `Some`) is stamped on `metadata.ownerReferences` so
+    /// k8s GC reaps the infrastructure object when the owning ClusterInstance is
+    /// deleted, even if the explicit `delete()` path never runs.
     pub fn build_infrastructure_object(
         name: &str,
         namespace: &str,
         capi: &CapiConfig,
+        owner_ref: Option<&OwnerReference>,
     ) -> DynamicObject {
         let data = if let Some(spec) = &capi.infrastructure_spec {
             serde_json::json!({ "spec": spec })
@@ -131,6 +147,7 @@ impl CapiBackend {
                     .into_iter()
                     .collect(),
                 ),
+                owner_references: owner_ref.cloned().map(|o| vec![o]),
                 ..Default::default()
             },
             data,
@@ -209,16 +226,17 @@ impl CapiBackend {
 }
 
 impl ClusterBackend for CapiBackend {
-    #[tracing::instrument(skip(self, config, addons, _owner_ref), fields(cluster = name, namespace))]
+    #[tracing::instrument(skip(self, config, addons, owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
-        // CAPI clusters create k8s resources owned via labels; see
-        // VkobeBackend::create for where the OwnerRef is consumed.
-        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+        // Stamped on the CAPI `Cluster` and infrastructure objects so k8s GC
+        // reaps them with the owning ClusterInstance even if `delete()` never
+        // runs (defense-in-depth fallback alongside the explicit cascade).
+        owner_ref: Option<&OwnerReference>,
     ) -> Result<()> {
         info!(
             cluster = name,
@@ -229,7 +247,8 @@ impl ClusterBackend for CapiBackend {
         let _ = config; // CAPI does not use ClusterConfig — configuration is in CapiConfig.
 
         // 1. Create the infrastructure resource first.
-        let infra_obj = Self::build_infrastructure_object(name, namespace, &self.capi_config);
+        let infra_obj =
+            Self::build_infrastructure_object(name, namespace, &self.capi_config, owner_ref);
         let infra_ar = Self::infra_api_resource(&self.capi_config);
         let infra_api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), namespace, &infra_ar);
@@ -255,7 +274,7 @@ impl ClusterBackend for CapiBackend {
         );
 
         // 2. Create the Cluster resource with infrastructureRef.
-        let cluster_obj = Self::build_cluster_object(name, namespace, &self.capi_config);
+        let cluster_obj = Self::build_cluster_object(name, namespace, &self.capi_config, owner_ref);
         let cluster_ar = Self::cluster_api_resource();
         let cluster_api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), namespace, &cluster_ar);
@@ -429,7 +448,7 @@ mod tests {
     #[test]
     fn test_build_cluster_object() {
         let capi = base_capi_config();
-        let obj = CapiBackend::build_cluster_object("my-vc", "ns", &capi);
+        let obj = CapiBackend::build_cluster_object("my-vc", "ns", &capi, None);
         let types = obj.types.as_ref().unwrap();
         assert_eq!(types.api_version, "cluster.x-k8s.io/v1beta1");
         assert_eq!(types.kind, "Cluster");
@@ -458,7 +477,7 @@ mod tests {
     #[test]
     fn test_build_infrastructure_object() {
         let capi = base_capi_config();
-        let obj = CapiBackend::build_infrastructure_object("my-vc", "ns", &capi);
+        let obj = CapiBackend::build_infrastructure_object("my-vc", "ns", &capi, None);
         let types = obj.types.as_ref().unwrap();
         assert_eq!(
             types.api_version,
@@ -482,7 +501,7 @@ mod tests {
             infrastructure_spec: None,
             infrastructure_plural: None,
         };
-        let obj = CapiBackend::build_infrastructure_object("my-vc", "ns", &capi);
+        let obj = CapiBackend::build_infrastructure_object("my-vc", "ns", &capi, None);
 
         // spec should be an empty object
         let spec = obj.data.get("spec").unwrap();
@@ -500,7 +519,7 @@ mod tests {
             })),
             infrastructure_plural: None,
         };
-        let obj = CapiBackend::build_cluster_object("my-k0s", "ns", &capi);
+        let obj = CapiBackend::build_cluster_object("my-k0s", "ns", &capi, None);
         let spec = obj.data.get("spec").unwrap();
         let infra_ref = spec.get("infrastructureRef").unwrap();
         assert_eq!(infra_ref["kind"], "K0smotronCluster");
@@ -508,6 +527,54 @@ mod tests {
             infra_ref["apiVersion"],
             "controlplane.cluster.x-k8s.io/v1beta1"
         );
+    }
+
+    fn sample_owner_ref() -> OwnerReference {
+        OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
+            kind: "ClusterInstance".to_string(),
+            name: "my-vc".to_string(),
+            uid: "abc-123".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }
+    }
+
+    /// Regression for the GC fallback: when an OwnerReference is supplied it
+    /// MUST be stamped on both the CAPI `Cluster` and the infrastructure
+    /// object, so k8s garbage-collects them with the parent ClusterInstance
+    /// even if the explicit `delete()` path never runs.
+    #[test]
+    fn test_build_objects_stamp_owner_reference() {
+        let capi = base_capi_config();
+        let owner = sample_owner_ref();
+
+        let cluster = CapiBackend::build_cluster_object("my-vc", "ns", &capi, Some(&owner));
+        let cluster_owners = cluster
+            .metadata
+            .owner_references
+            .as_deref()
+            .expect("Cluster must carry an OwnerReference");
+        assert_eq!(cluster_owners, std::slice::from_ref(&owner));
+
+        let infra = CapiBackend::build_infrastructure_object("my-vc", "ns", &capi, Some(&owner));
+        let infra_owners = infra
+            .metadata
+            .owner_references
+            .as_deref()
+            .expect("infrastructure object must carry an OwnerReference");
+        assert_eq!(infra_owners, std::slice::from_ref(&owner));
+    }
+
+    /// When no OwnerReference is supplied, the field stays absent (legacy
+    /// behavior — relies on the explicit `delete()` cascade instead).
+    #[test]
+    fn test_build_objects_omit_owner_reference_when_none() {
+        let capi = base_capi_config();
+        let cluster = CapiBackend::build_cluster_object("my-vc", "ns", &capi, None);
+        assert!(cluster.metadata.owner_references.is_none());
+        let infra = CapiBackend::build_infrastructure_object("my-vc", "ns", &capi, None);
+        assert!(infra.metadata.owner_references.is_none());
     }
 
     // =================================================================

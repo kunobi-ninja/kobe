@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 /// Maximum length for Kubernetes resource names (per RFC 1123 / K8s docs).
 const MAX_K8S_NAME_LEN: usize = 253;
+
+/// The separator token that joins `{name}`, `{virtual_namespace}`, and the
+/// `{suffix}` in a host name (e.g. `my-app-x-default-x-vc`).
+const SEPARATOR: &str = "-x-";
 
 /// Label key indicating a resource is managed by kobe-sync.
 pub const LABEL_MANAGED: &str = "vkobe.kunobi.ninja/managed";
@@ -44,39 +46,71 @@ impl NameTranslator {
 
     /// Translate a virtual resource name into a host resource name.
     ///
-    /// Example: `to_host_name("my-app", "default")` -> `"my-app-x-default-x-vc"`
+    /// Example: `to_host_name("my-app", "default")` -> `Ok("my-app-x-default-x-vc")`
     ///
     /// When the translated name would exceed the Kubernetes 253-character limit,
     /// it is truncated and a deterministic hash is appended to preserve uniqueness.
-    pub fn to_host_name(&self, virtual_name: &str, virtual_ns: &str) -> String {
-        let full = format!("{}-x-{}-x-{}", virtual_name, virtual_ns, self.suffix);
-        if full.len() <= MAX_K8S_NAME_LEN {
-            return full;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TranslateError::SeparatorInIdentity`] when the virtual name or
+    /// namespace itself contains the `-x-` separator token. Such an input would
+    /// produce an ambiguous host name: distinct `(name, ns)` pairs could collide
+    /// onto the same host object (cross-tenant clobber in the host namespace),
+    /// and the reverse split in [`to_virtual`](Self::to_virtual) could not
+    /// recover the original pair. Both are k8s-legal names, so we reject them
+    /// loudly at sync time rather than silently mistranslating.
+    pub fn to_host_name(
+        &self,
+        virtual_name: &str,
+        virtual_ns: &str,
+    ) -> Result<String, TranslateError> {
+        if virtual_name.contains(SEPARATOR) {
+            return Err(TranslateError::SeparatorInIdentity {
+                field: "name",
+                value: virtual_name.to_string(),
+            });
         }
-        // Truncate and append a hash to ensure uniqueness.
-        let mut hasher = DefaultHasher::new();
-        virtual_name.hash(&mut hasher);
-        virtual_ns.hash(&mut hasher);
-        let hash = format!("{:016x}", hasher.finish());
+        if virtual_ns.contains(SEPARATOR) {
+            return Err(TranslateError::SeparatorInIdentity {
+                field: "namespace",
+                value: virtual_ns.to_string(),
+            });
+        }
+
+        let full = format!(
+            "{virtual_name}{SEPARATOR}{virtual_ns}{SEPARATOR}{}",
+            self.suffix
+        );
+        if full.len() <= MAX_K8S_NAME_LEN {
+            return Ok(full);
+        }
+        // Truncate and append a build-stable hash to ensure uniqueness. FNV-1a
+        // is used (not `DefaultHasher`, whose algorithm is unspecified and may
+        // change across Rust releases) so a toolchain bump never re-hashes an
+        // already-synced object's name and orphans it. Mirrors `hash_identity`
+        // in `src/api/routes.rs`.
+        let hash = fnv1a_hex(virtual_name, virtual_ns);
         let prefix_len = MAX_K8S_NAME_LEN - hash.len() - 1; // -1 for the dash
         let truncated = &full[..prefix_len];
         // Ensure truncated doesn't end with a dash (invalid K8s name).
         let truncated = truncated.trim_end_matches('-');
-        format!("{truncated}-{hash}")
+        Ok(format!("{truncated}-{hash}"))
     }
 
     /// Reverse-translate a host resource name back to the virtual (name, namespace) pair.
     ///
     /// Returns `None` if the host name does not match the expected suffix pattern.
     pub fn to_virtual(&self, host_name: &str) -> Option<(String, String)> {
-        let suffix_with_sep = format!("-x-{}", self.suffix);
+        let suffix_with_sep = format!("{SEPARATOR}{}", self.suffix);
         let without_suffix = host_name.strip_suffix(&suffix_with_sep)?;
         // Find the last `-x-` separator before the suffix — that separates the
-        // virtual name from the virtual namespace.
-        let sep = "-x-";
-        let sep_pos = without_suffix.rfind(sep)?;
+        // virtual name from the virtual namespace. Forward translation rejects
+        // any name/namespace containing the separator (see `to_host_name`), so
+        // a single split point is unambiguous for every name we produce.
+        let sep_pos = without_suffix.rfind(SEPARATOR)?;
         let virtual_name = &without_suffix[..sep_pos];
-        let virtual_ns = &without_suffix[sep_pos + sep.len()..];
+        let virtual_ns = &without_suffix[sep_pos + SEPARATOR.len()..];
         if virtual_name.is_empty() || virtual_ns.is_empty() {
             return None;
         }
@@ -137,10 +171,19 @@ impl NameTranslator {
     /// * Labels and annotations are merged with management metadata.
     /// * All other fields (resourceVersion, uid, etc.) are cleared so the
     ///   result can be used in a create/apply call.
-    pub fn translate_object_meta(&self, meta: &ObjectMeta, virtual_ns: &str) -> ObjectMeta {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`TranslateError`] from [`to_host_name`](Self::to_host_name)
+    /// when the virtual name or namespace contains the `-x-` separator token.
+    pub fn translate_object_meta(
+        &self,
+        meta: &ObjectMeta,
+        virtual_ns: &str,
+    ) -> Result<ObjectMeta, TranslateError> {
         let virtual_name = meta.name.as_deref().unwrap_or_default();
 
-        let host_name = self.to_host_name(virtual_name, virtual_ns);
+        let host_name = self.to_host_name(virtual_name, virtual_ns)?;
 
         let existing_labels = meta.labels.clone().unwrap_or_default();
         let translated_labels = self.translate_labels(&existing_labels, virtual_ns);
@@ -150,14 +193,64 @@ impl NameTranslator {
             existing_annotations.insert(k, v);
         }
 
-        ObjectMeta {
+        Ok(ObjectMeta {
             name: Some(host_name),
             namespace: Some(self.host_namespace.clone()),
             labels: Some(translated_labels),
             annotations: Some(existing_annotations),
             ..Default::default()
+        })
+    }
+}
+
+/// Error returned by name translation when an input cannot be safely encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslateError {
+    /// A virtual name or namespace contained the `-x-` separator token, which
+    /// would produce an ambiguous (potentially colliding) host name.
+    SeparatorInIdentity {
+        /// Which identity field carried the separator (`"name"` / `"namespace"`).
+        field: &'static str,
+        /// The offending value.
+        value: String,
+    },
+}
+
+impl std::fmt::Display for TranslateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TranslateError::SeparatorInIdentity { field, value } => write!(
+                f,
+                "virtual {field} {value:?} contains the reserved `-x-` separator token; \
+                 cannot produce an unambiguous host name"
+            ),
         }
     }
+}
+
+impl std::error::Error for TranslateError {}
+
+/// FNV-1a hash of `name` + `namespace`, rendered as a fixed 16-hex-digit
+/// string. Build-stable across Rust releases (unlike `DefaultHasher`), so a
+/// truncated host name is reproducible after a toolchain bump. Constants match
+/// `hash_identity` in `src/api/routes.rs`.
+fn fnv1a_hex(name: &str, namespace: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = FNV_OFFSET;
+    // Hash name, then a `-x-` domain separator, then namespace, so that e.g.
+    // ("ab", "c") and ("a", "bc") never collide.
+    for byte in name
+        .as_bytes()
+        .iter()
+        .chain(SEPARATOR.as_bytes())
+        .chain(namespace.as_bytes())
+    {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -171,14 +264,17 @@ mod tests {
     #[test]
     fn test_to_host_name_basic() {
         let t = translator();
-        assert_eq!(t.to_host_name("my-app", "default"), "my-app-x-default-x-vc");
+        assert_eq!(
+            t.to_host_name("my-app", "default").unwrap(),
+            "my-app-x-default-x-vc"
+        );
     }
 
     #[test]
     fn test_to_host_name_custom_ns() {
         let t = translator();
         assert_eq!(
-            t.to_host_name("nginx", "kube-system"),
+            t.to_host_name("nginx", "kube-system").unwrap(),
             "nginx-x-kube-system-x-vc"
         );
     }
@@ -222,7 +318,7 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         let t = translator();
-        let host = t.to_host_name("api-server", "production");
+        let host = t.to_host_name("api-server", "production").unwrap();
         let (name, ns) = t.to_virtual(&host).expect("roundtrip should succeed");
         assert_eq!(name, "api-server");
         assert_eq!(ns, "production");
@@ -318,7 +414,7 @@ mod tests {
             ..Default::default()
         };
 
-        let translated = t.translate_object_meta(&meta, "default");
+        let translated = t.translate_object_meta(&meta, "default").unwrap();
 
         assert_eq!(
             translated.name,
@@ -351,7 +447,7 @@ mod tests {
             ..Default::default()
         };
 
-        let translated = t.translate_object_meta(&meta, "myns");
+        let translated = t.translate_object_meta(&meta, "myns").unwrap();
 
         assert_eq!(translated.name, Some("bare-x-myns-x-vc".to_string()));
         let labels = translated.labels.as_ref().unwrap();
@@ -362,23 +458,65 @@ mod tests {
     #[test]
     fn test_to_virtual_namespace_with_hyphens() {
         let t = translator();
-        // Virtual name "a" in namespace "b-c-d"
-        let host = t.to_host_name("a", "b-c-d");
+        // Virtual name "a" in namespace "b-c-d" (plain hyphens, no `-x-`).
+        let host = t.to_host_name("a", "b-c-d").unwrap();
         assert_eq!(host, "a-x-b-c-d-x-vc");
         let (name, ns) = t.to_virtual(&host).unwrap();
         assert_eq!(name, "a");
         assert_eq!(ns, "b-c-d");
     }
 
+    /// A virtual name containing the `-x-` separator token is rejected up
+    /// front. Without rejection it would produce an ambiguous host name
+    /// (see `test_collision_is_rejected`), so we surface the error loudly
+    /// instead of silently mistranslating.
     #[test]
-    fn test_to_virtual_name_containing_x() {
+    fn test_to_host_name_rejects_separator_in_name() {
         let t = translator();
-        // Virtual name that itself contains "-x-"
-        let host = t.to_host_name("my-x-app", "default");
-        assert_eq!(host, "my-x-app-x-default-x-vc");
-        let (name, ns) = t.to_virtual(&host).unwrap();
-        assert_eq!(name, "my-x-app");
-        assert_eq!(ns, "default");
+        let err = t.to_host_name("my-x-app", "default").unwrap_err();
+        assert_eq!(
+            err,
+            TranslateError::SeparatorInIdentity {
+                field: "name",
+                value: "my-x-app".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_to_host_name_rejects_separator_in_namespace() {
+        let t = translator();
+        let err = t.to_host_name("app", "team-x-prod").unwrap_err();
+        assert_eq!(
+            err,
+            TranslateError::SeparatorInIdentity {
+                field: "namespace",
+                value: "team-x-prod".to_string(),
+            }
+        );
+    }
+
+    /// Collision/ambiguity case: WITHOUT the separator guard, these two
+    /// distinct `(name, ns)` pairs both format to the same host string
+    /// `a-x-b-x-c-x-vc`, which is the cross-tenant clobber the guard
+    /// prevents. The guard makes both inputs error out instead.
+    #[test]
+    fn test_collision_is_rejected() {
+        let t = translator();
+        // ("a-x-b", "c") and ("a", "b-x-c") would both naively render as
+        // "a-x-b-x-c-x-vc" — an ambiguous, colliding host name.
+        assert!(t.to_host_name("a-x-b", "c").is_err());
+        assert!(t.to_host_name("a", "b-x-c").is_err());
+    }
+
+    #[test]
+    fn test_translate_object_meta_rejects_separator() {
+        let t = translator();
+        let meta = ObjectMeta {
+            name: Some("svc-x-evil".to_string()),
+            ..Default::default()
+        };
+        assert!(t.translate_object_meta(&meta, "default").is_err());
     }
 
     #[test]
@@ -386,7 +524,7 @@ mod tests {
         let t = translator();
         let long_name = "a".repeat(200);
         let long_ns = "b".repeat(100);
-        let result = t.to_host_name(&long_name, &long_ns);
+        let result = t.to_host_name(&long_name, &long_ns).unwrap();
         assert!(result.len() <= 253);
         assert!(!result.ends_with('-'));
     }
@@ -396,9 +534,39 @@ mod tests {
         let t = translator();
         let long_name = "a".repeat(200);
         let long_ns = "b".repeat(100);
-        let r1 = t.to_host_name(&long_name, &long_ns);
-        let r2 = t.to_host_name(&long_name, &long_ns);
+        let r1 = t.to_host_name(&long_name, &long_ns).unwrap();
+        let r2 = t.to_host_name(&long_name, &long_ns).unwrap();
         assert_eq!(r1, r2);
+    }
+
+    /// Build-stability assertion: a known input maps to a known fixed hash
+    /// suffix. FNV-1a is deterministic across Rust releases, so this value
+    /// must never change — if a toolchain bump altered it, every truncated
+    /// host name would change and orphan the previously-synced object.
+    #[test]
+    fn test_truncated_hash_suffix_is_stable() {
+        let t = translator();
+        let long_name = "a".repeat(200);
+        let long_ns = "b".repeat(100);
+        let host = t.to_host_name(&long_name, &long_ns).unwrap();
+        // The suffix is the last 16 hex chars after the final dash.
+        let suffix = host.rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 16, "suffix must be 16 hex digits: {host}");
+        // Known fixed FNV-1a value for these exact inputs.
+        assert_eq!(
+            suffix, "379313b7e60dafdf",
+            "truncation hash suffix must be build-stable; got {host}"
+        );
+    }
+
+    /// The raw FNV-1a helper is order-sensitive (domain-separated), so e.g.
+    /// ("ab", "c") and ("a", "bc") produce different digests even though
+    /// their naive concatenation matches.
+    #[test]
+    fn test_fnv1a_hex_domain_separated() {
+        assert_ne!(fnv1a_hex("ab", "c"), fnv1a_hex("a", "bc"));
+        // Stable known value.
+        assert_eq!(fnv1a_hex("my-app", "default").len(), 16);
     }
 
     #[test]
@@ -406,7 +574,7 @@ mod tests {
         let t = translator();
         let long_name = "a".repeat(200);
         let long_ns = "b".repeat(100);
-        let host = t.to_host_name(&long_name, &long_ns);
+        let host = t.to_host_name(&long_name, &long_ns).unwrap();
         // Truncated names cannot be reverse-translated.
         assert!(t.to_virtual(&host).is_none());
     }

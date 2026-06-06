@@ -32,9 +32,9 @@ use tracing::{debug, info, warn};
 use crate::crd::{Addon, ClusterConfig, IntraPlacementMode, Placement, ReadinessGate};
 
 use super::{
-    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health, datastore,
-    node_affinity_from_selector, read_kubeconfig_secret, server_anti_affinity_terms,
-    virtual_client_from_kubeconfig,
+    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health,
+    data_volume_claim_template, datastore, node_affinity_from_selector, read_kubeconfig_secret,
+    server_anti_affinity_terms, virtual_client_from_kubeconfig,
 };
 
 /// Database name prefix for k0s clusters.
@@ -392,14 +392,12 @@ spec:
             );
         }
 
-        // If persistence is configured, mount data volume
-        if config.persistence.is_some() {
-            volume_mounts.push(VolumeMount {
-                name: "data".to_string(),
-                mount_path: "/var/lib/k0s/data".to_string(),
-                ..Default::default()
-            });
-        }
+        // Persistence is handled by backing the existing `k0s-data` volume
+        // (mounted above at k0s's real data dir `/var/lib/k0s`) with a PVC via
+        // the StatefulSet's volumeClaimTemplates — see `build_server_volumes`
+        // and `build_server_statefulset`. The previous code mounted a separate
+        // `data` volume at `/var/lib/k0s/data`, a subdir k0s never writes to, so
+        // persistence was a no-op. No extra mount is needed here.
 
         let _ = (name, namespace); // used for consistency with k3s signature
 
@@ -496,6 +494,12 @@ spec:
     }
 
     /// Build the volumes list for the server pod.
+    ///
+    /// The `k0s-data` volume (mounted at k0s's real data dir `/var/lib/k0s`) is
+    /// an `emptyDir` only when persistence is NOT configured. When persistence
+    /// IS configured it is omitted here and provided instead as a per-replica
+    /// PVC via the StatefulSet's `volumeClaimTemplates` (a pod-level volume of
+    /// the same name would shadow the claim template).
     fn build_server_volumes(name: &str, config: &ClusterConfig) -> Vec<Volume> {
         let mut volumes = vec![
             // k0s config ConfigMap mount
@@ -507,15 +511,20 @@ spec:
                 }),
                 ..Default::default()
             },
-            // Shared k0s data volume
-            Volume {
+        ];
+
+        // Shared k0s data volume. Without persistence it's an emptyDir (legacy
+        // behavior, unchanged); with persistence it's backed by a PVC declared
+        // in volumeClaimTemplates and therefore not listed as a pod volume.
+        if config.persistence.is_none() {
+            volumes.push(Volume {
                 name: "k0s-data".to_string(),
                 empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
                     ..Default::default()
                 }),
                 ..Default::default()
-            },
-        ];
+            });
+        }
 
         if config.servers > 1 {
             volumes.insert(
@@ -534,15 +543,6 @@ spec:
                     ..Default::default()
                 },
             );
-        }
-
-        // Data volume -- PVC if persistence is configured, otherwise emptyDir
-        if config.persistence.is_some() {
-            volumes.push(Volume {
-                name: "data".to_string(),
-                empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
-                ..Default::default()
-            });
         }
 
         volumes
@@ -572,6 +572,15 @@ spec:
                 .unwrap_or(DEFAULT_CLUSTER_DOMAIN),
         );
         let volumes = Self::build_server_volumes(name, config);
+
+        // When persistence is configured, back the `k0s-data` volume (mounted at
+        // k0s's real data dir `/var/lib/k0s`) with a per-replica PVC via
+        // `volumeClaimTemplates` instead of an emptyDir, so control-plane state
+        // survives reschedules. `None` ⇒ no template (`k0s-data` stays emptyDir).
+        let volume_claim_templates = config
+            .persistence
+            .as_ref()
+            .map(|p| vec![data_volume_claim_template("k0s-data", p)]);
 
         StatefulSet {
             metadata: ObjectMeta {
@@ -605,6 +614,7 @@ spec:
                         ..Default::default()
                     }),
                 },
+                volume_claim_templates,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1973,14 +1983,99 @@ mod tests {
         config.persistence = Some(PersistenceConfig {
             storage_type: Some("dynamic".to_string()),
             storage_class_name: Some("local-path".to_string()),
-            storage_request_size: Some("10Gi".to_string()),
+            storage_request_size: Some("25Gi".to_string()),
         });
 
         let sts = K0sBackend::build_server_statefulset("p-cluster", "ns", &config, None);
+        let sts_spec = sts.spec.as_ref().unwrap();
+        let pod_spec = sts_spec.template.spec.as_ref().unwrap();
 
-        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
-        let volumes = pod_spec.volumes.as_ref().unwrap();
-        assert!(volumes.iter().any(|v| v.name == "data"));
+        // No bogus `data` pod volume, and `k0s-data` is NOT an emptyDir — it is
+        // backed by the PVC declared in volumeClaimTemplates.
+        if let Some(volumes) = pod_spec.volumes.as_ref() {
+            assert!(
+                !volumes.iter().any(|v| v.name == "data"),
+                "the unused `data` volume must be gone"
+            );
+            assert!(
+                !volumes.iter().any(|v| v.name == "k0s-data"),
+                "k0s-data must come from volumeClaimTemplates, not a pod volume"
+            );
+        }
+
+        // The controller container mounts `k0s-data` at k0s's REAL data dir,
+        // and there must be NO mount at the unused `/var/lib/k0s/data` subdir.
+        let server = &pod_spec.containers[0];
+        let mounts = server.volume_mounts.as_ref().unwrap();
+        let data_mount = mounts
+            .iter()
+            .find(|m| m.name == "k0s-data")
+            .expect("k0s-data mount must exist");
+        assert_eq!(data_mount.mount_path, "/var/lib/k0s");
+        assert!(
+            !mounts.iter().any(|m| m.mount_path == "/var/lib/k0s/data"),
+            "must not mount the unused /var/lib/k0s/data subdir"
+        );
+
+        // A volumeClaimTemplate must back the `k0s-data` volume, honoring the
+        // PersistenceConfig storageClassName + size request.
+        let templates = sts_spec
+            .volume_claim_templates
+            .as_ref()
+            .expect("volumeClaimTemplates must be present when persistence is set");
+        let data_pvc = templates
+            .iter()
+            .find(|t| t.metadata.name.as_deref() == Some("k0s-data"))
+            .expect("a `k0s-data` volumeClaimTemplate must exist");
+        let pvc_spec = data_pvc.spec.as_ref().unwrap();
+        assert_eq!(pvc_spec.storage_class_name.as_deref(), Some("local-path"));
+        assert_eq!(
+            pvc_spec
+                .resources
+                .as_ref()
+                .unwrap()
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("storage")
+                .unwrap()
+                .0,
+            "25Gi"
+        );
+        assert_eq!(
+            pvc_spec.access_modes.as_deref(),
+            Some(&["ReadWriteOnce".to_string()][..])
+        );
+    }
+
+    /// persistence=None must keep `k0s-data` as an emptyDir pod volume and
+    /// declare NO volumeClaimTemplate (unchanged legacy behavior).
+    #[test]
+    fn test_build_server_statefulset_no_persistence_keeps_emptydir() {
+        let config = base_config();
+        assert!(config.persistence.is_none());
+        let sts = K0sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts_spec = sts.spec.as_ref().unwrap();
+        assert!(
+            sts_spec.volume_claim_templates.is_none(),
+            "no persistence ⇒ no volumeClaimTemplates"
+        );
+        let volumes = sts_spec
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .volumes
+            .as_ref()
+            .unwrap();
+        let k0s_data = volumes
+            .iter()
+            .find(|v| v.name == "k0s-data")
+            .expect("k0s-data emptyDir volume must exist when persistence is None");
+        assert!(
+            k0s_data.empty_dir.is_some(),
+            "k0s-data must be emptyDir when persistence is None"
+        );
     }
 
     #[test]

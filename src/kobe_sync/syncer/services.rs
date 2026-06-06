@@ -27,7 +27,7 @@ pub fn translate_service_to_host(
     translator: &NameTranslator,
     virtual_ns: &str,
 ) -> anyhow::Result<Service> {
-    let translated_meta = translator.translate_object_meta(&svc.metadata, virtual_ns);
+    let translated_meta = translator.translate_object_meta(&svc.metadata, virtual_ns)?;
 
     let translated_spec = svc.spec.as_ref().map(|spec| {
         let mut new_spec = spec.clone();
@@ -145,7 +145,11 @@ async fn handle_service_event(
             }
 
             let virtual_name = svc.name_any();
-            let host_name = ctx.translator.to_host_name(&virtual_name, &virtual_ns);
+            // If the name can't be translated (contains the `-x-` separator),
+            // the object was never synced to the host — nothing to delete.
+            let Ok(host_name) = ctx.translator.to_host_name(&virtual_name, &virtual_ns) else {
+                return Ok(());
+            };
 
             debug!(
                 name = %host_name,
