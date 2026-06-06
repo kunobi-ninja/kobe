@@ -306,7 +306,7 @@ async fn reconcile_claim(
             if let Err(msg) = validate_static(&ctx.plan, svc, cls) {
                 return set_conflict(&claims_api, &claim, msg).await;
             }
-            let (used_svc, used_cls) = compute_used(&ctx, &claim).await;
+            let (used_svc, used_cls) = compute_used(&ctx, &claim).await?;
             if used_svc.iter().any(|x| x == svc) || used_cls.iter().any(|x| x == cls) {
                 return set_conflict(
                     &claims_api,
@@ -332,7 +332,7 @@ async fn reconcile_claim(
         }
         // Dynamic allocation.
         (None, None) => {
-            let (used_svc, used_cls) = compute_used(&ctx, &claim).await;
+            let (used_svc, used_cls) = compute_used(&ctx, &claim).await?;
             match ctx.plan.pick_first_free(used_svc, used_cls) {
                 Some((_slot, svc, cls)) => (svc, cls),
                 None => {
@@ -374,64 +374,53 @@ async fn reconcile_claim(
 ///
 /// We exclude the claim being reconciled from the "claims" axis so
 /// re-reconciling a Bound claim doesn't see itself as a competitor.
-async fn compute_used(ctx: &IpamContext, current: &CIDRClaim) -> (Vec<String>, Vec<String>) {
+///
+/// Both lists are load-bearing for collision-freedom, so a transient
+/// list error is propagated rather than swallowed: allocating from a
+/// partial in-use set could re-issue a slot already held by another
+/// claim/instance (a #42-class CIDR collision). The caller fails the
+/// reconcile on error, leaving the claim Pending for `error_policy` to
+/// retry — strictly safer than binding on an under-populated view.
+async fn compute_used(
+    ctx: &IpamContext,
+    current: &CIDRClaim,
+) -> Result<(Vec<String>, Vec<String>), IpamError> {
     let mut used_svc = Vec::new();
     let mut used_cls = Vec::new();
     let current_uid = current.metadata.uid.clone();
 
     let claims_api: Api<CIDRClaim> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
-    match claims_api.list(&ListParams::default()).await {
-        Ok(list) => {
-            for c in list.items {
-                if c.metadata.uid == current_uid && current_uid.is_some() {
-                    continue;
-                }
-                let Some(status) = c.status.as_ref() else {
-                    continue;
-                };
-                if let Some(svc) = &status.service_cidr {
-                    used_svc.push(svc.clone());
-                }
-                if let Some(cls) = &status.cluster_cidr {
-                    used_cls.push(cls.clone());
-                }
-            }
+    let claim_list = claims_api.list(&ListParams::default()).await?;
+    for c in claim_list.items {
+        if c.metadata.uid == current_uid && current_uid.is_some() {
+            continue;
         }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to list CIDRClaims for in-use computation; \
-                 falling back to plan-only allocation \
-                 (risk: reissuing an in-use slot)"
-            );
+        let Some(status) = c.status.as_ref() else {
+            continue;
+        };
+        if let Some(svc) = &status.service_cidr {
+            used_svc.push(svc.clone());
+        }
+        if let Some(cls) = &status.cluster_cidr {
+            used_cls.push(cls.clone());
         }
     }
 
     let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
-    match instances_api.list(&ListParams::default()).await {
-        Ok(list) => {
-            for inst in list.items {
-                let Some(net) = inst.status.and_then(|s| s.network) else {
-                    continue;
-                };
-                if ctx.plan.service.slot_of(&net.service_cidr).is_some() {
-                    used_svc.push(net.service_cidr);
-                }
-                if ctx.plan.cluster.slot_of(&net.cluster_cidr).is_some() {
-                    used_cls.push(net.cluster_cidr);
-                }
-            }
+    let instance_list = instances_api.list(&ListParams::default()).await?;
+    for inst in instance_list.items {
+        let Some(net) = inst.status.and_then(|s| s.network) else {
+            continue;
+        };
+        if ctx.plan.service.slot_of(&net.service_cidr).is_some() {
+            used_svc.push(net.service_cidr);
         }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to list ClusterInstances for IPAM adoption sweep; \
-                 pre-IPAM allocations may be reissued"
-            );
+        if ctx.plan.cluster.slot_of(&net.cluster_cidr).is_some() {
+            used_cls.push(net.cluster_cidr);
         }
     }
 
-    (used_svc, used_cls)
+    Ok((used_svc, used_cls))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -439,16 +428,27 @@ async fn compute_used(ctx: &IpamContext, current: &CIDRClaim) -> (Vec<String>, V
 // ─────────────────────────────────────────────────────────────────────
 
 fn validate_static(plan: &PoolPlan, svc: &str, cls: &str) -> Result<(), String> {
-    if plan.service.slot_of(svc).is_none() {
+    let Some(svc_slot) = plan.service.slot_of(svc) else {
         return Err(format!(
             "requestedServiceCidr {svc} is not aligned to the plan's service prefix /{} or is outside the parent block",
             plan.service.slot_prefix
         ));
-    }
-    if plan.cluster.slot_of(cls).is_none() {
+    };
+    let Some(cls_slot) = plan.cluster.slot_of(cls) else {
         return Err(format!(
             "requestedClusterCidr {cls} is not aligned to the plan's cluster prefix /{} or is outside the parent block",
             plan.cluster.slot_prefix
+        ));
+    };
+    // Slot N of the service axis pairs with slot N of the cluster axis
+    // (see the design comment in `reconcile_claim`'s "one side pinned"
+    // arm). A two-sided reservation that pins service slot A and cluster
+    // slot B (A != B) would break that invariant — every dynamic claim
+    // assumes the two CIDRs of a slot move together — so reject it.
+    if svc_slot != cls_slot {
+        return Err(format!(
+            "requestedServiceCidr and requestedClusterCidr must be at the same slot index \
+             (service {svc} is slot {svc_slot}, cluster {cls} is slot {cls_slot})"
         ));
     }
     Ok(())
@@ -608,6 +608,28 @@ mod tests {
     fn validate_static_rejects_wrong_prefix() {
         let p = plan();
         assert!(validate_static(&p, "10.240.0.0/16", "10.248.0.0/20").is_err());
+    }
+
+    // FIX 6: a two-sided reservation must pin both axes at the SAME slot
+    // index. Service slot 0 with cluster slot 1 violates the "slot N of
+    // service pairs with slot N of cluster" invariant and must be rejected.
+    #[test]
+    fn validate_static_rejects_mismatched_slot_indices() {
+        let p = plan();
+        // 10.240.0.0/20 is service slot 0; 10.248.16.0/20 is cluster slot 1.
+        let err = validate_static(&p, "10.240.0.0/20", "10.248.16.0/20")
+            .expect_err("mismatched slot indices must be rejected");
+        assert!(
+            err.contains("same slot index"),
+            "error should mention the slot-index requirement: {err}"
+        );
+    }
+
+    // FIX 6 control: aligned, same-slot reservations on both axes still pass.
+    #[test]
+    fn validate_static_accepts_matching_slot_indices() {
+        let p = plan();
+        assert!(validate_static(&p, "10.240.16.0/20", "10.248.16.0/20").is_ok());
     }
 
     #[test]

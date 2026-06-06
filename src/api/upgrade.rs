@@ -47,6 +47,13 @@ use crate::api::connect::BackendUpgradeAccess;
 const DEFAULT_MAX_UPGRADES: usize = 64;
 const ENV_MAX_UPGRADES: &str = "KOBE_CONNECT_UPGRADE_MAX";
 
+/// Upper bound on the TCP dial + TLS handshake + HTTP/1.1 handshake to the
+/// backend apiserver. A backend that accepts the TCP connection but stalls the
+/// handshake would otherwise pin the concurrency permit and fds forever; this
+/// bounds that window so the permit is released. (Idle-timeout on the
+/// established bridge is out of scope — this only covers dial+handshake.)
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Process-global concurrency guard for connect-proxy upgrade tunnels. A
 /// permit is held for the full lifetime of each tunnel; exhaustion fails fast
 /// with 503 rather than queueing.
@@ -133,33 +140,51 @@ pub(crate) async fn tunnel_upgrade(
         }
     };
 
-    // 3. Dial TCP + TLS.
-    let tcp = match TcpStream::connect((host.as_str(), port)).await {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(error = %err, host = %host, port, "Connect proxy upgrade: TCP dial failed");
-            return upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster");
-        }
-    };
-    tcp.set_nodelay(true).ok();
-
-    let connector = TlsConnector::from(access.tls.clone());
-    let tls_stream = match connector.connect(server_name, tcp).await {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(error = %err, host = %host, "Connect proxy upgrade: TLS handshake failed");
-            return upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster");
-        }
-    };
-
-    // 4. HTTP/1.1 handshake. `with_upgrades()` is critical — without it hyper
+    // 3. Dial TCP + TLS + HTTP/1.1 handshake, all under a single bound.
+    //    Without a timeout a backend that accepts the TCP connection but then
+    //    stalls the TLS handshake (or the HTTP/1 handshake) would pin the
+    //    concurrency permit and the fds indefinitely. Bound the whole
+    //    dial+handshake so a stuck backend frees the permit (the `permit`
+    //    guard drops on every early return below) instead of leaking it.
+    //    `with_upgrades()` on the conn task is critical — without it hyper
     //    closes the connection after 101 instead of yielding the socket.
-    let io = TokioIo::new(tls_stream);
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
-        Ok(pair) => pair,
-        Err(err) => {
+    let dial =
+        async {
+            let tcp = TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(|err| {
+                warn!(error = %err, host = %host, port, "Connect proxy upgrade: TCP dial failed");
+                upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster")
+            })?;
+            tcp.set_nodelay(true).ok();
+
+            let connector = TlsConnector::from(access.tls.clone());
+            let tls_stream = connector.connect(server_name, tcp).await.map_err(|err| {
+                warn!(error = %err, host = %host, "Connect proxy upgrade: TLS handshake failed");
+                upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster")
+            })?;
+
+            let io = TokioIo::new(tls_stream);
+            hyper::client::conn::http1::handshake(io).await.map_err(|err| {
             warn!(error = %err, host = %host, "Connect proxy upgrade: HTTP/1 handshake failed");
-            return upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster");
+            upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster")
+        })
+        };
+
+    let (mut sender, conn) = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(resp)) => return resp,
+        Err(_elapsed) => {
+            warn!(
+                host = %host,
+                port,
+                timeout_secs = DIAL_TIMEOUT.as_secs(),
+                "Connect proxy upgrade: dial/handshake timed out"
+            );
+            return upgrade_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Timed out reaching leased cluster",
+            );
         }
     };
     tokio::spawn(async move {

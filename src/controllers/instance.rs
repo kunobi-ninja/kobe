@@ -198,7 +198,13 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         .unwrap_or_else(|| ctx.namespace.clone());
     let status = instance.status.clone().unwrap_or_default();
     let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
-    let config = resolve_instance_config(&ctx.client, &instance, &ns).await?;
+    // Resolve config tolerantly during deletion: a cascading ClusterPool
+    // delete sets a deletionTimestamp on the child AND removes the pool, so a
+    // strict resolve would Err before the finalizer path runs and deadlock the
+    // delete. `resolve_instance_config` falls back to `status.created_with`
+    // when the pool is gone and we're deleting (see #95-adjacent note there).
+    let is_deleting = instance.metadata.deletion_timestamp.is_some();
+    let config = resolve_instance_config(&ctx.client, &instance, &ns, is_deleting).await?;
     let profile_name = instance.spec.pool_ref.as_ref().map(|r| r.name.clone());
     let owner = profile_name.as_deref().unwrap_or(name.as_str());
 
@@ -805,10 +811,29 @@ async fn resolve_instance_config(
     client: &Client,
     instance: &ClusterInstance,
     namespace: &str,
+    is_deleting: bool,
 ) -> Result<ResolvedInstanceConfig, InstanceError> {
     if let Some(pool_ref) = &instance.spec.pool_ref {
-        let Some(profile) = get_profile(client, &pool_ref.name, namespace).await else {
-            return Err(anyhow::anyhow!("Owning pool {} not found", pool_ref.name).into());
+        let profile = match get_profile(client, &pool_ref.name, namespace).await {
+            Some(p) => p,
+            None if is_deleting => {
+                // ClusterInstances carry the pool as a controller
+                // ownerReference, so deleting a ClusterPool cascades a
+                // deletionTimestamp onto every child instance — but the pool
+                // may already be gone by the time we reconcile the child.
+                // Failing here would deadlock the delete: reconcile returns
+                // Err before the finalizer path runs, so backend cleanup
+                // never happens and the instance is stuck deleting forever
+                // (#95-adjacent). Fall back to a config derived from the
+                // instance's own `status.created_with` (the delete path
+                // already pins the backend via `created_with`), so teardown
+                // can still tear down the right backend resources and then
+                // release the finalizer.
+                return Ok(deletion_fallback_config(instance, &pool_ref.name));
+            }
+            None => {
+                return Err(anyhow::anyhow!("Owning pool {} not found", pool_ref.name).into());
+            }
         };
         let backend_type = profile.spec.backend.backend_type.clone();
         let owner_name = profile.name_any();
@@ -863,6 +888,51 @@ async fn resolve_instance_config(
         ),
         snapshot: instance.spec.snapshot.clone(),
     })
+}
+
+/// Build a minimal [`ResolvedInstanceConfig`] for the delete path when the
+/// owning pool is gone. Only `backend.backend_type` and `owner_name` are
+/// load-bearing for teardown — `delete_instance_backend` reads the backend
+/// type (further refined by `status.created_with` pinning) and ignores the
+/// cluster/addon/bootstrap fields. We seed the backend type from
+/// `status.created_with.backend_type` (the authoritative provenance), then
+/// fall back to the instance's own `spec.backend` for pre-provenance
+/// instances, defaulting otherwise.
+fn deletion_fallback_config(
+    instance: &ClusterInstance,
+    owner_name: &str,
+) -> ResolvedInstanceConfig {
+    let backend_type = instance
+        .status
+        .as_ref()
+        .and_then(|s| s.created_with.as_ref())
+        .and_then(|cw| cw.backend_type.clone())
+        .or_else(|| {
+            instance
+                .spec
+                .backend
+                .as_ref()
+                .map(|b| b.backend_type.clone())
+        })
+        .unwrap_or_default();
+
+    // Carry through any per-instance backend config (capi/vkobe/vcluster) the
+    // instance itself recorded, so `backend_dispatch_for_config` can construct
+    // the backend without the pool. Pool-backed instances usually have an
+    // empty `spec.backend`; the backend constructors tolerate `None` configs.
+    let mut backend = instance.spec.backend.clone().unwrap_or_default();
+    backend.backend_type = backend_type;
+
+    ResolvedInstanceConfig {
+        owner_name: owner_name.to_string(),
+        backend,
+        cluster: instance.spec.cluster.clone().unwrap_or_default(),
+        addons: Vec::new(),
+        bootstraps: Vec::new(),
+        health_check: None,
+        readiness_gates: Vec::new(),
+        snapshot: None,
+    }
 }
 
 /// Read the owning ClusterPool's `status.goldenGeneration` — the generation at
@@ -2434,6 +2504,116 @@ mod tests {
         remove_finalizer(&instances_api, &instance, INSTANCE_FINALIZER)
             .await
             .unwrap();
+    }
+
+    /// Helper: a pool-managed instance that is being deleted while its
+    /// owning pool is already gone (the cascading-delete deadlock from
+    /// FIX 2). Carries `status.created_with.backend_type` so the delete
+    /// path can pin the backend without the pool.
+    fn pool_managed_deleting_instance(name: &str, pool: &str) -> Arc<ClusterInstance> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "deletionTimestamp": "2026-05-21T10:00:00Z",
+                    "finalizers": [INSTANCE_FINALIZER]
+                },
+                "spec": {
+                    "poolRef": { "name": pool },
+                    "addons": [],
+                    "readinessGates": []
+                },
+                "status": {
+                    "phase": "Creating",
+                    "provisioned": true,
+                    "createdWith": { "operatorVersion": "0.23.1", "type": "k3s" },
+                    "network": {
+                        "serviceCidr": "10.240.0.0/20",
+                        "clusterCidr": "10.248.0.0/20"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// FIX 2 regression: a ClusterPool delete cascades a deletionTimestamp
+    /// onto every child ClusterInstance, but the pool may already be gone
+    /// when we reconcile the child. Previously `resolve_instance_config`
+    /// ran BEFORE the finalizer path and Err'd on the missing pool, so
+    /// `remove_finalizer` was never reached and the instance was stuck
+    /// deleting forever. Now the finalizer path must still run: backend
+    /// cleanup happens and the finalizer is released.
+    #[tokio::test]
+    async fn reconcile_deletes_and_releases_finalizer_when_owning_pool_is_gone() {
+        let (ctx, server, backend) = test_instance_context().await;
+        let instance = pool_managed_deleting_instance("orphan-deleting", "gone-pool");
+
+        // Owning pool GET returns 404 — the pool is already deleted.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/gone-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("clusterpools", "gone-pool")),
+            )
+            .mount(&server)
+            .await;
+
+        // Finalizer-removal PATCH (empty finalizers array after filtering ours).
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/orphan-deleting",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "metadata": { "finalizers": [] }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(instance_api_response("orphan-deleting")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // cleanup_orphan_projected_resources lists pods + best-effort deletes
+        // a probe pod by name. Feed it an empty list + 404 on the probe.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/pods/kobe-readiness-probe-orphan-deleting-x-kube-system-x-vc",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(
+                crate::testutil::k8s_not_found(
+                    "pods",
+                    "kobe-readiness-probe-orphan-deleting-x-kube-system-x-vc",
+                ),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_instance(instance, ctx)
+            .await
+            .expect("reconcile must NOT error when the owning pool is gone during deletion");
+
+        assert_eq!(action, Action::await_change());
+        let calls = backend.call_count();
+        assert_eq!(
+            calls.delete, 1,
+            "backend.delete() MUST run even when the owning pool is gone"
+        );
     }
 
     /// `add_finalizer` MUST be a no-op (zero API calls) when the

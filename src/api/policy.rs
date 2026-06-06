@@ -49,18 +49,34 @@ pub fn clamp_ttl(requested: &str, policy: &Policy) -> chrono::Duration {
 }
 
 /// Format a chrono::Duration as a human-readable string (e.g. "1h30m").
+///
+/// Seconds-aware: sub-minute durations are preserved as an `Ns`
+/// component rather than truncated to `"0m"`. Truncating to `"0m"` used
+/// to round-trip through `parse_duration` as a 0 TTL, which the lease
+/// controller then replaced with its 1h fallback — silently turning a
+/// requested 30s lease into 1h. Examples: 3600s → "1h", 90s → "1m30s",
+/// 30s → "30s", 0s → "0s".
 pub fn format_duration(d: &chrono::Duration) -> String {
     let total_secs = d.num_seconds();
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
 
-    if hours > 0 && minutes > 0 {
-        format!("{hours}h{minutes}m")
-    } else if hours > 0 {
-        format!("{hours}h")
-    } else {
-        format!("{minutes}m")
+    let mut out = String::new();
+    if hours > 0 {
+        out.push_str(&format!("{hours}h"));
     }
+    if minutes > 0 {
+        out.push_str(&format!("{minutes}m"));
+    }
+    if seconds > 0 {
+        out.push_str(&format!("{seconds}s"));
+    }
+    if out.is_empty() {
+        // A true zero (or sub-second) duration.
+        out.push_str("0s");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -118,5 +134,34 @@ mod tests {
         assert_eq!(format_duration(&chrono::Duration::hours(1)), "1h");
         assert_eq!(format_duration(&chrono::Duration::minutes(30)), "30m");
         assert_eq!(format_duration(&chrono::Duration::minutes(90)), "1h30m");
+    }
+
+    #[test]
+    fn test_format_duration_is_seconds_aware() {
+        // Sub-minute durations must NOT truncate to "0m" (which would
+        // round-trip back as a 0 TTL and hit the lease controller's 1h
+        // fallback). They keep an `Ns` component instead.
+        assert_eq!(format_duration(&chrono::Duration::seconds(30)), "30s");
+        assert_eq!(format_duration(&chrono::Duration::seconds(90)), "1m30s");
+        assert_eq!(format_duration(&chrono::Duration::seconds(3661)), "1h1m1s");
+        assert_eq!(format_duration(&chrono::Duration::seconds(3600)), "1h");
+        // A true zero is the only thing that renders as "0s".
+        assert_eq!(format_duration(&chrono::Duration::zero()), "0s");
+    }
+
+    #[test]
+    fn test_format_duration_round_trips_through_parse_duration() {
+        // The regression we're guarding: format → parse must preserve a
+        // short TTL instead of collapsing it to zero.
+        for secs in [30i64, 45, 90, 600, 3600, 5400] {
+            let formatted = format_duration(&chrono::Duration::seconds(secs));
+            let parsed =
+                parse_duration(&formatted).expect("formatted duration must re-parse cleanly");
+            assert_eq!(
+                parsed.num_seconds(),
+                secs,
+                "round-trip mismatch for {secs}s (formatted as {formatted})"
+            );
+        }
     }
 }

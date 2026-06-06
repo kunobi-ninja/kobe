@@ -77,6 +77,13 @@ pub const ENV_MAX_UPGRADES_PER_IDENTITY: &str = "KOBE_SYNC_MAX_UPGRADES_PER_IDEN
 /// Env var to override `DEFAULT_MAX_UPGRADES_TOTAL`.
 pub const ENV_MAX_UPGRADES_TOTAL: &str = "KOBE_SYNC_MAX_UPGRADES_TOTAL";
 
+/// Upper bound on the TCP dial + TLS handshake + HTTP/1.1 handshake to the host
+/// apiserver. A backend that accepts the TCP connection but stalls the
+/// handshake would otherwise pin the concurrency permit and fds forever; this
+/// bounds that window so the permit is released. (Idle-timeout on the
+/// established bridge is out of scope — this only covers dial+handshake.)
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Read a positive `usize` from env, or fall back to `default`.
 fn limit_from_env(var: &str, default: usize) -> usize {
     match std::env::var(var) {
@@ -469,27 +476,37 @@ pub async fn dispatch_upgrade(
         .with_context(|| format!("Invalid host apiserver URL: {host_url}"))
         .map_err(tag_err)?;
 
-    // 2. Dial TCP + TLS.
-    let tcp = TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("Failed to TCP-dial host apiserver at {host}:{port}"))
-        .map_err(tag_err)?;
-    tcp.set_nodelay(true).ok();
-    let connector = TlsConnector::from(tls);
-    let tls_stream = connector
-        .connect(server_name, tcp)
-        .await
-        .context("Failed to TLS-handshake with host apiserver")
-        .map_err(tag_err)?;
-
-    // 3. Hand the connection to hyper's HTTP/1.1 client. `with_upgrades`
-    //    is critical — without it, hyper closes the connection after 101
-    //    instead of yielding the underlying socket to us.
-    let io = TokioIo::new(tls_stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("HTTP/1 handshake with host apiserver failed")
-        .map_err(tag_err)?;
+    // 2. Dial TCP + TLS + the HTTP/1.1 handshake, all under a single bound.
+    //    Without a timeout a host apiserver that accepts the TCP connection
+    //    but then stalls the TLS (or HTTP/1) handshake would pin the
+    //    concurrency permit (`_permit`) and the fds indefinitely. Bound the
+    //    whole dial+handshake so a stuck backend frees the permit on timeout.
+    //    `with_upgrades` (below) is critical — without it, hyper closes the
+    //    connection after 101 instead of yielding the underlying socket to us.
+    let dial = async {
+        let tcp = TcpStream::connect((host.as_str(), port))
+            .await
+            .with_context(|| format!("Failed to TCP-dial host apiserver at {host}:{port}"))?;
+        tcp.set_nodelay(true).ok();
+        let connector = TlsConnector::from(tls);
+        let tls_stream = connector
+            .connect(server_name, tcp)
+            .await
+            .context("Failed to TLS-handshake with host apiserver")?;
+        let io = TokioIo::new(tls_stream);
+        hyper::client::conn::http1::handshake(io)
+            .await
+            .context("HTTP/1 handshake with host apiserver failed")
+    };
+    let (mut sender, conn) = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
+        Ok(result) => result.map_err(tag_err)?,
+        Err(_elapsed) => {
+            return Err(tag_err(anyhow::anyhow!(
+                "Timed out dialing host apiserver at {host}:{port} after {}s",
+                DIAL_TIMEOUT.as_secs()
+            )));
+        }
+    };
 
     // The connection task drives reads/writes for `sender`. Spawn it
     // with `.with_upgrades()` so the post-101 byte stream remains

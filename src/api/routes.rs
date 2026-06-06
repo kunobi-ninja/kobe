@@ -658,6 +658,23 @@ async fn create_lease<B: ClusterBackend>(
         }
     };
     let effective_ttl = policy::clamp_ttl(ttl_str, &policy);
+    // A TTL that clamps to (effectively) zero is a client error: the lease
+    // would either be born already-expired or, worse, fall through to the
+    // lease controller's 1h fallback and silently last far longer than asked
+    // (see `format_duration`). Reject it explicitly rather than papering over
+    // the requested value.
+    if effective_ttl.num_seconds() <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "TTL too short".to_string(),
+                detail: Some(format!(
+                    "Requested TTL '{ttl_str}' resolves to a zero-length lease; request at least 1 second"
+                )),
+            }),
+        )
+            .into_response();
+    }
     let was_clamped = effective_ttl < requested_ttl;
     let ttl_formatted = format_duration(&effective_ttl);
 

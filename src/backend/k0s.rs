@@ -1073,6 +1073,19 @@ impl ClusterBackend for K0sBackend {
             "Creating k0s cluster"
         );
 
+        // Multi-server HA is not actually implemented: the StatefulSet is
+        // hardcoded to a single replica and no real k0s join token is
+        // generated, so `servers > 1` would only make the sole controller
+        // pass `--token-file` and try to join a nonexistent cluster — it
+        // never goes Ready and create() times out after 10 minutes. Reject
+        // it up front with a clear error instead of silently hanging.
+        if config.servers > 1 {
+            anyhow::bail!(
+                "k0s backend does not support servers > 1 (HA not implemented); got servers={}",
+                config.servers
+            );
+        }
+
         // 1. Create token secret
         self.create_token_secret(name, namespace).await?;
 
@@ -2092,6 +2105,30 @@ mod tests {
             .create("test-cluster", "test-ns", &config, &[], None)
             .await;
         assert!(result.is_ok(), "create should succeed: {result:?}");
+    }
+
+    /// FIX 5: `servers > 1` is not implemented for the k0s backend (the
+    /// StatefulSet is hardcoded to 1 replica and no real join token is
+    /// generated). `create()` must reject it up front with a clear error
+    /// rather than provisioning a controller that tries to join a
+    /// nonexistent cluster and times out after 10 minutes.
+    #[tokio::test]
+    async fn test_create_rejects_multi_server() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K0sBackend::new(client, Default::default());
+
+        let mut config = base_config();
+        config.servers = 3;
+        let result = backend
+            .create("ha-cluster", "test-ns", &config, &[], None)
+            .await;
+        let err = result.expect_err("create must reject servers > 1");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("servers > 1"),
+            "error must explain the unsupported HA config: {msg}"
+        );
     }
 
     #[tokio::test]
