@@ -501,6 +501,46 @@ pub static POOL_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// Connect proxy: request latency + per-lease cache effectiveness
+// ─────────────────────────────────────────────────────────────────────
+
+/// Wall-clock of one full `connect_proxy_inner` invocation, from entry to
+/// completion (buffered response sent, or upgrade tunnel handed off).
+///
+/// Labels: `kind` (`buffered` | `upgrade`).
+///
+/// Buckets cover sub-ms → seconds: a cache-hit buffered GET against a warm
+/// backend should land in the low-ms buckets, a cache-miss pays 3 serial
+/// kube GETs + a fresh reqwest client build (tens of ms), and slow upstreams
+/// / large bodies fill the tail. The point of this histogram is to make the
+/// cache win (hit vs miss latency) measurable, so the fast buckets are dense.
+pub static CONNECT_PROXY_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "kobe_connect_proxy_request_duration_seconds",
+        "Time spent in one connect-proxy request",
+        &["kind"],
+        vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+        ]
+    )
+    .unwrap()
+});
+
+/// Per-lease connect-context cache outcome counter.
+///
+/// Labels: `result` (`hit` | `miss`). A `hit` skips token validation, the
+/// lease GET, the kubeconfig Secret read, and the reqwest client build; a
+/// `miss` runs the full path and repopulates the cache.
+pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_connect_proxy_cache_total",
+        "Connect-proxy per-lease cache lookups by result",
+        &["result"]
+    )
+    .unwrap()
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
 
@@ -592,6 +632,9 @@ pub fn init() {
     LazyLock::force(&IPAM_POOL_CAPACITY);
     LazyLock::force(&IPAM_POOL_ALLOCATED);
     LazyLock::force(&POOL_SIZE);
+    // Connect proxy
+    LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
+    LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);
 }
 
 /// Encode all registered metrics in Prometheus text exposition format.

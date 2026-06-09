@@ -18,7 +18,10 @@ use crate::crd::ClusterLease;
 
 const CONNECT_TOKEN_KEY: &str = "token";
 
-#[derive(Debug)]
+// `Clone` is cheap: `reqwest::Client` is internally `Arc`, and the two
+// `String`s are short. The connect-proxy per-lease cache clones a
+// `BackendAccess` out of the map on every hit, so cloning must stay cheap.
+#[derive(Debug, Clone)]
 pub(crate) struct BackendAccess {
     pub server: String,
     pub client: reqwest::Client,

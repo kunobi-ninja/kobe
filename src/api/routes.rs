@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::auth::{AuthIdentity, JwtAuthenticator};
 use crate::api::connect::{
-    backend_access_from_kubeconfig, build_backend_tls_config, build_connect_kubeconfig,
-    ensure_lease_connect_token, validate_lease_connect_token,
+    BackendAccess, backend_access_from_kubeconfig, build_backend_tls_config,
+    build_connect_kubeconfig, ensure_lease_connect_token, validate_lease_connect_token,
 };
 use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
@@ -40,6 +40,127 @@ pub struct AppState<B: ClusterBackend> {
     /// Shared PostgreSQL datastore when one is configured; empty in
     /// embedded-datastore mode. Consulted by the `/readyz` probe.
     pub datastore: crate::backend::datastore::SharedDatastore,
+    /// Short-TTL per-lease validation/connection cache for the connect proxy.
+    /// Lets a burst of requests through one lease (e.g. a single `kubectl`,
+    /// which fans out into dozens of API calls) skip the per-request token
+    /// validate + lease GET + kubeconfig Secret read + reqwest client build.
+    pub connect_cache: ConnectCache,
+}
+
+/// Per-lease connect-proxy context cache. Newtype over a shared, mutex-guarded
+/// map keyed by `lease_id`. `std` only — entries are tiny and short-lived (5s
+/// TTL), so a coarse `Mutex` around a `HashMap` is more than enough and avoids
+/// pulling in an external cache crate.
+#[derive(Clone, Default)]
+pub struct ConnectCache(Arc<std::sync::Mutex<std::collections::HashMap<String, ConnectCtx>>>);
+
+/// One cached connect-proxy context for a lease. Everything here was validated
+/// fresh at `cached_at`; on a hit we re-enforce the security gates (token match,
+/// phase, expiry) before reusing the cached backend.
+#[derive(Clone)]
+struct ConnectCtx {
+    cached_at: std::time::Instant,
+    /// The connect token that was validated as correct when this entry was
+    /// populated. Compared against the presented token with a constant-time
+    /// `secret_eq` on every hit; a mismatch is a cache MISS (full revalidate).
+    token: String,
+    cluster_name: String,
+    /// Lease expiry (RFC3339), re-checked freshly against `now()` each hit.
+    expires_at: Option<String>,
+    phase: LeasePhase,
+    /// reqwest client + server + bearer — cheap to clone (Arc-internal client).
+    backend: BackendAccess,
+    /// Raw backend kubeconfig, retained for the upgrade path's
+    /// `build_backend_tls_config` (the rustls config can't be cloned cheaply).
+    raw_kubeconfig: String,
+}
+
+/// Revocation-staleness tradeoff: a cached context is reused for up to this
+/// long without re-reading the connect-token Secret or re-fetching the lease.
+/// At 5s, revoking a token (deleting the Secret) or releasing a lease takes up
+/// to 5s to fully cut off in-flight cache holders. Expiry is the exception —
+/// it is ALWAYS re-evaluated against the wall clock on every request and an
+/// expired hit is evicted, so TTL never extends a lease past `expires_at`.
+const CONNECT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Outcome of a connect-cache lookup. On a `Hit` the caller skips the full
+/// validate/get/extract/build path; on a `Miss` it runs the full path and
+/// repopulates the entry.
+enum CacheLookup {
+    Hit(ConnectCtx),
+    Miss,
+}
+
+impl ConnectCache {
+    /// Look up `lease_id` and decide hit vs miss WITHOUT mutating phase/expiry
+    /// gates (the caller re-enforces those). A hit requires, in order:
+    /// the entry exists, it is within TTL, and the presented token matches the
+    /// cached token via a constant-time `secret_eq`. A token mismatch is a
+    /// MISS so a wrong/revoked token can never ride a cached context — it is
+    /// forced back through full revalidation.
+    fn lookup(&self, lease_id: &str, presented_token: &str) -> CacheLookup {
+        let map = self.0.lock().expect("connect cache mutex poisoned");
+        match map.get(lease_id) {
+            Some(entry)
+                if entry.cached_at.elapsed() < CONNECT_CACHE_TTL
+                    // Constant-time compare: never short-circuit on the first
+                    // differing byte, and never serve a cached backend to a
+                    // token that doesn't match what we validated.
+                    && kunobi_auth::secret_eq(&entry.token, presented_token) =>
+            {
+                CacheLookup::Hit(entry.clone())
+            }
+            _ => CacheLookup::Miss,
+        }
+    }
+
+    /// Remove a lease's cached entry (e.g. on an expired-on-hit eviction).
+    fn evict(&self, lease_id: &str) {
+        self.0
+            .lock()
+            .expect("connect cache mutex poisoned")
+            .remove(lease_id);
+    }
+
+    /// Insert/refresh a lease's entry after a full revalidation. Opportunistically
+    /// prunes stale entries while we hold the lock (the map only ever holds
+    /// active leases, so this stays cheap).
+    fn insert(&self, lease_id: String, ctx: ConnectCtx) {
+        let mut map = self.0.lock().expect("connect cache mutex poisoned");
+        map.retain(|_, entry| entry.cached_at.elapsed() < CONNECT_CACHE_TTL);
+        map.insert(lease_id, ctx);
+    }
+}
+
+/// RAII timer for `kobe_connect_proxy_request_duration_seconds`. Observes once
+/// on `Drop`, so every early-return path through `connect_proxy_inner` (and the
+/// upgrade hand-off) is timed without sprinkling `observe` at each return. The
+/// `kind` label defaults to `buffered`; the upgrade branch flips it via
+/// [`ConnectProxyTimer::set_kind`] right before it tunnels.
+struct ConnectProxyTimer {
+    started: Instant,
+    kind: &'static str,
+}
+
+impl ConnectProxyTimer {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            kind: "buffered",
+        }
+    }
+
+    fn set_kind(&mut self, kind: &'static str) {
+        self.kind = kind;
+    }
+}
+
+impl Drop for ConnectProxyTimer {
+    fn drop(&mut self) {
+        metrics::CONNECT_PROXY_REQUEST_DURATION
+            .with_label_values(&[self.kind])
+            .observe(self.started.elapsed().as_secs_f64());
+    }
 }
 
 /// Implement kunobi-auth's AuthnProvider so that RequiredAuth/OptionalAuth extractors work.
@@ -1035,6 +1156,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     path: String,
     request: axum::extract::Request,
 ) -> Response {
+    // RAII latency timer: observes `kobe_connect_proxy_request_duration_seconds`
+    // on Drop so every early return (and the upgrade hand-off) is timed. Defaults
+    // to kind=buffered; flipped to kind=upgrade just before tunneling.
+    let mut timer = ConnectProxyTimer::start();
+
     // Decompose the raw request: method / headers / query are needed by both
     // the buffered and the upgrade path. The body / OnUpgrade live in
     // `request`, which we keep intact and hand to `tunnel_upgrade` for the
@@ -1069,149 +1195,254 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         return connect_error(StatusCode::UNAUTHORIZED, "Missing Bearer token");
     };
 
-    let token_is_valid = match validate_lease_connect_token(
-        &state.client,
-        &state.namespace,
-        &lease_id,
-        connect_token,
-    )
-    .await
-    {
-        Ok(valid) => valid,
-        Err(err) => {
-            warn!(
-                request_id = %request_id,
-                lease_id = %lease_id,
-                error = %err,
-                "Connect proxy failed to validate lease token"
-            );
-            return connect_infra_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to validate lease token",
-                &err,
-            );
+    // ── Per-lease connect-context cache ──────────────────────────────────
+    //
+    // A single `kubectl` fans out into dozens of API calls through one lease;
+    // without a cache each pays 3 serial kube GETs (token Secret, lease,
+    // kubeconfig Secret) + a fresh reqwest client build. We cache the validated
+    // context for `CONNECT_CACHE_TTL` (5s) keyed by lease_id. SECURITY: a hit
+    // STILL re-enforces the token match (constant-time, in `lookup`), the Bound
+    // phase, and lease expiry (against the current wall clock) — only the
+    // *phase decision* and the backend connection are reused with up-to-5s
+    // staleness; expiry and token are never stale. The 5s revocation-staleness
+    // tradeoff: deleting the connect-token Secret or releasing the lease takes
+    // up to 5s to fully cut off in-flight cache holders.
+    //
+    // These are owned so both the hit and miss branches converge on the same
+    // bindings (a hit has no `lease` object to borrow from).
+    let cluster_name: String;
+    let chosen_backend: String;
+    let pool_ref: String;
+    let raw_kubeconfig: String;
+    let backend: BackendAccess;
+
+    match state.connect_cache.lookup(&lease_id, connect_token) {
+        CacheLookup::Hit(ctx) => {
+            metrics::CONNECT_PROXY_CACHE_TOTAL
+                .with_label_values(&["hit"])
+                .inc();
+
+            // Re-enforce the gates freshly even on a hit. Phase must still be
+            // Bound (same rejection as the cold path).
+            if ctx.phase != LeasePhase::Bound {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    phase = %ctx.phase,
+                    "Connect proxy rejected lease outside Bound phase (cached)"
+                );
+                return connect_error(
+                    StatusCode::CONFLICT,
+                    format!("Lease is not active (phase {})", ctx.phase),
+                );
+            }
+
+            // Expiry is re-evaluated against `now()` on EVERY request. An
+            // expired hit evicts the entry so a stale context can't be served
+            // again, then rejects with the same 410/Gone the cold path uses.
+            if lease_is_expired(ctx.expires_at.as_deref()) {
+                state.connect_cache.evict(&lease_id);
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    expires_at = ?ctx.expires_at,
+                    "Connect proxy rejected expired lease (cached, evicted)"
+                );
+                return connect_error(StatusCode::GONE, "Lease has expired");
+            }
+
+            cluster_name = ctx.cluster_name;
+            // `chosen_backend` is a logging-only label; the cached path reuses
+            // the backend connection without re-resolving the pool, so report
+            // "cached" to make the fast path visible in logs.
+            chosen_backend = "cached".to_string();
+            pool_ref = String::new();
+            raw_kubeconfig = ctx.raw_kubeconfig;
+            backend = ctx.backend;
         }
-    };
+        CacheLookup::Miss => {
+            metrics::CONNECT_PROXY_CACHE_TOTAL
+                .with_label_values(&["miss"])
+                .inc();
 
-    if !token_is_valid {
-        warn!(
-            request_id = %request_id,
-            lease_id = %lease_id,
-            method = %method,
-            path = %request_path,
-            "Connect proxy rejected invalid lease token"
-        );
-        return connect_error(StatusCode::UNAUTHORIZED, "Invalid lease token");
-    }
+            // ── Full cold path: validate token, load lease, check phase +
+            // expiry, extract kubeconfig, build BackendAccess, then populate
+            // the cache. ─────────────────────────────────────────────────
+            let token_is_valid = match validate_lease_connect_token(
+                &state.client,
+                &state.namespace,
+                &lease_id,
+                connect_token,
+            )
+            .await
+            {
+                Ok(valid) => valid,
+                Err(err) => {
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        error = %err,
+                        "Connect proxy failed to validate lease token"
+                    );
+                    return connect_infra_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to validate lease token",
+                        &err,
+                    );
+                }
+            };
 
-    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
-    let lease = match leases_api.get(&lease_id).await {
-        Ok(lease) => lease,
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {
-            warn!(
-                request_id = %request_id,
-                lease_id = %lease_id,
-                "Connect proxy lease not found"
-            );
-            return connect_error(StatusCode::NOT_FOUND, "Lease not found");
-        }
-        Err(err) => {
-            warn!(
-                request_id = %request_id,
-                lease_id = %lease_id,
-                error = %err,
-                "Connect proxy failed to load lease"
-            );
-            return connect_infra_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load lease",
-                &err,
-            );
-        }
-    };
+            if !token_is_valid {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    method = %method,
+                    path = %request_path,
+                    "Connect proxy rejected invalid lease token"
+                );
+                return connect_error(StatusCode::UNAUTHORIZED, "Invalid lease token");
+            }
 
-    let status = lease.status.clone().unwrap_or_default();
-    if status.phase != LeasePhase::Bound {
-        warn!(
-            request_id = %request_id,
-            lease_id = %lease_id,
-            phase = %status.phase,
-            "Connect proxy rejected lease outside Bound phase"
-        );
-        return connect_error(
-            StatusCode::CONFLICT,
-            format!("Lease is not active (phase {})", status.phase),
-        );
-    }
+            let leases_api: Api<ClusterLease> =
+                Api::namespaced(state.client.clone(), &state.namespace);
+            let lease = match leases_api.get(&lease_id).await {
+                Ok(lease) => lease,
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        "Connect proxy lease not found"
+                    );
+                    return connect_error(StatusCode::NOT_FOUND, "Lease not found");
+                }
+                Err(err) => {
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        error = %err,
+                        "Connect proxy failed to load lease"
+                    );
+                    return connect_infra_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to load lease",
+                        &err,
+                    );
+                }
+            };
 
-    // Enforce TTL synchronously on the request path. The phase only flips to
-    // Expired on the next ~30s reconcile / 60s reaper sweep, so without this an
-    // expired holder retains full API access during the lag — in a multi-tenant
-    // pool the cluster may already be slated for recycle/handoff.
-    if lease_is_expired(status.expires_at.as_deref()) {
-        warn!(
-            request_id = %request_id,
-            lease_id = %lease_id,
-            expires_at = ?status.expires_at,
-            "Connect proxy rejected expired lease"
-        );
-        return connect_error(StatusCode::GONE, "Lease has expired");
-    }
+            let status = lease.status.clone().unwrap_or_default();
+            if status.phase != LeasePhase::Bound {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    phase = %status.phase,
+                    "Connect proxy rejected lease outside Bound phase"
+                );
+                return connect_error(
+                    StatusCode::CONFLICT,
+                    format!("Lease is not active (phase {})", status.phase),
+                );
+            }
 
-    let Some(cluster_name) = status.cluster_name.as_deref() else {
-        warn!(
-            request_id = %request_id,
-            lease_id = %lease_id,
-            "Connect proxy found bound lease without cluster name"
-        );
-        return connect_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Lease is bound without a cluster name",
-        );
-    };
+            // Enforce TTL synchronously on the request path. The phase only flips
+            // to Expired on the next ~30s reconcile / 60s reaper sweep, so without
+            // this an expired holder retains full API access during the lag — in a
+            // multi-tenant pool the cluster may already be slated for recycle/handoff.
+            if lease_is_expired(status.expires_at.as_deref()) {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    expires_at = ?status.expires_at,
+                    "Connect proxy rejected expired lease"
+                );
+                return connect_error(StatusCode::GONE, "Lease has expired");
+            }
 
-    let mut chosen_backend = "fallback".to_string();
-    let raw_kubeconfig = if let Some(factory) = state.factory.as_ref() {
-        let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
-        match pools_api.get(&lease.spec.pool_ref).await {
-            Ok(pool) => {
-                chosen_backend = format!("{:?}", pool.spec.backend.backend_type);
-                match factory.backend_for(&pool) {
-                    Ok(backend) => match backend
-                        .extract_kubeconfig(cluster_name, &state.namespace)
-                        .await
-                    {
-                        Ok(kubeconfig) => kubeconfig,
-                        Err(err) => {
-                            warn!(
-                                request_id = %request_id,
-                                lease_id = %lease_id,
-                                pool = %lease.spec.pool_ref,
-                                cluster = %cluster_name,
-                                backend = %chosen_backend,
-                                error = %err,
-                                "Connect proxy failed to extract backend kubeconfig"
-                            );
-                            return connect_infra_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "Failed to extract backend kubeconfig",
-                                &err,
-                            );
+            let Some(cluster) = status.cluster_name.as_deref() else {
+                warn!(
+                    request_id = %request_id,
+                    lease_id = %lease_id,
+                    "Connect proxy found bound lease without cluster name"
+                );
+                return connect_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Lease is bound without a cluster name",
+                );
+            };
+
+            let mut resolved_backend = "fallback".to_string();
+            let raw = if let Some(factory) = state.factory.as_ref() {
+                let pools_api: Api<ClusterPool> =
+                    Api::namespaced(state.client.clone(), &state.namespace);
+                match pools_api.get(&lease.spec.pool_ref).await {
+                    Ok(pool) => {
+                        resolved_backend = format!("{:?}", pool.spec.backend.backend_type);
+                        match factory.backend_for(&pool) {
+                            Ok(b) => match b.extract_kubeconfig(cluster, &state.namespace).await {
+                                Ok(kubeconfig) => kubeconfig,
+                                Err(err) => {
+                                    warn!(
+                                        request_id = %request_id,
+                                        lease_id = %lease_id,
+                                        pool = %lease.spec.pool_ref,
+                                        cluster = %cluster,
+                                        backend = %resolved_backend,
+                                        error = %err,
+                                        "Connect proxy failed to extract backend kubeconfig"
+                                    );
+                                    return connect_infra_error(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "Failed to extract backend kubeconfig",
+                                        &err,
+                                    );
+                                }
+                            },
+                            Err(err) => {
+                                warn!(
+                                    request_id = %request_id,
+                                    lease_id = %lease_id,
+                                    pool = %lease.spec.pool_ref,
+                                    cluster = %cluster,
+                                    error = %err,
+                                    "Connect proxy failed to resolve backend for pool, falling back"
+                                );
+                                resolved_backend = "fallback".to_string();
+                                match state
+                                    .backend
+                                    .extract_kubeconfig(cluster, &state.namespace)
+                                    .await
+                                {
+                                    Ok(kubeconfig) => kubeconfig,
+                                    Err(err) => {
+                                        warn!(
+                                            request_id = %request_id,
+                                            lease_id = %lease_id,
+                                            cluster = %cluster,
+                                            error = %err,
+                                            "Connect proxy failed to extract backend kubeconfig"
+                                        );
+                                        return connect_infra_error(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "Failed to extract backend kubeconfig",
+                                            &err,
+                                        );
+                                    }
+                                }
+                            }
                         }
-                    },
+                    }
                     Err(err) => {
                         warn!(
                             request_id = %request_id,
                             lease_id = %lease_id,
                             pool = %lease.spec.pool_ref,
-                            cluster = %cluster_name,
+                            cluster = %cluster,
                             error = %err,
-                            "Connect proxy failed to resolve backend for pool, falling back"
+                            "Connect proxy failed to load pool for backend resolution, falling back"
                         );
-                        chosen_backend = "fallback".to_string();
                         match state
                             .backend
-                            .extract_kubeconfig(cluster_name, &state.namespace)
+                            .extract_kubeconfig(cluster, &state.namespace)
                             .await
                         {
                             Ok(kubeconfig) => kubeconfig,
@@ -1219,7 +1450,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                                 warn!(
                                     request_id = %request_id,
                                     lease_id = %lease_id,
-                                    cluster = %cluster_name,
+                                    cluster = %cluster,
                                     error = %err,
                                     "Connect proxy failed to extract backend kubeconfig"
                                 );
@@ -1232,19 +1463,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         }
                     }
                 }
-            }
-            Err(err) => {
-                warn!(
-                    request_id = %request_id,
-                    lease_id = %lease_id,
-                    pool = %lease.spec.pool_ref,
-                    cluster = %cluster_name,
-                    error = %err,
-                    "Connect proxy failed to load pool for backend resolution, falling back"
-                );
+            } else {
                 match state
                     .backend
-                    .extract_kubeconfig(cluster_name, &state.namespace)
+                    .extract_kubeconfig(cluster, &state.namespace)
                     .await
                 {
                     Ok(kubeconfig) => kubeconfig,
@@ -1252,7 +1474,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         warn!(
                             request_id = %request_id,
                             lease_id = %lease_id,
-                            cluster = %cluster_name,
+                            cluster = %cluster,
                             error = %err,
                             "Connect proxy failed to extract backend kubeconfig"
                         );
@@ -1263,49 +1485,48 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         );
                     }
                 }
-            }
-        }
-    } else {
-        match state
-            .backend
-            .extract_kubeconfig(cluster_name, &state.namespace)
-            .await
-        {
-            Ok(kubeconfig) => kubeconfig,
-            Err(err) => {
-                warn!(
-                    request_id = %request_id,
-                    lease_id = %lease_id,
-                    cluster = %cluster_name,
-                    error = %err,
-                    "Connect proxy failed to extract backend kubeconfig"
-                );
-                return connect_infra_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to extract backend kubeconfig",
-                    &err,
-                );
-            }
-        }
-    };
+            };
 
-    let backend = match backend_access_from_kubeconfig(&raw_kubeconfig) {
-        Ok(backend) => backend,
-        Err(err) => {
-            warn!(
-                request_id = %request_id,
-                lease_id = %lease_id,
-                cluster = %cluster_name,
-                error = %err,
-                "Connect proxy failed to parse backend kubeconfig"
+            let built = match backend_access_from_kubeconfig(&raw) {
+                Ok(b) => b,
+                Err(err) => {
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        cluster = %cluster,
+                        error = %err,
+                        "Connect proxy failed to parse backend kubeconfig"
+                    );
+                    return connect_infra_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to parse backend kubeconfig",
+                        &err,
+                    );
+                }
+            };
+
+            // Populate the cache with the now-validated context. `connect_token`
+            // is the token we just confirmed correct via `validate_lease_connect_token`.
+            state.connect_cache.insert(
+                lease_id.clone(),
+                ConnectCtx {
+                    cached_at: Instant::now(),
+                    token: connect_token.to_string(),
+                    cluster_name: cluster.to_string(),
+                    expires_at: status.expires_at.clone(),
+                    phase: status.phase.clone(),
+                    backend: built.clone(),
+                    raw_kubeconfig: raw.clone(),
+                },
             );
-            return connect_infra_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to parse backend kubeconfig",
-                &err,
-            );
+
+            cluster_name = cluster.to_string();
+            chosen_backend = resolved_backend;
+            pool_ref = lease.spec.pool_ref.clone();
+            raw_kubeconfig = raw;
+            backend = built;
         }
-    };
+    }
 
     let request_url = match backend_request_url(&backend.server, &path, raw_query.0.as_deref()) {
         Ok(url) => url,
@@ -1332,6 +1553,9 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     // splices the upgraded sockets (see api::upgrade). All lease validation has
     // already run above; from here we just need the backend's rustls config.
     if headers_request_upgrade(&headers) {
+        // This request is an exec/attach/port-forward tunnel: relabel the
+        // latency histogram so the upgrade path is measured separately.
+        timer.set_kind("upgrade");
         let protocol =
             requested_upgrade_protocol(&headers).unwrap_or_else(|| "unknown".to_string());
         let upgrade_access = match build_backend_tls_config(&raw_kubeconfig) {
@@ -1371,7 +1595,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     info!(
         request_id = %request_id,
         lease_id = %lease_id,
-        pool = %lease.spec.pool_ref,
+        pool = %pool_ref,
         cluster = %cluster_name,
         backend = %chosen_backend,
         upstream = %backend.server,
@@ -2298,6 +2522,139 @@ mod tests {
         assert!(!lease_is_expired(Some("not-a-timestamp")));
     }
 
+    /// Build a `ConnectCtx` for cache tests. `age` ages `cached_at` into the
+    /// past so the staleness branch can be exercised without sleeping.
+    fn test_ctx(token: &str, expires_at: Option<&str>, phase: LeasePhase) -> ConnectCtx {
+        ConnectCtx {
+            cached_at: Instant::now(),
+            token: token.to_string(),
+            cluster_name: "pool-ci-small-6".to_string(),
+            expires_at: expires_at.map(str::to_string),
+            phase,
+            backend: BackendAccess {
+                server: "https://backend.svc:6443".to_string(),
+                client: reqwest::Client::new(),
+                bearer_token: Some("backend-bearer".to_string()),
+            },
+            raw_kubeconfig: "raw-kubeconfig".to_string(),
+        }
+    }
+
+    #[test]
+    fn connect_cache_hit_within_ttl_matching_token() {
+        let cache = ConnectCache::default();
+        cache.insert(
+            "lease-1".to_string(),
+            test_ctx("good-token", None, LeasePhase::Bound),
+        );
+
+        match cache.lookup("lease-1", "good-token") {
+            CacheLookup::Hit(ctx) => {
+                assert_eq!(ctx.cluster_name, "pool-ci-small-6");
+                assert_eq!(ctx.backend.server, "https://backend.svc:6443");
+                assert_eq!(ctx.backend.bearer_token.as_deref(), Some("backend-bearer"));
+                assert_eq!(ctx.raw_kubeconfig, "raw-kubeconfig");
+            }
+            CacheLookup::Miss => panic!("expected a cache hit for a fresh matching entry"),
+        }
+    }
+
+    #[test]
+    fn connect_cache_miss_on_token_mismatch() {
+        // A presented token that does not match the cached token must MISS so it
+        // is forced back through full revalidation — never served cached context.
+        let cache = ConnectCache::default();
+        cache.insert(
+            "lease-1".to_string(),
+            test_ctx("good-token", None, LeasePhase::Bound),
+        );
+
+        assert!(
+            matches!(cache.lookup("lease-1", "wrong-token"), CacheLookup::Miss),
+            "a mismatched token must be a cache miss"
+        );
+        // The non-matching lookup must not have evicted the valid entry.
+        assert!(
+            matches!(cache.lookup("lease-1", "good-token"), CacheLookup::Hit(_)),
+            "the original entry should still be present after a mismatch"
+        );
+    }
+
+    #[test]
+    fn connect_cache_miss_when_stale() {
+        let cache = ConnectCache::default();
+        cache.insert(
+            "lease-1".to_string(),
+            test_ctx("good-token", None, LeasePhase::Bound),
+        );
+        // Age the entry past the TTL without sleeping.
+        {
+            let mut map = cache.0.lock().unwrap();
+            let entry = map.get_mut("lease-1").unwrap();
+            entry.cached_at = Instant::now()
+                .checked_sub(CONNECT_CACHE_TTL + std::time::Duration::from_secs(1))
+                .expect("instant underflow");
+        }
+
+        assert!(
+            matches!(cache.lookup("lease-1", "good-token"), CacheLookup::Miss),
+            "an entry older than the TTL must be a cache miss"
+        );
+    }
+
+    #[test]
+    fn connect_cache_miss_when_absent() {
+        let cache = ConnectCache::default();
+        assert!(matches!(cache.lookup("nope", "token"), CacheLookup::Miss));
+    }
+
+    #[test]
+    fn connect_cache_evict_removes_entry() {
+        // Mirrors the expired-on-hit path: a hit that is then found expired
+        // evicts the entry so a stale context can't be served again.
+        let cache = ConnectCache::default();
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        cache.insert(
+            "lease-1".to_string(),
+            test_ctx("good-token", Some(&past), LeasePhase::Bound),
+        );
+
+        // The entry is a fresh, token-matching hit...
+        let CacheLookup::Hit(ctx) = cache.lookup("lease-1", "good-token") else {
+            panic!("expected a hit");
+        };
+        // ...but its lease has expired, which the handler re-checks per request.
+        assert!(lease_is_expired(ctx.expires_at.as_deref()));
+        cache.evict("lease-1");
+
+        assert!(
+            matches!(cache.lookup("lease-1", "good-token"), CacheLookup::Miss),
+            "an evicted entry must no longer hit"
+        );
+    }
+
+    #[test]
+    fn connect_cache_insert_prunes_stale_entries() {
+        // `insert` opportunistically prunes entries older than the TTL while it
+        // holds the lock, so the map only ever retains active leases.
+        let cache = ConnectCache::default();
+        cache.insert("stale".to_string(), test_ctx("t", None, LeasePhase::Bound));
+        {
+            let mut map = cache.0.lock().unwrap();
+            let entry = map.get_mut("stale").unwrap();
+            entry.cached_at = Instant::now()
+                .checked_sub(CONNECT_CACHE_TTL + std::time::Duration::from_secs(1))
+                .expect("instant underflow");
+        }
+
+        // Inserting a fresh, unrelated lease should prune the stale one.
+        cache.insert("fresh".to_string(), test_ctx("t2", None, LeasePhase::Bound));
+
+        let map = cache.0.lock().unwrap();
+        assert!(!map.contains_key("stale"), "stale entry should be pruned");
+        assert!(map.contains_key("fresh"), "fresh entry should remain");
+    }
+
     #[test]
     fn test_lease_exceeds_quota() {
         let active = vec![
@@ -2471,6 +2828,7 @@ mod tests {
             authenticator,
             factory: None,
             datastore: Default::default(),
+            connect_cache: Default::default(),
         };
 
         (build_router(state), server)
@@ -2686,6 +3044,7 @@ mod tests {
             authenticator,
             factory: None,
             datastore: Default::default(),
+            connect_cache: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -2759,6 +3118,7 @@ mod tests {
             authenticator,
             factory: None,
             datastore: Default::default(),
+            connect_cache: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -2811,6 +3171,100 @@ mod tests {
         assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
     }
 
+    /// A miss populates the per-lease cache, and a subsequent request HITS it:
+    /// the second request must NOT re-read the connect-token Secret or re-GET
+    /// the lease. We assert this by mounting those two kube mocks with
+    /// `expect(1)` (wiremock fails on drop if they're hit more than once) while
+    /// the backend `/version` mock allows both requests through.
+    #[tokio::test]
+    async fn test_connect_proxy_caches_lease_context_across_requests() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        backend.set_kubeconfig(&format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
+            server.uri()
+        ));
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+        };
+
+        use wiremock::matchers::{header, method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // The token Secret and lease GETs may happen AT MOST once: the second
+        // request must be served from cache.
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "lease-abc",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .and(header("authorization", "Bearer backend-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_raw(r#"{"gitVersion":"v1.32.0"}"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let make_request = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, "Bearer lease-token".parse().unwrap());
+            connect_proxy::<crate::testutil::MockBackend>(
+                State(state.clone()),
+                Path(("lease-abc".to_string(), "version".to_string())),
+                connect_request(Method::GET, headers, None, Body::empty()),
+            )
+        };
+
+        // First request: cold miss, populates the cache.
+        let first = make_request().await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(
+            matches!(
+                state.connect_cache.lookup("lease-abc", "lease-token"),
+                CacheLookup::Hit(_)
+            ),
+            "the miss should have populated the cache"
+        );
+
+        // Second request: served from cache. The `expect(1)` mocks above will
+        // fail on server drop if this re-read the Secret or the lease.
+        let second = make_request().await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(response_text(second).await, r#"{"gitVersion":"v1.32.0"}"#);
+    }
+
     // #85: exec/attach/port-forward negotiate an HTTP upgrade. The connect proxy
     // now TUNNELS these (no longer a 501) by driving a raw hyper client over the
     // backend TLS config. This test exercises the dispatch: lease validation
@@ -2836,6 +3290,7 @@ mod tests {
             authenticator,
             factory: None,
             datastore: Default::default(),
+            connect_cache: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -2911,6 +3366,7 @@ mod tests {
             authenticator,
             factory: None,
             datastore: Default::default(),
+            connect_cache: Default::default(),
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(

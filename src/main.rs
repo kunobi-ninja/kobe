@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         backend: backend.clone(),
         factory: Some(factory.clone()),
         datastore: datastore.clone(),
+        connect_cache: Default::default(),
     };
 
     let app = build_router(state);
