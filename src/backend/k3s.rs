@@ -19,6 +19,7 @@ use k8s_openapi::api::core::v1::{
     ObjectFieldSelector, Pod, PodAffinity, PodAffinityTerm, PodSpec, PodTemplateSpec, Secret,
     SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
@@ -63,22 +64,42 @@ fn cluster_domain(config: &ClusterConfig) -> &str {
 
 /// The kubeconfig publisher sidecar script, mounted from a ConfigMap.
 ///
-/// Waits for k3s to write the kubeconfig, rewrites the server URL to the
-/// FQDN of the ClusterIP Service, and creates/updates a Kubernetes
-/// Secret. The FQDN form (4 dots) skips the musl-libc `search`-domain
+/// Waits for k3s to write the kubeconfig, then ONLY the ordinal-0 pod
+/// rewrites the server URL to the FQDN of the ClusterIP Service and
+/// creates/updates the `{name}-kubeconfig` Secret. Non-zero ordinals just
+/// idle. The FQDN form (4 dots) skips the musl-libc `search`-domain
 /// fallback issue that breaks the short `.svc` form on Alpine images.
+///
+/// Single-writer election (ordinal-0) removes the N-way concurrent `apply`
+/// race once `servers > 1`: the kubeconfig content is byte-identical across
+/// replicas (the CA comes from the shared datastore), so there's no value in
+/// every replica racing to write it — and OrderedReady makes pod-0 the
+/// bootstrapper anyway. The publish is an idempotent upsert wrapped in a
+/// bounded retry loop so a transient apiserver/RBAC hiccup retries instead of
+/// CrashLooping, and a recreated pod-0 re-applying is a no-op.
 const KUBECONFIG_PUBLISHER_SCRIPT: &str = r#"#!/bin/sh
-set -e
 echo "Waiting for kubeconfig to appear..."
 while [ ! -f /output/kubeconfig ]; do sleep 1; done
-echo "Kubeconfig found, rewriting server URL..."
-sed -i "s|https://127.0.0.1:6443|https://${CLUSTER_NAME}-server.${NAMESPACE}.svc.${CLUSTER_DOMAIN}:6443|" /output/kubeconfig
-echo "Publishing kubeconfig as Secret..."
-kubectl create secret generic ${CLUSTER_NAME}-kubeconfig \
-  --from-file=kubeconfig=/output/kubeconfig \
-  --namespace=${NAMESPACE} \
-  -o yaml --dry-run=client | kubectl apply -f -
-echo "Kubeconfig Secret published, sleeping..."
+echo "Kubeconfig found."
+case "${POD_NAME}" in
+  *-0)
+    set -e
+    echo "Ordinal-0: rewriting server URL..."
+    sed -i "s|https://127.0.0.1:6443|https://${CLUSTER_NAME}-server.${NAMESPACE}.svc.${CLUSTER_DOMAIN}:6443|" /output/kubeconfig
+    echo "Ordinal-0: publishing kubeconfig as Secret..."
+    until kubectl create secret generic ${CLUSTER_NAME}-kubeconfig \
+      --from-file=kubeconfig=/output/kubeconfig \
+      --namespace=${NAMESPACE} \
+      -o yaml --dry-run=client | kubectl apply -f -; do
+      echo "publish failed, retrying..."
+      sleep 2
+    done
+    echo "Kubeconfig Secret published, sleeping..."
+    ;;
+  *)
+    echo "Non-zero ordinal (${POD_NAME}): not publishing kubeconfig, idling..."
+    ;;
+esac
 sleep infinity
 "#;
 
@@ -92,6 +113,41 @@ fn has_registry_mirrors(config: &ClusterConfig) -> bool {
         .registry_mirrors
         .as_ref()
         .is_some_and(|m| !m.is_empty())
+}
+
+/// Pure readiness predicate for the server StatefulSet.
+///
+/// `replicas` is the StatefulSet's `status.replicas` (the CLAMPED spec value
+/// reflected back by the controller), `ready_replicas` is its
+/// `status.readyReplicas`. Ready iff there is at least one desired replica and
+/// all of them are ready (`want > 0 && have >= want`). Keying off the clamped
+/// `status.replicas` — not the raw `config.servers` — means `servers == 0`
+/// collapses to the single-server path. Extracted as a pure fn so it is
+/// unit-testable without a live apiserver.
+fn server_sts_ready(replicas: Option<i32>, ready_replicas: Option<i32>) -> bool {
+    let want = replicas.unwrap_or(0);
+    let have = ready_replicas.unwrap_or(0);
+    want > 0 && have >= want
+}
+
+/// HA gate: `servers > 1` requires an external (shared) datastore.
+///
+/// Reads the RAW `servers` count. Returns `Err` (with a message mentioning
+/// "external datastore") when `servers > 1` and no shared datastore is
+/// configured, because without it each replica would run its own embedded
+/// SQLite → split-brain. Extracted as a pure fn so the gate is unit-testable
+/// independent of the mock-heavy `create()`.
+///
+/// B5: `servers > 1` inherits the datastore's availability SLO — there is no
+/// embedded-etcd quorum fallback in this backend; require an HA/managed
+/// PostgreSQL.
+fn ha_requires_datastore(servers: u32, has_datastore: bool) -> Result<()> {
+    if servers > 1 && !has_datastore {
+        anyhow::bail!(
+            "k3s HA (servers={servers}) requires an external datastore (shared PostgreSQL); none configured. Without it each replica runs its own embedded SQLite -> split-brain. Configure a shared datastore or set servers=1."
+        );
+    }
+    Ok(())
 }
 
 /// Render the contents of `registries.yaml` from a mirrors map.
@@ -479,9 +535,17 @@ impl K3sBackend {
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
             }]),
+            // HTTPS /readyz (not a bare TCP connect) so a replica only counts
+            // Ready — and only joins the Service Endpoints / the
+            // readyReplicas>=servers gate — once its apiserver genuinely serves
+            // with the shared cluster cert. This closes the transient-x509
+            // window where the port is open but the cert isn't the shared one
+            // yet. Mirrors the liveness probe's /cacerts HTTPS shape below.
             readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-                tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
+                http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                    path: Some("/readyz".to_string()),
                     port: IntOrString::Int(6443),
+                    scheme: Some("HTTPS".to_string()),
                     ..Default::default()
                 }),
                 initial_delay_seconds: Some(10),
@@ -532,6 +596,21 @@ impl K3sBackend {
                 EnvVar {
                     name: "CLUSTER_DOMAIN".to_string(),
                     value: Some(cluster_domain.to_string()),
+                    ..Default::default()
+                },
+                // Downward-API pod name so the publisher script can elect
+                // ordinal-0 as the SOLE writer of the kubeconfig Secret (see
+                // KUBECONFIG_PUBLISHER_SCRIPT). Under OrderedReady pod-0 is the
+                // bootstrapper, so it is the natural single publisher.
+                EnvVar {
+                    name: "POD_NAME".to_string(),
+                    value_from: Some(EnvVarSource {
+                        field_ref: Some(ObjectFieldSelector {
+                            field_path: "metadata.name".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             ]),
@@ -622,11 +701,18 @@ impl K3sBackend {
     }
 
     /// Build the server StatefulSet.
+    ///
+    /// `replicas` is the already-clamped control-plane count (callers pass
+    /// `config.servers.max(1)`). The builder deliberately does NOT read
+    /// `config.servers` itself — mirroring `build_agent_deployment` — so the
+    /// HA gate (which reads the RAW `config.servers`) and the replica count
+    /// stay decoupled and independently testable.
     fn build_server_statefulset(
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         datastore_endpoint: Option<&str>,
+        replicas: u32,
     ) -> StatefulSet {
         let image = k3s_image(&config.version);
         let pool = config.pool_name.as_deref();
@@ -655,8 +741,13 @@ impl K3sBackend {
                 ..Default::default()
             },
             spec: Some(StatefulSetSpec {
-                replicas: Some(1),
+                replicas: Some(i32::try_from(replicas).unwrap_or(i32::MAX)),
                 service_name: Some(format!("{name}-server")),
+                // LOAD-BEARING for HA: OrderedReady serializes pod-0 to
+                // bootstrap the shared-datastore cluster CA before peers join;
+                // Parallel would race N servers on a fresh DB and diverge CAs
+                // (split-brain). Do not change to Parallel.
+                pod_management_policy: Some("OrderedReady".to_string()),
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
                     ..Default::default()
@@ -716,6 +807,55 @@ impl K3sBackend {
                     node_port,
                     ..Default::default()
                 }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Build the PodDisruptionBudget for HA (servers>1) control planes.
+    ///
+    /// Selects the same server pod labels as `build_service` / the
+    /// StatefulSet. `minAvailable`: `servers>=3 → servers-1` (tolerate one
+    /// voluntary disruption while keeping a working majority of replicas);
+    /// `servers==2 → 1` (keep at least one control plane up). Only ever called
+    /// for `servers > 1`.
+    ///
+    /// NOTE: a PDB protects ONLY voluntary disruptions (node drains/evictions);
+    /// it does NOT gate the StatefulSet's own RollingUpdate (which already does
+    /// one-pod-at-a-time + readiness).
+    fn build_pod_disruption_budget(
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> PodDisruptionBudget {
+        let pool = config.pool_name.as_deref();
+        let labels = Self::server_labels(name, pool);
+
+        let min_available = if config.servers >= 3 {
+            config.servers - 1
+        } else {
+            1
+        };
+
+        PodDisruptionBudget {
+            metadata: ObjectMeta {
+                name: Some(format!("{name}-server")),
+                namespace: Some(namespace.to_string()),
+                labels: Some(Self::cluster_labels(name, pool)),
+                ..Default::default()
+            },
+            spec: Some(PodDisruptionBudgetSpec {
+                // Saturate consistently with the StatefulSet replica conversion
+                // (k8s int32); an absurd >i32::MAX server count is unreachable in
+                // practice but must not silently collapse minAvailable to 1.
+                min_available: Some(IntOrString::Int(
+                    i32::try_from(min_available).unwrap_or(i32::MAX),
+                )),
+                selector: Some(LabelSelector {
+                    match_labels: Some(labels),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -930,41 +1070,108 @@ impl K3sBackend {
         }
     }
 
-    /// Wait for the kubeconfig Secret to appear (created by the sidecar).
-    async fn wait_ready(&self, name: &str, namespace: &str) -> Result<()> {
+    /// Wait for the k3s cluster to become ready.
+    ///
+    /// Polls BOTH conditions in the SAME loop and only returns `Ok` when:
+    ///   (a) the `{name}-kubeconfig` Secret exists (published by pod-0), AND
+    ///   (b) the server StatefulSet reports enough ready replicas
+    ///       (`server_sts_ready` against its CLAMPED `status.replicas`).
+    ///
+    /// `servers` is the RAW `config.servers`; it only sizes the timeout budget
+    /// (see below). The readiness predicate keys off the StatefulSet's own
+    /// `status.replicas` (the clamped spec value), so `servers == 0` collapses
+    /// cleanly to the single-server path.
+    ///
+    /// Single-server behavior note: the historical wait returned the instant
+    /// the kubeconfig Secret appeared. Additionally gating on `readyReplicas`
+    /// means a single-server cluster is now declared Ready a few seconds later
+    /// — once its apiserver actually passes the HTTPS `/readyz` probe and joins
+    /// the Service Endpoints — instead of the moment k3s wrote its kubeconfig.
+    /// This is a deliberate, strictly-safer change (never advertise Ready
+    /// before the API genuinely serves), not a regression.
+    ///
+    /// Transient (non-404) API errors while polling are NOT fatal: they are
+    /// logged and treated as "not ready yet", so a blip does not fail an
+    /// otherwise-healthy provision. Only exhausting the budget fails — and an
+    /// idempotent `create_database` makes the ensuing reconcile retry safe.
+    ///
+    /// B3 (pod-0 SPOF): pod-0 is a hard bootstrap dependency under OrderedReady
+    /// (it seeds the CA and is the sole kubeconfig publisher); if pod-0 cannot
+    /// reach Ready, the instance burns the wait_ready budget and recycles —
+    /// mitigated by idempotent `create_database` (step 1) and the in-sidecar
+    /// retry (step 7). No operator-side fallback in this version.
+    async fn wait_ready(&self, name: &str, namespace: &str, servers: u32) -> Result<()> {
         debug!(cluster = name, "Waiting for k3s cluster to become ready");
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-kubeconfig");
+        let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+        let sts_name = format!("{name}-server");
 
-        // Poll every 5s for up to 10 minutes
-        for attempt in 0..120 {
-            match secrets.get(&secret_name).await {
-                Ok(_) => {
-                    info!(
-                        cluster = name,
-                        attempts = attempt + 1,
-                        "k3s cluster kubeconfig secret found"
-                    );
-                    return Ok(());
-                }
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    if attempt % 12 == 0 {
-                        debug!(
-                            cluster = name,
-                            attempt = attempt + 1,
-                            "Waiting for k3s cluster kubeconfig..."
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
+        // B2 (timeout budget): OrderedReady serializes bring-up, so N servers
+        // take proportionally longer than one. Scale the attempt budget with
+        // the count: 120 attempts (×5s = 600s) for the first server, +36
+        // attempts (+180s) per additional server. servers=1 → 600s (unchanged
+        // from the historical single-server budget); servers=3 → 192×5s = 960s.
+        let max_attempts = 120 + 36 * (servers.saturating_sub(1)) as usize;
+
+        for attempt in 0..max_attempts {
+            // (a) kubeconfig Secret present?
+            let secret_ready = match secrets.get(&secret_name).await {
+                Ok(_) => true,
+                Err(kube::Error::Api(ae)) if ae.code == 404 => false,
+                // Transient (non-404) errors are not fatal: log and keep
+                // polling within the budget rather than failing the whole
+                // provision on a blip.
                 Err(e) => {
-                    return Err(e).context(format!("Error checking k3s cluster {name} readiness"));
+                    warn!(cluster = name, error = %e, "transient error polling kubeconfig Secret; retrying");
+                    false
                 }
+            };
+
+            // (b) StatefulSet readyReplicas >= clamped spec replicas?
+            let sts_ready = match sts_api.get(&sts_name).await {
+                Ok(sts) => {
+                    let status = sts.status.as_ref();
+                    server_sts_ready(
+                        status.map(|s| s.replicas),
+                        status.and_then(|s| s.ready_replicas),
+                    )
+                }
+                Err(kube::Error::Api(ae)) if ae.code == 404 => false,
+                // Transient (non-404) errors are not fatal: log and keep polling.
+                Err(e) => {
+                    warn!(cluster = name, error = %e, "transient error polling server StatefulSet; retrying");
+                    false
+                }
+            };
+
+            if secret_ready && sts_ready {
+                info!(
+                    cluster = name,
+                    attempts = attempt + 1,
+                    "k3s cluster ready (kubeconfig secret present and server StatefulSet ready)"
+                );
+                return Ok(());
             }
+
+            if attempt % 12 == 0 {
+                debug!(
+                    cluster = name,
+                    attempt = attempt + 1,
+                    secret_ready,
+                    sts_ready,
+                    "Waiting for k3s cluster readiness..."
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
-        anyhow::bail!("k3s cluster {name} not ready after 10 minutes");
+        anyhow::bail!(
+            "k3s cluster {name} not ready after {} attempts ({}s)",
+            max_attempts,
+            max_attempts * 5
+        );
     }
 
     /// Delete a resource, ignoring 404 (already deleted).
@@ -1081,6 +1288,12 @@ impl ClusterBackend for K3sBackend {
 
         // 3. If PostgreSQL configured, create per-cluster database. Read the
         // current connection each time so a rotated credential is picked up.
+        //
+        // `servers` is IMMUTABLE in practice: it is folded into the pool's
+        // `profile_spec_hash` (see `pool::manager::profile_spec_hash`), so any
+        // change to it is a full recycle — the old instance (with its DB and
+        // PVCs) is torn down and a fresh-named one created. We never mutate the
+        // replica count of a live StatefulSet in place.
         let datastore_endpoint = if let Some((pool, base_url)) = self.datastore.current() {
             datastore::create_database(&pool, name, "k3s_").await?;
             let endpoint = datastore::cluster_endpoint(&base_url, name, "k3s_")?;
@@ -1089,9 +1302,23 @@ impl ClusterBackend for K3sBackend {
             None
         };
 
-        // 4. Create server StatefulSet
-        let sts =
-            Self::build_server_statefulset(name, namespace, config, datastore_endpoint.as_deref());
+        // 3b. HA gate (B5): servers>1 requires a shared external datastore. The
+        // gate reads the RAW config.servers and MUST fire before ANY
+        // StatefulSet/Service/PDB is patched — otherwise we'd provision N
+        // embedded-SQLite replicas that diverge into split-brain. servers>1
+        // inherits the datastore's availability SLO; there is no embedded-etcd
+        // quorum fallback here, so an HA/managed PostgreSQL is required.
+        ha_requires_datastore(config.servers, datastore_endpoint.is_some())?;
+
+        // 4. Create server StatefulSet. The replica count is the clamped
+        // `config.servers.max(1)` (the builder never reads config.servers).
+        let sts = Self::build_server_statefulset(
+            name,
+            namespace,
+            config,
+            datastore_endpoint.as_deref(),
+            config.servers.max(1),
+        );
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         let sts_name = format!("{name}-server");
         sts_api
@@ -1118,8 +1345,34 @@ impl ClusterBackend for K3sBackend {
             .with_context(|| format!("Failed to apply Service for {name}"))?;
         info!(cluster = name, "Service applied");
 
-        // 6. Wait for kubeconfig Secret (created by sidecar)
-        self.wait_ready(name, namespace).await?;
+        // 5b. For HA (servers>1) ONLY, additively create a PodDisruptionBudget.
+        //
+        // The PDB protects ONLY voluntary disruptions (node drains/evictions);
+        // it does NOT gate the StatefulSet's own RollingUpdate (which already
+        // does one-pod-at-a-time + readiness). Single-server stays
+        // byte-for-byte unchanged (no PDB created).
+        if config.servers > 1 {
+            let pdb = Self::build_pod_disruption_budget(name, namespace, config);
+            let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+            let pdb_name = format!("{name}-server");
+            pdb_api
+                .patch(
+                    &pdb_name,
+                    &PatchParams::apply("kobe-operator").force(),
+                    &Patch::Apply(&pdb),
+                )
+                .await
+                .with_context(|| format!("Failed to apply PodDisruptionBudget for {name}"))?;
+            info!(
+                cluster = name,
+                servers = config.servers,
+                "PodDisruptionBudget applied"
+            );
+        }
+
+        // 6. Wait for readiness: kubeconfig Secret published by pod-0 AND the
+        // server StatefulSet reporting readyReplicas >= clamped replicas.
+        self.wait_ready(name, namespace, config.servers).await?;
 
         // 7. Create agent Deployment if requested
         if let Some(agents) = config.agents
@@ -1152,6 +1405,15 @@ impl ClusterBackend for K3sBackend {
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
         info!(cluster = name, "Deleting k3s cluster");
 
+        // B4 (known PVC leak): the per-replica PVCs created from the
+        // StatefulSet's `volumeClaimTemplates` (named
+        // `data-{name}-server-{ordinal}`) are NOT deleted here and are
+        // orphaned on recycle. This is tolerable today because `servers` is
+        // folded into `spec_hash`, so any `servers` change is a full recycle
+        // with a NEW instance name — the orphans are scoped to the old name,
+        // not reused. Tracked as a follow-up (PVC GC + immutability handling),
+        // intentionally out of scope for the HA change to keep it focused.
+
         // Delete agent Deployment
         let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&deploy_api, &format!("{name}-agent")).await?;
@@ -1163,6 +1425,12 @@ impl ClusterBackend for K3sBackend {
         // Delete server StatefulSet
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&sts_api, &format!("{name}-server")).await?;
+
+        // Delete the HA PodDisruptionBudget (created only for servers>1;
+        // harmless 404 for single-server). delete() has no ClusterConfig here,
+        // so we attempt the delete unconditionally and swallow 404.
+        let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+        Self::delete_ignoring_not_found(&pdb_api, &format!("{name}-server")).await?;
 
         // Delete publisher ConfigMap
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
@@ -1250,7 +1518,7 @@ mod tests {
     #[test]
     fn test_build_server_statefulset_basic() {
         let config = base_config();
-        let sts = K3sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("test-cluster", "test-ns", &config, None, 1);
 
         assert_eq!(sts.metadata.name.as_deref(), Some("test-cluster-server"));
         assert_eq!(sts.metadata.namespace.as_deref(), Some("test-ns"));
@@ -1290,7 +1558,7 @@ mod tests {
             "base_config must leave allocation to the reconciler; got {:?}",
             config.allocated_network
         );
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
             .args
             .clone()
@@ -1324,7 +1592,7 @@ mod tests {
             service_cidr: "10.245.32.0/20".to_string(),
             cluster_cidr: "10.253.32.0/20".to_string(),
         });
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
             .args
             .clone()
@@ -1347,6 +1615,7 @@ mod tests {
             "ns",
             &config,
             Some("postgres://user:pass@pg:5432/k3s_pg_cluster"),
+            1,
         );
 
         let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
@@ -1367,7 +1636,7 @@ mod tests {
             storage_request_size: Some("20Gi".to_string()),
         });
 
-        let sts = K3sBackend::build_server_statefulset("p-cluster", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("p-cluster", "ns", &config, None, 1);
         let sts_spec = sts.spec.as_ref().unwrap();
         let pod_spec = sts_spec.template.spec.as_ref().unwrap();
 
@@ -1426,7 +1695,7 @@ mod tests {
     fn test_build_server_statefulset_no_persistence_has_no_pvc_template() {
         let config = base_config();
         assert!(config.persistence.is_none());
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         assert!(
             sts.spec.unwrap().volume_claim_templates.is_none(),
             "no persistence ⇒ no volumeClaimTemplates"
@@ -1443,7 +1712,7 @@ mod tests {
             storage_class_name: None,
             storage_request_size: None,
         });
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let templates = sts.spec.unwrap().volume_claim_templates.unwrap();
         let pvc_spec = templates[0].spec.as_ref().unwrap();
         assert!(pvc_spec.storage_class_name.is_none());
@@ -1470,7 +1739,7 @@ mod tests {
             "--flannel-backend=none".to_string(),
         ];
 
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
 
         let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
         let server = &pod_spec.containers[0];
@@ -1484,7 +1753,7 @@ mod tests {
         // Default (taints: None) keeps k3s's no-taint default — must not
         // emit any --node-taint flags. Backwards-compatible.
         let config = base_config();
-        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None, 1);
         let args = sts
             .spec
             .as_ref()
@@ -1506,7 +1775,7 @@ mod tests {
         // is semantically equivalent to omission — no flags emitted.
         let mut config = base_config();
         config.taints = Some(vec![]);
-        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None, 1);
         let args = sts
             .spec
             .as_ref()
@@ -1538,7 +1807,7 @@ mod tests {
                 effect: TaintEffect::NoExecute,
             },
         ]);
-        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("test", "ns", &config, None, 1);
         let args = sts
             .spec
             .as_ref()
@@ -1743,7 +2012,7 @@ mod tests {
             ..base_config()
         };
 
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
 
         let server = pod_spec
@@ -2008,6 +2277,18 @@ mod tests {
         })
     }
 
+    /// A StatefulSet GET response whose status reports `replicas` desired and
+    /// `replicas` ready — i.e. the cluster is fully Ready. Used by create-flow
+    /// tests so `wait_ready`'s readiness predicate is satisfied immediately.
+    fn ready_statefulset_response(name: &str, namespace: &str, replicas: i32) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": name, "namespace": namespace },
+            "status": { "replicas": replicas, "readyReplicas": replicas }
+        })
+    }
+
     #[tokio::test]
     async fn test_create_cluster_basic() {
         let server = MockServer::start().await;
@@ -2076,6 +2357,22 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(secret_response("test-cluster-kubeconfig", "test-ns")),
+            )
+            .mount(&server)
+            .await;
+
+        // Mock: GET StatefulSet (wait_ready now polls readyReplicas too).
+        // Report 1 desired / 1 ready so the readiness predicate passes.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/test-cluster-server",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ready_statefulset_response(
+                    "test-cluster-server",
+                    "test-ns",
+                    1,
+                )),
             )
             .mount(&server)
             .await;
@@ -2194,6 +2491,10 @@ mod tests {
                 "StatefulSet",
             ),
             (
+                "/apis/policy/v1/namespaces/test-ns/poddisruptionbudgets/test-cluster-server",
+                "PodDisruptionBudget",
+            ),
+            (
                 "/api/v1/namespaces/test-ns/configmaps/test-cluster-kubeconfig-publisher",
                 "ConfigMap",
             ),
@@ -2214,6 +2515,7 @@ mod tests {
         for (path_str, kind) in expected_paths {
             let api_version = match *kind {
                 "Deployment" | "StatefulSet" => "apps/v1",
+                "PodDisruptionBudget" => "policy/v1",
                 _ => "v1",
             };
             // Derive the resource name from the trailing path segment so the
@@ -2366,7 +2668,7 @@ mod tests {
     fn test_build_server_statefulset_no_spread_renders_no_affinity() {
         let config = base_config();
         assert!(config.placement.is_none());
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(pod_spec.affinity.is_none());
     }
@@ -2387,7 +2689,7 @@ mod tests {
             placement: Some(placement),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(pod_spec.affinity.is_none());
     }
@@ -2411,7 +2713,7 @@ mod tests {
             placement: Some(placement),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         let affinity = pod_spec.affinity.expect("affinity present");
         let anti = affinity
@@ -2483,7 +2785,8 @@ mod tests {
             pool_name: Some("ci-k3s-kunobi".to_string()),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("pool-ci-k3s-kunobi-7", "ns", &config, None);
+        let sts =
+            K3sBackend::build_server_statefulset("pool-ci-k3s-kunobi-7", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         let anti = pod_spec.affinity.unwrap().pod_anti_affinity.unwrap();
         let term = &anti
@@ -2537,7 +2840,7 @@ mod tests {
             placement: Some(placement),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         let anti = pod_spec.affinity.unwrap().pod_anti_affinity.unwrap();
         assert!(
@@ -2558,7 +2861,7 @@ mod tests {
             kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("my-cluster", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("my-cluster", "ns", &config, None, 1);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
 
         let server = pod_spec
@@ -2663,7 +2966,7 @@ mod tests {
             "guard for the rest of the test"
         );
 
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let server_spec = sts.spec.unwrap().template.spec.unwrap();
         let server = server_spec
             .containers
@@ -2743,7 +3046,7 @@ mod tests {
             ..base_config()
         };
 
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let server = sts.spec.unwrap().template.spec.unwrap();
         let server_c = server
             .containers
@@ -2788,7 +3091,7 @@ mod tests {
             ..base_config()
         };
 
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let server_spec = sts.spec.unwrap().template.spec.unwrap();
         let server_c = server_spec
             .containers
@@ -2831,7 +3134,7 @@ mod tests {
             }),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let vol = pod
             .volumes
@@ -2866,8 +3169,8 @@ mod tests {
             kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
             ..base_config()
         };
-        let sts1 = K3sBackend::build_server_statefulset("cluster-a", "ns", &config, None);
-        let sts2 = K3sBackend::build_server_statefulset("cluster-b", "ns", &config, None);
+        let sts1 = K3sBackend::build_server_statefulset("cluster-a", "ns", &config, None, 1);
+        let sts2 = K3sBackend::build_server_statefulset("cluster-b", "ns", &config, None, 1);
 
         let p1 = sts1
             .spec
@@ -2914,7 +3217,7 @@ mod tests {
             kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let sts_spec = sts.spec.unwrap();
         let pod = sts_spec.template.spec.unwrap();
 
@@ -2961,7 +3264,7 @@ mod tests {
             kubelet_shared_mount: Some(KubeletSharedMountConfig::default()),
             ..base_config()
         };
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let server = pod
             .containers
@@ -3021,7 +3324,7 @@ mod tests {
         let config = config_with_placement(placement);
 
         // Server StatefulSet
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let na = pod
             .affinity
@@ -3070,7 +3373,7 @@ mod tests {
         };
         let config = config_with_placement(placement);
 
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let tols = pod.tolerations.expect("server tolerations present");
         assert_eq!(tols.len(), 1);
@@ -3096,7 +3399,7 @@ mod tests {
             ..Default::default()
         };
         let config = config_with_placement(placement);
-        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None);
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let anti = pod.affinity.unwrap().pod_anti_affinity.unwrap();
         let term = &anti
@@ -3399,5 +3702,238 @@ mod tests {
         // MockServer Drop validates that the mock with the exact labelSelector
         // was called exactly once — any different labelSelector would not match
         // and the .expect(1) would fail.
+    }
+
+    // =================================================================
+    // HA (servers>1) control-plane tests (#148)
+    // =================================================================
+
+    /// (1) The StatefulSet replica count tracks the `replicas` arg the builder
+    /// is given (callers pass `config.servers.max(1)`), NOT a hardcoded 1.
+    #[test]
+    fn test_build_server_statefulset_replicas_scale() {
+        let config = base_config();
+        let sts3 = K3sBackend::build_server_statefulset("c", "ns", &config, None, 3);
+        assert_eq!(sts3.spec.as_ref().unwrap().replicas, Some(3));
+
+        let sts1 = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
+        assert_eq!(sts1.spec.as_ref().unwrap().replicas, Some(1));
+    }
+
+    /// (2) Clamp: a `0` replica count (servers=0 → `.max(1)` at the call site,
+    /// but the builder still renders whatever it's handed) — verify the
+    /// single-server callers' `.max(1)` clamp produces `Some(1)`.
+    #[test]
+    fn test_build_server_statefulset_clamp_zero() {
+        // Mirror the create() call site: servers=0 → config.servers.max(1) == 1.
+        let servers: u32 = 0;
+        let config = base_config();
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, servers.max(1));
+        assert_eq!(sts.spec.as_ref().unwrap().replicas, Some(1));
+    }
+
+    /// (3) podManagementPolicy MUST be OrderedReady (load-bearing for HA
+    /// bootstrap; Parallel would race N servers and diverge CAs).
+    #[test]
+    fn test_build_server_statefulset_pod_management_policy_ordered_ready() {
+        let config = base_config();
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 3);
+        assert_eq!(
+            sts.spec.as_ref().unwrap().pod_management_policy.as_deref(),
+            Some("OrderedReady")
+        );
+        // And the default updateStrategy is left untouched (not pinned).
+        assert!(sts.spec.as_ref().unwrap().update_strategy.is_none());
+    }
+
+    /// (4) The publisher sidecar carries a downward-API POD_NAME env var bound
+    /// to `metadata.name`, used to elect ordinal-0 as the sole writer.
+    #[test]
+    fn test_publisher_sidecar_has_pod_name_field_ref() {
+        let sidecar = K3sBackend::build_publisher_sidecar(
+            "c",
+            "ns",
+            "rancher/k3s:v1.31.3-k3s1",
+            "cluster.local",
+        );
+        let env = sidecar.env.as_ref().expect("sidecar must have env");
+        let pod_name = env
+            .iter()
+            .find(|e| e.name == "POD_NAME")
+            .expect("sidecar must have POD_NAME env");
+        let field_ref = pod_name
+            .value_from
+            .as_ref()
+            .and_then(|s| s.field_ref.as_ref())
+            .expect("POD_NAME must be a downward-API field_ref");
+        assert_eq!(field_ref.field_path, "metadata.name");
+        assert!(pod_name.value.is_none());
+    }
+
+    /// (5) The publisher script gates the rewrite+publish behind the `*-0)`
+    /// case so only ordinal-0 ever touches the Secret.
+    #[test]
+    fn test_publisher_script_elects_ordinal_zero() {
+        let script = KUBECONFIG_PUBLISHER_SCRIPT;
+        assert!(
+            script.contains("*-0)"),
+            "script must branch on the -0 ordinal: {script}"
+        );
+        // The publish (kubectl apply via create secret) must live INSIDE the
+        // *-0) branch — i.e. it appears after the case guard.
+        let zero_idx = script.find("*-0)").expect("must contain *-0)");
+        let publish_idx = script
+            .find("kubectl create secret generic")
+            .expect("must publish a secret");
+        assert!(
+            publish_idx > zero_idx,
+            "publish must be inside the *-0) branch"
+        );
+        // Idempotent upsert (dry-run | apply) and a bounded retry loop.
+        assert!(script.contains("--dry-run=client"));
+        assert!(script.contains("kubectl apply -f -"));
+        assert!(script.contains("until kubectl create secret"));
+    }
+
+    /// (6) The HA gate rejects servers>1 without a datastore, and allows the
+    /// safe combinations.
+    #[test]
+    fn test_ha_requires_datastore_gate() {
+        let err = ha_requires_datastore(3, false).expect_err("servers>1 + no datastore must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("external datastore"),
+            "gate error must mention external datastore: {msg}"
+        );
+
+        assert!(ha_requires_datastore(3, true).is_ok());
+        assert!(ha_requires_datastore(1, false).is_ok());
+        assert!(ha_requires_datastore(2, true).is_ok());
+        // servers==2 without datastore is also HA → rejected.
+        assert!(ha_requires_datastore(2, false).is_err());
+    }
+
+    /// (7) The Service selector is independent of the replica count — it
+    /// selects all server pods regardless of how many there are.
+    #[test]
+    fn test_service_selector_independent_of_replica_count() {
+        let mut config = base_config();
+        config.servers = 1;
+        let svc1 = K3sBackend::build_service("c", "ns", &config);
+        config.servers = 5;
+        let svc5 = K3sBackend::build_service("c", "ns", &config);
+        assert_eq!(
+            svc1.spec.as_ref().unwrap().selector,
+            svc5.spec.as_ref().unwrap().selector,
+            "service selector must not depend on the replica count"
+        );
+        // And it is the role=server label set, not a per-pod identity.
+        let sel = svc1.spec.as_ref().unwrap().selector.as_ref().unwrap();
+        assert_eq!(
+            sel.get("kobe.kunobi.ninja/role").map(String::as_str),
+            Some("server")
+        );
+    }
+
+    /// (8) TLS SANs include both the short and FQDN service names and NO
+    /// per-pod SAN — the cert is shared across all replicas.
+    #[test]
+    fn test_server_tls_sans_short_and_fqdn_no_per_pod() {
+        let config = base_config();
+        let container = K3sBackend::build_server_container("my-cluster", "ns", &config, None);
+        let args = container.args.as_ref().unwrap();
+        assert!(args.contains(&"--tls-san=my-cluster-server.ns.svc".to_string()));
+        assert!(args.contains(&"--tls-san=my-cluster-server.ns.svc.cluster.local".to_string()));
+        // No SAN references a StatefulSet pod ordinal (e.g. *-server-0).
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--tls-san=") && a.contains("-server-")),
+            "TLS SANs must not pin per-pod identities: {args:?}"
+        );
+    }
+
+    /// (9) The pure readiness predicate: false when have<want, true when
+    /// have>=want, and the single-server case (1 ready of 1) is Ready.
+    #[test]
+    fn test_server_sts_ready_predicate() {
+        // have < want
+        assert!(!server_sts_ready(Some(3), Some(2)));
+        assert!(!server_sts_ready(Some(3), None));
+        // have == want
+        assert!(server_sts_ready(Some(3), Some(3)));
+        // have > want (scale-down transient)
+        assert!(server_sts_ready(Some(2), Some(3)));
+        // single-server: 1 ready of 1
+        assert!(server_sts_ready(Some(1), Some(1)));
+        assert!(!server_sts_ready(Some(1), Some(0)));
+        // no desired replicas (status not yet populated) → not ready
+        assert!(!server_sts_ready(Some(0), Some(0)));
+        assert!(!server_sts_ready(None, None));
+    }
+
+    /// (10) The readiness probe is an HTTPS GET on /readyz:6443 (not a bare TCP
+    /// connect), so a replica only counts Ready once its apiserver serves with
+    /// the shared cluster cert.
+    #[test]
+    fn test_server_readiness_probe_is_readyz_https() {
+        let config = base_config();
+        let container = K3sBackend::build_server_container("c", "ns", &config, None);
+        let probe = container.readiness_probe.as_ref().expect("readiness probe");
+        assert!(
+            probe.tcp_socket.is_none(),
+            "readiness probe must no longer be a bare TCP connect"
+        );
+        let http = probe
+            .http_get
+            .as_ref()
+            .expect("readiness probe must be http_get");
+        assert_eq!(http.path.as_deref(), Some("/readyz"));
+        assert_eq!(http.scheme.as_deref(), Some("HTTPS"));
+        assert_eq!(http.port, IntOrString::Int(6443));
+    }
+
+    /// PDB minAvailable: servers>=3 → servers-1; servers==2 → 1. Selector is
+    /// the server pod labels.
+    #[test]
+    fn test_build_pod_disruption_budget_min_available() {
+        let mut config = base_config();
+
+        config.servers = 3;
+        let pdb3 = K3sBackend::build_pod_disruption_budget("c", "ns", &config);
+        assert_eq!(
+            pdb3.spec.as_ref().unwrap().min_available,
+            Some(IntOrString::Int(2))
+        );
+
+        config.servers = 5;
+        let pdb5 = K3sBackend::build_pod_disruption_budget("c", "ns", &config);
+        assert_eq!(
+            pdb5.spec.as_ref().unwrap().min_available,
+            Some(IntOrString::Int(4))
+        );
+
+        config.servers = 2;
+        let pdb2 = K3sBackend::build_pod_disruption_budget("c", "ns", &config);
+        assert_eq!(
+            pdb2.spec.as_ref().unwrap().min_available,
+            Some(IntOrString::Int(1))
+        );
+
+        // Selector is the role=server label set.
+        let sel = pdb2
+            .spec
+            .as_ref()
+            .unwrap()
+            .selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            sel.get("kobe.kunobi.ninja/role").map(String::as_str),
+            Some("server")
+        );
     }
 }

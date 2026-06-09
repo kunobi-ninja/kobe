@@ -173,19 +173,45 @@ pub fn sanitize_db_name(cluster_name: &str, prefix: &str) -> Result<String> {
     Ok(db_name)
 }
 
+/// True iff `code` is PostgreSQL's `duplicate_database` SQLSTATE (`42P04`),
+/// i.e. the `CREATE DATABASE` failed only because the database already exists.
+///
+/// Extracted as a pure helper so it can be unit-tested without simulating a
+/// live sqlx error.
+fn is_duplicate_db_error(code: Option<&str>) -> bool {
+    code == Some("42P04")
+}
+
 /// Create a new database for a cluster.
+///
+/// Idempotent: PostgreSQL has no `CREATE DATABASE IF NOT EXISTS`, so a
+/// "database already exists" error (`42P04`) is treated as success. This
+/// matters because `create()` re-runs on every `Creating && !provisioned`
+/// reconcile re-entry: the first `create_database` that errors *after* the
+/// `CREATE DATABASE` actually succeeded (e.g. a transient PG blip or a
+/// `wait_ready` timeout downstream) leaves the database in place, and the
+/// next reconcile would otherwise hit "already exists" → `Err` → `Failed`
+/// forever → recycle storm.
 pub async fn create_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
     info!(db = %db_name, cluster = cluster_name, "Creating database");
 
     let sql = format!("CREATE DATABASE \"{db_name}\"");
-    sqlx::query(&sql)
-        .execute(pool)
-        .await
-        .with_context(|| format!("Failed to create database {db_name}"))?;
-
-    debug!(db = %db_name, "Database created");
-    Ok(())
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => {
+            debug!(db = %db_name, "Database created");
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(dberr) = e.as_database_error()
+                && is_duplicate_db_error(dberr.code().as_deref())
+            {
+                debug!(db = %db_name, "Database already exists, treating create as idempotent no-op");
+                return Ok(());
+            }
+            Err(e).with_context(|| format!("Failed to create database {db_name}"))
+        }
+    }
 }
 
 /// Create a new database from a template (golden image).
@@ -374,5 +400,16 @@ mod tests {
     fn test_cluster_endpoint_k0s_prefix() {
         let result = cluster_endpoint("postgres://u:p@h:5432/admin", "cl-1", "k0s_").unwrap();
         assert_eq!(result, "postgres://u:p@h:5432/k0s_cl_1");
+    }
+
+    /// `create_database` is idempotent: only PostgreSQL's `duplicate_database`
+    /// SQLSTATE (`42P04`) is swallowed. We can't easily fabricate a live sqlx
+    /// `DatabaseError` in a unit test, so we lock the pure detector instead.
+    #[test]
+    fn test_is_duplicate_db_error() {
+        assert!(is_duplicate_db_error(Some("42P04")));
+        assert!(!is_duplicate_db_error(Some("42501"))); // insufficient_privilege
+        assert!(!is_duplicate_db_error(Some("")));
+        assert!(!is_duplicate_db_error(None));
     }
 }

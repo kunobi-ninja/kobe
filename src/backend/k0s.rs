@@ -1091,7 +1091,7 @@ impl ClusterBackend for K0sBackend {
         // it up front with a clear error instead of silently hanging.
         if config.servers > 1 {
             anyhow::bail!(
-                "k0s backend does not support servers > 1 (HA not implemented); got servers={}",
+                "k0s HA (servers>1) is not yet implemented in this backend: the control-plane StatefulSet is single-replica and the generated join token does not satisfy k0s per-controller join. HA requires a shared external datastore (kine/PostgreSQL) AND per-controller join tokens; use the k3s backend for HA today. Got servers={}.",
                 config.servers
             );
         }
@@ -2221,7 +2221,7 @@ mod tests {
         let err = result.expect_err("create must reject servers > 1");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("servers > 1"),
+            msg.contains("servers>1") && msg.contains("not yet implemented"),
             "error must explain the unsupported HA config: {msg}"
         );
     }
