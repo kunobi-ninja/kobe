@@ -48,6 +48,7 @@ pub async fn write_live_set(
 use crate::crd::ClusterInstance;
 use futures::FutureExt;
 use futures::StreamExt;
+use kube::runtime::reflector::{Store, reflector, store};
 use kube::runtime::watcher::{Config, watcher};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
@@ -61,17 +62,19 @@ pub async fn run_live_set_controller(client: Client, namespace: &str, shutdown: 
     let cms: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     let cis: Api<ClusterInstance> = Api::all(client.clone());
 
-    if let Err(e) = relist_and_write(&cis, &cms, namespace).await {
-        warn!(error = %e, "initial live-set write failed; will retry from watch loop");
-    }
+    // Maintain a shared informer cache of every ClusterInstance instead of
+    // issuing a full LIST on each watch event. The reflector Store is fed by
+    // the same cluster-wide, unselected watch the old loop already ran, so it
+    // holds the identical complete set — only the data source changes (one
+    // watch + O(1) cache reads, no per-event LIST RPC against the apiserver).
+    let (reader, writer) = store::<ClusterInstance>();
 
     let notify = std::sync::Arc::new(Notify::new());
     let notify_clone = notify.clone();
-    let cis_clone = cis.clone();
 
     let watch_shutdown = shutdown.clone();
     let watch_handle = tokio::spawn(async move {
-        let mut stream = Box::pin(watcher(cis_clone, Config::default()));
+        let mut stream = Box::pin(reflector(writer, watcher(cis, Config::default())));
         loop {
             tokio::select! {
                 _ = watch_shutdown.cancelled() => break,
@@ -86,13 +89,35 @@ pub async fn run_live_set_controller(client: Client, namespace: &str, shutdown: 
         }
     });
 
+    // Block the first publish until the cache has finished its initial sync, so
+    // we never write an empty instance set (which the reaper reads as "every
+    // lease-root subdir is stale"). Bounded by shutdown so teardown can't hang.
+    tokio::select! {
+        _ = shutdown.cancelled() => {
+            watch_handle.abort();
+            info!("live-set controller stopped");
+            return;
+        }
+        res = reader.wait_until_ready() => {
+            if let Err(e) = res {
+                warn!(error = %e, "live-set cache writer dropped before ready; stopping");
+                watch_handle.abort();
+                return;
+            }
+        }
+    }
+
+    if let Err(e) = write_from_store(&reader, &cms, namespace).await {
+        warn!(error = %e, "initial live-set write failed; will retry from watch loop");
+    }
+
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = notify.notified() => {
                 sleep(Duration::from_secs(1)).await;
                 while notify.notified().now_or_never().is_some() {}
-                if let Err(e) = relist_and_write(&cis, &cms, namespace).await {
+                if let Err(e) = write_from_store(&reader, &cms, namespace).await {
                     warn!(error = %e, "live-set write failed (will retry on next event)");
                 }
             }
@@ -103,16 +128,15 @@ pub async fn run_live_set_controller(client: Client, namespace: &str, shutdown: 
     info!("live-set controller stopped");
 }
 
-async fn relist_and_write(
-    cis: &Api<ClusterInstance>,
+/// Snapshot the reflector cache into the `kobe-live-instances` ConfigMap.
+async fn write_from_store(
+    reader: &Store<ClusterInstance>,
     cms: &Api<ConfigMap>,
     namespace: &str,
 ) -> Result<()> {
-    use kube::api::ListParams;
-    let list = cis.list(&ListParams::default()).await?;
     let mut names = BTreeSet::new();
-    for ci in list.items {
-        if let Some(n) = ci.metadata.name {
+    for ci in reader.state() {
+        if let Some(n) = ci.metadata.name.clone() {
             names.insert(n);
         }
     }
