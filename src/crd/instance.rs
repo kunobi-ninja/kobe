@@ -113,6 +113,14 @@ pub struct ClusterInstanceStatus {
     pub bootstrapped: bool,
 
     /// Lease currently attached to this instance.
+    ///
+    /// Intentionally NO `skip_serializing_if`: unlike the write-once
+    /// `spec_hash`/`created_with` fields, `lease_ref` is *actively managed* —
+    /// set when a lease binds and written back to `None` to **clear** it when
+    /// the lease is released/recycled. `None` is a meaningful "clear" signal,
+    /// so it must serialize as `null` (the Merge-Patch delete) rather than be
+    /// omitted. Adding `skip_serializing_if` here would make a released
+    /// instance keep a stale `lease_ref` forever.
     #[serde(default)]
     pub lease_ref: Option<ResourceRef>,
 
@@ -124,10 +132,20 @@ pub struct ClusterInstanceStatus {
     pub active_bootstrap: Option<String>,
 
     /// When the instance became idle and eligible for scale-down.
+    ///
+    /// Intentionally NO `skip_serializing_if` (same reasoning as `lease_ref`):
+    /// actively managed, not write-once. Set to `Some(now)` when the instance
+    /// becomes idle and back to `None` to **clear** it the moment it stops
+    /// being idle (leased, recycling, …). The `None`→`null` Merge-Patch delete
+    /// is required; omitting it would leave a busy instance carrying a stale
+    /// idle timestamp and corrupt the scale-down decision in `pool::manager`.
     #[serde(default)]
     pub idle_since: Option<String>,
 
-    /// When the instance entered its current phase.
+    /// When the instance entered its current phase. Written `Some(now)` on
+    /// every transition; never deliberately cleared, but kept without
+    /// `skip_serializing_if` for consistency with the other actively-managed
+    /// timestamp fields above.
     #[serde(default)]
     pub state_since: Option<String>,
 
@@ -190,6 +208,72 @@ pub struct ClusterInstanceStatus {
     /// preserves the original write through every subsequent patch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_with: Option<ClusterInstanceProvenance>,
+
+    /// Human-readable detail about the instance's current state — *why*
+    /// it is in `phase`. Set fresh on every status write by the instance
+    /// controller (each construction site supplies a concise phrase like
+    /// `"provisioning backend resources"` or `"running bootstrap 'foo'"`),
+    /// so it always describes the most recent transition rather than a
+    /// stale value.
+    ///
+    /// `skip_serializing_if = "Option::is_none"` protects it from
+    /// cross-controller Merge-Patch erasure, same pattern as `spec_hash`:
+    /// a writer that leaves this `None` (e.g. the profile controller, or
+    /// a "ready / no message" instance-controller path) must omit the key
+    /// entirely, otherwise a JSON Merge Patch carrying `"message": null`
+    /// would wipe the on-disk value (RFC 7396).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+
+    /// Standard Kubernetes-style status conditions, derived centrally by
+    /// the instance controller from `phase` / `provisioned` /
+    /// `bootstrapped` (see `derive_instance_conditions`). Currently
+    /// emitted: `Provisioned`, `Ready`, `Bootstrapped`. These give
+    /// `kubectl` and ops tooling a familiar, machine-readable surface for
+    /// *why* the instance is where it is.
+    ///
+    /// `skip_serializing_if = "Vec::is_empty"` protects the list from
+    /// cross-controller Merge-Patch erasure, same pattern as `spec_hash`:
+    /// the profile controller (a separate status writer) re-emits status
+    /// without conditions of its own, so an empty `Vec` must be omitted
+    /// from the JSON entirely — otherwise a JSON Merge Patch carrying
+    /// `"conditions": []` would replace the on-disk list with an empty
+    /// one (RFC 7396 / array-replacement).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ClusterInstanceCondition>,
+}
+
+/// One status condition on a `ClusterInstance`. Mirrors the core/v1
+/// condition shape (type/status/reason/message/lastTransitionTime) — and
+/// `KobeStoreCondition` — so kubectl and operators see a familiar
+/// surface across all Kobe resources.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterInstanceCondition {
+    /// Condition name. Emitted values: `Provisioned`, `Ready`,
+    /// `Bootstrapped`.
+    #[serde(rename = "type")]
+    pub condition_type: String,
+
+    /// One of: `True`, `False`, `Unknown`.
+    pub status: String,
+
+    /// Machine-readable reason. For the `True` case this is the
+    /// condition name (e.g. `Provisioned`); for the `False` case it is
+    /// typically the current phase (e.g. `Creating`, `Failed`,
+    /// `Recycling`) so operators can see at a glance what is blocking.
+    pub reason: String,
+
+    /// Human-readable detail, generally a copy of `status.message` for
+    /// the current state (or empty when there is none).
+    pub message: String,
+
+    /// RFC3339 of the last status change. Updated only when `status`
+    /// flips (True ↔ False ↔ Unknown), not on every reconcile, so tools
+    /// tailing `kubectl get -w` see meaningful transitions rather than
+    /// churn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
 }
 
 /// Provenance stamp written once at create time on

@@ -23,9 +23,9 @@ use crate::backend::{
 };
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
-    ClusterConfig, ClusterInstance, ClusterInstanceNetwork, ClusterInstancePhase,
-    ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig, LeasePhase, ReadinessGate,
-    SnapshotConfig,
+    ClusterConfig, ClusterInstance, ClusterInstanceCondition, ClusterInstanceNetwork,
+    ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig,
+    LeasePhase, ReadinessGate, SnapshotConfig,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -312,7 +312,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         );
                         patch_instance_status(
                             &instances_api,
-                            &name,
+                            &instance,
                             ClusterInstanceStatus {
                                 phase: ClusterInstancePhase::Creating,
                                 provisioned: false,
@@ -330,6 +330,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 // is preserved (we never want to overwrite it
                                 // from an instance-controller patch).
                                 created_with: None,
+                                message: Some("network allocated; awaiting provisioning".into()),
+                                // Overwritten centrally in patch_instance_status.
+                                conditions: Vec::new(),
                             },
                         )
                         .await?;
@@ -372,7 +375,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 Ok(()) => {
                     patch_instance_status(
                         &instances_api,
-                        &name,
+                        &instance,
                         ClusterInstanceStatus {
                             phase: ClusterInstancePhase::Creating,
                             provisioned: true,
@@ -383,6 +386,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
                             spec_hash: status.spec_hash.clone(),
+                            message: Some("waiting for control plane to become ready".into()),
                             ..Default::default()
                         },
                     )
@@ -390,7 +394,8 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     Ok(Action::requeue(std::time::Duration::from_secs(5)))
                 }
                 Err(e) => {
-                    warn!(instance = %name, error = %format!("{e:#}"), "Provisioning failed");
+                    let failure = format!("{e:#}");
+                    warn!(instance = %name, error = %failure, "Provisioning failed");
                     observe_instance_create(
                         &instance,
                         &config.backend.backend_type,
@@ -398,7 +403,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     );
                     patch_instance_status(
                         &instances_api,
-                        &name,
+                        &instance,
                         ClusterInstanceStatus {
                             phase: ClusterInstancePhase::Failed,
                             provisioned: false,
@@ -409,6 +414,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
                             spec_hash: status.spec_hash.clone(),
+                            message: Some(format!("provisioning failed: {failure}")),
                             ..Default::default()
                         },
                     )
@@ -422,9 +428,10 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             if ready {
                 match reconcile_instance_bootstraps(&ctx, &config, &instance, &name, &ns).await {
                     Ok(Some(active_bootstrap)) => {
+                        let message = Some(format!("running bootstrap '{active_bootstrap}'"));
                         patch_instance_status(
                             &instances_api,
-                            &name,
+                            &instance,
                             ClusterInstanceStatus {
                                 phase: ClusterInstancePhase::Creating,
                                 provisioned: true,
@@ -435,6 +442,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 state_since: status.state_since,
                                 health_failures: 0,
                                 spec_hash: status.spec_hash.clone(),
+                                message,
                                 ..Default::default()
                             },
                         )
@@ -449,7 +457,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         );
                         patch_instance_status(
                             &instances_api,
-                            &name,
+                            &instance,
                             ClusterInstanceStatus {
                                 phase: ClusterInstancePhase::Ready,
                                 provisioned: true,
@@ -460,6 +468,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: 0,
                                 spec_hash: status.spec_hash.clone(),
+                                message: Some("ready".into()),
                                 ..Default::default()
                             },
                         )
@@ -467,7 +476,8 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         Ok(Action::requeue(std::time::Duration::from_secs(30)))
                     }
                     Err(e) => {
-                        warn!(instance = %name, error = %format!("{e:#}"), "Bootstrap failed");
+                        let failure = format!("{e:#}");
+                        warn!(instance = %name, error = %failure, "Bootstrap failed");
                         observe_instance_create(
                             &instance,
                             &config.backend.backend_type,
@@ -492,9 +502,13 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 crate::metrics::BootstrapFailureReason::BackoffLimit.as_str(),
                             ])
                             .inc();
+                        let message = Some(format!(
+                            "bootstrap '{}' failed: {failure}",
+                            status.active_bootstrap.as_deref().unwrap_or("unknown")
+                        ));
                         patch_instance_status(
                             &instances_api,
-                            &name,
+                            &instance,
                             ClusterInstanceStatus {
                                 phase: ClusterInstancePhase::Failed,
                                 provisioned: true,
@@ -505,6 +519,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: status.health_failures,
                                 spec_hash: status.spec_hash.clone(),
+                                message,
                                 ..Default::default()
                             },
                         )
@@ -517,7 +532,8 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Ready => {
-            let next = evaluate_ready_instance(&ctx, &config, &name, &ns, &status).await?;
+            let next =
+                evaluate_ready_instance(&ctx, &config, &instance, &name, &ns, &status).await?;
             Ok(next)
         }
         ClusterInstancePhase::Leased => {
@@ -567,9 +583,13 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 phase = ?status.phase,
                 "Standalone instance is terminal past the grace window; recycling to release backend resources"
             );
+            let message = Some(format!(
+                "recycling terminal standalone instance (was {})",
+                phase_reason(&status.phase)
+            ));
             patch_instance_status(
                 &instances_api,
-                &name,
+                &instance,
                 ClusterInstanceStatus {
                     phase: ClusterInstancePhase::Recycling,
                     provisioned: status.provisioned,
@@ -580,6 +600,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: status.health_failures,
                     spec_hash: status.spec_hash.clone(),
+                    message,
                     ..Default::default()
                 },
             )
@@ -643,7 +664,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
         let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
         patch_instance_status(
             &instances_api,
-            name,
+            instance,
             ClusterInstanceStatus {
                 phase: ClusterInstancePhase::Recycling,
                 provisioned: status.provisioned,
@@ -654,6 +675,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                 health_failures: status.health_failures,
                 spec_hash: status.spec_hash.clone(),
+                message: Some("recycling: leased instance lost its lease reference".into()),
                 ..Default::default()
             },
         )
@@ -679,9 +701,13 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
                 let instances_api: Api<ClusterInstance> =
                     Api::namespaced(ctx.client.clone(), namespace);
+                let message = Some(format!(
+                    "recycling: lease '{}' is {}",
+                    lease_ref.name, lease_status.phase
+                ));
                 patch_instance_status(
                     &instances_api,
-                    name,
+                    instance,
                     ClusterInstanceStatus {
                         phase: ClusterInstancePhase::Recycling,
                         provisioned: status.provisioned,
@@ -692,6 +718,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                         state_since: Some(chrono::Utc::now().to_rfc3339()),
                         health_failures: status.health_failures,
                         spec_hash: status.spec_hash.clone(),
+                        message,
                         ..Default::default()
                     },
                 )
@@ -730,7 +757,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                         Api::namespaced(ctx.client.clone(), namespace);
                     patch_instance_status(
                         &instances_api,
-                        name,
+                        instance,
                         ClusterInstanceStatus {
                             // The cluster was reserved but never handed to a tenant
                             // (the lease never reached Bound), so it is clean —
@@ -744,6 +771,9 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                             state_since: Some(chrono::Utc::now().to_rfc3339()),
                             health_failures: status.health_failures,
                             spec_hash: status.spec_hash.clone(),
+                            message: Some(
+                                "ready; reclaimed from an orphaned lease reservation".into(),
+                            ),
                             ..Default::default()
                         },
                     )
@@ -762,9 +792,13 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
             observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
             let instances_api: Api<ClusterInstance> =
                 Api::namespaced(ctx.client.clone(), namespace);
+            let message = Some(format!(
+                "recycling: lease '{}' no longer exists",
+                lease_ref.name
+            ));
             patch_instance_status(
                 &instances_api,
-                name,
+                instance,
                 ClusterInstanceStatus {
                     phase: ClusterInstancePhase::Recycling,
                     provisioned: status.provisioned,
@@ -775,6 +809,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: status.health_failures,
                     spec_hash: status.spec_hash.clone(),
+                    message,
                     ..Default::default()
                 },
             )
@@ -1054,6 +1089,7 @@ async fn evaluate_instance_readiness<B: ClusterBackend + Clone>(
 async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     config: &ResolvedInstanceConfig,
+    instance: &ClusterInstance,
     name: &str,
     namespace: &str,
     status: &ClusterInstanceStatus,
@@ -1071,7 +1107,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                     Api::namespaced(ctx.client.clone(), namespace);
                 patch_instance_status(
                     &instances_api,
-                    name,
+                    instance,
                     ClusterInstanceStatus {
                         phase: ClusterInstancePhase::Ready,
                         provisioned: status.provisioned,
@@ -1082,6 +1118,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                         state_since: status.state_since.clone(),
                         health_failures: 0,
                         spec_hash: status.spec_hash.clone(),
+                        message: Some("ready; health check recovered".into()),
                         ..Default::default()
                     },
                 )
@@ -1093,27 +1130,33 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
         }
         Ok(false) => {
             let failures = status.health_failures + 1;
-            let next_phase = if failures >= threshold {
+            let over_threshold = failures >= threshold;
+            let next_phase = if over_threshold {
                 ClusterInstancePhase::Recycling
             } else {
                 ClusterInstancePhase::Ready
             };
+            let message = Some(if over_threshold {
+                format!("recycling: health check failed {failures}/{threshold} times")
+            } else {
+                format!("health check failing ({failures}/{threshold})")
+            });
             let instances_api: Api<ClusterInstance> =
                 Api::namespaced(ctx.client.clone(), namespace);
             patch_instance_status(
                 &instances_api,
-                name,
+                instance,
                 ClusterInstanceStatus {
                     phase: next_phase,
                     provisioned: status.provisioned,
                     bootstrapped: status.bootstrapped,
-                    lease_ref: if failures >= threshold {
+                    lease_ref: if over_threshold {
                         None
                     } else {
                         status.lease_ref.clone()
                     },
                     active_bootstrap: None,
-                    idle_since: if failures >= threshold {
+                    idle_since: if over_threshold {
                         None
                     } else {
                         status.idle_since.clone()
@@ -1121,6 +1164,7 @@ async fn evaluate_ready_instance<B: ClusterBackend + Clone>(
                     state_since: Some(chrono::Utc::now().to_rfc3339()),
                     health_failures: failures,
                     spec_hash: status.spec_hash.clone(),
+                    message,
                     ..Default::default()
                 },
             )
@@ -1826,15 +1870,127 @@ async fn remove_finalizer(
     Ok(())
 }
 
+/// Stable, machine-readable name for a phase, used as a condition
+/// `reason` (e.g. the `Ready=False` reason is the phase that is blocking
+/// readiness). Kept PascalCase so it reads as a k8s condition reason.
+fn phase_reason(phase: &ClusterInstancePhase) -> &'static str {
+    match phase {
+        ClusterInstancePhase::Creating => "Creating",
+        ClusterInstancePhase::Ready => "Ready",
+        ClusterInstancePhase::Leased => "Leased",
+        ClusterInstancePhase::Recycling => "Recycling",
+        ClusterInstancePhase::Unhealthy => "Unhealthy",
+        ClusterInstancePhase::Failed => "Failed",
+    }
+}
+
+/// Derive the standard condition set for a `ClusterInstance` from its
+/// status fields. PURE: no I/O, no clock — `now` is passed in so callers
+/// control the timestamp and tests are deterministic.
+///
+/// Emits three conditions:
+/// - `Provisioned`: `True` iff `status.provisioned`.
+/// - `Ready`: `True` iff `phase` is `Ready` or `Leased`.
+/// - `Bootstrapped`: `True` iff `status.bootstrapped`.
+///
+/// `lastTransitionTime` follows core/v1 / `KobeStoreCondition` semantics:
+/// for each derived condition we look up the matching `condition_type` in
+/// `prev`; if found AND its `status` is unchanged we keep the previous
+/// timestamp, otherwise we stamp `now`. So the time only moves when the
+/// condition actually flips (or is brand new), never on a redundant
+/// reconcile.
+fn derive_instance_conditions(
+    status: &ClusterInstanceStatus,
+    prev: &[ClusterInstanceCondition],
+    now: &str,
+) -> Vec<ClusterInstanceCondition> {
+    let message = status.message.clone().unwrap_or_default();
+    let bool_status = |b: bool| if b { "True" } else { "False" };
+
+    // Helper: build one condition, preserving lastTransitionTime when the
+    // status is unchanged vs. `prev`.
+    let build = |condition_type: &str, new_status: &str, reason: String, message: String| {
+        let last_transition_time = prev
+            .iter()
+            .find(|c| c.condition_type == condition_type)
+            .filter(|c| c.status == new_status)
+            .and_then(|c| c.last_transition_time.clone())
+            .or_else(|| Some(now.to_string()));
+        ClusterInstanceCondition {
+            condition_type: condition_type.to_string(),
+            status: new_status.to_string(),
+            reason,
+            message,
+            last_transition_time,
+        }
+    };
+
+    let is_ready = matches!(
+        status.phase,
+        ClusterInstancePhase::Ready | ClusterInstancePhase::Leased
+    );
+    let phase = phase_reason(&status.phase);
+
+    vec![
+        build(
+            "Provisioned",
+            bool_status(status.provisioned),
+            if status.provisioned {
+                "Provisioned".to_string()
+            } else {
+                // Not provisioned: surface the phase so a stuck create vs
+                // a fresh instance is distinguishable.
+                phase.to_string()
+            },
+            message.clone(),
+        ),
+        build(
+            "Ready",
+            bool_status(is_ready),
+            // Reason is always the phase: for Ready=True it's Ready/Leased,
+            // for Ready=False it names what's blocking (Creating/Failed/…).
+            phase.to_string(),
+            message.clone(),
+        ),
+        build(
+            "Bootstrapped",
+            bool_status(status.bootstrapped),
+            if status.bootstrapped {
+                "Bootstrapped".to_string()
+            } else {
+                phase.to_string()
+            },
+            message,
+        ),
+    ]
+}
+
+/// Central status-write helper. Every status mutation in this controller
+/// routes through here, so conditions are derived in ONE place rather
+/// than at the ~13 construction sites (which just leave
+/// `conditions: Vec::new()` — it is overwritten here).
+///
+/// Derives `status.conditions` from the just-built `status`, preserving
+/// `lastTransitionTime` against the instance's *current* on-disk
+/// conditions (`instance.status.conditions`), then JSON-Merge-Patches
+/// `{ "status": status }`.
 async fn patch_instance_status(
     instances_api: &Api<ClusterInstance>,
-    name: &str,
-    status: ClusterInstanceStatus,
+    instance: &ClusterInstance,
+    mut status: ClusterInstanceStatus,
 ) -> Result<(), kube::Error> {
+    let prev = instance
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or(&[]);
+    let now = chrono::Utc::now().to_rfc3339();
+    status.conditions = derive_instance_conditions(&status, prev, &now);
+
     let patch = serde_json::json!({ "status": status });
     instances_api
         .patch_status(
-            name,
+            &instance.name_any(),
             &PatchParams::apply("kobe-operator"),
             &Patch::Merge(&patch),
         )
@@ -1862,6 +2018,223 @@ mod tests {
     use crate::testutil::MockBackend;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Find a derived condition by type. Panics if absent (tests assert
+    /// all three are always present).
+    fn cond<'a>(conds: &'a [ClusterInstanceCondition], ty: &str) -> &'a ClusterInstanceCondition {
+        conds
+            .iter()
+            .find(|c| c.condition_type == ty)
+            .unwrap_or_else(|| panic!("missing condition {ty}"))
+    }
+
+    fn status_for(
+        phase: ClusterInstancePhase,
+        provisioned: bool,
+        bootstrapped: bool,
+    ) -> ClusterInstanceStatus {
+        ClusterInstanceStatus {
+            phase,
+            provisioned,
+            bootstrapped,
+            message: Some("hello".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn derive_conditions_ready_phase_is_ready_true() {
+        let now = "2026-01-01T00:00:00Z";
+        for phase in [ClusterInstancePhase::Ready, ClusterInstancePhase::Leased] {
+            let phase_name = phase_reason(&phase).to_string();
+            let st = status_for(phase, true, true);
+            let conds = derive_instance_conditions(&st, &[], now);
+
+            let ready = cond(&conds, "Ready");
+            assert_eq!(ready.status, "True");
+            assert_eq!(ready.reason, phase_name);
+            assert_eq!(ready.message, "hello");
+
+            assert_eq!(cond(&conds, "Provisioned").status, "True");
+            assert_eq!(cond(&conds, "Provisioned").reason, "Provisioned");
+            assert_eq!(cond(&conds, "Bootstrapped").status, "True");
+            assert_eq!(cond(&conds, "Bootstrapped").reason, "Bootstrapped");
+        }
+    }
+
+    #[test]
+    fn derive_conditions_non_ready_phase_is_ready_false_with_phase_reason() {
+        let now = "2026-01-01T00:00:00Z";
+        for phase in [
+            ClusterInstancePhase::Creating,
+            ClusterInstancePhase::Recycling,
+            ClusterInstancePhase::Unhealthy,
+            ClusterInstancePhase::Failed,
+        ] {
+            let phase_name = phase_reason(&phase).to_string();
+            // not provisioned, not bootstrapped
+            let st = status_for(phase, false, false);
+            let conds = derive_instance_conditions(&st, &[], now);
+
+            let ready = cond(&conds, "Ready");
+            assert_eq!(ready.status, "False");
+            assert_eq!(ready.reason, phase_name, "Ready reason names the phase");
+
+            // Provisioned False -> reason is the phase.
+            let prov = cond(&conds, "Provisioned");
+            assert_eq!(prov.status, "False");
+            assert_eq!(prov.reason, phase_name);
+
+            // Bootstrapped False -> reason is the phase.
+            let boot = cond(&conds, "Bootstrapped");
+            assert_eq!(boot.status, "False");
+            assert_eq!(boot.reason, phase_name);
+        }
+    }
+
+    #[test]
+    fn derive_conditions_provisioned_and_bootstrapped_toggle() {
+        let now = "2026-01-01T00:00:00Z";
+        // Provisioned but not yet bootstrapped, still Creating.
+        let st = status_for(ClusterInstancePhase::Creating, true, false);
+        let conds = derive_instance_conditions(&st, &[], now);
+        assert_eq!(cond(&conds, "Provisioned").status, "True");
+        assert_eq!(cond(&conds, "Bootstrapped").status, "False");
+        assert_eq!(cond(&conds, "Ready").status, "False");
+    }
+
+    #[test]
+    fn derive_conditions_message_defaults_to_empty_when_none() {
+        let now = "2026-01-01T00:00:00Z";
+        let st = ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Creating,
+            message: None,
+            ..Default::default()
+        };
+        let conds = derive_instance_conditions(&st, &[], now);
+        assert_eq!(cond(&conds, "Ready").message, "");
+    }
+
+    #[test]
+    fn derive_conditions_preserves_transition_time_when_status_unchanged() {
+        let prev_time = "2025-12-31T00:00:00Z";
+        let now = "2026-01-01T00:00:00Z";
+        // Previous: Ready=True (Leased phase).
+        let prev = vec![ClusterInstanceCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "Leased".to_string(),
+            message: "old".to_string(),
+            last_transition_time: Some(prev_time.to_string()),
+        }];
+        // Now: still Ready=True (Ready phase). Status unchanged -> keep time.
+        let st = status_for(ClusterInstancePhase::Ready, true, true);
+        let conds = derive_instance_conditions(&st, &prev, now);
+        let ready = cond(&conds, "Ready");
+        assert_eq!(ready.status, "True");
+        assert_eq!(
+            ready.last_transition_time.as_deref(),
+            Some(prev_time),
+            "transition time preserved when status does not flip"
+        );
+    }
+
+    #[test]
+    fn derive_conditions_updates_transition_time_when_status_flips() {
+        let prev_time = "2025-12-31T00:00:00Z";
+        let now = "2026-01-01T00:00:00Z";
+        // Previous: Ready=True.
+        let prev = vec![ClusterInstanceCondition {
+            condition_type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "Ready".to_string(),
+            message: String::new(),
+            last_transition_time: Some(prev_time.to_string()),
+        }];
+        // Now: phase Failed -> Ready=False. Status flipped -> stamp now.
+        let st = status_for(ClusterInstancePhase::Failed, true, false);
+        let conds = derive_instance_conditions(&st, &prev, now);
+        let ready = cond(&conds, "Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(
+            ready.last_transition_time.as_deref(),
+            Some(now),
+            "transition time updated when status flips"
+        );
+    }
+
+    #[test]
+    fn derive_conditions_stamps_now_for_new_condition_type() {
+        let now = "2026-01-01T00:00:00Z";
+        // prev has only Ready; Provisioned/Bootstrapped are brand new.
+        let prev = vec![ClusterInstanceCondition {
+            condition_type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "Creating".to_string(),
+            message: String::new(),
+            last_transition_time: Some("2025-01-01T00:00:00Z".to_string()),
+        }];
+        let st = status_for(ClusterInstancePhase::Creating, true, false);
+        let conds = derive_instance_conditions(&st, &prev, now);
+        // Provisioned is new -> stamped now.
+        assert_eq!(
+            cond(&conds, "Provisioned").last_transition_time.as_deref(),
+            Some(now)
+        );
+        // Ready unchanged (False) -> preserves old time.
+        assert_eq!(
+            cond(&conds, "Ready").last_transition_time.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn status_omits_empty_conditions_and_none_message() {
+        // A status with no conditions and no message must serialize
+        // WITHOUT those keys, so a merge-patch from a writer that did not
+        // set them never carries `"conditions": []` / `"message": null`
+        // (which would erase another writer's value per RFC 7396).
+        let st = ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Creating,
+            conditions: vec![],
+            message: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("conditions"),
+            "empty conditions must be omitted, got: {json}"
+        );
+        assert!(
+            !obj.contains_key("message"),
+            "None message must be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn status_serializes_conditions_and_message_when_present() {
+        let st = ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Ready,
+            message: Some("ready".into()),
+            conditions: vec![ClusterInstanceCondition {
+                condition_type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "Ready".to_string(),
+                message: "ready".to_string(),
+                last_transition_time: Some("2026-01-01T00:00:00Z".to_string()),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["message"], "ready");
+        assert_eq!(json["conditions"][0]["type"], "Ready");
+        assert_eq!(json["conditions"][0]["status"], "True");
+        assert_eq!(
+            json["conditions"][0]["lastTransitionTime"],
+            "2026-01-01T00:00:00Z"
+        );
+    }
 
     #[test]
     fn standalone_terminal_recycle_respects_grace() {
