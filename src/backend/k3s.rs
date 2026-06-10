@@ -535,17 +535,18 @@ impl K3sBackend {
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
             }]),
-            // HTTPS /readyz (not a bare TCP connect) so a replica only counts
-            // Ready — and only joins the Service Endpoints / the
-            // readyReplicas>=servers gate — once its apiserver genuinely serves
-            // with the shared cluster cert. This closes the transient-x509
-            // window where the port is open but the cert isn't the shared one
-            // yet. Mirrors the liveness probe's /cacerts HTTPS shape below.
+            // TCP connect on 6443. We previously tried an HTTPS GET on /readyz
+            // to make readyReplicas mean "genuinely serving the cluster cert",
+            // but k3s's /readyz requires authentication and answers an
+            // unauthenticated kubelet probe with HTTP 401 — so the probe never
+            // succeeds, the pod never becomes Ready, and the instance never
+            // reaches Ready (it recycles forever). /cacerts (used by liveness)
+            // is unauthenticated but is up long before the apiserver is ready,
+            // so it's a poor readiness signal. A bare TCP accept on 6443 is the
+            // known-good readiness gate k3s clusters have always used here.
             readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-                http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                    path: Some("/readyz".to_string()),
+                tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
                     port: IntOrString::Int(6443),
-                    scheme: Some("HTTPS".to_string()),
                     ..Default::default()
                 }),
                 initial_delay_seconds: Some(10),
@@ -1084,11 +1085,10 @@ impl K3sBackend {
     ///
     /// Single-server behavior note: the historical wait returned the instant
     /// the kubeconfig Secret appeared. Additionally gating on `readyReplicas`
-    /// means a single-server cluster is now declared Ready a few seconds later
-    /// — once its apiserver actually passes the HTTPS `/readyz` probe and joins
-    /// the Service Endpoints — instead of the moment k3s wrote its kubeconfig.
-    /// This is a deliberate, strictly-safer change (never advertise Ready
-    /// before the API genuinely serves), not a regression.
+    /// means a single-server cluster is declared Ready a moment later — once the
+    /// server pod passes its TCP:6443 readiness probe and joins the Service
+    /// Endpoints — instead of the moment k3s wrote its kubeconfig. A small,
+    /// safer delay (don't advertise Ready before 6443 accepts), not a regression.
     ///
     /// Transient (non-404) API errors while polling are NOT fatal: they are
     /// logged and treated as "not ready yet", so a blip does not fail an
@@ -1428,9 +1428,22 @@ impl ClusterBackend for K3sBackend {
 
         // Delete the HA PodDisruptionBudget (created only for servers>1;
         // harmless 404 for single-server). delete() has no ClusterConfig here,
-        // so we attempt the delete unconditionally and swallow 404.
+        // so we attempt the delete unconditionally. BEST-EFFORT: a failure here
+        // must NEVER abort instance teardown — a missing `policy` RBAC grant
+        // returns 403 (RBAC is checked before existence, so even single-server
+        // instances that never had a PDB get 403, not 404), and propagating it
+        // wedges the whole pool in Recycling (the instance-cleanup finalizer is
+        // never released). So we log and continue rather than `?`. The PDB is a
+        // best-effort drain protection, not load-bearing for correctness.
         let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
-        Self::delete_ignoring_not_found(&pdb_api, &format!("{name}-server")).await?;
+        if let Err(e) = Self::delete_ignoring_not_found(&pdb_api, &format!("{name}-server")).await {
+            warn!(
+                cluster = name,
+                error = %e,
+                "best-effort PodDisruptionBudget delete failed (continuing teardown; \
+                 check the operator's policy/poddisruptionbudgets RBAC if this persists)"
+            );
+        }
 
         // Delete publisher ConfigMap
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
@@ -3872,25 +3885,24 @@ mod tests {
         assert!(!server_sts_ready(None, None));
     }
 
-    /// (10) The readiness probe is an HTTPS GET on /readyz:6443 (not a bare TCP
-    /// connect), so a replica only counts Ready once its apiserver serves with
-    /// the shared cluster cert.
+    /// (10) The readiness probe is a TCP connect on 6443. An HTTPS GET on
+    /// /readyz does NOT work here — k3s's /readyz requires auth and 401s an
+    /// unauthenticated kubelet probe, so the pod never becomes Ready. TCP-accept
+    /// is the known-good readiness gate.
     #[test]
-    fn test_server_readiness_probe_is_readyz_https() {
+    fn test_server_readiness_probe_is_tcp_6443() {
         let config = base_config();
         let container = K3sBackend::build_server_container("c", "ns", &config, None);
         let probe = container.readiness_probe.as_ref().expect("readiness probe");
         assert!(
-            probe.tcp_socket.is_none(),
-            "readiness probe must no longer be a bare TCP connect"
+            probe.http_get.is_none(),
+            "readiness probe must NOT be an HTTP GET (k3s /readyz 401s an unauthenticated probe)"
         );
-        let http = probe
-            .http_get
+        let tcp = probe
+            .tcp_socket
             .as_ref()
-            .expect("readiness probe must be http_get");
-        assert_eq!(http.path.as_deref(), Some("/readyz"));
-        assert_eq!(http.scheme.as_deref(), Some("HTTPS"));
-        assert_eq!(http.port, IntOrString::Int(6443));
+            .expect("readiness probe must be a TCP socket check");
+        assert_eq!(tcp.port, IntOrString::Int(6443));
     }
 
     /// PDB minAvailable: servers>=3 → servers-1; servers==2 → 1. Selector is
