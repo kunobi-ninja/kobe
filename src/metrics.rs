@@ -413,6 +413,341 @@ pub static INSTANCE_CREATES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// P0 observability: failure / health signals recent incidents proved
+// invisible. Pure observability — no behavior change, just emission
+// alongside existing control flow.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Coarse classification of a pool's `last_failure_reason` text into a
+/// bounded label vocabulary. The reason string itself is high-cardinality
+/// (it embeds indexes, pool names, free-form guidance) so it can NEVER be a
+/// label value; this enum maps it onto a fixed, alert-friendly set via simple
+/// keyword matching in [`PoolFailureClass::from_reason`].
+///
+/// `#[allow(dead_code)]`: the full vocabulary is frozen up front so dashboards
+/// / alerts can reference every class stably; not every variant is reachable
+/// from the current single `last_failure_reason` text (today it's almost
+/// always the generic "not reaching Ready" message → `Other`), but the
+/// backend-create / delete / bootstrap / health / kobestore / ipam classes
+/// gain emitters as those reason strings get richer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolFailureClass {
+    /// Backend resource create failed (StatefulSet / Service / etc.).
+    BackendCreate,
+    /// Backend resource delete / teardown failed (PDB 403, PVC reap, …).
+    BackendDelete,
+    /// Bootstrap Job failed.
+    Bootstrap,
+    /// Health probes failed.
+    Health,
+    /// Backend datastore (`KobeStore`) reported degraded.
+    KobestoreDegraded,
+    /// CIDR / IPAM allocation failure.
+    Ipam,
+    /// Anything not matched by the keyword rules above.
+    Other,
+}
+
+impl PoolFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendCreate => "backend_create",
+            Self::BackendDelete => "backend_delete",
+            Self::Bootstrap => "bootstrap",
+            Self::Health => "health",
+            Self::KobestoreDegraded => "kobestore_degraded",
+            Self::Ipam => "ipam",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classify a free-form `last_failure_reason` string into a bounded class
+    /// via lowercase substring/keyword matching. The raw string is NEVER used
+    /// as a label — only the returned class's `as_str()` is.
+    ///
+    /// Order matters: delete-related keywords are checked before the generic
+    /// "create" so a PDB delete 403 ("poddisruption") classifies as
+    /// `BackendDelete` rather than falling through.
+    pub fn from_reason(reason: &str) -> Self {
+        let r = reason.to_ascii_lowercase();
+        if r.contains("delete") || r.contains("poddisruption") || r.contains("teardown") {
+            Self::BackendDelete
+        } else if r.contains("bootstrap") {
+            Self::Bootstrap
+        } else if r.contains("health") {
+            Self::Health
+        } else if r.contains("kobestore") || r.contains("datastore") {
+            Self::KobestoreDegraded
+        } else if r.contains("cidr") || r.contains("ipam") {
+            Self::Ipam
+        } else if r.contains("create") || r.contains("statefulset") {
+            Self::BackendCreate
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Why a backend resource operation (create/delete) failed, classified from a
+/// `kube::Error` into a bounded set so the operator never labels with a raw
+/// kube error message. See [`classify_kube_error`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendOpErrorReason {
+    /// 403 / Forbidden — missing RBAC grant (e.g. the PDB delete that 403'd
+    /// in the incident because the operator lacked `policy/...` delete).
+    Rbac,
+    /// 404 / Not Found.
+    NotFound,
+    /// Request timed out / deadline exceeded.
+    Timeout,
+    /// 409 / Conflict.
+    Conflict,
+    /// Transport / connection / IO error reaching the apiserver.
+    Io,
+    /// Anything else.
+    Other,
+}
+
+impl BackendOpErrorReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rbac => "rbac",
+            Self::NotFound => "not_found",
+            Self::Timeout => "timeout",
+            Self::Conflict => "conflict",
+            Self::Io => "io",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Why an instance stuck in `Creating` got recycled.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckCreatingReason {
+    /// The configured creating-timeout elapsed while still `Creating`.
+    Timeout,
+    /// Spec drifted while the instance was mid-`Creating` (stamped hash no
+    /// longer matches the pool's current hash).
+    Drift,
+}
+
+impl StuckCreatingReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Drift => "drift",
+        }
+    }
+}
+
+/// Role of a guest-cluster pod, derived from its existing name/label shape so
+/// OOM-kill counts stay bounded instead of carrying the raw pod name.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestPodRole {
+    /// k3s/k0s control-plane server (`*-server-N`).
+    Server,
+    /// k3s/k0s agent (`*-agent*`).
+    Agent,
+    /// kine shim (`*kine*`).
+    Kine,
+    /// Datastore pod (etcd / postgres / generic datastore).
+    Datastore,
+    /// Anything else.
+    Other,
+}
+
+impl GuestPodRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Agent => "agent",
+            Self::Kine => "kine",
+            Self::Datastore => "datastore",
+            Self::Other => "other",
+        }
+    }
+
+    /// Derive the role from a pod name. StatefulSet server pods are
+    /// `{cluster}-server-{ordinal}`; agent Deployment pods are
+    /// `{cluster}-agent-{hash}-{hash}`; kine/datastore pods carry those
+    /// substrings.
+    pub fn from_pod_name(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        if n.contains("kine") {
+            Self::Kine
+        } else if n.contains("-server-") || n.ends_with("-server") {
+            Self::Server
+        } else if n.contains("-agent-") || n.ends_with("-agent") || n.contains("-agent") {
+            Self::Agent
+        } else if n.contains("etcd") || n.contains("postgres") || n.contains("datastore") {
+            Self::Datastore
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Outcome of a connect-proxy request, classified at every return path so a
+/// single low-cardinality counter (~7 series) makes rejections visible.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// Request forwarded successfully (buffered response or upgrade tunnel
+    /// handed off).
+    Ok,
+    /// No Bearer token presented.
+    MissingToken,
+    /// Token present but invalid / mismatched.
+    InvalidToken,
+    /// Lease object not found.
+    LeaseNotFound,
+    /// Lease exists but is not in the `Bound` phase.
+    PhaseNotBound,
+    /// Lease expired (TTL elapsed).
+    Expired,
+    /// Backend / infrastructure error (kube API, kubeconfig, transport, …).
+    BackendError,
+}
+
+impl ConnectOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::MissingToken => "missing_token",
+            Self::InvalidToken => "invalid_token",
+            Self::LeaseNotFound => "lease_not_found",
+            Self::PhaseNotBound => "phase_not_bound",
+            Self::Expired => "expired",
+            Self::BackendError => "backend_error",
+        }
+    }
+}
+
+/// Classify a `kube::Error` into a bounded [`BackendOpErrorReason`]. Maps HTTP
+/// status codes (403→Rbac, 404→NotFound, 409→Conflict) and transport failures
+/// (timeout/connect→Timeout/Io) onto the closed set; everything else is
+/// `Other`. The raw error is logged at the call site, never used as a label.
+pub fn classify_kube_error(e: &kube::Error) -> BackendOpErrorReason {
+    match e {
+        kube::Error::Api(ae) => match ae.code {
+            403 => BackendOpErrorReason::Rbac,
+            404 => BackendOpErrorReason::NotFound,
+            409 => BackendOpErrorReason::Conflict,
+            408 | 504 => BackendOpErrorReason::Timeout,
+            _ => {
+                // Some apiservers encode the reason in the message rather than
+                // a distinct code; fall back to keyword matching but only over
+                // the structured `reason`/`message` we already hold.
+                let reason = ae.reason.to_ascii_lowercase();
+                if reason.contains("forbidden") {
+                    BackendOpErrorReason::Rbac
+                } else if reason.contains("notfound") {
+                    BackendOpErrorReason::NotFound
+                } else if reason.contains("conflict") || reason.contains("alreadyexists") {
+                    BackendOpErrorReason::Conflict
+                } else if reason.contains("timeout") {
+                    BackendOpErrorReason::Timeout
+                } else {
+                    BackendOpErrorReason::Other
+                }
+            }
+        },
+        // Transport / connection layer failures.
+        kube::Error::HyperError(_) | kube::Error::Service(_) => BackendOpErrorReason::Io,
+        kube::Error::Discovery(_) => BackendOpErrorReason::Other,
+        other => {
+            // `kube::Error` is non-exhaustive; classify by the rendered string
+            // for the request/connect/timeout variants without matching every
+            // arm.
+            let s = other.to_string().to_ascii_lowercase();
+            if s.contains("timeout") || s.contains("timed out") || s.contains("deadline") {
+                BackendOpErrorReason::Timeout
+            } else if s.contains("connect") || s.contains("connection") || s.contains("transport") {
+                BackendOpErrorReason::Io
+            } else {
+                BackendOpErrorReason::Other
+            }
+        }
+    }
+}
+
+/// Per-pool consecutive provision failures (gauge mirror of
+/// `ClusterPool.status.consecutiveFailures`). A non-zero, rising value is the
+/// "this pool can't fill" signal that incidents proved invisible.
+pub static POOL_CONSECUTIVE_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_pool_consecutive_failures",
+        "Current consecutive provision failures per pool",
+        &["profile"]
+    )
+    .unwrap()
+});
+
+/// Counts the EDGE where a pool's consecutive-failure count just increased,
+/// keyed by the coarse [`PoolFailureClass`]. Counting only the edge (not every
+/// steady-state reconcile) keeps this a "new failure started" signal rather
+/// than a slowly-climbing counter that tracks reconcile frequency.
+pub static POOL_FAILURE_REASON_CHANGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_pool_failure_reason_changes_total",
+        "Edges where a pool's consecutive-failure count increased, by failure class",
+        &["profile", "failure_class"]
+    )
+    .unwrap()
+});
+
+/// Best-effort backend delete failures (PDB, PVC, …) that the teardown path
+/// logs and continues past. The PDB 403 in the incident produced zero metrics;
+/// this counter makes those silent-but-meaningful failures alertable.
+pub static BACKEND_DELETE_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_backend_delete_failures_total",
+        "Best-effort backend resource delete failures by reason",
+        &["backend", "reason"]
+    )
+    .unwrap()
+});
+
+/// Instances recycled because they were stuck in `Creating` past the
+/// creating-timeout (or drifted mid-Creating).
+pub static INSTANCE_STUCK_CREATING_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_instance_stuck_creating_total",
+        "Instances recycled for being stuck in Creating, by reason",
+        &["profile", "reason"]
+    )
+    .unwrap()
+});
+
+/// Guest-cluster pod OOM-kills observed by the KobeStore health controller.
+/// Keyed by the bounded [`GuestPodRole`] so a server-vs-kine OOM is
+/// distinguishable without per-pod cardinality.
+pub static GUEST_POD_OOM_KILLS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_guest_pod_oom_kills_total",
+        "Guest-cluster pod OOMKilled events by pod role",
+        &["profile", "backend", "pod_role"]
+    )
+    .unwrap()
+});
+
+/// Connect-proxy request outcomes, classified at every return path. Single
+/// `outcome` label keeps cardinality at ~7 series; the per-lease detail lives
+/// in traces / logs, not here.
+pub static CONNECT_PROXY_REQUEST_OUTCOME_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_connect_proxy_request_outcome_total",
+        "Connect-proxy request outcomes by classification",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
 /// `CIDRClaim` lifecycle outcome counter.
 pub static IPAM_CLAIMS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -635,6 +970,13 @@ pub fn init() {
     // Connect proxy
     LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
     LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);
+    // P0 observability
+    LazyLock::force(&POOL_CONSECUTIVE_FAILURES);
+    LazyLock::force(&POOL_FAILURE_REASON_CHANGES_TOTAL);
+    LazyLock::force(&BACKEND_DELETE_FAILURES_TOTAL);
+    LazyLock::force(&INSTANCE_STUCK_CREATING_TOTAL);
+    LazyLock::force(&GUEST_POD_OOM_KILLS_TOTAL);
+    LazyLock::force(&CONNECT_PROXY_REQUEST_OUTCOME_TOTAL);
 }
 
 /// Encode all registered metrics in Prometheus text exposition format.
@@ -730,5 +1072,157 @@ mod tests {
             output.contains("test-profile"),
             "gather() should contain the label value 'test-profile' after increment"
         );
+    }
+
+    // ── P0 enum / classifier tests ────────────────────────────────────
+
+    #[test]
+    fn pool_failure_class_as_str() {
+        assert_eq!(PoolFailureClass::BackendCreate.as_str(), "backend_create");
+        assert_eq!(PoolFailureClass::BackendDelete.as_str(), "backend_delete");
+        assert_eq!(PoolFailureClass::Bootstrap.as_str(), "bootstrap");
+        assert_eq!(PoolFailureClass::Health.as_str(), "health");
+        assert_eq!(
+            PoolFailureClass::KobestoreDegraded.as_str(),
+            "kobestore_degraded"
+        );
+        assert_eq!(PoolFailureClass::Ipam.as_str(), "ipam");
+        assert_eq!(PoolFailureClass::Other.as_str(), "other");
+    }
+
+    #[test]
+    fn pool_failure_class_from_reason() {
+        use PoolFailureClass as P;
+        // delete-related keywords win over a co-occurring "create".
+        assert_eq!(
+            P::from_reason("best-effort PodDisruptionBudget delete failed"),
+            P::BackendDelete
+        );
+        assert_eq!(
+            P::from_reason("failed to delete server StatefulSet"),
+            P::BackendDelete
+        );
+        assert_eq!(
+            P::from_reason("bootstrap Job BackoffLimitExceeded"),
+            P::Bootstrap
+        );
+        assert_eq!(P::from_reason("health probes failed 3 times"), P::Health);
+        assert_eq!(
+            P::from_reason("KobeStore degraded: MemoryPressure"),
+            P::KobestoreDegraded
+        );
+        assert_eq!(
+            P::from_reason("datastore unavailable"),
+            P::KobestoreDegraded
+        );
+        assert_eq!(P::from_reason("CIDR pool exhausted"), P::Ipam);
+        assert_eq!(P::from_reason("ipam conflict on claim"), P::Ipam);
+        assert_eq!(
+            P::from_reason("Failed to apply server StatefulSet"),
+            P::BackendCreate
+        );
+        // The generic backoff reason text → Other.
+        assert_eq!(
+            P::from_reason(
+                "2 instance(s) not reaching Ready (attempted up to index 3, highest Ready 1)"
+            ),
+            P::Other
+        );
+    }
+
+    #[test]
+    fn backend_op_error_reason_as_str() {
+        assert_eq!(BackendOpErrorReason::Rbac.as_str(), "rbac");
+        assert_eq!(BackendOpErrorReason::NotFound.as_str(), "not_found");
+        assert_eq!(BackendOpErrorReason::Timeout.as_str(), "timeout");
+        assert_eq!(BackendOpErrorReason::Conflict.as_str(), "conflict");
+        assert_eq!(BackendOpErrorReason::Io.as_str(), "io");
+        assert_eq!(BackendOpErrorReason::Other.as_str(), "other");
+    }
+
+    fn api_error(code: u16, reason: &str) -> kube::Error {
+        kube::Error::Api(
+            kube::core::Status::failure(&format!("{reason} (code {code})"), reason)
+                .with_code(code)
+                .boxed(),
+        )
+    }
+
+    #[test]
+    fn classify_kube_error_by_code() {
+        assert_eq!(
+            classify_kube_error(&api_error(403, "Forbidden")),
+            BackendOpErrorReason::Rbac
+        );
+        assert_eq!(
+            classify_kube_error(&api_error(404, "NotFound")),
+            BackendOpErrorReason::NotFound
+        );
+        assert_eq!(
+            classify_kube_error(&api_error(409, "Conflict")),
+            BackendOpErrorReason::Conflict
+        );
+        assert_eq!(
+            classify_kube_error(&api_error(504, "Timeout")),
+            BackendOpErrorReason::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_kube_error_by_reason_fallback() {
+        // Code 0 (unknown) but reason text carries the signal.
+        assert_eq!(
+            classify_kube_error(&api_error(0, "Forbidden")),
+            BackendOpErrorReason::Rbac
+        );
+        assert_eq!(
+            classify_kube_error(&api_error(0, "AlreadyExists")),
+            BackendOpErrorReason::Conflict
+        );
+        assert_eq!(
+            classify_kube_error(&api_error(0, "SomethingWeird")),
+            BackendOpErrorReason::Other
+        );
+    }
+
+    #[test]
+    fn stuck_creating_reason_as_str() {
+        assert_eq!(StuckCreatingReason::Timeout.as_str(), "timeout");
+        assert_eq!(StuckCreatingReason::Drift.as_str(), "drift");
+    }
+
+    #[test]
+    fn guest_pod_role_as_str() {
+        assert_eq!(GuestPodRole::Server.as_str(), "server");
+        assert_eq!(GuestPodRole::Agent.as_str(), "agent");
+        assert_eq!(GuestPodRole::Kine.as_str(), "kine");
+        assert_eq!(GuestPodRole::Datastore.as_str(), "datastore");
+        assert_eq!(GuestPodRole::Other.as_str(), "other");
+    }
+
+    #[test]
+    fn guest_pod_role_from_pod_name() {
+        use GuestPodRole as R;
+        assert_eq!(R::from_pod_name("pool-e2e-basic-0-server-0"), R::Server);
+        assert_eq!(
+            R::from_pod_name("pool-e2e-basic-0-agent-7d9c-abcde"),
+            R::Agent
+        );
+        // kine takes priority even if other substrings are present.
+        assert_eq!(R::from_pod_name("kobestore-kine-5f6c-xyz"), R::Kine);
+        assert_eq!(R::from_pod_name("etcd-0"), R::Datastore);
+        assert_eq!(R::from_pod_name("postgres-primary-0"), R::Datastore);
+        assert_eq!(R::from_pod_name("some-random-pod"), R::Other);
+    }
+
+    #[test]
+    fn connect_outcome_as_str() {
+        assert_eq!(ConnectOutcome::Ok.as_str(), "ok");
+        assert_eq!(ConnectOutcome::MissingToken.as_str(), "missing_token");
+        assert_eq!(ConnectOutcome::InvalidToken.as_str(), "invalid_token");
+        assert_eq!(ConnectOutcome::LeaseNotFound.as_str(), "lease_not_found");
+        assert_eq!(ConnectOutcome::PhaseNotBound.as_str(), "phase_not_bound");
+        assert_eq!(ConnectOutcome::Expired.as_str(), "expired");
+        assert_eq!(ConnectOutcome::BackendError.as_str(), "backend_error");
     }
 }

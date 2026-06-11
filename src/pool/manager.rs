@@ -444,6 +444,10 @@ pub fn compute_pool_actions(
     // unhealthy paths.
     let mut deleting: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Profile name for P0 stuck-Creating observability labels (bounded:
+    // one series per pool). Computed once so each emission site reuses it.
+    let metric_profile = profile.metadata.name.clone().unwrap_or_default();
+
     // === 1. Unhealthy: always Delete (unbounded). ===
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Unhealthy {
@@ -496,6 +500,10 @@ pub fn compute_pool_actions(
                 && let Some(since) = entry.state_since
                 && now - since > creating_timeout
             {
+                emit_stuck_creating(
+                    &metric_profile,
+                    crate::metrics::StuckCreatingReason::Timeout,
+                );
                 actions.push(PoolAction::Delete(name.clone()));
                 deleting.insert(name.clone());
             }
@@ -522,6 +530,7 @@ pub fn compute_pool_actions(
                 cluster = %name,
                 "Drifted Creating: recycling without waiting for timeout"
             );
+            emit_stuck_creating(&metric_profile, crate::metrics::StuckCreatingReason::Drift);
             actions.push(PoolAction::Delete(name.clone()));
             deleting.insert(name.clone());
         }
@@ -596,6 +605,10 @@ pub fn compute_pool_actions(
             && let Some(since) = entry.state_since
             && now - since > creating_timeout
         {
+            emit_stuck_creating(
+                &metric_profile,
+                crate::metrics::StuckCreatingReason::Timeout,
+            );
             actions.push(PoolAction::Delete(name.clone()));
             deleting.insert(name.clone());
         }
@@ -660,6 +673,16 @@ pub fn compute_pool_actions(
     }
 
     actions
+}
+
+/// Emit `kobe_instance_stuck_creating_total{profile, reason}` when a Creating
+/// instance is recycled for being wedged (timeout elapsed or drift mid-create).
+/// `compute_pool_actions` is pure aside from this counter bump; the recycle
+/// decision itself is unchanged.
+fn emit_stuck_creating(profile: &str, reason: crate::metrics::StuckCreatingReason) {
+    crate::metrics::INSTANCE_STUCK_CREATING_TOTAL
+        .with_label_values(&[profile, reason.as_str()])
+        .inc();
 }
 
 /// Maximum clusters to create in a single reconciliation pass.

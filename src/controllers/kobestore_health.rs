@@ -252,6 +252,33 @@ async fn evaluate_health(client: &Client, namespace: &str, store: &KobeStore) ->
     evaluate_pods(&pods)
 }
 
+/// Emit `kobe_guest_pod_oom_kills_total{profile, backend, pod_role}` for one
+/// OOMKilled pod. All label values are bounded:
+/// - `pod_role` from the pod-name shape via
+///   [`crate::metrics::GuestPodRole::from_pod_name`].
+/// - `profile` from the pod's `kobe.kunobi.ninja/pool` label when present,
+///   else `"unknown"` (KobeStore backing pods like kine are shared across
+///   pools and carry no pool label — bounded by pool count + 1).
+/// - `backend` from the chart-set `app.kubernetes.io/component` label (e.g.
+///   `datastore-kine`), else `"unknown"`. This label is chart-controlled so
+///   the value set is bounded.
+fn emit_guest_pod_oom(pod: &Pod) {
+    let name = pod.metadata.name.as_deref().unwrap_or_default();
+    let role = crate::metrics::GuestPodRole::from_pod_name(name);
+    let labels = pod.metadata.labels.as_ref();
+    let profile = labels
+        .and_then(|l| l.get("kobe.kunobi.ninja/pool"))
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    let backend = labels
+        .and_then(|l| l.get("app.kubernetes.io/component"))
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    crate::metrics::GUEST_POD_OOM_KILLS_TOTAL
+        .with_label_values(&[profile, backend, role.as_str()])
+        .inc();
+}
+
 /// Pure function over a slice of pods → health evaluation.
 /// Extracted from `evaluate_health` so the actual classification logic
 /// is unit-testable without a kube fixture.
@@ -303,6 +330,13 @@ pub fn evaluate_pods(pods: &[Pod]) -> HealthEvaluation {
                 && term.reason.as_deref() == Some("OOMKilled")
                 && let Some(finished_at) = term.finished_at.as_ref()
             {
+                // P0 observability: every OOMKilled we observe (recent or not)
+                // is counted. Labels are bounded — `pod_role` from the pod-name
+                // shape, `profile` from the pod's pool label (else "unknown"),
+                // `backend` from the chart-set component label (else "unknown").
+                // Reuses the existing OOM detection above; no new pod parsing.
+                emit_guest_pod_oom(pod);
+
                 let finished_ms = finished_at.0.as_millisecond();
                 if now_ms - finished_ms <= window_ms {
                     let entry = (pod_name.clone(), finished_ms);

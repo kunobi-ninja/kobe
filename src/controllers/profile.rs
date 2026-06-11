@@ -672,6 +672,26 @@ async fn reconcile_profile(
 
     let backoff = compute_backoff_state(&profile, &pool_state, &counts, now);
 
+    // Snapshot the P0 pool-failure observability inputs BEFORE `backoff` is
+    // partially moved into `ClusterPoolStatus` below. `prev_failures` comes
+    // from the pre-reconcile status so the reason-change counter fires only on
+    // the rising edge; the failure class is mapped from the (free-form)
+    // `last_failure_reason` into the bounded `PoolFailureClass` — the raw
+    // string is never used as a label. Emitted after the status patch.
+    let pool_failure_signals = PoolFailureSignals {
+        consecutive_failures: backoff.consecutive_failures,
+        prev_failures: profile
+            .status
+            .as_ref()
+            .map(|s| s.consecutive_failures)
+            .unwrap_or(0),
+        failure_class: backoff
+            .last_failure_reason
+            .as_deref()
+            .map(crate::metrics::PoolFailureClass::from_reason)
+            .unwrap_or(crate::metrics::PoolFailureClass::Other),
+    };
+
     let phase = crate::pool::manager::compute_pool_phase(
         &profile,
         &counts,
@@ -707,7 +727,41 @@ async fn reconcile_profile(
         )
         .await?;
 
+    // P0 observability: pool failure gauge + reason-change edge counter.
+    // Emitted after the status patch so the gauge mirrors the value we just
+    // persisted (signals snapshotted above before `backoff` was consumed).
+    emit_pool_failure_metrics(&name, &pool_failure_signals);
+
     Ok(Action::requeue(std::time::Duration::from_secs(30)))
+}
+
+/// Pre-extracted inputs for the P0 pool-failure metrics, captured before the
+/// `BackoffState` is partially moved into `ClusterPoolStatus`.
+struct PoolFailureSignals {
+    consecutive_failures: u32,
+    prev_failures: u32,
+    failure_class: crate::metrics::PoolFailureClass,
+}
+
+/// Emit the P0 pool-failure observability signals for one reconcile.
+///
+/// - `kobe_pool_consecutive_failures{profile}` — gauge set to the current
+///   `consecutive_failures`.
+/// - `kobe_pool_failure_reason_changes_total{profile, failure_class}` —
+///   incremented ONLY on the rising edge (`new > prev`) so steady-state
+///   failures aren't re-counted. `failure_class` is the bounded
+///   [`crate::metrics::PoolFailureClass`] mapped from the free-form
+///   `last_failure_reason` text — the raw reason string is never a label.
+fn emit_pool_failure_metrics(profile: &str, signals: &PoolFailureSignals) {
+    crate::metrics::POOL_CONSECUTIVE_FAILURES
+        .with_label_values(&[profile])
+        .set(signals.consecutive_failures as i64);
+
+    if signals.consecutive_failures > signals.prev_failures {
+        crate::metrics::POOL_FAILURE_REASON_CHANGES_TOTAL
+            .with_label_values(&[profile, signals.failure_class.as_str()])
+            .inc();
+    }
 }
 
 /// Build pool state from ClusterInstance inventory.

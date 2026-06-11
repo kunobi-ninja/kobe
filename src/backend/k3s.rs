@@ -41,6 +41,39 @@ use super::{
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kobe-operator";
 
+/// Record a best-effort backend resource-op failure into
+/// `kobe_backend_delete_failures_total`. Only `op="delete"` is emitted today
+/// (the best-effort teardown sites that warn-and-continue); the `op` argument
+/// is kept so a future create-side use can share this helper. The kube error
+/// is classified into the bounded [`crate::metrics::BackendOpErrorReason`] so
+/// the raw error string is never used as a label value.
+fn record_backend_op_error(backend: &str, op: &str, e: &kube::Error) {
+    let reason = crate::metrics::classify_kube_error(e);
+    if op == "delete" {
+        crate::metrics::BACKEND_DELETE_FAILURES_TOTAL
+            .with_label_values(&[backend, reason.as_str()])
+            .inc();
+    }
+}
+
+/// Record a best-effort `delete` failure whose error has been boxed into
+/// `anyhow` by [`K3sBackend::delete_ignoring_not_found`]. Downcasts back to the
+/// underlying `kube::Error` for precise classification; if the chain doesn't
+/// carry one (shouldn't happen on these paths), records the bounded
+/// `reason="other"` rather than fabricating a label from the error text.
+fn record_anyhow_backend_delete_error(backend: &str, e: &anyhow::Error) {
+    if let Some(kube_err) = e.downcast_ref::<kube::Error>() {
+        record_backend_op_error(backend, "delete", kube_err);
+    } else {
+        crate::metrics::BACKEND_DELETE_FAILURES_TOTAL
+            .with_label_values(&[
+                backend,
+                crate::metrics::BackendOpErrorReason::Other.as_str(),
+            ])
+            .inc();
+    }
+}
+
 /// Convert a k3s semver version to a valid Docker image reference.
 ///
 /// k3s releases use `+` for build metadata (e.g. `v1.31.3+k3s1`), but `+` is
@@ -1453,6 +1486,7 @@ impl ClusterBackend for K3sBackend {
                     if Self::is_server_data_pvc(pvc_name, name)
                         && let Err(e) = Self::delete_ignoring_not_found(&pvc_api, pvc_name).await
                     {
+                        record_anyhow_backend_delete_error("k3s", &e);
                         warn!(
                             cluster = name,
                             pvc = pvc_name,
@@ -1481,6 +1515,7 @@ impl ClusterBackend for K3sBackend {
         // best-effort drain protection, not load-bearing for correctness.
         let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
         if let Err(e) = Self::delete_ignoring_not_found(&pdb_api, &format!("{name}-server")).await {
+            record_anyhow_backend_delete_error("k3s", &e);
             warn!(
                 cluster = name,
                 error = %e,

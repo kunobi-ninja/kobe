@@ -492,6 +492,25 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
 /// details to a low-trust caller — possibly before lease-token validation).
 fn connect_infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -> Response {
     warn!(error = %err, "{message}");
+    metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+        .with_label_values(&[metrics::ConnectOutcome::BackendError.as_str()])
+        .inc();
+    connect_error(status, message)
+}
+
+/// Increment `kobe_connect_proxy_request_outcome_total{outcome}` then build the
+/// rejection response. Used at every non-infra rejection return in
+/// `connect_proxy_inner` so the cold and cached paths classify identically.
+/// (Infra/backend failures go through `connect_infra_error`, which records
+/// `outcome="backend_error"` itself.)
+fn connect_reject(
+    outcome: metrics::ConnectOutcome,
+    status: StatusCode,
+    message: impl Into<String>,
+) -> Response {
+    metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+        .with_label_values(&[outcome.as_str()])
+        .inc();
     connect_error(status, message)
 }
 
@@ -1192,7 +1211,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             path = %request_path,
             "Connect proxy rejected request without bearer token"
         );
-        return connect_error(StatusCode::UNAUTHORIZED, "Missing Bearer token");
+        return connect_reject(
+            metrics::ConnectOutcome::MissingToken,
+            StatusCode::UNAUTHORIZED,
+            "Missing Bearer token",
+        );
     };
 
     // ── Per-lease connect-context cache ──────────────────────────────────
@@ -1231,7 +1254,8 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     phase = %ctx.phase,
                     "Connect proxy rejected lease outside Bound phase (cached)"
                 );
-                return connect_error(
+                return connect_reject(
+                    metrics::ConnectOutcome::PhaseNotBound,
                     StatusCode::CONFLICT,
                     format!("Lease is not active (phase {})", ctx.phase),
                 );
@@ -1248,7 +1272,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     expires_at = ?ctx.expires_at,
                     "Connect proxy rejected expired lease (cached, evicted)"
                 );
-                return connect_error(StatusCode::GONE, "Lease has expired");
+                return connect_reject(
+                    metrics::ConnectOutcome::Expired,
+                    StatusCode::GONE,
+                    "Lease has expired",
+                );
             }
 
             cluster_name = ctx.cluster_name;
@@ -1300,7 +1328,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     path = %request_path,
                     "Connect proxy rejected invalid lease token"
                 );
-                return connect_error(StatusCode::UNAUTHORIZED, "Invalid lease token");
+                return connect_reject(
+                    metrics::ConnectOutcome::InvalidToken,
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid lease token",
+                );
             }
 
             let leases_api: Api<ClusterLease> =
@@ -1313,7 +1345,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         lease_id = %lease_id,
                         "Connect proxy lease not found"
                     );
-                    return connect_error(StatusCode::NOT_FOUND, "Lease not found");
+                    return connect_reject(
+                        metrics::ConnectOutcome::LeaseNotFound,
+                        StatusCode::NOT_FOUND,
+                        "Lease not found",
+                    );
                 }
                 Err(err) => {
                     warn!(
@@ -1338,7 +1374,8 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     phase = %status.phase,
                     "Connect proxy rejected lease outside Bound phase"
                 );
-                return connect_error(
+                return connect_reject(
+                    metrics::ConnectOutcome::PhaseNotBound,
                     StatusCode::CONFLICT,
                     format!("Lease is not active (phase {})", status.phase),
                 );
@@ -1355,7 +1392,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     expires_at = ?status.expires_at,
                     "Connect proxy rejected expired lease"
                 );
-                return connect_error(StatusCode::GONE, "Lease has expired");
+                return connect_reject(
+                    metrics::ConnectOutcome::Expired,
+                    StatusCode::GONE,
+                    "Lease has expired",
+                );
             }
 
             let Some(cluster) = status.cluster_name.as_deref() else {
@@ -1364,7 +1405,8 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     lease_id = %lease_id,
                     "Connect proxy found bound lease without cluster name"
                 );
-                return connect_error(
+                return connect_reject(
+                    metrics::ConnectOutcome::BackendError,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Lease is bound without a cluster name",
                 );
@@ -1589,6 +1631,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             protocol = %protocol,
             "Connect proxy tunneling HTTP upgrade (exec/attach/port-forward)"
         );
+        // Upgrade tunnel handed off: count as a successful connect outcome.
+        // Any failure inside the tunnel is its own concern (the request was
+        // accepted and proxied); the outcome counter tracks the proxy's
+        // accept/reject decision, not upstream stream health.
+        metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+            .with_label_values(&[metrics::ConnectOutcome::Ok.as_str()])
+            .inc();
         return crate::api::upgrade::tunnel_upgrade(request, upgrade_access, &path_and_query).await;
     }
 
@@ -1747,6 +1796,12 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             "Connect proxy received upstream server error"
         );
 
+        // The proxy reached the backend and is relaying its response (even a
+        // 5xx FROM the leased cluster is a successful proxy outcome — the
+        // rejection counter is for the proxy's own accept/reject decisions).
+        metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+            .with_label_values(&[metrics::ConnectOutcome::Ok.as_str()])
+            .inc();
         return response
             .body(Body::from(response_bytes))
             .expect("connect proxy response");
@@ -1783,6 +1838,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
         .bytes_stream()
         .map_err(std::io::Error::other);
 
+    // Successful proxy: response is being streamed downstream.
+    metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+        .with_label_values(&[metrics::ConnectOutcome::Ok.as_str()])
+        .inc();
     response
         .body(Body::from_stream(response_stream))
         .expect("connect proxy response")
