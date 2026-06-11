@@ -16,8 +16,9 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, ConfigMap, Container, EnvVar, EnvVarSource, HostPathVolumeSource, KeyToPath,
-    ObjectFieldSelector, Pod, PodAffinity, PodAffinityTerm, PodSpec, PodTemplateSpec, Secret,
-    SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
+    ObjectFieldSelector, PersistentVolumeClaim, Pod, PodAffinity, PodAffinityTerm, PodSpec,
+    PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration,
+    Volume, VolumeMount,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -1193,6 +1194,22 @@ impl K3sBackend {
         }
     }
 
+    /// True iff `pvc_name` is one of `cluster`'s server-StatefulSet
+    /// `volumeClaimTemplate` PVCs — exactly `data-{cluster}-server-{ordinal}`
+    /// where `ordinal` is a non-empty run of ASCII digits (the StatefulSet pod
+    /// ordinal).
+    ///
+    /// The numeric-ordinal check is load-bearing: a bare `data-{cluster}-server-`
+    /// prefix would also match the PVCs of a *different* cluster literally named
+    /// `{cluster}-server` (whose PVCs are `data-{cluster}-server-server-{n}`), so
+    /// without it `delete("foo")` could reap `foo-server`'s volumes.
+    fn is_server_data_pvc(pvc_name: &str, cluster: &str) -> bool {
+        let prefix = format!("data-{cluster}-server-");
+        pvc_name.strip_prefix(&prefix).is_some_and(|ordinal| {
+            !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())
+        })
+    }
+
     /// Opportunistic force-delete of pods carrying
     /// `kobe.kunobi.ninja/cluster=<cluster_name>`.
     ///
@@ -1405,15 +1422,6 @@ impl ClusterBackend for K3sBackend {
     async fn delete(&self, name: &str, namespace: &str) -> Result<()> {
         info!(cluster = name, "Deleting k3s cluster");
 
-        // B4 (known PVC leak): the per-replica PVCs created from the
-        // StatefulSet's `volumeClaimTemplates` (named
-        // `data-{name}-server-{ordinal}`) are NOT deleted here and are
-        // orphaned on recycle. This is tolerable today because `servers` is
-        // folded into `spec_hash`, so any `servers` change is a full recycle
-        // with a NEW instance name — the orphans are scoped to the old name,
-        // not reused. Tracked as a follow-up (PVC GC + immutability handling),
-        // intentionally out of scope for the HA change to keep it focused.
-
         // Delete agent Deployment
         let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&deploy_api, &format!("{name}-agent")).await?;
@@ -1425,6 +1433,42 @@ impl ClusterBackend for K3sBackend {
         // Delete server StatefulSet
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&sts_api, &format!("{name}-server")).await?;
+
+        // Reap the per-replica server data PVCs (#154). Kubernetes deliberately
+        // RETAINS volumeClaimTemplate PVCs (`data-{name}-server-{ordinal}`) when
+        // their StatefulSet is deleted, so without this every recycle of a
+        // persistence-enabled member orphans them forever — a host-disk leak,
+        // N× worse for HA. delete() has no ClusterConfig/replica count, so we
+        // LIST and match the exact StatefulSet PVC name shape via
+        // `is_server_data_pvc` (prefix + numeric ordinal, so it can't collide
+        // with a *different* cluster named `{name}-server`). BEST-EFFORT, like
+        // the PDB below: a list/delete failure must NEVER abort teardown.
+        let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        match pvc_api.list(&ListParams::default()).await {
+            Ok(list) => {
+                for pvc in list.items {
+                    let Some(pvc_name) = pvc.metadata.name.as_deref() else {
+                        continue;
+                    };
+                    if Self::is_server_data_pvc(pvc_name, name)
+                        && let Err(e) = Self::delete_ignoring_not_found(&pvc_api, pvc_name).await
+                    {
+                        warn!(
+                            cluster = name,
+                            pvc = pvc_name,
+                            error = %e,
+                            "best-effort server PVC delete failed (continuing teardown)"
+                        );
+                    }
+                }
+            }
+            Err(e) => warn!(
+                cluster = name,
+                error = %e,
+                "best-effort server PVC list failed (continuing teardown; orphaned \
+                 data-<name>-server-* PVCs may remain)"
+            ),
+        }
 
         // Delete the HA PodDisruptionBudget (created only for servers>1;
         // harmless 404 for single-server). delete() has no ClusterConfig here,
@@ -2547,10 +2591,83 @@ mod tests {
                 .await;
         }
 
+        // PVC reaping (#154): the LIST returns the cluster's own server PVC, a
+        // collision PVC belonging to a *different* cluster named
+        // `test-cluster-server`, and another cluster's PVC. ONLY the first is
+        // reaped.
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/persistentvolumeclaims",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaimList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [
+                    { "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                      "metadata": { "name": "data-test-cluster-server-0", "namespace": "test-ns" } },
+                    { "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                      "metadata": { "name": "data-test-cluster-server-server-0", "namespace": "test-ns" } },
+                    { "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                      "metadata": { "name": "data-other-cluster-server-0", "namespace": "test-ns" } }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // The cluster's own data PVC MUST be deleted.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/persistentvolumeclaims/data-test-cluster-server-0",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(generic_response(
+                "v1",
+                "PersistentVolumeClaim",
+                "data-test-cluster-server-0",
+                "test-ns",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The `test-cluster-server` collision PVC MUST NOT be deleted.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/persistentvolumeclaims/data-test-cluster-server-server-0",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
         let result = backend.delete("test-cluster", "test-ns").await;
         assert!(result.is_ok(), "delete should succeed: {result:?}");
         // MockServer's Drop verifies the `.expect(1)` assertions — any
         // missing DELETE call panics here.
+    }
+
+    #[test]
+    fn test_is_server_data_pvc() {
+        // The cluster's own StatefulSet data PVCs (numeric ordinal).
+        assert!(K3sBackend::is_server_data_pvc("data-foo-server-0", "foo"));
+        assert!(K3sBackend::is_server_data_pvc("data-foo-server-12", "foo"));
+        // No ordinal / non-numeric ordinal → not a StatefulSet PVC.
+        assert!(!K3sBackend::is_server_data_pvc("data-foo-server-", "foo"));
+        assert!(!K3sBackend::is_server_data_pvc("data-foo-server-x", "foo"));
+        // A different cluster's PVC.
+        assert!(!K3sBackend::is_server_data_pvc("data-bar-server-0", "foo"));
+        // Load-bearing: cluster `foo` must NOT match a *different* cluster
+        // literally named `foo-server` (whose PVCs are data-foo-server-server-N).
+        assert!(!K3sBackend::is_server_data_pvc(
+            "data-foo-server-server-0",
+            "foo"
+        ));
+        // …and the `foo-server` cluster correctly matches its OWN PVCs.
+        assert!(K3sBackend::is_server_data_pvc(
+            "data-foo-server-server-0",
+            "foo-server"
+        ));
+        // Unrelated shapes (agent PVC, missing `data-` prefix).
+        assert!(!K3sBackend::is_server_data_pvc("data-foo-agent-0", "foo"));
+        assert!(!K3sBackend::is_server_data_pvc("foo-server-0", "foo"));
     }
 
     /// Idempotency: re-running `delete()` on an instance whose resources
