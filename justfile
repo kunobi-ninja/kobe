@@ -78,6 +78,13 @@ test-smoke-bootstrap-vkobe-kine ttl='2m' *args:
 test-smoke-pool pool='ci-small' ttl='2m' *args:
     @mise exec -- bun run ./hack/test-smoke-pool.ts {{ pool }} {{ ttl }} {{ args }}
 
+# Provision a real single-server k3s instance, assert it reaches Ready, then
+# recycle it and assert clean teardown (RBAC + readiness-probe regression gate).
+# Talks directly to the host kind cluster; set E2E_CLUSTER to match the harness.
+[group('dev')]
+test-smoke-k3s cluster='e2e-kobe' *args:
+    @env E2E_CLUSTER={{ cluster }} mise exec -- bun run ./hack/test-e2e-k3s.ts {{ args }}
+
 # Local e2e environment entrypoint
 [group('dev')]
 e2e *args:

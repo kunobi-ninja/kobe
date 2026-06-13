@@ -14,6 +14,18 @@ const DEMO_TOKEN_SECRET = "e2e-local-token";
 const DEMO_POLICY = "e2e-local-token";
 const DEMO_K0S_POOL = "e2e-k0s";
 const DEMO_K0S_VERSION = "v1.35.1+k0s.0";
+// Single-server k3s pool exercised by the provision→Ready→recycle CI smoke
+// gate (hack/test-e2e-k3s.ts). Uses embedded SQLite (no shared datastore in
+// kind) and warms one member via scaling.minReady=1. The matching guest image
+// is pre-loaded into the kind nodes (see K3S_GUEST_IMAGE) so provisioning
+// stays inside the smoke gate's wait_ready budget.
+const DEMO_K3S_POOL = "e2e-k3s";
+const DEMO_K3S_VERSION = "v1.31.3+k3s1";
+// k3s guest image the k3s backend launches for `version: v1.31.3+k3s1`.
+// The backend rewrites the `+` build-metadata separator to `-` because OCI
+// tags forbid `+` (see k3s_image() in src/backend/k3s.rs). Keep this in sync
+// with DEMO_K3S_VERSION.
+const K3S_GUEST_IMAGE = "rancher/k3s:v1.31.3-k3s1";
 const DEMO_VKOBE_ETCD_POOL = "e2e-vkobe-etcd";
 const DEMO_VKOBE_BOOTSTRAP_POOL = "e2e-vkobe-etcd-bootstrap";
 const DEMO_VKOBE_ETCD_STORE = "e2e-vkobe-store-etcd";
@@ -374,6 +386,27 @@ async function verifyImageInNode(node: string, imageRef: string): Promise<void> 
   info(`  - verified ${imageRef} on ${node}`);
 }
 
+async function loadRemoteImagesIntoKind(cluster: string, images: string[]): Promise<void> {
+  if (images.length === 0) return;
+  step(`Pre-loading guest images into kind cluster '${cluster}'`);
+  const kind = await resolveTool("kind");
+  const nodes = await kindNodes(cluster);
+  for (const image of images) {
+    info(`  - pulling ${image}`);
+    await runCommand(["docker", "pull", "--platform", nativePlatform(), image], {
+      step: `failed to pull guest image '${image}'`,
+      stream: true,
+    });
+    info(`  - loading ${image} into kind cluster '${cluster}'`);
+    await runCommand([kind, "load", "docker-image", image, "--name", cluster], {
+      step: `failed to load guest image '${image}' into kind cluster '${cluster}'`,
+    });
+    for (const node of nodes) {
+      await verifyImageInNode(node, image);
+    }
+  }
+}
+
 async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<void> {
   step(`Loading images into kind cluster '${cluster}'`);
   await saveImages(imageTag);
@@ -386,6 +419,12 @@ async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<vo
     await verifyImageInNode(node, `zondax/kobe-operator:${imageTag}`);
     await verifyImageInNode(node, `zondax/kobe-sync:${imageTag}`);
   }
+
+  // Pre-load guest backend images so a leased/warmed instance doesn't have to
+  // pull them inside the smoke gate's wait_ready budget. k3s is launched with
+  // the default IfNotPresent pull policy for its tagged image, so a node-local
+  // copy means the kubelet never reaches out to the registry.
+  await loadRemoteImagesIntoKind(cluster, [K3S_GUEST_IMAGE]);
 }
 
 async function prepareHelm(): Promise<void> {
@@ -503,6 +542,40 @@ spec:
     failureThreshold: 3
   scaling:
     minReady: 0
+    maxClusters: 2
+    scaleUpThreshold: 0
+    scaleDownAfter: "5m"
+    queueTimeout: "5m"
+  resources:
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+---
+# Single-server k3s pool for the provision→Ready→recycle CI smoke gate.
+# Modeled on deploy/profiles/e2e-direct-k3s.yaml but with the shared-Postgres
+# backend.datastore block dropped (the kunobi-postgres secret doesn't exist in
+# kind) so each k3s instance uses embedded SQLite, and no bootstraps block (a
+# bare k3s keeps memory ~1Gi and provisioning fast). scaling.minReady=1 warms
+# exactly one member automatically.
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: ClusterPool
+metadata:
+  name: ${DEMO_K3S_POOL}
+  namespace: ${namespace}
+spec:
+  size: 1
+  ttl: "1h"
+  backend:
+    type: k3s
+  cluster:
+    version: "${DEMO_K3S_VERSION}"
+    servers: 1
+    agents: 0
+  healthCheck:
+    intervalSeconds: 30
+    failureThreshold: 3
+  scaling:
+    minReady: 1
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
@@ -814,7 +887,7 @@ spec:
       memory: "512Mi"
 ---
 # vcluster backend: bare pool. The operator runs
-# `helm upgrade --install loft-sh/vcluster` per ClusterInstance into
+# \`helm upgrade --install loft-sh/vcluster\` per ClusterInstance into
 # its own host namespace (vcluster-<instance>), so unlike the vkobe
 # pools above this needs no KobeStore reference and no syncer list.
 apiVersion: kobe.kunobi.ninja/v1alpha1
@@ -893,12 +966,15 @@ async function bootstrapLocalResources(cluster: string, namespace: string): Prom
       "/bin/sh",
       "-lc",
       `CTX=${kubeContext(cluster)}
-for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_K0S_POOL} -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
+for pool in ${DEMO_K0S_POOL} ${DEMO_K3S_POOL}; do
+for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=$pool -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
   kubectl --context "$CTX" delete statefulset -n ${namespace} "\${name}-server" --ignore-not-found >/dev/null 2>&1 || true
   kubectl --context "$CTX" delete deployment -n ${namespace} "\${name}-agent" --ignore-not-found >/dev/null 2>&1 || true
   kubectl --context "$CTX" delete service -n ${namespace} "\${name}-server" --ignore-not-found >/dev/null 2>&1 || true
   kubectl --context "$CTX" delete configmap -n ${namespace} "\${name}-k0s-config" "\${name}-kubeconfig-publisher" --ignore-not-found >/dev/null 2>&1 || true
   kubectl --context "$CTX" delete secret -n ${namespace} "\${name}-token" "\${name}-kubeconfig" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CTX" delete pvc -n ${namespace} -l "kobe.kunobi.ninja/cluster=\${name}" --ignore-not-found >/dev/null 2>&1 || true
+done
 done
 for pool in ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}; do
 for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=$pool -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
@@ -915,6 +991,7 @@ for name in $(kubectl --context "$CTX" get clusterinstances.kobe.kunobi.ninja -n
 done
 done
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_K0S_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_K3S_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_ETCD_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespace} -l kobe.kunobi.ninja/pool=${DEMO_VKOBE_KINE_POOL} --ignore-not-found >/dev/null 2>&1 || true
@@ -927,7 +1004,7 @@ kubectl --context "$CTX" delete clusterinstances.kobe.kunobi.ninja -n ${namespac
 for ns in $(kubectl --context "$CTX" get namespace -l kobe.kunobi.ninja/backend=vcluster -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null); do
   kubectl --context "$CTX" delete namespace "$ns" --ignore-not-found >/dev/null 2>&1 || true
 done
-kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} ${DEMO_VCLUSTER_POOL} ${DEMO_VCLUSTER_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_K3S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} ${DEMO_VCLUSTER_POOL} ${DEMO_VCLUSTER_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete kobestore.kobe.kunobi.ninja -n ${namespace} ${DEMO_VKOBE_ETCD_STORE} ${DEMO_VKOBE_KINE_STORE} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete service -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true
@@ -968,7 +1045,7 @@ async function printContext(cluster: string, namespace: string): Promise<void> {
   info(`Context: kind-${cluster}`);
   info(`Namespace: ${namespace}`);
   info(
-    `Demo pools: ${DEMO_K0S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_BOOTSTRAP_POOL}, ${DEMO_VKOBE_KINE_POOL}, ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}, ${DEMO_VCLUSTER_POOL}, ${DEMO_VCLUSTER_BOOTSTRAP_POOL}`,
+    `Demo pools: ${DEMO_K0S_POOL}, ${DEMO_K3S_POOL}, ${DEMO_VKOBE_ETCD_POOL}, ${DEMO_VKOBE_BOOTSTRAP_POOL}, ${DEMO_VKOBE_KINE_POOL}, ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL}, ${DEMO_VCLUSTER_POOL}, ${DEMO_VCLUSTER_BOOTSTRAP_POOL}`,
   );
   info(`Demo vkobe stores: ${DEMO_VKOBE_ETCD_STORE} -> ${DEMO_VKOBE_ETCD_BACKEND}, ${DEMO_VKOBE_KINE_STORE} -> ${DEMO_VKOBE_KINE_BACKEND}`);
   info(`Demo bootstrap: ${DEMO_BOOTSTRAP_CONFIG} -> ${DEMO_BOOTSTRAP_NAMESPACE}/${DEMO_BOOTSTRAP_CONFIGMAP}`);

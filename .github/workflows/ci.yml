@@ -26,6 +26,9 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  # Nightly trigger for the slow privileged-k3s e2e gate (see the `e2e` job).
+  schedule:
+    - cron: "0 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -112,6 +115,61 @@ jobs:
 
       - name: Build all images (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from='
+
+  # Provision→Ready→recycle smoke gate against a REAL single-server k3s cluster
+  # running nested-in-pod inside plain kind, with the operator installed via the
+  # real Helm chart (so its real rbac.yaml is in effect). Catches two regression
+  # classes unit tests can't see: the k3s readiness-probe class (members never
+  # go Ready) and the RBAC-403 recycle-wedge class (instances stuck Recycling).
+  #
+  # PHASE 1: nightly + manual ONLY — slow and new, not yet a PR-required check.
+  # No `container:` block: like `docker-dry-run`, this needs the host Docker
+  # socket for kind + buildx, so it runs directly on the self-hosted runner.
+  e2e:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: [checks]
+    runs-on: kunobi-runners
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Provides bun + helm + kind + just (and rust, per mise.toml). The e2e
+      # harness resolves these via `mise which`, and `just` runs the recipe.
+      - name: Set up mise tools
+        uses: jdx/mise-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Parameterize the kind cluster name with the run id so concurrent/
+      # persistent self-hosted runs never collide on a shared cluster name.
+      - name: Bring up the e2e harness (kind + chart + pools)
+        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}
+
+      - name: Run the k3s provision→Ready→recycle smoke gate
+        run: mise exec -- just test-smoke-k3s e2e-${{ github.run_id }}
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          CTX=kind-e2e-${{ github.run_id }}
+          kubectl --context "$CTX" get pods,clusterinstances,clusterpools -A -o wide || true
+          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 200 --all-containers || true
+          mkdir -p /tmp/kind-logs
+          mise exec -- kind export logs /tmp/kind-logs --name e2e-${{ github.run_id }} || true
+
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-logs-${{ github.run_id }}
+          path: /tmp/kind-logs
+          if-no-files-found: ignore
+
+      # Always tear down so kind clusters never leak on the persistent runner.
+      - name: Tear down the e2e harness
+        if: always()
+        run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}
 
   publish:
     if: github.event_name != 'pull_request'
