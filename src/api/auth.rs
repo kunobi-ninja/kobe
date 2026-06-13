@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use kunobi_auth::secret_eq;
-use kunobi_auth::server::JwksManager;
+use jsonwebtoken::Algorithm;
+use kunobi_auth::AuthFailReason;
 use kunobi_auth::server::ssh::{CompiledSshProvider, NonceTracker, ParsedAuthorizedKey};
+use kunobi_auth::server::{
+    AuthBuilder, AuthEvent, AuthObserver, AuthnProvider, ConfiguredAuth, JwtAuthConfig,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -44,29 +48,33 @@ pub struct AuthMethodInfo {
     pub audience: Option<String>,
 }
 
-/// A compiled provider entry, built from an AccessPolicy CRD.
-#[derive(Debug, Clone)]
-struct CompiledProvider {
-    /// The policy name (from metadata.name).
-    name: String,
-    issuer: String,
-    jwks_url: String,
-    audience: Vec<String>,
-    authorized_parties: Vec<String>,
-    /// Allowed signing algorithms as their string names (e.g. `"RS256"`), passed
-    /// to [`JwksManager::validate_jwt`] which parses + enforces them.
-    algorithms: Vec<String>,
-    identity_template: String,
-    /// Flat rules list — first matching rule wins.
+/// kobe's authorization context for one Bearer-validatable provider (OIDC or
+/// static token), recovered after kunobi-auth verifies the credential.
+struct ProviderAuthz {
     rules: Vec<AccessRule>,
+    kind: ProviderKind,
 }
 
-/// A compiled static token provider, built from an AccessPolicy + Secret.
-#[derive(Debug, Clone)]
-struct CompiledTokenProvider {
-    name: String,
-    token: String,
-    rules: Vec<AccessRule>,
+enum ProviderKind {
+    /// OIDC provider: identity is rendered from the template over the JWT claims.
+    Oidc {
+        issuer: String,
+        identity_template: String,
+    },
+    /// Static bearer token: identity is the provider name, issuer is `"token"`.
+    Token,
+}
+
+/// An atomically-published snapshot of the Bearer-auth configuration: the
+/// kunobi-auth verifier plus kobe's per-provider authorization context, kept in
+/// one value so a request never observes a verifier provider whose rules aren't
+/// published yet (or vice versa).
+struct AuthSnapshot {
+    /// kunobi-auth verifier (static-token + JWT signature/iss/aud/azp/exp/nbf),
+    /// with kobe's [`AuthObserver`] wired in for telemetry.
+    configured: Arc<ConfiguredAuth>,
+    /// Provider name -> kobe authorization context (rules + identity source).
+    by_provider: HashMap<String, ProviderAuthz>,
 }
 
 /// A compiled SSH policy provider, pairing kunobi-auth's CompiledSshProvider
@@ -76,37 +84,79 @@ struct CompiledSshPolicyProvider {
     rules: Vec<AccessRule>,
 }
 
+/// Feeds credential-verification FAILURES into kobe's metrics, tagged with the
+/// precise [`AuthFailReason`] from kunobi-auth (bad signature, expired, audience
+/// mismatch, …). Registered on the [`ConfiguredAuth`].
+///
+/// `Success` is deliberately NOT counted here: kunobi verifies the *credential*,
+/// but kobe's authorization (rule -> Policy) runs afterwards and can still
+/// reject. [`JwtAuthenticator::validate`] emits `AUTH_SUCCESS_TOTAL` only once a
+/// request is fully authenticated AND authorized, and emits the kobe-side
+/// authorization failures the observer never sees — so the counters stay honest
+/// end-to-end (and symmetric with the SSH path).
+struct KobeAuthObserver;
+
+impl AuthObserver for KobeAuthObserver {
+    fn observe(&self, event: AuthEvent<'_>) {
+        if let AuthEvent::Failure { provider, reason } = event {
+            crate::metrics::AUTH_FAILURE_TOTAL
+                .with_label_values(&[provider.unwrap_or("unknown"), reason.label()])
+                .inc();
+        }
+    }
+}
+
 /// JWT authenticator supporting any OIDC provider via AccessPolicy CRDs.
+///
+/// Credential verification (static token + JWT) is delegated to kunobi-auth's
+/// [`ConfiguredAuth`]; kobe layers authorization (rule -> Policy resolution),
+/// identity templating, and the SSH path on top.
 pub struct JwtAuthenticator {
-    /// JWKS fetch/cache + JWT signature/iss/aud/exp/nbf/alg verification,
-    /// delegated to kunobi-auth so the rules stay shared across services.
-    jwks: JwksManager,
-    /// Compiled OIDC providers from AccessPolicy CRDs.
-    providers: RwLock<Vec<CompiledProvider>>,
-    /// Compiled SSH providers from AccessPolicy CRDs.
+    /// Atomically-swapped Bearer-auth config, rebuilt on every policy change.
+    auth: RwLock<Arc<AuthSnapshot>>,
+    /// Compiled SSH providers (kobe-side; SSH is not modeled by ConfiguredAuth).
     ssh_providers: RwLock<Vec<CompiledSshPolicyProvider>>,
-    /// Compiled static token providers from AccessPolicy CRDs + referenced Secrets.
-    token_providers: RwLock<Vec<CompiledTokenProvider>>,
-    /// Nonce tracker for SSH replay protection.
+    /// Nonce tracker for SSH replay protection (survives policy rebuilds).
     nonce_tracker: NonceTracker,
     /// SSHSIG namespace (e.g. "kobe-system").
     ssh_namespace: String,
+    /// Telemetry hook, shared across every ConfiguredAuth rebuild.
+    observer: Arc<KobeAuthObserver>,
+    /// JWT clock-skew tolerance applied on each rebuild (None = kunobi-auth's 60s).
+    leeway: Option<Duration>,
 }
 
 impl JwtAuthenticator {
     pub fn new(ssh_namespace: String) -> Self {
+        // Optional operator override for JWT clock-skew tolerance; unset keeps
+        // kunobi-auth's implicit 60s default, matching prior behavior exactly.
+        let leeway = std::env::var("KOBE_JWT_LEEWAY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs);
+
         Self {
-            jwks: JwksManager::new(),
-            providers: RwLock::new(Vec::new()),
+            auth: RwLock::new(Arc::new(AuthSnapshot {
+                configured: Arc::new(AuthBuilder::new().build()),
+                by_provider: HashMap::new(),
+            })),
             ssh_providers: RwLock::new(Vec::new()),
-            token_providers: RwLock::new(Vec::new()),
             nonce_tracker: NonceTracker::new(std::time::Duration::from_secs(60)),
             ssh_namespace,
+            observer: Arc::new(KobeAuthObserver),
+            leeway,
         }
     }
 
-    /// Recompile the provider lookup table from AccessPolicy CRDs.
-    /// Called by the AccessPolicy watcher whenever CRDs change.
+    /// Load the current Bearer-auth snapshot (cheap `Arc` clone; lock released).
+    async fn snapshot(&self) -> Arc<AuthSnapshot> {
+        self.auth.read().await.clone()
+    }
+
+    /// Recompile the auth configuration from AccessPolicy CRDs. Called by the
+    /// AccessPolicy watcher whenever CRDs change. Rebuilds the kunobi-auth
+    /// verifier + kobe's authorization context into one new [`AuthSnapshot`]
+    /// (published atomically); SSH providers are swapped separately.
     pub async fn update_policies(
         &self,
         policies: Vec<AccessPolicy>,
@@ -125,68 +175,123 @@ impl JwtAuthenticator {
             }
         }
 
-        // Compile OIDC providers
-        let compiled: Vec<CompiledProvider> = oidc_policies
-            .into_iter()
-            .filter_map(|ap| {
-                let policy_name = ap.metadata.name.unwrap_or_default();
-                let spec = ap.spec;
+        // Build the kunobi-auth verifier (JWT + static token) and kobe's
+        // per-provider authorization context together, so they stay coherent.
+        let mut builder = AuthBuilder::new().observer(self.observer.clone());
+        if let Some(leeway) = self.leeway {
+            builder = builder.leeway(leeway);
+        }
+        let mut by_provider: HashMap<String, ProviderAuthz> = HashMap::new();
 
-                // Only OIDC auth is supported for JWT validation currently
-                let oidc = spec.auth.oidc?;
+        // OIDC providers
+        for ap in oidc_policies {
+            let policy_name = ap.metadata.name.unwrap_or_default();
+            let spec = ap.spec;
+            let Some(oidc) = spec.auth.oidc else { continue };
 
-                let jwks_url = oidc
-                    .jwks_url
-                    .unwrap_or_else(|| format!("{}/.well-known/jwks.json", oidc.issuer));
+            let jwks_url = oidc
+                .jwks_url
+                .unwrap_or_else(|| format!("{}/.well-known/jwks.json", oidc.issuer));
 
-                // Keep only algorithm names kunobi-auth can parse; it re-parses
-                // and enforces them in `validate_jwt`.
-                let algorithms: Vec<String> = oidc
-                    .algorithms
-                    .iter()
-                    .filter(|a| parse_algorithm(a).is_some())
-                    .cloned()
-                    .collect();
+            // Keep only algorithm names kunobi-auth can parse; it re-parses and
+            // enforces them in validate_jwt_bound.
+            let algorithms: Vec<String> = oidc
+                .algorithms
+                .iter()
+                .filter(|a| parse_algorithm(a).is_some())
+                .cloned()
+                .collect();
+            if algorithms.is_empty() {
+                warn!(provider = %policy_name, "No valid algorithms configured, skipping provider");
+                continue;
+            }
 
-                if algorithms.is_empty() {
-                    warn!(
-                        provider = %policy_name,
-                        "No valid algorithms configured, skipping provider"
-                    );
-                    return None;
-                }
+            // A provider must bind tokens by `audience` or `authorizedParties`
+            // (azp); with neither, any validly-signed token from the issuer would
+            // be accepted (token confusion). validate_jwt_bound rejects that at
+            // runtime, but skip it at compile time too with a clear warning.
+            if oidc.audience.is_empty() && oidc.authorized_parties.is_empty() {
+                warn!(
+                    provider = %policy_name,
+                    "OIDC provider sets neither audience nor authorizedParties; \
+                     skipping (tokens cannot be bound safely)"
+                );
+                continue;
+            }
 
-                // A provider must bind tokens by `audience` or `authorizedParties`
-                // (azp) — with neither, any validly-signed token from the issuer
-                // would be accepted (token confusion). validate_jwt_bound rejects
-                // that case, so skip such a provider with a clear warning.
-                if oidc.audience.is_empty() && oidc.authorized_parties.is_empty() {
-                    warn!(
-                        provider = %policy_name,
-                        "OIDC provider sets neither audience nor authorizedParties; \
-                         skipping (tokens cannot be bound safely)"
-                    );
-                    return None;
-                }
-
-                Some(CompiledProvider {
-                    name: policy_name,
-                    issuer: oidc.issuer,
+            builder = builder.jwt(
+                JwtAuthConfig::oidc(
+                    policy_name.clone(),
+                    oidc.issuer.clone(),
                     jwks_url,
-                    audience: oidc.audience,
-                    authorized_parties: oidc.authorized_parties,
-                    algorithms,
-                    identity_template: spec.identity,
+                    oidc.audience,
+                )
+                .authorized_parties(oidc.authorized_parties)
+                .algorithms(algorithms)
+                // Enforces "sub present and a string" (kobe's historical
+                // contract); kobe derives the real identity from the template.
+                .identity_claim("sub"),
+            );
+            by_provider.insert(
+                policy_name,
+                ProviderAuthz {
                     rules: spec.rules,
-                })
-            })
-            .collect();
+                    kind: ProviderKind::Oidc {
+                        issuer: oidc.issuer,
+                        identity_template: spec.identity,
+                    },
+                },
+            );
+        }
 
-        let count = compiled.len();
-        *self.providers.write().await = compiled;
-        debug!(providers = count, "OIDC access policies updated");
+        // Static token providers
+        for ap in token_policies {
+            let policy_name = ap.metadata.name.unwrap_or_default();
+            let spec = ap.spec;
+            let Some(token_auth) = spec.auth.token else {
+                continue;
+            };
+            let token = match token_secrets.get(&token_auth.secret_ref) {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => {
+                    warn!(
+                        provider = %policy_name,
+                        secret_ref = %token_auth.secret_ref,
+                        "Missing or empty token Secret, skipping token provider"
+                    );
+                    continue;
+                }
+            };
+            // Static identity = provider name (kobe's historical behavior).
+            builder = builder.static_token(policy_name.clone(), token, policy_name.clone());
+            by_provider.insert(
+                policy_name,
+                ProviderAuthz {
+                    rules: spec.rules,
+                    kind: ProviderKind::Token,
+                },
+            );
+        }
 
-        // Compile SSH providers
+        let oidc_count = by_provider
+            .values()
+            .filter(|p| matches!(p.kind, ProviderKind::Oidc { .. }))
+            .count();
+        let token_count = by_provider.len() - oidc_count;
+
+        // Publish the new Bearer-auth snapshot atomically (one swap keeps the
+        // verifier and the rule table coherent for every in-flight request).
+        *self.auth.write().await = Arc::new(AuthSnapshot {
+            configured: Arc::new(builder.build()),
+            by_provider,
+        });
+        debug!(
+            oidc_providers = oidc_count,
+            token_providers = token_count,
+            "Bearer auth config updated"
+        );
+
+        // SSH providers (kobe-side; swapped independently of the Bearer config).
         let ssh_compiled: Vec<CompiledSshPolicyProvider> = ssh_policies
             .into_iter()
             .filter_map(|ap| {
@@ -231,55 +336,31 @@ impl JwtAuthenticator {
         let ssh_count = ssh_compiled.len();
         *self.ssh_providers.write().await = ssh_compiled;
         debug!(ssh_providers = ssh_count, "SSH policies updated");
-
-        let token_compiled: Vec<CompiledTokenProvider> = token_policies
-            .into_iter()
-            .filter_map(|ap| {
-                let policy_name = ap.metadata.name.unwrap_or_default();
-                let spec = ap.spec;
-                let token_auth = spec.auth.token?;
-                let token = match token_secrets.get(&token_auth.secret_ref) {
-                    Some(token) if !token.is_empty() => token.clone(),
-                    _ => {
-                        warn!(
-                            provider = %policy_name,
-                            secret_ref = %token_auth.secret_ref,
-                            "Missing or empty token Secret, skipping token provider"
-                        );
-                        return None;
-                    }
-                };
-
-                Some(CompiledTokenProvider {
-                    name: policy_name,
-                    token,
-                    rules: spec.rules,
-                })
-            })
-            .collect();
-
-        let token_count = token_compiled.len();
-        *self.token_providers.write().await = token_compiled;
-        debug!(
-            token_providers = token_count,
-            "Static token policies updated"
-        );
     }
 
     /// Return the list of supported auth methods for the /v1/status endpoint.
     pub async fn auth_methods(&self) -> Vec<AuthMethodInfo> {
-        let providers = self.providers.read().await;
+        let snap = self.snapshot().await;
         let ssh_providers = self.ssh_providers.read().await;
-        let token_providers = self.token_providers.read().await;
 
-        let mut methods: Vec<AuthMethodInfo> = providers
+        let mut methods: Vec<AuthMethodInfo> = snap
+            .by_provider
             .iter()
-            .map(|p| AuthMethodInfo {
-                method_type: "oidc".to_string(),
-                issuer: Some(p.issuer.clone()),
-                client_id: None, // TODO: expose client_id for CLI discovery
-                description: Some(p.name.clone()),
-                audience: None,
+            .map(|(name, pa)| match &pa.kind {
+                ProviderKind::Oidc { issuer, .. } => AuthMethodInfo {
+                    method_type: "oidc".to_string(),
+                    issuer: Some(issuer.clone()),
+                    client_id: None, // TODO: expose client_id for CLI discovery
+                    description: Some(name.clone()),
+                    audience: None,
+                },
+                ProviderKind::Token => AuthMethodInfo {
+                    method_type: "token".to_string(),
+                    issuer: None,
+                    client_id: None,
+                    description: Some(name.clone()),
+                    audience: None,
+                },
             })
             .collect();
 
@@ -293,16 +374,12 @@ impl JwtAuthenticator {
             });
         }
 
-        for tp in token_providers.iter() {
-            methods.push(AuthMethodInfo {
-                method_type: "token".to_string(),
-                issuer: None,
-                client_id: None,
-                description: Some(tp.name.clone()),
-                audience: None,
-            });
-        }
-
+        // `by_provider` is a HashMap, so sort for a stable /v1/status response.
+        // method_type order ("oidc" < "ssh" < "token") matches the prior layout.
+        methods.sort_by(|a, b| {
+            (a.method_type.as_str(), a.description.as_deref())
+                .cmp(&(b.method_type.as_str(), b.description.as_deref()))
+        });
         methods
     }
 
@@ -318,31 +395,51 @@ impl JwtAuthenticator {
             Some((name, val)) => (name, Some(val)),
             None => (requester_type, None),
         };
-        let providers = self.providers.read().await;
-        if let Some(provider) = providers.iter().find(|p| p.name == policy_name) {
-            let rule = find_matching_rule(&provider.rules, matched_value)?;
+
+        // Bearer providers (OIDC + static token) live in the snapshot.
+        let snap = self.snapshot().await;
+        if let Some(pa) = snap.by_provider.get(policy_name) {
+            let rule = find_matching_rule(&pa.rules, matched_value)?;
             return Some(access_rule_to_policy(rule));
         }
-        drop(providers);
 
+        // SSH providers are kept separately.
         let ssh_providers = self.ssh_providers.read().await;
-        if let Some(provider) = ssh_providers
+        let provider = ssh_providers
             .iter()
-            .find(|p| p.provider.name == policy_name)
-        {
-            let rule = find_matching_rule(&provider.rules, matched_value)?;
-            return Some(access_rule_to_policy(rule));
-        }
-        drop(ssh_providers);
-
-        let token_providers = self.token_providers.read().await;
-        let provider = token_providers.iter().find(|p| p.name == policy_name)?;
+            .find(|p| p.provider.name == policy_name)?;
         let rule = find_matching_rule(&provider.rules, matched_value)?;
         Some(access_rule_to_policy(rule))
     }
 
     /// Validate an SSH-signed request and return the authenticated identity.
+    ///
+    /// Wraps [`Self::validate_ssh_inner`] to emit auth metrics: SSH runs outside
+    /// kunobi-auth's `ConfiguredAuth`, so its outcomes never reach the
+    /// `AuthObserver` — emit the same counters here for a uniform namespace.
     pub async fn validate_ssh(
+        &self,
+        ssh_header: &str,
+        method: &str,
+        path_with_query: &str,
+        body: Option<&[u8]>,
+    ) -> Result<AuthIdentity, AuthError> {
+        let result = self
+            .validate_ssh_inner(ssh_header, method, path_with_query, body)
+            .await;
+        match &result {
+            Ok(id) => crate::metrics::AUTH_SUCCESS_TOTAL
+                .with_label_values(&[id.requester_type.as_str(), "ssh"])
+                .inc(),
+            // The provider isn't attributable for most pre-verification failures.
+            Err(_) => crate::metrics::AUTH_FAILURE_TOTAL
+                .with_label_values(&["unknown", AuthFailReason::TokenRejected.label()])
+                .inc(),
+        }
+        result
+    }
+
+    async fn validate_ssh_inner(
         &self,
         ssh_header: &str,
         method: &str,
@@ -395,140 +492,95 @@ impl JwtAuthenticator {
         })
     }
 
-    /// Validate a JWT and return the authenticated identity.
+    /// Validate a Bearer credential (static token or JWT) and return the
+    /// authenticated identity.
     ///
-    /// Peeks at the unverified `iss` claim to select the correct provider(s),
-    /// then validates the token signature and claims against that provider's JWKS.
+    /// Verification (static-token match, or JWT signature / iss / aud / azp /
+    /// exp / nbf) is delegated to kunobi-auth's [`ConfiguredAuth`], which fires
+    /// the [`AuthObserver`]. kobe then resolves the matched provider's rule into
+    /// a [`Policy`](crate::api::policy::Policy) and renders the identity.
     pub async fn validate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
-        {
-            let token_providers = self.token_providers.read().await;
-            if let Some(provider) = token_providers.iter().find(|p| secret_eq(&p.token, token)) {
-                let rule = find_matching_rule(&provider.rules, None).ok_or_else(|| {
-                    AuthError::InvalidToken(
-                        "No access rule configured for static token provider".into(),
-                    )
-                })?;
+        let snap = self.snapshot().await;
 
-                debug!(
-                    requester_type = %provider.name,
-                    provider = %provider.name,
-                    "Static token validated"
-                );
-
-                return Ok(AuthIdentity {
-                    requester_type: provider.name.clone(),
-                    identity: provider.name.clone(),
-                    issuer: "token".to_string(),
-                    policy: access_rule_to_policy(rule),
-                });
-            }
-        }
-
-        let header = decode_header(token).map_err(|e| AuthError::InvalidToken(e.to_string()))?;
-
-        let providers = self.providers.read().await;
-
-        if providers.is_empty() {
+        // No Bearer-validatable providers configured at all. ConfiguredAuth is
+        // never called, so the observer doesn't see this — count it here.
+        if snap.by_provider.is_empty() {
+            crate::metrics::AUTH_FAILURE_TOTAL
+                .with_label_values(&["unknown", AuthFailReason::NoMatchingProvider.label()])
+                .inc();
             return Err(AuthError::InvalidToken(
                 "No auth policies configured".into(),
             ));
         }
 
-        // Peek at the unverified issuer to pre-select the correct provider(s),
-        // avoiding cross-provider token acceptance.
-        let issuer = peek_issuer(token, &header)?;
-
-        let matching: Vec<_> = providers.iter().filter(|p| p.issuer == issuer).collect();
-
-        if matching.is_empty() {
-            return Err(AuthError::InvalidToken(format!(
-                "No provider configured for issuer: {issuer}"
-            )));
-        }
-
-        let mut last_error = String::new();
-        for provider in matching {
-            match self.validate_with_provider(token, provider).await {
-                Ok(identity) => return Ok(identity),
-                Err(e) => {
-                    last_error = e.to_string();
-                    continue;
-                }
-            }
-        }
-
-        Err(AuthError::InvalidToken(format!(
-            "Token not accepted by provider for issuer {issuer}: {last_error}"
-        )))
-    }
-
-    /// Validate a token against a specific compiled provider.
-    ///
-    /// Delegates signature / issuer / audience / exp / nbf / algorithm checks to
-    /// [`JwksManager::validate_jwt_bound`] (which fetches + caches JWKS, validates
-    /// the `aud` and/or `azp` binding — whichever the provider sets — and refuses
-    /// a token bound by neither), before kobe-specific rule matching and identity
-    /// templating.
-    async fn validate_with_provider(
-        &self,
-        token: &str,
-        provider: &CompiledProvider,
-    ) -> Result<AuthIdentity, AuthError> {
-        let claims_map = self
-            .jwks
-            .validate_jwt_bound(
-                token,
-                &provider.jwks_url,
-                &provider.issuer,
-                &provider.audience,
-                &provider.authorized_parties,
-                &provider.algorithms,
-            )
+        // kunobi-auth verifies the credential; on failure the observer has
+        // already counted it (with the precise reason), so just propagate.
+        let kid = snap
+            .configured
+            .authenticate(token)
             .await
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
-        // View the validated claims through kunobi-auth's AuthIdentity so claim
-        // extraction (`claim_str`: dot-path + coercion) and rule matching
-        // (`first_match` + `ClaimMatch::matches`) are the shared, tested
-        // primitives instead of kobe-local copies. `identity`/`method` are
-        // placeholders — kobe derives its own identity from the template below.
-        let claims = kunobi_auth::AuthIdentity {
-            provider: provider.name.clone(),
-            identity: String::new(),
-            method: "oidc".into(),
-            claims: claims_map,
+        // Recover kobe's authorization context for the provider that accepted
+        // the credential. The claims are already verified, so this is a pure,
+        // cheap re-evaluation over trusted data — no re-parse, no JWKS re-fetch.
+        // Authorization failures below are kobe-side (post-credential), so the
+        // observer never sees them — count them here for honest telemetry.
+        let Some(pa) = snap.by_provider.get(&kid.provider) else {
+            // Invariant: a provider verified by this snapshot's ConfiguredAuth is
+            // always in the same snapshot's by_provider. Count + reject defensively.
+            crate::metrics::AUTH_FAILURE_TOTAL
+                .with_label_values(&[kid.provider.as_str(), "no_matching_rule"])
+                .inc();
+            return Err(AuthError::InvalidToken(
+                "verified provider missing from auth snapshot".into(),
+            ));
         };
 
-        // Preserve the historical contract that `sub` is present and a string.
-        require_string_sub(&claims)?;
+        let Some((rule, matched_value)) = match_rule(&pa.rules, &kid) else {
+            // Credential verified but no AccessRule authorizes it (deny-by-default).
+            crate::metrics::AUTH_FAILURE_TOTAL
+                .with_label_values(&[kid.provider.as_str(), "no_matching_rule"])
+                .inc();
+            return Err(AuthError::InvalidToken(
+                "No access rule matched for this token".into(),
+            ));
+        };
 
-        // First matching rule (deny-by-default; an unconditional rule is the
-        // fallback). Matching delegates to kunobi-auth's `first_match` +
-        // `ClaimMatch::matches` via the shared `match_rule` helper.
-        let (rule, matched_value) = match_rule(&provider.rules, &claims).ok_or_else(|| {
-            AuthError::InvalidToken("No access rule matched for this token".into())
-        })?;
-
-        // Format identity from template.
-        let identity = format_identity(&provider.identity_template, &claims);
-
-        // Build requester_type: "{policy_name}" or "{policy_name}:{matched_value}"
         let requester_type = match &matched_value {
-            Some(val) => format!("{}:{}", provider.name, val),
-            None => provider.name.clone(),
+            Some(val) => format!("{}:{}", kid.provider, val),
+            None => kid.provider.clone(),
+        };
+
+        let (identity, issuer) = match &pa.kind {
+            ProviderKind::Oidc {
+                identity_template, ..
+            } => (
+                format_identity(identity_template, &kid),
+                kid.claim_str("iss").unwrap_or_default(),
+            ),
+            // Static token: kunobi-auth sets kid.identity to the provider name;
+            // the issuer is the "token" sentinel (kobe's historical behavior).
+            ProviderKind::Token => (kid.identity.clone(), "token".to_string()),
         };
 
         debug!(
             identity = %identity,
             requester_type = %requester_type,
-            provider = %provider.name,
-            "Token validated"
+            provider = %kid.provider,
+            "Credential validated"
         );
+
+        // Fully authenticated AND authorized — count the success here (not in the
+        // observer), so it never includes credential-valid-but-unauthorized tokens.
+        crate::metrics::AUTH_SUCCESS_TOTAL
+            .with_label_values(&[kid.provider.as_str(), kid.method.as_str()])
+            .inc();
 
         Ok(AuthIdentity {
             requester_type,
             identity,
-            issuer: claims.claim_str("iss").unwrap_or_default(),
+            issuer,
             policy: access_rule_to_policy(rule),
         })
     }
@@ -542,21 +594,6 @@ fn claim_match_to_kunobi(m: &ClaimMatch) -> kunobi_auth::ClaimMatch {
     kunobi_auth::ClaimMatch {
         claim: m.claim.clone(),
         value: m.value.clone(),
-    }
-}
-
-/// Enforce kobe's historical contract that the `sub` claim is present AND a
-/// JSON string. The old typed `GenericClaims { sub: String }` rejected an
-/// absent or non-string `sub` at deserialization; we gate on the raw claim type
-/// (`claim`, not `claim_str` — the latter would coerce a numeric/bool/null
-/// `sub` and silently accept a token the old path rejected).
-fn require_string_sub(claims: &kunobi_auth::AuthIdentity) -> Result<(), AuthError> {
-    if matches!(claims.claim("sub"), Some(serde_json::Value::String(_))) {
-        Ok(())
-    } else {
-        Err(AuthError::InvalidToken(
-            "malformed claims: missing or non-string sub".into(),
-        ))
     }
 }
 
@@ -642,30 +679,6 @@ fn access_rule_to_policy(rule: &AccessRule) -> crate::api::policy::Policy {
         default_priority: 50,
         max_extensions: rule.max_extensions,
     }
-}
-
-/// Peek at the unverified `iss` claim from a JWT without signature validation.
-///
-/// Used to pre-select the correct provider before full token verification,
-/// preventing cross-provider token acceptance.
-fn peek_issuer(token: &str, header: &jsonwebtoken::Header) -> Result<String, AuthError> {
-    let mut validation = Validation::new(header.alg);
-    validation.insecure_disable_signature_validation();
-    validation.validate_aud = false;
-    validation.validate_exp = false;
-    validation.required_spec_claims = std::collections::HashSet::new();
-
-    let dummy_key = DecodingKey::from_secret(b"");
-
-    #[derive(Deserialize)]
-    struct IssClaim {
-        iss: String,
-    }
-
-    let data = decode::<IssClaim>(token, &dummy_key, &validation)
-        .map_err(|e| AuthError::InvalidToken(format!("Failed to peek at JWT issuer: {e}")))?;
-
-    Ok(data.claims.iss)
 }
 
 /// Parse an algorithm string into a jsonwebtoken Algorithm.
@@ -786,39 +799,6 @@ mod tests {
             method: "oidc".to_string(),
             claims,
         }
-    }
-
-    fn identity_with_sub(sub: serde_json::Value) -> kunobi_auth::AuthIdentity {
-        let mut claims = HashMap::new();
-        claims.insert("sub".to_string(), sub);
-        kunobi_auth::AuthIdentity {
-            provider: "p".to_string(),
-            identity: String::new(),
-            method: "oidc".to_string(),
-            claims,
-        }
-    }
-
-    // --- require_string_sub: parity with the old typed GenericClaims ---
-
-    #[test]
-    fn require_string_sub_accepts_string_rejects_absent_or_non_string() {
-        // A present string sub is accepted (as the old GenericClaims did).
-        assert!(require_string_sub(&make_claims("user-1", HashMap::new())).is_ok());
-
-        // Absent / numeric / bool / null / object sub are all rejected — the old
-        // `sub: String` deserialization rejected each of these as malformed.
-        let empty = kunobi_auth::AuthIdentity {
-            provider: "p".to_string(),
-            identity: String::new(),
-            method: "oidc".to_string(),
-            claims: HashMap::new(),
-        };
-        assert!(require_string_sub(&empty).is_err());
-        assert!(require_string_sub(&identity_with_sub(serde_json::json!(123))).is_err());
-        assert!(require_string_sub(&identity_with_sub(serde_json::json!(true))).is_err());
-        assert!(require_string_sub(&identity_with_sub(serde_json::Value::Null)).is_err());
-        assert!(require_string_sub(&identity_with_sub(serde_json::json!({"x": 1}))).is_err());
     }
 
     // --- match_rule (rule matching via kunobi_auth::first_match) tests ---
@@ -1281,5 +1261,57 @@ mod tests {
         assert_eq!(identity.identity, "local-token");
         assert_eq!(identity.issuer, "token");
         assert_eq!(identity.policy.allowed_pools, vec!["*"]);
+    }
+
+    #[tokio::test]
+    async fn validate_credential_valid_but_unauthorized_counts_failure_not_success() {
+        // Static token whose only rule has a match clause (no unconditional
+        // fallback): the credential matches, but static tokens carry no claims,
+        // so no rule authorizes it -> 401. The success counter must NOT move;
+        // the no_matching_rule failure counter must. (Regression guard for
+        // emitting metrics on the full authn+authz outcome, not mid-pipeline.)
+        let auth = JwtAuthenticator::new("test".to_string());
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "AccessPolicy",
+            "metadata": { "name": "metrics-authz-reject" },
+            "spec": {
+                "auth": { "token": { "secretRef": "s" } },
+                "rules": [{
+                    "match": { "claim": "role", "value": "admin" },
+                    "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1
+                }]
+            }
+        }))
+        .unwrap();
+        let mut secrets = HashMap::new();
+        secrets.insert("s".to_string(), "the-token".to_string());
+        auth.update_policies(vec![policy], secrets).await;
+
+        // Unique provider label, so the global counters don't race other tests.
+        let provider = "metrics-authz-reject";
+        let success_before = crate::metrics::AUTH_SUCCESS_TOTAL
+            .with_label_values(&[provider, "token"])
+            .get();
+        let failure_before = crate::metrics::AUTH_FAILURE_TOTAL
+            .with_label_values(&[provider, "no_matching_rule"])
+            .get();
+
+        assert!(auth.validate("the-token").await.is_err());
+
+        assert_eq!(
+            crate::metrics::AUTH_SUCCESS_TOTAL
+                .with_label_values(&[provider, "token"])
+                .get(),
+            success_before,
+            "credential-valid-but-unauthorized must NOT count as success"
+        );
+        assert_eq!(
+            crate::metrics::AUTH_FAILURE_TOTAL
+                .with_label_values(&[provider, "no_matching_rule"])
+                .get(),
+            failure_before + 1,
+            "must count as a no_matching_rule failure"
+        );
     }
 }

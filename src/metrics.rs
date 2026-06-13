@@ -748,6 +748,29 @@ pub static CONNECT_PROXY_REQUEST_OUTCOME_TOTAL: LazyLock<IntCounterVec> = LazyLo
     .unwrap()
 });
 
+/// Successful authentications, by `provider` (AccessPolicy name) and `method`
+/// ("oidc" / "token" via kunobi-auth's `AuthObserver`, or "ssh").
+pub static AUTH_SUCCESS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_auth_success_total",
+        "Successful authentications by provider and method",
+        &["provider", "method"]
+    )
+    .unwrap()
+});
+
+/// Failed authentications, by `provider` (or "unknown" when not attributable)
+/// and `reason`. `reason` is a bounded label from `AuthFailReason::label()`
+/// (e.g. "expired", "audience_mismatch", "no_matching_provider", "token_rejected").
+pub static AUTH_FAILURE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_auth_failure_total",
+        "Failed authentications by provider and reason",
+        &["provider", "reason"]
+    )
+    .unwrap()
+});
+
 /// `CIDRClaim` lifecycle outcome counter.
 pub static IPAM_CLAIMS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -977,6 +1000,9 @@ pub fn init() {
     LazyLock::force(&INSTANCE_STUCK_CREATING_TOTAL);
     LazyLock::force(&GUEST_POD_OOM_KILLS_TOTAL);
     LazyLock::force(&CONNECT_PROXY_REQUEST_OUTCOME_TOTAL);
+    // Auth
+    LazyLock::force(&AUTH_SUCCESS_TOTAL);
+    LazyLock::force(&AUTH_FAILURE_TOTAL);
 }
 
 /// Encode all registered metrics in Prometheus text exposition format.
