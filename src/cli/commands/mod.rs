@@ -111,6 +111,10 @@ async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
 
 async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
     let store = kunobi_auth::client::TofuStore::new()?;
+    // The SSH auth path has no OIDC issuer (status reports issuer=None for ssh,
+    // and SSH identities are stamped issuer="ssh"), so pin the endpoint under
+    // the "ssh" sentinel for the issuer slot that TofuStore::trust now requires.
+    let pinned_issuer = "ssh";
     match store.verify(endpoint, audience)? {
         kunobi_auth::client::TofuResult::Trusted => Ok(()),
         kunobi_auth::client::TofuResult::FirstConnect { endpoint, audience } => {
@@ -122,7 +126,7 @@ async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             if input.trim().eq_ignore_ascii_case("y") {
-                store.trust(&endpoint, &audience)?;
+                store.trust(&endpoint, pinned_issuer, &audience)?;
                 Ok(())
             } else {
                 anyhow::bail!("Connection refused by user")
@@ -146,7 +150,7 @@ async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             if input.trim().eq_ignore_ascii_case("y") {
-                store.trust(&endpoint, &current)?;
+                store.trust(&endpoint, pinned_issuer, &current)?;
                 Ok(())
             } else {
                 anyhow::bail!("Connection refused by user")

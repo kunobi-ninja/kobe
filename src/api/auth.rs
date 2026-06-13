@@ -13,19 +13,6 @@ use tracing::{debug, warn};
 use crate::crd::access_policy::{AccessPolicy, AccessRule, ClaimMatch};
 use crate::pool::parse_duration;
 
-/// Generic JWT claims — captures all claims from any OIDC provider.
-///
-/// Built by deserializing the validated claim map returned by
-/// [`kunobi_auth::server::JwksManager::validate_jwt`], for kobe-specific rule
-/// matching and identity templating.
-#[derive(Debug, Deserialize)]
-struct GenericClaims {
-    iss: String,
-    sub: String,
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
-}
-
 /// Validated identity extracted from a JWT.
 #[derive(Debug, Clone)]
 pub struct AuthIdentity {
@@ -500,14 +487,29 @@ impl JwtAuthenticator {
             .await
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
-        let claims: GenericClaims =
-            serde_json::from_value(serde_json::Value::Object(claims_map.into_iter().collect()))
-                .map_err(|e| AuthError::InvalidToken(format!("malformed claims: {e}")))?;
+        // View the validated claims through kunobi-auth's AuthIdentity so claim
+        // extraction (`claim_str`: dot-path + coercion) and rule matching
+        // (`first_match` + `ClaimMatch::matches`) are the shared, tested
+        // primitives instead of kobe-local copies. `identity`/`method` are
+        // placeholders — kobe derives its own identity from the template below.
+        let claims = kunobi_auth::AuthIdentity {
+            provider: provider.name.clone(),
+            identity: String::new(),
+            method: "oidc".into(),
+            claims: claims_map,
+        };
 
-        // Find matching rule — iterate rules, check match clauses against claims
-        let (rule, matched_value) = find_matching_rule_with_claims(&provider.rules, &claims)?;
+        // Preserve the historical contract that `sub` is present and a string.
+        require_string_sub(&claims)?;
 
-        // Format identity from template
+        // First matching rule (deny-by-default; an unconditional rule is the
+        // fallback). Matching delegates to kunobi-auth's `first_match` +
+        // `ClaimMatch::matches` via the shared `match_rule` helper.
+        let (rule, matched_value) = match_rule(&provider.rules, &claims).ok_or_else(|| {
+            AuthError::InvalidToken("No access rule matched for this token".into())
+        })?;
+
+        // Format identity from template.
         let identity = format_identity(&provider.identity_template, &claims);
 
         // Build requester_type: "{policy_name}" or "{policy_name}:{matched_value}"
@@ -526,36 +528,56 @@ impl JwtAuthenticator {
         Ok(AuthIdentity {
             requester_type,
             identity,
-            issuer: claims.iss,
+            issuer: claims.claim_str("iss").unwrap_or_default(),
             policy: access_rule_to_policy(rule),
         })
     }
 }
 
-/// Find the first matching rule from a rules list, checking match clauses against JWT claims.
-/// Returns the matched rule and the optional matched claim value (used for requester_type).
-fn find_matching_rule_with_claims<'a>(
-    rules: &'a [AccessRule],
-    claims: &GenericClaims,
-) -> Result<(&'a AccessRule, Option<String>), AuthError> {
-    for rule in rules {
-        match &rule.match_clause {
-            Some(ClaimMatch { claim, value }) => {
-                if let Some(actual) = get_claim_value(&claims.extra, &claims.sub, claim)
-                    && actual == *value
-                {
-                    return Ok((rule, Some(value.clone())));
-                }
-            }
-            None => {
-                // No match clause — this rule applies unconditionally
-                return Ok((rule, None));
-            }
-        }
+/// Project kobe's CRD [`ClaimMatch`](crate::crd::access_policy::ClaimMatch) into
+/// the field-identical [`kunobi_auth::ClaimMatch`] so the shared `first_match`
+/// primitive can evaluate it. kobe keeps its own CRD type because it must derive
+/// `JsonSchema` (which `kunobi_auth::ClaimMatch` deliberately does not).
+fn claim_match_to_kunobi(m: &ClaimMatch) -> kunobi_auth::ClaimMatch {
+    kunobi_auth::ClaimMatch {
+        claim: m.claim.clone(),
+        value: m.value.clone(),
     }
-    Err(AuthError::InvalidToken(
-        "No access rule matched for this token".into(),
-    ))
+}
+
+/// Enforce kobe's historical contract that the `sub` claim is present AND a
+/// JSON string. The old typed `GenericClaims { sub: String }` rejected an
+/// absent or non-string `sub` at deserialization; we gate on the raw claim type
+/// (`claim`, not `claim_str` — the latter would coerce a numeric/bool/null
+/// `sub` and silently accept a token the old path rejected).
+fn require_string_sub(claims: &kunobi_auth::AuthIdentity) -> Result<(), AuthError> {
+    if matches!(claims.claim("sub"), Some(serde_json::Value::String(_))) {
+        Ok(())
+    } else {
+        Err(AuthError::InvalidToken(
+            "malformed claims: missing or non-string sub".into(),
+        ))
+    }
+}
+
+/// First rule whose claim-match is satisfied by `claims`, deny-by-default — an
+/// unconditional rule (no `match_clause`) is the fallback. Returns the rule and
+/// the matched clause value (used to build `requester_type`). Matching is
+/// delegated to [`kunobi_auth::first_match`] over kobe's rules, projecting each
+/// CRD [`ClaimMatch`](crate::crd::access_policy::ClaimMatch) into the
+/// field-identical `kunobi_auth::ClaimMatch` the primitive evaluates.
+fn match_rule<'a>(
+    rules: &'a [AccessRule],
+    claims: &kunobi_auth::AuthIdentity,
+) -> Option<(&'a AccessRule, Option<String>)> {
+    let projected: Vec<(&'a AccessRule, Option<kunobi_auth::ClaimMatch>)> = rules
+        .iter()
+        .map(|r| (r, r.match_clause.as_ref().map(claim_match_to_kunobi)))
+        .collect();
+    let matched = kunobi_auth::first_match(&projected, claims, |(_, clause)| clause.as_ref())?;
+    // `matched.0` is the `&'a AccessRule` from `rules`; the projected vec (and
+    // the borrowed clause) are dropped at return, so nothing of it escapes.
+    Some((matched.0, matched.1.as_ref().map(|m| m.value.clone())))
 }
 
 /// Find the first matching rule by optional matched_value (for policy_for_requester_type lookups).
@@ -573,46 +595,13 @@ fn find_matching_rule<'a>(
     }
 }
 
-/// Get a claim value by dot-path from the claims map.
-///
-/// Supports paths like `sub`, `repository`, `private_metadata.role`.
-/// Special-cases `sub` and `iss` which are top-level fields, not in the extra map.
-fn get_claim_value(
-    extra: &HashMap<String, serde_json::Value>,
-    sub: &str,
-    path: &str,
-) -> Option<String> {
-    // Handle the standard JWT claims that aren't in the extra map
-    if path == "sub" {
-        return Some(sub.to_string());
-    }
-
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    // Start from the root of extra claims
-    let mut current: &serde_json::Value = extra.get(parts[0])?;
-
-    // Traverse nested path
-    for part in &parts[1..] {
-        current = current.get(part)?;
-    }
-
-    // Convert the final value to a string
-    match current {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Bool(b) => Some(b.to_string()),
-        _ => Some(current.to_string()),
-    }
-}
-
-/// Format an identity string by replacing `{claim_name}` placeholders with claim values.
-///
-/// Uses a single forward pass to avoid re-expansion when claim values contain `{`.
-fn format_identity(template: &str, claims: &GenericClaims) -> String {
+/// Format an identity string by replacing `{claim_name}` placeholders with claim
+/// values read from the validated claim set via
+/// [`kunobi_auth::AuthIdentity::claim_str`] (dot-path + String/Number/Bool
+/// coercion). A single forward pass avoids re-expansion when claim values
+/// contain `{`; an unclosed `{` is kept verbatim; an unknown claim renders as
+/// `_missing_{name}_`.
+fn format_identity(template: &str, claims: &kunobi_auth::AuthIdentity) -> String {
     let mut result = String::with_capacity(template.len());
     let mut remaining = template;
 
@@ -622,14 +611,9 @@ fn format_identity(template: &str, claims: &GenericClaims) -> String {
 
         if let Some(end) = remaining.find('}') {
             let key = &remaining[..end];
-            let value = if key == "sub" {
-                claims.sub.clone()
-            } else if key == "iss" {
-                claims.iss.clone()
-            } else {
-                get_claim_value(&claims.extra, &claims.sub, key)
-                    .unwrap_or_else(|| format!("_missing_{key}_"))
-            };
+            let value = claims
+                .claim_str(key)
+                .unwrap_or_else(|| format!("_missing_{key}_"));
             result.push_str(&value);
             remaining = &remaining[end + 1..];
         } else {
@@ -781,15 +765,63 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
 mod tests {
     use super::*;
 
-    fn make_claims(sub: &str, extra: HashMap<String, serde_json::Value>) -> GenericClaims {
-        GenericClaims {
-            iss: "https://test.example.com".to_string(),
-            sub: sub.to_string(),
-            extra,
+    /// Build a `kunobi_auth::AuthIdentity` over a claim set (sub + iss + extra) —
+    /// the view kobe's rule matching + identity templating now operate on.
+    fn make_claims(
+        sub: &str,
+        extra: HashMap<String, serde_json::Value>,
+    ) -> kunobi_auth::AuthIdentity {
+        let mut claims = extra;
+        claims.insert(
+            "sub".to_string(),
+            serde_json::Value::String(sub.to_string()),
+        );
+        claims.insert(
+            "iss".to_string(),
+            serde_json::Value::String("https://test.example.com".to_string()),
+        );
+        kunobi_auth::AuthIdentity {
+            provider: "test".to_string(),
+            identity: String::new(),
+            method: "oidc".to_string(),
+            claims,
         }
     }
 
-    // --- find_matching_rule_with_claims tests ---
+    fn identity_with_sub(sub: serde_json::Value) -> kunobi_auth::AuthIdentity {
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), sub);
+        kunobi_auth::AuthIdentity {
+            provider: "p".to_string(),
+            identity: String::new(),
+            method: "oidc".to_string(),
+            claims,
+        }
+    }
+
+    // --- require_string_sub: parity with the old typed GenericClaims ---
+
+    #[test]
+    fn require_string_sub_accepts_string_rejects_absent_or_non_string() {
+        // A present string sub is accepted (as the old GenericClaims did).
+        assert!(require_string_sub(&make_claims("user-1", HashMap::new())).is_ok());
+
+        // Absent / numeric / bool / null / object sub are all rejected — the old
+        // `sub: String` deserialization rejected each of these as malformed.
+        let empty = kunobi_auth::AuthIdentity {
+            provider: "p".to_string(),
+            identity: String::new(),
+            method: "oidc".to_string(),
+            claims: HashMap::new(),
+        };
+        assert!(require_string_sub(&empty).is_err());
+        assert!(require_string_sub(&identity_with_sub(serde_json::json!(123))).is_err());
+        assert!(require_string_sub(&identity_with_sub(serde_json::json!(true))).is_err());
+        assert!(require_string_sub(&identity_with_sub(serde_json::Value::Null)).is_err());
+        assert!(require_string_sub(&identity_with_sub(serde_json::json!({"x": 1}))).is_err());
+    }
+
+    // --- match_rule (rule matching via kunobi_auth::first_match) tests ---
 
     #[test]
     fn test_find_rule_no_match_clause() {
@@ -801,7 +833,7 @@ mod tests {
             max_extensions: 2,
         }];
         let claims = make_claims("test-sub", HashMap::new());
-        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        let (rule, matched) = match_rule(&rules, &claims).unwrap();
         assert_eq!(rule.pools, vec!["*"]);
         assert!(matched.is_none());
     }
@@ -835,13 +867,13 @@ mod tests {
             serde_json::Value::String("org:admin".to_string()),
         );
         let claims = make_claims("test-sub", extra);
-        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        let (rule, matched) = match_rule(&rules, &claims).unwrap();
         assert_eq!(rule.max_ttl, "8h");
         assert_eq!(matched, Some("org:admin".to_string()));
 
         // No claim match — falls through to unconditional rule
         let claims = make_claims("test-sub", HashMap::new());
-        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        let (rule, matched) = match_rule(&rules, &claims).unwrap();
         assert_eq!(rule.max_ttl, "1h");
         assert!(matched.is_none());
     }
@@ -865,7 +897,7 @@ mod tests {
             serde_json::json!({"role": "admin"}),
         );
         let claims = make_claims("test-sub", extra);
-        let (rule, matched) = find_matching_rule_with_claims(&rules, &claims).unwrap();
+        let (rule, matched) = match_rule(&rules, &claims).unwrap();
         assert_eq!(rule.max_ttl, "4h");
         assert_eq!(matched, Some("admin".to_string()));
     }
@@ -883,7 +915,7 @@ mod tests {
             max_extensions: 2,
         }];
         let claims = make_claims("test-sub", HashMap::new());
-        assert!(find_matching_rule_with_claims(&rules, &claims).is_err());
+        assert!(match_rule(&rules, &claims).is_none());
     }
 
     // --- format_identity tests ---
@@ -922,65 +954,65 @@ mod tests {
         );
     }
 
-    // --- get_claim_value tests ---
+    // --- claim extraction via AuthIdentity::claim_str ---
+    // (these previously exercised kobe's get_claim_value; the dot-path +
+    // String/Number/Bool coercion is now kunobi-auth's claim_str — same results.)
 
     #[test]
-    fn test_get_claim_value_top_level() {
+    fn test_claim_str_top_level() {
         let mut extra = HashMap::new();
         extra.insert(
             "email".to_string(),
             serde_json::Value::String("test@example.com".to_string()),
         );
         assert_eq!(
-            get_claim_value(&extra, "user_1", "email"),
+            make_claims("user_1", extra).claim_str("email"),
             Some("test@example.com".to_string())
         );
     }
 
     #[test]
-    fn test_get_claim_value_sub() {
-        let extra = HashMap::new();
+    fn test_claim_str_sub() {
         assert_eq!(
-            get_claim_value(&extra, "user_123", "sub"),
+            make_claims("user_123", HashMap::new()).claim_str("sub"),
             Some("user_123".to_string())
         );
     }
 
     #[test]
-    fn test_get_claim_value_nested() {
+    fn test_claim_str_nested() {
         let mut extra = HashMap::new();
         extra.insert(
             "private_metadata".to_string(),
             serde_json::json!({"role": "admin", "level": 5}),
         );
-
+        let claims = make_claims("user_1", extra);
         assert_eq!(
-            get_claim_value(&extra, "user_1", "private_metadata.role"),
+            claims.claim_str("private_metadata.role"),
             Some("admin".to_string())
         );
         assert_eq!(
-            get_claim_value(&extra, "user_1", "private_metadata.level"),
+            claims.claim_str("private_metadata.level"),
             Some("5".to_string())
         );
     }
 
     #[test]
-    fn test_get_claim_value_missing() {
-        let extra = HashMap::new();
-        assert_eq!(get_claim_value(&extra, "user_1", "nonexistent"), None);
+    fn test_claim_str_missing() {
+        assert_eq!(
+            make_claims("user_1", HashMap::new()).claim_str("nonexistent"),
+            None
+        );
     }
 
     #[test]
-    fn test_get_claim_value_deeply_nested_missing() {
+    fn test_claim_str_deeply_nested_missing() {
         let mut extra = HashMap::new();
         extra.insert("a".to_string(), serde_json::json!({"b": {"c": "found"}}));
-
-        assert_eq!(
-            get_claim_value(&extra, "u", "a.b.c"),
-            Some("found".to_string())
-        );
-        assert_eq!(get_claim_value(&extra, "u", "a.b.d"), None);
-        assert_eq!(get_claim_value(&extra, "u", "a.x.c"), None);
+        let claims = make_claims("u", extra);
+        assert_eq!(claims.claim_str("a.b.c"), Some("found".to_string()));
+        assert_eq!(claims.claim_str("a.b.d"), None);
+        assert_eq!(claims.claim_str("a.x.c"), None);
     }
 
     // --- parse_algorithm tests ---

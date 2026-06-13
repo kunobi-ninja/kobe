@@ -110,6 +110,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Authenticated pulls avoid Docker Hub's anonymous rate limit (~100/6h per
+      # IP), which the shared self-hosted runner egress IP intermittently trips —
+      # surfacing as a 429 on the base-image pull. `publish` already logs in; the
+      # dry-run did not. `continue-on-error` keeps fork PRs (no secrets) working
+      # via anonymous pulls, exactly as before.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
