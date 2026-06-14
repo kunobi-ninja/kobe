@@ -218,6 +218,17 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 ///
 /// API routes have a concurrency limit for DoS protection.
 /// Infrastructure routes (/livez, /readyz, /healthz, /metrics) are exempt.
+/// Serve the Kunobi auth-discovery document at `/.well-known/kunobi-auth` so the
+/// CLI (`kobe login`) can discover the OIDC issuer / client_id / audience to
+/// authenticate against. Returns 404 when no AccessPolicy configures interactive
+/// login (no OIDC provider sets a `clientId`).
+async fn kunobi_auth_discovery<B: ClusterBackend>(State(state): State<AppState<B>>) -> Response {
+    match state.authenticator.discovery_metadata().await {
+        Some(doc) => Json(doc).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> Router {
     // Concurrency-limited API routes
     let api_routes = Router::new()
@@ -241,6 +252,11 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .merge(api_routes)
         .merge(connect_routes)
         .route("/v1/status", get(status::<B>))
+        // OIDC auth discovery for `kobe login` (unauthenticated, like /v1/status).
+        .route(
+            kunobi_auth::server::KUNOBI_AUTH_DISCOVERY_PATH,
+            get(kunobi_auth_discovery::<B>),
+        )
         .route("/livez", get(livez))
         .route("/readyz", get(readyz::<B>))
         // Back-compat alias for liveness — kept so external monitoring

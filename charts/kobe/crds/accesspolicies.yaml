@@ -52,6 +52,14 @@ spec:
                         items:
                           type: string
                         type: array
+                      clientId:
+                        description: |-
+                          OAuth client ID for interactive CLI login. When set, this provider is
+                          advertised at `/.well-known/kunobi-auth` (issuer + client_id + audience)
+                          so `kobe login` can discover where to authenticate. Machine providers
+                          (e.g. CI/GitHub Actions) that never do interactive login leave this unset.
+                        nullable: true
+                        type: string
                       issuer:
                         description: OIDC issuer URL (must match `iss` claim).
                         type: string

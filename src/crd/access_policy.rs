@@ -75,6 +75,13 @@ pub struct OidcAuth {
     /// Allowed JWT signing algorithms. Defaults to `["RS256"]`.
     #[serde(default = "default_algorithms")]
     pub algorithms: Vec<String>,
+
+    /// OAuth client ID for interactive CLI login. When set, this provider is
+    /// advertised at `/.well-known/kunobi-auth` (issuer + client_id + audience)
+    /// so `kobe login` can discover where to authenticate. Machine providers
+    /// (e.g. CI/GitHub Actions) that never do interactive login leave this unset.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// Static bearer token authentication via a Kubernetes Secret.

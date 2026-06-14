@@ -5,11 +5,11 @@ use std::time::Duration;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use jsonwebtoken::Algorithm;
-use kunobi_auth::AuthFailReason;
 use kunobi_auth::server::ssh::{CompiledSshProvider, NonceTracker, ParsedAuthorizedKey};
 use kunobi_auth::server::{
     AuthBuilder, AuthEvent, AuthObserver, AuthnProvider, ConfiguredAuth, JwtAuthConfig,
 };
+use kunobi_auth::{AuthFailReason, KunobiAuthDiscovery};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -59,6 +59,9 @@ enum ProviderKind {
     /// OIDC provider: identity is rendered from the template over the JWT claims.
     Oidc {
         issuer: String,
+        /// OAuth client ID for interactive CLI login (`/v1/status` +
+        /// `/.well-known/kunobi-auth`). `None` for machine-only providers.
+        client_id: Option<String>,
         identity_template: String,
     },
     /// Static bearer token: identity is the provider name, issuer is `"token"`.
@@ -75,6 +78,10 @@ struct AuthSnapshot {
     configured: Arc<ConfiguredAuth>,
     /// Provider name -> kobe authorization context (rules + identity source).
     by_provider: HashMap<String, ProviderAuthz>,
+    /// The OIDC provider advertised at `/.well-known/kunobi-auth` for interactive
+    /// CLI login — the one with a `client_id` set. `None` when no provider
+    /// configures interactive login.
+    discovery: Option<KunobiAuthDiscovery>,
 }
 
 /// A compiled SSH policy provider, pairing kunobi-auth's CompiledSshProvider
@@ -139,6 +146,7 @@ impl JwtAuthenticator {
             auth: RwLock::new(Arc::new(AuthSnapshot {
                 configured: Arc::new(AuthBuilder::new().build()),
                 by_provider: HashMap::new(),
+                discovery: None,
             })),
             ssh_providers: RwLock::new(Vec::new()),
             nonce_tracker: NonceTracker::new(std::time::Duration::from_secs(60)),
@@ -151,6 +159,13 @@ impl JwtAuthenticator {
     /// Load the current Bearer-auth snapshot (cheap `Arc` clone; lock released).
     async fn snapshot(&self) -> Arc<AuthSnapshot> {
         self.auth.read().await.clone()
+    }
+
+    /// The auth-discovery document served at `/.well-known/kunobi-auth` — the
+    /// OIDC provider designated for interactive CLI login (the one with a
+    /// `clientId`), or `None` when no provider configures interactive login.
+    pub async fn discovery_metadata(&self) -> Option<KunobiAuthDiscovery> {
+        self.snapshot().await.discovery.clone()
     }
 
     /// Recompile the auth configuration from AccessPolicy CRDs. Called by the
@@ -182,6 +197,9 @@ impl JwtAuthenticator {
             builder = builder.leeway(leeway);
         }
         let mut by_provider: HashMap<String, ProviderAuthz> = HashMap::new();
+        // OIDC providers that set a `clientId` — candidates for the
+        // /.well-known/kunobi-auth discovery document. (name, doc) pairs.
+        let mut discovery_candidates: Vec<(String, KunobiAuthDiscovery)> = Vec::new();
 
         // OIDC providers
         for ap in oidc_policies {
@@ -219,25 +237,40 @@ impl JwtAuthenticator {
                 continue;
             }
 
+            // Capture discovery data before oidc's fields move into the builder.
+            let client_id = oidc.client_id.clone();
+            let discovery_audience = oidc.audience.first().cloned();
+            let issuer = oidc.issuer.clone();
+
             builder = builder.jwt(
-                JwtAuthConfig::oidc(
-                    policy_name.clone(),
-                    oidc.issuer.clone(),
-                    jwks_url,
-                    oidc.audience,
-                )
-                .authorized_parties(oidc.authorized_parties)
-                .algorithms(algorithms)
-                // Enforces "sub present and a string" (kobe's historical
-                // contract); kobe derives the real identity from the template.
-                .identity_claim("sub"),
+                JwtAuthConfig::oidc(policy_name.clone(), issuer.clone(), jwks_url, oidc.audience)
+                    .authorized_parties(oidc.authorized_parties)
+                    .algorithms(algorithms)
+                    // Enforces "sub present and a string" (kobe's historical
+                    // contract); kobe derives the real identity from the template.
+                    .identity_claim("sub"),
             );
+
+            // A `clientId` marks this provider as the interactive-login target
+            // advertised at /.well-known/kunobi-auth.
+            if let Some(cid) = &client_id {
+                discovery_candidates.push((
+                    policy_name.clone(),
+                    KunobiAuthDiscovery {
+                        issuer: issuer.clone(),
+                        client_id: cid.clone(),
+                        audience: discovery_audience,
+                    },
+                ));
+            }
+
             by_provider.insert(
                 policy_name,
                 ProviderAuthz {
                     rules: spec.rules,
                     kind: ProviderKind::Oidc {
-                        issuer: oidc.issuer,
+                        issuer,
+                        client_id,
                         identity_template: spec.identity,
                     },
                 },
@@ -279,11 +312,26 @@ impl JwtAuthenticator {
             .count();
         let token_count = by_provider.len() - oidc_count;
 
+        // Discovery doc: the OIDC provider designated for interactive CLI login
+        // (the one with a clientId). Pick deterministically by name; warn if
+        // several configure interactive login (only one can be advertised).
+        discovery_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        if discovery_candidates.len() > 1 {
+            warn!(
+                count = discovery_candidates.len(),
+                chosen = %discovery_candidates[0].0,
+                "Multiple OIDC providers set a clientId; advertising the \
+                 first by name at /.well-known/kunobi-auth"
+            );
+        }
+        let discovery = discovery_candidates.into_iter().next().map(|(_, doc)| doc);
+
         // Publish the new Bearer-auth snapshot atomically (one swap keeps the
         // verifier and the rule table coherent for every in-flight request).
         *self.auth.write().await = Arc::new(AuthSnapshot {
             configured: Arc::new(builder.build()),
             by_provider,
+            discovery,
         });
         debug!(
             oidc_providers = oidc_count,
@@ -347,10 +395,12 @@ impl JwtAuthenticator {
             .by_provider
             .iter()
             .map(|(name, pa)| match &pa.kind {
-                ProviderKind::Oidc { issuer, .. } => AuthMethodInfo {
+                ProviderKind::Oidc {
+                    issuer, client_id, ..
+                } => AuthMethodInfo {
                     method_type: "oidc".to_string(),
                     issuer: Some(issuer.clone()),
-                    client_id: None, // TODO: expose client_id for CLI discovery
+                    client_id: client_id.clone(),
                     description: Some(name.clone()),
                     audience: None,
                 },
@@ -1313,5 +1363,69 @@ mod tests {
             failure_before + 1,
             "must count as a no_matching_rule failure"
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_metadata_advertises_the_provider_with_a_client_id() {
+        let auth = JwtAuthenticator::new("test".to_string());
+
+        // A machine provider (no clientId) and an interactive one (clientId set).
+        let machine: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "ci" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://token.actions.githubusercontent.com",
+                "audience": ["kobe"], "algorithms": ["RS256"]
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        let human: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "corp" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://login.corp.example",
+                "audience": ["kobe-api"], "algorithms": ["RS256"],
+                "clientId": "kobe-cli"
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        auth.update_policies(vec![machine, human], HashMap::new())
+            .await;
+
+        let doc = auth
+            .discovery_metadata()
+            .await
+            .expect("the interactive provider must be advertised");
+        assert_eq!(doc.issuer, "https://login.corp.example");
+        assert_eq!(doc.client_id, "kobe-cli");
+        assert_eq!(doc.audience.as_deref(), Some("kobe-api"));
+
+        // /v1/status exposes client_id only for the interactive provider.
+        let methods = auth.auth_methods().await;
+        let corp = methods
+            .iter()
+            .find(|m| m.description.as_deref() == Some("corp"))
+            .unwrap();
+        assert_eq!(corp.client_id.as_deref(), Some("kobe-cli"));
+        let ci = methods
+            .iter()
+            .find(|m| m.description.as_deref() == Some("ci"))
+            .unwrap();
+        assert_eq!(ci.client_id, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_metadata_is_none_without_an_interactive_provider() {
+        let auth = JwtAuthenticator::new("test".to_string());
+        let machine: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "ci" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://idp", "audience": ["kobe"], "algorithms": ["RS256"]
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        auth.update_policies(vec![machine], HashMap::new()).await;
+        assert!(auth.discovery_metadata().await.is_none());
     }
 }
