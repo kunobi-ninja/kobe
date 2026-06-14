@@ -798,7 +798,20 @@ fn backoff_active(profile: &ClusterPool, now: chrono::DateTime<chrono::Utc>) -> 
     };
     match chrono::DateTime::parse_from_rfc3339(next) {
         Ok(next_at) => now < next_at.with_timezone(&chrono::Utc),
-        Err(_) => false, // malformed status → don't block creates
+        // Fail CLOSED (#166): a malformed `nextAttemptAt` must not silently
+        // disable backoff. Failing open let a pool whose status got corrupted
+        // keep creating at full speed (and compounds with any concurrency-cap
+        // race). Treat an unparseable timestamp as "backoff active" — suppress
+        // scale-up until the reconciler rewrites a valid value next cycle.
+        Err(e) => {
+            tracing::warn!(
+                pool = profile.metadata.name.as_deref().unwrap_or("<unknown>"),
+                next_attempt_at = next,
+                error = %e,
+                "malformed status.nextAttemptAt; failing closed (suppressing scale-up) until rewritten"
+            );
+            true
+        }
     }
 }
 
@@ -1994,6 +2007,37 @@ mod tests {
     }
 
     #[test]
+    fn test_backoff_fails_closed_on_malformed_next_attempt_at() {
+        // #166: a malformed `status.nextAttemptAt` must FAIL CLOSED (suppress
+        // scale-up), not fail open. Failing open let a pool whose status got
+        // corrupted keep creating at full speed.
+        let profile = make_profile_with_backoff(1, 3, 2, Some("not-a-timestamp".to_string()));
+        assert!(
+            backoff_active(&profile, chrono::Utc::now()),
+            "malformed nextAttemptAt must be treated as backoff-active (fail closed)"
+        );
+        let state = PoolState {
+            clusters: HashMap::new(),
+        };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let creates: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, PoolAction::Create(_)))
+            .collect();
+        assert_eq!(
+            creates.len(),
+            0,
+            "malformed backoff state must suppress Create (fail closed)"
+        );
+    }
+
+    #[test]
     fn test_scale_up_proceeds_when_no_backoff_state() {
         let profile = make_profile_with_backoff(1, 3, 0, None);
         let state = PoolState {
@@ -2011,30 +2055,6 @@ mod tests {
             .filter(|a| matches!(a, PoolAction::Create(_)))
             .collect();
         assert_eq!(creates.len(), 1);
-    }
-
-    #[test]
-    fn test_malformed_next_attempt_does_not_block_creates() {
-        let profile = make_profile_with_backoff(1, 3, 2, Some("not-a-timestamp".to_string()));
-        let state = PoolState {
-            clusters: HashMap::new(),
-        };
-        let actions = compute_pool_actions(
-            &profile,
-            &state,
-            chrono::Utc::now(),
-            &test_render_ctx(),
-            &Default::default(),
-        );
-        let creates: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, PoolAction::Create(_)))
-            .collect();
-        assert_eq!(
-            creates.len(),
-            1,
-            "malformed timestamp should fail open, not lock the pool"
-        );
     }
 
     // --- Pool phase ---

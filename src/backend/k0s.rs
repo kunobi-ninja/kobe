@@ -18,9 +18,9 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, Container, EnvVar, Event as K8sEvent, KeyToPath, Pod, PodAffinity,
-    PodAffinityTerm, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort,
-    ServiceSpec, Toleration, Volume, VolumeMount,
+    Affinity, ConfigMap, Container, EnvVar, Event as K8sEvent, KeyToPath, PersistentVolumeClaim,
+    Pod, PodAffinity, PodAffinityTerm, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource,
+    Service, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -950,6 +950,25 @@ spec:
         Ok(matches.join(" | "))
     }
 
+    /// True iff `pvc_name` is one of this cluster's StatefulSet server data
+    /// PVCs (`data-{cluster}-server-{ordinal}`).
+    ///
+    /// The numeric-ordinal check is load-bearing: a bare `data-{cluster}-server-`
+    /// prefix would also match the PVCs of a *different* cluster literally named
+    /// `{cluster}-server` (whose PVCs are `data-{cluster}-server-server-{n}`), so
+    /// without it `delete("foo")` could reap `foo-server`'s volumes.
+    ///
+    /// NOTE: mirrors `K3sBackend::is_server_data_pvc` (identical
+    /// `volumeClaimTemplate` name shape). A shared helper is the
+    /// divergence-proof follow-up — see ADR-002 §2.9; this duplication is
+    /// exactly the per-kind divergence that left #154 fixed in k3s but not here.
+    fn is_server_data_pvc(pvc_name: &str, cluster: &str) -> bool {
+        let prefix = format!("data-{cluster}-server-");
+        pvc_name.strip_prefix(&prefix).is_some_and(|ordinal| {
+            !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())
+        })
+    }
+
     /// Delete a resource, ignoring 404 (already deleted).
     async fn delete_ignoring_not_found<K>(api: &Api<K>, name: &str) -> Result<()>
     where
@@ -1190,6 +1209,42 @@ impl ClusterBackend for K0sBackend {
         Self::delete_ignoring_not_found(&sts_api, &sts_name).await?;
         Self::wait_deleted(&sts_api, &sts_name).await?;
 
+        // Reap the per-replica server data PVCs (#154). This fix shipped for
+        // k3s but never generalized here (ADR-002 §2.9): k0s uses the same
+        // `volumeClaimTemplate` shape (`data-{name}-server-{ordinal}`), and k8s
+        // RETAINS those PVCs when the StatefulSet is deleted — so without this
+        // every recycle of a persistence-enabled k0s member orphaned them
+        // forever (a host-disk leak AND residual control-plane state on a
+        // retained volume). delete() has no replica count, so we LIST and match
+        // the exact StatefulSet PVC name shape. BEST-EFFORT: a list/delete
+        // failure must NEVER abort teardown.
+        let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        match pvc_api.list(&ListParams::default()).await {
+            Ok(list) => {
+                for pvc in list.items {
+                    let Some(pvc_name) = pvc.metadata.name.as_deref() else {
+                        continue;
+                    };
+                    if Self::is_server_data_pvc(pvc_name, name)
+                        && let Err(e) = Self::delete_ignoring_not_found(&pvc_api, pvc_name).await
+                    {
+                        warn!(
+                            cluster = name,
+                            pvc = pvc_name,
+                            error = %e,
+                            "best-effort server PVC delete failed (continuing teardown)"
+                        );
+                    }
+                }
+            }
+            Err(e) => warn!(
+                cluster = name,
+                error = %e,
+                "best-effort server PVC list failed (continuing teardown; orphaned \
+                 data-<name>-server-* PVCs may remain)"
+            ),
+        }
+
         // Delete k0s config ConfigMap
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&cms, &format!("{name}-k0s-config")).await?;
@@ -1271,6 +1326,30 @@ mod tests {
     #[test]
     fn test_db_prefix_is_k0s() {
         assert_eq!(DB_PREFIX, "k0s_");
+    }
+
+    #[test]
+    fn test_is_server_data_pvc() {
+        // matches data-{cluster}-server-{ordinal}
+        assert!(K0sBackend::is_server_data_pvc("data-foo-server-0", "foo"));
+        assert!(K0sBackend::is_server_data_pvc("data-foo-server-12", "foo"));
+        // missing / non-numeric ordinal
+        assert!(!K0sBackend::is_server_data_pvc("data-foo-server-", "foo"));
+        assert!(!K0sBackend::is_server_data_pvc("data-foo-server-x", "foo"));
+        // different cluster
+        assert!(!K0sBackend::is_server_data_pvc("data-bar-server-0", "foo"));
+        // must NOT reap a different cluster literally named `foo-server`
+        assert!(!K0sBackend::is_server_data_pvc(
+            "data-foo-server-server-0",
+            "foo"
+        ));
+        assert!(K0sBackend::is_server_data_pvc(
+            "data-foo-server-server-0",
+            "foo-server"
+        ));
+        // wrong role / missing prefix
+        assert!(!K0sBackend::is_server_data_pvc("data-foo-agent-0", "foo"));
+        assert!(!K0sBackend::is_server_data_pvc("foo-server-0", "foo"));
     }
 
     #[test]
