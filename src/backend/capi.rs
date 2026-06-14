@@ -223,6 +223,54 @@ impl CapiBackend {
 
         anyhow::bail!("CAPI cluster {name} not ready after 5 minutes");
     }
+
+    /// Wait for the CAPI `Cluster` to be fully finalized (gone), confirming the
+    /// infrastructure provider reaped the backing cloud resources (VM/VPC/LB).
+    ///
+    /// CAPI deletion is asynchronous: `delete()` only marks the Cluster
+    /// `Terminating`; the provider controller runs the real teardown and removes
+    /// the finalizer when done. Returning before the Cluster is gone is
+    /// fire-and-forget — kobe would release the lease while cloud resources are
+    /// still live, with no handle left to retry or detect the leak (#178). Poll
+    /// every 5s for up to 5 minutes; on timeout return an error so the instance
+    /// stays in Recycling and the (idempotent) delete is retried next reconcile.
+    async fn wait_cluster_deleted(&self, name: &str, namespace: &str) -> Result<()> {
+        let cluster_ar = Self::cluster_api_resource();
+        let cluster_api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), namespace, &cluster_ar);
+
+        for attempt in 0..60 {
+            match cluster_api.get_opt(name).await {
+                Ok(None) => {
+                    info!(
+                        cluster = name,
+                        attempts = attempt + 1,
+                        "CAPI Cluster finalized — provider destroy confirmed"
+                    );
+                    return Ok(());
+                }
+                Ok(Some(_)) => {
+                    if attempt % 6 == 0 {
+                        debug!(
+                            cluster = name,
+                            attempt = attempt + 1,
+                            "Waiting for CAPI Cluster to finalize (provider teardown in progress)..."
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    return Err(e).context(format!("Error polling CAPI Cluster {name} deletion"));
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "CAPI Cluster {name} still terminating after 5 minutes — provider destroy not \
+             confirmed; leaving instance in Recycling to retry rather than release over a \
+             possible cloud leak"
+        );
+    }
 }
 
 impl ClusterBackend for CapiBackend {
@@ -322,6 +370,13 @@ impl ClusterBackend for CapiBackend {
                 return Err(e).context(format!("Failed to delete CAPI Cluster {name}"));
             }
         }
+
+        // Confirm the provider actually finalized the Cluster (and reaped the
+        // backing cloud infra) before we release the handle (#178). Without this,
+        // delete() returns Ok the instant the apiserver accepts the DELETE — a
+        // fire-and-forget that frees the lease while cloud resources may still be
+        // live, with nothing left to retry or detect.
+        self.wait_cluster_deleted(name, namespace).await?;
 
         // Also delete the infrastructure resource in case cascade didn't clean it up.
         let infra_ar = Self::infra_api_resource(&self.capi_config);
@@ -756,6 +811,21 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Confirmed-destroy poll (#178): delete() must GET the Cluster until it
+        // is gone before returning. 404 = finalized; expect(1..) proves the poll
+        // runs rather than fire-and-forget.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/cluster.x-k8s.io/v1beta1/namespaces/test-ns/clusters/my-vc",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("clusters", "my-vc")),
+            )
+            .expect(1..)
+            .mount(&server)
+            .await;
+
         let result = backend.delete("my-vc", "test-ns").await;
         assert!(result.is_ok(), "delete should succeed: {result:?}");
     }
@@ -800,6 +870,19 @@ mod tests {
                     .set_body_json(crate::testutil::k8s_not_found("secrets", "gone-kubeconfig")),
             )
             .expect(1)
+            .mount(&server)
+            .await;
+
+        // Confirmed-destroy poll on an already-gone Cluster (#178): GET 404.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/cluster.x-k8s.io/v1beta1/namespaces/test-ns/clusters/gone",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("clusters", "gone")),
+            )
+            .expect(1..)
             .mount(&server)
             .await;
 
