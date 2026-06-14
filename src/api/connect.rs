@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use kube::{Client, ResourceExt};
 use rand::Rng;
 use reqwest::{Certificate, Identity};
@@ -476,6 +476,29 @@ pub(crate) async fn validate_lease_connect_token(
         )),
         Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
         Err(e) => Err(e).with_context(|| format!("Failed to read connect token {name}")),
+    }
+}
+
+/// Explicitly delete the lease's connect-token Secret.
+///
+/// Called from the lease controller at release/expiry so the token is gone
+/// immediately, instead of lingering until owner-ref GC reaps it when the lease
+/// CRD is finally deleted at the end of recycling (#178). `validate_lease_connect_token`
+/// returns `false` on a 404, so deleting the Secret denies any non-cached
+/// request at once; combined with the proxy's per-request phase/expiry re-check
+/// (#116), access is cut as soon as the lease leaves `Bound`. Idempotent: a 404
+/// (token never minted, or already gone) is success.
+pub(crate) async fn delete_lease_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease_id: &str,
+) -> Result<()> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let name = connect_secret_name(lease_id);
+    match secrets.delete(&name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Failed to delete connect token {name}")),
     }
 }
 

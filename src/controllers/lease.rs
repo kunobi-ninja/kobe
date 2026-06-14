@@ -482,6 +482,18 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
             remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
+            // Explicitly delete the lease's connect-token Secret now, rather
+            // than waiting for owner-ref GC when the lease CRD is deleted at the
+            // end of Recycling (#178). Closes the window where a released lease's
+            // token still validates if the CRD delete is interrupted; access is
+            // also bounded per-request by the proxy phase/expiry re-check (#116).
+            // Best-effort: a failure must not abort recycling.
+            if let Err(e) =
+                crate::api::connect::delete_lease_connect_token(&ctx.client, &ns, &name).await
+            {
+                warn!(lease = %name, "best-effort connect-token delete failed (continuing): {e:#}");
+            }
+
             // Capture diagnostics BEFORE flipping to Recycling: the cluster is
             // still alive (we mark the instance recycling only after the patch
             // below), and recording the URL in the SAME patch that advances the
@@ -1520,6 +1532,21 @@ mod tests {
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(make_test_profile()))
+            .mount(&server)
+            .await;
+
+        // The connect-token Secret must be explicitly deleted at release (#178),
+        // not left to owner-ref GC. expect(1) verifies the controller issues it.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/released-1-connect-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "released-1-connect-token", "namespace": "test-ns" }
+            })))
+            .expect(1)
             .mount(&server)
             .await;
 
