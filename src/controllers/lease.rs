@@ -14,7 +14,7 @@ use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
     ClusterInstance, ClusterInstancePhase, ClusterLease, ClusterLeaseStatus, ClusterPool,
-    LeasePhase,
+    ClusterPoolPhase, ClusterPoolStatus, LeasePhase,
 };
 use crate::diagnostics;
 use crate::pool::{PoolState, parse_duration};
@@ -241,6 +241,8 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             diagnostics_url: status.diagnostics_url.clone(),
             extensions_count: status.extensions_count,
             max_extensions: status.max_extensions,
+            // Now bound: clear any stale "no Ready cluster" exhaustion message.
+            message: None,
         };
 
         leases_api
@@ -363,6 +365,8 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     diagnostics_url: None,
                     extensions_count: 0,
                     max_extensions,
+                    // Bound now: clear any prior "no Ready cluster" message.
+                    message: None,
                 };
 
                 let patch = serde_json::json!({ "status": new_status });
@@ -404,12 +408,47 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     }
                 }
             } else {
+                // No Ready cluster to bind. Populate status.message with the
+                // pool's health so a client can tell "warming up" from "this
+                // pool will never satisfy me" — a fixed-size pool has no queue
+                // timeout, so an exhausted pool otherwise leaves the lease hung
+                // in Pending with no explanation (#189). Read the pool status
+                // (best-effort; a missing pool yields a generic message).
+                let pool_status = get_profile(&ctx.client, &lease.spec.pool_ref, &ns)
+                    .await
+                    .and_then(|p| p.status);
+                let (message, reason) = unsatisfiable_status(&lease.spec.pool_ref, &pool_status);
+
+                // Only count genuinely-unsatisfiable demand. A healthy-but-warming
+                // pool (reason=Warming) is a normal cold-start, not an exhaustion
+                // event — counting it on every ~5s requeue tick would swamp the
+                // alert signal with normal warm-ups (#189 review).
+                if reason != crate::metrics::LeaseUnsatisfiableReason::Warming {
+                    crate::metrics::LEASE_UNSATISFIABLE_TOTAL
+                        .with_label_values(&[lease.spec.pool_ref.as_str(), reason.as_str()])
+                        .inc();
+                }
+
                 info!(
                     lease = %name,
                     profile = %lease.spec.pool_ref,
                     priority = lease.spec.priority,
-                    "No ready cluster, lease queued at position {position}"
+                    reason = reason.as_str(),
+                    "No ready cluster, lease queued at position {position}: {message}"
                 );
+
+                // Best-effort: a failed message write must not block requeue —
+                // the lease is still validly Pending and will retry.
+                if let Err(e) = leases_api
+                    .patch_status(
+                        &name,
+                        &PatchParams::apply("kobe-operator"),
+                        &Patch::Merge(&serde_json::json!({ "status": { "message": message } })),
+                    )
+                    .await
+                {
+                    warn!(lease = %name, "Failed to write unsatisfiable status message (continuing): {e}");
+                }
 
                 Ok(Action::requeue(std::time::Duration::from_secs(5)))
             }
@@ -892,6 +931,58 @@ fn try_start_reconcile<'a, B: ClusterBackend>(
         active_reconciles: &ctx.active_reconciles,
         lease_name: lease_name.to_string(),
     }))
+}
+
+/// Build a human-readable lease `status.message` and classify the
+/// [`crate::metrics::LeaseUnsatisfiableReason`] from a pool's status, for the
+/// "no Ready cluster" case. Shared so the controller branch and the
+/// `create_lease` pre-flight (src/api/routes.rs) classify a pool identically.
+///
+/// The message echoes the pool fields an operator/client needs to decide
+/// whether to keep waiting: phase, consecutiveFailures, lastFailureReason.
+pub fn unsatisfiable_status(
+    pool_ref: &str,
+    pool_status: &Option<ClusterPoolStatus>,
+) -> (String, crate::metrics::LeaseUnsatisfiableReason) {
+    use crate::metrics::LeaseUnsatisfiableReason as R;
+
+    let Some(status) = pool_status else {
+        // No pool status (pool missing or never reconciled): treat as warming
+        // rather than asserting exhaustion we can't prove.
+        return (
+            format!("no Ready cluster; pool {pool_ref} has no status yet (warming up)"),
+            R::Warming,
+        );
+    };
+
+    let phase = status.phase;
+    let reason = match phase {
+        Some(ClusterPoolPhase::Failing) => R::PoolExhausted,
+        Some(ClusterPoolPhase::Backoff) => R::CapacityBlocked,
+        // Healthy/ScalingUp/Idle with no Ready cluster right now is a transient
+        // warm-up; anything else (e.g. ScalingDown) is treated as degraded.
+        Some(ClusterPoolPhase::Healthy)
+        | Some(ClusterPoolPhase::ScalingUp)
+        | Some(ClusterPoolPhase::Idle)
+        | None => R::Warming,
+        Some(ClusterPoolPhase::ScalingDown) => R::Degraded,
+    };
+
+    let phase_str = phase
+        .map(|p| format!("{p:?}"))
+        .unwrap_or_else(|| "Unknown".to_string());
+    let mut message = format!(
+        "no Ready cluster; pool {pool_ref} phase={phase_str}, consecutiveFailures={}",
+        status.consecutive_failures
+    );
+    if let Some(last) = status.last_failure_reason.as_deref() {
+        message.push_str(&format!(", lastFailureReason={last}"));
+    }
+    if let Some(next) = status.next_attempt_at.as_deref() {
+        message.push_str(&format!(", nextAttemptAt={next}"));
+    }
+
+    (message, reason)
 }
 
 async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<ClusterPool> {
@@ -1856,6 +1947,154 @@ mod tests {
         assert!(
             err.contains("Maximum extensions"),
             "Expected 'Maximum extensions' in error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // unsatisfiable_status: pool-health → message + reason classification (#189)
+    // -----------------------------------------------------------------------
+
+    fn pool_status(
+        phase: Option<ClusterPoolPhase>,
+        consecutive_failures: u32,
+        last_failure_reason: Option<&str>,
+    ) -> ClusterPoolStatus {
+        ClusterPoolStatus {
+            phase,
+            consecutive_failures,
+            last_failure_reason: last_failure_reason.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_status_classifies_failing_pool_as_exhausted() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let status = Some(pool_status(
+            Some(ClusterPoolPhase::Failing),
+            3,
+            Some("server StatefulSet not reaching Ready"),
+        ));
+        let (msg, reason) = unsatisfiable_status("p", &status);
+        assert_eq!(reason, R::PoolExhausted);
+        assert!(msg.contains("phase=Failing"), "got: {msg}");
+        assert!(msg.contains("consecutiveFailures=3"), "got: {msg}");
+        assert!(
+            msg.contains("lastFailureReason=server StatefulSet not reaching Ready"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_status_classifies_backoff_as_capacity_blocked() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let status = Some(pool_status(Some(ClusterPoolPhase::Backoff), 1, None));
+        let (_, reason) = unsatisfiable_status("p", &status);
+        assert_eq!(reason, R::CapacityBlocked);
+    }
+
+    #[test]
+    fn unsatisfiable_status_treats_healthy_and_missing_as_warming() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let healthy = Some(pool_status(Some(ClusterPoolPhase::Healthy), 0, None));
+        assert_eq!(unsatisfiable_status("p", &healthy).1, R::Warming);
+        // No status at all → warming (we won't assert exhaustion we can't prove).
+        let (msg, reason) = unsatisfiable_status("p", &None);
+        assert_eq!(reason, R::Warming);
+        assert!(msg.contains("warming up"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile_lease: Pending — no Ready cluster writes a status.message and
+    // bumps kobe_lease_unsatisfiable_total (#189).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_reconcile_pending_no_ready_writes_message_for_failing_pool() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = make_test_lease("unsat-1", "Pending");
+
+        // queue-position + message PATCHes both target this /status path.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/unsat-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "unsat-1", "namespace": "test-ns" },
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
+                           "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
+                "status": { "phase": "Pending", "queuePosition": 1 }
+            })))
+            .mount(&server)
+            .await;
+
+        // A Failing pool — the controller reads this to build the message.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "metadata": { "name": "test-profile", "namespace": "test-ns" },
+                "spec": { "size": 3, "ttl": "2h", "cluster": { "version": "v1.31.3+k3s1" } },
+                "status": {
+                    "phase": "Failing",
+                    "consecutiveFailures": 4,
+                    "lastFailureReason": "server StatefulSet not reaching Ready"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        // No Ready instances.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        let before = crate::metrics::LEASE_UNSATISFIABLE_TOTAL
+            .with_label_values(&["test-profile", "pool_exhausted"])
+            .get();
+
+        let action = reconcile_lease(lease, ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+
+        // The metric for the Failing-pool reason incremented.
+        let after = crate::metrics::LEASE_UNSATISFIABLE_TOTAL
+            .with_label_values(&["test-profile", "pool_exhausted"])
+            .get();
+        assert_eq!(after, before + 1, "unsatisfiable metric should increment");
+
+        // A status PATCH carrying a non-empty `message` was issued.
+        let requests = server.received_requests().await.unwrap();
+        let wrote_message = requests.iter().any(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path().ends_with("/clusterleases/unsat-1/status")
+                && serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|b| {
+                        b.get("status")
+                            .and_then(|s| s.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(|m| m.contains("phase=Failing") && !m.is_empty())
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(
+            wrote_message,
+            "expected a status PATCH writing a non-empty message containing the pool phase"
         );
     }
 }

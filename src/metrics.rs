@@ -773,6 +773,56 @@ pub static CONNECT_PROXY_REQUEST_OUTCOME_TOTAL: LazyLock<IntCounterVec> = LazyLo
     .unwrap()
 });
 
+/// Why a lease could not (yet) be satisfied — a bounded label vocabulary so a
+/// hung `Pending` lease becomes alertable without high-cardinality strings.
+/// Shared by the `create_lease` 503 pre-flight and the lease controller's
+/// no-Ready-cluster branch so both classify identically.
+///
+/// `#[allow(dead_code)]`: the full set is frozen up front so dashboards / alerts
+/// can reference every reason stably; not every variant is reachable from every
+/// emission site (e.g. `Warming` is the create-path "healthy-but-empty" case,
+/// which the controller branch never emits because it only runs once Pending).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseUnsatisfiableReason {
+    /// Pool phase is `Failing` — sustained provision failures; this pool will
+    /// not satisfy the lease without operator attention.
+    PoolExhausted,
+    /// Pool is in a backoff window (phase `Backoff`) with no schedulable
+    /// headroom — capacity is blocked behind the retry timer.
+    CapacityBlocked,
+    /// Pool is otherwise unhealthy / degraded (no Ready clusters and not a
+    /// clean warm-up case).
+    Degraded,
+    /// Healthy-but-empty warm pool: clusters are still coming up. Transient;
+    /// the lease should bind shortly. (Returned as 202, not 503.)
+    Warming,
+}
+
+impl LeaseUnsatisfiableReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolExhausted => "pool_exhausted",
+            Self::CapacityBlocked => "capacity_blocked",
+            Self::Degraded => "degraded",
+            Self::Warming => "warming",
+        }
+    }
+}
+
+/// A lease could not be satisfied at request time (503 pre-flight) or remained
+/// unbound in the controller's no-Ready-cluster branch, keyed by the bounded
+/// [`LeaseUnsatisfiableReason`]. Makes a pool that "can never satisfy a lease"
+/// visible instead of leaving the lease hung in `Pending` forever.
+pub static LEASE_UNSATISFIABLE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_lease_unsatisfiable_total",
+        "Leases that could not be satisfied, by profile and reason",
+        &["profile", "reason"]
+    )
+    .unwrap()
+});
+
 /// Successful authentications, by `provider` (AccessPolicy name) and `method`
 /// ("oidc" / "token" via kunobi-auth's `AuthObserver`, or "ssh").
 pub static AUTH_SUCCESS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1045,6 +1095,8 @@ pub fn init() {
     // Auth
     LazyLock::force(&AUTH_SUCCESS_TOTAL);
     LazyLock::force(&AUTH_FAILURE_TOTAL);
+    // Lease exhaustion (#189)
+    LazyLock::force(&LEASE_UNSATISFIABLE_TOTAL);
 }
 
 /// Encode all registered metrics in Prometheus text exposition format.
@@ -1297,6 +1349,20 @@ mod tests {
         assert_eq!(R::from_pod_name("etcd-0"), R::Datastore);
         assert_eq!(R::from_pod_name("postgres-primary-0"), R::Datastore);
         assert_eq!(R::from_pod_name("some-random-pod"), R::Other);
+    }
+
+    #[test]
+    fn lease_unsatisfiable_reason_as_str() {
+        assert_eq!(
+            LeaseUnsatisfiableReason::PoolExhausted.as_str(),
+            "pool_exhausted"
+        );
+        assert_eq!(
+            LeaseUnsatisfiableReason::CapacityBlocked.as_str(),
+            "capacity_blocked"
+        );
+        assert_eq!(LeaseUnsatisfiableReason::Degraded.as_str(), "degraded");
+        assert_eq!(LeaseUnsatisfiableReason::Warming.as_str(), "warming");
     }
 
     #[test]

@@ -281,6 +281,7 @@ async fn concurrency_limit(
                 Json(ErrorResponse {
                     error: "Server is under heavy load".to_string(),
                     detail: Some("Too many concurrent requests, please retry".to_string()),
+                    reason: None,
                 }),
             )
                 .into_response();
@@ -374,6 +375,11 @@ struct LeaseResponse {
     effective_ttl: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     alias: Option<String>,
+    /// Human-readable explanation of the lease's current state (#189), echoed
+    /// from `ClusterLeaseStatus.message` — primarily why a Pending lease has
+    /// not bound yet (pool health). Omitted when empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -449,11 +455,45 @@ struct ProfileResponse {
     policy: PoolPolicyResponse,
 }
 
-#[derive(Serialize)]
+/// Bounded, machine-readable reason for a lease-creation rejection (#189), so a
+/// client can branch on *why* without parsing the human `error` string. Only
+/// the lease pre-flight path sets it today; everything else leaves it None.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum ErrorReason {
+    /// Pool phase is `Failing` — it will not satisfy the lease without
+    /// operator attention.
+    PoolExhausted,
+    /// Pool is in a backoff window with no schedulable headroom.
+    CapacityBlocked,
+    /// Pool is otherwise degraded.
+    Degraded,
+    /// Healthy-but-empty warm pool: still coming up. (Carried on a 202, not a
+    /// 503 — the lease is expected to bind shortly.)
+    Warming,
+}
+
+impl From<crate::metrics::LeaseUnsatisfiableReason> for ErrorReason {
+    fn from(r: crate::metrics::LeaseUnsatisfiableReason) -> Self {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        match r {
+            R::PoolExhausted => Self::PoolExhausted,
+            R::CapacityBlocked => Self::CapacityBlocked,
+            R::Degraded => Self::Degraded,
+            R::Warming => Self::Warming,
+        }
+    }
+}
+
+#[derive(Serialize, Default)]
 struct ErrorResponse {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// Bounded machine-readable reason (#189). Omitted unless set by the lease
+    /// pre-flight path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<ErrorReason>,
 }
 
 fn pool_policy_response(profile: &ClusterPool) -> PoolPolicyResponse {
@@ -553,9 +593,98 @@ fn infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -
         Json(ErrorResponse {
             error: message.to_string(),
             detail: None,
+            reason: None,
         }),
     )
         .into_response()
+}
+
+/// Default `Retry-After` (seconds) for a lease pre-flight 503 when the pool's
+/// backoff `next_attempt_at` is absent or already in the past. A `Failing` pool
+/// needs operator attention, so this is a "don't hammer us" pace, not a promise
+/// the next retry will succeed.
+const LEASE_PREFLIGHT_DEFAULT_RETRY_AFTER_SECS: u64 = 30;
+
+/// #189 lease-create pre-flight. Returns `Some(503 response)` when the pool
+/// cannot satisfy a new lease right now — a `Failing` pool, or a `Backoff` pool
+/// with no schedulable headroom (zero Ready and already at its capacity bound).
+/// Returns `None` for a healthy-but-empty / warming pool so the caller proceeds
+/// to the normal 202 Pending path.
+///
+/// The 503 carries a `Retry-After` header (derived from the pool's backoff
+/// `next_attempt_at` when present, else a sane default) and a bounded
+/// machine-readable `reason`. Increments `kobe_lease_unsatisfiable_total`.
+fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Response> {
+    use crate::crd::ClusterPoolPhase;
+    use crate::metrics::LeaseUnsatisfiableReason as R;
+
+    let status = pool.status.clone();
+    let phase = status.as_ref().and_then(|s| s.phase);
+    let ready = status.as_ref().map(|s| s.ready).unwrap_or(0);
+
+    // Capacity bound: the most clusters this pool will ever run. Prefer the
+    // autoscaler ceiling; fall back to the fixed size.
+    let capacity = pool
+        .spec
+        .scaling
+        .as_ref()
+        .map(|s| s.max_clusters)
+        .unwrap_or(pool.spec.size)
+        .max(pool.spec.size);
+    let in_flight = status
+        .as_ref()
+        .map(|s| s.ready + s.leased + s.creating + s.recycling + s.unhealthy)
+        .unwrap_or(0);
+    let at_capacity = in_flight >= capacity;
+
+    let reject_reason = match phase {
+        // Sustained failures — won't bind without operator action.
+        Some(ClusterPoolPhase::Failing) => Some(R::PoolExhausted),
+        // In a backoff window AND no headroom to create or hand out a cluster.
+        Some(ClusterPoolPhase::Backoff) if ready == 0 && at_capacity => Some(R::CapacityBlocked),
+        // Healthy-but-empty, scaling up, idle, in-backoff-with-headroom, etc.:
+        // a transient warm-up — let the lease queue (202 Pending).
+        _ => None,
+    };
+
+    let reason = reject_reason?;
+
+    // Build the human message from the pool's health (shared classifier).
+    let (message, _) = crate::controllers::lease::unsatisfiable_status(profile, &status);
+
+    // Retry-After: seconds until the pool's next provision attempt, if known
+    // and in the future; otherwise a sane default.
+    let retry_after = status
+        .as_ref()
+        .and_then(|s| s.next_attempt_at.as_deref())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds())
+        .filter(|secs| *secs > 0)
+        .map(|secs| secs as u64)
+        .unwrap_or(LEASE_PREFLIGHT_DEFAULT_RETRY_AFTER_SECS);
+
+    metrics::LEASE_UNSATISFIABLE_TOTAL
+        .with_label_values(&[profile, reason.as_str()])
+        .inc();
+
+    warn!(
+        profile = %profile,
+        reason = reason.as_str(),
+        retry_after_secs = retry_after,
+        "Rejecting lease create: pool cannot satisfy it ({message})"
+    );
+
+    let body = Json(ErrorResponse {
+        error: "Pool cannot satisfy a new lease".to_string(),
+        detail: Some(message),
+        reason: Some(reason.into()),
+    });
+    let mut resp = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("retry-after"), value);
+    }
+    Some(resp)
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -758,6 +887,7 @@ async fn create_lease<B: ClusterBackend>(
                     "Profile name must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars)"
                         .to_string(),
                 ),
+                reason: None,
             }),
         )
             .into_response();
@@ -772,6 +902,7 @@ async fn create_lease<B: ClusterBackend>(
                     req.profile
                 ),
                 detail: None,
+                reason: None,
             }),
         )
             .into_response();
@@ -791,6 +922,7 @@ async fn create_lease<B: ClusterBackend>(
                     "Alias must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars)"
                         .to_string(),
                 ),
+                reason: None,
             }),
         )
             .into_response();
@@ -808,6 +940,7 @@ async fn create_lease<B: ClusterBackend>(
                         "Could not parse '{}'. Use format like '30m', '1h', '2h30m'",
                         ttl_str
                     )),
+                    reason: None,
                 }),
             )
                 .into_response();
@@ -827,6 +960,7 @@ async fn create_lease<B: ClusterBackend>(
                 detail: Some(format!(
                     "Requested TTL '{ttl_str}' resolves to a zero-length lease; request at least 1 second"
                 )),
+                reason: None,
             }),
         )
             .into_response();
@@ -854,6 +988,7 @@ async fn create_lease<B: ClusterBackend>(
                     policy.max_concurrent_leases
                 ),
                 detail: Some(format!("You have {} active leases", active_count)),
+                reason: None,
             }),
         )
             .into_response();
@@ -873,6 +1008,7 @@ async fn create_lease<B: ClusterBackend>(
                             "Lease '{}' already holds this alias; release it or extend that lease instead",
                             holders[0]
                         )),
+                        reason: None,
                     }),
                 )
                     .into_response();
@@ -885,6 +1021,22 @@ async fn create_lease<B: ClusterBackend>(
                     e,
                 );
             }
+        }
+    }
+
+    // #189 pre-flight: GET the target pool and refuse up-front when it cannot
+    // satisfy the lease, instead of creating a ClusterLease that hangs Pending
+    // forever (fixed-size pools have no queue_timeout). A `Failing` pool — or a
+    // `Backoff` pool with no schedulable headroom (zero Ready and at capacity) —
+    // returns 503 + Retry-After + a machine-readable `reason`; a healthy-but-
+    // empty warm pool keeps the 202 Pending below. A missing pool / read error
+    // is non-fatal here (the lease controller surfaces it), so we fall through.
+    {
+        let pools_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+        if let Ok(pool) = pools_api.get(&req.profile).await
+            && let Some(unavailable) = pool_preflight_rejection(&req.profile, &pool)
+        {
+            return unavailable;
         }
     }
 
@@ -930,6 +1082,7 @@ async fn create_lease<B: ClusterBackend>(
                     policy.max_concurrent_leases
                 ),
                 detail: Some("A concurrent request won the quota race; please retry".to_string()),
+                reason: None,
             }),
         )
             .into_response();
@@ -967,6 +1120,7 @@ async fn create_lease<B: ClusterBackend>(
             Json(ErrorResponse {
                 error: format!("Alias '{alias}' is already in use by an active lease"),
                 detail: Some("A concurrent request won the alias race; please retry".to_string()),
+                reason: None,
             }),
         )
             .into_response();
@@ -995,6 +1149,7 @@ async fn create_lease<B: ClusterBackend>(
         diagnostics_url: None,
         effective_ttl: None,
         alias: req.alias.clone(),
+        message: None,
     };
 
     if was_clamped {
@@ -1069,6 +1224,7 @@ async fn get_lease<B: ClusterBackend>(
                     Json(ErrorResponse {
                         error: "Lease not found".to_string(),
                         detail: None,
+                        reason: None,
                     }),
                 )
                     .into_response();
@@ -1125,6 +1281,7 @@ async fn get_lease<B: ClusterBackend>(
                                         "The request did not include a usable Host header"
                                             .to_string(),
                                     ),
+                                    reason: None,
                                 }),
                             )
                                 .into_response();
@@ -1151,6 +1308,8 @@ async fn get_lease<B: ClusterBackend>(
                     diagnostics_url: status.diagnostics_url,
                     effective_ttl: None,
                     alias,
+                    // #189: surface why a Pending lease isn't binding (pool health).
+                    message: status.message,
                 }),
             )
                 .into_response()
@@ -1160,6 +1319,7 @@ async fn get_lease<B: ClusterBackend>(
             Json(ErrorResponse {
                 error: "Lease not found".to_string(),
                 detail: None,
+                reason: None,
             }),
         )
             .into_response(),
@@ -1941,6 +2101,7 @@ async fn extend_lease<B: ClusterBackend>(
                     Json(ErrorResponse {
                         error: "Lease not found".to_string(),
                         detail: None,
+                        reason: None,
                     }),
                 )
                     .into_response();
@@ -1952,6 +2113,7 @@ async fn extend_lease<B: ClusterBackend>(
                 Json(ErrorResponse {
                     error: "Lease not found".to_string(),
                     detail: None,
+                    reason: None,
                 }),
             )
                 .into_response();
@@ -1982,6 +2144,7 @@ async fn extend_lease<B: ClusterBackend>(
             Json(ErrorResponse {
                 error: e.to_string(),
                 detail: None,
+                reason: None,
             }),
         )
             .into_response(),
@@ -2031,6 +2194,7 @@ async fn get_diagnostics<B: ClusterBackend>(
                     Json(ErrorResponse {
                         error: message.to_string(),
                         detail: None,
+                        reason: None,
                     }),
                 )
                     .into_response()
@@ -2091,6 +2255,7 @@ async fn get_pool<B: ClusterBackend>(
             Json(ErrorResponse {
                 error: "Profile not found".to_string(),
                 detail: None,
+                reason: None,
             }),
         )
             .into_response(),
@@ -3868,5 +4033,218 @@ mod tests {
         assert!(is_zero(&0));
         assert!(!is_zero(&1));
         assert!(!is_zero(&100));
+    }
+
+    // --- #189: create_lease pool pre-flight (503 vs 202) ---
+
+    /// Build a `(state, server)` pair for direct create_lease handler calls.
+    async fn preflight_state() -> (AppState<crate::testutil::MockBackend>, wiremock::MockServer) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = crate::testutil::MockBackend::new();
+        let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let state = AppState {
+            client,
+            backend,
+            namespace: "test-ns".to_string(),
+            authenticator,
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+        };
+        (state, server)
+    }
+
+    /// A pool JSON value with a given status block. `e2e-basic` matches the
+    /// `e2e-*` pool allow-list on `test_identity()`.
+    fn pool_with_status(name: &str, status: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "metadata": { "name": name, "namespace": "test-ns" },
+            "spec": { "size": 3, "ttl": "2h", "cluster": { "version": "v1.31.3+k3s1" } },
+            "status": status
+        })
+    }
+
+    #[tokio::test]
+    async fn test_create_lease_against_failing_pool_returns_503_with_retry_after_and_reason() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+
+        // count_active_leases: the requester has no active leases.
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        // The pool is Failing, with a known next_attempt_at so Retry-After is
+        // derived from it (~120s out).
+        let next = (chrono::Utc::now() + chrono::Duration::seconds(120)).to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-basic",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool_with_status(
+                "e2e-basic",
+                serde_json::json!({
+                    "phase": "Failing",
+                    "consecutiveFailures": 5,
+                    "lastFailureReason": "server StatefulSet not reaching Ready",
+                    "nextAttemptAt": next,
+                }),
+            )))
+            .mount(&server)
+            .await;
+
+        // No POST mock: a 503 pre-flight must NOT create a lease.
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: "e2e-basic".to_string(),
+                ttl: None,
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("Retry-After header present and numeric");
+        assert!(
+            (1..=120).contains(&retry_after),
+            "Retry-After should be derived from next_attempt_at, got {retry_after}"
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["reason"].as_str(), Some("pool_exhausted"));
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("phase=Failing"),
+            "detail should carry the pool health: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_lease_against_healthy_pool_returns_202() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (state, server) = preflight_state().await;
+
+        // Both the count and the post-create re-list see no active leases.
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        // Healthy pool with no Ready right now (warming) — must NOT 503.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/e2e-basic",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool_with_status(
+                "e2e-basic",
+                serde_json::json!({ "phase": "Healthy", "ready": 1 }),
+            )))
+            .mount(&server)
+            .await;
+
+        // The lease gets created (202 path).
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "lease-xxxxxxxxxxxx", "namespace": "test-ns" },
+                "spec": { "poolRef": "e2e-basic", "ttl": "1h",
+                           "requester": {"type": "github-actions:ci",
+                                          "identity": test_identity().identity}, "priority": 100 }
+            })))
+            .mount(&server)
+            .await;
+
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: "e2e-basic".to_string(),
+                ttl: None,
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "a healthy pool must keep the 202 Pending behavior"
+        );
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "202 must not carry a Retry-After header"
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["phase"].as_str(), Some("Pending"));
+    }
+
+    #[test]
+    fn pool_preflight_rejection_passes_through_healthy_and_missing_status() {
+        // No status → warming → no rejection (proceed to 202).
+        let pool: ClusterPool =
+            serde_json::from_value(pool_with_status("e2e-basic", serde_json::json!({}))).unwrap();
+        assert!(pool_preflight_rejection("e2e-basic", &pool).is_none());
+
+        // Healthy → no rejection.
+        let pool: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "Healthy" }),
+        ))
+        .unwrap();
+        assert!(pool_preflight_rejection("e2e-basic", &pool).is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_preflight_rejection_rejects_failing_pool() {
+        let pool: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "Failing", "consecutiveFailures": 3 }),
+        ))
+        .unwrap();
+        let resp =
+            pool_preflight_rejection("e2e-basic", &pool).expect("a Failing pool must be rejected");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Absent next_attempt_at → the default Retry-After.
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some(
+                LEASE_PREFLIGHT_DEFAULT_RETRY_AFTER_SECS
+                    .to_string()
+                    .as_str()
+            )
+        );
     }
 }

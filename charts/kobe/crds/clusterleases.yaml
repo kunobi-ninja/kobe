@@ -92,6 +92,19 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              message:
+                description: |-
+                  Human-readable explanation of the lease's current state, set when the
+                  reason is non-obvious — primarily why a `Pending` lease has not bound
+                  (e.g. "no Ready cluster; pool p phase=Failing, consecutiveFailures=3,
+                  lastFailureReason=..."). Lets a client distinguish "warming up" from
+                  "this pool will never satisfy me" without scraping pool status itself.
+
+                  skip_serializing_if: omit when None so a JSON-Merge-Patch (RFC 7396)
+                  pass-through preservation can't erase a previously-set message via an
+                  explicit null. (Full K8s `conditions` are a deliberate follow-up.)
+                nullable: true
+                type: string
               phase:
                 default: Pending
                 description: Current phase of the lease lifecycle.

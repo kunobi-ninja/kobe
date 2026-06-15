@@ -83,6 +83,18 @@ pub struct ClusterLeaseStatus {
     /// Maximum number of extensions allowed (from policy).
     #[serde(default)]
     pub max_extensions: u32,
+
+    /// Human-readable explanation of the lease's current state, set when the
+    /// reason is non-obvious — primarily why a `Pending` lease has not bound
+    /// (e.g. "no Ready cluster; pool p phase=Failing, consecutiveFailures=3,
+    /// lastFailureReason=..."). Lets a client distinguish "warming up" from
+    /// "this pool will never satisfy me" without scraping pool status itself.
+    ///
+    /// skip_serializing_if: omit when None so a JSON-Merge-Patch (RFC 7396)
+    /// pass-through preservation can't erase a previously-set message via an
+    /// explicit null. (Full K8s `conditions` are a deliberate follow-up.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Lease lifecycle phases.
