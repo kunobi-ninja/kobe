@@ -820,25 +820,40 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     }
 }
 
-/// For vkobe pools that didn't declare any readiness gates, inject
-/// a default `SchedulingProbe` so a cluster that responds at the
-/// apiserver but can't actually schedule workloads stays in
-/// `Creating` until the stuck-Creating timeout recycles it instead
-/// of silently passing as `Ready`.
+/// Inject a per-backend default readiness gate when a pool declares
+/// **none**, so a cluster that merely answers at the apiserver can't be
+/// leased while it's actually unusable:
 ///
-/// Triggered only when the user-supplied list is **empty**. Any
-/// non-empty list is treated as "user knows what they want" and
-/// passed through unchanged — including a list that contains its
-/// own explicit `SchedulingProbe` (e.g. with a non-default
-/// namespace), which we'd otherwise duplicate.
+/// - **vkobe** → `SchedulingProbe`. vkobe has no real kubelet, so a
+///   virtual cluster can report Healthy with zero schedulable nodes (the
+///   bug `ci-vkobe-flux` hid behind for 7 days on an internal cluster). Its DNS is
+///   host-projected, not a standard `kube-dns` Service, so the DNS gate
+///   below doesn't apply to it.
+/// - **k3s / k0s / vcluster** → `DNSHealthy`. These bundle CoreDNS fronted
+///   by the `kube-dns` Service; gate on DNS *actually serving* so a cluster
+///   whose CoreDNS crashloops on an in-cluster x509 mismatch (#42) —
+///   answering apiserver, dead DNS — is never leased.
+/// - **capi** → none. CAPI clusters are provider/distro-defined and
+///   `kube-dns` is not guaranteed; imposing a DNS gate could wedge a valid
+///   pool.
+///
+/// Triggered only when the user list is **empty**. Any non-empty list is
+/// "user knows what they want" and passes through unchanged — which is also
+/// the opt-out for a pool that deliberately disables CoreDNS: declare your
+/// own gate(s) and the default is skipped.
 fn apply_default_readiness_gates(
     backend_type: BackendType,
     gates: Vec<ReadinessGate>,
 ) -> Vec<ReadinessGate> {
-    if gates.is_empty() && backend_type == BackendType::Vkobe {
-        vec![ReadinessGate::SchedulingProbe { namespace: None }]
-    } else {
-        gates
+    if !gates.is_empty() {
+        return gates;
+    }
+    match backend_type {
+        BackendType::Vkobe => vec![ReadinessGate::SchedulingProbe { namespace: None }],
+        BackendType::K3s | BackendType::K0s | BackendType::Vcluster => {
+            vec![ReadinessGate::DnsHealthy { namespace: None }]
+        }
+        BackendType::Capi => gates,
     }
 }
 
@@ -2631,21 +2646,27 @@ mod tests {
         ));
     }
 
-    /// k3s/k0s/capi pools do **not** get the default — those backends
-    /// run real kubelets so a usable apiserver implies a usable
-    /// cluster (modulo whatever readiness gates the user separately
-    /// declares for their workloads). The probe is vkobe-specific
-    /// because vkobe's no-real-kubelet design is what makes the
-    /// silent-no-nodes failure mode possible.
+    /// Real-cluster backends (k3s/k0s/vcluster) with no user gates get a
+    /// default `DNSHealthy` — they bundle CoreDNS behind `kube-dns`, so a
+    /// dead-DNS-but-live-apiserver cluster (#42) must not be leased.
     #[test]
-    fn non_vkobe_backends_do_not_get_default_scheduling_probe() {
-        for backend in [BackendType::K3s, BackendType::K0s, BackendType::Capi] {
-            let gates = apply_default_readiness_gates(backend, vec![]);
+    fn real_cluster_backends_with_no_gates_get_default_dns_healthy() {
+        for backend in [BackendType::K3s, BackendType::K0s, BackendType::Vcluster] {
+            let gates = apply_default_readiness_gates(backend.clone(), vec![]);
+            assert_eq!(gates.len(), 1, "{backend:?} should get one default gate");
             assert!(
-                gates.is_empty(),
-                "non-vkobe backend should not gain a default gate"
+                matches!(gates[0], ReadinessGate::DnsHealthy { namespace: None }),
+                "{backend:?} default should be DNSHealthy"
             );
         }
+    }
+
+    /// CAPI clusters are provider-defined; `kube-dns` is not guaranteed, so
+    /// no default gate is imposed (one could wedge an otherwise-valid pool).
+    #[test]
+    fn capi_pool_with_no_gates_gets_no_default() {
+        let gates = apply_default_readiness_gates(BackendType::Capi, vec![]);
+        assert!(gates.is_empty(), "capi should not gain a default gate");
     }
 
     /// User explicitly declares any non-empty `readiness_gates` list
