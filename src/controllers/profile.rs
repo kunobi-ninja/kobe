@@ -643,7 +643,7 @@ async fn reconcile_profile(
     // (server AND agent). This silently wedged ci-k3s-kunobi (8c → 16/cluster).
     // Meter the effective CPU request and warn so it's visible before the
     // nodes saturate.
-    if let Some(res) = profile.spec.resources.as_ref() {
+    let effective_cpu_millicores = if let Some(res) = profile.spec.resources.as_ref() {
         let defaulted = res.limits_without_requests();
         if !defaulted.is_empty() {
             warn!(
@@ -655,10 +655,13 @@ async fn reconcile_profile(
                  over-reservation."
             );
         }
-        crate::metrics::POOL_EFFECTIVE_CPU_REQUEST_MILLICORES
-            .with_label_values(&[name.as_str()])
-            .set(res.effective_cpu_millicores().unwrap_or(0));
-    }
+        res.effective_cpu_millicores().unwrap_or(0)
+    } else {
+        0
+    };
+    crate::metrics::POOL_EFFECTIVE_CPU_REQUEST_MILLICORES
+        .with_label_values(&[name.as_str()])
+        .set(effective_cpu_millicores);
 
     let queue_depth = {
         let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);

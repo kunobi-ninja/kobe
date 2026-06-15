@@ -893,22 +893,163 @@ impl ResourceRequirements {
     }
 }
 
-/// Parse a Kubernetes CPU quantity into millicores: the milli suffix
-/// (`"250m"` → 250) and whole/fractional cores (`"8"` → 8000, `"2.5"` →
-/// 2500). Returns `None` for unparseable input.
+/// Parse a Kubernetes CPU quantity into millicores.
+///
+/// Covers Kubernetes `Quantity` suffix forms (`m`, decimal SI, binary SI,
+/// and decimal exponents) using integer math so valid but uncommon forms do
+/// not get reported as `0`. Values above the gauge range saturate at
+/// `i64::MAX`; unparseable or negative input returns `None`.
 #[allow(dead_code)]
 fn parse_cpu_millicores(s: &str) -> Option<i64> {
+    let (mantissa, fractional_digits, suffix) = split_quantity(s)?;
+    let value = match suffix {
+        QuantitySuffix::DecimalSi(cores_exponent) => {
+            let scale_exponent = cores_exponent.saturating_add(3);
+            scaled_decimal_to_millicores(mantissa, fractional_digits, scale_exponent)
+        }
+        QuantitySuffix::DecimalExponent(exponent) => {
+            let scale_exponent = exponent.saturating_add(3);
+            scaled_decimal_to_millicores(mantissa, fractional_digits, scale_exponent)
+        }
+        QuantitySuffix::BinarySi(power) => {
+            let factor = 1024u128.saturating_pow(power).saturating_mul(1000);
+            let numerator = mantissa.saturating_mul(factor);
+            ceil_div(numerator, pow10_u128(fractional_digits))
+        }
+    };
+    Some(value.min(i64::MAX as u128) as i64)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QuantitySuffix {
+    /// Decimal SI exponent in cores: `m` = -3, `k` = 3, `M` = 6, ...
+    DecimalSi(i32),
+    /// Decimal exponent in cores from `e`/`E` notation.
+    DecimalExponent(i32),
+    /// Binary SI power in cores: `Ki` = 1, `Mi` = 2, ...
+    BinarySi(u32),
+}
+
+fn split_quantity(s: &str) -> Option<(u128, u32, QuantitySuffix)> {
     let s = s.trim();
-    if let Some(milli) = s.strip_suffix('m') {
-        milli.trim().parse::<i64>().ok()
-    } else {
-        // Reject non-finite / negative so a bogus value yields no series
-        // rather than a lying gauge (e.g. "inf" → i64::MAX, "NaN" → 0).
-        s.parse::<f64>()
-            .ok()
-            .filter(|cores| cores.is_finite() && *cores >= 0.0)
-            .map(|cores| (cores * 1000.0).round() as i64)
+    let s = s.strip_prefix('+').unwrap_or(s);
+    if s.is_empty() || s.starts_with('-') {
+        return None;
     }
+
+    let bytes = s.as_bytes();
+    let mut idx = 0;
+    let mut mantissa = 0u128;
+    let mut fractional_digits = 0u32;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                mantissa = mantissa
+                    .saturating_mul(10)
+                    .saturating_add((bytes[idx] - b'0') as u128);
+                if seen_dot {
+                    fractional_digits = fractional_digits.checked_add(1)?;
+                }
+                idx += 1;
+            }
+            b'.' if !seen_dot => {
+                seen_dot = true;
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+
+    if !seen_digit {
+        return None;
+    }
+
+    let suffix = parse_quantity_suffix(&s[idx..])?;
+    Some((mantissa, fractional_digits, suffix))
+}
+
+fn parse_quantity_suffix(s: &str) -> Option<QuantitySuffix> {
+    match s {
+        "" => Some(QuantitySuffix::DecimalSi(0)),
+        "m" => Some(QuantitySuffix::DecimalSi(-3)),
+        "k" => Some(QuantitySuffix::DecimalSi(3)),
+        "M" => Some(QuantitySuffix::DecimalSi(6)),
+        "G" => Some(QuantitySuffix::DecimalSi(9)),
+        "T" => Some(QuantitySuffix::DecimalSi(12)),
+        "P" => Some(QuantitySuffix::DecimalSi(15)),
+        "E" => Some(QuantitySuffix::DecimalSi(18)),
+        "Ki" => Some(QuantitySuffix::BinarySi(1)),
+        "Mi" => Some(QuantitySuffix::BinarySi(2)),
+        "Gi" => Some(QuantitySuffix::BinarySi(3)),
+        "Ti" => Some(QuantitySuffix::BinarySi(4)),
+        "Pi" => Some(QuantitySuffix::BinarySi(5)),
+        "Ei" => Some(QuantitySuffix::BinarySi(6)),
+        _ if s.starts_with('e') || (s.starts_with('E') && s.len() > 1) => {
+            parse_decimal_exponent(&s[1..]).map(QuantitySuffix::DecimalExponent)
+        }
+        _ => None,
+    }
+}
+
+fn parse_decimal_exponent(s: &str) -> Option<i32> {
+    let (negative, digits) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s.strip_prefix('+').unwrap_or(s))
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let limit = if negative {
+        i32::MAX as i64 + 1
+    } else {
+        i32::MAX as i64
+    };
+    let mut value = 0i64;
+    for digit in digits.bytes().map(|b| (b - b'0') as i64) {
+        value = value.saturating_mul(10).saturating_add(digit);
+        if value >= limit {
+            return Some(if negative { i32::MIN } else { i32::MAX });
+        }
+    }
+
+    if negative {
+        Some(-(value as i32))
+    } else {
+        Some(value as i32)
+    }
+}
+
+fn scaled_decimal_to_millicores(
+    mantissa: u128,
+    fractional_digits: u32,
+    scale_exponent: i32,
+) -> u128 {
+    if scale_exponent >= 0 {
+        let numerator = mantissa.saturating_mul(pow10_u128(scale_exponent as u32));
+        ceil_div(numerator, pow10_u128(fractional_digits))
+    } else {
+        let denominator_exponent = fractional_digits.saturating_add(scale_exponent.unsigned_abs());
+        ceil_div(mantissa, pow10_u128(denominator_exponent))
+    }
+}
+
+fn pow10_u128(exp: u32) -> u128 {
+    10u128.saturating_pow(exp)
+}
+
+fn ceil_div(numerator: u128, denominator: u128) -> u128 {
+    if denominator == 0 {
+        return u128::MAX;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    quotient.saturating_add(u128::from(remainder != 0))
 }
 
 // --- Enhancement: Health Probes ---
@@ -1582,10 +1723,27 @@ mod tests {
         assert_eq!(parse_cpu_millicores("250m"), Some(250));
         assert_eq!(parse_cpu_millicores("2.5"), Some(2500));
         assert_eq!(parse_cpu_millicores("0.1"), Some(100));
+        assert_eq!(parse_cpu_millicores("+1"), Some(1000));
+        assert_eq!(parse_cpu_millicores(".5"), Some(500));
+        assert_eq!(parse_cpu_millicores("1k"), Some(1_000_000));
+        assert_eq!(parse_cpu_millicores("1M"), Some(1_000_000_000));
+        assert_eq!(parse_cpu_millicores("1Ki"), Some(1_024_000));
+        assert_eq!(parse_cpu_millicores("1e3"), Some(1_000_000));
+        assert_eq!(parse_cpu_millicores("1E+3"), Some(1_000_000));
+        assert_eq!(parse_cpu_millicores("1E-3"), Some(1));
+        // Kubernetes Quantity rounds sub-milli positive values up.
+        assert_eq!(parse_cpu_millicores("0.1m"), Some(1));
         assert_eq!(parse_cpu_millicores("garbage"), None);
+        assert_eq!(parse_cpu_millicores("1e"), None);
+        assert_eq!(parse_cpu_millicores("1KiB"), None);
         // Non-finite / negative must yield no series, not a lying value.
         assert_eq!(parse_cpu_millicores("inf"), None);
         assert_eq!(parse_cpu_millicores("NaN"), None);
         assert_eq!(parse_cpu_millicores("-1"), None);
+        // Valid but oversized quantities saturate instead of reporting 0.
+        assert_eq!(parse_cpu_millicores("100E"), Some(i64::MAX));
+        assert_eq!(parse_cpu_millicores("1e2147483647"), Some(i64::MAX));
+        assert_eq!(parse_cpu_millicores("1e999999999999"), Some(i64::MAX));
+        assert_eq!(parse_cpu_millicores("1e-999999999999"), Some(1));
     }
 }
