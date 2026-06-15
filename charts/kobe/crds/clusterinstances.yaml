@@ -577,6 +577,7 @@ spec:
                       - DaemonSetReady
                       - URLHealthy
                       - SchedulingProbe
+                      - DNSHealthy
                       type: string
                     url:
                       type: string

@@ -10,8 +10,8 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{
-    NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, Secret,
+    Endpoints, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, Secret,
     VolumeResourceRequirements, WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -611,6 +611,30 @@ pub async fn check_readiness_gate_impl(
         }
         ReadinessGate::SchedulingProbe { namespace } => {
             check_scheduling_probe(vc_client, namespace.as_deref(), instance_name).await
+        }
+        ReadinessGate::DnsHealthy { namespace } => {
+            // CoreDNS is fronted by the `kube-dns` Service; if CoreDNS is
+            // crashlooping (e.g. x509 mismatch against the in-cluster apiserver,
+            // #42) its pods never go Ready, so the Service has zero serving
+            // endpoints and DNS does not resolve — even though the apiserver
+            // answers. Checking endpoints is a stronger "DNS works" signal than
+            // CoreDNS pod-readiness alone. `not_ready_addresses` are excluded.
+            let ns = namespace.as_deref().unwrap_or(PROBE_NAMESPACE_DEFAULT);
+            let endpoints: Api<Endpoints> = Api::namespaced(vc_client.clone(), ns);
+            match endpoints.get("kube-dns").await {
+                Ok(ep) => {
+                    let ready: usize = ep
+                        .subsets
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|s| s.addresses.as_ref())
+                        .map(|a| a.len())
+                        .sum();
+                    Ok(ready > 0)
+                }
+                Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
+                Err(e) => Err(e.into()),
+            }
         }
     }
 }
@@ -1221,6 +1245,62 @@ current-context: default
                 .contains("flux-system")
         );
         assert!(addons[0].url.is_none());
+    }
+
+    #[tokio::test]
+    async fn dns_healthy_gate_true_when_kube_dns_has_ready_endpoints() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kube-system/endpoints/kube-dns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": { "name": "kube-dns", "namespace": "kube-system" },
+                "subsets": [ { "addresses": [ { "ip": "10.0.0.10" } ] } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::DnsHealthy { namespace: None };
+        let ok = check_readiness_gate_impl(&client, &gate, "inst")
+            .await
+            .unwrap();
+        assert!(
+            ok,
+            "kube-dns with a ready endpoint should satisfy DnsHealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_healthy_gate_false_when_kube_dns_has_no_ready_endpoints() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        // CoreDNS crashlooping (#42): the Service exists but its endpoints are
+        // all not-ready → DNS does not actually resolve.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kube-system/endpoints/kube-dns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": { "name": "kube-dns", "namespace": "kube-system" },
+                "subsets": [ { "notReadyAddresses": [ { "ip": "10.0.0.10" } ] } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::DnsHealthy { namespace: None };
+        let ok = check_readiness_gate_impl(&client, &gate, "inst")
+            .await
+            .unwrap();
+        assert!(
+            !ok,
+            "kube-dns with no ready endpoints (CoreDNS crashloop) must fail DnsHealthy"
+        );
     }
 
     #[tokio::test]

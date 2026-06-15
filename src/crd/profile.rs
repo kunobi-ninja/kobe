@@ -896,6 +896,19 @@ pub enum ReadinessGate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
     },
+
+    /// CoreDNS health: the in-cluster `kube-dns` Service has at least one
+    /// ready endpoint — i.e. DNS actually resolves, not just that CoreDNS
+    /// pods exist. Catches the silent bad-but-Ready class where CoreDNS
+    /// crashloops against the in-cluster apiserver on an x509 cert mismatch
+    /// (#42): its pods never become Ready, so the Service has zero serving
+    /// endpoints, even though the apiserver itself answers. `namespace`
+    /// defaults to `kube-system` (where `kube-dns` lives on every kube distro).
+    #[serde(rename = "DNSHealthy")]
+    DnsHealthy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
 }
 
 // Manual JsonSchema impl — Kubernetes CRD structural schemas require that
@@ -918,7 +931,8 @@ impl JsonSchema for ReadinessGate {
                         "DeploymentReady",
                         "DaemonSetReady",
                         "URLHealthy",
-                        "SchedulingProbe"
+                        "SchedulingProbe",
+                        "DNSHealthy"
                     ]
                 },
                 "name": { "type": "string" },
