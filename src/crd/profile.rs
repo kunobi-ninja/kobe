@@ -809,11 +809,60 @@ pub struct ResourceRequirements {
 }
 
 impl ResourceRequirements {
+    /// Resource keys that carry a `limit` but no explicit `request`.
+    ///
+    /// Kubernetes silently copies each such limit into the request, so a
+    /// pool that sets `limits: {cpu: "8"}` with empty `requests` reserves a
+    /// full 8 cores *per pod* — invisibly. The `ci-k3s-kunobi` capacity
+    /// wedge (issue #189) was exactly this: 8-core limits with no requests
+    /// reserved 16 cores/cluster and silently saturated the nodes. Callers
+    /// surface these keys (warn + meter) so the hidden reservation is
+    /// visible before it wedges the cluster.
+    #[allow(dead_code)]
+    pub fn limits_without_requests(&self) -> Vec<String> {
+        self.limits
+            .keys()
+            .filter(|k| !self.requests.contains_key(*k))
+            .cloned()
+            .collect()
+    }
+
+    /// Effective resource requests as Kubernetes will actually apply them:
+    /// every explicit request, plus each `limit` whose key is absent from
+    /// `requests` (mirroring the kubelet's limit→request default). Makes the
+    /// otherwise-implicit reservation auditable instead of relying on silent
+    /// kube behavior.
+    #[allow(dead_code)]
+    pub fn effective_requests(&self) -> BTreeMap<String, String> {
+        let mut effective = self.requests.clone();
+        for (key, limit) in &self.limits {
+            effective
+                .entry(key.clone())
+                .or_insert_with(|| limit.clone());
+        }
+        effective
+    }
+
+    /// Effective CPU request in millicores — the value Kubernetes reserves
+    /// per pod — or `None` when neither a CPU request nor limit is set.
+    /// Drives `kobe_pool_effective_cpu_request_millicores`.
+    #[allow(dead_code)]
+    pub fn effective_cpu_millicores(&self) -> Option<i64> {
+        self.effective_requests()
+            .get("cpu")
+            .and_then(|v| parse_cpu_millicores(v))
+    }
+
     /// Convert to the `k8s_openapi` shape expected by Container specs.
     ///
     /// `None` is returned when both maps are empty — that lets the
     /// caller use `..Default::default()` semantics (no `resources:` field
     /// emitted) instead of producing `{limits: {}, requests: {}}`.
+    ///
+    /// `requests` is populated from [`Self::effective_requests`] so the
+    /// kubelet's implicit limit→request copy becomes explicit: kobe owns
+    /// the reserved value and it is auditable in the rendered pod spec
+    /// rather than materializing silently inside the cluster (issue #189).
     // `#[allow(dead_code)]` keeps the `crdgen` binary happy: it imports
     // this module purely to walk the JSON schema and never invokes
     // runtime-only methods (same reason `allocated_network` carries the
@@ -838,9 +887,27 @@ impl ResourceRequirements {
         };
         Some(k8s_openapi::api::core::v1::ResourceRequirements {
             limits: to_map(&self.limits),
-            requests: to_map(&self.requests),
+            requests: to_map(&self.effective_requests()),
             ..Default::default()
         })
+    }
+}
+
+/// Parse a Kubernetes CPU quantity into millicores: the milli suffix
+/// (`"250m"` → 250) and whole/fractional cores (`"8"` → 8000, `"2.5"` →
+/// 2500). Returns `None` for unparseable input.
+#[allow(dead_code)]
+fn parse_cpu_millicores(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Some(milli) = s.strip_suffix('m') {
+        milli.trim().parse::<i64>().ok()
+    } else {
+        // Reject non-finite / negative so a bogus value yields no series
+        // rather than a lying gauge (e.g. "inf" → i64::MAX, "NaN" → 0).
+        s.parse::<f64>()
+            .ok()
+            .filter(|cores| cores.is_finite() && *cores >= 0.0)
+            .map(|cores| (cores * 1000.0).round() as i64)
     }
 }
 
@@ -1432,5 +1499,93 @@ mod tests {
         assert!(m.server);
         assert!(!m.agents);
         assert_eq!(m.host_path_root, "/data/kobe/leases");
+    }
+
+    // --- ResourceRequirements: limit→request guardrail (issue #189) ---
+
+    fn res(limits: &[(&str, &str)], requests: &[(&str, &str)]) -> ResourceRequirements {
+        let m = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        ResourceRequirements {
+            limits: m(limits),
+            requests: m(requests),
+        }
+    }
+
+    #[test]
+    fn to_k8s_makes_limit_without_request_explicit() {
+        // The ci-k3s-kunobi footgun: cpu/memory limits, empty requests.
+        // Kubernetes would silently copy the limit into the request; we make
+        // that explicit in the rendered spec so the reservation is auditable.
+        let r = res(&[("cpu", "8"), ("memory", "4Gi")], &[]);
+        let k = r.to_k8s().expect("non-empty resources must render");
+        let requests = k.requests.expect("requests populated from limits");
+        assert_eq!(requests.get("cpu").unwrap().0, "8");
+        assert_eq!(requests.get("memory").unwrap().0, "4Gi");
+        assert_eq!(
+            r.limits_without_requests(),
+            vec!["cpu".to_string(), "memory".to_string()]
+        );
+    }
+
+    #[test]
+    fn to_k8s_preserves_explicit_request_over_limit() {
+        // An explicit (smaller) request must win — defaulting only fills
+        // keys that are absent from requests.
+        let r = res(&[("cpu", "8")], &[("cpu", "250m")]);
+        let requests = r.to_k8s().unwrap().requests.unwrap();
+        assert_eq!(requests.get("cpu").unwrap().0, "250m");
+        assert!(r.limits_without_requests().is_empty());
+    }
+
+    #[test]
+    fn to_k8s_none_when_both_empty() {
+        let r = res(&[], &[]);
+        assert!(r.to_k8s().is_none());
+        assert!(r.limits_without_requests().is_empty());
+        assert!(r.effective_cpu_millicores().is_none());
+    }
+
+    #[test]
+    fn effective_cpu_millicores_parses_cores_and_milli() {
+        assert_eq!(
+            res(&[("cpu", "8")], &[]).effective_cpu_millicores(),
+            Some(8000)
+        );
+        assert_eq!(
+            res(&[], &[("cpu", "250m")]).effective_cpu_millicores(),
+            Some(250)
+        );
+        assert_eq!(
+            res(&[("cpu", "2.5")], &[]).effective_cpu_millicores(),
+            Some(2500)
+        );
+        // An explicit request still wins for the metered value.
+        assert_eq!(
+            res(&[("cpu", "8")], &[("cpu", "500m")]).effective_cpu_millicores(),
+            Some(500)
+        );
+        // No CPU key anywhere → nothing to meter.
+        assert_eq!(
+            res(&[("memory", "1Gi")], &[]).effective_cpu_millicores(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_cpu_millicores_handles_formats() {
+        assert_eq!(parse_cpu_millicores("8"), Some(8000));
+        assert_eq!(parse_cpu_millicores("250m"), Some(250));
+        assert_eq!(parse_cpu_millicores("2.5"), Some(2500));
+        assert_eq!(parse_cpu_millicores("0.1"), Some(100));
+        assert_eq!(parse_cpu_millicores("garbage"), None);
+        // Non-finite / negative must yield no series, not a lying value.
+        assert_eq!(parse_cpu_millicores("inf"), None);
+        assert_eq!(parse_cpu_millicores("NaN"), None);
+        assert_eq!(parse_cpu_millicores("-1"), None);
     }
 }

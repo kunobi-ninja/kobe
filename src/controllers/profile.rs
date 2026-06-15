@@ -633,6 +633,29 @@ async fn reconcile_profile(
     pool_size_set("unhealthy", counts.unhealthy);
     pool_size_set("recycling", counts.recycling);
 
+    // Surface hidden CPU over-reservation (issue #189): a pool that sets
+    // `resources.limits` with empty `requests` makes the kubelet copy each
+    // limit into the request, reserving the full limit on every guest pod
+    // (server AND agent). This silently wedged ci-k3s-kunobi (8c → 16/cluster).
+    // Meter the effective CPU request and warn so it's visible before the
+    // nodes saturate.
+    if let Some(res) = profile.spec.resources.as_ref() {
+        let defaulted = res.limits_without_requests();
+        if !defaulted.is_empty() {
+            warn!(
+                profile = %name,
+                keys = ?defaulted,
+                "ClusterPool sets resource limits without explicit requests; \
+                 Kubernetes reserves the full limit as the request on every guest \
+                 pod (server + agent). Set spec.resources.requests to avoid silent \
+                 over-reservation."
+            );
+        }
+        crate::metrics::POOL_EFFECTIVE_CPU_REQUEST_MILLICORES
+            .with_label_values(&[name.as_str()])
+            .set(res.effective_cpu_millicores().unwrap_or(0));
+    }
+
     let queue_depth = {
         let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
         let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={name}"));
