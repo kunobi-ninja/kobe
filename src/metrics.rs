@@ -533,6 +533,13 @@ pub enum StuckCreatingReason {
     /// Spec drifted while the instance was mid-`Creating` (stamped hash no
     /// longer matches the pool's current hash).
     Drift,
+    /// The guest server/agent Pods can't be scheduled (Pending +
+    /// `PodScheduled=False, reason=Unschedulable`, e.g. "Insufficient cpu").
+    /// This is NOT a recycle reason — it labels the *backpressure* path where
+    /// the instance is deliberately held (next_attempt_at extended) instead of
+    /// being Deleted, because respawning would only create more unschedulable
+    /// Pods.
+    Unschedulable,
 }
 
 impl StuckCreatingReason {
@@ -540,6 +547,7 @@ impl StuckCreatingReason {
         match self {
             Self::Timeout => "timeout",
             Self::Drift => "drift",
+            Self::Unschedulable => "unschedulable",
         }
     }
 }
@@ -732,6 +740,23 @@ pub static GUEST_POD_OOM_KILLS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
         "kobe_guest_pod_oom_kills_total",
         "Guest-cluster pod OOMKilled events by pod role",
         &["profile", "backend", "pod_role"]
+    )
+    .unwrap()
+});
+
+/// Guest-cluster server/agent Pods the host scheduler could not place
+/// (Pending + `PodScheduled=False, reason=Unschedulable`, e.g. "Insufficient
+/// cpu"). Incremented by the instance controller's `Creating` arm when its
+/// scheduling-block detector fires, so a wedged pool surfaces as backpressure
+/// instead of being silently churned by the creating-timeout recycle. Keyed by
+/// the bounded [`GuestPodRole`] (and a `reason` label distinguishing the
+/// condition-derived `Unschedulable` from an Event-derived `FailedScheduling`)
+/// so cardinality stays a small, fixed product per pool.
+pub static GUEST_POD_UNSCHEDULABLE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_guest_pod_unschedulable_total",
+        "Guest-cluster server/agent Pods the host scheduler could not place, by pod role and reason",
+        &["profile", "backend", "pod_role", "reason"]
     )
     .unwrap()
 });
@@ -1015,6 +1040,7 @@ pub fn init() {
     LazyLock::force(&BACKEND_DELETE_FAILURES_TOTAL);
     LazyLock::force(&INSTANCE_STUCK_CREATING_TOTAL);
     LazyLock::force(&GUEST_POD_OOM_KILLS_TOTAL);
+    LazyLock::force(&GUEST_POD_UNSCHEDULABLE_TOTAL);
     LazyLock::force(&CONNECT_PROXY_REQUEST_OUTCOME_TOTAL);
     // Auth
     LazyLock::force(&AUTH_SUCCESS_TOTAL);
@@ -1231,6 +1257,22 @@ mod tests {
     fn stuck_creating_reason_as_str() {
         assert_eq!(StuckCreatingReason::Timeout.as_str(), "timeout");
         assert_eq!(StuckCreatingReason::Drift.as_str(), "drift");
+        assert_eq!(StuckCreatingReason::Unschedulable.as_str(), "unschedulable");
+    }
+
+    /// The Unschedulable counter must be registerable with its full 4-label
+    /// set so an emission at the call site never panics on a label mismatch.
+    #[test]
+    fn guest_pod_unschedulable_total_accepts_labels() {
+        init();
+        GUEST_POD_UNSCHEDULABLE_TOTAL
+            .with_label_values(&["_test", "k3s", "server", "Unschedulable"])
+            .inc();
+        let output = gather();
+        assert!(
+            output.contains("kobe_guest_pod_unschedulable_total"),
+            "unschedulable counter must appear after an observation"
+        );
     }
 
     #[test]

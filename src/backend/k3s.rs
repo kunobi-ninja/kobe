@@ -15,10 +15,10 @@
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, ConfigMap, Container, EnvVar, EnvVarSource, HostPathVolumeSource, KeyToPath,
-    ObjectFieldSelector, PersistentVolumeClaim, Pod, PodAffinity, PodAffinityTerm, PodSpec,
-    PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec, Toleration,
-    Volume, VolumeMount,
+    Affinity, ConfigMap, Container, EnvVar, EnvVarSource, Event as K8sEvent, HostPathVolumeSource,
+    KeyToPath, ObjectFieldSelector, PersistentVolumeClaim, Pod, PodAffinity, PodAffinityTerm,
+    PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec,
+    Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -33,9 +33,9 @@ use crate::crd::{
 };
 
 use super::{
-    ClusterBackend, apply_addon_impl, check_readiness_gate_impl, check_virtual_health,
-    data_volume_claim_template, datastore, node_affinity_from_selector, read_kubeconfig_secret,
-    server_anti_affinity_terms, virtual_client_from_kubeconfig,
+    ClusterBackend, SchedulingBlocked, apply_addon_impl, check_readiness_gate_impl,
+    check_virtual_health, data_volume_claim_template, datastore, node_affinity_from_selector,
+    read_kubeconfig_secret, server_anti_affinity_terms, virtual_client_from_kubeconfig,
 };
 
 /// Labels applied to all resources managed by this backend.
@@ -162,6 +162,85 @@ fn server_sts_ready(replicas: Option<i32>, ready_replicas: Option<i32>) -> bool 
     let want = replicas.unwrap_or(0);
     let have = ready_replicas.unwrap_or(0);
     want > 0 && have >= want
+}
+
+/// Pure classifier: is THIS pod blocked on scheduling?
+///
+/// A Pod is scheduling-blocked iff it is `Pending` AND carries a
+/// `PodScheduled` condition with `status=False` and `reason=Unschedulable`
+/// (the exact shape the kube-scheduler writes when no node can host the pod,
+/// e.g. "0/3 nodes are available: 3 Insufficient cpu"). Returns the
+/// `(reason, message)` pair from that condition when blocked, else `None`.
+///
+/// A `Running`/`Succeeded` pod, a `Pending` pod that HAS scheduled (image
+/// pulling, init containers), or a pod with no `PodScheduled=False` condition
+/// is NOT a scheduling block — those are normal bring-up states the existing
+/// readiness/timeout logic already handles. Extracted pure so it is
+/// unit-testable without a live apiserver.
+fn pod_scheduling_blocked(pod: &Pod) -> Option<(String, String)> {
+    let status = pod.status.as_ref()?;
+    // Only Pending pods can be unschedulable; a scheduled pod has moved on.
+    if status.phase.as_deref() != Some("Pending") {
+        return None;
+    }
+    let conditions = status.conditions.as_ref()?;
+    conditions.iter().find_map(|c| {
+        if c.type_ == "PodScheduled"
+            && c.status == "False"
+            && c.reason.as_deref() == Some("Unschedulable")
+        {
+            Some((
+                c.reason
+                    .clone()
+                    .unwrap_or_else(|| "Unschedulable".to_string()),
+                c.message.clone().unwrap_or_default(),
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// A `Pending` pod that has NOT been bound to a node yet (`spec.nodeName`
+/// unset). Gates the `FailedScheduling`-event fallback: a pod that HAS been
+/// scheduled (nodeName set) but is still `Pending` because it is pulling an
+/// image or running init containers must not be treated as scheduling-blocked
+/// off a stale, since-resolved `FailedScheduling` event from an earlier
+/// placement attempt (#189 review). Extracted pure for unit tests.
+fn pod_pending_unscheduled(pod: &Pod) -> bool {
+    pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Pending")
+        && pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .is_none()
+}
+
+/// Pure classifier: the latest `FailedScheduling` Event for `pod_name`, if any.
+///
+/// The scheduler emits a `FailedScheduling` Event (reason=`FailedScheduling`)
+/// with a message like "0/3 nodes are available: 3 Insufficient cpu" on every
+/// failed placement attempt. This is the corroborating / fallback signal when
+/// the `PodScheduled` condition itself isn't (yet) populated. We pick the
+/// event with the latest timestamp so the message reflects the most recent
+/// attempt. Returns `(reason, message)` when found. Extracted pure for tests.
+fn latest_failed_scheduling_event(events: &[K8sEvent], pod_name: &str) -> Option<(String, String)> {
+    events
+        .iter()
+        .filter(|e| e.reason.as_deref() == Some("FailedScheduling"))
+        .filter(|e| e.involved_object.name.as_deref() == Some(pod_name))
+        .max_by(|a, b| {
+            // Prefer last_timestamp, fall back to event_time; missing sorts first.
+            let ak = a.last_timestamp.as_ref().map(|t| t.0);
+            let bk = b.last_timestamp.as_ref().map(|t| t.0);
+            ak.cmp(&bk)
+        })
+        .map(|e| {
+            (
+                "FailedScheduling".to_string(),
+                e.message.clone().unwrap_or_default(),
+            )
+        })
 }
 
 /// HA gate: `servers > 1` requires an external (shared) datastore.
@@ -1208,6 +1287,101 @@ impl K3sBackend {
         );
     }
 
+    /// Read the cluster's guest server/agent Pods and classify whether the
+    /// instance is wedged purely on scheduling (Pending + `PodScheduled=False,
+    /// reason=Unschedulable`, e.g. "Insufficient cpu"), corroborated by the
+    /// latest `FailedScheduling` Event.
+    ///
+    /// Mirrors the pod/event-reading approach of k0s'
+    /// `summarize_server_pod`/`summarize_server_pod_events`, but returns a
+    /// typed [`SchedulingBlocked`] instead of a debug string so the caller can
+    /// act on it (backpressure, not blind recycle).
+    ///
+    /// Order: check the server StatefulSet Pods first (the hard bootstrap
+    /// dependency — pod-0 is the kubeconfig publisher), then the agent
+    /// Deployment Pods. We list by the backend's own labels
+    /// (`kobe.kunobi.ninja/cluster=<name>` + `role`) rather than guessing the
+    /// `-0` ordinal, so this works for HA (servers>1) and agent-replica fan-out
+    /// alike. A missing-pods / list-error case is treated as "not blocked"
+    /// (`Ok(None)`): we only want to engage backpressure on a *positive*
+    /// scheduling signal, never on a transient read blip.
+    async fn detect_scheduling_blocked_impl(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<SchedulingBlocked>> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let events: Api<K8sEvent> = Api::namespaced(self.client.clone(), namespace);
+
+        // server first (control-plane is the hard dependency), then agent.
+        for (role_label, pod_role) in [
+            ("server", crate::metrics::GuestPodRole::Server),
+            ("agent", crate::metrics::GuestPodRole::Agent),
+        ] {
+            let lp = ListParams::default().labels(&format!(
+                "kobe.kunobi.ninja/cluster={name},kobe.kunobi.ninja/role={role_label}"
+            ));
+            let pod_list = match pods.list(&lp).await {
+                Ok(list) => list,
+                // Read blip → "unknown", not "blocked": don't engage
+                // backpressure off a transient list failure.
+                Err(e) => {
+                    debug!(
+                        cluster = name,
+                        role = role_label,
+                        error = %e,
+                        "scheduling-block probe: pod list failed (treating as not-blocked)"
+                    );
+                    continue;
+                }
+            };
+
+            for pod in &pod_list.items {
+                let pod_name = pod.metadata.name.as_deref().unwrap_or_default();
+
+                // Primary signal: the PodScheduled=False/Unschedulable condition.
+                if let Some((reason, mut message)) = pod_scheduling_blocked(pod) {
+                    // Enrich with the latest FailedScheduling event message when
+                    // the condition's own message is empty.
+                    if message.is_empty()
+                        && let Ok(list) = events.list(&ListParams::default()).await
+                        && let Some((_, ev_msg)) =
+                            latest_failed_scheduling_event(&list.items, pod_name)
+                    {
+                        message = ev_msg;
+                    }
+                    return Ok(Some(SchedulingBlocked {
+                        reason,
+                        message,
+                        pod_role,
+                    }));
+                }
+
+                // Fallback signal: a Pending pod that has NOT been bound to a
+                // node yet, but a FailedScheduling event was already emitted
+                // (the PodScheduled condition can lag the first event). The
+                // `spec.nodeName`-unset gate is essential: a SCHEDULED pod that
+                // is still Pending because it is pulling an image / running init
+                // containers must not be flagged off a stale, since-resolved
+                // FailedScheduling event from an earlier placement attempt
+                // (#189 review).
+                if pod_pending_unscheduled(pod)
+                    && let Ok(list) = events.list(&ListParams::default()).await
+                    && let Some((reason, message)) =
+                        latest_failed_scheduling_event(&list.items, pod_name)
+                {
+                    return Ok(Some(SchedulingBlocked {
+                        reason,
+                        message,
+                        pod_role,
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Delete a resource, ignoring 404 (already deleted).
     async fn delete_ignoring_not_found<K>(api: &Api<K>, name: &str) -> Result<()>
     where
@@ -1582,6 +1756,14 @@ impl ClusterBackend for K3sBackend {
         );
         let vc_client = self.virtual_client(name, namespace).await?;
         apply_addon_impl(&vc_client, addon).await
+    }
+
+    async fn detect_scheduling_blocked(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<SchedulingBlocked>> {
+        self.detect_scheduling_blocked_impl(name, namespace).await
     }
 }
 
@@ -4099,5 +4281,296 @@ mod tests {
             sel.get("kobe.kunobi.ninja/role").map(String::as_str),
             Some("server")
         );
+    }
+
+    // =================================================================
+    // #189 — guest-Pod Unschedulable detection
+    // =================================================================
+
+    /// Build a server Pod with the given phase and an optional
+    /// `PodScheduled` condition (status, reason, message).
+    fn pod_with_scheduling(name: &str, phase: &str, scheduled: Option<(&str, &str, &str)>) -> Pod {
+        let conditions = scheduled.map(|(status, reason, message)| {
+            vec![serde_json::json!({
+                "type": "PodScheduled",
+                "status": status,
+                "reason": reason,
+                "message": message,
+            })]
+        });
+        let value = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": name, "namespace": "test-ns" },
+            "spec": { "containers": [{ "name": "k3s", "image": "rancher/k3s:x" }] },
+            "status": {
+                "phase": phase,
+                "conditions": conditions,
+            }
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn pod_scheduling_blocked_flags_pending_unschedulable() {
+        let pod = pod_with_scheduling(
+            "pool-x-server-0",
+            "Pending",
+            Some((
+                "False",
+                "Unschedulable",
+                "0/3 nodes are available: 3 Insufficient cpu.",
+            )),
+        );
+        let got = pod_scheduling_blocked(&pod);
+        assert_eq!(
+            got,
+            Some((
+                "Unschedulable".to_string(),
+                "0/3 nodes are available: 3 Insufficient cpu.".to_string()
+            )),
+            "Pending + PodScheduled=False/Unschedulable must classify as blocked"
+        );
+    }
+
+    #[test]
+    fn pod_scheduling_blocked_ignores_running_pod() {
+        // A scheduled, Running pod is never a scheduling block — even if a
+        // stale condition lingered, the phase gate alone excludes it.
+        let pod = pod_with_scheduling("pool-x-server-0", "Running", Some(("True", "", "")));
+        assert_eq!(pod_scheduling_blocked(&pod), None);
+    }
+
+    #[test]
+    fn pod_scheduling_blocked_ignores_pending_but_scheduled() {
+        // Pending while pulling the image / running init containers: the
+        // PodScheduled condition is True, so it is NOT a scheduling block.
+        let pod = pod_with_scheduling("pool-x-server-0", "Pending", Some(("True", "", "")));
+        assert_eq!(pod_scheduling_blocked(&pod), None);
+    }
+
+    #[test]
+    fn pod_scheduling_blocked_none_when_no_status() {
+        // No status / no conditions → not blocked (missing pods case).
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "pool-x-server-0", "namespace": "test-ns" },
+            "spec": { "containers": [] }
+        }))
+        .unwrap();
+        assert_eq!(pod_scheduling_blocked(&pod), None);
+    }
+
+    #[test]
+    fn pod_pending_unscheduled_true_when_pending_and_no_node() {
+        // Pending with no spec.nodeName → genuinely awaiting scheduling.
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "pool-x-server-0", "namespace": "test-ns" },
+            "spec": { "containers": [] },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap();
+        assert!(pod_pending_unscheduled(&pod));
+    }
+
+    #[test]
+    fn pod_pending_unscheduled_false_when_scheduled_but_pending() {
+        // Bound to a node (spec.nodeName set) but still Pending (image pull /
+        // init containers): NOT awaiting scheduling — the event fallback must
+        // not flag it off a stale FailedScheduling event (#189 false-positive).
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "pool-x-server-0", "namespace": "test-ns" },
+            "spec": { "containers": [], "nodeName": "physical-server1" },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap();
+        assert!(!pod_pending_unscheduled(&pod));
+    }
+
+    #[test]
+    fn pod_pending_unscheduled_false_when_running() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "pool-x-server-0", "namespace": "test-ns" },
+            "spec": { "containers": [], "nodeName": "physical-server1" },
+            "status": { "phase": "Running" }
+        }))
+        .unwrap();
+        assert!(!pod_pending_unscheduled(&pod));
+    }
+
+    #[test]
+    fn latest_failed_scheduling_event_picks_most_recent_match() {
+        let mk = |pod: &str, msg: &str, ts: &str| -> K8sEvent {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Event",
+                "metadata": { "name": format!("{pod}.evt"), "namespace": "test-ns" },
+                "involvedObject": { "name": pod },
+                "reason": "FailedScheduling",
+                "message": msg,
+                "lastTimestamp": ts,
+            }))
+            .unwrap()
+        };
+        // An unrelated reason and a different pod must be filtered out.
+        let other_reason: K8sEvent = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Event",
+            "metadata": { "name": "x", "namespace": "test-ns" },
+            "involvedObject": { "name": "pool-x-server-0" },
+            "reason": "Scheduled",
+            "message": "ignore me",
+        }))
+        .unwrap();
+        let events = vec![
+            mk(
+                "pool-x-server-0",
+                "older insufficient cpu",
+                "2026-06-15T10:00:00Z",
+            ),
+            mk(
+                "pool-x-server-0",
+                "newest insufficient cpu",
+                "2026-06-15T10:05:00Z",
+            ),
+            mk(
+                "pool-other-server-0",
+                "different pod",
+                "2026-06-15T10:09:00Z",
+            ),
+            other_reason,
+        ];
+        let got = latest_failed_scheduling_event(&events, "pool-x-server-0");
+        assert_eq!(
+            got,
+            Some((
+                "FailedScheduling".to_string(),
+                "newest insufficient cpu".to_string()
+            ))
+        );
+        // No matching pod → None.
+        assert_eq!(
+            latest_failed_scheduling_event(&events, "pool-absent-0"),
+            None
+        );
+    }
+
+    /// End-to-end (wiremock): a Pending+Unschedulable server pod makes the
+    /// detector report `SchedulingBlocked` with the server role and the
+    /// condition's reason/message.
+    #[tokio::test]
+    async fn detect_scheduling_blocked_reports_unschedulable_server() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster},kobe.kunobi.ninja/role=server"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [serde_json::to_value(pod_with_scheduling(
+                    "pool-test-1-server-0",
+                    "Pending",
+                    Some(("False", "Unschedulable", "0/3 nodes are available: 3 Insufficient cpu.")),
+                )).unwrap()]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let got = backend
+            .detect_scheduling_blocked_impl(cluster, ns)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Some(SchedulingBlocked {
+                reason: "Unschedulable".to_string(),
+                message: "0/3 nodes are available: 3 Insufficient cpu.".to_string(),
+                pod_role: crate::metrics::GuestPodRole::Server,
+            })
+        );
+        // Agent pods are never listed: the server block short-circuits first.
+    }
+
+    /// A Running server pod with no agent pods → not blocked (`Ok(None)`).
+    /// The detector falls through server (Running) → agent (empty) → None.
+    #[tokio::test]
+    async fn detect_scheduling_blocked_none_when_running() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster},kobe.kunobi.ninja/role=server"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [serde_json::to_value(pod_with_scheduling(
+                    "pool-test-1-server-0", "Running", Some(("True", "", "")),
+                )).unwrap()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster},kobe.kunobi.ninja/role=agent"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let got = backend
+            .detect_scheduling_blocked_impl(cluster, ns)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// Missing pods (empty lists for both roles) → not blocked.
+    #[tokio::test]
+    async fn detect_scheduling_blocked_none_when_pods_absent() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+
+        // Any pod LIST returns an empty list (no role filter on the mock).
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let got = backend
+            .detect_scheduling_blocked_impl("pool-test-1", "test-ns")
+            .await
+            .unwrap();
+        assert_eq!(got, None);
     }
 }

@@ -283,6 +283,20 @@ impl ClusterBackend for BackendDispatch {
             Self::Vcluster(b) => b.apply_addon(name, namespace, addon).await,
         }
     }
+
+    async fn detect_scheduling_blocked(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<SchedulingBlocked>> {
+        match self {
+            Self::K3s(b) => b.detect_scheduling_blocked(name, namespace).await,
+            Self::K0s(b) => b.detect_scheduling_blocked(name, namespace).await,
+            Self::Capi(b) => b.detect_scheduling_blocked(name, namespace).await,
+            Self::Vkobe(b) => b.detect_scheduling_blocked(name, namespace).await,
+            Self::Vcluster(b) => b.detect_scheduling_blocked(name, namespace).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +358,26 @@ impl BackendFactory {
     pub fn client(&self) -> &Client {
         &self.client
     }
+}
+
+/// A guest cluster whose control-plane (or agent) Pods cannot be scheduled.
+///
+/// Returned by [`ClusterBackend::detect_scheduling_blocked`] when an
+/// instance is wedged in `Creating` purely because the kube-scheduler can't
+/// place its server/agent Pods (e.g. "Insufficient cpu"), as opposed to a
+/// pod that scheduled but is failing to boot. The distinction matters: a
+/// scheduling block is *backpressure* — respawning the instance just creates
+/// more Pods that still can't schedule (a thundering herd). The controller
+/// uses this to surface a clear signal and avoid a blind recycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulingBlocked {
+    /// Scheduler-supplied reason, e.g. `Unschedulable` (from the
+    /// `PodScheduled` condition) or `FailedScheduling` (from the Event).
+    pub reason: String,
+    /// Human-readable detail, e.g. `0/3 nodes are available: 3 Insufficient cpu`.
+    pub message: String,
+    /// Which guest Pod is blocked (server vs agent), for the metric label.
+    pub pod_role: crate::metrics::GuestPodRole,
 }
 
 /// Backend-agnostic interface for managing virtual cluster lifecycles.
@@ -412,6 +446,27 @@ pub trait ClusterBackend: Send + Sync {
         namespace: &str,
         addon: &Addon,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Classify whether a still-`Creating` instance is blocked purely because
+    /// the host-cluster scheduler cannot place its guest server/agent Pods
+    /// (Pending + `PodScheduled=False, reason=Unschedulable`, and/or a recent
+    /// `FailedScheduling` Event such as "Insufficient cpu").
+    ///
+    /// Returns `Ok(Some(SchedulingBlocked {..}))` when blocked, `Ok(None)`
+    /// when the pods are absent / scheduled / running (not a scheduling
+    /// block). Errors are surfaced so callers can treat a probe failure as
+    /// "unknown — don't act" rather than "not blocked".
+    ///
+    /// Default is `Ok(None)`: only backends that own host-cluster Pods
+    /// (k3s today) can observe this, so every other backend (k0s, vcluster,
+    /// capi, vkobe) inherits the no-op and is entirely unaffected.
+    fn detect_scheduling_blocked(
+        &self,
+        _name: &str,
+        _namespace: &str,
+    ) -> impl std::future::Future<Output = Result<Option<SchedulingBlocked>>> + Send {
+        async { Ok(None) }
+    }
 }
 
 // ---------------------------------------------------------------------------

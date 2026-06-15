@@ -285,6 +285,14 @@ pub struct ClusterEntry {
     /// Hash of the profile spec when this cluster was created.
     /// Used to detect spec drift and trigger recreation of unclaimed clusters.
     pub spec_hash: Option<SpecHash>,
+    /// The instance controller flagged this Creating instance as
+    /// scheduling-blocked (guest server/agent Pods Unschedulable, #189) via
+    /// its `status.message` prefix. The stuck-Creating timeout (steps 2 & 5)
+    /// must NOT Delete such an entry — recycling would just respawn Pods that
+    /// still can't schedule. The profile controller engages backpressure
+    /// (extends `next_attempt_at`) for it instead. Derived from the synced
+    /// status message in `build_pool_state`; `false` for every other state.
+    pub scheduling_blocked: bool,
 }
 
 /// Decisions the pool manager emits after evaluating state.
@@ -405,6 +413,19 @@ fn resolve_creating_timeout(profile: &crate::crd::ClusterPool) -> chrono::Durati
 /// 2 minutes is generous.
 const UNSTAMPED_RECYCLE_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 
+/// Prefix the instance controller stamps on `ClusterInstance.status.message`
+/// when it detects the guest server/agent Pods are Unschedulable (#189).
+///
+/// This is the cross-controller channel for the scheduling-block signal: the
+/// instance controller (producer) holds the live backend handle to probe
+/// Pods, while the pool manager (consumer) owns the stuck-Creating recycle
+/// decision. Rather than widen the CRD with a new bool field, the manager
+/// reads this prefix off the status message it already syncs into
+/// `PoolState`; a Creating entry carrying it is held with backpressure
+/// (next_attempt_at extended) instead of being Deleted — recycling would only
+/// respawn Pods that still can't schedule (a thundering herd).
+pub const SCHEDULING_BLOCKED_MESSAGE_PREFIX: &str = "scheduling blocked:";
+
 /// Whether a cluster entry should recycle for spec drift.
 ///
 /// A *stamped* entry drifts when its hash differs from `current_hash`. An
@@ -495,6 +516,13 @@ pub fn compute_pool_actions(
         // of any provision-failure counter.
         let creating_timeout = resolve_creating_timeout(profile);
         for (name, entry) in &state.clusters {
+            // #189: a scheduling-blocked Creating is backpressure, not a
+            // wedge to recycle — Deleting it just respawns Unschedulable
+            // Pods. Hold it (the profile controller has already extended
+            // next_attempt_at, which is exactly the backoff window we're in).
+            if entry.scheduling_blocked {
+                continue;
+            }
             if entry.state == ClusterState::Creating
                 && !deleting.contains(name)
                 && let Some(since) = entry.state_since
@@ -600,6 +628,13 @@ pub fn compute_pool_actions(
     // === 5. Stuck Creating timeout. ===
     let creating_timeout = resolve_creating_timeout(profile);
     for (name, entry) in &state.clusters {
+        // #189: scheduling-blocked Creating instances are held (backpressure),
+        // never recycled by the timeout — see step 2 for the rationale. The
+        // backoff (next_attempt_at) drives the eventual retry once the host
+        // cluster has capacity again.
+        if entry.scheduling_blocked {
+            continue;
+        }
         if entry.state == ClusterState::Creating
             && !deleting.contains(name)
             && let Some(since) = entry.state_since
@@ -1143,6 +1178,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1153,6 +1189,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1163,6 +1200,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
 
@@ -1193,6 +1231,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: Some(current.clone()),
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1203,6 +1242,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: Some("ddddffffffffffff".to_string()),
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1213,6 +1253,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1223,6 +1264,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: Some("ddddffffffffffff".to_string()),
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -1335,6 +1377,7 @@ mod tests {
             health_failures: 0,
             state_since: None,
             spec_hash: None,
+            scheduling_blocked: false,
         }
     }
 
@@ -1498,6 +1541,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1508,6 +1552,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -1553,6 +1598,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1563,6 +1609,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -1613,6 +1660,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: Some(stale_hash.clone()), // stale
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -1623,6 +1671,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: Some(stale_hash.clone()), // stale but leased
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -1834,6 +1883,7 @@ mod tests {
                 health_failures: 0,
                 state_since: None,
                 spec_hash: Some(current_hash),
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -2200,6 +2250,7 @@ mod tests {
             health_failures: 0,
             state_since: Some(chrono::Utc::now() - chrono::Duration::seconds(age_seconds)),
             spec_hash: Some("ddddffffffffffff".to_string()), // never matches the real current hash
+            scheduling_blocked: false,
         }
     }
 
@@ -2210,6 +2261,7 @@ mod tests {
             health_failures: 0,
             state_since: Some(chrono::Utc::now()),
             spec_hash: Some(current_hash),
+            scheduling_blocked: false,
         }
     }
 
@@ -2535,6 +2587,7 @@ mod tests {
                 health_failures: 0,
                 state_since: Some(chrono::Utc::now() - chrono::Duration::minutes(10)),
                 spec_hash: Some(current.clone()),
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -2790,6 +2843,7 @@ mod tests {
                 health_failures: 0,
                 state_since: Some(now - chrono::Duration::minutes(15)),
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         clusters.insert(
@@ -2800,6 +2854,7 @@ mod tests {
                 health_failures: 0,
                 state_since: Some(now - chrono::Duration::minutes(25)),
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -2853,6 +2908,7 @@ mod tests {
                 health_failures: 0,
                 state_since: Some(now - chrono::Duration::minutes(12)),
                 spec_hash: None,
+                scheduling_blocked: false,
             },
         );
         let state = PoolState { clusters };
@@ -2873,6 +2929,150 @@ mod tests {
         assert!(
             deletes.contains(&"pool-test-profile-12m".to_string()),
             "instance Creating for 12min should be deleted because garbage falls back to 10m default; deletes={deletes:?}"
+        );
+    }
+
+    /// #189: a scheduling-blocked Creating instance must NOT be recycled by the
+    /// stuck-Creating timeout, no matter how long it's been Creating —
+    /// respawning would just create more Unschedulable Pods. A *clean*
+    /// (not-blocked) sibling past the timeout still gets Deleted, proving the
+    /// guard is scoped to the blocked entry only.
+    #[test]
+    fn scheduling_blocked_creating_is_not_recycled_by_timeout() {
+        let profile = make_profile(
+            6,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 6,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+
+        let mut clusters = HashMap::new();
+        // Blocked for 30m (well past 10m) — must be HELD, not Deleted.
+        clusters.insert(
+            "pool-test-profile-blocked".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(30)),
+                spec_hash: None,
+                scheduling_blocked: true,
+            },
+        );
+        // Clean, equally-old Creating — the control: it MUST be Deleted.
+        clusters.insert(
+            "pool-test-profile-clean".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(30)),
+                spec_hash: None,
+                scheduling_blocked: false,
+            },
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !deletes.contains(&"pool-test-profile-blocked".to_string()),
+            "scheduling-blocked Creating must NOT be recycled by the timeout; deletes={deletes:?}"
+        );
+        assert!(
+            deletes.contains(&"pool-test-profile-clean".to_string()),
+            "a clean Creating past the timeout must still be recycled; deletes={deletes:?}"
+        );
+    }
+
+    /// Same guard, but inside the `backoff_active` early-return path (step 2):
+    /// a scheduling-blocked Creating is still held while the pool is in its
+    /// backoff window, while a clean one past the timeout is still Deleted.
+    #[test]
+    fn scheduling_blocked_creating_held_during_backoff() {
+        let mut profile = make_profile(
+            6,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 6,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+        // Put the pool inside an active backoff window.
+        profile.status = Some(crate::crd::ClusterPoolStatus {
+            next_attempt_at: Some((now + chrono::Duration::minutes(1)).to_rfc3339()),
+            consecutive_failures: 1,
+            ..Default::default()
+        });
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-blocked".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(30)),
+                spec_hash: None,
+                scheduling_blocked: true,
+            },
+        );
+        clusters.insert(
+            "pool-test-profile-clean".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(30)),
+                spec_hash: None,
+                scheduling_blocked: false,
+            },
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !deletes.contains(&"pool-test-profile-blocked".to_string()),
+            "scheduling-blocked Creating must be held even during backoff; deletes={deletes:?}"
+        );
+        assert!(
+            deletes.contains(&"pool-test-profile-clean".to_string()),
+            "a clean stuck Creating is still recycled during backoff; deletes={deletes:?}"
         );
     }
 }

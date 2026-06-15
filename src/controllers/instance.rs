@@ -528,7 +528,118 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     }
                 }
             } else {
-                Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                // Not Ready yet. Before the blind 5s requeue, probe whether the
+                // instance is wedged purely because the host scheduler can't
+                // place its guest server/agent Pods (Unschedulable, #189). If so
+                // we surface it as BACKPRESSURE — a clear status message + a
+                // metric — and deliberately do NOT drive a recycle: respawning
+                // would only create more Pods that still can't schedule (a
+                // thundering herd). The stamped `status.message` prefix is the
+                // signal the pool manager reads to hold this entry instead of
+                // recycling it on the creating-timeout (it extends the existing
+                // #166 fail-closed backoff window instead).
+                //
+                // `state_since` is carried through unchanged: resetting it would
+                // restart the stuck-Creating timer, and we intentionally rely on
+                // the pool manager's backoff (not the timer) to gate retries.
+                match detect_instance_scheduling_blocked(&ctx, &config, &name, &ns).await {
+                    Ok(Some(blocked)) => {
+                        let backend_str = backend_label(&config.backend.backend_type);
+                        crate::metrics::GUEST_POD_UNSCHEDULABLE_TOTAL
+                            .with_label_values(&[
+                                profile_label(&instance),
+                                backend_str,
+                                blocked.pod_role.as_str(),
+                                &blocked.reason,
+                            ])
+                            .inc();
+                        warn!(
+                            instance = %name,
+                            owner = %owner,
+                            pod_role = blocked.pod_role.as_str(),
+                            reason = %blocked.reason,
+                            message = %blocked.message,
+                            "Guest Pods Unschedulable — applying backpressure (no recycle)"
+                        );
+                        // `SCHEDULING_BLOCKED_MESSAGE_PREFIX` is the cross-
+                        // controller marker; keep it the literal prefix.
+                        let message = Some(format!(
+                            "{} {} pod {}: {}",
+                            crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX,
+                            blocked.pod_role.as_str(),
+                            blocked.reason,
+                            blocked.message,
+                        ));
+                        patch_instance_status(
+                            &instances_api,
+                            &instance,
+                            ClusterInstanceStatus {
+                                phase: ClusterInstancePhase::Creating,
+                                provisioned: true,
+                                bootstrapped: false,
+                                lease_ref: status.lease_ref.clone(),
+                                active_bootstrap: None,
+                                idle_since: status.idle_since.clone(),
+                                // Preserve the existing transition time — do not
+                                // restart the stuck-Creating timer (see above).
+                                state_since: status.state_since.clone(),
+                                health_failures: status.health_failures,
+                                spec_hash: status.spec_hash.clone(),
+                                message,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                        Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                    }
+                    // Not scheduling-blocked. If a PRIOR reconcile marked this
+                    // instance blocked but it no longer is (capacity freed, or it
+                    // scheduled and is now wedged for a different reason), the
+                    // sticky `SCHEDULING_BLOCKED_MESSAGE_PREFIX` in status.message
+                    // must be EDGE-CLEARED — otherwise `build_pool_state` keeps
+                    // reporting scheduling_blocked=true and the pool manager
+                    // suppresses the legitimate creating-timeout recycle forever
+                    // (#189 review). Overwrite with a neutral message (a Merge
+                    // patch can't reliably null a skipped field) and reset
+                    // `state_since` so the now-schedulable instance gets a fresh
+                    // bootstrap window instead of an immediate recycle for time
+                    // consumed while it was held.
+                    Ok(None) => {
+                        if status.message.as_deref().is_some_and(|m| {
+                            m.starts_with(crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX)
+                        }) {
+                            patch_instance_status(
+                                &instances_api,
+                                &instance,
+                                ClusterInstanceStatus {
+                                    phase: ClusterInstancePhase::Creating,
+                                    provisioned: true,
+                                    bootstrapped: false,
+                                    lease_ref: status.lease_ref.clone(),
+                                    active_bootstrap: None,
+                                    idle_since: status.idle_since.clone(),
+                                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                    health_failures: status.health_failures,
+                                    spec_hash: status.spec_hash.clone(),
+                                    message: Some(
+                                        "waiting for control plane to become ready".to_string(),
+                                    ),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        }
+                        Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                    }
+                    Err(e) => {
+                        debug!(
+                            instance = %name,
+                            error = %format!("{e:#}"),
+                            "scheduling-block probe failed; treating as not-blocked"
+                        );
+                        Ok(Action::requeue(std::time::Duration::from_secs(5)))
+                    }
+                }
             }
         }
         ClusterInstancePhase::Ready => {
@@ -1700,6 +1811,25 @@ async fn check_instance_health<B: ClusterBackend + Clone>(
         backend.check_health(name, namespace).await
     } else {
         ctx.backend.check_health(name, namespace).await
+    }
+}
+
+/// Probe whether a still-`Creating` instance is blocked purely on host-cluster
+/// scheduling (guest server/agent Pods Unschedulable, #189). Dispatches the
+/// same way as [`check_instance_health`] so the factory and single-backend
+/// wiring stay consistent. Default trait impl returns `Ok(None)` for every
+/// backend except k3s, so this is a cheap no-op everywhere else.
+async fn detect_instance_scheduling_blocked<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    name: &str,
+    namespace: &str,
+) -> Result<Option<crate::backend::SchedulingBlocked>, anyhow::Error> {
+    if ctx.factory.is_some() {
+        let backend = backend_dispatch_for_config(ctx, config)?;
+        backend.detect_scheduling_blocked(name, namespace).await
+    } else {
+        ctx.backend.detect_scheduling_blocked(name, namespace).await
     }
 }
 

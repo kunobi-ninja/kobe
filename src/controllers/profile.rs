@@ -548,6 +548,10 @@ async fn reconcile_profile(
                             &ctx.render_ctx,
                             &bootstrap_specs,
                         )),
+                        // Freshly created — it hasn't had a chance to report a
+                        // scheduling block yet; build_pool_state recomputes this
+                        // from status.message on the next reconcile.
+                        scheduling_blocked: false,
                     },
                 );
             }
@@ -814,10 +818,21 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
         let status = instance.status.clone().unwrap_or_default();
         let state = cluster_state_from_phase(&status.phase);
 
+        // #189: a Creating instance whose backend reported its guest Pods are
+        // Unschedulable stamps a known prefix on `status.message`. Surface it
+        // as `scheduling_blocked` so the pool manager holds it (backpressure)
+        // instead of recycling it on the creating-timeout. Only meaningful
+        // while Creating — a Ready/Leased instance has long since scheduled.
+        let scheduling_blocked = state == ClusterState::Creating
+            && status.message.as_deref().is_some_and(|m| {
+                m.starts_with(crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX)
+            });
+
         debug!(
             profile = profile_name,
             cluster = %cluster_name,
             ?state,
+            scheduling_blocked,
             "Discovered cluster from ClusterInstance"
         );
 
@@ -829,6 +844,7 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
                 health_failures: status.health_failures,
                 state_since: parse_optional_time(status.state_since.as_deref()),
                 spec_hash: status.spec_hash,
+                scheduling_blocked,
             },
         );
     }
@@ -1142,6 +1158,15 @@ fn compute_backoff_state(
     let prev_max_attempted = prev.map(|s| s.max_attempted_index).unwrap_or(0);
     let prev_last_ready_max = prev.map(|s| s.last_ready_max_index).unwrap_or(0);
 
+    // #189: a Creating instance whose guest Pods are Unschedulable is the
+    // explicit backpressure signal. The index-gap math below only engages
+    // backoff once an attempted index outruns the highest Ready one, which
+    // can lag (or never fire) for a single wedged member. Treat a live
+    // scheduling block as "engage backoff now" so scale-up is suppressed and
+    // `next_attempt_at` is extended — exactly the fail-closed backoff #166
+    // wires up — instead of churning new (still-unschedulable) members.
+    let scheduling_blocked_present = pool_state.clusters.values().any(|e| e.scheduling_blocked);
+
     // High-water mark of any cluster name we've ever seen, including the
     // current state and the sticky previous status value.
     let profile_name = profile.metadata.name.clone().unwrap_or_default();
@@ -1166,9 +1191,12 @@ fn compute_backoff_state(
     let new_last_ready_max = max_ready_now.max(prev_last_ready_max);
 
     // Anything currently Ready/leased OR an instance reached Ready in this
-    // pool's lifetime → reset failures to 0.
+    // pool's lifetime → reset failures to 0. A live scheduling block holds
+    // the pool in backpressure though, so we don't take the clean-clear path
+    // even when other members are Ready (otherwise scale-up would resume and
+    // spawn more Pods the scheduler still can't place).
     let any_ready = counts.ready > 0 || counts.leased > 0 || new_last_ready_max > 0;
-    if any_ready && new_last_ready_max >= new_max_attempted {
+    if any_ready && new_last_ready_max >= new_max_attempted && !scheduling_blocked_present {
         // Pool has caught up — every attempted index has reached Ready at
         // some point. Clear failures.
         return BackoffState {
@@ -1180,13 +1208,25 @@ fn compute_backoff_state(
         };
     }
 
-    let new_failures = new_max_attempted.saturating_sub(new_last_ready_max);
+    // Index-gap failures, floored to at least 1 while a scheduling block is
+    // live so the backoff window is always engaged for the wedged member.
+    let new_failures = new_max_attempted
+        .saturating_sub(new_last_ready_max)
+        .max(u32::from(scheduling_blocked_present));
 
     // Refresh next_attempt_at only when failure count strictly increased,
     // so repeated reconciles inside one window don't push the wait further.
+    // A scheduling block must always carry a (possibly preserved) future
+    // attempt time so `backoff_active` keeps suppressing scale-up/recycle.
     let next_attempt = if new_failures > prev_failures && new_failures > 0 {
         crate::pool::manager::backoff_delay_for(profile, new_failures)
             .map(|d| (now + d).to_rfc3339())
+    } else if scheduling_blocked_present {
+        // Hold the window: refresh if we somehow lost it, else carry forward.
+        prev_next_attempt.clone().or_else(|| {
+            crate::pool::manager::backoff_delay_for(profile, new_failures.max(1))
+                .map(|d| (now + d).to_rfc3339())
+        })
     } else if new_failures == 0 {
         None
     } else {
