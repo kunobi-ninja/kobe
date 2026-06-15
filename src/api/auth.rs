@@ -569,7 +569,7 @@ impl JwtAuthenticator {
             .configured
             .authenticate(token)
             .await
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+            .map_err(map_kunobi_auth_error)?;
 
         // Recover kobe's authorization context for the provider that accepted
         // the credential. The claims are already verified, so this is a pure,
@@ -753,8 +753,38 @@ fn parse_algorithm(s: &str) -> Option<Algorithm> {
 /// Auth errors.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    /// The credential was rejected (missing/expired/invalid token, no matching
+    /// rule, …). The caller's fault → `401 Unauthorized`.
     #[error("Invalid token: {0}")]
     InvalidToken(String),
+    /// The credential could NOT be evaluated because of a server-side fault —
+    /// e.g. the IdP/JWKS endpoint is unreachable or returned an invalid
+    /// document. Not the caller's fault → `500 Internal Server Error`, so a
+    /// JWKS outage pages an operator instead of looking like normal auth churn.
+    #[error("Internal auth error: {0}")]
+    Internal(String),
+}
+
+impl AuthError {
+    /// HTTP status for this error: credential rejections are `401`, server-side
+    /// faults are `500`.
+    fn status_code(&self) -> axum::http::StatusCode {
+        match self {
+            AuthError::InvalidToken(_) => axum::http::StatusCode::UNAUTHORIZED,
+            AuthError::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Map a kunobi-auth error to kobe's, preserving the 4xx/5xx distinction: kunobi
+/// flags JWKS/IdP transport + structural faults as `Internal` (server's
+/// problem); everything else is a token-level rejection.
+fn map_kunobi_auth_error(e: kunobi_auth::AuthError) -> AuthError {
+    if matches!(e, kunobi_auth::AuthError::Internal { .. }) {
+        AuthError::Internal(e.to_string())
+    } else {
+        AuthError::InvalidToken(e.to_string())
+    }
 }
 
 /// Axum extractor for AuthIdentity.
@@ -796,7 +826,7 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
                         error = %e,
                         "SSH authentication failed"
                     );
-                    axum::http::StatusCode::UNAUTHORIZED
+                    e.status_code()
                 });
         }
 
@@ -817,9 +847,10 @@ impl<B: crate::backend::ClusterBackend> FromRequestParts<crate::api::routes::App
                 method = method,
                 path = path_with_query,
                 error = %e,
+                status = e.status_code().as_u16(),
                 "Bearer authentication failed"
             );
-            axum::http::StatusCode::UNAUTHORIZED
+            e.status_code()
         })
     }
 }
@@ -1427,5 +1458,39 @@ mod tests {
         .unwrap();
         auth.update_policies(vec![machine], HashMap::new()).await;
         assert!(auth.discovery_metadata().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn jwks_unreachable_is_internal_500_not_401() {
+        // A JWKS/IdP outage is the server's fault, not the caller's: it must map
+        // to AuthError::Internal (500), not InvalidToken (401), so monitoring
+        // sees a server error rather than normal auth churn.
+        let auth = JwtAuthenticator::new("test".to_string());
+        let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1", "kind": "AccessPolicy",
+            "metadata": { "name": "down-idp" },
+            "spec": { "auth": { "oidc": {
+                "issuer": "https://issuer.example.com",
+                // Loopback + unused port: connection refused immediately, no network.
+                "jwksUrl": "http://127.0.0.1:1/jwks.json",
+                "audience": ["aud"], "algorithms": ["RS256"]
+            }}, "rules": [{ "pools": ["*"], "maxTtl": "1h", "maxConcurrentLeases": 1 }] }
+        }))
+        .unwrap();
+        auth.update_policies(vec![policy], HashMap::new()).await;
+
+        // Structurally valid JWT; verification fails at the JWKS *transport* layer.
+        let token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.\
+                     eyJzdWIiOiJ4IiwiaXNzIjoiaHR0cHM6Ly9pc3N1ZXIuZXhhbXBsZS5jb20ifQ.\
+                     sig";
+        let err = auth.validate(token).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::Internal(_)),
+            "JWKS outage must be Internal (500), got: {err:?}"
+        );
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
