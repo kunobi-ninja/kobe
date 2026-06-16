@@ -446,6 +446,9 @@ pub enum PoolFailureClass {
     KobestoreDegraded,
     /// CIDR / IPAM allocation failure.
     Ipam,
+    /// Pool wedged on capacity: the #191 scheduling-blocked (Unschedulable)
+    /// backpressure is engaged — guest Pods can't be placed (issue #189).
+    Capacity,
     /// Anything not matched by the keyword rules above.
     Other,
 }
@@ -459,6 +462,7 @@ impl PoolFailureClass {
             Self::Health => "health",
             Self::KobestoreDegraded => "kobestore_degraded",
             Self::Ipam => "ipam",
+            Self::Capacity => "capacity",
             Self::Other => "other",
         }
     }
@@ -474,6 +478,12 @@ impl PoolFailureClass {
         let r = reason.to_ascii_lowercase();
         if r.contains("delete") || r.contains("poddisruption") || r.contains("teardown") {
             Self::BackendDelete
+        } else if r.contains("capacity")
+            || r.contains("unschedulable")
+            || r.contains("insufficient")
+            || r.contains("scheduling blocked")
+        {
+            Self::Capacity
         } else if r.contains("bootstrap") {
             Self::Bootstrap
         } else if r.contains("health") {
@@ -973,6 +983,20 @@ pub static POOL_EFFECTIVE_CPU_REQUEST_MILLICORES: LazyLock<IntGaugeVec> = LazyLo
     .unwrap()
 });
 
+/// 1 when the pool has scheduling-blocked (capacity-starved) instances — the
+/// #191 Unschedulable backpressure is engaged (guest Pods can't be placed,
+/// so create/recycle is held instead of churning unschedulable members);
+/// 0 otherwise (issue #189). Derived purely from the existing #191
+/// scheduling-blocked state — observability only, never an admission gate.
+pub static POOL_CAPACITY_BLOCKED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_pool_capacity_blocked",
+        "1 when the pool has scheduling-blocked (capacity-starved) instances (#191 backpressure engaged), else 0",
+        &["profile"]
+    )
+    .unwrap()
+});
+
 // ─────────────────────────────────────────────────────────────────────
 // Connect proxy: request latency + per-lease cache effectiveness
 // ─────────────────────────────────────────────────────────────────────
@@ -1106,6 +1130,7 @@ pub fn init() {
     LazyLock::force(&IPAM_POOL_ALLOCATED);
     LazyLock::force(&POOL_SIZE);
     LazyLock::force(&POOL_EFFECTIVE_CPU_REQUEST_MILLICORES);
+    LazyLock::force(&POOL_CAPACITY_BLOCKED);
     // Connect proxy
     LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
     LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);
@@ -1233,6 +1258,7 @@ mod tests {
             "kobestore_degraded"
         );
         assert_eq!(PoolFailureClass::Ipam.as_str(), "ipam");
+        assert_eq!(PoolFailureClass::Capacity.as_str(), "capacity");
         assert_eq!(PoolFailureClass::Other.as_str(), "other");
     }
 
@@ -1266,6 +1292,19 @@ mod tests {
         assert_eq!(
             P::from_reason("Failed to apply server StatefulSet"),
             P::BackendCreate
+        );
+        // Capacity wedge: the #191 scheduling-blocked reason wording (#189).
+        assert_eq!(
+            P::from_reason(
+                "capacity-blocked: 2 instance(s) unschedulable; 2 instance(s) not \
+                 reaching Ready (attempted up to index 3, highest Ready 1)"
+            ),
+            P::Capacity
+        );
+        assert_eq!(P::from_reason("Insufficient cpu"), P::Capacity);
+        assert_eq!(
+            P::from_reason("scheduling blocked: Unschedulable"),
+            P::Capacity
         );
         // The generic backoff reason text → Other.
         assert_eq!(

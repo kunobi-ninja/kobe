@@ -145,6 +145,116 @@ mod cluster_instance_tests {
         assert!(backoff.last_failure_reason.is_none());
     }
 
+    /// Minimal `ClusterEntry` for backoff/gauge tests, with `scheduling_blocked`
+    /// configurable. Other fields are inert for these computations.
+    fn entry_with_block(state: ClusterState, scheduling_blocked: bool) -> ClusterEntry {
+        ClusterEntry {
+            state,
+            idle_since: None,
+            health_failures: 0,
+            state_since: None,
+            spec_hash: None,
+            scheduling_blocked,
+            crashlooping: false,
+        }
+    }
+
+    /// #189 (observability): when the #191 scheduling-blocked backpressure is
+    /// engaged, the reason string gains the `capacity-blocked:` wording so it's
+    /// classifiable as `PoolFailureClass::Capacity`. This is a STRING-ONLY
+    /// enrichment — the failure count (control-flow signal) is unchanged.
+    #[test]
+    fn backoff_reason_carries_capacity_wording_when_scheduling_blocked() {
+        let profile = profile_with_status(serde_json::json!({
+            "consecutiveFailures": 2, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 1
+        }));
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-p-0".to_string(),
+            entry_with_block(ClusterState::Creating, true),
+        );
+        let pool_state = PoolState { clusters };
+        let counts = crate::pool::manager::StateCounts::default();
+        let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+
+        let reason = backoff
+            .last_failure_reason
+            .clone()
+            .expect("reason populated while scheduling-blocked");
+        assert!(
+            reason.starts_with("capacity-blocked:"),
+            "expected capacity wording, got: {reason}"
+        );
+        assert!(reason.contains("unschedulable"), "got: {reason}");
+        // The original triage detail is preserved (only prefixed).
+        assert!(reason.contains("not reaching Ready"), "got: {reason}");
+        // The capacity wording is classifiable by the bounded class.
+        assert_eq!(
+            crate::metrics::PoolFailureClass::from_reason(&reason),
+            crate::metrics::PoolFailureClass::Capacity
+        );
+        // Control-flow signal (failure count) is still engaged, unchanged.
+        assert!(backoff.consecutive_failures > 0);
+    }
+
+    /// A non-blocked failing pool produces the SAME backoff result it does
+    /// today: no capacity wording, same failure count / reason content. Guards
+    /// against the #189 string enrichment leaking into the non-blocked path.
+    #[test]
+    fn backoff_reason_unchanged_for_non_blocked_failing_pool() {
+        let profile = profile_with_status(serde_json::json!({
+            "consecutiveFailures": 2, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 1
+        }));
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-p-0".to_string(),
+            entry_with_block(ClusterState::Creating, false),
+        );
+        let pool_state = PoolState { clusters };
+        let counts = crate::pool::manager::StateCounts::default();
+        let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+
+        let reason = backoff
+            .last_failure_reason
+            .expect("reason populated while failing");
+        assert!(
+            !reason.contains("capacity-blocked"),
+            "non-blocked pool must not get capacity wording, got: {reason}"
+        );
+        assert!(reason.contains("not reaching Ready"), "got: {reason}");
+        // Failure count is the plain index-gap (3 - 1 = 2), unchanged.
+        assert_eq!(backoff.consecutive_failures, 2);
+    }
+
+    /// #189 (observability): the `kobe_pool_capacity_blocked` gauge reflects the
+    /// presence of any scheduling-blocked instance in pool_state — 0 when none,
+    /// 1 when present. Read-only mirror of the #191 backpressure signal.
+    #[test]
+    fn pool_capacity_blocked_gauge_reflects_scheduling_blocked_presence() {
+        crate::metrics::init();
+        let g = &crate::metrics::POOL_CAPACITY_BLOCKED;
+
+        // No blocked instances → 0.
+        let none = [
+            entry_with_block(ClusterState::Ready, false),
+            entry_with_block(ClusterState::Creating, false),
+        ];
+        let blocked_none = none.iter().any(|e| e.scheduling_blocked);
+        g.with_label_values(&["gauge-test-none"])
+            .set(i64::from(blocked_none));
+        assert_eq!(g.with_label_values(&["gauge-test-none"]).get(), 0);
+
+        // Any blocked instance → 1.
+        let some = [
+            entry_with_block(ClusterState::Ready, false),
+            entry_with_block(ClusterState::Creating, true),
+        ];
+        let blocked_some = some.iter().any(|e| e.scheduling_blocked);
+        g.with_label_values(&["gauge-test-some"])
+            .set(i64::from(blocked_some));
+        assert_eq!(g.with_label_values(&["gauge-test-some"]).get(), 1);
+    }
+
     fn instance_response_json(
         name: &str,
         pool: &str,
@@ -663,6 +773,16 @@ async fn reconcile_profile(
     crate::metrics::POOL_EFFECTIVE_CPU_REQUEST_MILLICORES
         .with_label_values(&[name.as_str()])
         .set(effective_cpu_millicores);
+
+    // #189 (observability): surface "this pool is wedged on capacity" derived
+    // from the existing #191 scheduling-blocked state. 1 when any instance is
+    // scheduling-blocked (guest Pods unschedulable), else 0. Read-only mirror
+    // of the backpressure signal — it does NOT gate admission or alter any
+    // create/recycle/backoff decision.
+    let capacity_blocked = pool_state.clusters.values().any(|e| e.scheduling_blocked);
+    crate::metrics::POOL_CAPACITY_BLOCKED
+        .with_label_values(&[name.as_str()])
+        .set(i64::from(capacity_blocked));
 
     let queue_depth = {
         let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
@@ -1257,12 +1377,30 @@ fn compute_backoff_state(
     // this field was only ever carried forward or cleared, so it was always
     // empty — defeating the status field's purpose.
     let last_failure_reason = if new_failures > 0 {
-        Some(format!(
+        let base = format!(
             "{new_failures} instance(s) not reaching Ready (attempted up to index \
              {new_max_attempted}, highest Ready {new_last_ready_max}); inspect the \
              Failed/Unhealthy ClusterInstances (kubectl get ci -l \
              kobe.kunobi.ninja/pool={profile_name}) and their pod logs/events"
-        ))
+        );
+        // #189 (observability): when the #191 scheduling-blocked backpressure is
+        // engaged, prefix the reason so it clearly reads as a capacity wedge and
+        // is classifiable by `PoolFailureClass::from_reason` → `Capacity`. This
+        // is a STRING-ONLY enrichment: it does NOT change the phase, the failure
+        // count, or any create/recycle/backoff decision — those already reacted
+        // to `scheduling_blocked_present` above.
+        if scheduling_blocked_present {
+            let blocked = pool_state
+                .clusters
+                .values()
+                .filter(|e| e.scheduling_blocked)
+                .count();
+            Some(format!(
+                "capacity-blocked: {blocked} instance(s) unschedulable; {base}"
+            ))
+        } else {
+            Some(base)
+        }
     } else {
         prev_reason
     };
