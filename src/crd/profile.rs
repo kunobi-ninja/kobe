@@ -853,6 +853,25 @@ impl ResourceRequirements {
             .and_then(|v| parse_cpu_millicores(v))
     }
 
+    /// `GOMAXPROCS` to pin on a Go workload from the CPU **limit** (whole
+    /// cores, floored, min 1), or `None` when no CPU limit is set.
+    ///
+    /// Without this, a Go process (k3s = apiserver + kubelet + controllers in
+    /// one binary) defaults `GOMAXPROCS` to the HOST core count and spawns
+    /// that many OS threads, while the container's CFS quota is the much
+    /// smaller `limits.cpu`. On a high-core host (e.g. 64 cores, `cpu: "8"`)
+    /// the startup burst blows past the 8-core quota and gets CFS-throttled —
+    /// stalling critical goroutines. In the `ci-k3s-kunobi` incident this
+    /// starved the nested kubelet's node-registration past the `CSINode` init
+    /// timeout, panicking the k3s server (`CrashLoopBackOff`, kobe #189).
+    /// Pinning `GOMAXPROCS` to the quota (what uber's automaxprocs does)
+    /// removes the oversubscription. Floored so Go never exceeds the quota.
+    #[allow(dead_code)]
+    pub fn gomaxprocs_from_cpu_limit(&self) -> Option<i64> {
+        let millicores = parse_cpu_millicores(self.limits.get("cpu")?)?;
+        Some((millicores / 1000).max(1))
+    }
+
     /// Convert to the `k8s_openapi` shape expected by Container specs.
     ///
     /// `None` is returned when both maps are empty — that lets the
@@ -1745,5 +1764,37 @@ mod tests {
         assert_eq!(parse_cpu_millicores("1e2147483647"), Some(i64::MAX));
         assert_eq!(parse_cpu_millicores("1e999999999999"), Some(i64::MAX));
         assert_eq!(parse_cpu_millicores("1e-999999999999"), Some(1));
+    }
+
+    #[test]
+    fn gomaxprocs_from_cpu_limit_floors_to_whole_cores() {
+        // The ci-k3s-kunobi case: limit 8 → GOMAXPROCS 8 (matches the CFS quota).
+        assert_eq!(
+            res(&[("cpu", "8")], &[]).gomaxprocs_from_cpu_limit(),
+            Some(8)
+        );
+        // Floored to whole cores, min 1 (Go never exceeds the quota).
+        assert_eq!(
+            res(&[("cpu", "2500m")], &[]).gomaxprocs_from_cpu_limit(),
+            Some(2)
+        );
+        assert_eq!(
+            res(&[("cpu", "500m")], &[]).gomaxprocs_from_cpu_limit(),
+            Some(1)
+        );
+        assert_eq!(
+            res(&[("cpu", "1")], &[]).gomaxprocs_from_cpu_limit(),
+            Some(1)
+        );
+        // Driven by the LIMIT, not the request; no cpu limit → None.
+        assert_eq!(
+            res(&[], &[("cpu", "8")]).gomaxprocs_from_cpu_limit(),
+            None,
+            "request without a limit must not pin GOMAXPROCS"
+        );
+        assert_eq!(
+            res(&[("memory", "4Gi")], &[]).gomaxprocs_from_cpu_limit(),
+            None
+        );
     }
 }

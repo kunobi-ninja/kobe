@@ -628,6 +628,22 @@ impl K3sBackend {
             volume_mounts.push(mount);
             env.push(env_var);
         }
+        // Pin GOMAXPROCS to the CPU limit so the Go runtime (k3s = apiserver +
+        // kubelet + controllers in one binary) does not oversubscribe threads
+        // to the host core count and get CFS-throttled on high-core hosts —
+        // which starved the nested kubelet's node registration past the
+        // CSINode init timeout and CrashLoopBackOff'd the server (#189).
+        if let Some(n) = config
+            .resources
+            .as_ref()
+            .and_then(|r| r.gomaxprocs_from_cpu_limit())
+        {
+            env.push(EnvVar {
+                name: "GOMAXPROCS".to_string(),
+                value: Some(n.to_string()),
+                ..Default::default()
+            });
+        }
 
         Container {
             name: "k3s-server".to_string(),
@@ -1096,6 +1112,20 @@ impl K3sBackend {
         {
             volume_mounts.push(mount);
             env.push(env_var);
+        }
+        // Pin GOMAXPROCS to the CPU limit (see the server container above) so
+        // the agent's k3s/kubelet does not oversubscribe + CFS-throttle on
+        // high-core hosts (#189).
+        if let Some(n) = config
+            .resources
+            .as_ref()
+            .and_then(|r| r.gomaxprocs_from_cpu_limit())
+        {
+            env.push(EnvVar {
+                name: "GOMAXPROCS".to_string(),
+                value: Some(n.to_string()),
+                ..Default::default()
+            });
         }
 
         let container = Container {
