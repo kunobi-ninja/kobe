@@ -853,6 +853,17 @@ impl ResourceRequirements {
             .and_then(|v| parse_cpu_millicores(v))
     }
 
+    /// Effective memory request in bytes — the value Kubernetes reserves
+    /// per pod — or `None` when neither a memory request nor limit is set.
+    /// Drives `kobe_pool_effective_memory_request_bytes` (sibling of
+    /// [`Self::effective_cpu_millicores`]).
+    #[allow(dead_code)]
+    pub fn effective_memory_bytes(&self) -> Option<i64> {
+        self.effective_requests()
+            .get("memory")
+            .and_then(|v| parse_memory_bytes(v))
+    }
+
     /// `GOMAXPROCS` to pin on a Go workload from the CPU **limit** (whole
     /// cores, floored, min 1), or `None` when no CPU limit is set.
     ///
@@ -932,6 +943,34 @@ fn parse_cpu_millicores(s: &str) -> Option<i64> {
         }
         QuantitySuffix::BinarySi(power) => {
             let factor = 1024u128.saturating_pow(power).saturating_mul(1000);
+            let numerator = mantissa.saturating_mul(factor);
+            ceil_div(numerator, pow10_u128(fractional_digits))
+        }
+    };
+    Some(value.min(i64::MAX as u128) as i64)
+}
+
+/// Parse a Kubernetes memory quantity into bytes.
+///
+/// Sibling of [`parse_cpu_millicores`] sharing the same [`split_quantity`]
+/// tokenizer and integer-only scaling, but the base unit is the byte (no
+/// `×1000` millicores conversion): binary suffixes `Ki`/`Mi`/`Gi`/`Ti`/`Pi`/`Ei`
+/// scale by `1024^n`, decimal `k`/`M`/`G`/`T`/`P`/`E` and `e`/`E`-exponent forms
+/// by `10^n`, plain integers are bytes. Values above the gauge range saturate at
+/// `i64::MAX`; unparseable, non-finite, or negative input returns `None`.
+#[allow(dead_code)]
+fn parse_memory_bytes(s: &str) -> Option<i64> {
+    let (mantissa, fractional_digits, suffix) = split_quantity(s)?;
+    let value = match suffix {
+        // Bytes, so the decimal exponent is used as-is (no millicores +3).
+        QuantitySuffix::DecimalSi(bytes_exponent) => {
+            scaled_decimal_to_millicores(mantissa, fractional_digits, bytes_exponent)
+        }
+        QuantitySuffix::DecimalExponent(exponent) => {
+            scaled_decimal_to_millicores(mantissa, fractional_digits, exponent)
+        }
+        QuantitySuffix::BinarySi(power) => {
+            let factor = 1024u128.saturating_pow(power);
             let numerator = mantissa.saturating_mul(factor);
             ceil_div(numerator, pow10_u128(fractional_digits))
         }
@@ -1734,6 +1773,43 @@ mod tests {
             res(&[("memory", "1Gi")], &[]).effective_cpu_millicores(),
             None
         );
+    }
+
+    #[test]
+    fn effective_memory_bytes_limit_only_request_wins_and_none() {
+        // Limit-only: the kubelet copies it into the request → metered value.
+        assert_eq!(
+            res(&[("memory", "4Gi")], &[]).effective_memory_bytes(),
+            Some(4_294_967_296)
+        );
+        // An explicit (smaller) request still wins for the metered value.
+        assert_eq!(
+            res(&[("memory", "4Gi")], &[("memory", "512Mi")]).effective_memory_bytes(),
+            Some(536_870_912)
+        );
+        // No memory key anywhere → nothing to meter.
+        assert_eq!(res(&[("cpu", "8")], &[]).effective_memory_bytes(), None);
+    }
+
+    #[test]
+    fn parse_memory_bytes_handles_formats() {
+        assert_eq!(parse_memory_bytes("4Gi"), Some(4_294_967_296));
+        assert_eq!(parse_memory_bytes("512Mi"), Some(536_870_912));
+        assert_eq!(parse_memory_bytes("1G"), Some(1_000_000_000));
+        assert_eq!(parse_memory_bytes("0"), Some(0));
+        assert_eq!(parse_memory_bytes("1Ki"), Some(1024));
+        assert_eq!(parse_memory_bytes("1k"), Some(1000));
+        assert_eq!(parse_memory_bytes("1M"), Some(1_000_000));
+        assert_eq!(parse_memory_bytes("1Ti"), Some(1_099_511_627_776));
+        assert_eq!(parse_memory_bytes("1e6"), Some(1_000_000));
+        assert_eq!(parse_memory_bytes("garbage"), None);
+        assert_eq!(parse_memory_bytes("-1"), None);
+        // Non-finite / unknown suffix must yield no series, not a lying value.
+        assert_eq!(parse_memory_bytes("inf"), None);
+        assert_eq!(parse_memory_bytes("NaN"), None);
+        assert_eq!(parse_memory_bytes("4GiB"), None);
+        // Valid but oversized quantities saturate instead of reporting 0.
+        assert_eq!(parse_memory_bytes("1e999999999999"), Some(i64::MAX));
     }
 
     #[test]

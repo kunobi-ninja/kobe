@@ -754,25 +754,32 @@ async fn reconcile_profile(
     // (server AND agent). This silently wedged ci-k3s-kunobi (8c → 16/cluster).
     // Meter the effective CPU request and warn so it's visible before the
     // nodes saturate.
-    let effective_cpu_millicores = if let Some(res) = profile.spec.resources.as_ref() {
-        let defaulted = res.limits_without_requests();
-        if !defaulted.is_empty() {
-            warn!(
-                profile = %name,
-                keys = ?defaulted,
-                "ClusterPool sets resource limits without explicit requests; \
-                 Kubernetes reserves the full limit as the request on every guest \
-                 pod (server + agent). Set spec.resources.requests to avoid silent \
-                 over-reservation."
-            );
-        }
-        res.effective_cpu_millicores().unwrap_or(0)
-    } else {
-        0
-    };
+    let (effective_cpu_millicores, effective_memory_bytes) =
+        if let Some(res) = profile.spec.resources.as_ref() {
+            let defaulted = res.limits_without_requests();
+            if !defaulted.is_empty() {
+                warn!(
+                    profile = %name,
+                    keys = ?defaulted,
+                    "ClusterPool sets resource limits without explicit requests; \
+                     Kubernetes reserves the full limit as the request on every guest \
+                     pod (server + agent). Set spec.resources.requests to avoid silent \
+                     over-reservation."
+                );
+            }
+            (
+                res.effective_cpu_millicores().unwrap_or(0),
+                res.effective_memory_bytes().unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
     crate::metrics::POOL_EFFECTIVE_CPU_REQUEST_MILLICORES
         .with_label_values(&[name.as_str()])
         .set(effective_cpu_millicores);
+    crate::metrics::POOL_EFFECTIVE_MEMORY_REQUEST_BYTES
+        .with_label_values(&[name.as_str()])
+        .set(effective_memory_bytes);
 
     // #189 (observability): surface "this pool is wedged on capacity" derived
     // from the existing #191 scheduling-blocked state. 1 when any instance is

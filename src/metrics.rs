@@ -997,6 +997,22 @@ pub static POOL_CAPACITY_BLOCKED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Effective memory request (bytes) kobe stamps onto each guest pod
+/// (k3s server + agent) for this pool — explicit `requests.memory` or, when
+/// absent, the `limits.memory` the kubelet silently copies into the request.
+/// Sibling of `kobe_pool_effective_cpu_request_millicores`: surfaces hidden
+/// over-reservation the same way, e.g. `limits.memory:"4Gi"` with empty
+/// requests reserves 4Gi per pod (8Gi/cluster), invisible until the nodes
+/// wedge (issue #189). 0 when the pool sets no memory limit/request.
+pub static POOL_EFFECTIVE_MEMORY_REQUEST_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_pool_effective_memory_request_bytes",
+        "Effective per-guest-pod memory request (bytes), incl. the kubelet's silent limit→request copy",
+        &["profile"]
+    )
+    .unwrap()
+});
+
 // ─────────────────────────────────────────────────────────────────────
 // Connect proxy: request latency + per-lease cache effectiveness
 // ─────────────────────────────────────────────────────────────────────
@@ -1131,6 +1147,7 @@ pub fn init() {
     LazyLock::force(&POOL_SIZE);
     LazyLock::force(&POOL_EFFECTIVE_CPU_REQUEST_MILLICORES);
     LazyLock::force(&POOL_CAPACITY_BLOCKED);
+    LazyLock::force(&POOL_EFFECTIVE_MEMORY_REQUEST_BYTES);
     // Connect proxy
     LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
     LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);
