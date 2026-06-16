@@ -24,7 +24,9 @@ use crate::api::connect::{
 use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
-use crate::crd::{ClusterLease, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester};
+use crate::crd::{
+    ClusterLease, ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester,
+};
 use crate::metrics;
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use kunobi_auth::server::{AuthnProvider, OptionalAuth};
@@ -380,6 +382,11 @@ struct LeaseResponse {
     /// not bound yet (pool health). Omitted when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Structured K8s-style status conditions (#189), echoed from
+    /// `ClusterLeaseStatus.conditions` — `Bound` and `Satisfiable`. The
+    /// machine-readable companion to `message`. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conditions: Vec<ClusterLeaseCondition>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -1150,6 +1157,7 @@ async fn create_lease<B: ClusterBackend>(
         effective_ttl: None,
         alias: req.alias.clone(),
         message: None,
+        conditions: Vec::new(),
     };
 
     if was_clamped {
@@ -1310,6 +1318,8 @@ async fn get_lease<B: ClusterBackend>(
                     alias,
                     // #189: surface why a Pending lease isn't binding (pool health).
                     message: status.message,
+                    // #189: structured conditions companion to `message`.
+                    conditions: status.conditions,
                 }),
             )
                 .into_response()

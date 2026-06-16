@@ -13,8 +13,8 @@ use tracing::{debug, error, info, warn};
 use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
-    ClusterInstance, ClusterInstancePhase, ClusterLease, ClusterLeaseStatus, ClusterPool,
-    ClusterPoolPhase, ClusterPoolStatus, LeasePhase,
+    ClusterInstance, ClusterInstancePhase, ClusterLease, ClusterLeaseCondition, ClusterLeaseStatus,
+    ClusterPool, ClusterPoolPhase, ClusterPoolStatus, LeasePhase,
 };
 use crate::diagnostics;
 use crate::pool::{PoolState, parse_duration};
@@ -232,7 +232,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             "Lease has an assigned cluster while still marked Pending; restoring Bound phase"
         );
 
-        let repaired_status = ClusterLeaseStatus {
+        let mut repaired_status = ClusterLeaseStatus {
             phase: LeasePhase::Bound,
             cluster_name: status.cluster_name.clone(),
             bound_at: status.bound_at.clone(),
@@ -243,7 +243,14 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             max_extensions: status.max_extensions,
             // Now bound: clear any stale "no Ready cluster" exhaustion message.
             message: None,
+            conditions: Vec::new(),
         };
+        repaired_status.conditions = derive_lease_conditions(
+            &repaired_status,
+            &status.conditions,
+            None,
+            &chrono::Utc::now().to_rfc3339(),
+        );
 
         leases_api
             .patch_status(
@@ -323,9 +330,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 if age > timeout {
                     warn!(lease = %name, "Lease exceeded queue timeout, expiring");
                     remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-                    let patch = serde_json::json!({
-                        "status": { "phase": "Expired" }
-                    });
+                    let patch = expired_status_patch(&status.conditions);
                     leases_api
                         .patch_status(
                             &name,
@@ -356,7 +361,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     .policy_for_requester_type(&lease.spec.requester.requester_type)
                     .await;
                 let max_extensions = policy.map(|p| p.max_extensions).unwrap_or(2);
-                let new_status = ClusterLeaseStatus {
+                let mut new_status = ClusterLeaseStatus {
                     phase: LeasePhase::Bound,
                     cluster_name: Some(cluster_name.clone()),
                     bound_at: Some(now.to_rfc3339()),
@@ -367,7 +372,14 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     max_extensions,
                     // Bound now: clear any prior "no Ready cluster" message.
                     message: None,
+                    conditions: Vec::new(),
                 };
+                new_status.conditions = derive_lease_conditions(
+                    &new_status,
+                    &status.conditions,
+                    None,
+                    &now.to_rfc3339(),
+                );
 
                 let patch = serde_json::json!({ "status": new_status });
                 match leases_api
@@ -437,13 +449,32 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     "No ready cluster, lease queued at position {position}: {message}"
                 );
 
+                // Derive conditions for the still-Pending, not-yet-satisfiable
+                // lease: Bound=False (phase Pending) and Satisfiable=False
+                // carrying the unsatisfiable reason. Preserve lastTransitionTime
+                // against the on-disk conditions so a steady-state warm-up
+                // doesn't churn the timestamp on every ~5s requeue tick.
+                let pending_status = ClusterLeaseStatus {
+                    phase: LeasePhase::Pending,
+                    message: Some(message.clone()),
+                    ..status.clone()
+                };
+                let conditions = derive_lease_conditions(
+                    &pending_status,
+                    &status.conditions,
+                    Some(reason),
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+
                 // Best-effort: a failed message write must not block requeue —
                 // the lease is still validly Pending and will retry.
                 if let Err(e) = leases_api
                     .patch_status(
                         &name,
                         &PatchParams::apply("kobe-operator"),
-                        &Patch::Merge(&serde_json::json!({ "status": { "message": message } })),
+                        &Patch::Merge(
+                            &serde_json::json!({ "status": { "message": message, "conditions": conditions } }),
+                        ),
                     )
                     .await
                 {
@@ -463,9 +494,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                                 .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
                                 .inc();
                             info!(lease = %name, "Lease TTL expired");
-                            let patch = serde_json::json!({
-                                "status": { "phase": "Expired" }
-                            });
+                            let patch = expired_status_patch(&status.conditions);
                             leases_api
                                 .patch_status(
                                     &name,
@@ -482,9 +511,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             expires_at = %expires_at_str,
                             "Failed to parse expires_at, force-expiring lease: {e}"
                         );
-                        let patch = serde_json::json!({
-                            "status": { "phase": "Expired" }
-                        });
+                        let patch = expired_status_patch(&status.conditions);
                         leases_api
                             .patch_status(
                                 &name,
@@ -566,7 +593,18 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 }
             }
 
-            let mut status_fields = serde_json::json!({ "phase": "Recycling" });
+            let recycling_status = ClusterLeaseStatus {
+                phase: LeasePhase::Recycling,
+                ..Default::default()
+            };
+            let conditions = derive_lease_conditions(
+                &recycling_status,
+                &status.conditions,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+            );
+            let mut status_fields =
+                serde_json::json!({ "phase": "Recycling", "conditions": conditions });
             if let Some(url) = &diag_url {
                 status_fields["diagnosticsUrl"] = serde_json::Value::String(url.clone());
             }
@@ -856,9 +894,7 @@ async fn run_reaper<B: ClusterBackend>(
                     Ok(expires_at) => {
                         if now > expires_at.with_timezone(&chrono::Utc) {
                             warn!(lease = %name, "Reaper: force-expiring overdue lease");
-                            let patch = serde_json::json!({
-                                "status": { "phase": "Expired" }
-                            });
+                            let patch = expired_status_patch(&status.conditions);
                             if let Err(e) = leases_api
                                 .patch_status(
                                     &name,
@@ -880,9 +916,7 @@ async fn run_reaper<B: ClusterBackend>(
                             expires_at = %expires_at_str,
                             "Reaper: failed to parse expires_at, force-expiring lease: {e}"
                         );
-                        let patch = serde_json::json!({
-                            "status": { "phase": "Expired" }
-                        });
+                        let patch = expired_status_patch(&status.conditions);
                         if let Err(e) = leases_api
                             .patch_status(
                                 &name,
@@ -914,6 +948,20 @@ async fn remove_from_queue(
     }
 }
 
+/// Build the `{ "status": { ... } }` merge patch that transitions a lease to
+/// `Expired`, carrying the derived conditions (`Bound=False`, `Satisfiable`)
+/// alongside the phase. `prev` is the lease's on-disk conditions, used to
+/// preserve `lastTransitionTime` when a condition's status is unchanged.
+fn expired_status_patch(prev: &[ClusterLeaseCondition]) -> serde_json::Value {
+    let expired = ClusterLeaseStatus {
+        phase: LeasePhase::Expired,
+        ..Default::default()
+    };
+    let conditions =
+        derive_lease_conditions(&expired, prev, None, &chrono::Utc::now().to_rfc3339());
+    serde_json::json!({ "status": { "phase": "Expired", "conditions": conditions } })
+}
+
 fn try_start_reconcile<'a, B: ClusterBackend>(
     ctx: &'a LeaseContext<B>,
     lease_name: &str,
@@ -931,6 +979,83 @@ fn try_start_reconcile<'a, B: ClusterBackend>(
         active_reconciles: &ctx.active_reconciles,
         lease_name: lease_name.to_string(),
     }))
+}
+
+/// Derive the standard condition set for a `ClusterLease` from its status.
+/// PURE: no I/O, no clock — `now` is passed in so callers control the
+/// timestamp and tests are deterministic. Mirrors
+/// `controllers::instance::derive_instance_conditions`.
+///
+/// Emits two conditions:
+/// - `Bound`: `True` iff `phase == Bound` (a cluster is assigned). Reason is
+///   always the phase, so `False` names what's blocking (Pending/Expired/…).
+/// - `Satisfiable`: `False` only on the no-Ready-cluster path (signalled by
+///   `unsatisfiable_reason = Some(reason)`), carrying that reason; otherwise
+///   `True` with the phase as reason. A `Warming` reason still counts as
+///   "not yet satisfiable" — it explains *why* the Pending lease has no
+///   cluster — so it is reported `False`.
+///
+/// `lastTransitionTime` follows core/v1 semantics: for each derived condition
+/// we look up the matching `condition_type` in `prev`; if found AND its
+/// `status` is unchanged we keep the previous timestamp, otherwise we stamp
+/// `now`. So the time only moves when the condition actually flips (or is
+/// brand new), never on a redundant reconcile.
+pub fn derive_lease_conditions(
+    status: &ClusterLeaseStatus,
+    prev: &[ClusterLeaseCondition],
+    unsatisfiable_reason: Option<crate::metrics::LeaseUnsatisfiableReason>,
+    now: &str,
+) -> Vec<ClusterLeaseCondition> {
+    let message = status.message.clone().unwrap_or_default();
+    let phase = status.phase.to_string();
+
+    // Helper: build one condition, preserving lastTransitionTime when the
+    // status is unchanged vs. `prev`.
+    let build = |condition_type: &str, new_status: &str, reason: String, message: String| {
+        let last_transition_time = prev
+            .iter()
+            .find(|c| c.condition_type == condition_type)
+            .filter(|c| c.status == new_status)
+            .and_then(|c| c.last_transition_time.clone())
+            .or_else(|| Some(now.to_string()));
+        ClusterLeaseCondition {
+            condition_type: condition_type.to_string(),
+            status: new_status.to_string(),
+            reason,
+            message,
+            last_transition_time,
+        }
+    };
+
+    let is_bound = status.phase == LeasePhase::Bound;
+    let bool_status = |b: bool| if b { "True" } else { "False" };
+
+    // Satisfiable is False (with the unsatisfiable reason) only on the
+    // no-Ready-cluster path; otherwise it's True with the phase as reason.
+    let (satisfiable_status, satisfiable_reason) = match unsatisfiable_reason {
+        // PascalCase for the condition reason (K8s convention; consistent with
+        // the PascalCase `Bound` reason). `as_str()` stays snake_case for the
+        // metric label.
+        Some(reason) => ("False", reason.condition_reason().to_string()),
+        None => ("True", phase.clone()),
+    };
+
+    vec![
+        build(
+            "Bound",
+            bool_status(is_bound),
+            // Reason is always the phase: for Bound=True it's `Bound`, for
+            // Bound=False it names what's blocking (Pending/Expired/…).
+            phase,
+            message.clone(),
+        ),
+        build(
+            "Satisfiable",
+            satisfiable_status,
+            satisfiable_reason,
+            message,
+        ),
+    ]
 }
 
 /// Build a human-readable lease `status.message` and classify the
@@ -2095,6 +2220,161 @@ mod tests {
         assert!(
             wrote_message,
             "expected a status PATCH writing a non-empty message containing the pool phase"
+        );
+
+        // The same PATCH must carry the structured conditions companion (#189):
+        // Bound=False (phase Pending) and Satisfiable=False (pool_exhausted).
+        let wrote_conditions = requests.iter().any(|r| {
+            r.method == http::Method::PATCH
+                && r.url.path().ends_with("/clusterleases/unsat-1/status")
+                && serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|b| {
+                        let conds = b.get("status")?.get("conditions")?.as_array()?.clone();
+                        let bound = conds
+                            .iter()
+                            .find(|c| c.get("type") == Some(&serde_json::json!("Bound")))?;
+                        let sat = conds
+                            .iter()
+                            .find(|c| c.get("type") == Some(&serde_json::json!("Satisfiable")))?;
+                        Some(
+                            bound.get("status") == Some(&serde_json::json!("False"))
+                                && bound.get("reason") == Some(&serde_json::json!("Pending"))
+                                && sat.get("status") == Some(&serde_json::json!("False"))
+                                && sat.get("reason") == Some(&serde_json::json!("PoolExhausted")),
+                        )
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(
+            wrote_conditions,
+            "expected a status PATCH writing Bound=False/Pending and Satisfiable=False/PoolExhausted conditions"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_lease_conditions (#189): pure derivation + lastTransitionTime
+    // -----------------------------------------------------------------------
+
+    fn lease_cond<'a>(conds: &'a [ClusterLeaseCondition], ty: &str) -> &'a ClusterLeaseCondition {
+        conds
+            .iter()
+            .find(|c| c.condition_type == ty)
+            .unwrap_or_else(|| panic!("missing condition {ty}"))
+    }
+
+    #[test]
+    fn derive_lease_conditions_bound_phase_is_bound_true_satisfiable_true() {
+        let now = "2026-01-01T00:00:00Z";
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            cluster_name: Some("pool-x-0".into()),
+            message: Some("running".into()),
+            ..Default::default()
+        };
+        let conds = derive_lease_conditions(&st, &[], None, now);
+
+        let bound = lease_cond(&conds, "Bound");
+        assert_eq!(bound.status, "True");
+        assert_eq!(bound.reason, "Bound");
+        assert_eq!(bound.message, "running");
+        assert_eq!(bound.last_transition_time.as_deref(), Some(now));
+
+        let sat = lease_cond(&conds, "Satisfiable");
+        assert_eq!(sat.status, "True");
+        assert_eq!(sat.reason, "Bound");
+    }
+
+    #[test]
+    fn derive_lease_conditions_pending_unsatisfiable_is_bound_false_satisfiable_false() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let now = "2026-01-01T00:00:00Z";
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Pending,
+            message: Some("no Ready cluster; pool p phase=Failing".into()),
+            ..Default::default()
+        };
+        // PoolExhausted: the no-Ready-cluster path classifies the pool.
+        let conds = derive_lease_conditions(&st, &[], Some(R::PoolExhausted), now);
+
+        let bound = lease_cond(&conds, "Bound");
+        assert_eq!(bound.status, "False");
+        assert_eq!(bound.reason, "Pending");
+
+        let sat = lease_cond(&conds, "Satisfiable");
+        assert_eq!(sat.status, "False");
+        assert_eq!(sat.reason, "PoolExhausted");
+        assert!(sat.message.contains("phase=Failing"));
+    }
+
+    #[test]
+    fn derive_lease_conditions_warming_is_satisfiable_false() {
+        // A healthy-but-warming pool still has no cluster yet, so the lease is
+        // not (currently) satisfiable — Satisfiable=False with reason `Warming`
+        // explains *why* the Pending lease has no cluster.
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let now = "2026-01-01T00:00:00Z";
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Pending,
+            ..Default::default()
+        };
+        let conds = derive_lease_conditions(&st, &[], Some(R::Warming), now);
+        let sat = lease_cond(&conds, "Satisfiable");
+        assert_eq!(sat.status, "False");
+        assert_eq!(sat.reason, "Warming");
+    }
+
+    #[test]
+    fn derive_lease_conditions_preserves_transition_time_when_status_unchanged() {
+        let prev_time = "2025-12-31T00:00:00Z";
+        let now = "2026-01-01T00:00:00Z";
+        // Previously Bound=True.
+        let prev = vec![ClusterLeaseCondition {
+            condition_type: "Bound".to_string(),
+            status: "True".to_string(),
+            reason: "Bound".to_string(),
+            message: "old".to_string(),
+            last_transition_time: Some(prev_time.to_string()),
+        }];
+        // Still Bound=True — status unchanged, keep the prior timestamp.
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            cluster_name: Some("pool-x-0".into()),
+            ..Default::default()
+        };
+        let conds = derive_lease_conditions(&st, &prev, None, now);
+        assert_eq!(
+            lease_cond(&conds, "Bound").last_transition_time.as_deref(),
+            Some(prev_time),
+            "transition time preserved when Bound status does not flip"
+        );
+    }
+
+    #[test]
+    fn derive_lease_conditions_updates_transition_time_when_status_flips() {
+        let prev_time = "2025-12-31T00:00:00Z";
+        let now = "2026-01-01T00:00:00Z";
+        // Previously Bound=True (lease was bound).
+        let prev = vec![ClusterLeaseCondition {
+            condition_type: "Bound".to_string(),
+            status: "True".to_string(),
+            reason: "Bound".to_string(),
+            message: String::new(),
+            last_transition_time: Some(prev_time.to_string()),
+        }];
+        // Now Expired -> Bound=False. Status flipped -> stamp now.
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Expired,
+            ..Default::default()
+        };
+        let conds = derive_lease_conditions(&st, &prev, None, now);
+        let bound = lease_cond(&conds, "Bound");
+        assert_eq!(bound.status, "False");
+        assert_eq!(bound.reason, "Expired");
+        assert_eq!(
+            bound.last_transition_time.as_deref(),
+            Some(now),
+            "transition time updated when Bound status flips"
         );
     }
 }

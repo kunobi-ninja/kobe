@@ -92,9 +92,58 @@ pub struct ClusterLeaseStatus {
     ///
     /// skip_serializing_if: omit when None so a JSON-Merge-Patch (RFC 7396)
     /// pass-through preservation can't erase a previously-set message via an
-    /// explicit null. (Full K8s `conditions` are a deliberate follow-up.)
+    /// explicit null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+
+    /// Standard Kubernetes-style status conditions, derived by the lease
+    /// controller from `phase` / `cluster_name` / `message` (see
+    /// `derive_lease_conditions`). Mirrors `ClusterInstanceStatus.conditions`.
+    /// Currently emitted: `Bound` (True once a cluster is assigned) and
+    /// `Satisfiable` (False on the no-Ready-cluster path, carrying the
+    /// unsatisfiable reason). These give `kubectl` and ops tooling a familiar,
+    /// machine-readable surface for *why* the lease is where it is, alongside
+    /// the human-readable `message`.
+    ///
+    /// `skip_serializing_if = "Vec::is_empty"` protects the list from
+    /// Merge-Patch erasure, same pattern as `message`: a writer that emits an
+    /// empty `Vec` (e.g. a status patch that only touches another field) must
+    /// omit the key entirely — otherwise a JSON Merge Patch carrying
+    /// `"conditions": []` would replace the on-disk list with an empty one
+    /// (RFC 7396 / array-replacement).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ClusterLeaseCondition>,
+}
+
+/// One status condition on a `ClusterLease`. Mirrors the core/v1 condition
+/// shape (type/status/reason/message/lastTransitionTime) — and
+/// `ClusterInstanceCondition` — so kubectl and operators see a familiar
+/// surface across all Kobe resources.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterLeaseCondition {
+    /// Condition name. Emitted values: `Bound`, `Satisfiable`.
+    #[serde(rename = "type")]
+    pub condition_type: String,
+
+    /// One of: `True`, `False`, `Unknown`.
+    pub status: String,
+
+    /// Machine-readable reason. For `Bound` this is the current phase
+    /// (e.g. `Bound`, `Pending`, `Expired`). For `Satisfiable` it is the
+    /// unsatisfiable classification (e.g. `Warming`, `PoolExhausted`) on the
+    /// no-Ready-cluster path, or the phase otherwise.
+    pub reason: String,
+
+    /// Human-readable detail, generally a copy of `status.message` for the
+    /// current state (or empty when there is none).
+    pub message: String,
+
+    /// RFC3339 of the last status change. Updated only when `status`
+    /// flips (True ↔ False ↔ Unknown), not on every reconcile, so tools
+    /// tailing `kubectl get -w` see meaningful transitions rather than churn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
 }
 
 /// Lease lifecycle phases.
@@ -179,6 +228,65 @@ mod json_safety_tests {
         assert_eq!(
             v.get("boundAt").and_then(|x| x.as_str()),
             Some("2026-06-04T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn empty_conditions_are_omitted_from_serialized_status() {
+        // An empty `conditions` Vec must NOT serialize (skip_serializing_if =
+        // Vec::is_empty), so a Merge-Patch from a writer that does not set
+        // conditions never carries `"conditions": []` — which would erase a
+        // previously-derived list per RFC 7396 array-replacement.
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Pending,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        assert!(
+            v.get("conditions").is_none(),
+            "empty conditions must be omitted, got: {v}"
+        );
+
+        // A populated list serializes with camelCase keys.
+        let st = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            conditions: vec![ClusterLeaseCondition {
+                condition_type: "Bound".into(),
+                status: "True".into(),
+                reason: "Bound".into(),
+                message: "running".into(),
+                last_transition_time: Some("2026-06-04T00:00:00Z".into()),
+            }],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        let conds = v.get("conditions").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].get("type").and_then(|x| x.as_str()), Some("Bound"));
+        assert_eq!(
+            conds[0].get("lastTransitionTime").and_then(|x| x.as_str()),
+            Some("2026-06-04T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn legacy_status_without_conditions_deserializes() {
+        // Back-compat: a ClusterLease persisted before the conditions field
+        // existed (no `conditions` key) must still deserialize, defaulting to
+        // an empty Vec.
+        let legacy = serde_json::json!({
+            "phase": "Bound",
+            "clusterName": "pool-x-0",
+            "expiresAt": "2026-06-04T01:00:00Z",
+            "queuePosition": 0,
+            "extensionsCount": 0,
+            "maxExtensions": 2
+        });
+        let status: ClusterLeaseStatus = serde_json::from_value(legacy).unwrap();
+        assert_eq!(status.phase, LeasePhase::Bound);
+        assert!(
+            status.conditions.is_empty(),
+            "missing conditions must default to an empty Vec"
         );
     }
 }

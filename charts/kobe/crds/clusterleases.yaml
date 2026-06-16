@@ -72,6 +72,62 @@ spec:
                 description: Name of the bound cluster (set when phase=Bound).
                 nullable: true
                 type: string
+              conditions:
+                description: |-
+                  Standard Kubernetes-style status conditions, derived by the lease
+                  controller from `phase` / `cluster_name` / `message` (see
+                  `derive_lease_conditions`). Mirrors `ClusterInstanceStatus.conditions`.
+                  Currently emitted: `Bound` (True once a cluster is assigned) and
+                  `Satisfiable` (False on the no-Ready-cluster path, carrying the
+                  unsatisfiable reason). These give `kubectl` and ops tooling a familiar,
+                  machine-readable surface for *why* the lease is where it is, alongside
+                  the human-readable `message`.
+
+                  `skip_serializing_if = "Vec::is_empty"` protects the list from
+                  Merge-Patch erasure, same pattern as `message`: a writer that emits an
+                  empty `Vec` (e.g. a status patch that only touches another field) must
+                  omit the key entirely — otherwise a JSON Merge Patch carrying
+                  `"conditions": []` would replace the on-disk list with an empty one
+                  (RFC 7396 / array-replacement).
+                items:
+                  description: |-
+                    One status condition on a `ClusterLease`. Mirrors the core/v1 condition
+                    shape (type/status/reason/message/lastTransitionTime) — and
+                    `ClusterInstanceCondition` — so kubectl and operators see a familiar
+                    surface across all Kobe resources.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        RFC3339 of the last status change. Updated only when `status`
+                        flips (True ↔ False ↔ Unknown), not on every reconcile, so tools
+                        tailing `kubectl get -w` see meaningful transitions rather than churn.
+                      nullable: true
+                      type: string
+                    message:
+                      description: |-
+                        Human-readable detail, generally a copy of `status.message` for the
+                        current state (or empty when there is none).
+                      type: string
+                    reason:
+                      description: |-
+                        Machine-readable reason. For `Bound` this is the current phase
+                        (e.g. `Bound`, `Pending`, `Expired`). For `Satisfiable` it is the
+                        unsatisfiable classification (e.g. `Warming`, `PoolExhausted`) on the
+                        no-Ready-cluster path, or the phase otherwise.
+                      type: string
+                    status:
+                      description: 'One of: `True`, `False`, `Unknown`.'
+                      type: string
+                    type:
+                      description: 'Condition name. Emitted values: `Bound`, `Satisfiable`.'
+                      type: string
+                  required:
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
               diagnosticsUrl:
                 description: URL to the diagnostic bundle captured on release.
                 nullable: true
@@ -102,7 +158,7 @@ spec:
 
                   skip_serializing_if: omit when None so a JSON-Merge-Patch (RFC 7396)
                   pass-through preservation can't erase a previously-set message via an
-                  explicit null. (Full K8s `conditions` are a deliberate follow-up.)
+                  explicit null.
                 nullable: true
                 type: string
               phase:

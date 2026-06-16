@@ -835,12 +835,25 @@ pub enum LeaseUnsatisfiableReason {
 }
 
 impl LeaseUnsatisfiableReason {
+    /// snake_case label for the `kobe_lease_unsatisfiable_total` metric.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PoolExhausted => "pool_exhausted",
             Self::CapacityBlocked => "capacity_blocked",
             Self::Degraded => "degraded",
             Self::Warming => "warming",
+        }
+    }
+
+    /// PascalCase reason for a Kubernetes status `Condition` — K8s convention
+    /// is PascalCase condition reasons, and it keeps the lease's `Satisfiable`
+    /// reason consistent with its PascalCase `Bound` reason (the phase).
+    pub const fn condition_reason(self) -> &'static str {
+        match self {
+            Self::PoolExhausted => "PoolExhausted",
+            Self::CapacityBlocked => "CapacityBlocked",
+            Self::Degraded => "Degraded",
+            Self::Warming => "Warming",
         }
     }
 }
