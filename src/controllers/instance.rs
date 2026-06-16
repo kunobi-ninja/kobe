@@ -592,22 +592,110 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         .await?;
                         Ok(Action::requeue(std::time::Duration::from_secs(5)))
                     }
-                    // Not scheduling-blocked. If a PRIOR reconcile marked this
-                    // instance blocked but it no longer is (capacity freed, or it
-                    // scheduled and is now wedged for a different reason), the
-                    // sticky `SCHEDULING_BLOCKED_MESSAGE_PREFIX` in status.message
-                    // must be EDGE-CLEARED — otherwise `build_pool_state` keeps
-                    // reporting scheduling_blocked=true and the pool manager
-                    // suppresses the legitimate creating-timeout recycle forever
-                    // (#189 review). Overwrite with a neutral message (a Merge
-                    // patch can't reliably null a skipped field) and reset
-                    // `state_since` so the now-schedulable instance gets a fresh
-                    // bootstrap window instead of an immediate recycle for time
-                    // consumed while it was held.
+                    // Not scheduling-blocked. Before the edge-clear, run the
+                    // crashloop probe (#197): a guest container stuck in
+                    // CrashLoopBackOff has scheduled (so the scheduling probe
+                    // returned None) but is still not coming up. This is purely
+                    // OBSERVABILITY — we emit `kobe_guest_pod_crashloop_total`
+                    // and stamp a human `status.message` so an operator sees
+                    // "server-0 CrashLoopBackOff exit 2 (x6)" on a dashboard.
+                    // We deliberately do NOT change the recycle path: the
+                    // creating-timeout still recycles this entry exactly as
+                    // today (respawning a crashlooper is the established
+                    // remediation), so `state_since` is carried through
+                    // UNCHANGED — resetting it would push back the timeout.
                     Ok(None) => {
-                        if status.message.as_deref().is_some_and(|m| {
+                        match detect_instance_crashloop(&ctx, &config, &name, &ns).await {
+                            Ok(Some(crash)) => {
+                                let backend_str = backend_label(&config.backend.backend_type);
+                                crate::metrics::GUEST_POD_CRASHLOOP_TOTAL
+                                    .with_label_values(&[
+                                        profile_label(&instance),
+                                        backend_str,
+                                        crash.pod_role.as_str(),
+                                        &crash.exit_code,
+                                    ])
+                                    .inc();
+                                warn!(
+                                    instance = %name,
+                                    owner = %owner,
+                                    pod_role = crash.pod_role.as_str(),
+                                    reason = %crash.reason,
+                                    exit_code = %crash.exit_code,
+                                    restart_count = crash.restart_count,
+                                    message = %crash.message,
+                                    "Guest Pod crashlooping (observability only; recycle unchanged)"
+                                );
+                                patch_instance_status(
+                                    &instances_api,
+                                    &instance,
+                                    ClusterInstanceStatus {
+                                        phase: ClusterInstancePhase::Creating,
+                                        provisioned: true,
+                                        bootstrapped: false,
+                                        lease_ref: status.lease_ref.clone(),
+                                        active_bootstrap: None,
+                                        idle_since: status.idle_since.clone(),
+                                        // Preserve the existing transition time —
+                                        // do NOT restart the stuck-Creating timer
+                                        // (the recycle must fire on schedule).
+                                        state_since: status.state_since.clone(),
+                                        health_failures: status.health_failures,
+                                        spec_hash: status.spec_hash.clone(),
+                                        // The crash message carries the
+                                        // CRASHLOOP_MESSAGE_MARKER verbatim, which
+                                        // build_pool_state reads to label the
+                                        // recycle CrashLooping (not Timeout).
+                                        message: Some(crash.message),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
+                                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug!(
+                                    instance = %name,
+                                    error = %format!("{e:#}"),
+                                    "crashloop probe failed; treating as not-crashlooping"
+                                );
+                                // Short-circuit: a transient probe error must NOT
+                                // fall through to the edge-clear below, which would
+                                // wipe a still-valid crashloop marker off the stale
+                                // status.message for one cycle (#197 review). Leave
+                                // the marker; re-evaluate next reconcile.
+                                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                            }
+                        }
+
+                        // Neither scheduling-blocked nor crashlooping. If a PRIOR
+                        // reconcile stamped a sticky scheduling-block /
+                        // crashloop marker on status.message that no longer
+                        // applies (capacity freed, container recovered, or it is
+                        // now wedged for a different reason), it must be
+                        // EDGE-CLEARED — otherwise `build_pool_state` keeps
+                        // reporting scheduling_blocked/crashlooping and the pool
+                        // manager mis-handles the creating-timeout recycle (#189
+                        // review). Overwrite with a neutral message (a Merge
+                        // patch can't reliably null a skipped field).
+                        //
+                        // `state_since` is reset ONLY for the scheduling-block
+                        // edge-clear: a held (backpressured) instance deserves a
+                        // fresh window once it can schedule. A crashloop entry was
+                        // NOT held, so on recovery we leave `state_since` intact.
+                        let was_scheduling_blocked = status.message.as_deref().is_some_and(|m| {
                             m.starts_with(crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX)
-                        }) {
+                        });
+                        let was_crashlooping = status.message.as_deref().is_some_and(|m| {
+                            m.contains(crate::pool::manager::CRASHLOOP_MESSAGE_MARKER)
+                        });
+                        if was_scheduling_blocked || was_crashlooping {
+                            let state_since = if was_scheduling_blocked {
+                                Some(chrono::Utc::now().to_rfc3339())
+                            } else {
+                                status.state_since.clone()
+                            };
                             patch_instance_status(
                                 &instances_api,
                                 &instance,
@@ -618,7 +706,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                     lease_ref: status.lease_ref.clone(),
                                     active_bootstrap: None,
                                     idle_since: status.idle_since.clone(),
-                                    state_since: Some(chrono::Utc::now().to_rfc3339()),
+                                    state_since,
                                     health_failures: status.health_failures,
                                     spec_hash: status.spec_hash.clone(),
                                     message: Some(
@@ -1830,6 +1918,25 @@ async fn detect_instance_scheduling_blocked<B: ClusterBackend + Clone>(
         backend.detect_scheduling_blocked(name, namespace).await
     } else {
         ctx.backend.detect_scheduling_blocked(name, namespace).await
+    }
+}
+
+/// Probe whether a still-`Creating` instance is wedged because its guest
+/// server/agent container is crashlooping (#197). Dispatches the same way as
+/// [`detect_instance_scheduling_blocked`] so the factory and single-backend
+/// wiring stay consistent. Default trait impl returns `Ok(None)` for every
+/// backend except k3s, so this is a cheap no-op everywhere else.
+async fn detect_instance_crashloop<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    name: &str,
+    namespace: &str,
+) -> Result<Option<crate::backend::GuestPodCrash>, anyhow::Error> {
+    if ctx.factory.is_some() {
+        let backend = backend_dispatch_for_config(ctx, config)?;
+        backend.detect_crashloop(name, namespace).await
+    } else {
+        ctx.backend.detect_crashloop(name, namespace).await
     }
 }
 

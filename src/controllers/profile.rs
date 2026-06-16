@@ -549,9 +549,10 @@ async fn reconcile_profile(
                             &bootstrap_specs,
                         )),
                         // Freshly created — it hasn't had a chance to report a
-                        // scheduling block yet; build_pool_state recomputes this
-                        // from status.message on the next reconcile.
+                        // scheduling block or crashloop yet; build_pool_state
+                        // recomputes both from status.message next reconcile.
                         scheduling_blocked: false,
+                        crashlooping: false,
                     },
                 );
             }
@@ -831,11 +832,24 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
                 m.starts_with(crate::pool::manager::SCHEDULING_BLOCKED_MESSAGE_PREFIX)
             });
 
+        // #197: a Creating instance whose backend reported its guest container
+        // is crashlooping carries the CRASHLOOP marker in `status.message`.
+        // Surface it as `crashlooping` so the stuck-Creating recycle is
+        // *labelled* `CrashLooping` — but, unlike scheduling_blocked, it is NOT
+        // held: a crashlooper still recycles on the creating-timeout as before.
+        // Only meaningful while Creating.
+        let crashlooping = state == ClusterState::Creating
+            && status
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains(crate::pool::manager::CRASHLOOP_MESSAGE_MARKER));
+
         debug!(
             profile = profile_name,
             cluster = %cluster_name,
             ?state,
             scheduling_blocked,
+            crashlooping,
             "Discovered cluster from ClusterInstance"
         );
 
@@ -848,6 +862,7 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
                 state_since: parse_optional_time(status.state_since.as_deref()),
                 spec_hash: status.spec_hash,
                 scheduling_blocked,
+                crashlooping,
             },
         );
     }

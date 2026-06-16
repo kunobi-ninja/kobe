@@ -293,6 +293,14 @@ pub struct ClusterEntry {
     /// (extends `next_attempt_at`) for it instead. Derived from the synced
     /// status message in `build_pool_state`; `false` for every other state.
     pub scheduling_blocked: bool,
+    /// The instance controller flagged this Creating instance as crashlooping
+    /// (guest server/agent container `CrashLoopBackOff`, #197) via its
+    /// `status.message` marker. Purely observational: it does NOT suppress the
+    /// stuck-Creating recycle (a crashlooper SHOULD be respawned). It only
+    /// switches the recycle's [`crate::metrics::StuckCreatingReason`] label
+    /// from `Timeout` to `CrashLooping` so the wedge is attributable. Derived
+    /// from the synced status message in `build_pool_state`; `false` otherwise.
+    pub crashlooping: bool,
 }
 
 /// Decisions the pool manager emits after evaluating state.
@@ -426,6 +434,23 @@ const UNSTAMPED_RECYCLE_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// respawn Pods that still can't schedule (a thundering herd).
 pub const SCHEDULING_BLOCKED_MESSAGE_PREFIX: &str = "scheduling blocked:";
 
+/// Marker the instance controller embeds in `ClusterInstance.status.message`
+/// when it detects the guest server/agent container is crashlooping (#197).
+///
+/// Same cross-controller channel as [`SCHEDULING_BLOCKED_MESSAGE_PREFIX`]: the
+/// instance controller (producer) holds the live backend handle to probe the
+/// Pods' `containerStatuses[]`, while the pool manager (consumer) labels the
+/// stuck-Creating recycle. Matched as a substring (the human crash message is
+/// `guest <role> pod CrashLoopBackOff: ...`, which carries this token
+/// verbatim) so the message stays readable rather than being a coded prefix.
+///
+/// Unlike the scheduling-block prefix this does NOT change the recycle
+/// decision — a crashlooping `Creating` still recycles on the creating-timeout
+/// exactly as before; the marker only lets the manager emit
+/// `kobe_instance_stuck_creating_total{reason="crashlooping"}` so the recycle
+/// is attributable to a crash rather than a plain timeout (#197).
+pub const CRASHLOOP_MESSAGE_MARKER: &str = "CrashLoopBackOff";
+
 /// Whether a cluster entry should recycle for spec drift.
 ///
 /// A *stamped* entry drifts when its hash differs from `current_hash`. An
@@ -528,10 +553,7 @@ pub fn compute_pool_actions(
                 && let Some(since) = entry.state_since
                 && now - since > creating_timeout
             {
-                emit_stuck_creating(
-                    &metric_profile,
-                    crate::metrics::StuckCreatingReason::Timeout,
-                );
+                emit_stuck_creating(&metric_profile, stuck_creating_reason(entry));
                 actions.push(PoolAction::Delete(name.clone()));
                 deleting.insert(name.clone());
             }
@@ -640,10 +662,7 @@ pub fn compute_pool_actions(
             && let Some(since) = entry.state_since
             && now - since > creating_timeout
         {
-            emit_stuck_creating(
-                &metric_profile,
-                crate::metrics::StuckCreatingReason::Timeout,
-            );
+            emit_stuck_creating(&metric_profile, stuck_creating_reason(entry));
             actions.push(PoolAction::Delete(name.clone()));
             deleting.insert(name.clone());
         }
@@ -718,6 +737,19 @@ fn emit_stuck_creating(profile: &str, reason: crate::metrics::StuckCreatingReaso
     crate::metrics::INSTANCE_STUCK_CREATING_TOTAL
         .with_label_values(&[profile, reason.as_str()])
         .inc();
+}
+
+/// Pick the [`crate::metrics::StuckCreatingReason`] for a timed-out Creating
+/// recycle. A crashlooping entry (flagged via its `status.message` marker, see
+/// [`CRASHLOOP_MESSAGE_MARKER`]) is labelled `CrashLooping`; otherwise it's a
+/// plain `Timeout`. This is label-only — the recycle decision (the `Delete`)
+/// is identical in both cases (#197).
+fn stuck_creating_reason(entry: &ClusterEntry) -> crate::metrics::StuckCreatingReason {
+    if entry.crashlooping {
+        crate::metrics::StuckCreatingReason::CrashLooping
+    } else {
+        crate::metrics::StuckCreatingReason::Timeout
+    }
 }
 
 /// Maximum clusters to create in a single reconciliation pass.
@@ -1179,6 +1211,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1190,6 +1223,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1201,6 +1235,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
 
@@ -1232,6 +1267,7 @@ mod tests {
                 state_since: None,
                 spec_hash: Some(current.clone()),
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1243,6 +1279,7 @@ mod tests {
                 state_since: None,
                 spec_hash: Some("ddddffffffffffff".to_string()),
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1254,6 +1291,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1265,6 +1303,7 @@ mod tests {
                 state_since: None,
                 spec_hash: Some("ddddffffffffffff".to_string()),
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -1378,6 +1417,7 @@ mod tests {
             state_since: None,
             spec_hash: None,
             scheduling_blocked: false,
+            crashlooping: false,
         }
     }
 
@@ -1542,6 +1582,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1553,6 +1594,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -1599,6 +1641,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1610,6 +1653,7 @@ mod tests {
                 state_since: None,
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -1661,6 +1705,7 @@ mod tests {
                 state_since: None,
                 spec_hash: Some(stale_hash.clone()), // stale
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -1672,6 +1717,7 @@ mod tests {
                 state_since: None,
                 spec_hash: Some(stale_hash.clone()), // stale but leased
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -1884,6 +1930,7 @@ mod tests {
                 state_since: None,
                 spec_hash: Some(current_hash),
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -2251,6 +2298,7 @@ mod tests {
             state_since: Some(chrono::Utc::now() - chrono::Duration::seconds(age_seconds)),
             spec_hash: Some("ddddffffffffffff".to_string()), // never matches the real current hash
             scheduling_blocked: false,
+            crashlooping: false,
         }
     }
 
@@ -2262,6 +2310,7 @@ mod tests {
             state_since: Some(chrono::Utc::now()),
             spec_hash: Some(current_hash),
             scheduling_blocked: false,
+            crashlooping: false,
         }
     }
 
@@ -2588,6 +2637,7 @@ mod tests {
                 state_since: Some(chrono::Utc::now() - chrono::Duration::minutes(10)),
                 spec_hash: Some(current.clone()),
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -2844,6 +2894,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(15)),
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -2855,6 +2906,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(25)),
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -2909,6 +2961,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(12)),
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -2964,6 +3017,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(30)),
                 spec_hash: None,
                 scheduling_blocked: true,
+                crashlooping: false,
             },
         );
         // Clean, equally-old Creating — the control: it MUST be Deleted.
@@ -2976,6 +3030,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(30)),
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };
@@ -3000,6 +3055,79 @@ mod tests {
         assert!(
             deletes.contains(&"pool-test-profile-clean".to_string()),
             "a clean Creating past the timeout must still be recycled; deletes={deletes:?}"
+        );
+    }
+
+    /// #197: `stuck_creating_reason` labels a crashlooping entry `CrashLooping`
+    /// and a plain one `Timeout`.
+    #[test]
+    fn stuck_creating_reason_labels_crashloop() {
+        let mut crashing = make_entry(ClusterState::Creating);
+        crashing.crashlooping = true;
+        assert_eq!(
+            stuck_creating_reason(&crashing),
+            crate::metrics::StuckCreatingReason::CrashLooping
+        );
+
+        let plain = make_entry(ClusterState::Creating);
+        assert_eq!(
+            stuck_creating_reason(&plain),
+            crate::metrics::StuckCreatingReason::Timeout
+        );
+    }
+
+    /// #197 (control flow unchanged): a CRASHLOOPING Creating past the
+    /// creating-timeout MUST still be recycled — unlike scheduling-blocked, the
+    /// crashloop flag is observability-only and does NOT suppress the Delete.
+    #[test]
+    fn crashlooping_creating_is_still_recycled_by_timeout() {
+        let profile = make_profile(
+            6,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 6,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+
+        let mut clusters = HashMap::new();
+        // Crashlooping for 30m (well past 10m) — MUST still be Deleted, exactly
+        // like a plain stuck Creating.
+        clusters.insert(
+            "pool-test-profile-crashing".into(),
+            ClusterEntry {
+                state: ClusterState::Creating,
+                idle_since: None,
+                health_failures: 0,
+                state_since: Some(now - chrono::Duration::minutes(30)),
+                spec_hash: None,
+                scheduling_blocked: false,
+                crashlooping: true,
+            },
+        );
+        let state = PoolState { clusters };
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deletes.contains(&"pool-test-profile-crashing".to_string()),
+            "a crashlooping Creating past the timeout MUST still be recycled (observability-only flag); deletes={deletes:?}"
         );
     }
 
@@ -3038,6 +3166,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(30)),
                 spec_hash: None,
                 scheduling_blocked: true,
+                crashlooping: false,
             },
         );
         clusters.insert(
@@ -3049,6 +3178,7 @@ mod tests {
                 state_since: Some(now - chrono::Duration::minutes(30)),
                 spec_hash: None,
                 scheduling_blocked: false,
+                crashlooping: false,
             },
         );
         let state = PoolState { clusters };

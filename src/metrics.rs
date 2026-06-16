@@ -540,6 +540,13 @@ pub enum StuckCreatingReason {
     /// being Deleted, because respawning would only create more unschedulable
     /// Pods.
     Unschedulable,
+    /// The guest server/agent container is genuinely crashlooping
+    /// (`CrashLoopBackOff`, or `restartCount >= 2` with a non-zero
+    /// `lastState.terminated` exit). Unlike `Unschedulable` this DOES recycle
+    /// on the existing creating-timeout (respawning a crashlooper is the
+    /// established remediation, #197); the variant exists only to label the
+    /// recycle so a crash-driven wedge is distinguishable from a plain timeout.
+    CrashLooping,
 }
 
 impl StuckCreatingReason {
@@ -548,6 +555,7 @@ impl StuckCreatingReason {
             Self::Timeout => "timeout",
             Self::Drift => "drift",
             Self::Unschedulable => "unschedulable",
+            Self::CrashLooping => "crashlooping",
         }
     }
 }
@@ -757,6 +765,23 @@ pub static GUEST_POD_UNSCHEDULABLE_TOTAL: LazyLock<IntCounterVec> = LazyLock::ne
         "kobe_guest_pod_unschedulable_total",
         "Guest-cluster server/agent Pods the host scheduler could not place, by pod role and reason",
         &["profile", "backend", "pod_role", "reason"]
+    )
+    .unwrap()
+});
+
+/// Guest-cluster server/agent Pods whose container is crashlooping
+/// (`CrashLoopBackOff`, or a `restartCount >= 2` with a non-zero
+/// `lastState.terminated` exit). Incremented by the instance controller's
+/// `Creating` arm when its crashloop detector fires (#197), so an operator
+/// sees "server-0 CrashLoopBackOff exit 2" on a dashboard instead of having to
+/// run `kubectl logs`. Keyed by the bounded [`GuestPodRole`] plus the
+/// `exit_code` as a string label (a small, fixed set in practice — k3s exits
+/// with a handful of codes), so cardinality stays a bounded product per pool.
+pub static GUEST_POD_CRASHLOOP_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_guest_pod_crashloop_total",
+        "Guest-cluster server/agent Pods crashlooping, by pod role and exit code",
+        &["profile", "backend", "pod_role", "exit_code"]
     )
     .unwrap()
 });
@@ -1091,6 +1116,7 @@ pub fn init() {
     LazyLock::force(&INSTANCE_STUCK_CREATING_TOTAL);
     LazyLock::force(&GUEST_POD_OOM_KILLS_TOTAL);
     LazyLock::force(&GUEST_POD_UNSCHEDULABLE_TOTAL);
+    LazyLock::force(&GUEST_POD_CRASHLOOP_TOTAL);
     LazyLock::force(&CONNECT_PROXY_REQUEST_OUTCOME_TOTAL);
     // Auth
     LazyLock::force(&AUTH_SUCCESS_TOTAL);
@@ -1310,6 +1336,7 @@ mod tests {
         assert_eq!(StuckCreatingReason::Timeout.as_str(), "timeout");
         assert_eq!(StuckCreatingReason::Drift.as_str(), "drift");
         assert_eq!(StuckCreatingReason::Unschedulable.as_str(), "unschedulable");
+        assert_eq!(StuckCreatingReason::CrashLooping.as_str(), "crashlooping");
     }
 
     /// The Unschedulable counter must be registerable with its full 4-label
@@ -1324,6 +1351,22 @@ mod tests {
         assert!(
             output.contains("kobe_guest_pod_unschedulable_total"),
             "unschedulable counter must appear after an observation"
+        );
+    }
+
+    /// The crashloop counter must be registerable with its full 4-label set
+    /// (`profile, backend, pod_role, exit_code`) so an emission at the call
+    /// site never panics on a label mismatch.
+    #[test]
+    fn guest_pod_crashloop_total_accepts_labels() {
+        init();
+        GUEST_POD_CRASHLOOP_TOTAL
+            .with_label_values(&["_test", "k3s", "server", "2"])
+            .inc();
+        let output = gather();
+        assert!(
+            output.contains("kobe_guest_pod_crashloop_total"),
+            "crashloop counter must appear after an observation"
         );
     }
 

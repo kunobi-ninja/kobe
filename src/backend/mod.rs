@@ -297,6 +297,16 @@ impl ClusterBackend for BackendDispatch {
             Self::Vcluster(b) => b.detect_scheduling_blocked(name, namespace).await,
         }
     }
+
+    async fn detect_crashloop(&self, name: &str, namespace: &str) -> Result<Option<GuestPodCrash>> {
+        match self {
+            Self::K3s(b) => b.detect_crashloop(name, namespace).await,
+            Self::K0s(b) => b.detect_crashloop(name, namespace).await,
+            Self::Capi(b) => b.detect_crashloop(name, namespace).await,
+            Self::Vkobe(b) => b.detect_crashloop(name, namespace).await,
+            Self::Vcluster(b) => b.detect_crashloop(name, namespace).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +388,36 @@ pub struct SchedulingBlocked {
     pub message: String,
     /// Which guest Pod is blocked (server vs agent), for the metric label.
     pub pod_role: crate::metrics::GuestPodRole,
+}
+
+/// A guest cluster whose control-plane (or agent) container is crashlooping.
+///
+/// Returned by [`ClusterBackend::detect_crashloop`] when an instance is wedged
+/// in `Creating` because its k3s server/agent container keeps crashing
+/// (`CrashLoopBackOff`, or `restartCount >= 2` with a non-zero
+/// `lastState.terminated` exit), as opposed to a pod that simply hasn't
+/// finished starting. The controller surfaces this as an observable signal
+/// (#197) — a clear `status.message` plus the `kobe_guest_pod_crashloop_total`
+/// metric — so an operator sees "server-0 CrashLoopBackOff exit 2 (x6)" on a
+/// dashboard instead of having to run `kubectl logs`. Unlike
+/// [`SchedulingBlocked`] this does NOT suppress the creating-timeout recycle:
+/// respawning a crashlooper is the established remediation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPodCrash {
+    /// Which guest Pod is crashlooping (server vs agent), for the metric label.
+    pub pod_role: crate::metrics::GuestPodRole,
+    /// Container exit code from `lastState.terminated.exitCode`, stringified for
+    /// the metric label (a small, fixed set in practice). `"unknown"` when the
+    /// signal was `CrashLoopBackOff` with no terminated state available yet.
+    pub exit_code: String,
+    /// Termination reason from `lastState.terminated.reason` (e.g. `Error`,
+    /// `OOMKilled`), or `"CrashLoopBackOff"` when derived from the waiting state.
+    pub reason: String,
+    /// Container restart count at observation time, for the human message.
+    pub restart_count: i32,
+    /// Short human string, e.g.
+    /// `guest server pod CrashLoopBackOff: Error exit 2 (x6)`.
+    pub message: String,
 }
 
 /// Backend-agnostic interface for managing virtual cluster lifecycles.
@@ -465,6 +505,30 @@ pub trait ClusterBackend: Send + Sync {
         _name: &str,
         _namespace: &str,
     ) -> impl std::future::Future<Output = Result<Option<SchedulingBlocked>>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Classify whether a still-`Creating` instance is wedged because its guest
+    /// server/agent container is crashlooping (`CrashLoopBackOff`, or a
+    /// `restartCount >= 2` with a non-zero `lastState.terminated` exit, #197).
+    ///
+    /// Returns `Ok(Some(GuestPodCrash {..}))` when crashlooping, `Ok(None)`
+    /// when the pods are absent / still starting / running (NOT a crashloop).
+    /// Errors are surfaced so callers can treat a probe failure as "unknown —
+    /// don't act" rather than "not crashlooping".
+    ///
+    /// This is purely observational: a positive result drives a metric and a
+    /// `status.message`, NOT a control-flow change — a crashlooping `Creating`
+    /// still recycles on the existing creating-timeout exactly as today.
+    ///
+    /// Default is `Ok(None)`: only backends that own host-cluster Pods (k3s
+    /// today) can observe this, so every other backend (k0s, vcluster, capi,
+    /// vkobe) inherits the no-op and is entirely unaffected.
+    fn detect_crashloop(
+        &self,
+        _name: &str,
+        _namespace: &str,
+    ) -> impl std::future::Future<Output = Result<Option<GuestPodCrash>>> + Send {
         async { Ok(None) }
     }
 }

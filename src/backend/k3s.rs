@@ -33,7 +33,7 @@ use crate::crd::{
 };
 
 use super::{
-    ClusterBackend, SchedulingBlocked, apply_addon_impl, check_readiness_gate_impl,
+    ClusterBackend, GuestPodCrash, SchedulingBlocked, apply_addon_impl, check_readiness_gate_impl,
     check_virtual_health, data_volume_claim_template, datastore, node_affinity_from_selector,
     read_kubeconfig_secret, server_anti_affinity_terms, virtual_client_from_kubeconfig,
 };
@@ -241,6 +241,96 @@ fn latest_failed_scheduling_event(events: &[K8sEvent], pod_name: &str) -> Option
                 e.message.clone().unwrap_or_default(),
             )
         })
+}
+
+/// The kubeconfig-publisher sidecar container name. The crashloop classifier
+/// ignores it: a publisher restart is an operational detail, not a guest
+/// control-plane crash, and flagging it would produce noisy false positives.
+const PUBLISHER_CONTAINER: &str = "kubeconfig-publisher";
+
+/// Pure classifier: is THIS pod's guest container crashlooping?
+///
+/// Conservative on purpose (the #189/#191 review demanded no false positives):
+/// a container is treated as crashlooping ONLY when either
+/// - its `state.waiting.reason == "CrashLoopBackOff"` (the kubelet has already
+///   given up and is backing off restarts), OR
+/// - `restartCount >= 2` AND `lastState.terminated` is present with a non-zero
+///   `exitCode` (it has actually died with an error more than once).
+///
+/// A single restart, a still-starting container (no terminated state), a clean
+/// exit (exitCode 0), or a `Running`/`Ready` container is NOT a crashloop —
+/// those are normal bring-up states the existing readiness/timeout logic
+/// already covers. The kubeconfig-publisher sidecar is skipped entirely.
+///
+/// Returns a [`GuestPodCrash`] (without the `pod_role`, which the caller fills
+/// from the pod's label) carrying the exit code / reason / restart count and a
+/// short human message, else `None`. Extracted pure so it is unit-testable
+/// without a live apiserver.
+///
+/// Follow-up (#197): capturing the container's `--previous` logs alongside this
+/// signal is intentionally out of scope for this PR; this classifier only reads
+/// `containerStatuses[]` from the Pod object.
+fn pod_crashloop(pod: &Pod, pod_role: crate::metrics::GuestPodRole) -> Option<GuestPodCrash> {
+    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+    statuses.iter().find_map(|cs| {
+        // Ignore the kubeconfig publisher: focus on the k3s container(s).
+        if cs.name == PUBLISHER_CONTAINER {
+            return None;
+        }
+
+        // Signal 1: the kubelet is actively backing off restarts.
+        let crashloop_backoff = cs
+            .state
+            .as_ref()
+            .and_then(|s| s.waiting.as_ref())
+            .and_then(|w| w.reason.as_deref())
+            == Some("CrashLoopBackOff");
+
+        // Last terminated state (if any) carries the exit code / reason. We
+        // require restartCount >= 2 for the terminated-only signal so a single
+        // crash-then-recover doesn't trip it.
+        let terminated = cs.last_state.as_ref().and_then(|s| s.terminated.as_ref());
+        // A container that has already gone Ready is recovered, not crashlooping —
+        // don't flag it off the terminated-only signal (#197 review). Gate on
+        // `ready` (not merely `state.running`): a crashlooper sampled in its brief
+        // running window between restarts is not yet Ready, so it is still caught.
+        // Signal 1 (CrashLoopBackOff waiting) is unaffected — a backing-off
+        // container is never ready.
+        let terminated_repeatedly =
+            !cs.ready && cs.restart_count >= 2 && terminated.is_some_and(|t| t.exit_code != 0);
+
+        if !crashloop_backoff && !terminated_repeatedly {
+            return None;
+        }
+
+        // Prefer the concrete terminated reason/exit code; fall back to the
+        // CrashLoopBackOff waiting state when no terminated record is present.
+        let (reason, exit_code) = match terminated {
+            Some(t) => (
+                t.reason
+                    .clone()
+                    .unwrap_or_else(|| "CrashLoopBackOff".to_string()),
+                t.exit_code.to_string(),
+            ),
+            None => ("CrashLoopBackOff".to_string(), "unknown".to_string()),
+        };
+
+        let message = format!(
+            "guest {} pod CrashLoopBackOff: {} exit {} (x{})",
+            pod_role.as_str(),
+            reason,
+            exit_code,
+            cs.restart_count,
+        );
+
+        Some(GuestPodCrash {
+            pod_role,
+            exit_code,
+            reason,
+            restart_count: cs.restart_count,
+            message,
+        })
+    })
 }
 
 /// HA gate: `servers > 1` requires an external (shared) datastore.
@@ -1412,6 +1502,59 @@ impl K3sBackend {
         Ok(None)
     }
 
+    /// Read the cluster's guest server/agent Pods and classify whether the
+    /// instance is wedged because a guest container is crashlooping (#197).
+    ///
+    /// Mirrors [`detect_scheduling_blocked_impl`]'s pod-listing approach: list
+    /// by the backend's own `cluster`+`role` labels (server first — the hard
+    /// bootstrap dependency — then agent), and delegate the per-pod decision to
+    /// the pure [`pod_crashloop`] classifier so the conservative rules stay
+    /// unit-testable. A missing-pods / list-error case is treated as "not
+    /// crashlooping" (`Ok(None)`): we only emit on a positive crash signal,
+    /// never on a transient read blip.
+    ///
+    /// Purely observational — the caller emits a metric + `status.message`; it
+    /// does NOT change the recycle/backoff control flow.
+    async fn detect_crashloop_impl(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Option<GuestPodCrash>> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        // server first (control-plane is the hard dependency), then agent.
+        for (role_label, pod_role) in [
+            ("server", crate::metrics::GuestPodRole::Server),
+            ("agent", crate::metrics::GuestPodRole::Agent),
+        ] {
+            let lp = ListParams::default().labels(&format!(
+                "kobe.kunobi.ninja/cluster={name},kobe.kunobi.ninja/role={role_label}"
+            ));
+            let pod_list = match pods.list(&lp).await {
+                Ok(list) => list,
+                // Read blip → "unknown", not "crashlooping": don't emit a
+                // crash signal off a transient list failure.
+                Err(e) => {
+                    debug!(
+                        cluster = name,
+                        role = role_label,
+                        error = %e,
+                        "crashloop probe: pod list failed (treating as not-crashlooping)"
+                    );
+                    continue;
+                }
+            };
+
+            for pod in &pod_list.items {
+                if let Some(crash) = pod_crashloop(pod, pod_role) {
+                    return Ok(Some(crash));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Delete a resource, ignoring 404 (already deleted).
     async fn delete_ignoring_not_found<K>(api: &Api<K>, name: &str) -> Result<()>
     where
@@ -1794,6 +1937,10 @@ impl ClusterBackend for K3sBackend {
         namespace: &str,
     ) -> Result<Option<SchedulingBlocked>> {
         self.detect_scheduling_blocked_impl(name, namespace).await
+    }
+
+    async fn detect_crashloop(&self, name: &str, namespace: &str) -> Result<Option<GuestPodCrash>> {
+        self.detect_crashloop_impl(name, namespace).await
     }
 }
 
@@ -4601,6 +4748,302 @@ mod tests {
             .detect_scheduling_blocked_impl("pool-test-1", "test-ns")
             .await
             .unwrap();
+        assert_eq!(got, None);
+    }
+
+    // =================================================================
+    // #197 — guest-Pod crashloop detection
+    // =================================================================
+
+    /// Build a Pod with a single named container status: restart count, an
+    /// optional `state.waiting.reason`, and an optional
+    /// `lastState.terminated.(reason, exitCode)`.
+    fn pod_with_container_status(
+        pod_name: &str,
+        container: &str,
+        restart_count: i32,
+        waiting_reason: Option<&str>,
+        terminated: Option<(&str, i32)>,
+    ) -> Pod {
+        let mut state = serde_json::Map::new();
+        if let Some(reason) = waiting_reason {
+            state.insert(
+                "waiting".to_string(),
+                serde_json::json!({ "reason": reason }),
+            );
+        } else {
+            state.insert("running".to_string(), serde_json::json!({}));
+        }
+        let last_state = terminated.map(|(reason, code)| {
+            serde_json::json!({
+                "terminated": { "reason": reason, "exitCode": code }
+            })
+        });
+        let value = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": pod_name, "namespace": "test-ns" },
+            "spec": { "containers": [{ "name": container, "image": "rancher/k3s:x" }] },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": container,
+                    "image": "rancher/k3s:x",
+                    "imageID": "",
+                    "ready": false,
+                    "restartCount": restart_count,
+                    "state": state,
+                    "lastState": last_state.unwrap_or(serde_json::json!({})),
+                }],
+            }
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn pod_crashloop_flags_crashloopbackoff() {
+        // CrashLoopBackOff waiting state → crashlooping, with reason/exit code
+        // pulled from the lastState.terminated record.
+        let pod = pod_with_container_status(
+            "pool-x-server-0",
+            "k3s-server",
+            6,
+            Some("CrashLoopBackOff"),
+            Some(("Error", 2)),
+        );
+        let got = pod_crashloop(&pod, crate::metrics::GuestPodRole::Server);
+        assert_eq!(
+            got,
+            Some(GuestPodCrash {
+                pod_role: crate::metrics::GuestPodRole::Server,
+                exit_code: "2".to_string(),
+                reason: "Error".to_string(),
+                restart_count: 6,
+                message: "guest server pod CrashLoopBackOff: Error exit 2 (x6)".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_flags_repeated_nonzero_terminations() {
+        // No CrashLoopBackOff waiting state yet, but restartCount >= 2 and the
+        // last termination was a non-zero exit → crashlooping.
+        let pod = pod_with_container_status(
+            "pool-x-server-0",
+            "k3s-server",
+            3,
+            None,
+            Some(("Error", 137)),
+        );
+        let got = pod_crashloop(&pod, crate::metrics::GuestPodRole::Server);
+        assert_eq!(
+            got,
+            Some(GuestPodCrash {
+                pod_role: crate::metrics::GuestPodRole::Server,
+                exit_code: "137".to_string(),
+                reason: "Error".to_string(),
+                restart_count: 3,
+                message: "guest server pod CrashLoopBackOff: Error exit 137 (x3)".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_ignores_single_restart() {
+        // One restart with a non-zero exit is NOT a crashloop (conservative
+        // rule: requires restartCount >= 2 for the terminated-only signal).
+        let pod =
+            pod_with_container_status("pool-x-server-0", "k3s-server", 1, None, Some(("Error", 1)));
+        assert_eq!(
+            pod_crashloop(&pod, crate::metrics::GuestPodRole::Server),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_ignores_running_container() {
+        // A Running container that has never crashed → not crashlooping.
+        let pod = pod_with_container_status("pool-x-server-0", "k3s-server", 0, None, None);
+        assert_eq!(
+            pod_crashloop(&pod, crate::metrics::GuestPodRole::Server),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_ignores_clean_exit_restarts() {
+        // Repeated restarts but the last termination was a CLEAN exit (code 0)
+        // and no CrashLoopBackOff → not a crashloop (e.g. an orderly restart).
+        let pod = pod_with_container_status(
+            "pool-x-server-0",
+            "k3s-server",
+            4,
+            None,
+            Some(("Completed", 0)),
+        );
+        assert_eq!(
+            pod_crashloop(&pod, crate::metrics::GuestPodRole::Server),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_ignores_recovered_ready_after_crashes() {
+        // Crashed >=2x during bootstrap but is NOW Ready → recovered, not
+        // crashlooping (#197 review): the terminated-only signal is gated on !ready.
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "pool-x-server-0", "namespace": "test-ns" },
+            "spec": { "containers": [{ "name": "k3s-server", "image": "rancher/k3s:x" }] },
+            "status": { "phase": "Running", "containerStatuses": [{
+                "name": "k3s-server", "image": "rancher/k3s:x", "imageID": "",
+                "ready": true, "restartCount": 3,
+                "state": { "running": {} },
+                "lastState": { "terminated": { "reason": "Error", "exitCode": 137 } }
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(
+            pod_crashloop(&pod, crate::metrics::GuestPodRole::Server),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_ignores_pending_no_container_status() {
+        // A still-starting Pod with no containerStatuses → not crashlooping.
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "pool-x-server-0", "namespace": "test-ns" },
+            "spec": { "containers": [] },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap();
+        assert_eq!(
+            pod_crashloop(&pod, crate::metrics::GuestPodRole::Server),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_ignores_publisher_sidecar() {
+        // The kubeconfig-publisher sidecar crashlooping must NOT be flagged:
+        // it is not a guest control-plane container.
+        let pod = pod_with_container_status(
+            "pool-x-server-0",
+            "kubeconfig-publisher",
+            9,
+            Some("CrashLoopBackOff"),
+            Some(("Error", 1)),
+        );
+        assert_eq!(
+            pod_crashloop(&pod, crate::metrics::GuestPodRole::Server),
+            None
+        );
+    }
+
+    #[test]
+    fn pod_crashloop_backoff_without_terminated_uses_unknown_exit() {
+        // CrashLoopBackOff with no lastState.terminated record yet → still
+        // flagged, with exit_code "unknown".
+        let pod = pod_with_container_status(
+            "pool-x-server-0",
+            "k3s-server",
+            2,
+            Some("CrashLoopBackOff"),
+            None,
+        );
+        let got = pod_crashloop(&pod, crate::metrics::GuestPodRole::Server)
+            .expect("CrashLoopBackOff must be flagged even without a terminated record");
+        assert_eq!(got.exit_code, "unknown");
+        assert_eq!(got.reason, "CrashLoopBackOff");
+    }
+
+    /// End-to-end (wiremock): a CrashLoopBackOff server pod makes the detector
+    /// report `GuestPodCrash` with the server role and the extracted exit code.
+    #[tokio::test]
+    async fn detect_crashloop_reports_crashlooping_server() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster},kobe.kunobi.ninja/role=server"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [serde_json::to_value(pod_with_container_status(
+                    "pool-test-1-server-0", "k3s-server", 6,
+                    Some("CrashLoopBackOff"), Some(("Error", 2)),
+                )).unwrap()]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let got = backend.detect_crashloop_impl(cluster, ns).await.unwrap();
+        assert_eq!(
+            got,
+            Some(GuestPodCrash {
+                pod_role: crate::metrics::GuestPodRole::Server,
+                exit_code: "2".to_string(),
+                reason: "Error".to_string(),
+                restart_count: 6,
+                message: "guest server pod CrashLoopBackOff: Error exit 2 (x6)".to_string(),
+            })
+        );
+        // Agent pods are never listed: the server crash short-circuits first.
+    }
+
+    /// A healthy (Running, no restarts) server pod with no agent pods → not
+    /// crashlooping (`Ok(None)`).
+    #[tokio::test]
+    async fn detect_crashloop_none_when_healthy() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+
+        let ns = "test-ns";
+        let cluster = "pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster},kobe.kunobi.ninja/role=server"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [serde_json::to_value(pod_with_container_status(
+                    "pool-test-1-server-0", "k3s-server", 0, None, None,
+                )).unwrap()]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/namespaces/{ns}/pods")))
+            .and(query_param(
+                "labelSelector",
+                format!("kobe.kunobi.ninja/cluster={cluster},kobe.kunobi.ninja/role=agent"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList",
+                "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let got = backend.detect_crashloop_impl(cluster, ns).await.unwrap();
         assert_eq!(got, None);
     }
 }
