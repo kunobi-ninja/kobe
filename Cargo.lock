@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "kobe-operator"
-version = "0.31.13"
+version = "0.32.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "kobectl"
-version = "0.31.13"
+version = "0.32.0-rc.1"
 dependencies = [
  "anyhow",
  "chrono",
