@@ -1,0 +1,80 @@
+[package]
+name = "kobectl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "kobe — CLI for the kobe cluster-pool operator: lease, inspect and manage instant CI/dev Kubernetes clusters"
+repository = "https://github.com/kunobi-ninja/kobe"
+homepage = "https://github.com/kunobi-ninja/kobe"
+keywords = ["kubernetes", "cli", "k3s", "ci", "cluster"]
+categories = ["command-line-utilities"]
+
+# The published crate is named `kobectl` (the names `kobe`/`kobe-cli` are taken
+# on crates.io by unrelated crates) but the BINARY it installs is `kobe`, the
+# same name every other channel (mise/brew/apt/winget/nix) ships.
+[[bin]]
+name = "kobe"
+path = "src/main.rs"
+
+[dependencies]
+# CLI-only dependency set — deliberately excludes the operator's heavy/unix-only
+# crates (kube, axum, sqlx, aws-sdk-s3 → aws-lc-sys, kunobi-ha, kunobi-reload).
+# Keeping this tree slim is what makes the Windows (msvc) cross-build viable.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+# rustls (ring) — never default-features (which would pull aws-lc-sys and break
+# the Windows cross-build, per kache's hard-won note).
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+# Dual git+version: the git source builds the repo today (and survives until
+# kunobi-auth is published to crates.io); the `version` requirement is what
+# `cargo publish` uses to resolve the dep from crates.io. Once kunobi-auth
+# v0.10.0 is on crates.io, the git key can be dropped.
+kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "v0.10.0", version = "0.10.0" }
+
+[package.metadata.binstall]
+# Asset stem is `kobe-<target>` (named after the binary, NOT the crate) — do NOT
+# use `{ name }` here, which would resolve to `kobectl-<target>`.
+pkg-url = "{ repo }/releases/download/v{ version }/kobe-{ target }{ archive-suffix }"
+# The release archive holds the bare `kobe` binary at its root (see
+# _release-rust.yml archive step).
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+# Windows targets are packaged as .zip by _release-rust.yml, not .tar.gz.
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+# Consumed by the shared release workflow's `build_deb`/`deb_package` path
+# (cargo-deb). `depends = ""` because the binary is a static musl build with no
+# shared-library deps for dpkg-shlibdeps to resolve. The copyright/license is
+# taken from the crate's `license = "Apache-2.0"` SPDX field (no license-file
+# path, which would not resolve from this member dir).
+[package.metadata.deb]
+# Override the Debian Package name to `kobe` (the crate is `kobectl`) so the
+# repo installs with `apt-get install kobe`, matching every other channel.
+name = "kobe"
+maintainer = "Kunobi Ninja <feedback@kunobi.ninja>"
+copyright = "2026, Zondax AG"
+depends = ""
+extended-description = "Command-line client for the kobe cluster-pool operator: lease, inspect and manage instant CI/dev Kubernetes clusters."
+section = "utils"
+priority = "optional"
+# `target/release/kobe` is rewritten to `target/<target>/release/kobe` by
+# cargo-deb when invoked with --target (matches kache's working config).
+assets = [
+    ["target/release/kobe", "usr/bin/kobe", "755"],
+]

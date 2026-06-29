@@ -1,0 +1,74 @@
+name: Publish crate
+
+# Publishes the kobe CLI crate `kobectl` to crates.io via OIDC Trusted
+# Publishing when a GitHub Release is published. Only the thin CLI crate is
+# published — `kobe-operator` ships as a container image, not a crate.
+#
+# Prerequisites (one-time, manual):
+#   - `kunobi-auth` must be published to crates.io first (kobectl depends on it;
+#     crates.io rejects git deps). See kunobi-ninja/kunobi-auth publish workflow.
+#   - crates.io Trusted Publisher configured for `kobectl` -> this repo + this
+#     workflow file.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish kobectl to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # OIDC for crates.io trusted publishing
+      actions: read # read CI job conclusions for the gate below
+    env:
+      CARGO_TERM_COLOR: always
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check release tag matches the workspace manifest
+        # Fail-closed version gate run directly here (not via require-ci-green) so
+        # the manual-UI-release path is gated too. Hermetic manifest reads.
+        run: ./scripts/check-version-consistency.sh "$RELEASE_TAG"
+
+      - name: Require CI green for this release commit
+        # Don't publish unless the release build/signing finished for this exact
+        # commit. `release: published` can fire from a hand-drafted UI release;
+        # this closes that hole.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" "release-cli / Upload release assets"
+
+      - name: Package kobectl
+        run: cargo package -p kobectl --locked
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1.0.4
+
+      - name: Publish kobectl
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          status="$(curl -sS -A kobe-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/kobectl/$version")"
+          if [ "$status" = "200" ]; then
+            echo "kobectl $version is already published"
+            exit 0
+          fi
+          if [ "$status" != "404" ]; then
+            echo "unexpected crates.io status while checking kobectl $version: $status" >&2
+            exit 1
+          fi
+          cargo publish -p kobectl --locked

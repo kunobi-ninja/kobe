@@ -1,0 +1,15 @@
+Origin: kobe
+Label: kobe
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: kobe — CLI for the cluster-pool operator: lease and manage instant CI/dev Kubernetes clusters (stable releases)
+
+Origin: kobe
+Label: kobe
+Suite: unstable
+Codename: unstable
+Architectures: amd64 arm64
+Components: main
+Description: kobe — CLI for the cluster-pool operator: lease and manage instant CI/dev Kubernetes clusters (pre-releases: RC/Beta)

@@ -5,24 +5,40 @@ on:
     branches: [main]
     paths:
       - "src/**"
+      - "crates/**"
       - "charts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "docker/**"
       - "docker-bake.hcl"
       - "hack/**"
+      - "scripts/**"
+      - "apt_config/**"
+      - "nix/**"
+      - "flake.nix"
+      - "flake.lock"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/package-publish.yml"
+      - ".github/workflows/publish-crates.yaml"
   push:
     branches: [main]
     paths:
       - "src/**"
+      - "crates/**"
       - "charts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "docker/**"
       - "docker-bake.hcl"
       - "hack/**"
+      - "scripts/**"
+      - "apt_config/**"
+      - "nix/**"
+      - "flake.nix"
+      - "flake.lock"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/package-publish.yml"
+      - ".github/workflows/publish-crates.yaml"
   release:
     types: [published]
   workflow_dispatch:
@@ -65,10 +81,11 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        # --workspace so the kobectl member is linted too (not just the operator).
+        run: cargo clippy --workspace -- -D warnings
 
       - name: Tests
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Security audit
         run: |
@@ -184,8 +201,15 @@ jobs:
         run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}
 
   publish:
-    if: github.event_name != 'pull_request'
-    needs: checks
+    # Pushes the operator/sync container images. On a RELEASE, gate the image
+    # push on version-consistency too, so a tag that disagrees with the manifest
+    # can't ship images while release-cli + crates are blocked. On push-to-main
+    # (where version-consistency is skipped) keep publishing as before.
+    needs: [checks, version-consistency]
+    if: >-
+      ${{ always() && github.event_name != 'pull_request'
+          && needs.checks.result == 'success'
+          && (github.event_name != 'release' || needs['version-consistency'].result == 'success') }}
     runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
@@ -213,35 +237,80 @@ jobs:
           BUILD_COMMIT: ${{ github.sha }}
         run: docker buildx bake -f docker-bake.hcl push
 
-  # Builds the kobe CLI for multiple targets and attaches the tarballs to
-  # the GitHub release as assets, so downstream tooling can install via
-  # `mise` (ubi backend) or `gh release download` in seconds instead of
-  # `cargo install --git`, which forces every consumer to compile from
-  # source on every CI run.
+  # Fail-closed version gate: on a release, the tag must agree with the
+  # workspace manifest version and Chart.yaml BEFORE any binary is built,
+  # signed, or published to crates.io. Hermetic (manifest reads only).
+  version-consistency:
+    if: github.event_name == 'release'
+    runs-on: kunobi-runners
+    container:
+      image: rust:1.94-bookworm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag == manifests
+        run: ./scripts/check-version-consistency.sh "${{ github.ref_name }}"
+
+  # Builds the kobe CLI (the `kobectl` member's `kobe` binary) for 6 targets,
+  # SIGNS them (macOS codesign+notarize, Windows code signing, Linux PGP via
+  # GCP-KMS), builds the Debian .deb assets, and attaches everything to the
+  # GitHub release. Consumed by:
+  #   - mise (ubi) / `gh release download` / cargo-binstall — prebuilt tarballs
+  #   - package-publish.yml — apt (.deb), brew (.sha256), winget (.exe)
   #
-  # Mirrors the pattern kache (also in this org) uses — same shared
-  # reusable workflow, same asset-naming convention. Asset names follow
-  # `kobe-<target>.tar.gz` (e.g. `kobe-x86_64-unknown-linux-musl.tar.gz`)
-  # which `ubi` resolves automatically by the consumer's host triple.
+  # Mirrors kache's `release` job (same shared reusable workflow + same shared
+  # Kunobi signing identity). Differences vs kache: kobe is a WORKSPACE, so
+  # `build_args` scopes the cross-build to `-p kobectl --bin kobe` (this also
+  # keeps the operator's `aws-lc-sys` out of the Windows tree, which is what
+  # makes the msvc cross-build viable), and `deb_package: kobectl` tells
+  # cargo-deb which member to package.
   #
-  # `extra_build_env` stamps the binary with the release tag so
-  # `kobe --version` reports the actual release; consumed by `build.rs`.
+  # Pinned to _workflows@v11 — the first tag carrying the generic-deb change
+  # (Zondax/_workflows#109: `deb_package` input + binary_name-based deb naming,
+  # which defaults to kache so the change is a strict no-op for existing
+  # consumers). This job will not function until that PR is merged and v11 is cut.
   release-cli:
     if: github.event_name == 'release'
-    needs: [checks]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@main
+    needs: [checks, version-consistency]
+    uses: zondax/_workflows/.github/workflows/_release-rust.yml@v11
     with:
       binary_name: kobe
-      # Match kache's target set exactly — drop x86_64-pc-windows-gnu.
-      # The Windows GNU cross-compile against Rust 1.94's std fails to
-      # link `GetHostNameW` (a Win32 API symbol newer std hostname code
-      # depends on), which mingw doesn't pull in via -lws2_32 by default
-      # — v0.12.3's release-cli job hit this and aborted. We have no
-      # Windows kobe consumer (Linux CI runners + macOS dev laptops only),
-      # so dropping the target is correct, not just expedient.
-      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin"]'
+      build_args: -p kobectl --bin kobe
+      deb_package: kobectl
+      # Build .deb assets (kobe_<version>_{amd64,arm64}.deb) for the apt repo.
+      build_deb: true
+      # Publish the bare signed kobe.exe per Windows arch (kobe-<triple>-pc-windows-msvc.exe)
+      # as a first-class asset so winget installs it as InstallerType: portable.
+      upload_windows_exe: true
+      # 6 targets incl. both Windows msvc arches, cross-built on Linux via
+      # cargo-xwin (no native Windows runner). The slim kobectl tree uses the
+      # `ring` rustls provider (NOT aws-lc-sys), so the arm64 msvc build links.
+      targets: '["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]'
       extra_build_env: |
         BUILD_VERSION=${{ github.ref_name }}
         BUILD_COMMIT=${{ github.sha }}
+        # Statically link the MSVC CRT so the .exe runs without the VC++
+        # Redistributable (winget validation VMs lack it). Applied per-triple.
+        CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static
+        CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static
+      # --- GCP-KMS code signing (reuses the shared CODESIGN_*/PGP_SIGN_* identity) ---
+      enable_signing: true
+      notarize_macos: true
+      jsign_sha256: ${{ vars.JSIGN_SHA256 }}
+      rcodesign_sha256: ${{ vars.RCODESIGN_SHA256 }}
+    secrets:
+      pgp_cert_base64: ${{ secrets.PGP_CERT_BASE64 }}
+      pgp_signer_token: ${{ secrets.GH_PAT_KUNOBI_NINJA_RELEASES }}
+      windows_cert_chain: ${{ secrets.CODESIGN_CERT_CHAIN }}
+      codesign_wif_provider: ${{ secrets.CODESIGN_WIF_PROVIDER }}
+      codesign_gcp_project: ${{ secrets.CODESIGN_GCP_PROJECT }}
+      codesign_service_account: ${{ secrets.CODESIGN_SERVICE_ACCOUNT }}
+      codesign_kms_keyring: ${{ secrets.CODESIGN_KMS_KEYRING }}
+      codesign_kms_key_alias: ${{ secrets.CODESIGN_KMS_KEY_ALIAS }}
+      pgp_sign_wif_provider: ${{ secrets.PGP_SIGN_WIF_PROVIDER }}
+      pgp_sign_gcp_project_id: ${{ secrets.PGP_SIGN_GCP_PROJECT_ID }}
+      pgp_sign_service_account: ${{ secrets.PGP_SIGN_SERVICE_ACCOUNT }}
+      pgp_sign_kms_key_version: ${{ secrets.PGP_SIGN_KMS_KEY_VERSION }}
     permissions:
       contents: write
+      id-token: write

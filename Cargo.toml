@@ -1,9 +1,25 @@
-[package]
-name = "kobe-operator"
-version = "0.0.0"
+[workspace]
+# The thin CLI crate `kobectl` (binary `kobe`) is a separate member so it can
+# be published to crates.io with a slim dependency tree. The operator stays the
+# root package (it is the bulk of the code and what the container images build).
+members = ["crates/kobectl"]
+resolver = "3"
+
+# Single source of truth for the release version, shared by the operator and the
+# CLI so they always publish in lockstep. `just bump X.Y.Z` rewrites this; the
+# version-consistency gate enforces tag == this == Chart.yaml at release time.
+[workspace.package]
+version = "0.31.13"
 edition = "2024"
 rust-version = "1.94.1"
 license = "Apache-2.0"
+
+[package]
+name = "kobe-operator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Cluster pool operator for instant CI/dev cluster provisioning (k3k, k3s, k0s, CAPI)"
 
 [[bin]]
@@ -17,10 +33,6 @@ path = "src/kobe_sync_bin.rs"
 [[bin]]
 name = "crdgen"
 path = "src/crdgen.rs"
-
-[[bin]]
-name = "kobe"
-path = "src/cli/main.rs"
 
 [[bin]]
 name = "kubeconfig-publisher"
@@ -99,14 +111,14 @@ base64 = "0.22"
 # Async trait (dyn dispatch for async traits)
 async-trait = "0.1"
 
-# CLI
+# Operator-side kunobi libs + CLI plumbing. (The interactive `kobe` CLI moved to
+# the `crates/kobectl` member; `ratatui`/`crossterm` went with it — the operator
+# uses none of the TUI crates.)
 kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "v0.10.0" }
 kunobi-ha = { git = "https://github.com/kunobi-ninja/kunobi-ha.git", tag = "v0.5.0" }
 # Hot-reload the PostgreSQL credential from a mounted Secret on rotation (#91).
 kunobi-reload = { git = "https://github.com/kunobi-ninja/kunobi-reload.git", branch = "main" }
 clap = { version = "4", features = ["derive"] }
-ratatui = "0.29"
-crossterm = "0.28"
 dirs = "6"
 
 # Utilities

@@ -9,7 +9,9 @@ The `kobe` CLI is a self-contained binary. It connects to a kobe operator endpoi
 
 ## Install the CLI
 
-<Tabs items={["mise (recommended)", "cargo-binstall", "from source"]}>
+All release binaries are signed (macOS codesigned + notarized, Windows code-signed, Linux/apt PGP-signed via GCP-KMS).
+
+<Tabs items={["mise (recommended)", "Homebrew", "apt (Debian/Ubuntu)", "winget (Windows)", "cargo", "Nix", "from source"]}>
   <Tab value="mise (recommended)">
     [mise](https://mise.jdx.dev) downloads the pre-built binary from GitHub releases and pins the version per project or globally.
 
@@ -27,14 +29,60 @@ The `kobe` CLI is a self-contained binary. It connects to a kobe operator endpoi
 
     Running `mise install` in the project root will install the pinned version.
   </Tab>
-  <Tab value="cargo-binstall">
-    [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads a pre-built binary from GitHub releases without compiling.
+  <Tab value="Homebrew">
+    macOS and Linux, via the Kunobi tap:
 
     ```sh
-    cargo binstall kobe
+    brew install kunobi-ninja/kunobi/kobe
     ```
 
-    If no pre-built binary is available for your target, it falls back to compiling from source automatically.
+    Pre-release (RC/beta) builds are published as a separate formula:
+
+    ```sh
+    brew install kunobi-ninja/kunobi/kobe-unstable
+    ```
+  </Tab>
+  <Tab value="apt (Debian/Ubuntu)">
+    Add the signed Kunobi apt repository (served from Cloudflare R2) and install.
+    The published `gpg.key` is an ASCII-armored OpenPGP cert, so it must be
+    dearmored into the binary keyring apt expects:
+
+    ```sh
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://r2.kunobi.com/kobe/apt/gpg.key \
+      | sudo gpg --dearmor -o /etc/apt/keyrings/kobe.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kobe.gpg] https://r2.kunobi.com/kobe/apt stable main" \
+      | sudo tee /etc/apt/sources.list.d/kobe.list
+    sudo apt-get update && sudo apt-get install kobe
+    ```
+
+    Use the `unstable` suite instead of `stable` for pre-release builds.
+  </Tab>
+  <Tab value="winget (Windows)">
+    ```powershell
+    winget install kunobi-ninja.kobe
+    ```
+
+    Pre-release builds: `winget install kunobi-ninja.kobe.Unstable`.
+  </Tab>
+  <Tab value="cargo">
+    The CLI is published to crates.io as `kobectl` (the crate name `kobe` was taken; the installed binary is still `kobe`).
+
+    ```sh
+    # download a pre-built binary (no compile) via cargo-binstall
+    cargo binstall kobectl
+
+    # or compile from crates.io
+    cargo install kobectl
+    ```
+  </Tab>
+  <Tab value="Nix">
+    Run without installing, or add to a profile:
+
+    ```sh
+    nix run github:kunobi-ninja/kobe -- --help
+    nix profile install github:kunobi-ninja/kobe
+    ```
   </Tab>
   <Tab value="from source">
     ```sh
