@@ -1,13 +1,12 @@
 apiVersion: v2
 name: kobe-demo
-description: Self-contained kobe demo for a fresh Exoscale SKS cluster.
+description: Self-contained kobe demo umbrella chart (cloud-agnostic).
 type: application
 version: 0.1.0
 appVersion: "0.19.1"
 keywords:
   - kobe
   - demo
-  - exoscale
 maintainers:
   - name: Zondax
     url: https://zondax.ch

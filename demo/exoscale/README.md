@@ -27,7 +27,7 @@ After `./demo up`, the target SKS cluster has:
 cd demo/exoscale
 
 # One-time, on a fresh clone of the kobe repo:
-./demo refresh                           # repackages charts/kobe-0.19.1.tgz from this repo
+./demo refresh                           # repackages ../_shared/chart/charts/kobe-0.19.1.tgz from this repo
 ./demo pull-secret <user> <docker-pat>   # so SKS can pull zondax/kobe-operator
 
 # Demo proper (terminal A):
@@ -51,7 +51,7 @@ KUBECONFIG=<that-path> kubectl get nodes # works (over the TLS tunnel)
 The `./demo up` flow:
 1. Picks the SKS kubeconfig — auto-selected if there's only one in `~/.kube/exoscale-*-config`, otherwise prompts. Inherited `KUBECONFIG` env is ignored unless its basename matches `exoscale-*-config`.
 2. `kubectl get nodes` — sanity check the cluster is reachable.
-3. Verifies `charts/kobe-0.19.1.tgz` is present.
+3. Verifies `../_shared/chart/charts/kobe-0.19.1.tgz` is present.
 4. Verifies the `regcred` pull-secret exists in `kobe-system` (errors with a clear instruction to run `./demo pull-secret` if missing — avoids silent ImagePullBackOff).
 5. `helm upgrade --install kobe-demo .` with your SSH pubkey passed via `--set sshPublicKey=...`.
 6. Polls until the kobe Deployment rolls out and the ClusterPool reaches `status.ready >= spec.scaling.minReady` (timeout 5 min).
@@ -85,16 +85,16 @@ Any tool that speaks to a kobe API endpoint with `auth: ssh` will see the same p
 
 ```bash
 cd demo/exoscale
-./demo refresh                          # repackages charts/kobe-X.Y.Z.tgz from this repo
-git add charts/
-git commit -m "chore(demo/exoscale): bump vendored kobe chart"
+./demo refresh                          # repackages ../_shared/chart/charts/kobe-X.Y.Z.tgz from this repo
+git add ../_shared/chart/charts/
+git commit -m "chore(demo): bump vendored kobe chart"
 ```
 
-If `charts/kobe/Chart.yaml` `version:` bumps, also update `KOBE_VERSION` at the top of `./demo`, `dependencies[0].version` in `Chart.yaml`, and the chart filename references in this README.
+If `charts/kobe/Chart.yaml` `version:` bumps, also update `KOBE_VERSION` at the top of `../_shared/lib.sh`, `dependencies[0].version` in `../_shared/chart/Chart.yaml`, and the chart filename references in this README.
 
 ## Troubleshooting
 
-- **`charts/kobe-0.19.1.tgz missing`:** run `./demo refresh` first. Expected only if the vendored tarball is somehow absent.
+- **Vendored chart tarball missing:** run `./demo refresh` first. Expected only if the vendored tarball is somehow absent.
 - **Pool stays `Pending`:** `kubectl -n kobe-system logs deploy/kobe --tail=200`. Common causes: image pull failure, missing RBAC for the pool service account, `local-path-provisioner` not Ready (PVCs stuck `Pending`).
 - **`kobe lease` returns 401 Unauthorized:** confirm your private SSH key matches the public key in `values.yaml` (or the override). Set `KOBE_SSH_KEY=...` if your active key isn't auto-discovered.
 - **Port-forward dies:** SKS has aggressive idle timeouts. Re-run `./demo forward`.
@@ -108,21 +108,15 @@ If `charts/kobe/Chart.yaml` `version:` bumps, also update `KOBE_VERSION` at the 
 ## Layout
 
 ```
-demo/exoscale/
-├── Chart.yaml                # umbrella chart metadata
-├── values.yaml               # demo's surface (SSH pubkey, pool sizing, kobe pass-through)
-├── charts/
-│   └── kobe-0.19.1.tgz        # vendored kobe chart from charts/kobe/ (refresh via ./demo refresh)
-├── templates/
-│   ├── access-policy.yaml    # AccessPolicy CR
-│   ├── cluster-pool.yaml     # ClusterPool CR (k3s, demo-sized)
-│   ├── local-path.yaml       # Rancher local-path-provisioner (gated)
-│   └── NOTES.txt             # post-install instructions
-├── manifests/ubuntu/
-│   ├── 00-namespace.yaml     # demo-workloads namespace
-│   └── 10-deployment.yaml    # plain ubuntu:24.04 pod for ./demo deploy-ubuntu
-├── demo                      # orchestration script
-└── README.md
+demo/
+├── _shared/                       # cloud-agnostic chart + helpers (see ../_shared/)
+│   ├── chart/                     # umbrella chart (Chart.yaml, values.yaml, templates/, charts/)
+│   ├── manifests/ubuntu/          # demo workload manifests
+│   └── lib.sh                     # all ./demo verb implementations
+└── exoscale/
+    ├── demo                       # thin wrapper: sets KUBECONFIG_GLOB and calls lib_dispatch
+    ├── values.yaml                # SKS-specific overrides (localPath.enabled=true)
+    └── README.md
 ```
 
 ## Out of scope

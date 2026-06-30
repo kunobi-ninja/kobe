@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Orchestrates the kobe-on-Hetzner-Cloud demo end-to-end.
+# Subcommands:
+#   tf up | tf down | tf output     (Hetzner-specific — terraform wrappers)
+#   up | down | lease | release | deploy-ubuntu | forward | tunnel |
+#   patch-lease | status | pull-secret | refresh | lint | template
+# Run ./demo help for full usage.
+set -euo pipefail
+
+CLOUD_DIR="$(cd "$(dirname "$0")" && pwd)"
+KUBECONFIG_GLOB="hetzner-*-config"
+TF_DIR="$CLOUD_DIR/terraform"
+
+# Prefer 'terraform' but fall back to 'tofu' (OpenTofu, drop-in compatible).
+# Override with TF_CMD=... if neither is on your default PATH.
+TF_CMD="${TF_CMD:-$(command -v terraform 2>/dev/null || command -v tofu 2>/dev/null || true)}"
+
+# shellcheck source=../_shared/lib.sh
+source "$CLOUD_DIR/../_shared/lib.sh"
+
+# --- Hetzner-specific verbs --------------------------------------------------
+cmd_tf_up() {
+  step "Terraform up - provision Hetzner k3s cluster"
+  [[ -n "${HCLOUD_TOKEN:-}" ]] || err "HCLOUD_TOKEN env var not set.
+       Generate one at https://console.hetzner.cloud/projects → Security → API Tokens
+       (Read & Write), then: export HCLOUD_TOKEN=..."
+  [[ -n "$TF_CMD" ]] || err "Neither 'terraform' nor 'tofu' on PATH. Install one:
+       brew install opentofu    # FOSS (recommended for public demo)
+       brew install hashicorp/tap/terraform"
+  local key_path="${TF_SSH_PUBLIC_KEY_PATH:-$HOME/.ssh/id_ed25519.pub}"
+  [[ -f "$key_path" ]] || err "SSH public key not found at $key_path.
+       Generate one: ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C \"you@example.com\""
+
+  step "$TF_CMD init"
+  cmd "$TF_CMD" -chdir="$TF_DIR" init -upgrade
+
+  step "$TF_CMD apply"
+  cmd "$TF_CMD" -chdir="$TF_DIR" apply -auto-approve
+
+  step "Outputs"
+  cmd "$TF_CMD" -chdir="$TF_DIR" output
+  bold "Done. Next:"
+  echo "  export HCLOUD_TOKEN=...                         # already set"
+  echo "  ./demo pull-secret <docker-user> <docker-pat>   # one-time per cluster"
+  echo "  ./demo up                                       # helm install"
+  echo "  ./demo tunnel                                   # terminal B"
+}
+
+cmd_tf_down() {
+  step "Terraform down - destroy Hetzner k3s cluster"
+  [[ -n "${HCLOUD_TOKEN:-}" ]] || err "HCLOUD_TOKEN env var not set."
+  [[ -n "$TF_CMD" ]] || err "Neither 'terraform' nor 'tofu' on PATH."
+
+  # Warn if helm release is still installed.
+  if [[ -f "$HOME/.kube/hetzner-kobe-demo-config" ]]; then
+    if KUBECONFIG="$HOME/.kube/hetzner-kobe-demo-config" \
+       helm -n "$NAMESPACE" list -q 2>/dev/null | grep -qx "$RELEASE"; then
+      note "Helm release '$RELEASE' is still installed. Run './demo down' first,"
+      note "or pass --force to destroy infra anyway (helm cleanup will be skipped)."
+      if [[ "${1:-}" != "--force" ]]; then
+        err "Aborting. Re-run with --force to override."
+      fi
+      note "--force given; proceeding with destroy."
+    fi
+  fi
+
+  cmd "$TF_CMD" -chdir="$TF_DIR" destroy -auto-approve
+}
+
+cmd_tf_output() {
+  [[ -n "$TF_CMD" ]] || err "Neither 'terraform' nor 'tofu' on PATH."
+  cmd "$TF_CMD" -chdir="$TF_DIR" output
+}
+
+# Called by lib_dispatch before its own case statement. Return 0 if handled.
+dispatch_extra() {
+  case "${1:-}" in
+    tf)
+      shift
+      case "${1:-}" in
+        up)      cmd_tf_up ;;
+        down)    shift; cmd_tf_down "$@" ;;
+        output)  cmd_tf_output ;;
+        ""|help) printf "Usage: ./demo tf {up|down|output}\n" ;;
+        *) err "Unknown 'tf' subcommand: $1" ;;
+      esac
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Extra usage block appended by lib_usage.
+usage_extra() {
+  cat <<EOF
+
+Hetzner-specific subcommands:
+  tf up          terraform init + apply + fetch kubeconfig (~90s)
+  tf down        terraform destroy (~30s). Pass --force to skip helm-release check.
+  tf output      terraform output (server IP, kubeconfig path, SSH command)
+
+Hetzner env: HCLOUD_TOKEN (required), TF_SSH_PUBLIC_KEY_PATH (default ~/.ssh/id_ed25519.pub),
+             TF_CMD (default: 'terraform' if on PATH, else 'tofu')
+EOF
+}
+
+lib_dispatch "$@"

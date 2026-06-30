@@ -1,0 +1,9 @@
+#cloud-config
+package_update: false
+runcmd:
+  - |
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_VERSION=${k3s_version} \
+      K3S_URL=https://${server_private_ip}:6443 \
+      K3S_TOKEN=${k3s_token} \
+      sh -

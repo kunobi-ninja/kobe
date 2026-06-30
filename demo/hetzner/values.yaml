@@ -1,0 +1,6 @@
+# Hetzner Cloud-specific overrides on top of demo/_shared/chart/values.yaml.
+# k3s ships local-path-provisioner as the default StorageClass already; do
+# not install Rancher's copy on top.
+localPath:
+  enabled: false
+  setAsDefault: false

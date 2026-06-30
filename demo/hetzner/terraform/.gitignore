@@ -1,0 +1,8 @@
+# Local Terraform state — contains the k3s join token (sensitive).
+*.tfstate
+*.tfstate.*
+.terraform/
+# Local overrides
+terraform.tfvars
+*.auto.tfvars
+# Note: .terraform.lock.hcl IS committed (provider-version reproducibility).

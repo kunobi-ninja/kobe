@@ -1,0 +1,15 @@
+#cloud-config
+# k3s server bootstrap. package_update intentionally skipped: the k3s
+# install script is self-contained and apt-update would cost ~60s of demo
+# wall time. The kubeconfig fetcher rewrites the public IP into the
+# server URL and sets insecure-skip-tls-verify (the firewall already
+# restricts 6443 to the caller IP).
+package_update: false
+runcmd:
+  - |
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_VERSION=${k3s_version} \
+      K3S_TOKEN=${k3s_token} \
+      sh -s - server \
+        --write-kubeconfig-mode=644 \
+        --disable=traefik
