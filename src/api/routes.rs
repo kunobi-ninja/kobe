@@ -2087,8 +2087,29 @@ async fn release_lease<B: ClusterBackend>(
         .inc();
 
     if status.phase == LeasePhase::Pending {
+        // A client cancelling a still-queued claim: record how long it waited
+        // before giving up (the flip side of a bind), from the object's
+        // creation to now.
+        if let Some(waited) = metrics::elapsed_secs_since_rfc3339(
+            lease
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|ts| ts.0.to_string())
+                .as_deref(),
+        ) {
+            metrics::LEASE_QUEUE_WAIT_SECONDS
+                .with_label_values(&[lease.spec.pool_ref.as_str(), "cancelled"])
+                .observe(waited);
+        }
         info!(lease_id = %id, "Pending lease cancelled");
     } else {
+        // A Bound lease released by the client: record how long it was held.
+        if let Some(held) = metrics::elapsed_secs_since_rfc3339(status.bound_at.as_deref()) {
+            metrics::LEASE_HOLD_SECONDS
+                .with_label_values(&[lease.spec.pool_ref.as_str(), "released"])
+                .observe(held);
+        }
         info!(lease_id = %id, "Bound lease released");
     }
 

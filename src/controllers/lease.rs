@@ -329,6 +329,9 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 let age = chrono::Utc::now() - created_at;
                 if age > timeout {
                     warn!(lease = %name, "Lease exceeded queue timeout, expiring");
+                    crate::metrics::LEASE_QUEUE_WAIT_SECONDS
+                        .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
+                        .observe(age.num_milliseconds() as f64 / 1000.0);
                     remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                     let patch = expired_status_patch(&status.conditions);
                     leases_api
@@ -397,6 +400,14 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
                         crate::metrics::CLAIM_BIND_DURATION
                             .with_label_values(&[&lease.spec.pool_ref])
+                            .observe(bind_duration);
+
+                        // Same elapsed value as CLAIM_BIND_DURATION, but into the
+                        // wide-bucket, outcome-labelled backlog histogram so a
+                        // long queued wait doesn't saturate the fast-path SLI's
+                        // 30s ceiling (#189).
+                        crate::metrics::LEASE_QUEUE_WAIT_SECONDS
+                            .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
                             .observe(bind_duration);
 
                         crate::metrics::CLAIMS_TOTAL
@@ -493,6 +504,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             crate::metrics::CLAIMS_TOTAL
                                 .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
                                 .inc();
+                            if let Some(held) = crate::metrics::elapsed_secs_since_rfc3339(
+                                status.bound_at.as_deref(),
+                            ) {
+                                crate::metrics::LEASE_HOLD_SECONDS
+                                    .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
+                                    .observe(held);
+                            }
                             info!(lease = %name, "Lease TTL expired");
                             let patch = expired_status_patch(&status.conditions);
                             leases_api

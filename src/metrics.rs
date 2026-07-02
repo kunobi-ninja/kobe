@@ -1027,6 +1027,54 @@ pub static POOL_EFFECTIVE_MEMORY_REQUEST_BYTES: LazyLock<IntGaugeVec> = LazyLock
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// Lease timing: queue wait (Pending→terminal) + hold duration (Bound→terminal)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Time a claim spent in `Pending` before reaching a terminal state, keyed by
+/// `outcome` (`bound` | `expired` | `cancelled`). This is the *backlog /
+/// exhaustion* view: the incident that motivated it (#189) had claims waiting
+/// minutes for a full pool, and the ones that never bound left no duration
+/// signal at all.
+///
+/// Deliberately distinct from [`CLAIM_BIND_DURATION`], which keeps sub-second
+/// buckets as the fast-path bind SLI ("is binding instant?") and only records
+/// successful binds. This histogram instead answers "how long do claims wait,
+/// including the ones that time out or get cancelled?" — so its buckets span
+/// 1s → 30min (pool `queue_timeout` is minutes-scale) and it carries the
+/// terminal `outcome`. The overlap on `outcome="bound"` is intentional: the two
+/// serve different questions (latency SLI vs saturation) and need different
+/// bucketing.
+pub static LEASE_QUEUE_WAIT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "kobe_lease_queue_wait_seconds",
+        "Time a claim spent Pending before reaching a terminal state, by outcome",
+        &["profile", "outcome"],
+        vec![1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0]
+    )
+    .unwrap()
+});
+
+/// Time a lease was held in `Bound` before its terminal transition, keyed by
+/// `outcome` (`released` | `expired`). Hold-time × arrival-rate is what sizes a
+/// warm pool — without it, right-sizing a pool after an exhaustion incident
+/// (#189) is guesswork. Measured from `status.bound_at` to the release / TTL
+/// expiry, co-located with the existing `kobe_claims_total{event}` emissions so
+/// it counts the same transitions (the reaper backstop path is intentionally
+/// not double-counted).
+///
+/// Buckets span 30s → 4h: the default lease TTL is 1h and leases extend up to a
+/// policy `max_ttl` ceiling, so the tail past 1h captures extended holds.
+pub static LEASE_HOLD_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "kobe_lease_hold_seconds",
+        "Time a lease was held in Bound before release or expiry, by outcome",
+        &["profile", "outcome"],
+        vec![30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0]
+    )
+    .unwrap()
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // Connect proxy: request latency + per-lease cache effectiveness
 // ─────────────────────────────────────────────────────────────────────
 
@@ -1130,6 +1178,16 @@ impl<const N: usize> Drop for Timer<'_, N> {
     }
 }
 
+/// Seconds elapsed from an RFC3339 timestamp to now, or `None` if the string is
+/// absent / unparseable. Clamps negatives to `0.0` so clock skew never records
+/// a nonsensical negative duration into a lease-timing histogram.
+pub fn elapsed_secs_since_rfc3339(ts: Option<&str>) -> Option<f64> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts?).ok()?;
+    let secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_milliseconds() as f64
+        / 1000.0;
+    Some(secs.max(0.0))
+}
+
 /// Force all LazyLock statics to initialize, registering metrics
 /// with the default Prometheus registry. Call once at startup.
 pub fn init() {
@@ -1164,6 +1222,9 @@ pub fn init() {
     // Connect proxy
     LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
     LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);
+    // Lease timing
+    LazyLock::force(&LEASE_QUEUE_WAIT_SECONDS);
+    LazyLock::force(&LEASE_HOLD_SECONDS);
     // P0 observability
     LazyLock::force(&POOL_CONSECUTIVE_FAILURES);
     LazyLock::force(&POOL_FAILURE_REASON_CHANGES_TOTAL);
@@ -1475,6 +1536,50 @@ mod tests {
         );
         assert_eq!(LeaseUnsatisfiableReason::Degraded.as_str(), "degraded");
         assert_eq!(LeaseUnsatisfiableReason::Warming.as_str(), "warming");
+    }
+
+    /// The lease-timing histograms must register with their full
+    /// `[profile, outcome]` label set so an emission never panics on a mismatch.
+    #[test]
+    fn lease_timing_histograms_registerable() {
+        init();
+        LEASE_QUEUE_WAIT_SECONDS
+            .with_label_values(&["_test", "bound"])
+            .observe(1.5);
+        LEASE_HOLD_SECONDS
+            .with_label_values(&["_test", "released"])
+            .observe(600.0);
+        let output = gather();
+        assert!(
+            output.contains("kobe_lease_queue_wait_seconds"),
+            "queue-wait histogram must appear after an observation"
+        );
+        assert!(
+            output.contains("kobe_lease_hold_seconds"),
+            "hold-duration histogram must appear after an observation"
+        );
+    }
+
+    /// Elapsed helper: absent / unparseable → None; a past timestamp → positive;
+    /// a future timestamp (clock skew) clamps to 0.0 rather than going negative.
+    #[test]
+    fn elapsed_secs_since_rfc3339_behaviour() {
+        assert_eq!(elapsed_secs_since_rfc3339(None), None);
+        assert_eq!(elapsed_secs_since_rfc3339(Some("not-a-timestamp")), None);
+
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let elapsed = elapsed_secs_since_rfc3339(Some(&past)).expect("parseable past ts");
+        assert!(
+            (100.0..1000.0).contains(&elapsed),
+            "≈120s expected, got {elapsed}"
+        );
+
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(120)).to_rfc3339();
+        assert_eq!(
+            elapsed_secs_since_rfc3339(Some(&future)),
+            Some(0.0),
+            "future timestamp must clamp to 0.0"
+        );
     }
 
     #[test]
