@@ -145,20 +145,34 @@ jobs:
       - name: Build all images (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from='
 
-  # Provision→Ready→recycle smoke gate against a REAL single-server k3s cluster
-  # running nested-in-pod inside plain kind, with the operator installed via the
-  # real Helm chart (so its real rbac.yaml is in effect). Catches two regression
-  # classes unit tests can't see: the k3s readiness-probe class (members never
+  # Backend-agnostic conformance gate (#164): the same provision→Ready→recycle
+  # smoke, run PER BACKEND, so "passes conformance" is provable for each backend
+  # rather than k3s-only. Each leg exercises the real Helm chart (real rbac.yaml)
+  # against a REAL cluster nested-in-pod inside plain kind, catching the two
+  # regression classes unit tests can't: the readiness-probe class (members never
   # go Ready) and the RBAC-403 recycle-wedge class (instances stuck Recycling).
   #
-  # PHASE 1: nightly + manual ONLY — slow and new, not yet a PR-required check.
-  # No `container:` block: like `docker-dry-run`, this needs the host Docker
-  # socket for kind + buildx, so it runs directly on the self-hosted runner.
-  e2e:
+  # Kept as one dedicated matrix job (cf. how kunobi-ninja/kache#487 kept its
+  # audit gate a dedicated, scoped job) — each leg owns an isolated kind cluster
+  # (name suffixed by backend) and always tears it down. `fail-fast: false` so
+  # one backend's failure doesn't mask the others.
+  #
+  # PHASE 1: nightly + manual ONLY, not yet a PR-required check. k3s is the
+  # proven leg (was the standalone `e2e` job); the vkobe legs run the same gate
+  # on the vkobe backend across both datastores (etcd + kine/sqlite). vcluster
+  # and capi have no e2e harness/pool yet — tracked as follow-up before they
+  # join the matrix (and before conformance becomes the admission rule for new
+  # backends, the remaining half of #164). No `container:` block: like
+  # `docker-dry-run`, this needs the host Docker socket for kind + buildx.
+  conformance:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs: [checks]
     runs-on: kunobi-runners
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [k3s, vkobe-etcd, vkobe-kine]
     steps:
       - uses: actions/checkout@v4
 
@@ -170,35 +184,44 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Parameterize the kind cluster name with the run id so concurrent/
+      # Per-backend kind cluster name (run id + backend) so concurrent legs and
       # persistent self-hosted runs never collide on a shared cluster name.
       - name: Bring up the e2e harness (kind + chart + pools)
-        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}
+        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}-${{ matrix.backend }}
 
-      - name: Run the k3s provision→Ready→recycle smoke gate
-        run: mise exec -- just test-smoke-k3s e2e-${{ github.run_id }}
+      # The smoke recipes differ by backend (k3s takes the cluster name; the
+      # vkobe recipes target their pool against the current kind context).
+      - name: Run the ${{ matrix.backend }} conformance smoke gate
+        run: |
+          CLUSTER=e2e-${{ github.run_id }}-${{ matrix.backend }}
+          case "${{ matrix.backend }}" in
+            k3s)        mise exec -- just test-smoke-k3s "$CLUSTER" ;;
+            vkobe-etcd) mise exec -- just test-smoke-vkobe ;;
+            vkobe-kine) mise exec -- just test-smoke-vkobe-kine ;;
+            *) echo "unknown backend ${{ matrix.backend }}" >&2; exit 1 ;;
+          esac
 
       - name: Diagnostics on failure
         if: failure()
         run: |
-          CTX=kind-e2e-${{ github.run_id }}
+          CTX=kind-e2e-${{ github.run_id }}-${{ matrix.backend }}
           kubectl --context "$CTX" get pods,clusterinstances,clusterpools -A -o wide || true
           kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 200 --all-containers || true
           mkdir -p /tmp/kind-logs
-          mise exec -- kind export logs /tmp/kind-logs --name e2e-${{ github.run_id }} || true
+          mise exec -- kind export logs /tmp/kind-logs --name e2e-${{ github.run_id }}-${{ matrix.backend }} || true
 
       - name: Upload kind logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: kind-logs-${{ github.run_id }}
+          name: kind-logs-${{ github.run_id }}-${{ matrix.backend }}
           path: /tmp/kind-logs
           if-no-files-found: ignore
 
       # Always tear down so kind clusters never leak on the persistent runner.
       - name: Tear down the e2e harness
         if: always()
-        run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}
+        run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}-${{ matrix.backend }}
 
   publish:
     # Pushes the operator/sync container images. On a RELEASE, gate the image
