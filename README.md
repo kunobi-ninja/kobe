@@ -1,5 +1,10 @@
 # Kobe
 
+[![Crates.io](https://img.shields.io/crates/v/kobectl.svg)](https://crates.io/crates/kobectl)
+[![CI](https://github.com/kunobi-ninja/kobe/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kunobi-ninja/kobe/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94.1-blue.svg)](Cargo.toml)
+
 **Premium cattle, managed by ninjas.**
 
 Kobe is a Kubernetes operator that manages fleets of ephemeral clusters. It pre-warms pools across multiple backends (k3s, k0s, [vcluster](https://www.vcluster.com/), CAPI) so your CI pipelines and developers get fully functional, isolated Kubernetes clusters instantly — leased via a simple HTTP API.
