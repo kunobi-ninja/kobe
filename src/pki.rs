@@ -369,6 +369,16 @@ pub async fn create_pki_secret(
     Ok(())
 }
 
+/// Parse the `NotAfter` (expiry) of the first certificate in a PEM bundle as a
+/// Unix timestamp in seconds. Returns `None` if the input is empty or not a
+/// parseable X.509 PEM — cert-expiry telemetry is best-effort and must never
+/// break a reconcile.
+pub fn cert_not_after_unix(pem: &str) -> Option<i64> {
+    let (_, block) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).ok()?;
+    let cert = block.parse_x509().ok()?;
+    Some(cert.validity().not_after.timestamp())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -491,6 +501,35 @@ mod tests {
         assert!(
             pki.sa_pub.contains("BEGIN PUBLIC KEY"),
             "sa_pub missing PEM header"
+        );
+    }
+
+    #[test]
+    fn test_cert_not_after_unix_parses_generated_cert() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = VirtualClusterPki::generate("expiry-test", &["kubernetes"]).unwrap();
+
+        // A freshly generated CA must parse and expire in the future.
+        let not_after = cert_not_after_unix(&pki.ca_cert).expect("CA cert NotAfter should parse");
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            not_after > now,
+            "generated CA NotAfter ({not_after}) should be in the future (now {now})"
+        );
+
+        // The apiserver serving cert must parse too.
+        assert!(
+            cert_not_after_unix(&pki.apiserver_cert).is_some(),
+            "apiserver cert NotAfter should parse"
+        );
+
+        // Garbage / non-PEM input is best-effort None, never a panic.
+        assert_eq!(cert_not_after_unix(""), None);
+        assert_eq!(cert_not_after_unix("not a certificate"), None);
+        assert_eq!(
+            cert_not_after_unix(&pki.ca_key),
+            None,
+            "a private key is not a cert"
         );
     }
 

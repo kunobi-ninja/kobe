@@ -720,6 +720,7 @@ async fn reconcile_profile(
         .await
         .insert(name.clone(), pool_state.clone());
     sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
+    emit_cert_expiry_metrics(&ctx.client, &ns, &name, &pool_state).await;
 
     // Phase metrics here only need the base state taxonomy — pass
     // `None` for `current_hash` so the drift-aware buckets stay 0.
@@ -1228,6 +1229,59 @@ async fn patch_cluster_instance_status(
         )
         .await?;
     Ok(())
+}
+
+/// Best-effort: emit `kobe_cert_expiry_seconds` for a pool by reading each
+/// instance's `{name}-certs` Secret and tracking the soonest-expiring cert per
+/// component. Never fails a reconcile — a missing secret (k3s/k0s backends,
+/// which manage their own PKI, or an instance not yet provisioned) is simply
+/// skipped, so a pool with no kobe-managed PKI emits nothing. See #169.
+async fn emit_cert_expiry_metrics(
+    client: &Client,
+    namespace: &str,
+    profile: &str,
+    pool_state: &PoolState,
+) {
+    use k8s_openapi::api::core::v1::Secret;
+
+    // Secret data key -> metric `component` label.
+    const COMPONENTS: [(&str, &str); 3] = [
+        ("ca.crt", "ca"),
+        ("apiserver.crt", "apiserver"),
+        ("front-proxy-ca.crt", "front_proxy_ca"),
+    ];
+
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let now = chrono::Utc::now().timestamp();
+    let mut worst: HashMap<&str, i64> = HashMap::new();
+
+    for cluster_name in pool_state.clusters.keys() {
+        // 404 (non-PKI backend / not yet created) or a transient error → skip.
+        let secret = match secrets.get_opt(&format!("{cluster_name}-certs")).await {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+        let Some(data) = secret.data else { continue };
+        for (key, component) in COMPONENTS {
+            let Some(pem) = data.get(key).and_then(|b| std::str::from_utf8(&b.0).ok()) else {
+                continue;
+            };
+            let Some(not_after) = crate::pki::cert_not_after_unix(pem) else {
+                continue;
+            };
+            let horizon = not_after - now;
+            worst
+                .entry(component)
+                .and_modify(|m| *m = (*m).min(horizon))
+                .or_insert(horizon);
+        }
+    }
+
+    for (component, horizon) in worst {
+        crate::metrics::CERT_EXPIRY_SECONDS
+            .with_label_values(&[profile, component])
+            .set(horizon);
+    }
 }
 
 async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_state: &PoolState) {

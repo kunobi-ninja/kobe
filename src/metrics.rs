@@ -1075,6 +1075,35 @@ pub static LEASE_HOLD_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// PKI: certificate expiry horizon
+// ─────────────────────────────────────────────────────────────────────
+
+/// Worst-case (minimum) seconds until certificate expiry across a pool's
+/// instances, by `component` (`ca` | `apiserver` | `front_proxy_ca`). Sourced
+/// from each instance's `{name}-certs` Secret — the kobe-managed PKI in
+/// `pki.rs` — so it only populates for backends that use it (vcluster / vkobe);
+/// k3s/k0s manage their own in-cluster PKI.
+///
+/// Rolled up per pool, NOT per cluster: cluster identity is high-cardinality and
+/// never a label (module rule). The *minimum* horizon makes "some cluster in
+/// this pool has a cert expiring soon" alertable; the specific cluster lives in
+/// logs/traces. Goes negative once a cert is past `NotAfter`.
+///
+/// Note (#169): the kobe PKI currently sets no explicit validity (rcgen default
+/// → effectively non-expiring), so today this surfaces that state rather than a
+/// tight horizon; bounded validity + recycle-before-expiry is the tracked
+/// follow-up. Emitting the gauge now means the alert/dashboard wiring is ready
+/// the day validity becomes bounded.
+pub static CERT_EXPIRY_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_cert_expiry_seconds",
+        "Worst-case seconds until certificate expiry per pool, by component",
+        &["profile", "component"]
+    )
+    .unwrap()
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // Connect proxy: request latency + per-lease cache effectiveness
 // ─────────────────────────────────────────────────────────────────────
 
@@ -1225,6 +1254,8 @@ pub fn init() {
     // Lease timing
     LazyLock::force(&LEASE_QUEUE_WAIT_SECONDS);
     LazyLock::force(&LEASE_HOLD_SECONDS);
+    // PKI
+    LazyLock::force(&CERT_EXPIRY_SECONDS);
     // P0 observability
     LazyLock::force(&POOL_CONSECUTIVE_FAILURES);
     LazyLock::force(&POOL_FAILURE_REASON_CHANGES_TOTAL);
