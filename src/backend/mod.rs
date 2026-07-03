@@ -755,7 +755,80 @@ pub async fn check_readiness_gate_impl(
                 Err(e) => Err(e.into()),
             }
         }
+        ReadinessGate::InClusterToken {
+            namespace,
+            service_account,
+        } => {
+            check_in_cluster_token(vc_client, namespace.as_deref(), service_account.as_deref())
+                .await
+        }
     }
+}
+
+/// Default ServiceAccount for the in-cluster token round-trip — every namespace
+/// has a `default` SA.
+const PROBE_SERVICE_ACCOUNT_DEFAULT: &str = "default";
+
+/// Run the [`ReadinessGate::InClusterToken`] check.
+///
+/// Mints a short-lived token for `service_account` in `namespace` via the guest
+/// apiserver's TokenRequest API, then validates it back through a TokenReview.
+/// Returns `true` only when the apiserver both **issues** the token (its SA
+/// signing key is present and TLS auth for the operator's admin client works)
+/// and **confirms it authenticates** (SA verification key + authentication path
+/// intact) — the exact chain a workload's `rest.InClusterConfig()` depends on.
+///
+/// A not-yet-created ServiceAccount (404) is `false`, not an error: the cluster
+/// is still warming up and the controller requeues, same as the other gates.
+async fn check_in_cluster_token(
+    vc_client: &Client,
+    namespace: Option<&str>,
+    service_account: Option<&str>,
+) -> Result<bool> {
+    use k8s_openapi::api::authentication::v1::{
+        TokenRequest, TokenRequestSpec, TokenReview, TokenReviewSpec,
+    };
+    use k8s_openapi::api::core::v1::ServiceAccount;
+    use kube::api::PostParams;
+
+    let ns = namespace.unwrap_or(PROBE_NAMESPACE_DEFAULT);
+    let sa = service_account.unwrap_or(PROBE_SERVICE_ACCOUNT_DEFAULT);
+
+    // 1. Ask the apiserver to sign a short-lived token for the SA.
+    let sas: Api<ServiceAccount> = Api::namespaced(vc_client.clone(), ns);
+    let request = TokenRequest {
+        metadata: Default::default(),
+        spec: TokenRequestSpec {
+            audiences: vec![],
+            expiration_seconds: Some(600),
+            bound_object_ref: None,
+        },
+        status: None,
+    };
+    let issued = match sas
+        .create_token_request(sa, &PostParams::default(), &request)
+        .await
+    {
+        Ok(t) => t,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(token) = issued.status.map(|s| s.token).filter(|t| !t.is_empty()) else {
+        return Ok(false);
+    };
+
+    // 2. Validate that token back through the apiserver.
+    let reviews: Api<TokenReview> = Api::all(vc_client.clone());
+    let review = TokenReview {
+        metadata: Default::default(),
+        spec: TokenReviewSpec {
+            token: Some(token),
+            audiences: None,
+        },
+        status: None,
+    };
+    let result = reviews.create(&PostParams::default(), &review).await?;
+    Ok(result.status.and_then(|s| s.authenticated).unwrap_or(false))
 }
 
 /// Default namespace for the scheduling-probe pod.
@@ -1420,6 +1493,122 @@ current-context: default
             !ok,
             "kube-dns with no ready endpoints (CoreDNS crashloop) must fail DnsHealthy"
         );
+    }
+
+    #[tokio::test]
+    async fn in_cluster_token_gate_true_when_issued_and_authenticated() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        // apiserver signs a token for the default SA...
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/serviceaccounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenRequest",
+                "metadata": { "name": "default", "namespace": "kube-system" },
+                "spec": { "audiences": [], "expirationSeconds": 600 },
+                "status": { "token": "signed-token", "expirationTimestamp": "2999-01-01T00:00:00Z" }
+            })))
+            .mount(&server)
+            .await;
+        // ...and validates it back as authenticated.
+        Mock::given(method("POST"))
+            .and(path("/apis/authentication.k8s.io/v1/tokenreviews"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenReview",
+                "metadata": {},
+                "spec": { "token": "signed-token" },
+                "status": { "authenticated": true, "user": { "username": "system:serviceaccount:kube-system:default" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::InClusterToken {
+            namespace: None,
+            service_account: None,
+        };
+        let ok = check_readiness_gate_impl(&client, &gate, "inst")
+            .await
+            .unwrap();
+        assert!(
+            ok,
+            "a SA token that issues and validates must satisfy InClusterToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_cluster_token_gate_false_when_token_not_authenticated() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/serviceaccounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenRequest",
+                "metadata": { "name": "default", "namespace": "kube-system" },
+                "spec": {},
+                "status": { "token": "signed-token", "expirationTimestamp": "2999-01-01T00:00:00Z" }
+            })))
+            .mount(&server)
+            .await;
+        // The apiserver answers but rejects its own token (broken sa.pub / x509).
+        Mock::given(method("POST"))
+            .and(path("/apis/authentication.k8s.io/v1/tokenreviews"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenReview",
+                "metadata": {},
+                "spec": { "token": "signed-token" },
+                "status": { "authenticated": false, "error": "invalid bearer token" }
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::InClusterToken {
+            namespace: None,
+            service_account: None,
+        };
+        let ok = check_readiness_gate_impl(&client, &gate, "inst")
+            .await
+            .unwrap();
+        assert!(!ok, "a token the apiserver won't authenticate must fail");
+    }
+
+    #[tokio::test]
+    async fn in_cluster_token_gate_false_when_sa_absent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        // SA not created yet on a warming cluster → 404 → gate false, not error.
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/namespaces/kube-system/serviceaccounts/default/token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("serviceaccounts", "default")),
+            )
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::InClusterToken {
+            namespace: None,
+            service_account: None,
+        };
+        let ok = check_readiness_gate_impl(&client, &gate, "inst")
+            .await
+            .unwrap();
+        assert!(!ok, "a not-yet-created SA must yield false, not an error");
     }
 
     #[tokio::test]

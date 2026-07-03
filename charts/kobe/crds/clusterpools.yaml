@@ -617,6 +617,8 @@ spec:
                       type: string
                     namespace:
                       type: string
+                    serviceAccount:
+                      type: string
                     type:
                       enum:
                       - CRDExists
@@ -625,6 +627,7 @@ spec:
                       - URLHealthy
                       - SchedulingProbe
                       - DNSHealthy
+                      - InClusterToken
                       type: string
                     url:
                       type: string

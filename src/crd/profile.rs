@@ -1175,6 +1175,29 @@ pub enum ReadinessGate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
     },
+
+    /// In-cluster ServiceAccount token round-trip: mint a short-lived token for
+    /// a ServiceAccount via the guest apiserver's TokenRequest API, then feed it
+    /// back through a TokenReview. Proves the apiserver can both *sign* (SA
+    /// signing key) and *verify* (SA public key) a token over its own TLS — the
+    /// exact chain any workload's `rest.InClusterConfig()` depends on, and the
+    /// silent bad-but-Ready class where the apiserver answers but SA auth is
+    /// broken (mis-provisioned sa.key/sa.pub, x509 mismatch — cf. #42/#92).
+    ///
+    /// Evaluated entirely from the operator's admin client — no probe Pod.
+    /// `namespace` defaults to `kube-system`; `serviceAccount` to `default`
+    /// (present in every namespace).
+    #[serde(rename = "InClusterToken")]
+    InClusterToken {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "serviceAccount"
+        )]
+        service_account: Option<String>,
+    },
 }
 
 // Manual JsonSchema impl — Kubernetes CRD structural schemas require that
@@ -1198,11 +1221,13 @@ impl JsonSchema for ReadinessGate {
                         "DaemonSetReady",
                         "URLHealthy",
                         "SchedulingProbe",
-                        "DNSHealthy"
+                        "DNSHealthy",
+                        "InClusterToken"
                     ]
                 },
                 "name": { "type": "string" },
                 "namespace": { "type": "string" },
+                "serviceAccount": { "type": "string" },
                 "url": { "type": "string" }
             }
         }))
