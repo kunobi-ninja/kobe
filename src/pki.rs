@@ -526,7 +526,11 @@ mod tests {
         // Garbage / non-PEM input is best-effort None, never a panic.
         assert_eq!(cert_not_after_unix(""), None);
         assert_eq!(cert_not_after_unix("not a certificate"), None);
-        assert_eq!(cert_not_after_unix(&pki.ca_key), None, "a private key is not a cert");
+        assert_eq!(
+            cert_not_after_unix(&pki.ca_key),
+            None,
+            "a private key is not a cert"
+        );
     }
 
     #[test]
