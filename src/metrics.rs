@@ -474,6 +474,13 @@ impl PoolFailureClass {
     /// Order matters: delete-related keywords are checked before the generic
     /// "create" so a PDB delete 403 ("poddisruption") classifies as
     /// `BackendDelete` rather than falling through.
+    ///
+    /// NOTE: substring matching over free-form text is inherently unsound when
+    /// that text embeds dynamic data (pool names, etc.), so live emitters set
+    /// [`PoolFailureClass`] structurally at the failure site instead. This is
+    /// retained only as a best-effort fallback for classifying *persisted*
+    /// legacy reason strings (e.g. reading back an older status).
+    #[allow(dead_code)]
     pub fn from_reason(reason: &str) -> Self {
         let r = reason.to_ascii_lowercase();
         if r.contains("delete") || r.contains("poddisruption") || r.contains("teardown") {
