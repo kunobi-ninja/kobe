@@ -285,8 +285,7 @@ mod cluster_instance_tests {
             );
             let pool_state = PoolState { clusters };
             let counts = crate::pool::manager::StateCounts::default();
-            let backoff =
-                compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+            let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
             let reason = backoff
                 .last_failure_reason
                 .as_deref()
@@ -1076,8 +1075,8 @@ fn emit_pool_failure_metrics(profile: &str, signals: &PoolFailureSignals) {
         .set(signals.consecutive_failures as i64);
 
     let new_failure_edge = signals.consecutive_failures > signals.prev_failures;
-    let class_transition = signals.consecutive_failures > 0
-        && signals.failure_class != signals.prev_failure_class;
+    let class_transition =
+        signals.consecutive_failures > 0 && signals.failure_class != signals.prev_failure_class;
     if new_failure_edge || class_transition {
         crate::metrics::POOL_FAILURE_REASON_CHANGES_TOTAL
             .with_label_values(&[profile, signals.failure_class.as_str()])
