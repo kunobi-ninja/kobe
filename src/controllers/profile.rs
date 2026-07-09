@@ -96,10 +96,14 @@ mod cluster_instance_tests {
     }
 
     fn profile_with_status(status: serde_json::Value) -> ClusterPool {
+        profile_with_status_named("p", status)
+    }
+
+    fn profile_with_status_named(name: &str, status: serde_json::Value) -> ClusterPool {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "ClusterPool",
-            "metadata": { "name": "p", "namespace": "test-ns" },
+            "metadata": { "name": name, "namespace": "test-ns" },
             "spec": {
                 "minSize": 2, "maxSize": 5,
                 "cluster": { "version": "v1.28.0", "serverCount": 1 },
@@ -188,9 +192,9 @@ mod cluster_instance_tests {
         assert!(reason.contains("unschedulable"), "got: {reason}");
         // The original triage detail is preserved (only prefixed).
         assert!(reason.contains("not reaching Ready"), "got: {reason}");
-        // The capacity wording is classifiable by the bounded class.
+        // The structural failure class reflects the capacity wedge.
         assert_eq!(
-            crate::metrics::PoolFailureClass::from_reason(&reason),
+            backoff.failure_class,
             crate::metrics::PoolFailureClass::Capacity
         );
         // Control-flow signal (failure count) is still engaged, unchanged.
@@ -224,6 +228,150 @@ mod cluster_instance_tests {
         assert!(reason.contains("not reaching Ready"), "got: {reason}");
         // Failure count is the plain index-gap (3 - 1 = 2), unchanged.
         assert_eq!(backoff.consecutive_failures, 2);
+    }
+
+    /// The generic (non-capacity) pool failure carries no attributable cause, so
+    /// its structural `failure_class` MUST be `Other`.
+    #[test]
+    fn generic_failure_class_is_other() {
+        let profile = profile_with_status(serde_json::json!({
+            "consecutiveFailures": 2, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 1
+        }));
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-p-0".to_string(),
+            entry_with_block(ClusterState::Creating, false),
+        );
+        let pool_state = PoolState { clusters };
+        let counts = crate::pool::manager::StateCounts::default();
+        let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+
+        assert_eq!(
+            backoff.failure_class,
+            crate::metrics::PoolFailureClass::Other
+        );
+    }
+
+    /// The metric's `failure_class` is set STRUCTURALLY, so a pool whose NAME
+    /// happens to contain a `from_reason` cause keyword must NOT be misclassified
+    /// — even though the free-form reason text (which embeds the pool name) would
+    /// trip that keyword if it were ever parsed. This is the general form of the
+    /// `Unhealthy`→`health` collision: the reason string carries dynamic data and
+    /// can never be a sound classification source.
+    #[test]
+    fn structural_failure_class_ignores_keyword_in_pool_name() {
+        use crate::metrics::PoolFailureClass as P;
+        // Each name embeds a distinct cause keyword; the generic failure class
+        // must stay `Other` regardless, while `from_reason` on the same text
+        // demonstrates the collision the structural approach avoids.
+        let cases = [
+            ("health-pool", P::Health),
+            ("create-pool", P::BackendCreate),
+            ("bootstrap-pool", P::Bootstrap),
+            ("delete-pool", P::BackendDelete),
+            ("ipam-pool", P::Ipam),
+        ];
+        for (name, collided) in cases {
+            let profile = profile_with_status_named(
+                name,
+                serde_json::json!({
+                    "consecutiveFailures": 2, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 1
+                }),
+            );
+            let mut clusters = HashMap::new();
+            clusters.insert(
+                format!("pool-{name}-0"),
+                entry_with_block(ClusterState::Creating, false),
+            );
+            let pool_state = PoolState { clusters };
+            let counts = crate::pool::manager::StateCounts::default();
+            let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+            let reason = backoff
+                .last_failure_reason
+                .as_deref()
+                .expect("reason populated while failing");
+
+            // The string classifier WOULD mislabel it (documents the hazard)…
+            assert_eq!(
+                P::from_reason(reason),
+                collided,
+                "expected the string classifier to collide on name {name}"
+            );
+            // …but the structural class the metric actually uses is correct.
+            assert_eq!(
+                backoff.failure_class,
+                P::Other,
+                "structural class must ignore pool-name keyword for {name}"
+            );
+        }
+    }
+
+    /// `persisted_failure_class` recovers a prior reconcile's class from the
+    /// capacity marker ONLY — never by keyword-parsing the free-form text, so a
+    /// pool named with a cause keyword is still recovered as `Other`.
+    #[test]
+    fn persisted_failure_class_recovers_via_marker_not_keywords() {
+        use crate::metrics::PoolFailureClass as P;
+        assert_eq!(persisted_failure_class(None), P::Other);
+        assert_eq!(
+            persisted_failure_class(Some(
+                "capacity-blocked: 2 instance(s) unschedulable; 2 instance(s) not reaching Ready"
+            )),
+            P::Capacity
+        );
+        // Generic reason — even one whose pool name embeds a keyword — is `Other`.
+        assert_eq!(
+            persisted_failure_class(Some(
+                "2 instance(s) not reaching Ready ... kubectl get ci -l \
+                 kobe.kunobi.ninja/pool=health-pool ..."
+            )),
+            P::Other
+        );
+    }
+
+    /// The reason-change counter fires on a class TRANSITION even when the
+    /// failure count is unchanged (`Other`→`Capacity` at the same count), but not
+    /// on steady-state failure at an unchanged class.
+    #[test]
+    fn reason_change_counter_fires_on_class_transition_at_equal_count() {
+        use crate::metrics::PoolFailureClass as P;
+        crate::metrics::init();
+        let counter = &crate::metrics::POOL_FAILURE_REASON_CHANGES_TOTAL;
+        let profile = "xition-test-pool";
+
+        // Steady state: same count, same class → no increment.
+        let before_other = counter.with_label_values(&[profile, "other"]).get();
+        emit_pool_failure_metrics(
+            profile,
+            &PoolFailureSignals {
+                consecutive_failures: 2,
+                prev_failures: 2,
+                failure_class: P::Other,
+                prev_failure_class: P::Other,
+            },
+        );
+        assert_eq!(
+            counter.with_label_values(&[profile, "other"]).get(),
+            before_other,
+            "unchanged class at unchanged count must not re-count"
+        );
+
+        // Class flip Other→Capacity at the SAME count → one increment on capacity.
+        let before_cap = counter.with_label_values(&[profile, "capacity"]).get();
+        emit_pool_failure_metrics(
+            profile,
+            &PoolFailureSignals {
+                consecutive_failures: 2,
+                prev_failures: 2,
+                failure_class: P::Capacity,
+                prev_failure_class: P::Other,
+            },
+        );
+        assert_eq!(
+            counter.with_label_values(&[profile, "capacity"]).get(),
+            before_cap + 1,
+            "a class transition at equal count must be counted"
+        );
     }
 
     /// #189 (observability): the `kobe_pool_capacity_blocked` gauge reflects the
@@ -615,10 +763,14 @@ async fn reconcile_profile(
     // already-failed instances) still proceed so we don't strand
     // resources.
     //
-    // `None` means OK-to-create; `Some(reason)` means halt creates
-    // for this reconcile and surface the reason in the
-    // ClusterPool.status. See `controllers::kobestore_health` for the
-    // condition this reads from.
+    // `None` means OK-to-create; `Some(reason)` means halt creates for this
+    // reconcile. The reason is LOGGED only — it is deliberately NOT written into
+    // `ClusterPool.status` and does NOT feed the pool-failure metrics: a
+    // degraded datastore is not a per-pool provision failure, and it already has
+    // its own first-class signal (`kobe_kobestore_healthy`, emitted by
+    // `controllers::kobestore_health`, which is also the condition this reads
+    // from). Folding it into `consecutiveFailures`/`failure_class` would double-
+    // count a cluster-wide outage as N pool failures and perturb backoff/phase.
     let backend_block = pool_creation_blocked_by_backend(&ctx.client, &ns, &profile).await;
     if let Some(ref reason) = backend_block {
         warn!(profile = %name, reason = %reason,
@@ -834,9 +986,9 @@ async fn reconcile_profile(
     // Snapshot the P0 pool-failure observability inputs BEFORE `backoff` is
     // partially moved into `ClusterPoolStatus` below. `prev_failures` comes
     // from the pre-reconcile status so the reason-change counter fires only on
-    // the rising edge; the failure class is mapped from the (free-form)
-    // `last_failure_reason` into the bounded `PoolFailureClass` — the raw
-    // string is never used as a label. Emitted after the status patch.
+    // the rising edge; `failure_class` is the bounded class decided
+    // structurally in `compute_backoff_state` (never parsed from the free-form
+    // reason text). Emitted after the status patch.
     let pool_failure_signals = PoolFailureSignals {
         consecutive_failures: backoff.consecutive_failures,
         prev_failures: profile
@@ -844,11 +996,13 @@ async fn reconcile_profile(
             .as_ref()
             .map(|s| s.consecutive_failures)
             .unwrap_or(0),
-        failure_class: backoff
-            .last_failure_reason
-            .as_deref()
-            .map(crate::metrics::PoolFailureClass::from_reason)
-            .unwrap_or(crate::metrics::PoolFailureClass::Other),
+        failure_class: backoff.failure_class,
+        prev_failure_class: persisted_failure_class(
+            profile
+                .status
+                .as_ref()
+                .and_then(|s| s.last_failure_reason.as_deref()),
+        ),
     };
 
     let phase = crate::pool::manager::compute_pool_phase(
@@ -900,6 +1054,7 @@ struct PoolFailureSignals {
     consecutive_failures: u32,
     prev_failures: u32,
     failure_class: crate::metrics::PoolFailureClass,
+    prev_failure_class: crate::metrics::PoolFailureClass,
 }
 
 /// Emit the P0 pool-failure observability signals for one reconcile.
@@ -907,16 +1062,22 @@ struct PoolFailureSignals {
 /// - `kobe_pool_consecutive_failures{profile}` — gauge set to the current
 ///   `consecutive_failures`.
 /// - `kobe_pool_failure_reason_changes_total{profile, failure_class}` —
-///   incremented ONLY on the rising edge (`new > prev`) so steady-state
-///   failures aren't re-counted. `failure_class` is the bounded
-///   [`crate::metrics::PoolFailureClass`] mapped from the free-form
-///   `last_failure_reason` text — the raw reason string is never a label.
+///   incremented on a *new failure edge* (`new > prev`) OR a *class transition
+///   while still failing* (e.g. `Other`→`Capacity` when a wedge becomes visible
+///   without the count rising). Steady-state failures at an unchanged class
+///   aren't re-counted, so this stays a "something changed" signal rather than a
+///   reconcile-frequency counter. `failure_class` is the bounded
+///   [`crate::metrics::PoolFailureClass`] set structurally on `BackoffState`
+///   where the cause is known — never parsed from the reason string.
 fn emit_pool_failure_metrics(profile: &str, signals: &PoolFailureSignals) {
     crate::metrics::POOL_CONSECUTIVE_FAILURES
         .with_label_values(&[profile])
         .set(signals.consecutive_failures as i64);
 
-    if signals.consecutive_failures > signals.prev_failures {
+    let new_failure_edge = signals.consecutive_failures > signals.prev_failures;
+    let class_transition =
+        signals.consecutive_failures > 0 && signals.failure_class != signals.prev_failure_class;
+    if new_failure_edge || class_transition {
         crate::metrics::POOL_FAILURE_REASON_CHANGES_TOTAL
             .with_label_values(&[profile, signals.failure_class.as_str()])
             .inc();
@@ -1318,11 +1479,37 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
     }
 }
 
+/// Marker prefix stamped on `last_failure_reason` when the #191 capacity wedge
+/// is engaged. It is the ONLY structured marker in the otherwise free-form
+/// reason text, so it doubles as the sound inverse used by
+/// [`persisted_failure_class`] to recover a prior reconcile's class.
+pub(crate) const CAPACITY_BLOCKED_REASON_PREFIX: &str = "capacity-blocked:";
+
+/// Recover the [`crate::metrics::PoolFailureClass`] a *previously persisted*
+/// pool reason was emitted with. Only `Capacity` carries a marker
+/// ([`CAPACITY_BLOCKED_REASON_PREFIX`]); every other persisted reason was
+/// `Other`. This is a marker-based inverse of the structural class — NOT the
+/// unsound keyword parsing of [`crate::metrics::PoolFailureClass::from_reason`].
+fn persisted_failure_class(reason: Option<&str>) -> crate::metrics::PoolFailureClass {
+    match reason {
+        Some(r) if r.starts_with(CAPACITY_BLOCKED_REASON_PREFIX) => {
+            crate::metrics::PoolFailureClass::Capacity
+        }
+        _ => crate::metrics::PoolFailureClass::Other,
+    }
+}
+
 /// Backoff bookkeeping computed once per reconcile.
 pub(crate) struct BackoffState {
     pub consecutive_failures: u32,
     pub next_attempt_at: Option<String>,
     pub last_failure_reason: Option<String>,
+    /// Bounded failure class for the `kobe_pool_failure_reason_changes_total`
+    /// label, set STRUCTURALLY here where the cause is known — never parsed back
+    /// out of `last_failure_reason` (that string embeds dynamic data such as the
+    /// pool name, so substring classification is unsound: a pool named e.g.
+    /// `…-health…` or `create-…` would mislabel the metric).
+    pub failure_class: crate::metrics::PoolFailureClass,
     pub max_attempted_index: u32,
     pub last_ready_max_index: u32,
 }
@@ -1402,6 +1589,7 @@ fn compute_backoff_state(
             consecutive_failures: 0,
             next_attempt_at: None,
             last_failure_reason: None,
+            failure_class: crate::metrics::PoolFailureClass::Other,
             max_attempted_index: new_max_attempted,
             last_ready_max_index: new_last_ready_max,
         };
@@ -1432,24 +1620,36 @@ fn compute_backoff_state(
         prev_next_attempt
     };
 
+    // Bounded failure class for the metric label, decided from the signals we
+    // actually have — NOT parsed back out of `last_failure_reason` below. That
+    // string embeds dynamic data (the pool name, indexes, free-form guidance),
+    // so substring classification is unsound. Today the only cause the pool loop
+    // can attribute is the #191 capacity wedge; everything else is `Other`.
+    let failure_class = if new_failures > 0 && scheduling_blocked_present {
+        crate::metrics::PoolFailureClass::Capacity
+    } else {
+        crate::metrics::PoolFailureClass::Other
+    };
+
     // Populate a triage-actionable reason from the signals we have (the
     // per-instance error isn't carried in PoolState, so we point operators at
     // the failing ClusterInstances rather than inventing detail). Previously
     // this field was only ever carried forward or cleared, so it was always
-    // empty — defeating the status field's purpose.
+    // empty — defeating the status field's purpose. This text is human-facing
+    // ONLY; the metric label comes from `failure_class` above.
     let last_failure_reason = if new_failures > 0 {
         let base = format!(
             "{new_failures} instance(s) not reaching Ready (attempted up to index \
              {new_max_attempted}, highest Ready {new_last_ready_max}); inspect the \
-             Failed/Unhealthy ClusterInstances (kubectl get ci -l \
+             Failed/not-Ready ClusterInstances (kubectl get ci -l \
              kobe.kunobi.ninja/pool={profile_name}) and their pod logs/events"
         );
         // #189 (observability): when the #191 scheduling-blocked backpressure is
-        // engaged, prefix the reason so it clearly reads as a capacity wedge and
-        // is classifiable by `PoolFailureClass::from_reason` → `Capacity`. This
-        // is a STRING-ONLY enrichment: it does NOT change the phase, the failure
-        // count, or any create/recycle/backoff decision — those already reacted
-        // to `scheduling_blocked_present` above.
+        // engaged, prefix the reason so it clearly reads as a capacity wedge
+        // (`failure_class` above is already `Capacity`). This is a STRING-ONLY
+        // enrichment: it does NOT change the phase, the failure count, or any
+        // create/recycle/backoff decision — those already reacted to
+        // `scheduling_blocked_present` above.
         if scheduling_blocked_present {
             let blocked = pool_state
                 .clusters
@@ -1457,7 +1657,7 @@ fn compute_backoff_state(
                 .filter(|e| e.scheduling_blocked)
                 .count();
             Some(format!(
-                "capacity-blocked: {blocked} instance(s) unschedulable; {base}"
+                "{CAPACITY_BLOCKED_REASON_PREFIX} {blocked} instance(s) unschedulable; {base}"
             ))
         } else {
             Some(base)
@@ -1470,6 +1670,7 @@ fn compute_backoff_state(
         consecutive_failures: new_failures,
         next_attempt_at: next_attempt,
         last_failure_reason,
+        failure_class,
         max_attempted_index: new_max_attempted,
         last_ready_max_index: new_last_ready_max,
     }

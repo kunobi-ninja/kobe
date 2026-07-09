@@ -251,9 +251,11 @@ pub enum RecycleReason {
     HealthFailed,
     /// Lease released by user; pool policy may recycle on release.
     LeaseReleased,
-    /// `KobeStore.status.conditions[Healthy]=False` — backend datastore
-    /// degraded; profile controller halted creates and recycles
-    /// pre-existing failed instances.
+    /// Reserved for a future path that recycles an instance specifically
+    /// because its backend datastore is degraded. The profile controller's
+    /// current KobeStore-degradation handling only PAUSES creates (log-only)
+    /// and is observed via `kobe_kobestore_healthy` — it does not recycle with
+    /// this reason today.
     KobeStoreDegraded,
     /// Associated `CIDRClaim` reached `Conflict` (requested CIDR
     /// already taken, or pool exhausted).
@@ -419,18 +421,16 @@ pub static INSTANCE_CREATES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 // alongside existing control flow.
 // ─────────────────────────────────────────────────────────────────────
 
-/// Coarse classification of a pool's `last_failure_reason` text into a
-/// bounded label vocabulary. The reason string itself is high-cardinality
-/// (it embeds indexes, pool names, free-form guidance) so it can NEVER be a
-/// label value; this enum maps it onto a fixed, alert-friendly set via simple
-/// keyword matching in [`PoolFailureClass::from_reason`].
+/// Coarse, bounded label vocabulary for pool failure transitions. Live emitters
+/// set this **structurally** where the cause is known (see
+/// `controllers::profile`); the raw `last_failure_reason` string is
+/// high-cardinality (it embeds indexes, pool names, free-form guidance) so it
+/// can NEVER be a label value.
 ///
 /// `#[allow(dead_code)]`: the full vocabulary is frozen up front so dashboards
-/// / alerts can reference every class stably; not every variant is reachable
-/// from the current single `last_failure_reason` text (today it's almost
-/// always the generic "not reaching Ready" message → `Other`), but the
-/// backend-create / delete / bootstrap / health / kobestore / ipam classes
-/// gain emitters as those reason strings get richer.
+/// / alerts can reference every class stably. The profile controller currently
+/// emits only `Capacity` and `Other`; the remaining variants are reserved
+/// vocabulary, not a promise of live emitters.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolFailureClass {
@@ -474,6 +474,13 @@ impl PoolFailureClass {
     /// Order matters: delete-related keywords are checked before the generic
     /// "create" so a PDB delete 403 ("poddisruption") classifies as
     /// `BackendDelete` rather than falling through.
+    ///
+    /// NOTE: substring matching over free-form text is inherently unsound when
+    /// that text embeds dynamic data (pool names, etc.), so live emitters set
+    /// [`PoolFailureClass`] structurally at the failure site instead and no
+    /// runtime code calls this. Retained only as a best-effort helper for
+    /// tests / offline inspection of legacy reason strings.
+    #[allow(dead_code)]
     pub fn from_reason(reason: &str) -> Self {
         let r = reason.to_ascii_lowercase();
         if r.contains("delete") || r.contains("poddisruption") || r.contains("teardown") {
@@ -714,14 +721,16 @@ pub static POOL_CONSECUTIVE_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Counts the EDGE where a pool's consecutive-failure count just increased,
-/// keyed by the coarse [`PoolFailureClass`]. Counting only the edge (not every
-/// steady-state reconcile) keeps this a "new failure started" signal rather
-/// than a slowly-climbing counter that tracks reconcile frequency.
+/// Counts the EDGE where a pool's failure signal changed — either its
+/// consecutive-failure count just increased, or its [`PoolFailureClass`]
+/// transitioned while still failing (e.g. `Other`→`Capacity` at an unchanged
+/// count). Counting only the edge (not every steady-state reconcile) keeps this
+/// a "something changed" signal rather than a counter that tracks reconcile
+/// frequency.
 pub static POOL_FAILURE_REASON_CHANGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "kobe_pool_failure_reason_changes_total",
-        "Edges where a pool's consecutive-failure count increased, by failure class",
+        "Pool failure count-increase or class-transition edges, by current failure class",
         &["profile", "failure_class"]
     )
     .unwrap()
