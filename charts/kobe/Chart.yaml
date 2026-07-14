@@ -5,7 +5,7 @@ description: >-
   Supports multiple backends: k3s, k0s, CAPI, and kobe-sync.
 type: application
 version: 0.21.17
-appVersion: "0.32.0-rc.1"
+appVersion: "0.33.0"
 keywords:
   - kubernetes
   - operator
