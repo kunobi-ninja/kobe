@@ -160,7 +160,7 @@ status:
 
 ## Documentation
 
-See [docs/kobe-docs/](docs/kobe-docs/) for the user-facing documentation site.
+See [kunobi.ninja/docs/kobe](https://kunobi.ninja/docs/kobe) for the user-facing documentation site.
 
 ## License
 
