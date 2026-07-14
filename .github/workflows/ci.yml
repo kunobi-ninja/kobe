@@ -20,27 +20,30 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/package-publish.yml"
       - ".github/workflows/publish-crates.yaml"
+  # Releases are cut by pushing a `v*` tag — NOT by publishing a GitHub Release
+  # by hand. `_release-rust.yml` creates the Release itself as a DRAFT, attaches
+  # every signed asset, and only then flips it to published. That ordering is
+  # mandatory now that immutable releases are enabled on this repo: a published
+  # immutable release has its assets and tag LOCKED, so nothing can be uploaded
+  # to it afterwards.
+  #
+  # Deliberately NOT `release: [published]`:
+  #   - Publishing a Release by hand would create it *published*, so release-cli
+  #     would upload into a locked release and fail.
+  #   - The draft→publish transition the shared workflow performs fires its own
+  #     `release: published` event; if this workflow also listened for it,
+  #     release-cli would re-run against the now-published release and fail.
+  # package-publish.yml / publish-crates.yaml DO still listen for
+  # `release: published` — that is the intended cascade, and it is why the
+  # publish is done with GH_PAT_KUNOBI_NINJA_RELEASES rather than GITHUB_TOKEN
+  # (GitHub suppresses workflow triggers for events raised by GITHUB_TOKEN).
+  #
+  # No `paths:` filter here: it applies to tag pushes too, and a tag push
+  # carries no file diff, so a filtered `push` would silently never fire the
+  # release. Mirrors kache's trigger block.
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "crates/**"
-      - "charts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "docker/**"
-      - "docker-bake.hcl"
-      - "hack/**"
-      - "scripts/**"
-      - "apt_config/**"
-      - "nix/**"
-      - "flake.nix"
-      - "flake.lock"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/package-publish.yml"
-      - ".github/workflows/publish-crates.yaml"
-  release:
-    types: [published]
+    tags: ["v*"]
   workflow_dispatch:
   # Nightly trigger for the slow privileged-k3s e2e gate (see the `e2e` job).
   schedule:
@@ -224,7 +227,7 @@ jobs:
         run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}-${{ matrix.backend }}
 
   publish:
-    # Pushes the operator/sync container images. On a RELEASE, gate the image
+    # Pushes the operator/sync container images. On a RELEASE TAG, gate the image
     # push on version-consistency too, so a tag that disagrees with the manifest
     # can't ship images while release-cli + crates are blocked. On push-to-main
     # (where version-consistency is skipped) keep publishing as before.
@@ -232,7 +235,7 @@ jobs:
     if: >-
       ${{ always() && github.event_name != 'pull_request'
           && needs.checks.result == 'success'
-          && (github.event_name != 'release' || needs['version-consistency'].result == 'success') }}
+          && (!startsWith(github.ref, 'refs/tags/v') || needs['version-consistency'].result == 'success') }}
     runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
@@ -246,8 +249,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract version from release
-        if: github.event_name == 'release'
+      - name: Extract version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
         id: version
         env:
           TAG: ${{ github.ref_name }}
@@ -264,7 +267,7 @@ jobs:
   # workspace manifest version and Chart.yaml BEFORE any binary is built,
   # signed, or published to crates.io. Hermetic (manifest reads only).
   version-consistency:
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: kunobi-runners
     container:
       image: rust:1.94-bookworm
@@ -293,7 +296,7 @@ jobs:
   # which defaults to kache so the change is a strict no-op for existing
   # consumers). This job will not function until that PR is merged and v11 is cut.
   release-cli:
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [checks, version-consistency]
     uses: zondax/_workflows/.github/workflows/_release-rust.yml@v11
     with:
