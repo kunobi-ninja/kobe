@@ -160,22 +160,34 @@ jobs:
   # (name suffixed by backend) and always tears it down. `fail-fast: false` so
   # one backend's failure doesn't mask the others.
   #
-  # PHASE 1: nightly + manual ONLY, not yet a PR-required check. k3s is the
-  # proven leg (was the standalone `e2e` job); the vkobe legs run the same gate
-  # on the vkobe backend across both datastores (etcd + kine/sqlite). vcluster
-  # and capi have no e2e harness/pool yet — tracked as follow-up before they
-  # join the matrix (and before conformance becomes the admission rule for new
-  # backends, the remaining half of #164). No `container:` block: like
-  # `docker-dry-run`, this needs the host Docker socket for kind + buildx.
+  # PHASE 2 (#10): the k3s leg — the production backend — also runs on every
+  # push to main and on release tags, so a conformance regression is caught
+  # before (main) or at (tag) the release boundary instead of a day later.
+  # The full matrix (k3s + both vkobe datastores) stays nightly + manual; the
+  # vkobe legs run the same gate across etcd + kine/sqlite. vcluster and capi
+  # have no e2e harness/pool yet — tracked as follow-up before they join the
+  # matrix; `backend_conformance_coverage_is_classified` (crd/profile.rs)
+  # forces every new BackendType to be consciously classified against this
+  # matrix. Since #28, reaching Ready on k3s/k0s/vcluster requires the
+  # functional admission gates (DNSHealthy + InClusterToken), so every leg
+  # that provisions to Ready exercises them end-to-end. Deliberately NOT in
+  # `publish.needs` yet: a flaky e2e must not block an urgent release —
+  # promote once the main-push signal proves stable. No `container:` block:
+  # like `docker-dry-run`, this needs the host Docker socket for kind + buildx.
   conformance:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+          || (github.event_name == 'push'
+              && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) }}
     needs: [checks]
     runs-on: kunobi-runners
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        backend: [k3s, vkobe-etcd, vkobe-kine]
+        # k3s-only on push (fast feedback on the production backend); the full
+        # matrix nightly / on manual dispatch.
+        backend: ${{ fromJSON(github.event_name == 'push' && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine"]') }}
     steps:
       - uses: actions/checkout@v4
 

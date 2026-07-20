@@ -1639,6 +1639,50 @@ fn default_backup_ttl() -> String {
 mod tests {
     use super::*;
 
+    /// #10: "passes conformance" is the admission rule for backends. The
+    /// exhaustive match is the enforcement: adding a `BackendType` variant
+    /// fails compilation here until the author consciously classifies it —
+    /// either naming its CI conformance-matrix leg(s) or documenting why it
+    /// is exempt. Covered legs are cross-checked against the workflow text so
+    /// this list can't silently drift from `.github/workflows/ci.yml`.
+    #[test]
+    fn backend_conformance_coverage_is_classified() {
+        fn conformance_legs(backend: &BackendType) -> Option<&'static [&'static str]> {
+            match backend {
+                BackendType::K3s => Some(&["\"k3s\""]),
+                BackendType::Vkobe => Some(&["vkobe-etcd", "vkobe-kine"]),
+                // Documented exemptions — NOT yet in the matrix:
+                // - vcluster: no e2e harness pool yet (#10 follow-up; must
+                //   join before it carries production load)
+                // - capi: no CI infrastructure provider yet
+                // - k0s: no e2e pool in the harness yet
+                BackendType::Vcluster | BackendType::Capi | BackendType::K0s => None,
+            }
+        }
+
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        // The iteration list may lag a new variant; that's fine — the
+        // exhaustive match above is what breaks the build for new variants.
+        for backend in [
+            BackendType::K3s,
+            BackendType::K0s,
+            BackendType::Capi,
+            BackendType::Vkobe,
+            BackendType::Vcluster,
+        ] {
+            if let Some(legs) = conformance_legs(&backend) {
+                for leg in legs {
+                    assert!(
+                        ci.contains(leg),
+                        "{backend:?} is classified as conformance-covered by leg {leg}, \
+                         but ci.yml's conformance matrix does not mention it — update \
+                         the matrix or this classification"
+                    );
+                }
+            }
+        }
+    }
+
     /// The canonical user-configurable syncer list. Both
     /// `default_vkobe_syncers` (this module — operator writes it into
     /// the per-cluster ConfigMap) and
