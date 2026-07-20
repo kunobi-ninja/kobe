@@ -383,6 +383,34 @@ pub fn cert_not_after_unix(pem: &str) -> Option<i64> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// CA certificate validity (days). Mirrors the kubeadm/k3s convention of a
+/// 10-year cluster CA. Bounded (rather than rcgen's effectively-non-expiring
+/// default) so the expiry horizon is real and observable (#19/#169).
+const CA_VALIDITY_DAYS: i64 = 3650;
+
+/// Leaf certificate validity (days) — apiserver serving cert, front-proxy
+/// client cert, kubeconfig client certs. One year, mirroring the kubeadm
+/// convention. The pool controller recycles instances well before this
+/// horizon (recycle-before-expiry, #19), so a leaf expiring in production
+/// means the recycle machinery has been broken for weeks — alert on the
+/// `kobe_cert_expiry_seconds` gauge.
+const LEAF_VALIDITY_DAYS: i64 = 365;
+
+/// Not-before backdate applied to every generated cert, absorbing clock skew
+/// between the operator and whatever validates the cert.
+const NOT_BEFORE_SKEW_HOURS: i64 = 1;
+
+/// Bounded validity window (`not_before`, `not_after`) for a cert generated
+/// "now", as rcgen timestamps. Whole-second precision is plenty for cert
+/// lifetimes; x509 stores seconds anyway.
+fn validity_window(validity_days: i64) -> (time::OffsetDateTime, time::OffsetDateTime) {
+    let now = time::OffsetDateTime::now_utc();
+    (
+        now - time::Duration::hours(NOT_BEFORE_SKEW_HOURS),
+        now + time::Duration::days(validity_days),
+    )
+}
+
 /// Generate a self-signed CA with a specific CN and org.
 fn generate_named_ca(san: &str, cn: &str, org: &str) -> Result<(String, String)> {
     let mut params = CertificateParams::new(vec![san.to_string()])?;
@@ -391,6 +419,7 @@ fn generate_named_ca(san: &str, cn: &str, org: &str) -> Result<(String, String)>
     params
         .distinguished_name
         .push(DnType::OrganizationName, org);
+    (params.not_before, params.not_after) = validity_window(CA_VALIDITY_DAYS);
 
     let key = KeyPair::generate()?;
     let cert = params.self_signed(&key)?;
@@ -430,6 +459,7 @@ fn generate_signed_cert(
     params
         .distinguished_name
         .push(DnType::OrganizationName, org);
+    (params.not_before, params.not_after) = validity_window(LEAF_VALIDITY_DAYS);
 
     let key = KeyPair::generate()?;
     let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
@@ -531,6 +561,38 @@ mod tests {
             None,
             "a private key is not a cert"
         );
+    }
+
+    /// #19: certificates must carry BOUNDED validity (CA ~10y, leafs ~1y) —
+    /// rcgen's default is effectively non-expiring, which made the expiry
+    /// horizon gauge vacuous and recycle-before-expiry impossible.
+    #[test]
+    fn test_generated_certs_have_bounded_validity() {
+        let pki = VirtualClusterPki::generate("test-cluster", &["kubernetes.default"]).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        const DAY: i64 = 86_400;
+
+        let ca = cert_not_after_unix(&pki.ca_cert).expect("CA NotAfter parses");
+        assert!(
+            (ca - now - CA_VALIDITY_DAYS * DAY).abs() < DAY,
+            "CA NotAfter should be ~{CA_VALIDITY_DAYS}d out, got {}d",
+            (ca - now) / DAY
+        );
+
+        for (name, pem) in [
+            ("apiserver", &pki.apiserver_cert),
+            ("front-proxy-client", &pki.front_proxy_client_cert),
+        ] {
+            let leaf = cert_not_after_unix(pem).expect("leaf NotAfter parses");
+            assert!(
+                (leaf - now - LEAF_VALIDITY_DAYS * DAY).abs() < DAY,
+                "{name} NotAfter should be ~{LEAF_VALIDITY_DAYS}d out, got {}d",
+                (leaf - now) / DAY
+            );
+        }
     }
 
     #[test]

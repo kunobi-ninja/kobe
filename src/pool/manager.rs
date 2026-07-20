@@ -306,6 +306,33 @@ pub struct ClusterEntry {
     /// the pool's `lastFailureReason` can cite concrete evidence instead of
     /// only pointing at `kubectl`. `None` unless `crashlooping`.
     pub crash_message: Option<String>,
+    /// Seconds until this instance's soonest-expiring kobe-managed PKI
+    /// certificate (#19), stamped by the profile controller from the
+    /// `{name}-certs` Secret before pool evaluation. `None` for backends with
+    /// self-managed PKI (k3s/k0s) and when the Secret is absent/unreadable
+    /// (fail-open — logged by the collector). An instance inside
+    /// [`CERT_RECYCLE_HORIZON_SECS`] is treated exactly like spec drift:
+    /// unclaimed members recycle (bounded, surge-replaced first, soonest
+    /// expiry first, never leased ones — a leased member self-resolves via
+    /// the post-lease recycle, so the residual exposure is a lease whose TTL
+    /// exceeds the remaining horizon).
+    pub cert_horizon_secs: Option<i64>,
+}
+
+/// Recycle-before-expiry horizon (#19): an instance whose soonest-expiring
+/// kobe-managed cert is within this window is treated as drifted. 30 days
+/// against a 1-year leaf validity leaves ample retry room if recycling is
+/// delayed (backoff, pool wedge) and stays far from the cliff. Lease TTL caps
+/// must stay well below this horizon: a lease outliving the remaining horizon
+/// is the one case recycle-before-expiry cannot cover.
+pub const CERT_RECYCLE_HORIZON_SECS: i64 = 30 * 86_400;
+
+impl ClusterEntry {
+    /// Whether this member's PKI is inside the recycle-before-expiry horizon.
+    pub fn cert_expiring(&self) -> bool {
+        self.cert_horizon_secs
+            .is_some_and(|h| h < CERT_RECYCLE_HORIZON_SECS)
+    }
 }
 
 /// Decisions the pool manager emits after evaluating state.
@@ -604,12 +631,26 @@ pub fn compute_pool_actions(
         .filter(|(name, e)| {
             e.state == ClusterState::Ready
                 && !deleting.contains(*name)
-                && entry_drift_eligible(e.spec_hash.as_ref(), e.state_since, &current_hash, now)
+                && (entry_drift_eligible(e.spec_hash.as_ref(), e.state_since, &current_hash, now)
+                    // #19: PKI approaching expiry recycles exactly like drift.
+                    || e.cert_expiring())
         })
         .collect();
+    // Soonest-expiring PKI first (#19) — an hour-left member must not queue
+    // behind 29-days-left ones under the max_recycling cap. Non-expiring
+    // drifted members keep the historical ordering: longest-Ready first,
+    // name as the deterministic tiebreak.
+    let expiry_key = |e: &ClusterEntry| {
+        if e.cert_expiring() {
+            e.cert_horizon_secs.unwrap_or(i64::MAX)
+        } else {
+            i64::MAX
+        }
+    };
     drifted_ready.sort_by(|a, b| {
-        a.1.state_since
-            .cmp(&b.1.state_since)
+        expiry_key(a.1)
+            .cmp(&expiry_key(b.1))
+            .then_with(|| a.1.state_since.cmp(&b.1.state_since))
             .then_with(|| a.0.cmp(b.0))
     });
 
@@ -1039,24 +1080,23 @@ pub fn count_states(state: &PoolState, current_hash: Option<&SpecHash>) -> State
             ClusterState::Recycling => c.recycling += 1,
         }
         // Only an entry with both a `current_hash` to compare against
-        // AND its own stamped hash can drift. Unstamped entries
+        // AND its own stamped hash can hash-drift. Unstamped entries
         // (`spec_hash == None`) count as clean — see type-level doc.
-        if let (Some(curr), Some(entry_hash)) = (current_hash, &entry.spec_hash) {
-            let drifted = entry_hash != curr;
+        // `cert_expiring` (#19) also counts as drift: a member whose PKI
+        // approaches expiry needs the same treatment as a spec change —
+        // surge-replace, then recycle the unclaimed ones, never leased.
+        if current_hash.is_some() {
+            let hash_drifted = matches!(
+                (current_hash, &entry.spec_hash),
+                (Some(curr), Some(entry_hash)) if entry_hash != curr
+            );
+            let drifted = hash_drifted || entry.cert_expiring();
             match (&entry.state, drifted) {
                 (ClusterState::Ready, true) => c.ready_drifted += 1,
                 (ClusterState::Ready, false) => c.ready_clean += 1,
                 (ClusterState::Creating, true) => c.creating_drifted += 1,
                 (ClusterState::Creating, false) => c.creating_clean += 1,
                 (ClusterState::Leased, true) => c.leased_drifted += 1,
-                _ => {}
-            }
-        } else if current_hash.is_some() {
-            // current_hash provided but entry unstamped → clean bucket.
-            // Keeps `ready_clean + ready_drifted == ready` invariant.
-            match entry.state {
-                ClusterState::Ready => c.ready_clean += 1,
-                ClusterState::Creating => c.creating_clean += 1,
                 _ => {}
             }
         }
@@ -1218,6 +1258,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1231,6 +1272,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1244,6 +1286,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
 
@@ -1277,6 +1320,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1290,6 +1334,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1303,6 +1348,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1316,6 +1362,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -1431,6 +1478,7 @@ mod tests {
             scheduling_blocked: false,
             crashlooping: false,
             crash_message: None,
+            cert_horizon_secs: None,
         }
     }
 
@@ -1597,6 +1645,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1610,6 +1659,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -1658,6 +1708,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1671,6 +1722,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -1724,6 +1776,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -1737,6 +1790,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -1951,6 +2005,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -2320,6 +2375,7 @@ mod tests {
             scheduling_blocked: false,
             crashlooping: false,
             crash_message: None,
+            cert_horizon_secs: None,
         }
     }
 
@@ -2333,6 +2389,7 @@ mod tests {
             scheduling_blocked: false,
             crashlooping: false,
             crash_message: None,
+            cert_horizon_secs: None,
         }
     }
 
@@ -2617,6 +2674,116 @@ mod tests {
         );
     }
 
+    /// #19 recycle-before-expiry: a Ready member flagged `cert_expiring`
+    /// recycles exactly like spec drift — even with a CLEAN hash — while a
+    /// leased cert-expiring member is never deleted (the drift invariant),
+    /// and `count_states` partitions both into the drifted buckets.
+    #[test]
+    fn cert_expiring_ready_recycles_like_drift_leased_untouched() {
+        let profile = make_profile_with_upgrade(2, 1, 1, Some(0));
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+
+        let expiring = ClusterEntry {
+            state: ClusterState::Ready,
+            idle_since: None,
+            health_failures: 0,
+            state_since: Some(chrono::Utc::now() - chrono::Duration::seconds(1000)),
+            // Hash matches current: ONLY the cert horizon drives the recycle.
+            spec_hash: Some(current.clone()),
+            scheduling_blocked: false,
+            crashlooping: false,
+            crash_message: None,
+            cert_horizon_secs: Some(86_400),
+        };
+        let mut clusters = HashMap::new();
+        clusters.insert("pool-test-profile-1".into(), expiring.clone());
+        let mut leased = expiring.clone();
+        leased.state = ClusterState::Leased;
+        clusters.insert("pool-test-profile-2".into(), leased);
+        let mut clean = expiring.clone();
+        clean.cert_horizon_secs = None;
+        clusters.insert("pool-test-profile-3".into(), clean);
+        let state = PoolState { clusters };
+
+        let counts = count_states(&state, Some(&current));
+        assert_eq!(counts.ready_drifted, 1, "cert-expiring Ready is drifted");
+        assert_eq!(
+            counts.ready_clean, 1,
+            "non-expiring clean-hash Ready is clean"
+        );
+        assert_eq!(
+            counts.leased_drifted, 1,
+            "cert-expiring Leased counts drifted"
+        );
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["pool-test-profile-1"],
+            "only the unclaimed cert-expiring member recycles; leased never"
+        );
+    }
+
+    /// #19: under the `max_recycling` cap, the member with the SOONEST cert
+    /// horizon recycles first — an hour-left member must not queue behind a
+    /// 29-days-left one, regardless of `state_since` age.
+    #[test]
+    fn soonest_expiring_member_recycles_first_under_cap() {
+        let profile = make_profile_with_upgrade(2, 1, 1, Some(0)); // max_recycling=1
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+
+        let entry = |horizon: i64, age_secs: i64| ClusterEntry {
+            state: ClusterState::Ready,
+            idle_since: None,
+            health_failures: 0,
+            state_since: Some(chrono::Utc::now() - chrono::Duration::seconds(age_secs)),
+            spec_hash: Some(current.clone()),
+            scheduling_blocked: false,
+            crashlooping: false,
+            crash_message: None,
+            cert_horizon_secs: Some(horizon),
+        };
+        let mut clusters = HashMap::new();
+        // Older member, but 29 days of horizon left.
+        clusters.insert("pool-test-profile-1".into(), entry(29 * 86_400, 10_000));
+        // Younger member, one hour left — must win the single recycle slot.
+        clusters.insert("pool-test-profile-2".into(), entry(3_600, 10));
+        let state = PoolState { clusters };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deletes,
+            vec!["pool-test-profile-2"],
+            "the one-hour-left member takes the capped recycle slot"
+        );
+    }
+
     /// Scale-down is gated on `drift_in_flight == 0`. While even a
     /// single drifted Ready remains, we must not reap fresh
     /// replacements as "excess idle past min_ready" — that would
@@ -2661,6 +2828,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -2919,6 +3087,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -2932,6 +3101,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -2988,6 +3158,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -3045,6 +3216,7 @@ mod tests {
                 scheduling_blocked: true,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         // Clean, equally-old Creating — the control: it MUST be Deleted.
@@ -3059,6 +3231,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -3137,6 +3310,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: true,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
@@ -3197,6 +3371,7 @@ mod tests {
                 scheduling_blocked: true,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         clusters.insert(
@@ -3210,6 +3385,7 @@ mod tests {
                 scheduling_blocked: false,
                 crashlooping: false,
                 crash_message: None,
+                cert_horizon_secs: None,
             },
         );
         let state = PoolState { clusters };
