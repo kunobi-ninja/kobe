@@ -1034,10 +1034,14 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
 ///   bug `ci-vkobe-flux` hid behind for 7 days on an internal cluster). Its DNS is
 ///   host-projected, not a standard `kube-dns` Service, so the DNS gate
 ///   below doesn't apply to it.
-/// - **k3s / k0s / vcluster** → `DNSHealthy`. These bundle CoreDNS fronted
-///   by the `kube-dns` Service; gate on DNS *actually serving* so a cluster
-///   whose CoreDNS crashloops on an in-cluster x509 mismatch (#42) —
-///   answering apiserver, dead DNS — is never leased.
+/// - **k3s / k0s / vcluster** → `DNSHealthy` + `InClusterToken` (#10). These
+///   bundle CoreDNS fronted by the `kube-dns` Service; gate on DNS *actually
+///   serving* so a cluster whose CoreDNS crashloops on an in-cluster x509
+///   mismatch (#42) — answering apiserver, dead DNS — is never leased. The
+///   token gate additionally proves the SA sign/verify chain a workload's
+///   `rest.InClusterConfig()` depends on (TokenRequest → TokenReview, both
+///   from the operator's admin client — cheap, no probe Pod), closing the
+///   second bad-but-Ready class from #42/#92.
 /// - **capi** → none. CAPI clusters are provider/distro-defined and
 ///   `kube-dns` is not guaranteed; imposing a DNS gate could wedge a valid
 ///   pool.
@@ -1056,7 +1060,13 @@ fn apply_default_readiness_gates(
     match backend_type {
         BackendType::Vkobe => vec![ReadinessGate::SchedulingProbe { namespace: None }],
         BackendType::K3s | BackendType::K0s | BackendType::Vcluster => {
-            vec![ReadinessGate::DnsHealthy { namespace: None }]
+            vec![
+                ReadinessGate::DnsHealthy { namespace: None },
+                ReadinessGate::InClusterToken {
+                    namespace: None,
+                    service_account: None,
+                },
+            ]
         }
         BackendType::Capi => gates,
     }
@@ -2889,17 +2899,29 @@ mod tests {
         ));
     }
 
-    /// Real-cluster backends (k3s/k0s/vcluster) with no user gates get a
-    /// default `DNSHealthy` — they bundle CoreDNS behind `kube-dns`, so a
-    /// dead-DNS-but-live-apiserver cluster (#42) must not be leased.
+    /// Real-cluster backends (k3s/k0s/vcluster) with no user gates get the
+    /// default functional-admission pair (#10): `DNSHealthy` (they bundle
+    /// CoreDNS behind `kube-dns`, so a dead-DNS-but-live-apiserver cluster
+    /// (#42) must not be leased) + `InClusterToken` (the SA sign/verify chain
+    /// every `rest.InClusterConfig()` workload depends on must round-trip).
     #[test]
-    fn real_cluster_backends_with_no_gates_get_default_dns_healthy() {
+    fn real_cluster_backends_with_no_gates_get_default_dns_and_token() {
         for backend in [BackendType::K3s, BackendType::K0s, BackendType::Vcluster] {
             let gates = apply_default_readiness_gates(backend.clone(), vec![]);
-            assert_eq!(gates.len(), 1, "{backend:?} should get one default gate");
+            assert_eq!(gates.len(), 2, "{backend:?} should get two default gates");
             assert!(
                 matches!(gates[0], ReadinessGate::DnsHealthy { namespace: None }),
-                "{backend:?} default should be DNSHealthy"
+                "{backend:?} first default should be DNSHealthy"
+            );
+            assert!(
+                matches!(
+                    gates[1],
+                    ReadinessGate::InClusterToken {
+                        namespace: None,
+                        service_account: None
+                    }
+                ),
+                "{backend:?} second default should be InClusterToken"
             );
         }
     }
