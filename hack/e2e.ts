@@ -48,7 +48,7 @@ const DEMO_VKOBE_VERSION = "1.35";
 const LOCAL_TARGET = "e2e";
 const LOCAL_ENDPOINT = "http://127.0.0.1:8080";
 const LOCAL_NODE_PORT = 30080;
-const REQUIRED_MISE_TOOLS = ["bun", "helm", "kind"];
+const REQUIRED_MISE_TOOLS = ["bun", "helm", "kind", "kubectl"];
 const FINGERPRINT_INPUTS = [
   "Cargo.toml",
   "Cargo.lock",
@@ -99,11 +99,15 @@ async function runCommand(
     allowFailure?: boolean;
     step?: string;
     stream?: boolean;
+    /** Feed this file to the child's stdin (e.g. piping an image archive
+     * into `docker exec -i … ctr images import -`). */
+    stdinFile?: string;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const stream = options?.stream ?? false;
   const proc = Bun.spawn({
     cmd,
+    stdin: options?.stdinFile ? Bun.file(options.stdinFile) : undefined,
     stdout: stream ? "inherit" : "pipe",
     stderr: stream ? "inherit" : "pipe",
     cwd: process.cwd(),
@@ -389,7 +393,6 @@ async function verifyImageInNode(node: string, imageRef: string): Promise<void> 
 async function loadRemoteImagesIntoKind(cluster: string, images: string[]): Promise<void> {
   if (images.length === 0) return;
   step(`Pre-loading guest images into kind cluster '${cluster}'`);
-  const kind = await resolveTool("kind");
   const nodes = await kindNodes(cluster);
   for (const image of images) {
     info(`  - pulling ${image}`);
@@ -397,11 +400,42 @@ async function loadRemoteImagesIntoKind(cluster: string, images: string[]): Prom
       step: `failed to pull guest image '${image}'`,
       stream: true,
     });
-    info(`  - loading ${image} into kind cluster '${cluster}'`);
-    await runCommand([kind, "load", "docker-image", image, "--name", cluster], {
-      step: `failed to load guest image '${image}' into kind cluster '${cluster}'`,
+
+    // Deliberately NOT `kind load docker-image` (#34): for a registry-pulled
+    // multi-arch image, `docker save` can emit an archive that still carries
+    // the multi-arch index, and kind's internal `ctr images import
+    // --all-platforms` then fails trying to resolve the foreign-platform
+    // manifests that were never pulled — and kind swallows ctr's stderr, so
+    // the nightly matrix died for weeks with an opaque "exit status 1".
+    // Import the archive ourselves WITHOUT `--all-platforms` (only the
+    // pulled platform must resolve, and it always does) and with stderr on
+    // the failure path.
+    const tarPath = `${TEMP_DIR}/guest-${image.replace(/[^a-zA-Z0-9._-]/g, "_")}.tar`;
+    info(`  - saving ${image} to ${tarPath}`);
+    await runCommand(["docker", "save", image, "-o", tarPath], {
+      step: `failed to save guest image '${image}'`,
     });
     for (const node of nodes) {
+      info(`  - importing ${image} into ${node}`);
+      await runCommand(
+        [
+          "docker",
+          "exec",
+          "-i",
+          node,
+          "ctr",
+          "--namespace=k8s.io",
+          "images",
+          "import",
+          "--digests",
+          "--snapshotter=overlayfs",
+          "-",
+        ],
+        {
+          stdinFile: tarPath,
+          step: `failed to import guest image '${image}' into node '${node}'`,
+        },
+      );
       await verifyImageInNode(node, image);
     }
   }
@@ -443,9 +477,10 @@ async function installChart(args: Args): Promise<void> {
   // CRDs in charts/kobe/crds/ are installed by Helm on first install. On upgrades,
   // re-apply with server-side apply using the "helm" field manager so ownership
   // stays consistent with what Helm uses internally (avoids field-manager conflicts).
+  const kubectl = await resolveTool("kubectl");
   await runCommand(
     [
-      "kubectl",
+      kubectl,
       "--context",
       kubeContext(args.cluster),
       "apply",

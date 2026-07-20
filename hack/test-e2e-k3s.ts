@@ -306,7 +306,28 @@ async function waitForReadyInstance(): Promise<string> {
 // finalizer is never removed, and the instance lingers in Recycling forever →
 // this times out and FAILS.
 async function recycleAndAssertGone(instanceName: string): Promise<void> {
-  info(`(B) Recycling instance '${instanceName}' via kubectl delete...`);
+  // Capture the doomed object's UID first: the pool controller replaces a
+  // deleted member within milliseconds, and on an otherwise-empty pool the
+  // replacement REUSES the lowest free index — i.e. the SAME NAME. A
+  // name-based "is it gone" poll then sees the healthy replacement forever
+  // and times out even though teardown worked perfectly (#34, round 2). The
+  // UID is the identity of the old object: same name + different UID ⇒ the
+  // old instance is gone and what we see is its replacement.
+  const { stdout: uidOut, exitCode: uidExit } = await kubectl(
+    [
+      "get",
+      "clusterinstance.kobe.kunobi.ninja",
+      "-n",
+      namespace,
+      instanceName,
+      "-o",
+      "jsonpath={.metadata.uid}",
+    ],
+    { allowFailure: true },
+  );
+  const doomedUid = uidExit === 0 ? uidOut.trim() : "";
+
+  info(`(B) Recycling instance '${instanceName}' (uid=${doomedUid || "?"}) via kubectl delete...`);
   // --wait=false: do NOT block on the finalizer here; the assertion below is
   // exactly that the finalizer is eventually released and the object vanishes.
   await kubectl(
@@ -327,6 +348,22 @@ async function recycleAndAssertGone(instanceName: string): Promise<void> {
   let attempt = 0;
   let lastPhase = "(unknown)";
 
+  const assertNoOrphanedPvcs = async (goneHow: string): Promise<void> => {
+    const orphans = await orphanedServerPvcs(instanceName);
+    if (orphans.length > 0) {
+      errorLine(
+        `(B) FAIL: instance '${instanceName}' was deleted but orphaned PVC(s) remain: ${orphans.join(", ")}`,
+      );
+      errorLine("     This is the #154 PVC-reaping regression class.");
+      await printDiagnostics("recycle left orphaned server data PVCs", instanceName);
+      process.exit(1);
+    }
+    const elapsed = Math.floor((Date.now() - (deadline - recycleTimeoutSeconds * 1000)) / 1000);
+    info(
+      `(B) PASS: instance '${instanceName}' is fully gone (${goneHow}) after ~${elapsed}s and no data-${instanceName}-server-* PVC was orphaned.`,
+    );
+  };
+
   while (Date.now() < deadline) {
     attempt += 1;
     const { stdout, exitCode } = await kubectl(
@@ -337,30 +374,26 @@ async function recycleAndAssertGone(instanceName: string): Promise<void> {
         namespace,
         instanceName,
         "-o",
-        "jsonpath={.status.phase}",
+        "jsonpath={.metadata.uid}{\"/\"}{.status.phase}",
       ],
       { allowFailure: true },
     );
 
     if (exitCode !== 0) {
-      // get failed ⇒ the object is gone (NotFound). Now assert no orphaned PVC.
-      const orphans = await orphanedServerPvcs(instanceName);
-      if (orphans.length > 0) {
-        errorLine(
-          `(B) FAIL: instance '${instanceName}' was deleted but orphaned PVC(s) remain: ${orphans.join(", ")}`,
-        );
-        errorLine("     This is the #154 PVC-reaping regression class.");
-        await printDiagnostics("recycle left orphaned server data PVCs", instanceName);
-        process.exit(1);
-      }
-      const elapsed = Math.floor((Date.now() - (deadline - recycleTimeoutSeconds * 1000)) / 1000);
-      info(
-        `(B) PASS: instance '${instanceName}' is fully gone after ~${elapsed}s and no data-${instanceName}-server-* PVC was orphaned.`,
-      );
+      // get failed ⇒ the object is gone (NotFound).
+      await assertNoOrphanedPvcs("NotFound");
       return;
     }
 
-    lastPhase = stdout.trim() || "(empty)";
+    const [uid, phase] = stdout.trim().split("/", 2);
+    if (doomedUid && uid && uid !== doomedUid) {
+      // Same name, different UID: the old object is fully deleted and the
+      // pool has already created its replacement. Teardown succeeded.
+      await assertNoOrphanedPvcs(`replaced by new instance uid=${uid}`);
+      return;
+    }
+
+    lastPhase = phase?.trim() || "(empty)";
     const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
     info(`  [${attempt}] ${remaining}s left - instance still present, phase=${lastPhase}`);
     await Bun.sleep(pollRetrySeconds * 1000);
