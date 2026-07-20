@@ -157,7 +157,7 @@ async function runCommand(
 }
 
 async function kobeJson<T>(args: string[]): Promise<T> {
-  const { stdout } = await runCommand(["cargo", "run", "--quiet", "--bin", "kobe", "--", ...kobeArgs, ...args]);
+  const { stdout } = await runCommand(["cargo", "run", "--quiet", "-p", "kobectl", "--bin", "kobe", "--", ...kobeArgs, ...args]);
   return JSON.parse(stdout) as T;
 }
 
