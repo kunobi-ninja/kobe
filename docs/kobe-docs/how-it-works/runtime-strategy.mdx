@@ -1,0 +1,64 @@
+---
+title: Runtime strategy
+description: Which virtual-cluster runtime kobe stands on today, where it is heading, and what is retired.
+---
+
+# Runtime strategy
+
+This page is the authoritative statement of kobe's runtime direction. If any
+other document disagrees with it, this page wins.
+
+kobe's value is the **fleet layer** — pools, leases, multi-backend admission,
+GitOps, golden images, observability — kept uniform across runtimes. The
+runtimes themselves are deliberately pluggable, and the strategy is two-pronged:
+
+## Density: vcluster
+
+For high-density, low-overhead virtual clusters (CI, ephemeral environments),
+kobe stands on **[vcluster](https://www.vcluster.com/)** (loft-sh, Apache 2.0)
+as the `vcluster` backend. The operator deploys one vcluster instance per
+`ClusterInstance` via the upstream Helm chart into a dedicated per-instance
+namespace.
+
+Because this backend inherits vcluster's syncer semantics, it also inherits
+its fidelity boundaries (cloud identity such as IRSA, syncer coverage, version
+skew). Route tenants who need full-fidelity cluster semantics to an
+isolation-tier backend instead.
+
+## Isolation: pkobe (native)
+
+For workloads that need real isolation and full API fidelity — dedicated
+control planes, real worker nodes, native RBAC/CSI/cloud-identity — kobe builds
+its own runtime: **pkobe** (dedicated control plane + real nodes, KubeVirt as
+the primary node provider). This is the backend kobe develops natively, and
+the roadmap's isolation tier. See the roadmap epic
+([#24](https://github.com/kunobi-ninja/kobe/issues/24)) and the pkobe issue
+([#23](https://github.com/kunobi-ninja/kobe/issues/23)).
+
+Until pkobe lands, full isolation is served by the **k3s / k0s** backends
+(nested real clusters) — today's production path — and **CAPI** for
+provider-managed real infrastructure.
+
+## Retired: kobe-sync / vkobe
+
+The in-house proxy-based syncer runtime — the `kobe-sync` sidecar and the
+`vkobe` backend built on it — is **retired**. It is not the path forward:
+maintaining translation fidelity for the full Kubernetes resource surface is a
+whole product in itself, and the effort is better spent on the fleet layer and
+on pkobe.
+
+The code still exists (the `vkobe` backend is marked deprecated in the CRD)
+to support existing pools during migration to `vcluster`, but no new
+functionality is added to it and new pools should not use it. Contributor
+guidance that presents kobe-sync as a core component is stale — this page
+supersedes it.
+
+## Summary
+
+| Need | Backend | Status |
+|---|---|---|
+| Nested real clusters (CI today) | `k3s` / `k0s` | Production |
+| High density, low overhead | `vcluster` | Adopted |
+| Full isolation, native fidelity | `pkobe` | In design (#23) |
+| Provider-managed real infra | `capi` | Available |
+| Proxy-based virtual clusters | `vkobe` (kobe-sync) | **Retired / deprecated** |

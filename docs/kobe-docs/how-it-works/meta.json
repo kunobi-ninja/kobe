@@ -1,4 +1,8 @@
 {
   "title": "How it works",
-  "pages": ["architecture", "pool-lifecycle"]
+  "pages": [
+    "architecture",
+    "runtime-strategy",
+    "pool-lifecycle"
+  ]
 }
