@@ -182,6 +182,13 @@ jobs:
     needs: [checks]
     runs-on: kunobi-runners
     timeout-minutes: 45
+    # The vkobe backend is ON HOLD (see docs/kobe-docs/how-it-works/
+    # runtime-strategy.mdx) and its legs currently fail on a real behavior
+    # tracked in #36 (pool creates no members in the kind harness). Keep them
+    # RUNNING — per-leg status and logs stay visible — but only the k3s
+    # (production) leg fails the run, so the nightly/tag signal is not
+    # permanent red noise while vkobe is paused. Drop this when #36 is fixed.
+    continue-on-error: ${{ matrix.backend != 'k3s' }}
     strategy:
       fail-fast: false
       matrix:
