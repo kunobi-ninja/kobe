@@ -767,14 +767,21 @@ impl K3sBackend {
             },
         ];
 
-        // If persistence is configured, mount data volume
-        if config.persistence.is_some() {
-            volume_mounts.push(VolumeMount {
-                name: "data".to_string(),
-                mount_path: "/var/lib/rancher/k3s".to_string(),
-                ..Default::default()
-            });
-        }
+        // Always mount the `data` volume at k3s's real data dir. With
+        // persistence it's a per-replica PVC (volumeClaimTemplates); without,
+        // an emptyDir (see `build_server_volumes`). Leaving the data dir in
+        // the container's overlayfs rw layer is what made the 2026-07-20
+        // ci-k3s-kunobi crashloop terminal: the nested containerd can't use
+        // the overlayfs snapshotter on top of overlayfs (slow ~25-35s
+        // runtime-ready, racing the kubelet's fatal CSINode-init deadline),
+        // and every container restart cold-started from scratch, replaying
+        // the lost race forever. An emptyDir gives containerd a real node
+        // filesystem AND lets a restart resume with certs/DB/images intact.
+        volume_mounts.push(VolumeMount {
+            name: "data".to_string(),
+            mount_path: "/var/lib/rancher/k3s".to_string(),
+            ..Default::default()
+        });
 
         // Optional registries.yaml mount — points at the file k3s
         // reads at startup to configure containerd mirrors.
@@ -972,8 +979,18 @@ impl K3sBackend {
         // backed by a per-replica PVC declared in the StatefulSet's
         // `volumeClaimTemplates` (see `build_server_statefulset`), so it is NOT
         // listed here — adding a pod-level volume of the same name would shadow
-        // the claim template. Without persistence, no `data` volume is needed
-        // (the container mount is only added when persistence is set).
+        // the claim template. Without persistence it's an emptyDir: k3s's data
+        // dir (incl. the nested containerd) must live on a real node
+        // filesystem, not the container's overlay rw layer, and must survive
+        // container restarts so a lost startup race self-heals instead of
+        // replaying identically (2026-07-20 CSINode-panic crashloop).
+        if config.persistence.is_none() {
+            volumes.push(Volume {
+                name: "data".to_string(),
+                empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+                ..Default::default()
+            });
+        }
 
         // Optional registries.yaml ConfigMap — only mounted when
         // registry_mirrors was set on the ClusterConfig.
@@ -1260,12 +1277,24 @@ impl K3sBackend {
         let labels = Self::agent_labels(name, pool);
         let domain = cluster_domain(config);
 
-        let mut volume_mounts = vec![VolumeMount {
-            name: "token".to_string(),
-            mount_path: "/var/lib/k3s/token".to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        }];
+        let mut volume_mounts = vec![
+            VolumeMount {
+                name: "token".to_string(),
+                mount_path: "/var/lib/k3s/token".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+            // k3s data dir on an emptyDir, same rationale as the server (see
+            // `build_server_container`): the agent's nested containerd needs a
+            // real node filesystem, and its state must survive container
+            // restarts — the agent kubelet runs the same fatal
+            // CSINode-init-deadline race on every cold start.
+            VolumeMount {
+                name: "data".to_string(),
+                mount_path: "/var/lib/rancher/k3s".to_string(),
+                ..Default::default()
+            },
+        ];
         if has_registry_mirrors(config) {
             volume_mounts.push(VolumeMount {
                 name: "registries-config".to_string(),
@@ -1322,19 +1351,28 @@ impl K3sBackend {
             ..Default::default()
         };
 
-        let mut volumes = vec![Volume {
-            name: "token".to_string(),
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(format!("{name}-token")),
-                items: Some(vec![KeyToPath {
-                    key: "token".to_string(),
-                    path: "token".to_string(),
+        let mut volumes = vec![
+            Volume {
+                name: "token".to_string(),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(format!("{name}-token")),
+                    items: Some(vec![KeyToPath {
+                        key: "token".to_string(),
+                        path: "token".to_string(),
+                        ..Default::default()
+                    }]),
                     ..Default::default()
-                }]),
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }];
+            },
+            // Agents are stateless across pod replacement — emptyDir is
+            // always the right backing here (no PVC variant like the server).
+            Volume {
+                name: "data".to_string(),
+                empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+                ..Default::default()
+            },
+        ];
         if has_registry_mirrors(config) {
             volumes.push(Volume {
                 name: "registries-config".to_string(),
@@ -2250,6 +2288,83 @@ mod tests {
         assert!(
             sts.spec.unwrap().volume_claim_templates.is_none(),
             "no persistence ⇒ no volumeClaimTemplates"
+        );
+    }
+
+    /// Without persistence, the k3s data dir must STILL be a real volume
+    /// (emptyDir) mounted at /var/lib/rancher/k3s on both server and agent —
+    /// never the container's overlay rw layer. Leaving it on overlay made the
+    /// 2026-07-20 crashloop terminal: nested containerd couldn't use the
+    /// overlayfs snapshotter (~25-35s runtime-ready racing the kubelet's
+    /// ~23s fatal CSINode-init window on k8s ≤1.32), and every restart
+    /// cold-started, replaying the lost race forever.
+    #[test]
+    fn test_no_persistence_data_dir_backed_by_emptydir() {
+        let config = base_config();
+        assert!(config.persistence.is_none(), "test premise: no persistence");
+
+        // Server: pod-level emptyDir `data` volume + container mount.
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
+        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        let data_vol = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "data")
+            .expect("server pod must have a `data` volume without persistence");
+        assert!(
+            data_vol.empty_dir.is_some(),
+            "no persistence ⇒ `data` is an emptyDir"
+        );
+        let server_mounts = pod_spec.containers[0].volume_mounts.as_ref().unwrap();
+        assert!(
+            server_mounts
+                .iter()
+                .any(|m| m.name == "data" && m.mount_path == "/var/lib/rancher/k3s"),
+            "server container must mount `data` at /var/lib/rancher/k3s"
+        );
+
+        // With persistence the pod-level volume must NOT appear (it would
+        // shadow the volumeClaimTemplates PVC of the same name).
+        let mut persisted = base_config();
+        persisted.persistence = Some(PersistenceConfig {
+            storage_type: Some("dynamic".to_string()),
+            storage_class_name: None,
+            storage_request_size: None,
+        });
+        let sts = K3sBackend::build_server_statefulset("c", "ns", &persisted, None, 1);
+        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        assert!(
+            !pod_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "data"),
+            "persistence ⇒ `data` comes from volumeClaimTemplates, not a pod volume"
+        );
+
+        // Agent: always emptyDir-backed `data` + mount.
+        let dep = K3sBackend::build_agent_deployment("c", "ns", &config, 1);
+        let pod_spec = dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        assert!(
+            pod_spec
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "data" && v.empty_dir.is_some()),
+            "agent pod must have an emptyDir `data` volume"
+        );
+        assert!(
+            pod_spec.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.name == "data" && m.mount_path == "/var/lib/rancher/k3s"),
+            "agent container must mount `data` at /var/lib/rancher/k3s"
         );
     }
 
