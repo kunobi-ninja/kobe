@@ -1115,11 +1115,11 @@ pub static LEASE_HOLD_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// this pool has a cert expiring soon" alertable; the specific cluster lives in
 /// logs/traces. Goes negative once a cert is past `NotAfter`.
 ///
-/// Note (#169): the kobe PKI currently sets no explicit validity (rcgen default
-/// → effectively non-expiring), so today this surfaces that state rather than a
-/// tight horizon; bounded validity + recycle-before-expiry is the tracked
-/// follow-up. Emitting the gauge now means the alert/dashboard wiring is ready
-/// the day validity becomes bounded.
+/// Since #19 the kobe PKI carries bounded validity (CA ~10y, leafs ~1y) and
+/// the profile controller recycles members whose soonest cert is within the
+/// recycle-before-expiry horizon (30d), so in a healthy pool this gauge never
+/// approaches zero — alert on it dropping below the horizon: that means the
+/// recycle machinery is failing to keep up.
 pub static CERT_EXPIRY_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "kobe_cert_expiry_seconds",

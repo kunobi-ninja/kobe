@@ -103,6 +103,7 @@ bytes = "1"
 
 # kobe-sync: TLS and certificates
 rcgen = { version = "0.13", features = ["x509-parser"] }
+time = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"

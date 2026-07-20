@@ -161,6 +161,7 @@ mod cluster_instance_tests {
             scheduling_blocked,
             crashlooping: false,
             crash_message: None,
+            cert_horizon_secs: None,
         }
     }
 
@@ -812,6 +813,37 @@ async fn reconcile_profile(
     // happened to succeed at this exact reconcile.
     let bootstrap_specs = resolve_bootstrap_specs(&ctx.client, &ns, &profile).await;
 
+    // #19 recycle-before-expiry: for kobe-managed-PKI backends, read
+    // per-instance cert horizons (also emits the `kobe_cert_expiry_seconds`
+    // gauge) and stamp them BEFORE evaluation, so this reconcile's actions
+    // already treat in-horizon members as drifted (surge-replace, recycle
+    // unclaimed soonest-expiry-first, never leased — the standard drift
+    // machinery). Skipped entirely for self-managed-PKI backends
+    // (k3s/k0s/capi): no `{name}-certs` Secret exists, so probing would only
+    // add per-member API calls to the reconcile path.
+    if matches!(
+        profile.spec.backend.backend_type,
+        crate::crd::BackendType::Vkobe | crate::crd::BackendType::Vcluster
+    ) {
+        let cert_horizons =
+            collect_and_emit_cert_expiry(&ctx.client, &ns, &name, &pool_state).await;
+        for (cluster_name, entry) in pool_state.clusters.iter_mut() {
+            let Some(horizon) = cert_horizons.get(cluster_name) else {
+                continue;
+            };
+            entry.cert_horizon_secs = Some(*horizon);
+            if entry.cert_expiring() {
+                warn!(
+                    profile = %name,
+                    cluster = %cluster_name,
+                    horizon_days = horizon / 86_400,
+                    "instance PKI certificate within the recycle-before-expiry \
+                     horizon; scheduling drift-style recycle (#19)"
+                );
+            }
+        }
+    }
+
     let actions = compute_pool_actions(
         &profile,
         &pool_state,
@@ -883,6 +915,7 @@ async fn reconcile_profile(
                         scheduling_blocked: false,
                         crashlooping: false,
                         crash_message: None,
+                        cert_horizon_secs: None,
                     },
                 );
             }
@@ -940,7 +973,6 @@ async fn reconcile_profile(
         .await
         .insert(name.clone(), pool_state.clone());
     sync_cluster_instance_statuses(&ctx.client, &ns, &pool_state).await;
-    emit_cert_expiry_metrics(&ctx.client, &ns, &name, &pool_state).await;
 
     // Phase metrics here only need the base state taxonomy — pass
     // `None` for `current_hash` so the drift-aware buckets stay 0.
@@ -1278,6 +1310,7 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
                 // pool's `lastFailureReason` instead of a bare pointer to
                 // kubectl.
                 crash_message: crashlooping.then(|| status.message.clone()).flatten(),
+                cert_horizon_secs: None,
             },
         );
     }
@@ -1518,17 +1551,22 @@ async fn patch_cluster_instance_status(
     Ok(())
 }
 
-/// Best-effort: emit `kobe_cert_expiry_seconds` for a pool by reading each
-/// instance's `{name}-certs` Secret and tracking the soonest-expiring cert per
-/// component. Never fails a reconcile — a missing secret (k3s/k0s backends,
-/// which manage their own PKI, or an instance not yet provisioned) is simply
-/// skipped, so a pool with no kobe-managed PKI emits nothing. See #169.
-async fn emit_cert_expiry_metrics(
+/// Best-effort: read each instance's `{name}-certs` Secret, emit
+/// `kobe_cert_expiry_seconds` per component (worst across the pool), and
+/// return each instance's soonest cert horizon in seconds — the input for
+/// recycle-before-expiry (#19). Only meaningful for backends using the
+/// kobe-managed PKI (vkobe / vcluster) — callers skip it entirely for
+/// self-managed-PKI backends (k3s/k0s/capi), keeping Secret reads off those
+/// pools' reconcile path. Never fails a reconcile: a missing Secret (instance
+/// not yet provisioned) is skipped silently; a read ERROR is skipped
+/// fail-open but logged, so a persistent RBAC/API problem is visible instead
+/// of silently disabling expiry protection. See #169.
+async fn collect_and_emit_cert_expiry(
     client: &Client,
     namespace: &str,
     profile: &str,
     pool_state: &PoolState,
-) {
+) -> HashMap<String, i64> {
     use k8s_openapi::api::core::v1::Secret;
 
     // Secret data key -> metric `component` label.
@@ -1541,12 +1579,26 @@ async fn emit_cert_expiry_metrics(
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let now = chrono::Utc::now().timestamp();
     let mut worst: HashMap<&str, i64> = HashMap::new();
+    let mut per_instance: HashMap<String, i64> = HashMap::new();
 
     for cluster_name in pool_state.clusters.keys() {
-        // 404 (non-PKI backend / not yet created) or a transient error → skip.
         let secret = match secrets.get_opt(&format!("{cluster_name}-certs")).await {
             Ok(Some(s)) => s,
-            _ => continue,
+            // Not yet provisioned → nothing to measure yet.
+            Ok(None) => continue,
+            // Fail-open (this pass must never wedge a reconcile) but VISIBLE:
+            // a persistent read failure would otherwise silently disable
+            // recycle-before-expiry for this member.
+            Err(e) => {
+                warn!(
+                    profile = %profile,
+                    cluster = %cluster_name,
+                    error = %e,
+                    "cert-expiry probe: failed to read certs Secret (fail-open, \
+                     no expiry protection for this member this reconcile)"
+                );
+                continue;
+            }
         };
         let Some(data) = secret.data else { continue };
         for (key, component) in COMPONENTS {
@@ -1561,6 +1613,10 @@ async fn emit_cert_expiry_metrics(
                 .entry(component)
                 .and_modify(|m| *m = (*m).min(horizon))
                 .or_insert(horizon);
+            per_instance
+                .entry(cluster_name.clone())
+                .and_modify(|m| *m = (*m).min(horizon))
+                .or_insert(horizon);
         }
     }
 
@@ -1569,6 +1625,8 @@ async fn emit_cert_expiry_metrics(
             .with_label_values(&[profile, component])
             .set(horizon);
     }
+
+    per_instance
 }
 
 async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_state: &PoolState) {
