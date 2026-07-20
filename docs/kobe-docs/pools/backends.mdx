@@ -1,11 +1,11 @@
 ---
 title: Backends
-description: k3s, k0s, CAPI, and vkobe — how each backend provisions virtual clusters.
+description: k3s, k0s, CAPI, and vcluster — how each backend provisions virtual clusters.
 ---
 
 # Backends
 
-kobe supports four backends for provisioning virtual clusters. The backend is selected per pool via `spec.backend.type`. All backends expose the same lease API; the difference is how each `ClusterInstance` is provisioned and what runtime it uses.
+kobe supports multiple backends for provisioning virtual clusters. The backend is selected per pool via `spec.backend.type`. All backends expose the same lease API; the difference is how each `ClusterInstance` is provisioned and what runtime it uses. For guidance on which runtime to pick — and which are retired — see [Runtime strategy](/docs/how-it-works/runtime-strategy).
 
 ## k3s (default)
 
@@ -69,9 +69,32 @@ spec:
 
 **When to use:** When you need to use an existing CAPI infrastructure provider, or when kobe's built-in backends don't support your target environment.
 
-## vkobe
+## vcluster
 
-vkobe is kobe's lightweight virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not depend on any third-party virtual cluster runtime.
+The vcluster backend deploys one [vcluster](https://www.vcluster.com/) (loft-sh, Apache 2.0) instance per `ClusterInstance` via the upstream Helm chart, into a dedicated per-instance host namespace — isolating projection scope per instance and making teardown trivially correct (`helm uninstall` + namespace delete).
+
+```yaml
+spec:
+  backend:
+    type: vcluster
+    vcluster:
+      chartVersion: ""        # optional; operator's pinned default applies when unset
+      values: |               # optional; free-form vcluster chart values (YAML),
+        sync:                 # merged on top of the operator's defaults
+          toHost:
+            ingresses:
+              enabled: true
+```
+
+**When to use:** High density and low per-cluster overhead without maintaining an in-house syncer. Note that fidelity boundaries (cloud identity such as IRSA, syncer coverage, version skew) are inherited from vcluster — route tenants who need full cluster semantics to a real-cluster backend.
+
+## vkobe (on hold)
+
+> **On hold.** Development of vkobe and its `kobe-sync` runtime is paused — see
+> [Runtime strategy](/docs/how-it-works/runtime-strategy). Existing pools keep
+> working; prefer `vcluster` for new density pools.
+
+vkobe is kobe's in-house virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not depend on any third-party virtual cluster runtime.
 
 ```yaml
 spec:
@@ -125,11 +148,11 @@ spec:
 
 ## Comparison
 
-| | k3s | k0s | CAPI | vkobe |
-|---|---|---|---|---|
-| Isolation | Full | Full | Full | Namespace |
-| Overhead per cluster | Low | Low | Provider-dependent | Very low |
-| Provision time | ~30s | ~30s | ~60s+ | ~5s |
-| Golden images (Velero) | Yes | Yes | Varies | No |
-| Shared etcd | Via PostgreSQL | Via PostgreSQL | No | Yes (required) |
-| Custom addons | Yes | Yes | Yes | Yes |
+| | k3s | k0s | CAPI | vcluster | vkobe (on hold) |
+|---|---|---|---|---|---|
+| Isolation | Full | Full | Full | Namespace | Namespace |
+| Overhead per cluster | Low | Low | Provider-dependent | Very low | Very low |
+| Provision time | ~30s | ~30s | ~60s+ | ~15s | ~5s |
+| Golden images (Velero) | Yes | Yes | Varies | No | No |
+| Shared etcd | Via PostgreSQL | Via PostgreSQL | No | No | Yes (required) |
+| Custom addons | Yes | Yes | Yes | Yes | Yes |
