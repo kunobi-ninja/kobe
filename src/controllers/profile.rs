@@ -164,6 +164,30 @@ mod cluster_instance_tests {
         }
     }
 
+    /// Guest-version guardrail: k8s ≤1.32 carries the ~23s fatal CSINode-init
+    /// window; ≥1.33 (and non-1.x / unparseable) does not.
+    #[test]
+    fn guest_version_narrow_csinode_window_classification() {
+        // The incident version and its neighbors.
+        assert!(guest_version_has_narrow_csinode_window("v1.31.3+k3s1"));
+        assert!(guest_version_has_narrow_csinode_window("v1.32.0-k3s1"));
+        assert!(guest_version_has_narrow_csinode_window("1.28.9"));
+        // Fixed upstream in 1.33.
+        assert!(!guest_version_has_narrow_csinode_window("v1.33.13+k3s1"));
+        assert!(!guest_version_has_narrow_csinode_window("v1.34.0"));
+        // Unparseable / exotic → no advisory without evidence.
+        assert!(!guest_version_has_narrow_csinode_window("latest"));
+        assert!(!guest_version_has_narrow_csinode_window(""));
+        assert!(!guest_version_has_narrow_csinode_window("v2.0.0"));
+
+        // Parser corner cases.
+        assert_eq!(guest_k8s_major_minor("v1.31.3+k3s1"), Some((1, 31)));
+        assert_eq!(guest_k8s_major_minor("1.32"), Some((1, 32)));
+        assert_eq!(guest_k8s_major_minor("v1.31+k0s.0"), Some((1, 31)));
+        assert_eq!(guest_k8s_major_minor("v1..3"), None);
+        assert_eq!(guest_k8s_major_minor("vx.y"), None);
+    }
+
     /// #197 follow-up: a crashlooping member's captured crash message (incl.
     /// the distilled "last log" fatal line) is cited in the reason, so the
     /// lease-preflight 503 `detail` built from it answers *why* the pool is
@@ -978,6 +1002,30 @@ async fn reconcile_profile(
         .with_label_values(&[name.as_str()])
         .set(effective_memory_bytes);
 
+    // Guest-version guardrail (2026-07-20 incident): a guest k8s ≤1.32 kubelet
+    // has only a ~23s FATAL CSINode-init retry window; nested containerd
+    // cold-start can exceed it, panicking the guest server/agent into a
+    // crashloop. k8s 1.33 widened the window to ~140s. kobe can't patch the
+    // kubelet, so for old versions the posture is: (a) this warning + the
+    // `kobe_pool_guest_version_advisory` gauge, and (b) the built-in
+    // mitigation of an emptyDir-backed guest data dir, which makes each
+    // restart resume (warm state) instead of replaying the race from zero.
+    let narrow_window = guest_version_has_narrow_csinode_window(&profile.spec.cluster.version);
+    if narrow_window {
+        warn!(
+            profile = %name,
+            guest_version = %profile.spec.cluster.version,
+            "guest Kubernetes ≤1.32 has a ~23s fatal CSINode-init window: slow \
+             nested-containerd cold starts can panic-crashloop guest pods \
+             (2026-07-20 ci-k3s-kunobi incident). Upgrade spec.cluster.version \
+             to >= v1.33 (window widened to ~140s). Until then the emptyDir \
+             data-dir mitigation limits the blast to self-healing restarts."
+        );
+    }
+    crate::metrics::POOL_GUEST_VERSION_ADVISORY
+        .with_label_values(&[name.as_str(), "narrow_csinode_window"])
+        .set(i64::from(narrow_window));
+
     // #189 (observability): surface "this pool is wedged on capacity" derived
     // from the existing #191 scheduling-blocked state. 1 when any instance is
     // scheduling-blocked (guest Pods unschedulable), else 0. Read-only mirror
@@ -1129,6 +1177,32 @@ fn emit_pool_failure_metrics(profile: &str, signals: &PoolFailureSignals) {
 }
 
 /// Build pool state from ClusterInstance inventory.
+/// Parse the guest Kubernetes `(major, minor)` out of a cluster version
+/// string as kobe accepts them: `v1.31.3+k3s1`, `v1.33.13-k3s1`, `1.32.0`,
+/// `v1.31.3+k0s.0`, … Returns `None` for anything it can't confidently parse
+/// (callers must then make no version-based claims).
+fn guest_k8s_major_minor(version: &str) -> Option<(u32, u32)> {
+    let v = version.trim().trim_start_matches('v');
+    let mut parts = v.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    // Minor may be followed by a patch (`.3+k3s1`) or carry a suffix directly
+    // (`1.31+k3s1`); stop at the first non-digit.
+    let minor_raw = parts.next()?;
+    let digits: String = minor_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some((major, digits.parse().ok()?))
+}
+
+/// True when the guest kubelet carries the ~23s fatal CSINode-init retry
+/// window (k8s ≤1.32; csi_plugin.go backoff 6 steps/15ms/×6). k8s 1.33
+/// widened it to ~140s (30ms/×8), which is what makes nested cold starts
+/// safe. Unparseable versions return `false` — no advisory without evidence.
+fn guest_version_has_narrow_csinode_window(version: &str) -> bool {
+    matches!(guest_k8s_major_minor(version), Some((1, minor)) if minor <= 32)
+}
+
 async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState {
     info!(
         profile = profile_name,

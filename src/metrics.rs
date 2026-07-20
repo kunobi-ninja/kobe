@@ -1019,6 +1019,23 @@ pub static POOL_CAPACITY_BLOCKED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// 1 when the pool's guest Kubernetes version carries a known operational
+/// hazard, else 0, by bounded `advisory` label. Current advisories:
+/// - `narrow_csinode_window`: guest k8s ≤1.32, whose kubelet has only a ~23s
+///   FATAL CSINode-init retry window (csi_plugin.go: 6 steps, 15ms, ×6) —
+///   nested containerd cold-start can exceed it and panic-crashloop the guest
+///   (2026-07-20 ci-k3s-kunobi incident). k8s 1.33 widened it to ~140s.
+///
+/// Observability only — never an admission gate.
+pub static POOL_GUEST_VERSION_ADVISORY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_pool_guest_version_advisory",
+        "1 when the pool's guest Kubernetes version has a known hazard (see advisory label), else 0",
+        &["profile", "advisory"]
+    )
+    .unwrap()
+});
+
 /// Effective memory request (bytes) kobe stamps onto each guest pod
 /// (k3s server + agent) for this pool — explicit `requests.memory` or, when
 /// absent, the `limits.memory` the kubelet silently copies into the request.
@@ -1255,6 +1272,7 @@ pub fn init() {
     LazyLock::force(&IPAM_POOL_ALLOCATED);
     LazyLock::force(&POOL_SIZE);
     LazyLock::force(&POOL_EFFECTIVE_CPU_REQUEST_MILLICORES);
+    LazyLock::force(&POOL_GUEST_VERSION_ADVISORY);
     LazyLock::force(&POOL_CAPACITY_BLOCKED);
     LazyLock::force(&POOL_EFFECTIVE_MEMORY_REQUEST_BYTES);
     // Connect proxy
