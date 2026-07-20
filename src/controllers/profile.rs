@@ -1188,7 +1188,10 @@ fn guest_k8s_major_minor(version: &str) -> Option<(u32, u32)> {
     // Minor may be followed by a patch (`.3+k3s1`) or carry a suffix directly
     // (`1.31+k3s1`); stop at the first non-digit.
     let minor_raw = parts.next()?;
-    let digits: String = minor_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = minor_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.is_empty() {
         return None;
     }
