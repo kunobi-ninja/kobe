@@ -191,10 +191,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Provides bun + helm + kind + just (and rust, per mise.toml). The e2e
-      # harness resolves these via `mise which`, and `just` runs the recipe.
+      # Provides bun + helm + kind + just + kubectl (and rust, per mise.toml).
+      # The e2e harness resolves these via `mise which`, and `just` runs the
+      # recipe.
       - name: Set up mise tools
         uses: jdx/mise-action@v2
+
+      # The vkobe smokes build the `kobe` CLI from source (cargo run -p
+      # kobectl), which needs a host C toolchain for proc-macro build scripts —
+      # the runner image stopped shipping one (#34). Guarded: no-op when cc
+      # already exists.
+      - name: Ensure C toolchain for the smoke CLI build
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            (sudo apt-get update -qq && sudo apt-get install -y -qq build-essential) \
+              || (apt-get update -qq && apt-get install -y -qq build-essential)
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
