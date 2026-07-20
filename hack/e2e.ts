@@ -48,7 +48,7 @@ const DEMO_VKOBE_VERSION = "1.35";
 const LOCAL_TARGET = "e2e";
 const LOCAL_ENDPOINT = "http://127.0.0.1:8080";
 const LOCAL_NODE_PORT = 30080;
-const REQUIRED_MISE_TOOLS = ["bun", "helm", "kind"];
+const REQUIRED_MISE_TOOLS = ["bun", "helm", "kind", "kubectl"];
 const FINGERPRINT_INPUTS = [
   "Cargo.toml",
   "Cargo.lock",
@@ -477,9 +477,10 @@ async function installChart(args: Args): Promise<void> {
   // CRDs in charts/kobe/crds/ are installed by Helm on first install. On upgrades,
   // re-apply with server-side apply using the "helm" field manager so ownership
   // stays consistent with what Helm uses internally (avoids field-manager conflicts).
+  const kubectl = await resolveTool("kubectl");
   await runCommand(
     [
-      "kubectl",
+      kubectl,
       "--context",
       kubeContext(args.cluster),
       "apply",
