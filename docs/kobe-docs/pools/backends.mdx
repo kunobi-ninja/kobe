@@ -88,13 +88,13 @@ spec:
 
 **When to use:** High density and low per-cluster overhead without maintaining an in-house syncer. Note that fidelity boundaries (cloud identity such as IRSA, syncer coverage, version skew) are inherited from vcluster — route tenants who need full cluster semantics to a real-cluster backend.
 
-## vkobe (deprecated)
+## vkobe (on hold)
 
-> **Deprecated.** vkobe and its `kobe-sync` runtime are retired — see
+> **On hold.** Development of vkobe and its `kobe-sync` runtime is paused — see
 > [Runtime strategy](/docs/how-it-works/runtime-strategy). Existing pools keep
-> working during migration to `vcluster`; do not create new vkobe pools.
+> working; prefer `vcluster` for new density pools.
 
-vkobe is kobe's retired in-house virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not depend on any third-party virtual cluster runtime.
+vkobe is kobe's in-house virtual cluster runtime. Each virtual cluster runs as a single pod containing a proxy-based kube-apiserver, an optional kube-controller-manager, and kobe-sync. It does not depend on any third-party virtual cluster runtime.
 
 ```yaml
 spec:
@@ -148,7 +148,7 @@ spec:
 
 ## Comparison
 
-| | k3s | k0s | CAPI | vcluster | vkobe (deprecated) |
+| | k3s | k0s | CAPI | vcluster | vkobe (on hold) |
 |---|---|---|---|---|---|
 | Isolation | Full | Full | Full | Namespace | Namespace |
 | Overhead per cluster | Low | Low | Provider-dependent | Very low | Very low |

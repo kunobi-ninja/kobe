@@ -57,9 +57,10 @@ See [Backends](/docs/pools/backends) for configuration and
 [Runtime strategy](/docs/how-it-works/runtime-strategy) for which runtime to
 pick and where the roadmap is heading.
 
-> **Note:** the in-house `kobe-sync` sidecar and the `vkobe` backend built on
-> it are **retired** — see [Runtime strategy](/docs/how-it-works/runtime-strategy).
-> They remain in the tree only to support migration of existing pools.
+> **Note:** development of the in-house `kobe-sync` sidecar and the `vkobe`
+> backend built on it is **on hold** — see
+> [Runtime strategy](/docs/how-it-works/runtime-strategy). Existing pools keep
+> working; prefer `vcluster` for new density pools.
 
 ## High availability
 
@@ -72,4 +73,4 @@ The operator supports multi-replica deployments via leader election. Only the le
 | `kobe-operator` | Operator + HTTP API server |
 | `kobe` | CLI client |
 | `crdgen` | CRD schema generator |
-| `kobe-sync` | Retired per-cluster runtime for the deprecated `vkobe` backend (kept for migration only) |
+| `kobe-sync` | Per-cluster runtime for the `vkobe` backend (development on hold) |
