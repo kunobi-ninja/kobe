@@ -1,9 +1,12 @@
 [settings]
 experimental = true
 
+# Pinned (not "latest") since #34: an unpinned kind meant a tool release could
+# — and did — break the conformance matrix overnight, invisibly. Bump these
+# deliberately, with a green conformance run as the gate.
 [tools]
-bun = "latest"
-helm = "latest"
-just = "latest"
-kind = "latest"
+bun = "1.3.14"
+helm = "4.2.3"
+just = "1.57.0"
+kind = "0.32.0"
 rust = { version = "1.95.0", profile = "default" }
