@@ -85,9 +85,18 @@ pub(crate) async fn create_lease_request(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
+        // Keep the server's `detail` (pool phase, consecutive failures, last
+        // failure reason) — a bare "Pool cannot satisfy a new lease" hides
+        // the actionable part of a 503 rejection.
         let msg = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+            .and_then(|v| {
+                let error = v["error"].as_str()?.to_string();
+                Some(match v["detail"].as_str() {
+                    Some(detail) => format!("{error} — {detail}"),
+                    None => error,
+                })
+            })
             .unwrap_or(text);
         anyhow::bail!("Failed to lease cluster (HTTP {status}): {msg}");
     }

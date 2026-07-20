@@ -613,10 +613,11 @@ fn infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -
 const LEASE_PREFLIGHT_DEFAULT_RETRY_AFTER_SECS: u64 = 30;
 
 /// #189 lease-create pre-flight. Returns `Some(503 response)` when the pool
-/// cannot satisfy a new lease right now — a `Failing` pool, or a `Backoff` pool
-/// with no schedulable headroom (zero Ready and already at its capacity bound).
-/// Returns `None` for a healthy-but-empty / warming pool so the caller proceeds
-/// to the normal 202 Pending path.
+/// cannot satisfy a new lease right now — a `Failing` pool with zero Ready
+/// members, or a `Backoff` pool with no schedulable headroom (zero Ready and
+/// already at its capacity bound). Returns `None` when a Ready member exists
+/// (bindable regardless of pool phase) or for a healthy-but-empty / warming
+/// pool, so the caller proceeds to the normal 202 Pending path.
 ///
 /// The 503 carries a `Retry-After` header (derived from the pool's backoff
 /// `next_attempt_at` when present, else a sane default) and a bounded
@@ -645,12 +646,19 @@ fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Respons
     let at_capacity = in_flight >= capacity;
 
     let reject_reason = match phase {
-        // Sustained failures — won't bind without operator action.
-        Some(ClusterPoolPhase::Failing) => Some(R::PoolExhausted),
+        // Sustained failures AND nothing Ready to hand out — won't bind
+        // without operator action. A Failing pool that still has Ready
+        // members must keep serving them: replacement provisioning being
+        // broken doesn't invalidate the clusters that already came up, and
+        // rejecting those leases turns a background provisioning problem
+        // into a full CI outage (2026-07-20: 5 Ready / 0 leased, every
+        // claim 503'd for hours).
+        Some(ClusterPoolPhase::Failing) if ready == 0 => Some(R::PoolExhausted),
         // In a backoff window AND no headroom to create or hand out a cluster.
         Some(ClusterPoolPhase::Backoff) if ready == 0 && at_capacity => Some(R::CapacityBlocked),
-        // Healthy-but-empty, scaling up, idle, in-backoff-with-headroom, etc.:
-        // a transient warm-up — let the lease queue (202 Pending).
+        // Failing/Backoff with Ready members, healthy-but-empty, scaling up,
+        // idle, etc.: bindable now or a transient warm-up — proceed to the
+        // normal 202 path.
         _ => None,
     };
 
@@ -4277,5 +4285,31 @@ mod tests {
                     .as_str()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn pool_preflight_rejection_serves_failing_pool_with_ready_members() {
+        // A Failing pool that still has Ready clusters must NOT be rejected:
+        // broken replacement provisioning doesn't invalidate the members that
+        // already came up, and the bind path serves Ready clusters regardless
+        // of pool phase (2026-07-20 incident: 5 Ready / 0 leased, every CI
+        // claim 503'd until an operator intervened).
+        let pool: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "Failing", "consecutiveFailures": 10, "ready": 5 }),
+        ))
+        .unwrap();
+        assert!(
+            pool_preflight_rejection("e2e-basic", &pool).is_none(),
+            "Failing pool with ready>0 must proceed to the 202 path"
+        );
+
+        // Same for Backoff: ready>0 already bypasses via the existing guard.
+        let pool: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "Backoff", "consecutiveFailures": 2, "ready": 1 }),
+        ))
+        .unwrap();
+        assert!(pool_preflight_rejection("e2e-basic", &pool).is_none());
     }
 }
