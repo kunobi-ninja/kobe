@@ -624,6 +624,12 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                     exit_code = %crash.exit_code,
                                     restart_count = crash.restart_count,
                                     message = %crash.message,
+                                    // The crashed container's dying words. This
+                                    // log line is the durable copy: the pod (and
+                                    // its `--previous` logs) is recycled shortly
+                                    // after, so without it the failure cause is
+                                    // unrecoverable post-mortem.
+                                    last_log_tail = %crash.last_log_tail.as_deref().unwrap_or(""),
                                     "Guest Pod crashlooping (observability only; recycle unchanged)"
                                 );
                                 patch_instance_status(

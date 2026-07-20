@@ -160,7 +160,50 @@ mod cluster_instance_tests {
             spec_hash: None,
             scheduling_blocked,
             crashlooping: false,
+            crash_message: None,
         }
+    }
+
+    /// #197 follow-up: a crashlooping member's captured crash message (incl.
+    /// the distilled "last log" fatal line) is cited in the reason, so the
+    /// lease-preflight 503 `detail` built from it answers *why* the pool is
+    /// failing. Newest instance (highest name) wins when several crashloop.
+    #[test]
+    fn backoff_reason_cites_crashloop_evidence() {
+        let profile = profile_with_status(serde_json::json!({
+            "consecutiveFailures": 2, "maxAttemptedIndex": 3, "lastReadyMaxIndex": 1
+        }));
+        let mut clusters = HashMap::new();
+        let mut entry = entry_with_block(ClusterState::Creating, false);
+        entry.crashlooping = true;
+        entry.crash_message = Some(
+            "guest server pod CrashLoopBackOff: Error exit 2 (x6); last log: \
+             panic: Failed to initialize CSINode after retrying: timed out"
+                .to_string(),
+        );
+        clusters.insert("pool-p-3".to_string(), entry);
+        let mut older = entry_with_block(ClusterState::Creating, false);
+        older.crashlooping = true;
+        older.crash_message = Some("older crash".to_string());
+        clusters.insert("pool-p-2".to_string(), older);
+        let pool_state = PoolState { clusters };
+        let counts = crate::pool::manager::StateCounts::default();
+        let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
+
+        let reason = backoff
+            .last_failure_reason
+            .expect("reason populated while failing");
+        assert!(
+            reason.contains("e.g. pool-p-3: guest server pod CrashLoopBackOff"),
+            "expected crashloop evidence from the newest member, got: {reason}"
+        );
+        assert!(
+            reason.contains("Failed to initialize CSINode"),
+            "expected the distilled last-log line, got: {reason}"
+        );
+        assert!(!reason.contains("older crash"), "got: {reason}");
+        // The generic triage pointer is still present.
+        assert!(reason.contains("not reaching Ready"), "got: {reason}");
     }
 
     /// #189 (observability): when the #191 scheduling-blocked backpressure is
@@ -815,6 +858,7 @@ async fn reconcile_profile(
                         // recomputes both from status.message next reconcile.
                         scheduling_blocked: false,
                         crashlooping: false,
+                        crash_message: None,
                     },
                 );
             }
@@ -1152,6 +1196,11 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
                 spec_hash: status.spec_hash,
                 scheduling_blocked,
                 crashlooping,
+                // Carry the evidence (crash message incl. the distilled "last
+                // log" line) so `compute_backoff_state` can cite it in the
+                // pool's `lastFailureReason` instead of a bare pointer to
+                // kubectl.
+                crash_message: crashlooping.then(|| status.message.clone()).flatten(),
             },
         );
     }
@@ -1638,12 +1687,26 @@ fn compute_backoff_state(
     // empty — defeating the status field's purpose. This text is human-facing
     // ONLY; the metric label comes from `failure_class` above.
     let last_failure_reason = if new_failures > 0 {
-        let base = format!(
+        let mut base = format!(
             "{new_failures} instance(s) not reaching Ready (attempted up to index \
              {new_max_attempted}, highest Ready {new_last_ready_max}); inspect the \
              Failed/not-Ready ClusterInstances (kubectl get ci -l \
              kobe.kunobi.ninja/pool={profile_name}) and their pod logs/events"
         );
+        // #197 follow-up: when a member is crashlooping we HAVE the concrete
+        // cause (the instance controller stamped it, incl. the distilled
+        // "last log" fatal line) — cite one example so the reason (and the
+        // lease-preflight 503 `detail` built from it) answers *why* instead
+        // of only pointing at kubectl. Highest name wins for determinism
+        // (that's the newest attempt under the pool's naming scheme).
+        if let Some((name, msg)) = pool_state
+            .clusters
+            .iter()
+            .filter_map(|(name, e)| e.crash_message.as_deref().map(|m| (name, m)))
+            .max_by(|a, b| a.0.cmp(b.0))
+        {
+            base.push_str(&format!("; e.g. {name}: {msg}"));
+        }
         // #189 (observability): when the #191 scheduling-blocked backpressure is
         // engaged, prefix the reason so it clearly reads as a capacity wedge
         // (`failure_class` above is already `Capacity`). This is a STRING-ONLY

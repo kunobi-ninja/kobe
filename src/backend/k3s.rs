@@ -329,8 +329,87 @@ fn pod_crashloop(pod: &Pod, pod_role: crate::metrics::GuestPodRole) -> Option<Gu
             reason,
             restart_count: cs.restart_count,
             message,
+            container: cs.name.clone(),
+            last_log_tail: None,
         })
     })
+}
+
+/// Max lines / bytes of a crashed container's `--previous` log tail we keep.
+/// Bounded so a chatty crasher can't bloat the status message pipeline or the
+/// operator's log line; 40 lines comfortably covers a Go panic + backtrace
+/// head plus the errors leading into it.
+const CRASH_LOG_TAIL_LINES: i64 = 40;
+const CRASH_LOG_TAIL_MAX_BYTES: usize = 4096;
+
+/// Max length of the single distilled "last log" line appended to the crash
+/// message (which flows into `ClusterInstance.status.message` and from there
+/// into pool `lastFailureReason` — keep it status-field sized).
+const CRASH_LOG_LINE_MAX_CHARS: usize = 240;
+
+/// Best-effort fetch of the crashed container's previous-run log tail.
+/// `Ok(None)` covers the benign cases (no previous instance yet, logs
+/// rotated away, empty output); only transport-level errors propagate.
+async fn fetch_crash_log_tail(
+    pods: &Api<Pod>,
+    pod_name: &str,
+    container: &str,
+) -> Result<Option<String>> {
+    let lp = kube::api::LogParams {
+        container: Some(container.to_string()),
+        previous: true,
+        tail_lines: Some(CRASH_LOG_TAIL_LINES),
+        ..Default::default()
+    };
+    match pods.logs(pod_name, &lp).await {
+        Ok(text) => {
+            let text = text.trim_end();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            // Keep the END of the tail when over budget — the fatal line is
+            // at the bottom.
+            let bounded = if text.len() > CRASH_LOG_TAIL_MAX_BYTES {
+                let cut = text.len() - CRASH_LOG_TAIL_MAX_BYTES;
+                // Snap forward to a char boundary, then to the next line start.
+                let mut idx = cut;
+                while idx < text.len() && !text.is_char_boundary(idx) {
+                    idx += 1;
+                }
+                let tail = &text[idx..];
+                tail.split_once('\n').map(|(_, rest)| rest).unwrap_or(tail)
+            } else {
+                text
+            };
+            Ok(Some(bounded.to_string()))
+        }
+        // 400: "previous terminated container not found" (first crash still
+        // being written, or kubelet GC'd it). 404: pod vanished mid-probe.
+        Err(kube::Error::Api(ae)) if ae.code == 400 || ae.code == 404 => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Pick the most diagnostic single line out of a crash log tail: the LAST
+/// line matching a fatal pattern (`panic:`, Go `fatal error:`, klog `F...`
+/// fatals, logrus `level=fatal`), else the last non-empty line. Truncated to
+/// [`CRASH_LOG_LINE_MAX_CHARS`].
+fn distill_fatal_line(tail: &str) -> Option<String> {
+    let is_fatal = |l: &str| {
+        l.contains("panic:")
+            || l.contains("fatal error:")
+            || l.contains("level=fatal")
+            || (l.starts_with('F') && l.len() > 1 && l.as_bytes()[1].is_ascii_digit())
+    };
+    let lines = || tail.lines().map(str::trim).filter(|l| !l.is_empty());
+    let picked = lines()
+        .rfind(|l| is_fatal(l))
+        .or_else(|| lines().next_back())?;
+    let mut line: String = picked.chars().take(CRASH_LOG_LINE_MAX_CHARS).collect();
+    if picked.chars().count() > CRASH_LOG_LINE_MAX_CHARS {
+        line.push('…');
+    }
+    Some(line)
 }
 
 /// HA gate: `servers > 1` requires an external (shared) datastore.
@@ -1546,7 +1625,28 @@ impl K3sBackend {
             };
 
             for pod in &pod_list.items {
-                if let Some(crash) = pod_crashloop(pod, pod_role) {
+                if let Some(mut crash) = pod_crashloop(pod, pod_role) {
+                    // Dying-words capture (#197 follow-up): grab a bounded tail
+                    // of the crashed container's previous run and distill its
+                    // fatal line into the message. Best-effort — the crash
+                    // signal itself never depends on log availability.
+                    if let Some(pod_name) = pod.metadata.name.as_deref() {
+                        match fetch_crash_log_tail(&pods, pod_name, &crash.container).await {
+                            Ok(Some(tail)) => {
+                                if let Some(line) = distill_fatal_line(&tail) {
+                                    crash.message = format!("{}; last log: {line}", crash.message);
+                                }
+                                crash.last_log_tail = Some(tail);
+                            }
+                            Ok(None) => {}
+                            Err(e) => debug!(
+                                cluster = name,
+                                pod = pod_name,
+                                error = %e,
+                                "crashloop probe: previous-log fetch failed (continuing without)"
+                            ),
+                        }
+                    }
                     return Ok(Some(crash));
                 }
             }
@@ -4820,6 +4920,8 @@ mod tests {
                 reason: "Error".to_string(),
                 restart_count: 6,
                 message: "guest server pod CrashLoopBackOff: Error exit 2 (x6)".to_string(),
+                container: "k3s-server".to_string(),
+                last_log_tail: None,
             })
         );
     }
@@ -4844,6 +4946,8 @@ mod tests {
                 reason: "Error".to_string(),
                 restart_count: 3,
                 message: "guest server pod CrashLoopBackOff: Error exit 137 (x3)".to_string(),
+                container: "k3s-server".to_string(),
+                last_log_tail: None,
             })
         );
     }
@@ -4989,18 +5093,71 @@ mod tests {
             .mount(&server)
             .await;
 
-        let got = backend.detect_crashloop_impl(cluster, ns).await.unwrap();
+        // Dying-words capture: the previous run's log tail is fetched and its
+        // fatal line is distilled into the message.
+        let tail = "time=\"...\" level=info msg=\"Waiting for control-plane node\"\n\
+                    panic: F0720 08:42:28 csi_plugin.go:323] Failed to initialize CSINode after retrying: timed out waiting for the condition\n\
+                    goroutine 10333 [running]:";
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/namespaces/{ns}/pods/pool-test-1-server-0/log"
+            )))
+            .and(query_param("previous", "true"))
+            .and(query_param("container", "k3s-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tail))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let got = backend
+            .detect_crashloop_impl(cluster, ns)
+            .await
+            .unwrap()
+            .expect("crashloop must be detected");
+        assert_eq!(got.pod_role, crate::metrics::GuestPodRole::Server);
+        assert_eq!(got.exit_code, "2");
+        assert_eq!(got.reason, "Error");
+        assert_eq!(got.restart_count, 6);
         assert_eq!(
-            got,
-            Some(GuestPodCrash {
-                pod_role: crate::metrics::GuestPodRole::Server,
-                exit_code: "2".to_string(),
-                reason: "Error".to_string(),
-                restart_count: 6,
-                message: "guest server pod CrashLoopBackOff: Error exit 2 (x6)".to_string(),
-            })
+            got.message,
+            "guest server pod CrashLoopBackOff: Error exit 2 (x6); last log: \
+             panic: F0720 08:42:28 csi_plugin.go:323] Failed to initialize CSINode after retrying: timed out waiting for the condition"
         );
+        assert_eq!(got.last_log_tail.as_deref(), Some(tail));
         // Agent pods are never listed: the server crash short-circuits first.
+    }
+
+    #[test]
+    fn distill_fatal_line_picks_last_fatal_else_last_line() {
+        // Prefers the last fatal-looking line over trailing backtrace noise.
+        let tail = "level=info msg=\"starting\"\n\
+                    panic: something broke\n\
+                    goroutine 1 [running]:";
+        assert_eq!(
+            distill_fatal_line(tail).as_deref(),
+            Some("panic: something broke")
+        );
+
+        // klog fatal (F<digits>...) counts as fatal.
+        let tail = "I0720 boot ok\nF0720 08:42:28 csi_plugin.go:323] boom\ntrailer";
+        assert_eq!(
+            distill_fatal_line(tail).as_deref(),
+            Some("F0720 08:42:28 csi_plugin.go:323] boom")
+        );
+
+        // No fatal pattern → last non-empty line.
+        assert_eq!(
+            distill_fatal_line("line one\nline two\n\n").as_deref(),
+            Some("line two")
+        );
+        // Empty → None.
+        assert_eq!(distill_fatal_line("\n  \n"), None);
+
+        // Over-long lines are truncated with an ellipsis.
+        let long = format!("panic: {}", "x".repeat(400));
+        let got = distill_fatal_line(&long).unwrap();
+        assert_eq!(got.chars().count(), CRASH_LOG_LINE_MAX_CHARS + 1);
+        assert!(got.ends_with('…'));
     }
 
     /// A healthy (Running, no restarts) server pod with no agent pods → not

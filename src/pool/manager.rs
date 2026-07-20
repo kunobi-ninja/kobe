@@ -301,6 +301,11 @@ pub struct ClusterEntry {
     /// from `Timeout` to `CrashLooping` so the wedge is attributable. Derived
     /// from the synced status message in `build_pool_state`; `false` otherwise.
     pub crashlooping: bool,
+    /// The crashlooping instance's `status.message` (e.g. `guest server pod
+    /// CrashLoopBackOff: Error exit 2 (x6); last log: panic: ...`), carried so
+    /// the pool's `lastFailureReason` can cite concrete evidence instead of
+    /// only pointing at `kubectl`. `None` unless `crashlooping`.
+    pub crash_message: Option<String>,
 }
 
 /// Decisions the pool manager emits after evaluating state.
@@ -1212,6 +1217,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1224,6 +1230,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1236,6 +1243,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
 
@@ -1268,6 +1276,7 @@ mod tests {
                 spec_hash: Some(current.clone()),
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1280,6 +1289,7 @@ mod tests {
                 spec_hash: Some("ddddffffffffffff".to_string()),
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1292,6 +1302,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1304,6 +1315,7 @@ mod tests {
                 spec_hash: Some("ddddffffffffffff".to_string()),
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -1418,6 +1430,7 @@ mod tests {
             spec_hash: None,
             scheduling_blocked: false,
             crashlooping: false,
+            crash_message: None,
         }
     }
 
@@ -1583,6 +1596,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1595,6 +1609,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -1642,6 +1657,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1654,6 +1670,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -1706,6 +1723,7 @@ mod tests {
                 spec_hash: Some(stale_hash.clone()), // stale
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -1718,6 +1736,7 @@ mod tests {
                 spec_hash: Some(stale_hash.clone()), // stale but leased
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -1931,6 +1950,7 @@ mod tests {
                 spec_hash: Some(current_hash),
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -2299,6 +2319,7 @@ mod tests {
             spec_hash: Some("ddddffffffffffff".to_string()), // never matches the real current hash
             scheduling_blocked: false,
             crashlooping: false,
+            crash_message: None,
         }
     }
 
@@ -2311,6 +2332,7 @@ mod tests {
             spec_hash: Some(current_hash),
             scheduling_blocked: false,
             crashlooping: false,
+            crash_message: None,
         }
     }
 
@@ -2638,6 +2660,7 @@ mod tests {
                 spec_hash: Some(current.clone()),
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -2895,6 +2918,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -2907,6 +2931,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -2962,6 +2987,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -3018,6 +3044,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: true,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         // Clean, equally-old Creating — the control: it MUST be Deleted.
@@ -3031,6 +3058,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -3108,6 +3136,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: true,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };
@@ -3167,6 +3196,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: true,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         clusters.insert(
@@ -3179,6 +3209,7 @@ mod tests {
                 spec_hash: None,
                 scheduling_blocked: false,
                 crashlooping: false,
+                crash_message: None,
             },
         );
         let state = PoolState { clusters };

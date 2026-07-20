@@ -416,8 +416,19 @@ pub struct GuestPodCrash {
     /// Container restart count at observation time, for the human message.
     pub restart_count: i32,
     /// Short human string, e.g.
-    /// `guest server pod CrashLoopBackOff: Error exit 2 (x6)`.
+    /// `guest server pod CrashLoopBackOff: Error exit 2 (x6)`. When the
+    /// backend captured the previous run's logs, a distilled fatal line is
+    /// appended: `...; last log: panic: Failed to initialize CSINode ...`.
     pub message: String,
+    /// Name of the crashlooping container (e.g. `k3s-server`), so callers can
+    /// fetch its logs.
+    pub container: String,
+    /// Bounded tail of the crashed container's `--previous` logs (its dying
+    /// words), best-effort. The instance controller logs this verbatim so the
+    /// evidence survives the instance being recycled — otherwise the only copy
+    /// dies with the pod and an operator has to race the crashloop with
+    /// `kubectl logs --previous`.
+    pub last_log_tail: Option<String>,
 }
 
 /// Backend-agnostic interface for managing virtual cluster lifecycles.
