@@ -144,6 +144,7 @@ resource "null_resource" "fetch_kubeconfig" {
     server_id  = hcloud_server.k3s_server[0].id
     public_ip  = hcloud_server.k3s_server[0].ipv4_address
     config_out = pathexpand("~/.kube/hetzner-${var.name}-config")
+    ctx_name   = "${var.name}-hetzner"
   }
 
   provisioner "local-exec" {
@@ -154,7 +155,7 @@ resource "null_resource" "fetch_kubeconfig" {
       OUT="${self.triggers.config_out}"
       echo "Waiting for SSH on $IP (up to 180s)..."
       for i in $(seq 1 60); do
-        if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        if ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
                -o ConnectTimeout=3 root@"$IP" 'exit 0' 2>/dev/null; then
           echo "SSH ready (attempt $i)."
           break
@@ -164,7 +165,7 @@ resource "null_resource" "fetch_kubeconfig" {
 
       echo "Waiting for /etc/rancher/k3s/k3s.yaml on $IP (up to 180s)..."
       for i in $(seq 1 60); do
-        if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        if ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
                root@"$IP" 'test -f /etc/rancher/k3s/k3s.yaml' 2>/dev/null; then
           echo "k3s kubeconfig present (attempt $i)."
           break
@@ -173,10 +174,14 @@ resource "null_resource" "fetch_kubeconfig" {
       done
 
       mkdir -p "$(dirname "$OUT")"
-      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      export CTX="${self.triggers.ctx_name}"
+      ssh -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
           root@"$IP" 'cat /etc/rancher/k3s/k3s.yaml' \
         | sed "s|127.0.0.1|$IP|" \
-        | yq '.clusters[].cluster."insecure-skip-tls-verify" = true' \
+        | yq 'del(.clusters[].cluster."certificate-authority-data")
+              | .clusters[].cluster."insecure-skip-tls-verify" = true
+              | (.clusters[].name, .contexts[].name, .contexts[].context.cluster,
+                 .contexts[].context.user, .users[].name, ."current-context") = strenv(CTX)' \
         > "$OUT"
       chmod 0600 "$OUT"
       echo "Wrote $OUT"
