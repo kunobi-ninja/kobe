@@ -11,7 +11,7 @@ The whole demo is driven by one script — `./demo` — that narrates each step 
 
 After `./demo tf up` followed by `./demo up`, your Hetzner project has:
 
-- 1 Hetzner Cloud server (`cx22` by default, ~4 €/mo prorated to ~0.006 €/h).
+- 1 Hetzner Cloud server (`cpx22` by default, prorated hourly).
 - 1 private network (`10.0.0.0/16`) and a firewall locking SSH + Kubernetes API to your caller IP.
 - k3s `v1.31.3+k3s1` running as the only node.
 - `~/.kube/hetzner-kobe-demo-config` — a local kubeconfig pointing at the server's public IP (with `insecure-skip-tls-verify: true`, see "Security model" below).
@@ -57,7 +57,7 @@ KUBECONFIG=<that-path> kubectl get nodes      # works (TLS tunnel)
 |---|---|---|
 | `name` | `kobe-demo` | Prefixes all Hetzner resources + the kubeconfig filename. |
 | `location` | `nbg1` | Hetzner DC. `fsn1`, `hel1` also work; `ash` / `hil` need a matching `network_zone` change in `main.tf`. |
-| `server_type` | `cx22` | 2 vCPU / 4 GB. Step up to `cx32` if you push the pool larger. |
+| `server_type` | `cpx22` | 2 vCPU / 4 GB. Step up to `cpx32` if you push the pool larger. |
 | `node_count` | `1` | 1 = single-node. >1 = 1 server + (n-1) agents. |
 | `ssh_public_key_path` | `~/.ssh/id_ed25519.pub` | Same key the kobe AccessPolicy expects. |
 | `k3s_version` | `v1.31.3+k3s1` | Match the inner pool's k3s. |
