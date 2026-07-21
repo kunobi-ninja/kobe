@@ -38,9 +38,8 @@ cd demo/exoscale
 
 # Back in A — kobe CLI config:
 kobe config set demo --endpoint http://localhost:8080 --auth ssh
-kobe config use demo
 
-./demo lease                             # leases a k3s cluster, auto-patches kubeconfig to https://localhost:8443
+./demo lease                             # leases a k3s cluster (target 'demo'; override with KOBE_TARGET), auto-patches kubeconfig to https://localhost:8443
 KUBECONFIG=<that-path> kubectl get nodes # works (over the TLS tunnel)
 ./demo deploy-ubuntu                     # server-side-applies a sandbox ubuntu pod into the leased cluster
 

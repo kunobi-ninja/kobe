@@ -29,6 +29,10 @@ NAMESPACE="${NAMESPACE:-kobe-system}"
 RELEASE="${RELEASE:-kobe-demo}"
 POOL="${POOL:-demo-k3s-small}"
 DEFAULT_LEASE_TTL="${DEFAULT_LEASE_TTL:-30m}"
+# Named kobe CLI target the script leases/releases against. 'kobe config
+# use' is per-shell (it does not reach this script's subshell), so lease
+# and release pass --target explicitly.
+KOBE_TARGET="${KOBE_TARGET:-demo}"
 KOBE_PORT="${KOBE_PORT:-8080}"
 TLS_PORT="${TLS_PORT:-8443}"
 TLS_DIR="${TLS_DIR:-$HOME/.config/kobe-demo}"
@@ -156,7 +160,7 @@ cmd_lease() {
   pick_kubeconfig
   step "Lease a cluster from pool $POOL (TTL $DEFAULT_LEASE_TTL)"
   note "Make sure './demo tunnel' (or 'forward') is running in another terminal."
-  cmd kobe lease "$POOL" --ttl "$DEFAULT_LEASE_TTL"
+  cmd kobe lease "$POOL" --ttl "$DEFAULT_LEASE_TTL" --target "$KOBE_TARGET"
 
   # Auto-patch the freshly written kubeconfig to use https://localhost:$TLS_PORT
   # so kubectl/Kunobi can talk to the leased cluster (kubectl 1.31+ refuses to
@@ -177,11 +181,11 @@ cmd_release() {
   local lease_id="${1:-}"
   if [[ -n "$lease_id" ]]; then
     step "Release lease $lease_id"
-    cmd kobe release "$lease_id"
+    cmd kobe release "$lease_id" --target "$KOBE_TARGET"
   else
     step "Release all active leases (kobe purge)"
     note "No lease ID given — using 'kobe purge' to release all and clean local kubeconfigs."
-    cmd kobe purge
+    cmd kobe purge --target "$KOBE_TARGET"
   fi
 }
 
@@ -447,7 +451,8 @@ Shared subcommands:
 
 Env overrides: KOBE_REPO, KOBE_VERSION, NAMESPACE, RELEASE, POOL,
                KUBECONFIG, SSH_PUBKEY, KOBE_PORT, DEFAULT_LEASE_TTL,
-               PULL_SECRET_NAME, DOCKER_REGISTRY, DOCKER_HUB_EMAIL
+               KOBE_TARGET, PULL_SECRET_NAME, DOCKER_REGISTRY,
+               DOCKER_HUB_EMAIL
 EOF
   if declare -f usage_extra >/dev/null 2>&1; then
     usage_extra
