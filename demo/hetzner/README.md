@@ -22,7 +22,7 @@ After `./demo tf up` followed by `./demo up`, your Hetzner project has:
 - `helm` v3.14+ (verified on v4), `kubectl` v1.31+, GNU `bash` v3+, `socat` (for `./demo tunnel`), `yq` (for `./demo deploy-ubuntu`), and `terraform` v1.5+ **or** OpenTofu v1.6+ (`brew install opentofu`) on your laptop. The `./demo` script auto-detects whichever is on PATH.
 - A Hetzner Cloud project + API token (Read & Write) exported as `HCLOUD_TOKEN`.
 - An **Ed25519** SSH keypair on disk (`~/.ssh/id_ed25519` by default). The kobe operator rejects RSA keys at AccessPolicy load time.
-- The `kobe` CLI installed (`cargo install --path . --bin kobe` from the repo root).
+- The `kobe` CLI installed (`cargo install --path crates/kobectl` from the repo root).
 - Docker Hub credentials with read access to the `zondax/kobe-operator` and `zondax/kobe-sync` images (today both are private). See `./demo pull-secret`.
 
 ## Walkthrough

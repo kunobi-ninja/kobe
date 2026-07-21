@@ -17,7 +17,7 @@ After `./demo up`, the target SKS cluster has:
 
 - `helm` v3.14+ or v4 (verified working on v4.0.4), `kubectl` v1.31+, GNU `bash` v3+, `socat` (for `./demo tunnel`), `yq` (for `./demo deploy-ubuntu`) on your laptop.
 - An Exoscale SKS kubeconfig in `~/.kube/exoscale-*-config` (e.g. one downloaded by Kunobi desktop). The script auto-discovers it; you don't `export KUBECONFIG=...` yourself.
-- The `kobe` CLI installed (`cargo install --path . --bin kobe` from the repo root).
+- The `kobe` CLI installed (`cargo install --path crates/kobectl` from the repo root).
 - An **Ed25519** SSH keypair on disk (`~/.ssh/id_ed25519` by default; override with `SSH_PUBKEY="$(cat /path/to/key.pub)" ./demo up`). The kobe operator rejects RSA keys at AccessPolicy load time.
 - Docker Hub credentials with read access to the `zondax/kobe-operator` and `zondax/kobe-sync` images (today both are private). See `./demo pull-secret` below.
 
