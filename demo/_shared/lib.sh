@@ -23,7 +23,7 @@ SHARED_MANIFESTS_DIR="$LIB_DIR/manifests"
 # --- Configuration defaults --------------------------------------------------
 : "${KUBECONFIG_GLOB:?KUBECONFIG_GLOB must be set by caller}"
 KOBE_REPO="${KOBE_REPO:-$(cd "$LIB_DIR/../.." && pwd)}"
-KOBE_VERSION="${KOBE_VERSION:-0.19.1}"
+KOBE_VERSION="${KOBE_VERSION:-0.21.19}"
 KOBE_TGZ="$SHARED_CHART_DIR/charts/kobe-${KOBE_VERSION}.tgz"
 NAMESPACE="${NAMESPACE:-kobe-system}"
 RELEASE="${RELEASE:-kobe-demo}"

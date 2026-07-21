@@ -27,7 +27,7 @@ After `./demo up`, the target SKS cluster has:
 cd demo/exoscale
 
 # One-time, on a fresh clone of the kobe repo:
-./demo refresh                           # repackages ../_shared/chart/charts/kobe-0.19.1.tgz from this repo
+./demo refresh                           # repackages ../_shared/chart/charts/kobe-0.21.19.tgz from this repo
 ./demo pull-secret <user> <docker-pat>   # so SKS can pull zondax/kobe-operator
 
 # Demo proper (terminal A):
@@ -51,7 +51,7 @@ KUBECONFIG=<that-path> kubectl get nodes # works (over the TLS tunnel)
 The `./demo up` flow:
 1. Picks the SKS kubeconfig — auto-selected if there's only one in `~/.kube/exoscale-*-config`, otherwise prompts. Inherited `KUBECONFIG` env is ignored unless its basename matches `exoscale-*-config`.
 2. `kubectl get nodes` — sanity check the cluster is reachable.
-3. Verifies `../_shared/chart/charts/kobe-0.19.1.tgz` is present.
+3. Verifies `../_shared/chart/charts/kobe-0.21.19.tgz` is present.
 4. Verifies the `regcred` pull-secret exists in `kobe-system` (errors with a clear instruction to run `./demo pull-secret` if missing — avoids silent ImagePullBackOff).
 5. `helm upgrade --install kobe-demo .` with your SSH pubkey passed via `--set sshPublicKey=...`.
 6. Polls until the kobe Deployment rolls out and the ClusterPool reaches `status.ready >= spec.scaling.minReady` (timeout 5 min).
