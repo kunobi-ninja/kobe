@@ -29,6 +29,9 @@ spec:
     scaleDownAfter: 30m
     queueTimeout: 5m
   resources:
+    # Kubernetes reserves the full limit as the request on every guest pod,
+    # so two warm 1-CPU instances can never schedule on a 2-vCPU demo node.
+    # 750m fits two alongside the operator and kube-system.
     limits:
-      cpu: "1"
+      cpu: "750m"
       memory: 1Gi

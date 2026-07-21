@@ -10,7 +10,7 @@ sshPublicKey: ""
 pool:
   name: demo-k3s-small
   size: 2                       # warm-pool target
-  minReady: 1
+  minReady: 2                   # the operator warms to minReady, not size
   maxClusters: 3
   ttl: 1h
   maxTtlPerLease: 2h
@@ -18,7 +18,9 @@ pool:
   k3s:
     version: v1.31.3+k3s1
     servers: 1
-    agents: 1
+    # Single-node inner clusters: with agents, two warm server+agent pairs
+    # do not fit the demo clouds' 2-vCPU default nodes.
+    agents: 0
 
 # Default OFF — k3s ships local-path-provisioner already. Clouds whose
 # managed k8s doesn't ship a default StorageClass (e.g. Exoscale SKS) flip
