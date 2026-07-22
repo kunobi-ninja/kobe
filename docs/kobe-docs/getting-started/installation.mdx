@@ -69,8 +69,13 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
     Add the Kunobi bucket once, then install from it:
 
     ```powershell
-    scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-bucket
+    scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-kunobi
+
+    # Stable
     scoop install kunobi/kobe
+
+    # Pre-release channel
+    scoop install kunobi/kobe-unstable
     ```
   </Tab>
   <Tab value="cargo">
