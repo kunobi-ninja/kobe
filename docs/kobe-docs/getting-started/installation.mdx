@@ -11,7 +11,7 @@ The `kobe` CLI is a self-contained binary. It connects to a kobe operator endpoi
 
 All release binaries are signed (macOS codesigned + notarized, Windows code-signed, Linux/apt PGP-signed via GCP-KMS).
 
-<Tabs items={["mise (recommended)", "Homebrew", "apt (Debian/Ubuntu)", "winget (Windows)", "cargo", "Nix", "from source"]}>
+<Tabs items={["mise (recommended)", "Homebrew", "apt (Debian/Ubuntu)", "winget (Windows)", "Scoop (Windows)", "cargo", "Nix", "from source"]}>
   <Tab value="mise (recommended)">
     [mise](https://mise.jdx.dev) downloads the pre-built binary from GitHub releases and pins the version per project or globally.
 
@@ -64,6 +64,19 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
     ```
 
     Pre-release builds: `winget install kunobi-ninja.kobe.Unstable`.
+  </Tab>
+  <Tab value="Scoop (Windows)">
+    Add the Kunobi bucket once, then install from it:
+
+    ```powershell
+    scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-kunobi
+
+    # Stable
+    scoop install kunobi/kobe
+
+    # Pre-release channel
+    scoop install kunobi/kobe-unstable
+    ```
   </Tab>
   <Tab value="cargo">
     The CLI is published to crates.io as `kobectl` (the crate name `kobe` was taken; the installed binary is still `kobe`).
