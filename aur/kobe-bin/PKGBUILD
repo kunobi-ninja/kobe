@@ -1,0 +1,21 @@
+# Maintainer: Kunobi Ninja <feedback@kunobi.ninja>
+# This PKGBUILD is generated/updated by kunobi-ninja/kobe CI on each stable
+# release (pkgver + checksums refreshed, then pushed to the AUR). It installs
+# the official prebuilt, statically linked musl binary from GitHub Releases.
+pkgname=kobe-bin
+pkgver=0.35.0
+pkgrel=1
+pkgdesc='CLI for pools of pre-warmed Kubernetes virtual clusters (prebuilt binary)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/kunobi-ninja/kobe'
+license=('Apache-2.0')
+provides=('kobe')
+conflicts=('kobe')
+source_x86_64=("kobe-$pkgver-x86_64.tar.gz::https://github.com/kunobi-ninja/kobe/releases/download/v$pkgver/kobe-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("kobe-$pkgver-aarch64.tar.gz::https://github.com/kunobi-ninja/kobe/releases/download/v$pkgver/kobe-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('07a6e6b6209c535d3e38ee812c90bce6a9eb4d033573a0b2406f0201daa2ebdc')
+sha256sums_aarch64=('9934c7bc4543739aa160dfcc8fc6cdcd1d4af72f9127b35cec4d4b65d32e2953')
+
+package() {
+  install -Dm0755 "$srcdir/kobe" "$pkgdir/usr/bin/kobe"
+}
