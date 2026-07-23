@@ -11,9 +11,9 @@ variable "location" {
 }
 
 variable "server_type" {
-  description = "Hetzner Cloud server type. cx22 = 2 vCPU / 4 GB / ~4 EUR/mo, enough for the demo."
+  description = "Hetzner Cloud server type. cpx22 = 2 vCPU / 4 GB, enough for the demo."
   type        = string
-  default     = "cx22"
+  default     = "cpx22"
 }
 
 variable "node_count" {

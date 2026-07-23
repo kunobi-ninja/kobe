@@ -11,7 +11,7 @@ The whole demo is driven by one script — `./demo` — that narrates each step 
 
 After `./demo tf up` followed by `./demo up`, your Hetzner project has:
 
-- 1 Hetzner Cloud server (`cx22` by default, ~4 €/mo prorated to ~0.006 €/h).
+- 1 Hetzner Cloud server (`cpx22` by default, prorated hourly).
 - 1 private network (`10.0.0.0/16`) and a firewall locking SSH + Kubernetes API to your caller IP.
 - k3s `v1.31.3+k3s1` running as the only node.
 - `~/.kube/hetzner-kobe-demo-config` — a local kubeconfig pointing at the server's public IP (with `insecure-skip-tls-verify: true`, see "Security model" below).
@@ -22,7 +22,7 @@ After `./demo tf up` followed by `./demo up`, your Hetzner project has:
 - `helm` v3.14+ (verified on v4), `kubectl` v1.31+, GNU `bash` v3+, `socat` (for `./demo tunnel`), `yq` (for `./demo deploy-ubuntu`), and `terraform` v1.5+ **or** OpenTofu v1.6+ (`brew install opentofu`) on your laptop. The `./demo` script auto-detects whichever is on PATH.
 - A Hetzner Cloud project + API token (Read & Write) exported as `HCLOUD_TOKEN`.
 - An **Ed25519** SSH keypair on disk (`~/.ssh/id_ed25519` by default). The kobe operator rejects RSA keys at AccessPolicy load time.
-- The `kobe` CLI installed (`cargo install --path . --bin kobe` from the repo root).
+- The `kobe` CLI installed (`cargo install --path crates/kobectl` from the repo root).
 - Docker Hub credentials with read access to the `zondax/kobe-operator` and `zondax/kobe-sync` images (today both are private). See `./demo pull-secret`.
 
 ## Walkthrough
@@ -39,8 +39,7 @@ export HCLOUD_TOKEN=...                       # from console.hetzner.cloud
 ./demo tunnel                                 # terminal B — keep running
 
 kobe config set demo --endpoint http://localhost:8080 --auth ssh
-kobe config use demo
-./demo lease                                  # leases a k3s cluster from the pool
+./demo lease                                  # leases a k3s cluster from the pool (target 'demo'; override with KOBE_TARGET)
 KUBECONFIG=<that-path> kubectl get nodes      # works (TLS tunnel)
 ./demo deploy-ubuntu                          # SSA an ubuntu pod into the lease
 
@@ -57,7 +56,7 @@ KUBECONFIG=<that-path> kubectl get nodes      # works (TLS tunnel)
 |---|---|---|
 | `name` | `kobe-demo` | Prefixes all Hetzner resources + the kubeconfig filename. |
 | `location` | `nbg1` | Hetzner DC. `fsn1`, `hel1` also work; `ash` / `hil` need a matching `network_zone` change in `main.tf`. |
-| `server_type` | `cx22` | 2 vCPU / 4 GB. Step up to `cx32` if you push the pool larger. |
+| `server_type` | `cpx22` | 2 vCPU / 4 GB. Step up to `cpx32` if you push the pool larger. |
 | `node_count` | `1` | 1 = single-node. >1 = 1 server + (n-1) agents. |
 | `ssh_public_key_path` | `~/.ssh/id_ed25519.pub` | Same key the kobe AccessPolicy expects. |
 | `k3s_version` | `v1.31.3+k3s1` | Match the inner pool's k3s. |
