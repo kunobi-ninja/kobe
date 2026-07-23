@@ -3,7 +3,7 @@ name: kobe-demo
 description: Self-contained kobe demo umbrella chart (cloud-agnostic).
 type: application
 version: 0.1.0
-appVersion: "0.19.1"
+appVersion: "0.35.0"
 keywords:
   - kobe
   - demo
@@ -16,5 +16,5 @@ maintainers:
 # `repository: ""` sentinel tells helm not to fetch it.
 dependencies:
   - name: kobe
-    version: "0.19.1"
+    version: "0.21.19"
     repository: ""
