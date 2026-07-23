@@ -10,7 +10,7 @@ After `./demo up`, the target SKS cluster has:
 
 - `kobe-system` namespace with the kobe operator (1 replica, image `v0.9.1`).
 - One `AccessPolicy` named `demo-ssh` accepting your SSH key.
-- One `ClusterPool` named `demo-k3s-small` pre-warming **2 k3s clusters** as pods on the SKS worker nodes (1 always Ready, max 3 total). Leasing one takes seconds.
+- One `ClusterPool` named `demo-k3s-small` pre-warming **2 k3s clusters** as pods on the SKS worker nodes (2 always Ready, max 3 total). Leasing one takes seconds.
 - `local-path-storage` namespace with Rancher's local-path-provisioner installed as the default StorageClass (since SKS doesn't ship one).
 
 ## Prerequisites
