@@ -1,11 +1,11 @@
 # kobe demo on Hetzner Cloud
 
-Self-contained Helm umbrella chart + Terraform module that:
+A Terraform module and a `./demo` script that:
 
 1. Provisions a small k3s cluster on Hetzner Cloud (single-node by default; multi-node by setting `node_count`).
 2. Installs the kobe operator on it, with a `ClusterPool` pre-warming 2 k3s clusters as pods and an `AccessPolicy` that authenticates the kobe HTTP API against your SSH public key.
 
-The whole demo is driven by one script — `./demo` — that narrates each step as it runs. Cloud-agnostic logic lives in [`../_shared/`](../_shared/); this folder contains only Hetzner-specific bits (Terraform + a values override for `localPath`).
+The whole demo is driven by one script — `./demo` — that narrates each step as it runs. It installs the kobe operator from the official chart (`charts/kobe`) with a minimal `values.yaml`, then applies the `ClusterPool` and `AccessPolicy` with `kubectl`. Cloud-agnostic logic lives in [`../_shared/`](../_shared/); this folder contains only the Hetzner-specific bits (the Terraform module).
 
 ## What you get
 
@@ -19,11 +19,10 @@ After `./demo tf up` followed by `./demo up`, your Hetzner project has:
 
 ## Prerequisites
 
-- `helm` v3.14+ (verified on v4), `kubectl` v1.31+, GNU `bash` v3+, `socat` (for `./demo tunnel`), `yq` (for `./demo deploy-ubuntu`), and `terraform` v1.5+ **or** OpenTofu v1.6+ (`brew install opentofu`) on your laptop. The `./demo` script auto-detects whichever is on PATH.
+- `helm` v3.14+ (verified on v4), `kubectl` v1.31+, GNU `bash` v3+, `socat` (for `./demo tunnel`), `yq` (for `./demo up` and `./demo deploy-ubuntu`), and `terraform` v1.5+ **or** OpenTofu v1.6+ (`brew install opentofu`) on your laptop. The `./demo` script auto-detects whichever is on PATH.
 - A Hetzner Cloud project + API token (Read & Write) exported as `HCLOUD_TOKEN`.
 - An **Ed25519** SSH keypair on disk (`~/.ssh/id_ed25519` by default). The kobe operator rejects RSA keys at AccessPolicy load time.
 - The `kobe` CLI installed (`cargo install --path crates/kobectl` from the repo root).
-- Docker Hub credentials with read access to the `zondax/kobe-operator` and `zondax/kobe-sync` images (today both are private). See `./demo pull-secret`.
 
 ## Walkthrough
 
@@ -34,8 +33,7 @@ cd demo/hetzner
 export HCLOUD_TOKEN=...                       # from console.hetzner.cloud
 
 ./demo tf up                                  # ~90 s: VM + k3s + kubeconfig
-./demo pull-secret <docker-user> <docker-pat> # so cluster can pull zondax/kobe-operator
-./demo up                                     # helm install
+./demo up                                     # helm install + apply CRs
 ./demo tunnel                                 # terminal B — keep running
 
 kobe config set demo --endpoint http://localhost:8080 --auth ssh
@@ -85,17 +83,15 @@ Inherited from `_shared/lib.sh` (same as the Exoscale demo):
 
 | Command | What it does |
 |---|---|
-| `./demo up` | Pick kubeconfig, verify cluster, helm install kobe-demo, wait for pool Ready |
+| `./demo up` | Pick kubeconfig, install the kobe chart + apply the ClusterPool/AccessPolicy, wait for pool Ready |
 | `./demo forward` | `kubectl port-forward svc/kobe-demo 8080:8080` (HTTP — kobe CLI only) |
 | `./demo tunnel` | port-forward + socat TLS terminator on `:8443` (HTTPS — for kubectl/Kunobi against leased clusters) |
 | `./demo lease` | `kobe lease demo-k3s-small --ttl 30m` (auto-patches lease kubeconfig to https://localhost:8443) |
 | `./demo release [LEASE_ID]` | `kobe release <id>` if id given, else `kobe purge` |
 | `./demo deploy-ubuntu [KUBECONFIG]` | Server-side-apply `_shared/manifests/ubuntu/*.yaml` into the leased cluster |
 | `./demo status` | `kubectl get clusterpool,clusterinstance,clusterlease` |
-| `./demo pull-secret <user> <token>` | Create `regcred` docker-registry secret in `kobe-system` |
-| `./demo down` | `helm uninstall kobe-demo` |
-| `./demo refresh` | Re-package `_shared/chart/charts/kobe-X.Y.Z.tgz` from `$KOBE_REPO` |
-| `./demo lint`, `./demo template` | Local-only helm checks |
+| `./demo down` | Delete the CRs + `helm uninstall kobe-demo` |
+| `./demo lint`, `./demo template` | Local-only helm checks on the kobe chart |
 
 ## Security model
 
@@ -109,21 +105,15 @@ The local kubeconfig that Terraform writes (`~/.kube/hetzner-${name}-config`) us
 
 ## Bumping kobe
 
-```bash
-cd demo/hetzner
-./demo refresh                          # repackages _shared/chart/charts/kobe-X.Y.Z.tgz
-git add ../_shared/chart/charts/
-git commit -m "chore(demo): bump vendored kobe chart"
-```
-
-If the chart's `Chart.yaml` `version:` bumps, also update `KOBE_VERSION` at the top of `_shared/lib.sh`, `dependencies[0].version` in `_shared/chart/Chart.yaml`, and the chart filename references in this README.
+`./demo up` installs the operator straight from `charts/kobe` in this repo, so the
+demo always tracks the chart in your checkout — there is nothing to re-vendor. To
+pin a specific operator image, set `image.tag` in `_shared/values.yaml`.
 
 ## Troubleshooting
 
 - **`./demo tf up` hangs at "Waiting for SSH":** the firewall is denying your caller IP. Cause: your egress IP changed since terraform plan (e.g. VPN, CGNAT). Re-run `./demo tf up` (terraform will re-detect) or set `var.allowed_api_cidr` explicitly.
 - **`./demo up` errors with "No kubeconfigs found (looking for hetzner-*-config)":** the `null_resource.fetch_kubeconfig` didn't run or was destroyed. Run `terraform -chdir=terraform apply -replace=null_resource.fetch_kubeconfig`.
-- **`./demo up` errors with `Pull-secret 'regcred' missing`:** run `./demo pull-secret <docker-user> <docker-pat>` first.
-- **Pool stays `Pending`:** `kubectl -n kobe-system logs deploy/kobe-demo --tail=200`. Common causes on a fresh k3s: image pull failure (pull-secret), or the pool's k3s-in-pod can't find a StorageClass — but k3s ships `local-path` as default, so this is unusual. Check `kubectl get sc`.
+- **Pool stays `Pending`:** `kubectl -n kobe-system logs deploy/kobe-demo --tail=200`. Common cause on a fresh k3s: the pool's k3s-in-pod can't find a StorageClass — but k3s ships `local-path` as default, so this is unusual. Check `kubectl get sc`.
 - **`./demo tunnel` dies repeatedly:** Hetzner doesn't have aggressive timeouts like SKS, but `kubectl port-forward` itself is fragile. Re-run.
 - **`kobe lease` returns 401 Unauthorized:** confirm your private SSH key matches the public key uploaded to Hetzner AND configured in the AccessPolicy. Override with `KOBE_SSH_KEY=...` if your active key isn't auto-discovered.
 - **`kobe lease ...` returns "no SSH auth method configured":** the kobe operator only accepts **Ed25519** SSH keys. Check the operator logs (`kubectl -n kobe-system logs deploy/kobe-demo | grep "only Ed25519"`); if you see RSA keys being skipped, regenerate or override with an Ed25519 key.
