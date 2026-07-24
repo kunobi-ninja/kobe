@@ -1,17 +1,21 @@
+# Warm pool of k3s clusters the tutorial leases from. Applied with kubectl
+# after the operator is installed, alongside accesspolicy.yaml.
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
 metadata:
-  name: {{ .Values.pool.name }}
+  name: demo-k3s-small
   namespace: kobe-system
 spec:
-  size: {{ .Values.pool.size }}
-  ttl: {{ .Values.pool.ttl | quote }}
+  size: 2
+  ttl: "1h"
   backend:
     type: k3s
   cluster:
-    version: {{ .Values.pool.k3s.version | quote }}
-    servers: {{ .Values.pool.k3s.servers }}
-    agents:  {{ .Values.pool.k3s.agents }}
+    version: "v1.31.3+k3s1"
+    servers: 1
+    # Single-node inner clusters: with agents, two warm server+agent pairs
+    # do not fit a 2-vCPU default node.
+    agents: 0
     serverArgs:
       - "--disable=traefik"
       - "--disable=metrics-server"
@@ -23,14 +27,14 @@ spec:
     intervalSeconds: 30
     failureThreshold: 5
   scaling:
-    minReady: {{ .Values.pool.minReady }}
-    maxClusters: {{ .Values.pool.maxClusters }}
+    minReady: 2
+    maxClusters: 3
     scaleUpThreshold: 0
     scaleDownAfter: 30m
     queueTimeout: 5m
   resources:
     # Kubernetes reserves the full limit as the request on every guest pod,
-    # so two warm 1-CPU instances can never schedule on a 2-vCPU demo node.
+    # so two warm 1-CPU instances can never schedule on a 2-vCPU node.
     # 750m fits two alongside the operator and kube-system.
     limits:
       cpu: "750m"

@@ -1,6 +1,0 @@
-# Exoscale SKS-specific overrides on top of demo/_shared/chart/values.yaml.
-# SKS doesn't ship a default StorageClass, so install Rancher's
-# local-path-provisioner and mark it default.
-localPath:
-  enabled: true
-  setAsDefault: true

@@ -3,7 +3,7 @@
 # Subcommands:
 #   tf up | tf down | tf output     (Hetzner-specific — terraform wrappers)
 #   up | down | lease | release | deploy-ubuntu | forward | tunnel |
-#   patch-lease | status | pull-secret | refresh | lint | template
+#   patch-lease | status | lint | template
 # Run ./demo help for full usage.
 set -euo pipefail
 
@@ -41,7 +41,6 @@ cmd_tf_up() {
   cmd "$TF_CMD" -chdir="$TF_DIR" output
   bold "Done. Next:"
   echo "  export HCLOUD_TOKEN=...                         # already set"
-  echo "  ./demo pull-secret <docker-user> <docker-pat>   # one-time per cluster"
   echo "  ./demo up                                       # helm install"
   echo "  ./demo tunnel                                   # terminal B"
 }

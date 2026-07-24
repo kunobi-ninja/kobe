@@ -8,23 +8,22 @@
 # Callers MUST set:
 #   KUBECONFIG_GLOB         e.g. "exoscale-*-config" or "hetzner-*-config"
 # Callers MAY set/override (defaults applied here if unset):
-#   KOBE_VERSION, NAMESPACE, RELEASE, POOL, DEFAULT_LEASE_TTL, KOBE_PORT,
-#   TLS_PORT, TLS_DIR, SSH_PUBKEY, PULL_SECRET_NAME, DOCKER_REGISTRY,
-#   DOCKER_HUB_EMAIL, KOBE_REPO.
+#   NAMESPACE, RELEASE, POOL, DEFAULT_LEASE_TTL, KOBE_PORT, TLS_PORT,
+#   TLS_DIR, SSH_PUBKEY, KOBE_REPO, KOBE_CHART_DIR.
 # Callers MAY define extra functions used by the dispatcher:
 #   dispatch_extra "$@"     return 0 if handled, non-zero to fall through
 #   usage_extra             prints additional help text after lib_usage
 
 # Anchored to lib.sh location so paths don't depend on caller cwd.
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHARED_CHART_DIR="$LIB_DIR/chart"
 SHARED_MANIFESTS_DIR="$LIB_DIR/manifests"
+SHARED_VALUES="$LIB_DIR/values.yaml"
 
 # --- Configuration defaults --------------------------------------------------
 : "${KUBECONFIG_GLOB:?KUBECONFIG_GLOB must be set by caller}"
 KOBE_REPO="${KOBE_REPO:-$(cd "$LIB_DIR/../.." && pwd)}"
-KOBE_VERSION="${KOBE_VERSION:-0.21.19}"
-KOBE_TGZ="$SHARED_CHART_DIR/charts/kobe-${KOBE_VERSION}.tgz"
+# The official kobe chart, installed straight from the repo clone.
+KOBE_CHART_DIR="${KOBE_CHART_DIR:-$KOBE_REPO/charts/kobe}"
 NAMESPACE="${NAMESPACE:-kobe-system}"
 RELEASE="${RELEASE:-kobe-demo}"
 POOL="${POOL:-demo-k3s-small}"
@@ -37,8 +36,6 @@ KOBE_PORT="${KOBE_PORT:-8080}"
 TLS_PORT="${TLS_PORT:-8443}"
 TLS_DIR="${TLS_DIR:-$HOME/.config/kobe-demo}"
 SSH_PUBKEY="${SSH_PUBKEY:-$(cat ~/.ssh/id_ed25519.pub 2>/dev/null || true)}"
-PULL_SECRET_NAME="${PULL_SECRET_NAME:-regcred}"
-DOCKER_REGISTRY="${DOCKER_REGISTRY:-https://index.docker.io/v1/}"
 
 # CLOUD_DIR is the directory holding the calling ./demo script (and its
 # values.yaml). Computed from $0 in the caller; we re-derive it here from
@@ -92,42 +89,37 @@ pick_kubeconfig() {
 
 # --- Subcommands -------------------------------------------------------------
 cmd_up() {
-  step "Step 1/6: Pick kubeconfig"
+  step "Step 1/4: Pick kubeconfig"
   pick_kubeconfig
 
-  step "Step 2/6: Verify cluster access"
+  step "Step 2/4: Verify cluster access"
   cmd kubectl get nodes
 
-  step "Step 3/6: Verify vendored kobe chart is present"
-  if [[ ! -f "$KOBE_TGZ" ]]; then
-    err "$KOBE_TGZ missing. Run: ./demo refresh"
+  step "Step 3/4: Install the kobe operator and apply the pool + access policy"
+  [[ -d "$KOBE_CHART_DIR" ]] || \
+    err "kobe chart not found at $KOBE_CHART_DIR. Set KOBE_REPO=... to the repo root."
+  # The chart declares an optional (disabled) etcd dependency; helm still needs
+  # the dependency tarball present before install. Build it if the clone lacks it.
+  if [[ ! -d "$KOBE_CHART_DIR/charts" ]] || [[ -z "$(ls -A "$KOBE_CHART_DIR/charts" 2>/dev/null)" ]]; then
+    cmd helm dependency build "$KOBE_CHART_DIR"
   fi
-  note "Found $KOBE_TGZ"
-
-  step "Step 4/6: Verify Docker Hub pull-secret exists"
-  cmd kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 || \
-    cmd kubectl create namespace "$NAMESPACE"
-  if ! kubectl -n "$NAMESPACE" get secret "$PULL_SECRET_NAME" >/dev/null 2>&1; then
-    err "Pull-secret '$PULL_SECRET_NAME' missing in namespace $NAMESPACE.
-       The kobe operator image (zondax/kobe-operator) is hosted on a private
-       Docker Hub repo and the cluster needs credentials to pull it.
-
-       Run once:
-         ./demo pull-secret <docker-hub-user> <docker-hub-token>"
+  # Cloud-specific extras applied first (e.g. a StorageClass on managed clusters
+  # that ship none). k3s/Hetzner has one, so the dir simply won't exist there.
+  if [[ -d "$CLOUD_DIR/manifests" ]]; then
+    note "Applying cloud-specific manifests from $CLOUD_DIR/manifests/"
+    cmd kubectl apply -f "$CLOUD_DIR/manifests/"
   fi
-  note "Found pull-secret '$PULL_SECRET_NAME' in $NAMESPACE"
+  cmd helm upgrade --install "$RELEASE" "$KOBE_CHART_DIR" \
+    -f "$SHARED_VALUES" --create-namespace -n "$NAMESPACE"
 
-  step "Step 5/6: Install kobe-demo (helm upgrade --install)"
-  local args=(
-    helm upgrade --install "$RELEASE" "$SHARED_CHART_DIR"
-    -f "$SHARED_CHART_DIR/values.yaml"
-    -f "$CLOUD_DIR/values.yaml"
-    --create-namespace -n "$NAMESPACE"
-  )
-  [[ -n "$SSH_PUBKEY" ]] && args+=( --set "sshPublicKey=$SSH_PUBKEY" )
-  cmd "${args[@]}"
+  [[ -n "$SSH_PUBKEY" ]] || \
+    err "No SSH public key found (looked for ~/.ssh/id_ed25519.pub). Set SSH_PUBKEY=..."
+  cmd kubectl apply -f "$SHARED_MANIFESTS_DIR/kobe/clusterpool.yaml"
+  note "Applying AccessPolicy with your SSH public key"
+  SSH_PUBKEY="$SSH_PUBKEY" yq '.spec.auth.ssh.authorizedKeys[0] = strenv(SSH_PUBKEY)' \
+    "$SHARED_MANIFESTS_DIR/kobe/accesspolicy.yaml" | kubectl apply -f -
 
-  step "Step 6/6: Wait for kobe operator + ClusterPool to be Ready"
+  step "Step 4/4: Wait for kobe operator + ClusterPool to be Ready"
   cmd kubectl -n "$NAMESPACE" rollout status "deploy/$RELEASE" --timeout=3m
   local min_ready
   min_ready="$(kubectl -n "$NAMESPACE" get clusterpool "$POOL" \
@@ -151,6 +143,8 @@ cmd_up() {
 
 cmd_down() {
   pick_kubeconfig
+  step "Delete the ClusterPool and AccessPolicy"
+  cmd kubectl delete -f "$SHARED_MANIFESTS_DIR/kobe/" --ignore-not-found
   step "Uninstall release $RELEASE from namespace $NAMESPACE"
   cmd helm uninstall -n "$NAMESPACE" "$RELEASE"
   note "CRDs and namespace $NAMESPACE are intentionally left in place."
@@ -339,62 +333,20 @@ cmd_patch_lease() {
   note "Done. kubectl/Kunobi can now use this kubeconfig (./demo tunnel must be running)."
 }
 
-cmd_pull_secret() {
-  local user="${1:-}"
-  local token="${2:-}"
-  local email="${3:-${DOCKER_HUB_EMAIL:-noreply@example.com}}"
-  if [[ -z "$user" || -z "$token" ]]; then
-    err "Usage: ./demo pull-secret <docker-hub-user> <docker-hub-token> [email]
-       Token must have read access to zondax/kobe-operator and zondax/kobe-sync
-       on Docker Hub. Generate one at https://hub.docker.com/settings/security."
-  fi
-  pick_kubeconfig
-  step "Create/replace Docker Hub pull-secret '$PULL_SECRET_NAME' in $NAMESPACE"
-  cmd kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 || \
-    cmd kubectl create namespace "$NAMESPACE"
-  kubectl -n "$NAMESPACE" delete secret "$PULL_SECRET_NAME" --ignore-not-found >/dev/null
-  cmd kubectl -n "$NAMESPACE" create secret docker-registry "$PULL_SECRET_NAME" \
-    --docker-server="$DOCKER_REGISTRY" \
-    --docker-username="$user" \
-    --docker-password="$token" \
-    --docker-email="$email"
-  note "Done. Now run: ./demo up"
-}
-
 cmd_status() {
   pick_kubeconfig
   step "Pool / Instance / Lease status"
   cmd kubectl -n "$NAMESPACE" get clusterpool,clusterinstance,clusterlease
 }
 
-cmd_refresh() {
-  step "Refresh vendored kobe chart from $KOBE_REPO"
-  [[ -d "$KOBE_REPO/charts/kobe" ]] || err "$KOBE_REPO/charts/kobe not found. Set KOBE_REPO=..."
-  local subcharts_dir="$KOBE_REPO/charts/kobe/charts"
-  if [[ ! -d "$subcharts_dir" ]] || [[ -z "$(ls -A "$subcharts_dir" 2>/dev/null)" ]]; then
-    note "Subcharts missing — running 'helm dependency build' (uses Chart.lock)"
-    cmd helm dependency build "$KOBE_REPO/charts/kobe"
-  else
-    note "Subcharts already present at $subcharts_dir — skipping dep fetch"
-  fi
-  cmd rm -f "$SHARED_CHART_DIR"/charts/kobe-*.tgz
-  cmd helm package "$KOBE_REPO/charts/kobe" -d "$SHARED_CHART_DIR/charts/"
-}
-
 cmd_lint() {
-  step "Lint the umbrella chart"
-  cmd helm lint "$SHARED_CHART_DIR" \
-    -f "$SHARED_CHART_DIR/values.yaml" \
-    -f "$CLOUD_DIR/values.yaml" \
-    --set sshPublicKey="ssh-ed25519 AAAATEMPLATEPLACEHOLDER lint@local"
+  step "helm lint the kobe chart with the demo values"
+  cmd helm lint "$KOBE_CHART_DIR" -f "$SHARED_VALUES"
 }
 
 cmd_template() {
-  step "Render full template output (no cluster contact)"
-  cmd helm template "$RELEASE" "$SHARED_CHART_DIR" \
-    -f "$SHARED_CHART_DIR/values.yaml" \
-    -f "$CLOUD_DIR/values.yaml" \
-    --set sshPublicKey="ssh-ed25519 AAAATEMPLATEPLACEHOLDER lint@local"
+  step "Render the kobe chart with the demo values (no cluster contact)"
+  cmd helm template "$RELEASE" "$KOBE_CHART_DIR" -f "$SHARED_VALUES" -n "$NAMESPACE"
 }
 
 # --- Shared dispatcher -------------------------------------------------------
@@ -417,8 +369,6 @@ lib_dispatch() {
     tunnel)          cmd_tunnel ;;
     patch-lease)     shift; cmd_patch_lease "$@" ;;
     status)          cmd_status ;;
-    pull-secret)     shift; cmd_pull_secret "$@" ;;
-    refresh)         cmd_refresh ;;
     lint)            cmd_lint ;;
     template)        cmd_template ;;
     ""|-h|--help|help) lib_usage ;;
@@ -431,8 +381,8 @@ lib_usage() {
 Usage: ./demo <subcommand>
 
 Shared subcommands:
-  up             Pick kubeconfig, verify cluster, helm install, wait for pool Ready
-  down           helm uninstall
+  up             Pick kubeconfig, install the kobe chart + apply the pool/policy, wait for Ready
+  down           delete the pool/policy + helm uninstall
   lease          kobe lease against the demo pool
   release        kobe release <lease-id> (or 'kobe purge' if no id given)
                    Usage: ./demo release [LEASE_ID]
@@ -443,16 +393,12 @@ Shared subcommands:
   patch-lease    Rewrite a leased kubeconfig to use https://localhost:$TLS_PORT
                    Usage: ./demo patch-lease [LEASED_KUBECONFIG_PATH]
   status         kubectl get clusterpool,clusterinstance,clusterlease
-  pull-secret    Create regcred docker-registry secret in $NAMESPACE
-                   Usage: ./demo pull-secret <user> <token> [email]
-  refresh        Re-package $SHARED_CHART_DIR/charts/kobe-X.Y.Z.tgz from \$KOBE_REPO
-  lint           helm lint the umbrella chart
-  template       helm template (local-only render)
+  lint           helm lint the kobe chart with the demo values
+  template       helm template the kobe chart (local-only render)
 
-Env overrides: KOBE_REPO, KOBE_VERSION, NAMESPACE, RELEASE, POOL,
+Env overrides: KOBE_REPO, KOBE_CHART_DIR, NAMESPACE, RELEASE, POOL,
                KUBECONFIG, SSH_PUBKEY, KOBE_PORT, DEFAULT_LEASE_TTL,
-               KOBE_TARGET, PULL_SECRET_NAME, DOCKER_REGISTRY,
-               DOCKER_HUB_EMAIL
+               KOBE_TARGET
 EOF
   if declare -f usage_extra >/dev/null 2>&1; then
     usage_extra
