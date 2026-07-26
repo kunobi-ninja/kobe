@@ -218,7 +218,7 @@ spec:
                 properties:
                   agents:
                     description: |-
-                      Number of k3s agent replicas (k3s backend only).
+                      Number of agent replicas (k3s and k0s backends only).
                       When set, creates a separate agent Deployment that joins the server.
                     format: uint32
                     minimum: 0.0
@@ -566,6 +566,10 @@ spec:
                 description: Standalone readiness gates. Pool-managed instances derive this from the pool.
                 items:
                   properties:
+                    count:
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
                     name:
                       type: string
                     namespace:
@@ -575,6 +579,7 @@ spec:
                     type:
                       enum:
                       - CRDExists
+                      - NodesReady
                       - DeploymentReady
                       - DaemonSetReady
                       - URLHealthy

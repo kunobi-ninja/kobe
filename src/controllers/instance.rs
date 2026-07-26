@@ -1034,7 +1034,11 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
 ///   bug `ci-vkobe-flux` hid behind for 7 days on an internal cluster). Its DNS is
 ///   host-projected, not a standard `kube-dns` Service, so the DNS gate
 ///   below doesn't apply to it.
-/// - **k3s / k0s / vcluster** → `DNSHealthy` + `InClusterToken` (#10). These
+/// - **k3s / k0s** → `NodesReady` + `DNSHealthy` + `InClusterToken`. The node
+///   gate requires every declared server and agent to have joined and report
+///   `Ready=True`; a control-plane-only cluster therefore cannot enter the
+///   lease pool when an agent is missing (#48).
+/// - **vcluster** → `DNSHealthy` + `InClusterToken` (#10). These
 ///   bundle CoreDNS fronted by the `kube-dns` Service; gate on DNS *actually
 ///   serving* so a cluster whose CoreDNS crashloops on an in-cluster x509
 ///   mismatch (#42) — answering apiserver, dead DNS — is never leased. The
@@ -1052,6 +1056,7 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
 /// own gate(s) and the default is skipped.
 fn apply_default_readiness_gates(
     backend_type: BackendType,
+    cluster: &ClusterConfig,
     gates: Vec<ReadinessGate>,
 ) -> Vec<ReadinessGate> {
     if !gates.is_empty() {
@@ -1059,15 +1064,26 @@ fn apply_default_readiness_gates(
     }
     match backend_type {
         BackendType::Vkobe => vec![ReadinessGate::SchedulingProbe { namespace: None }],
-        BackendType::K3s | BackendType::K0s | BackendType::Vcluster => {
-            vec![
-                ReadinessGate::DnsHealthy { namespace: None },
-                ReadinessGate::InClusterToken {
-                    namespace: None,
-                    service_account: None,
-                },
-            ]
-        }
+        BackendType::K3s | BackendType::K0s => vec![
+            ReadinessGate::NodesReady {
+                count: cluster
+                    .servers
+                    .max(1)
+                    .saturating_add(cluster.agents.unwrap_or_default()),
+            },
+            ReadinessGate::DnsHealthy { namespace: None },
+            ReadinessGate::InClusterToken {
+                namespace: None,
+                service_account: None,
+            },
+        ],
+        BackendType::Vcluster => vec![
+            ReadinessGate::DnsHealthy { namespace: None },
+            ReadinessGate::InClusterToken {
+                namespace: None,
+                service_account: None,
+            },
+        ],
         BackendType::Capi => gates,
     }
 }
@@ -1116,6 +1132,8 @@ async fn resolve_instance_config(
         // siblings of the SAME pool rather than every kobe-managed
         // server pod on the host cluster.
         cluster.pool_name = Some(owner_name.clone());
+        let readiness_gates =
+            apply_default_readiness_gates(backend_type, &cluster, spec.readiness_gates);
         return Ok(ResolvedInstanceConfig {
             owner_name,
             backend: spec.backend,
@@ -1123,7 +1141,7 @@ async fn resolve_instance_config(
             addons: spec.addons,
             bootstraps: spec.bootstraps,
             health_check: spec.health_check,
-            readiness_gates: apply_default_readiness_gates(backend_type, spec.readiness_gates),
+            readiness_gates,
             snapshot: spec.snapshot,
         });
     }
@@ -1140,6 +1158,11 @@ async fn resolve_instance_config(
         .ok_or_else(|| anyhow::anyhow!("Standalone ClusterInstance missing spec.cluster"))?;
 
     let backend_type = backend.backend_type.clone();
+    let readiness_gates = apply_default_readiness_gates(
+        backend_type,
+        &cluster,
+        instance.spec.readiness_gates.clone(),
+    );
     Ok(ResolvedInstanceConfig {
         owner_name: instance.name_any(),
         backend,
@@ -1147,10 +1170,7 @@ async fn resolve_instance_config(
         addons: instance.spec.addons.clone(),
         bootstraps: instance.spec.bootstraps.clone(),
         health_check: instance.spec.health_check.clone(),
-        readiness_gates: apply_default_readiness_gates(
-            backend_type,
-            instance.spec.readiness_gates.clone(),
-        ),
+        readiness_gates,
         snapshot: instance.spec.snapshot.clone(),
     })
 }
@@ -2891,7 +2911,8 @@ mod tests {
     /// behind for 7 days on an internal cluster.
     #[test]
     fn vkobe_pool_with_no_gates_gets_default_scheduling_probe() {
-        let gates = apply_default_readiness_gates(BackendType::Vkobe, vec![]);
+        let gates =
+            apply_default_readiness_gates(BackendType::Vkobe, &ClusterConfig::default(), vec![]);
         assert_eq!(gates.len(), 1);
         assert!(matches!(
             gates[0],
@@ -2899,38 +2920,87 @@ mod tests {
         ));
     }
 
-    /// Real-cluster backends (k3s/k0s/vcluster) with no user gates get the
-    /// default functional-admission pair (#10): `DNSHealthy` (they bundle
-    /// CoreDNS behind `kube-dns`, so a dead-DNS-but-live-apiserver cluster
-    /// (#42) must not be leased) + `InClusterToken` (the SA sign/verify chain
-    /// every `rest.InClusterConfig()` workload depends on must round-trip).
+    /// k3s/k0s default admission includes the declared topology: every server
+    /// and agent must join and report Ready before the instance can be leased.
+    /// This contains the agent join failure from #47 instead of rotating an
+    /// unusable control-plane-only cluster through the pool (#48).
     #[test]
-    fn real_cluster_backends_with_no_gates_get_default_dns_and_token() {
-        for backend in [BackendType::K3s, BackendType::K0s, BackendType::Vcluster] {
-            let gates = apply_default_readiness_gates(backend.clone(), vec![]);
-            assert_eq!(gates.len(), 2, "{backend:?} should get two default gates");
+    fn k3s_k0s_default_readiness_requires_declared_server_and_agent_nodes_ready() {
+        let cluster = ClusterConfig {
+            servers: 1,
+            agents: Some(2),
+            ..Default::default()
+        };
+        for backend in [BackendType::K3s, BackendType::K0s] {
+            let gates = apply_default_readiness_gates(backend.clone(), &cluster, vec![]);
+            assert_eq!(gates.len(), 3, "{backend:?} should get three default gates");
             assert!(
-                matches!(gates[0], ReadinessGate::DnsHealthy { namespace: None }),
-                "{backend:?} first default should be DNSHealthy"
+                matches!(gates[0], ReadinessGate::NodesReady { count: 3 }),
+                "{backend:?} first default should require all declared nodes"
+            );
+            assert!(
+                matches!(gates[1], ReadinessGate::DnsHealthy { namespace: None }),
+                "{backend:?} second default should be DNSHealthy"
             );
             assert!(
                 matches!(
-                    gates[1],
+                    gates[2],
                     ReadinessGate::InClusterToken {
                         namespace: None,
                         service_account: None
                     }
                 ),
-                "{backend:?} second default should be InClusterToken"
+                "{backend:?} third default should be InClusterToken"
             );
         }
+    }
+
+    /// Both backends provision one server when `servers: 0` (k3s clamps the
+    /// StatefulSet replica count and k0s has one fixed controller). The
+    /// topology gate must count that runtime server so one joined node cannot
+    /// hide a missing declared agent.
+    #[test]
+    fn k3s_k0s_default_readiness_counts_runtime_server_when_servers_is_zero() {
+        let cluster = ClusterConfig {
+            servers: 0,
+            agents: Some(1),
+            ..Default::default()
+        };
+        for backend in [BackendType::K3s, BackendType::K0s] {
+            let gates = apply_default_readiness_gates(backend, &cluster, vec![]);
+            assert!(
+                matches!(gates[0], ReadinessGate::NodesReady { count: 2 }),
+                "runtime server plus declared agent should require two ready nodes"
+            );
+        }
+    }
+
+    /// vcluster does not create guest server/agent nodes from ClusterConfig,
+    /// so it retains the functional DNS + token admission pair.
+    #[test]
+    fn vcluster_with_no_gates_gets_default_dns_and_token() {
+        let gates =
+            apply_default_readiness_gates(BackendType::Vcluster, &ClusterConfig::default(), vec![]);
+        assert_eq!(gates.len(), 2);
+        assert!(matches!(
+            gates[0],
+            ReadinessGate::DnsHealthy { namespace: None }
+        ));
+        assert!(matches!(
+            gates[1],
+            ReadinessGate::InClusterToken {
+                namespace: None,
+                service_account: None
+            }
+        ));
     }
 
     /// CAPI clusters are provider-defined; `kube-dns` is not guaranteed, so
     /// no default gate is imposed (one could wedge an otherwise-valid pool).
     #[test]
     fn capi_pool_with_no_gates_gets_no_default() {
-        let gates = apply_default_readiness_gates(BackendType::Capi, vec![]);
+        let gates =
+            apply_default_readiness_gates(BackendType::Capi, &ClusterConfig::default(), vec![]);
         assert!(gates.is_empty(), "capi should not gain a default gate");
     }
 
@@ -2943,7 +3013,11 @@ mod tests {
         let user_gates = vec![ReadinessGate::CrdExists {
             name: "kustomizations.kustomize.toolkit.fluxcd.io".to_string(),
         }];
-        let result = apply_default_readiness_gates(BackendType::Vkobe, user_gates.clone());
+        let result = apply_default_readiness_gates(
+            BackendType::Vkobe,
+            &ClusterConfig::default(),
+            user_gates.clone(),
+        );
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], ReadinessGate::CrdExists { .. }));
     }
