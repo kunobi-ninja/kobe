@@ -1,0 +1,9 @@
+# Minimal values for the official kobe chart (charts/kobe), used by ./demo up.
+#
+# Everything not set here relies on the chart's own defaults — the chart already
+# defaults imagePullSecrets to [], and etcd/kine/serviceMonitor/ingress to
+# disabled, so the operator installs cleanly with no extra configuration.
+#
+# The two overrides below are the only tutorial-specific bits:
+replicas: 1                      # a single operator replica is plenty here
+operatorNamespace: kobe-system   # watch the namespace we install the CRs into

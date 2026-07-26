@@ -1,6 +1,6 @@
 # kobe demo on Exoscale SKS
 
-Self-contained Helm umbrella chart that brings up the kobe operator on a vanilla Exoscale SKS cluster, with a small k3s `ClusterPool` pre-warmed and an `AccessPolicy` that authenticates the kobe HTTP API against your SSH public key.
+Brings up the kobe operator on a vanilla Exoscale SKS cluster — installed from the official chart (`charts/kobe`) with a minimal `values.yaml` — plus a small k3s `ClusterPool` and an `AccessPolicy` (both applied with `kubectl`) that authenticates the kobe HTTP API against your SSH public key.
 
 The whole demo is driven by one script — `./demo` — that narrates each step as it runs.
 
@@ -19,16 +19,11 @@ After `./demo up`, the target SKS cluster has:
 - An Exoscale SKS kubeconfig in `~/.kube/exoscale-*-config` (e.g. one downloaded by Kunobi desktop). The script auto-discovers it; you don't `export KUBECONFIG=...` yourself.
 - The `kobe` CLI installed (`cargo install --path crates/kobectl` from the repo root).
 - An **Ed25519** SSH keypair on disk (`~/.ssh/id_ed25519` by default; override with `SSH_PUBKEY="$(cat /path/to/key.pub)" ./demo up`). The kobe operator rejects RSA keys at AccessPolicy load time.
-- Docker Hub credentials with read access to the `zondax/kobe-operator` and `zondax/kobe-sync` images (today both are private). See `./demo pull-secret` below.
 
 ## Walkthrough
 
 ```bash
 cd demo/exoscale
-
-# One-time, on a fresh clone of the kobe repo:
-./demo refresh                           # repackages ../_shared/chart/charts/kobe-0.21.19.tgz from this repo
-./demo pull-secret <user> <docker-pat>   # so SKS can pull zondax/kobe-operator
 
 # Demo proper (terminal A):
 ./demo up                                # picks SKS kubeconfig, helm install, wait for Ready
@@ -50,10 +45,9 @@ KUBECONFIG=<that-path> kubectl get nodes # works (over the TLS tunnel)
 The `./demo up` flow:
 1. Picks the SKS kubeconfig — auto-selected if there's only one in `~/.kube/exoscale-*-config`, otherwise prompts. Inherited `KUBECONFIG` env is ignored unless its basename matches `exoscale-*-config`.
 2. `kubectl get nodes` — sanity check the cluster is reachable.
-3. Verifies `../_shared/chart/charts/kobe-0.21.19.tgz` is present.
-4. Verifies the `regcred` pull-secret exists in `kobe-system` (errors with a clear instruction to run `./demo pull-secret` if missing — avoids silent ImagePullBackOff).
-5. `helm upgrade --install kobe-demo .` with your SSH pubkey passed via `--set sshPublicKey=...`.
-6. Polls until the kobe Deployment rolls out and the ClusterPool reaches `status.ready >= spec.scaling.minReady` (timeout 5 min).
+3. Applies `exoscale/manifests/` (the local-path StorageClass, since SKS ships none), then `helm upgrade --install kobe-demo charts/kobe -f ../_shared/values.yaml`.
+4. `kubectl apply` the `ClusterPool`, and the `AccessPolicy` with your SSH pubkey injected via `yq`.
+5. Polls until the kobe Deployment rolls out and the ClusterPool reaches `status.ready >= spec.scaling.minReady` (timeout 5 min).
 
 Each step prints `==> <what>` and `$ <command>` before running, so a live audience can follow along.
 
@@ -65,15 +59,13 @@ Each step prints `==> <what>` and `$ <command>` before running, so a live audien
 | `./demo forward` | `kubectl port-forward svc/kobe-demo 8080:8080` (HTTP — for kobe CLI only) |
 | `./demo tunnel` | port-forward + socat TLS terminator on `:8443` (HTTPS — needed for kubectl/Kunobi against leased clusters; bearer tokens are stripped over plain HTTP by kubectl ≥1.31) |
 | `./demo patch-lease [PATH]` | Rewrite a leased kubeconfig's server URL from `http://localhost:8080` to `https://localhost:8443` and add `insecure-skip-tls-verify: true` |
-| `./demo pull-secret <user> <token>` | Create a `regcred` docker-registry Secret in `kobe-system` so the cluster can pull `zondax/kobe-operator` |
 | `./demo lease` | `kobe lease demo-k3s-small --ttl 30m` (auto-patches the resulting kubeconfig to use `https://localhost:8443`) |
 | `./demo release [LEASE_ID]` | `kobe release <id>` if id given, else `kobe purge` (release all) |
 | `./demo deploy-ubuntu [KUBECONFIG]` | Server-side-apply `manifests/ubuntu/*.yaml` into the leased cluster via curl (kubectl can't because of the bearer-over-HTTP/TLS-tunnel split). Defaults to the most-recent leased kubeconfig. |
 | `./demo status` | `kubectl get clusterpool,clusterinstance,clusterlease` |
-| `./demo down` | `helm uninstall kobe-demo` |
-| `./demo refresh` | Re-package `charts/kobe-X.Y.Z.tgz` from `$KOBE_REPO` (defaults to repo root) |
-| `./demo lint` | `helm lint .` |
-| `./demo template` | `helm template .` (local render, no cluster) |
+| `./demo down` | Delete the CRs + `helm uninstall kobe-demo` |
+| `./demo lint` | `helm lint charts/kobe -f ../_shared/values.yaml` |
+| `./demo template` | `helm template charts/kobe` (local render, no cluster) |
 | `./demo help` | Usage |
 
 ## Drive it from a UI (e.g. Kunobi desktop)
@@ -82,18 +74,12 @@ Any tool that speaks to a kobe API endpoint with `auth: ssh` will see the same p
 
 ## Bumping kobe
 
-```bash
-cd demo/exoscale
-./demo refresh                          # repackages ../_shared/chart/charts/kobe-X.Y.Z.tgz from this repo
-git add ../_shared/chart/charts/
-git commit -m "chore(demo): bump vendored kobe chart"
-```
-
-If `charts/kobe/Chart.yaml` `version:` bumps, also update `KOBE_VERSION` at the top of `../_shared/lib.sh`, `dependencies[0].version` in `../_shared/chart/Chart.yaml`, and the chart filename references in this README.
+`./demo up` installs the operator straight from `charts/kobe` in this repo, so the
+demo always tracks the chart in your checkout — there is nothing to re-vendor. To
+pin a specific operator image, set `image.tag` in `../_shared/values.yaml`.
 
 ## Troubleshooting
 
-- **Vendored chart tarball missing:** run `./demo refresh` first. Expected only if the vendored tarball is somehow absent.
 - **Pool stays `Pending`:** `kubectl -n kobe-system logs deploy/kobe --tail=200`. Common causes: image pull failure, missing RBAC for the pool service account, `local-path-provisioner` not Ready (PVCs stuck `Pending`).
 - **`kobe lease` returns 401 Unauthorized:** confirm your private SSH key matches the public key in `values.yaml` (or the override). Set `KOBE_SSH_KEY=...` if your active key isn't auto-discovered.
 - **Port-forward dies:** SKS has aggressive idle timeouts. Re-run `./demo forward`.
@@ -108,8 +94,9 @@ If `charts/kobe/Chart.yaml` `version:` bumps, also update `KOBE_VERSION` at the 
 
 ```
 demo/
-├── _shared/                       # cloud-agnostic chart + helpers (see ../_shared/)
-│   ├── chart/                     # umbrella chart (Chart.yaml, values.yaml, templates/, charts/)
+├── _shared/                       # cloud-agnostic helpers + manifests (see ../_shared/)
+│   ├── values.yaml                # minimal values for the official kobe chart
+│   ├── manifests/kobe/            # ClusterPool + AccessPolicy
 │   ├── manifests/ubuntu/          # demo workload manifests
 │   └── lib.sh                     # all ./demo verb implementations
 └── exoscale/
