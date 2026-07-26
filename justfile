@@ -146,8 +146,12 @@ coverage-open:
 clean:
     cargo clean
 
-# Bump the release version across the workspace + Chart.yaml appVersion in
-# lockstep, then verify consistency. Usage: just bump 0.32.0  (or 0.32.0-rc.1)
+# Bump the release version across the workspace + Chart.yaml version and
+# appVersion in lockstep, then verify consistency. The chart ships with the
+# operator on the same `v*` tag, so all three move together — a chart-only fix
+# is a patch release of the whole thing, NOT a `-1` suffix (semver reads that as
+# a prerelease, so it would sort BELOW the release it fixes and be hidden from
+# `helm search` / dependency resolution). Usage: just bump 0.32.0 (or 0.32.0-rc.1)
 [group('release')]
 bump VERSION:
     #!/usr/bin/env bash
@@ -165,9 +169,10 @@ bump VERSION:
     fi
     # Sets [workspace.package].version; both kobe-operator and kobectl inherit.
     cargo set-version --workspace "{{ VERSION }}"
-    # Mirror into the chart's appVersion (the chart's own `version:` is decoupled
-    # and bumped separately when the chart itself changes).
+    # Mirror into the chart's appVersion AND its own `version:` — the chart is
+    # published from the same release tag, so both track the operator version.
     perl -i -pe 's/^appVersion:.*$/appVersion: "{{ VERSION }}"/' charts/kobe/Chart.yaml
+    perl -i -pe 's/^version:.*$/version: {{ VERSION }}/' charts/kobe/Chart.yaml
     cargo update -p kobe-operator -p kobectl --precise "{{ VERSION }}" 2>/dev/null || true
     ./scripts/check-version-consistency.sh
     echo "Bumped to {{ VERSION }}. Review the diff, commit, then \`just release\`."
