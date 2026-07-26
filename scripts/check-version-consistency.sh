@@ -8,11 +8,16 @@
 # (`[workspace.package].version`), inherited by both `kobe-operator` and the
 # published `kobectl` crate. The places that must mirror it:
 #   - charts/kobe/Chart.yaml  `appVersion`  (the app/operator release version)
+#   - charts/kobe/Chart.yaml  `version`     (the chart ships on the same tag)
 #   - nix/package.nix         `version`     (only if the file exists)
 #
-# NOTE: the chart's own `version:` is INTENTIONALLY decoupled — kobe versions the
-# Helm chart on its own track (e.g. chart 0.21.x while appVersion is 0.31.x), so
-# it is deliberately NOT gated here.
+# NOTE: the chart's own `version:` used to be on its own track (chart 0.21.x while
+# appVersion was 0.31.x). As of 0.36.0 the chart is published from the same `v*`
+# release tag as the image, so it is gated here too and `just bump` moves both.
+# A chart-only fix is therefore a patch release of the whole thing — NOT a
+# `X.Y.Z-1` suffix, which semver reads as a PRERELEASE of X.Y.Z (it sorts below
+# the release it means to fix, and helm hides it from search / dependency
+# resolution without --devel).
 # The binary's --version comes from BUILD_VERSION=<tag> at build time; the tag is
 # a checked mirror of the manifest.
 #
@@ -76,12 +81,19 @@ def chart_field(name):
     mm = re.search(rf'(?m)^{name}:\s*"?([^"\s]+)"?\s*$', chart)
     return mm.group(1) if mm else None
 
-# Only appVersion is gated; the chart's own `version:` is decoupled on purpose.
 chart_appversion = chart_field("appVersion")
 if chart_appversion is None:
     errors.append("charts/kobe/Chart.yaml has no `appVersion:`")
 elif chart_appversion != ws_version:
     errors.append(f"Chart.yaml appVersion {chart_appversion!r} != workspace version {ws_version!r}")
+
+# The chart is published from the same release tag, so its own `version:` tracks
+# the operator version too.
+chart_version = chart_field("version")
+if chart_version is None:
+    errors.append("charts/kobe/Chart.yaml has no `version:`")
+elif chart_version != ws_version:
+    errors.append(f"Chart.yaml version {chart_version!r} != workspace version {ws_version!r}")
 
 # --- nix/package.nix version (optional) ---
 nix_pkg = root / "nix" / "package.nix"
@@ -104,7 +116,7 @@ if errors:
     sys.exit(1)
 
 if tag_version:
-    print(f"version consistency OK: tag {tag_version} == workspace == Chart.yaml appVersion")
+    print(f"version consistency OK: tag {tag_version} == workspace == Chart.yaml version + appVersion")
 else:
-    print(f"version consistency OK: workspace == Chart.yaml appVersion == {ws_version}")
+    print(f"version consistency OK: workspace == Chart.yaml version + appVersion == {ws_version}")
 PY
