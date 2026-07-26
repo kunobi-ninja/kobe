@@ -294,6 +294,37 @@ jobs:
           BUILD_COMMIT: ${{ github.sha }}
         run: docker buildx bake -f docker-bake.hcl push
 
+  # Pushes the Helm chart as an OCI artifact, from the SAME `v*` tag as the
+  # image — the chart is versioned with the operator (Chart.yaml `version:` ==
+  # `appVersion:` == the workspace version, enforced by version-consistency), so
+  # there is no second tag to remember and no way to publish a chart whose
+  # appVersion points at an image that was never built:
+  #   - `needs: version-consistency` proves tag == Chart.yaml version + appVersion
+  #   - `needs: publish` proves the operator image for that version was pushed in
+  #     THIS run, which is why no registry probe is needed here
+  # Tag-only: a push to main must not publish a chart version that is already
+  # released (chart versions are immutable in the registry).
+  publish-chart:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version-consistency, publish]
+    runs-on: kunobi-runners
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Package & push Helm chart (OCI)
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          helm registry login registry-1.docker.io -u "$DOCKERHUB_USER" -p "$DOCKERHUB_TOKEN"
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm dependency build charts/kobe
+          helm package charts/kobe
+          helm push kobe-*.tgz oci://registry-1.docker.io/zondax
+
   # Fail-closed version gate: on a release, the tag must agree with the
   # workspace manifest version and Chart.yaml BEFORE any binary is built,
   # signed, or published to crates.io. Hermetic (manifest reads only).
