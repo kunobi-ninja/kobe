@@ -24,7 +24,9 @@ use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec}
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PropagationPolicy};
+use kube::api::{
+    Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, PropagationPolicy,
+};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -535,6 +537,19 @@ impl K3sBackend {
         hex::encode(bytes)
     }
 
+    /// Validate that a persisted node-token Secret is usable.
+    fn validate_token_secret(secret: &Secret, secret_name: &str) -> Result<()> {
+        secret
+            .data
+            .as_ref()
+            .and_then(|data| data.get("token"))
+            .filter(|token| !token.0.is_empty())
+            .with_context(|| {
+                format!("Token secret {secret_name} is missing non-empty data.token")
+            })?;
+        Ok(())
+    }
+
     /// Standard labels for resources belonging to a cluster.
     ///
     /// When `pool_name` is `Some`, also stamps
@@ -569,12 +584,30 @@ impl K3sBackend {
         labels
     }
 
-    /// Create the token Secret for k3s node authentication.
+    /// Ensure the token Secret for k3s node authentication exists.
+    ///
+    /// The Secret is create-once: an existing non-empty `data.token` is never
+    /// patched or replaced because a running server may have persisted its
+    /// original token. Creation uses POST, and a concurrent creator winning the
+    /// race is read back and validated.
     async fn create_token_secret(&self, name: &str, namespace: &str) -> Result<()> {
-        let token = Self::generate_token();
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-token");
 
+        match secrets.get(&secret_name).await {
+            Ok(existing) => {
+                Self::validate_token_secret(&existing, &secret_name)?;
+                debug!(cluster = name, "Token secret already exists; preserving it");
+                return Ok(());
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to read token secret {secret_name}"));
+            }
+        }
+
+        let token = Self::generate_token();
         let secret = Secret {
             metadata: ObjectMeta {
                 name: Some(secret_name.clone()),
@@ -590,16 +623,24 @@ impl K3sBackend {
             ..Default::default()
         };
 
-        secrets
-            .patch(
-                &secret_name,
-                &PatchParams::apply("kobe-operator").force(),
-                &Patch::Apply(&secret),
-            )
-            .await
-            .with_context(|| format!("Failed to apply token secret {secret_name}"))?;
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => debug!(cluster = name, "Token secret created"),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                let winner = secrets.get(&secret_name).await.with_context(|| {
+                    format!("Failed to read token secret {secret_name} after create conflict")
+                })?;
+                Self::validate_token_secret(&winner, &secret_name)?;
+                debug!(
+                    cluster = name,
+                    "Concurrent token secret creator won; preserving it"
+                );
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create token secret {secret_name}"));
+            }
+        }
 
-        debug!(cluster = name, "Token secret applied");
         Ok(())
     }
 
@@ -2086,6 +2127,8 @@ impl ClusterBackend for K3sBackend {
 mod tests {
     use super::*;
     use crate::crd::{ClusterConfig, ExposeConfig, KubeletSharedMountConfig, PersistenceConfig};
+    use base64::Engine as _;
+    use std::sync::{Arc, Mutex};
 
     fn base_config() -> ClusterConfig {
         ClusterConfig {
@@ -2930,6 +2973,17 @@ mod tests {
         })
     }
 
+    fn token_secret_response(name: &str, namespace: &str, token: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name, "namespace": namespace },
+            "data": {
+                "token": base64::engine::general_purpose::STANDARD.encode(token)
+            }
+        })
+    }
+
     fn generic_response(
         api_version: &str,
         kind: &str,
@@ -2941,6 +2995,166 @@ mod tests {
             "kind": kind,
             "metadata": { "name": name, "namespace": namespace }
         })
+    }
+
+    #[tokio::test]
+    async fn create_token_secret_keeps_existing_bytes() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+        let persisted_token = Arc::new(Mutex::new(None::<Vec<u8>>));
+        let reader_token = Arc::clone(&persisted_token);
+        let responder_token = Arc::clone(&persisted_token);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(move |_request: &wiremock::Request| {
+                let persisted = reader_token.lock().unwrap().clone();
+                match persisted {
+                    Some(token) => ResponseTemplate::new(200).set_body_json(token_secret_response(
+                        "test-cluster-token",
+                        "test-ns",
+                        &token,
+                    )),
+                    None => ResponseTemplate::new(404).set_body_json(
+                        crate::testutil::k8s_not_found("secrets", "test-cluster-token"),
+                    ),
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/secrets"))
+            .respond_with(move |request: &wiremock::Request| {
+                let candidate: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("Secret request must be JSON");
+                let candidate = candidate["stringData"]["token"]
+                    .as_str()
+                    .expect("Secret must contain stringData.token")
+                    .as_bytes()
+                    .to_vec();
+                let mut persisted = responder_token.lock().unwrap();
+                if persisted.is_none() {
+                    *persisted = Some(candidate);
+                    ResponseTemplate::new(201)
+                        .set_body_json(secret_response("test-cluster-token", "test-ns"))
+                } else {
+                    ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "message": "secrets \"test-cluster-token\" already exists",
+                        "reason": "AlreadyExists",
+                        "details": {
+                            "name": "test-cluster-token",
+                            "kind": "secrets"
+                        },
+                        "code": 409
+                    }))
+                }
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        backend
+            .create_token_secret("test-cluster", "test-ns")
+            .await
+            .unwrap();
+        let original = persisted_token.lock().unwrap().clone().unwrap();
+
+        backend
+            .create_token_secret("test-cluster", "test-ns")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            persisted_token.lock().unwrap().as_deref(),
+            Some(original.as_slice()),
+            "a repeated create must not rotate the persisted node token"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_token_secret_reads_concurrent_winner() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let backend = K3sBackend::new(client, Default::default());
+        let winner = b"concurrent-winner-token";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "test-cluster-token",
+                )),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(token_secret_response(
+                    "test-cluster-token",
+                    "test-ns",
+                    winner,
+                )),
+            )
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/secrets"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "secrets \"test-cluster-token\" already exists",
+                "reason": "AlreadyExists",
+                "details": {
+                    "name": "test-cluster-token",
+                    "kind": "secrets"
+                },
+                "code": 409
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        backend
+            .create_token_secret("test-cluster", "test-ns")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_token_secret_rejects_empty_token() {
+        let secret = Secret {
+            data: Some(BTreeMap::from([(
+                "token".to_string(),
+                k8s_openapi::ByteString(Vec::new()),
+            )])),
+            ..Default::default()
+        };
+
+        let error = K3sBackend::validate_token_secret(&secret, "cluster-token").unwrap_err();
+        assert!(
+            error.to_string().contains("missing non-empty data.token"),
+            "malformed existing Secrets must fail clearly: {error:#}"
+        );
     }
 
     /// A StatefulSet GET response whose status reports `replicas` desired and
@@ -2961,13 +3175,25 @@ mod tests {
         let client = mock_client(&server);
         let backend = K3sBackend::new(client, Default::default());
 
-        // Mock: PATCH token secret (server-side apply)
-        Mock::given(method("PATCH"))
+        // Mock: GET token Secret (absent before create)
+        Mock::given(method("GET"))
             .and(path(
                 "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
             ))
             .respond_with(
-                ResponseTemplate::new(200)
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "test-cluster-token",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        // Mock: POST token secret (create-once)
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/secrets"))
+            .respond_with(
+                ResponseTemplate::new(201)
                     .set_body_json(secret_response("test-cluster-token", "test-ns")),
             )
             .mount(&server)

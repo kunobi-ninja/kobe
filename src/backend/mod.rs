@@ -10,13 +10,13 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{
-    Endpoints, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+    Endpoints, Node, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
     PersistentVolumeClaim, PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, Secret,
     VolumeResourceRequirements, WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::{Client, Config, ResourceExt};
 use tracing::{debug, info, warn};
 
@@ -692,6 +692,26 @@ pub async fn check_readiness_gate_impl(
                 Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
                 Err(e) => Err(e.into()),
             }
+        }
+        ReadinessGate::NodesReady { count } => {
+            let nodes: Api<Node> = Api::all(vc_client.clone());
+            let ready = nodes
+                .list(&ListParams::default())
+                .await?
+                .items
+                .iter()
+                .filter(|node| {
+                    node.status
+                        .as_ref()
+                        .and_then(|status| status.conditions.as_ref())
+                        .is_some_and(|conditions| {
+                            conditions.iter().any(|condition| {
+                                condition.type_ == "Ready" && condition.status == "True"
+                            })
+                        })
+                })
+                .count() as u32;
+            Ok(ready >= *count)
         }
         ReadinessGate::DeploymentReady {
             name: deploy_name,
@@ -1448,6 +1468,137 @@ current-context: default
                 .contains("flux-system")
         );
         assert!(addons[0].url.is_none());
+    }
+
+    #[tokio::test]
+    async fn nodes_ready_gate_passes_only_when_requested_nodes_report_ready() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "NodeList",
+                "metadata": {},
+                "items": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": { "name": "server-0" },
+                        "status": {
+                            "conditions": [
+                                { "type": "Ready", "status": "True", "lastHeartbeatTime": null, "lastTransitionTime": null }
+                            ]
+                        }
+                    },
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": { "name": "agent-0" },
+                        "status": {
+                            "conditions": [
+                                { "type": "Ready", "status": "True", "lastHeartbeatTime": null, "lastTransitionTime": null }
+                            ]
+                        }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::NodesReady { count: 2 };
+        assert!(
+            check_readiness_gate_impl(&client, &gate, "inst")
+                .await
+                .unwrap(),
+            "all requested nodes reporting Ready=True should satisfy NodesReady"
+        );
+    }
+
+    #[tokio::test]
+    async fn nodes_ready_gate_rejects_joined_but_unready_nodes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "NodeList",
+                "metadata": {},
+                "items": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": { "name": "server-0" },
+                        "status": {
+                            "conditions": [
+                                { "type": "Ready", "status": "True", "lastHeartbeatTime": null, "lastTransitionTime": null }
+                            ]
+                        }
+                    },
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": { "name": "agent-0" },
+                        "status": {
+                            "conditions": [
+                                { "type": "Ready", "status": "False", "lastHeartbeatTime": null, "lastTransitionTime": null }
+                            ]
+                        }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::NodesReady { count: 2 };
+        assert!(
+            !check_readiness_gate_impl(&client, &gate, "inst")
+                .await
+                .unwrap(),
+            "a registered node without Ready=True must not satisfy NodesReady"
+        );
+    }
+
+    #[tokio::test]
+    async fn nodes_ready_gate_rejects_missing_nodes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/nodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "NodeList",
+                "metadata": {},
+                "items": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": { "name": "server-0" },
+                        "status": {
+                            "conditions": [
+                                { "type": "Ready", "status": "True", "lastHeartbeatTime": null, "lastTransitionTime": null }
+                            ]
+                        }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = ReadinessGate::NodesReady { count: 2 };
+        assert!(
+            !check_readiness_gate_impl(&client, &gate, "inst")
+                .await
+                .unwrap(),
+            "a missing agent node must keep the topology gate unsatisfied"
+        );
     }
 
     #[tokio::test]

@@ -376,7 +376,7 @@ pub struct ClusterConfig {
     #[serde(default = "default_servers")]
     pub servers: u32,
 
-    /// Number of k3s agent replicas (k3s backend only).
+    /// Number of agent replicas (k3s and k0s backends only).
     /// When set, creates a separate agent Deployment that joins the server.
     #[serde(default)]
     pub agents: Option<u32>,
@@ -1133,6 +1133,13 @@ pub enum ReadinessGate {
     #[serde(rename = "CRDExists")]
     CrdExists { name: String },
 
+    /// Check that at least `count` cluster nodes report the Kubernetes
+    /// `Ready=True` condition. This asserts that the declared server and
+    /// agent topology actually joined, rather than accepting a
+    /// control-plane-only cluster whose apiserver happens to respond.
+    #[serde(rename = "NodesReady")]
+    NodesReady { count: u32 },
+
     /// Check that a Deployment is available (ready replicas > 0).
     #[serde(rename = "DeploymentReady")]
     DeploymentReady { name: String, namespace: String },
@@ -1217,6 +1224,7 @@ impl JsonSchema for ReadinessGate {
                     "type": "string",
                     "enum": [
                         "CRDExists",
+                        "NodesReady",
                         "DeploymentReady",
                         "DaemonSetReady",
                         "URLHealthy",
@@ -1224,6 +1232,11 @@ impl JsonSchema for ReadinessGate {
                         "DNSHealthy",
                         "InClusterToken"
                     ]
+                },
+                "count": {
+                    "type": "integer",
+                    "format": "uint32",
+                    "minimum": 0
                 },
                 "name": { "type": "string" },
                 "namespace": { "type": "string" },
