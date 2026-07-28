@@ -86,10 +86,17 @@ All release binaries are signed (macOS codesigned + notarized, Windows code-sign
     Pre-release builds: `choco install kobe --pre`.
   </Tab>
   <Tab value="AUR (Arch Linux)">
-    The official prebuilt-binary package is [`kobe-bin`](https://aur.archlinux.org/packages/kobe-bin) (statically linked, x86_64 + aarch64). Install it with your preferred AUR helper:
+    Three official packages are available (all provide the `kobe` command — install one):
 
     ```sh
-    paru -S kobe-bin   # or: yay -S kobe-bin
+    # Prebuilt binary — recommended (statically linked, x86_64 + aarch64, no compile)
+    paru -S kobe-bin
+
+    # Builds the latest main from source
+    paru -S kobe-git
+
+    # Builds the latest release from source
+    paru -S kobe
     ```
   </Tab>
   <Tab value="cargo">
