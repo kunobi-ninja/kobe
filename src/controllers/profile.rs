@@ -600,6 +600,10 @@ mod cluster_instance_tests {
     async fn status_sync_does_not_revert_an_instance_that_took_a_lease_mid_reconcile() {
         let (ctx, server) = test_profile_context().await;
         let name = "pool-test-profile-0";
+        // What `reserve_ready_instance` stamps atomically with the
+        // reservation. The 2-minute orphan-reclaim grace is measured
+        // against it, so it must survive this sync.
+        let fresh_state_since = chrono::Utc::now().to_rfc3339();
 
         // On disk the lease controller has already bound this instance.
         Mock::given(method("GET"))
@@ -614,6 +618,7 @@ mod cluster_instance_tests {
                 "status": {
                     "phase": "Leased",
                     "leaseRef": { "name": "lease-abc123def456" },
+                    "stateSince": fresh_state_since,
                     "provisioned": true
                 }
             })))
@@ -655,7 +660,9 @@ mod cluster_instance_tests {
             crash_message: None,
             cert_horizon_secs: None,
         };
-        entry.state_since = Some(chrono::Utc::now());
+        // Deliberately STALE, matching the rest of this pre-bind snapshot.
+        // Stamping it `now` here would mask the reservation race below.
+        entry.state_since = Some(chrono::Utc::now() - chrono::Duration::hours(2));
         let mut clusters = HashMap::new();
         clusters.insert(name.to_string(), entry);
         let pool_state = PoolState {
@@ -674,6 +681,14 @@ mod cluster_instance_tests {
                 "the sync reverted a leased instance to Ready while its leaseRef \
                  was still set — the pool manager would then treat it as \
                  reclaimable. body: {body}"
+            );
+            assert_eq!(
+                body.pointer("/status/stateSince").and_then(|v| v.as_str()),
+                Some(fresh_state_since.as_str()),
+                "the reservation's fresh stateSince must survive — the 2-minute \
+                 orphan-reclaim grace is measured against it, and a stale value \
+                 makes it instantly elapsed so the reclaimer can take a live \
+                 reservation away from a binding lease. body: {body}"
             );
             assert!(
                 body.pointer("/status/idleSince")
@@ -1892,6 +1907,27 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
         } else {
             entry.idle_since.map(|ts| ts.to_rfc3339())
         };
+        // `state_since` is part of the same atomic reservation write, and it is
+        // load-bearing, not cosmetic. The two-phase bind leaves the lease
+        // `Pending` with no `clusterName` between reserving the instance and
+        // patching the lease, so `evaluate_leased_instance` sees
+        // `reservation_orphaned == true` during every NORMAL bind. The only
+        // thing stopping it from releasing the reservation there is the
+        // two-minute `reservation_grace_elapsed` check against this field —
+        // which is exactly why `reserve_ready_instance` stamps it `now`.
+        //
+        // Writing the stale in-memory value back would make that grace
+        // instantly elapsed and let the reclaimer take a live reservation away
+        // from a binding lease. That path only became reachable once this
+        // function started preserving `Leased` (before, the instance was
+        // reverted to `Ready` and the leased arm never ran) — so preserving
+        // phase without preserving this timestamp would trade one bug for a
+        // worse one.
+        let state_since = if lease_held {
+            current.state_since.clone()
+        } else {
+            entry.state_since.map(|ts| ts.to_rfc3339())
+        };
 
         let _ = patch_cluster_instance_status(
             client,
@@ -1904,7 +1940,7 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
                 lease_ref: current.lease_ref,
                 active_bootstrap: current.active_bootstrap,
                 idle_since,
-                state_since: entry.state_since.map(|ts| ts.to_rfc3339()),
+                state_since,
                 health_failures: entry.health_failures,
                 // Prefer the on-disk hash over the in-memory entry: an
                 // operator restart that rebuilds pool_state from the API may
