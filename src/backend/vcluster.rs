@@ -108,6 +108,49 @@ async fn read_vcluster_kubeconfig(client: &Client, host_ns: &str, name: &str) ->
         .with_context(|| format!("Secret {secret_name} data.config is not valid UTF-8"))
 }
 
+/// Build the argument vector for the `helm upgrade --install` invocation
+/// issued by [`VclusterBackend::create`].
+///
+/// Split out of `create()` purely so the ordering contract can be pinned by
+/// a test: Helm merges repeated `--values` files left-to-right with later
+/// wins, so the operator defaults MUST be passed first and the
+/// user-supplied `VclusterConfig.values` file second. Swapping them would
+/// silently make pool overrides a no-op.
+///
+/// `upgrade --install` (rather than plain `install`) keeps reconciliation
+/// idempotent: re-running `create()` on an existing release converges
+/// instead of failing with "cannot re-use a name that is still in use".
+fn helm_install_args(
+    name: &str,
+    chart_ref: &str,
+    host_ns: &str,
+    chart_version: &str,
+    timeout: &str,
+    defaults_path: &std::path::Path,
+    user_values_path: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "upgrade".to_string(),
+        "--install".to_string(),
+        name.to_string(),
+        chart_ref.to_string(),
+        "--namespace".to_string(),
+        host_ns.to_string(),
+        "--version".to_string(),
+        chart_version.to_string(),
+        "--values".to_string(),
+        defaults_path.to_str().unwrap().to_string(),
+        "--timeout".to_string(),
+        timeout.to_string(),
+        "--wait".to_string(),
+    ];
+    if let Some(p) = user_values_path {
+        args.push("--values".to_string());
+        args.push(p.to_str().unwrap().to_string());
+    }
+    args
+}
+
 /// Default vcluster Helm chart version pinned by the operator.
 ///
 /// Bumped in lock-step with our integration tests against vcluster
@@ -320,21 +363,18 @@ impl ClusterBackend for VclusterBackend {
         let chart_version = self.chart_version().to_string();
         let timeout = format!("{HELM_INSTALL_TIMEOUT_SECS}s");
 
-        let mut cmd = Command::new("helm");
-        cmd.arg("upgrade")
-            .arg("--install")
-            .arg(name)
-            .arg(&chart_ref)
-            .args(["--namespace", &host_ns])
-            .args(["--version", &chart_version])
-            .args(["--values", defaults_path.to_str().unwrap()])
-            .args(["--timeout", &timeout])
-            .arg("--wait");
-        if let Some(p) = &user_values_path {
-            cmd.args(["--values", p.to_str().unwrap()]);
-        }
+        let helm_args = helm_install_args(
+            name,
+            &chart_ref,
+            &host_ns,
+            &chart_version,
+            &timeout,
+            &defaults_path,
+            user_values_path.as_deref(),
+        );
 
-        let output = cmd
+        let output = Command::new("helm")
+            .args(&helm_args)
             .output()
             .await
             .context("failed to spawn `helm upgrade --install`")?;
@@ -505,3 +545,744 @@ impl ClusterBackend for VclusterBackend {
 
 #[allow(dead_code)]
 const _: Duration = Duration::from_secs(0); // keep the `Duration` import live for future timeouts
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mock_client(server: &MockServer) -> Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::testutil::mock_k8s_client(server)
+    }
+
+    fn backend(server: &MockServer, config: Option<VclusterConfig>) -> VclusterBackend {
+        VclusterBackend::new(mock_client(server), config)
+    }
+
+    /// A backend whose `Client` points at a dead address. Only safe for the
+    /// pure helpers (`host_namespace`, `chart_version`, `default_values_yaml`)
+    /// which never touch the API server.
+    fn offline_backend(config: Option<VclusterConfig>) -> VclusterBackend {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let kube_config = kube::Config::new("http://127.0.0.1:1/".parse().unwrap());
+        VclusterBackend::new(Client::try_from(kube_config).unwrap(), config)
+    }
+
+    fn base_config() -> ClusterConfig {
+        ClusterConfig {
+            version: "v1.32.0".to_string(),
+            servers: 1,
+            ..Default::default()
+        }
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn secret_response(name: &str, host_ns: &str, data: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name, "namespace": host_ns },
+            "data": data,
+        })
+    }
+
+    fn statefulset_response(
+        name: &str,
+        host_ns: &str,
+        replicas: i32,
+        ready_replicas: i32,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": name, "namespace": host_ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": name } },
+                "serviceName": name,
+                "template": { "metadata": {}, "spec": { "containers": [] } },
+            },
+            "status": {
+                "replicas": replicas,
+                "readyReplicas": ready_replicas,
+                "availableReplicas": ready_replicas,
+            },
+        })
+    }
+
+    // =================================================================
+    // Naming / host-namespace invariants
+    // =================================================================
+
+    /// Every instance is scoped to `vcluster-<name>`, never to the
+    /// `ClusterInstance`'s own namespace. This is the single fact the
+    /// whole backend is built on: the values file, health probe,
+    /// kubeconfig read and teardown all derive from it.
+    #[tokio::test]
+    async fn host_namespace_is_derived_from_the_instance_name_only() {
+        let b = offline_backend(None);
+        assert_eq!(b.host_namespace("foo"), "vcluster-foo");
+        assert_eq!(
+            b.host_namespace("pool-ci-abc123"),
+            "vcluster-pool-ci-abc123"
+        );
+    }
+
+    /// `delete()` refuses to issue a namespace delete unless the target
+    /// carries the `vcluster-` prefix. That guard is only sound because
+    /// `host_namespace()` unconditionally emits the prefix — if a future
+    /// refactor changed the scheme (a configurable prefix, a hash, an
+    /// empty-name shortcut) every delete would start erroring out. Pin
+    /// the producer side of the contract the guard consumes.
+    #[tokio::test]
+    async fn host_namespace_always_carries_the_prefix_the_delete_guard_requires() {
+        let b = offline_backend(None);
+        for name in [
+            "a",
+            "",
+            "vcluster",
+            "kube-system",
+            "default",
+            "x".repeat(60).as_str(),
+        ] {
+            let ns = b.host_namespace(name);
+            assert!(
+                ns.starts_with("vcluster-"),
+                "host_namespace({name:?}) = {ns:?} would trip delete()'s safety guard"
+            );
+        }
+    }
+
+    // =================================================================
+    // Chart version resolution
+    // =================================================================
+
+    /// No pool config, or a pool config that simply omits `chartVersion`,
+    /// both fall back to the operator's pinned default. The second case is
+    /// the easy one to regress by testing `self.config.is_some()` instead
+    /// of the inner `Option`.
+    #[tokio::test]
+    async fn chart_version_falls_back_to_the_pinned_default() {
+        assert_eq!(offline_backend(None).chart_version(), DEFAULT_CHART_VERSION);
+        assert_eq!(
+            offline_backend(Some(VclusterConfig::default())).chart_version(),
+            DEFAULT_CHART_VERSION
+        );
+        assert_eq!(
+            offline_backend(Some(VclusterConfig {
+                chart_version: None,
+                values: Some("controlPlane: {}".to_string()),
+            }))
+            .chart_version(),
+            DEFAULT_CHART_VERSION
+        );
+    }
+
+    /// A pool-level `chartVersion` wins over the operator default.
+    #[tokio::test]
+    async fn chart_version_honours_the_pool_override() {
+        let b = offline_backend(Some(VclusterConfig {
+            chart_version: Some("0.29.1".to_string()),
+            values: None,
+        }));
+        assert_eq!(b.chart_version(), "0.29.1");
+        assert_ne!(b.chart_version(), DEFAULT_CHART_VERSION);
+    }
+
+    // =================================================================
+    // Operator-default Helm values
+    // =================================================================
+
+    /// The defaults file is handed to `helm --values`, so it has to be
+    /// well-formed YAML with the keys the chart expects at the right
+    /// depth. A stray indent in the `format!` literal is invisible until
+    /// helm rejects it at install time.
+    #[tokio::test]
+    async fn default_values_yaml_parses_as_yaml_with_the_expected_shape() {
+        let b = offline_backend(None);
+        let yaml = b.default_values_yaml("foo", &base_config());
+        let v: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&yaml).expect("operator default values must be valid YAML");
+
+        assert!(
+            v["exportKubeConfig"]["server"].as_str().is_some(),
+            "exportKubeConfig.server must be a scalar string: {yaml}"
+        );
+        assert_eq!(
+            v["controlPlane"]["statefulSet"]["persistence"]["volumeClaim"]["enabled"].as_bool(),
+            Some(true),
+            "the control-plane PVC must stay enabled so etcd survives a pod restart: {yaml}"
+        );
+    }
+
+    /// `extract_kubeconfig()` deliberately does *no* URL rewriting — it
+    /// relies on the chart having written an in-cluster-resolvable server
+    /// URL, which comes from this values file. The URL must therefore
+    /// address the vcluster Service (named after the Helm release) inside
+    /// the very namespace `host_namespace()` computes. Deriving the
+    /// expectation from `host_namespace()` keeps the two in lock-step.
+    #[tokio::test]
+    async fn default_values_yaml_points_the_kubeconfig_server_at_the_host_namespace_service() {
+        let b = offline_backend(None);
+        let name = "pool-ci-7f3a";
+        let yaml = b.default_values_yaml(name, &base_config());
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        let server = v["exportKubeConfig"]["server"].as_str().unwrap();
+
+        assert_eq!(
+            server,
+            format!(
+                "https://{name}.{ns}.svc.cluster.local:443",
+                ns = b.host_namespace(name)
+            ),
+            "kubeconfig server URL drifted from host_namespace()/release name"
+        );
+    }
+
+    // =================================================================
+    // Helm argument assembly
+    // =================================================================
+
+    /// Helm merges repeated `--values` left-to-right with later wins, so
+    /// the user file must come *after* the operator defaults. Reversing
+    /// them turns every pool-level override into a silent no-op.
+    #[test]
+    fn helm_install_args_passes_user_values_after_operator_defaults() {
+        let args = helm_install_args(
+            "foo",
+            "kobe-loft-sh/vcluster",
+            "vcluster-foo",
+            "0.34.0",
+            "300s",
+            Path::new("/tmp/defaults.yaml"),
+            Some(Path::new("/tmp/user.yaml")),
+        );
+
+        let values_files: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.as_str() == "--values" && *i + 1 < args.len())
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(
+            values_files,
+            vec!["/tmp/defaults.yaml", "/tmp/user.yaml"],
+            "user values must be the last --values so helm's last-wins merge applies them on top"
+        );
+    }
+
+    /// With no pool-level `values`, exactly one `--values` is passed and
+    /// no dangling flag is left behind.
+    #[test]
+    fn helm_install_args_omits_user_values_when_the_pool_supplies_none() {
+        let args = helm_install_args(
+            "foo",
+            "kobe-loft-sh/vcluster",
+            "vcluster-foo",
+            "0.34.0",
+            "300s",
+            Path::new("/tmp/defaults.yaml"),
+            None,
+        );
+        assert_eq!(args.iter().filter(|a| a.as_str() == "--values").count(), 1);
+        assert_eq!(args.last().map(String::as_str), Some("--wait"));
+    }
+
+    /// The release is scoped to the per-instance host namespace, pinned to
+    /// an explicit chart version, and waited on. Losing `--wait` would make
+    /// `create()` return before the vcluster exists, so the addon loop that
+    /// immediately follows would fail against a missing apiserver.
+    #[test]
+    fn helm_install_args_scope_the_release_and_wait_for_readiness() {
+        let args = helm_install_args(
+            "foo",
+            "kobe-loft-sh/vcluster",
+            "vcluster-foo",
+            "0.34.0",
+            "300s",
+            Path::new("/tmp/defaults.yaml"),
+            None,
+        );
+
+        // `upgrade --install`, not `install`: reconciliation must be
+        // idempotent over an existing release.
+        assert_eq!(args[0], "upgrade");
+        assert_eq!(args[1], "--install");
+        assert_eq!(args[2], "foo", "release name is the instance name");
+        assert_eq!(args[3], "kobe-loft-sh/vcluster");
+
+        let flag_value = |flag: &str| -> Option<&str> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+        };
+        assert_eq!(flag_value("--namespace"), Some("vcluster-foo"));
+        assert_eq!(flag_value("--version"), Some("0.34.0"));
+        assert_eq!(flag_value("--timeout"), Some("300s"));
+        assert!(args.iter().any(|a| a == "--wait"));
+    }
+
+    /// The helm subprocess timeout string must be derived from
+    /// [`HELM_INSTALL_TIMEOUT_SECS`] in helm's duration syntax. A bare
+    /// number (no unit) is rejected by helm at parse time.
+    #[test]
+    fn helm_install_timeout_is_expressed_in_helm_duration_syntax() {
+        let timeout = format!("{HELM_INSTALL_TIMEOUT_SECS}s");
+        assert_eq!(timeout, "300s");
+        assert!(timeout.ends_with('s') && timeout[..timeout.len() - 1].parse::<u64>().is_ok());
+    }
+
+    // =================================================================
+    // Host namespace bootstrap
+    // =================================================================
+
+    /// The host namespace is server-side-applied with the labels the
+    /// chart's namespace-protection policy and operator-side reaping keys
+    /// off. Losing `kobe.kunobi.ninja/backend=vcluster` makes an orphaned
+    /// namespace indistinguishable from a user's own.
+    #[tokio::test]
+    async fn ensure_host_namespace_applies_kobe_ownership_labels() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/namespaces/vcluster-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "vcluster-foo" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        backend(&server, None)
+            .ensure_host_namespace("vcluster-foo")
+            .await
+            .expect("ensure_host_namespace should succeed");
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests.first().expect("a PATCH must have been issued");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["metadata"]["name"], "vcluster-foo");
+        assert_eq!(
+            body["metadata"]["labels"]["app.kubernetes.io/managed-by"],
+            "kobe-operator"
+        );
+        assert_eq!(
+            body["metadata"]["labels"]["kobe.kunobi.ninja/backend"],
+            "vcluster"
+        );
+        // Server-side apply under a stable field manager, forced, so a
+        // re-reconcile converges instead of conflicting.
+        let query = req.url.query().unwrap_or_default();
+        assert!(
+            query.contains("fieldManager=kobe-operator"),
+            "expected a server-side apply field manager, got query {query:?}"
+        );
+        assert!(
+            query.contains("force=true"),
+            "apply must be forced to resolve field-manager conflicts, got query {query:?}"
+        );
+    }
+
+    // =================================================================
+    // Kubeconfig extraction
+    // =================================================================
+
+    /// vcluster's chart publishes the kubeconfig to Secret `vc-<release>`
+    /// under data key `config` — a different convention from the k3s/k0s
+    /// backends (`<name>-kubeconfig` / key `kubeconfig`). Reading the wrong
+    /// name or key yields a permanently un-leasable instance.
+    #[tokio::test]
+    async fn extract_kubeconfig_reads_the_vc_prefixed_secret_config_key() {
+        let server = MockServer::start().await;
+        let kubeconfig = "apiVersion: v1\nkind: Config\nclusters: []\n";
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret_response(
+                "vc-foo",
+                "vcluster-foo",
+                serde_json::json!({
+                    "config": b64(kubeconfig.as_bytes()),
+                    // A decoy under the k3s/k0s convention: picking this up
+                    // would mean the backend read the wrong key.
+                    "kubeconfig": b64(b"wrong-key"),
+                }),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let got = backend(&server, None)
+            .extract_kubeconfig("foo", "kobe-system")
+            .await
+            .expect("extract_kubeconfig should succeed");
+        assert_eq!(got, kubeconfig);
+    }
+
+    /// The `namespace` argument is the `ClusterInstance`'s own namespace
+    /// (usually `kobe-system`); the workload lives in `vcluster-<name>`.
+    /// The mock only answers under the host namespace, so a backend that
+    /// used the passed namespace would 404. Mirrors the `_namespace`
+    /// doc-comment on [`VclusterBackend::host_namespace`].
+    #[tokio::test]
+    async fn extract_kubeconfig_ignores_the_instance_namespace() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret_response(
+                "vc-foo",
+                "vcluster-foo",
+                serde_json::json!({ "config": b64(b"kc") }),
+            )))
+            .mount(&server)
+            .await;
+
+        for instance_ns in ["kobe-system", "some-other-ns", ""] {
+            let got = backend(&server, None)
+                .extract_kubeconfig("foo", instance_ns)
+                .await;
+            assert!(
+                got.is_ok(),
+                "instance namespace {instance_ns:?} must not affect the lookup: {got:?}"
+            );
+        }
+    }
+
+    /// A missing Secret is an error, not an empty kubeconfig — the caller
+    /// must be able to distinguish "not published yet" from "published as
+    /// empty", and the message must name the Secret and namespace so an
+    /// operator can go look.
+    #[tokio::test]
+    async fn extract_kubeconfig_errors_when_the_secret_is_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("secrets", "vc-foo")),
+            )
+            .mount(&server)
+            .await;
+
+        let err = backend(&server, None)
+            .extract_kubeconfig("foo", "kobe-system")
+            .await
+            .expect_err("absent Secret must be an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("vc-foo"), "error must name the Secret: {msg}");
+        assert!(
+            msg.contains("vcluster-foo"),
+            "error must name the host namespace: {msg}"
+        );
+    }
+
+    /// A Secret that exists but has no `config` key means the chart wrote
+    /// something unexpected. That must surface as a distinct, greppable
+    /// error rather than an empty string.
+    #[tokio::test]
+    async fn extract_kubeconfig_errors_when_the_config_key_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret_response(
+                "vc-foo",
+                "vcluster-foo",
+                serde_json::json!({ "kubeconfig": b64(b"wrong-key") }),
+            )))
+            .mount(&server)
+            .await;
+
+        let err = backend(&server, None)
+            .extract_kubeconfig("foo", "kobe-system")
+            .await
+            .expect_err("Secret without data.config must be an error");
+        assert!(
+            format!("{err:#}").contains("missing data.config"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Secret payloads are opaque bytes. Non-UTF-8 content must be
+    /// reported, never lossily coerced into a kubeconfig that then fails
+    /// far away from the cause.
+    #[tokio::test]
+    async fn extract_kubeconfig_errors_when_config_is_not_utf8() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret_response(
+                "vc-foo",
+                "vcluster-foo",
+                serde_json::json!({ "config": b64(&[0xff, 0xfe, 0x00]) }),
+            )))
+            .mount(&server)
+            .await;
+
+        let err = backend(&server, None)
+            .extract_kubeconfig("foo", "kobe-system")
+            .await
+            .expect_err("non-UTF-8 data.config must be an error");
+        assert!(
+            format!("{err:#}").contains("not valid UTF-8"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    // =================================================================
+    // Health probe
+    // =================================================================
+
+    /// Before helm has created anything there is no StatefulSet. That is
+    /// "not healthy yet", not a reconcile failure — returning `Err` here
+    /// would put every freshly-created instance into a failed state.
+    #[tokio::test]
+    async fn check_health_is_false_when_the_statefulset_is_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("statefulsets", "foo")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let healthy = backend(&server, None)
+            .check_health("foo", "kobe-system")
+            .await
+            .expect("absent StatefulSet must not be an error");
+        assert!(!healthy);
+    }
+
+    /// A StatefulSet that exists but has fewer ready replicas than created
+    /// ones is still coming up. The kubeconfig Secret must not even be
+    /// consulted — asserting on the un-mounted Secret route proves the
+    /// short-circuit.
+    #[tokio::test]
+    async fn check_health_is_false_while_replicas_are_not_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(statefulset_response(
+                    "foo",
+                    "vcluster-foo",
+                    1,
+                    0,
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let healthy = backend(&server, None)
+            .check_health("foo", "kobe-system")
+            .await
+            .unwrap();
+        assert!(!healthy);
+        // No Secret GET was mounted; if the probe had continued, wiremock
+        // would have recorded a second request.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A StatefulSet reporting zero replicas (scaled to zero, or status
+    /// not yet populated) is not healthy, even though `readyReplicas >=
+    /// replicas` holds vacuously at 0 >= 0. This is what the `want > 0`
+    /// guard exists for.
+    #[tokio::test]
+    async fn check_health_is_false_when_the_statefulset_reports_zero_replicas() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(statefulset_response(
+                    "foo",
+                    "vcluster-foo",
+                    0,
+                    0,
+                )),
+            )
+            .mount(&server)
+            .await;
+        // Mounted as *present* on purpose: the replica guard must be the
+        // only thing that can produce `false` in this scenario.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret_response(
+                "vc-foo",
+                "vcluster-foo",
+                serde_json::json!({ "config": b64(b"kc") }),
+            )))
+            .mount(&server)
+            .await;
+
+        let healthy = backend(&server, None)
+            .check_health("foo", "kobe-system")
+            .await
+            .unwrap();
+        assert!(!healthy, "a zero-replica StatefulSet must not read healthy");
+    }
+
+    /// A ready StatefulSet is not enough: without the `vc-<name>` Secret
+    /// nobody can reach the virtual cluster, so the instance must not be
+    /// advertised as healthy (and handed out on a lease).
+    #[tokio::test]
+    async fn check_health_is_false_when_the_kubeconfig_secret_is_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(statefulset_response(
+                    "foo",
+                    "vcluster-foo",
+                    1,
+                    1,
+                )),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("secrets", "vc-foo")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let healthy = backend(&server, None)
+            .check_health("foo", "kobe-system")
+            .await
+            .expect("absent Secret must not be an error");
+        assert!(!healthy);
+    }
+
+    /// Ready StatefulSet plus published kubeconfig Secret — both probed in
+    /// the per-instance host namespace, never the instance's own.
+    #[tokio::test]
+    async fn check_health_is_true_when_the_statefulset_is_ready_and_the_secret_exists() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(statefulset_response(
+                    "foo",
+                    "vcluster-foo",
+                    1,
+                    1,
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret_response(
+                "vc-foo",
+                "vcluster-foo",
+                serde_json::json!({ "config": b64(b"kc") }),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            backend(&server, None)
+                .check_health("foo", "kobe-system")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Only 404 means "not there yet". Any other API failure (RBAC denial,
+    /// apiserver outage) must propagate as an error — silently reporting
+    /// `false` would let the pool controller tear down and recreate healthy
+    /// instances during an unrelated control-plane blip.
+    #[tokio::test]
+    async fn check_health_propagates_non_404_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "statefulsets.apps \"foo\" is forbidden",
+                "reason": "Forbidden",
+                "code": 403,
+            })))
+            .mount(&server)
+            .await;
+
+        let err = backend(&server, None)
+            .check_health("foo", "kobe-system")
+            .await
+            .expect_err("a 403 must not be swallowed as `unhealthy`");
+        assert!(
+            format!("{err:#}").contains("StatefulSet get failed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Same rule on the Secret leg of the probe.
+    #[tokio::test]
+    async fn check_health_propagates_non_404_secret_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/vcluster-foo/statefulsets/foo",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(statefulset_response(
+                    "foo",
+                    "vcluster-foo",
+                    1,
+                    1,
+                )),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/vcluster-foo/secrets/vc-foo"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "etcd is unavailable",
+                "reason": "InternalError",
+                "code": 500,
+            })))
+            .mount(&server)
+            .await;
+
+        let err = backend(&server, None)
+            .check_health("foo", "kobe-system")
+            .await
+            .expect_err("a 500 must not be swallowed as `unhealthy`");
+        assert!(
+            format!("{err:#}").contains("kubeconfig Secret get failed"),
+            "unexpected error: {err:#}"
+        );
+    }
+}
