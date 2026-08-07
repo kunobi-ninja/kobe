@@ -137,19 +137,42 @@ if not images_block:
         "annotation was removed or restructured; update this check or restore it"
     )
 else:
-    block = "\n".join(images_block)
-    found = dict(re.findall(r"docker\.io/zondax/([\w.-]+):(\S+)", block))
-    for missing in sorted(REQUIRED_FIRST_PARTY - found.keys()):
+    # Strip YAML comments before matching. A commented-out entry is not an
+    # image field Artifact Hub can scan, so counting one would let the block
+    # look complete while the listing was actually missing that image.
+    def strip_comment(line):
+        cut = re.search(r"(^|\s)#", line)
+        return line[: cut.start()] if cut else line
+
+    live = [strip_comment(l) for l in images_block]
+
+    # Collect every occurrence, not a name->tag dict: collapsing duplicates
+    # would let a stale ref pass as long as a correct one appeared later.
+    occurrences = []
+    for line in live:
+        occurrences += re.findall(r"docker\.io/zondax/([\w.-]+):(\S+)", line)
+
+    seen = {}
+    for image_name, image_tag in occurrences:
+        seen.setdefault(image_name, []).append(image_tag)
+
+    for missing in sorted(REQUIRED_FIRST_PARTY - seen.keys()):
         errors.append(
             f"Chart.yaml artifacthub.io/images is missing the first-party image "
             f"{missing!r} — Artifact Hub would not scan it"
         )
-    for image_name, image_tag in sorted(found.items()):
-        if image_tag != expected_image_tag:
+    for image_name, tags in sorted(seen.items()):
+        if len(tags) > 1:
             errors.append(
-                f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
-                f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
+                f"Chart.yaml artifacthub.io/images lists {image_name!r} "
+                f"{len(tags)} times ({', '.join(sorted(tags))}) — one entry per image"
             )
+        for image_tag in tags:
+            if image_tag != expected_image_tag:
+                errors.append(
+                    f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
+                    f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
+                )
 
 # --- Chart.yaml artifacthub.io/prerelease matches the version ---
 # Artifact Hub surfaces prereleases differently, and rc publishing is a
