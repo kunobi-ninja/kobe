@@ -26,7 +26,18 @@ pub const HOST_NS: &str = "pool-test";
 /// skipping the native load avoids the macOS Security-framework
 /// `-36 I/O error` that surfaces when many tests build clients in
 /// parallel.
+///
+/// The provider install is not optional. This build enables both `ring`
+/// and `aws-lc-rs`, so rustls cannot pick a process-level
+/// `CryptoProvider` on its own and `Client::try_from` panics unless one
+/// was already installed. Without this line the kobe-sync tests pass
+/// only when some earlier test in the same binary happened to install
+/// it first — so the suite goes green while any single test run in
+/// isolation (`cargo test --exact <name>`, or a filtered run) panics.
+/// `install_default` returns `Err` once a provider exists, which is the
+/// normal case here and is deliberately ignored.
 pub fn mock_client(server: &MockServer) -> Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let config = kube::Config {
         cluster_url: server.uri().parse().unwrap(),
         default_namespace: HOST_NS.into(),
