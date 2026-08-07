@@ -95,6 +95,99 @@ if chart_version is None:
 elif chart_version != ws_version:
     errors.append(f"Chart.yaml version {chart_version!r} != workspace version {ws_version!r}")
 
+# --- Chart.yaml artifacthub.io/images tags ---
+# The Artifact Hub annotation pins fully-qualified image refs so the security
+# report scans the right tags. They are first-party images, so they move with
+# the release and would otherwise silently advertise a stale version forever
+# (`just bump` rewrites them; this is what stops that from being optional).
+# Third-party images (kine, flux-cli, kubectl) are deliberately not checked.
+#
+# The expected tag is `v<version>`, NOT the bare version: docker-bake.hcl
+# publishes `v${VERSION}` and the templates default to
+# `printf "v%s" .Chart.AppVersion`, so a bare `0.37.0` image does not exist.
+# (The CHART's own OCI tag is bare semver — a different artifact. Conflating
+# the two is exactly the mistake this check now catches.)
+expected_image_tag = f"v{ws_version}"
+
+# Every first-party image the chart deploys. Asserting the SET, not just the
+# tags of whatever happens to be present: a check that only validated the refs
+# it found would pass just as happily after someone deleted the kobe-sync
+# entry, while still advertising that it protects the image listing.
+REQUIRED_FIRST_PARTY = {"kobe-operator", "kobe-sync"}
+
+# Read the annotation's own block scalar rather than scanning the whole file,
+# so an image-shaped string in a comment or a different annotation cannot
+# satisfy this. The block is the run of more-indented lines after the key.
+images_block = []
+lines = chart.splitlines()
+for i, line in enumerate(lines):
+    m = re.match(r"^(\s*)artifacthub\.io/images:\s*\|", line)
+    if not m:
+        continue
+    key_indent = len(m.group(1))
+    for follow in lines[i + 1 :]:
+        if follow.strip() and (len(follow) - len(follow.lstrip())) <= key_indent:
+            break
+        images_block.append(follow)
+    break
+
+if not images_block:
+    errors.append(
+        "charts/kobe/Chart.yaml has no `artifacthub.io/images: |` block — the "
+        "annotation was removed or restructured; update this check or restore it"
+    )
+else:
+    # Strip YAML comments before matching. A commented-out entry is not an
+    # image field Artifact Hub can scan, so counting one would let the block
+    # look complete while the listing was actually missing that image.
+    def strip_comment(line):
+        cut = re.search(r"(^|\s)#", line)
+        return line[: cut.start()] if cut else line
+
+    live = [strip_comment(l) for l in images_block]
+
+    # Collect every occurrence, not a name->tag dict: collapsing duplicates
+    # would let a stale ref pass as long as a correct one appeared later.
+    occurrences = []
+    for line in live:
+        occurrences += re.findall(r"docker\.io/zondax/([\w.-]+):(\S+)", line)
+
+    seen = {}
+    for image_name, image_tag in occurrences:
+        seen.setdefault(image_name, []).append(image_tag)
+
+    for missing in sorted(REQUIRED_FIRST_PARTY - seen.keys()):
+        errors.append(
+            f"Chart.yaml artifacthub.io/images is missing the first-party image "
+            f"{missing!r} — Artifact Hub would not scan it"
+        )
+    for image_name, tags in sorted(seen.items()):
+        if len(tags) > 1:
+            errors.append(
+                f"Chart.yaml artifacthub.io/images lists {image_name!r} "
+                f"{len(tags)} times ({', '.join(sorted(tags))}) — one entry per image"
+            )
+        for image_tag in tags:
+            if image_tag != expected_image_tag:
+                errors.append(
+                    f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
+                    f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
+                )
+
+# --- Chart.yaml artifacthub.io/prerelease matches the version ---
+# Artifact Hub surfaces prereleases differently, and rc publishing is a
+# supported flow (`just bump 0.38.0-rc.1`), so a static value would advertise
+# every release candidate as stable. `just bump` derives it; this enforces it.
+expected_prerelease = "true" if "-" in ws_version else "false"
+pm = re.search(r'(?m)^\s*artifacthub\.io/prerelease:\s*"?([^"\s]+)"?\s*$', chart)
+if pm is None:
+    errors.append("charts/kobe/Chart.yaml has no `artifacthub.io/prerelease:` annotation")
+elif pm.group(1) != expected_prerelease:
+    errors.append(
+        f"Chart.yaml artifacthub.io/prerelease {pm.group(1)!r} != {expected_prerelease!r} "
+        f"for version {ws_version!r}"
+    )
+
 # --- nix/package.nix version (optional) ---
 nix_pkg = root / "nix" / "package.nix"
 if nix_pkg.exists():

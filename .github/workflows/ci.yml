@@ -90,6 +90,13 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # The release gate itself only runs on tag pushes (version-consistency),
+      # which is the right place for it — but that means its parsing logic is
+      # otherwise unexercised until a release is being cut. These tests run on
+      # every change so a regression in the gate surfaces here instead.
+      - name: Version-consistency gate tests
+        run: ./scripts/test-version-consistency.sh
+
       - name: Security audit
         run: |
           cargo install cargo-audit --locked || true
