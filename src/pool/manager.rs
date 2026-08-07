@@ -2521,7 +2521,10 @@ mod tests {
             e.idle_since = Some(now - chrono::Duration::hours(1));
             clusters.insert(format!("pool-test-profile-{i}"), e);
         }
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         let actions = compute_pool_actions(
             &profile,
@@ -2566,7 +2569,10 @@ mod tests {
             e.state_since = Some(now - chrono::Duration::hours(1));
             clusters.insert(format!("pool-test-profile-{i}"), e);
         }
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         let actions = compute_pool_actions(
             &profile,
