@@ -57,6 +57,13 @@ const connectRetrySeconds = parsePositiveInt(
   "CONNECT_RETRY_SECONDS",
 );
 const minEndpointVersion = Bun.env.MIN_ENDPOINT_VERSION ?? "v0.8.11";
+// Scale-to-zero pools (`scaling.minReady: 0`) hold nothing warm by design —
+// the queued claim is what drives provisioning. Waiting for `ready > 0`
+// before requesting a lease would therefore time out against a pool that is
+// behaving exactly as configured, which is what wedged the vkobe legs at
+// `ready=0 creating=0` (#36). Set POOL_ON_DEMAND=1 for those pools and give
+// LEASE_WAIT_TIMEOUT enough room to cover a cold provision.
+const onDemand = (Bun.env.POOL_ON_DEMAND ?? "") !== "";
 
 let leaseId = "";
 let released = false;
@@ -431,7 +438,15 @@ async function main(): Promise<void> {
       `🚫 Endpoint ${endpointVersion} is too old for this smoke test.\n   Expected at least ${minEndpointVersion}.\n   Reason: this smoke test assumes the warm-cluster readiness fix.\n   Bail out: no lease requested.`,
     );
   }
-  poolBefore = await waitForWarmPool(pool);
+  if (onDemand) {
+    // `poolBefore` is already the status fetched above; nothing has run
+    // since that could have changed it, so no re-fetch.
+    info(
+      `Pool '${pool}' is on-demand (POOL_ON_DEMAND set): skipping the warm-capacity wait — the lease request below is what drives provisioning.`,
+    );
+  } else {
+    poolBefore = await waitForWarmPool(pool);
+  }
 
   info(`Pool '${pool}': ${renderPool(poolBefore)}`);
   info(`Requesting lease from pool '${pool}' (ttl=${ttl}, lease wait timeout=${leaseWaitTimeout})...`);
@@ -454,6 +469,19 @@ async function main(): Promise<void> {
     if (message.includes("Timed out waiting for lease")) {
       errorLine(message);
       await printLeaseWaitDiagnostics("lease did not become ready within the acquisition timeout");
+      process.exitCode = 1;
+      return;
+    }
+    // A claim the operator expired server-side (queueTimeout) surfaces as a
+    // terminal phase, NOT as a client timeout — so it would otherwise skip
+    // the diagnostics below and rethrow bare. That is the single most likely
+    // on-demand failure, and the one where "why didn't the pool provision?"
+    // is exactly the question the diagnostics answer.
+    if (message.includes("ended in phase")) {
+      errorLine(message);
+      await printLeaseWaitDiagnostics(
+        "claim reached a terminal phase before it was usable — if this is Expired, the claim outlived the pool's scaling.queueTimeout (a cold start slower than the budget, contention for capacity, or the pool making no progress at all; the pool state below distinguishes them)",
+      );
       process.exitCode = 1;
       return;
     }

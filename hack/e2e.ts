@@ -797,7 +797,16 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: this is a server-side
+    # cap, so a shorter value here expires the queued claim regardless of
+    # how long the client waits (scale-to-zero pools provision on demand).
+    queueTimeout: "12m"
+    # Caps ONE provisioning attempt: past it the operator recycles that
+    # instance as wedged. The claim itself survives and a later attempt can
+    # still serve it, up to the waits above — so this is a chosen retry
+    # policy, not a hard bound on the claim. Sized to fit a cold start in
+    # one attempt so the leg measures provisioning rather than retries.
+    creatingTimeout: "8m"
   resources:
     limits:
       cpu: "500m"
@@ -875,7 +884,16 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: this is a server-side
+    # cap, so a shorter value here expires the queued claim regardless of
+    # how long the client waits (scale-to-zero pools provision on demand).
+    queueTimeout: "12m"
+    # Caps ONE provisioning attempt: past it the operator recycles that
+    # instance as wedged. The claim itself survives and a later attempt can
+    # still serve it, up to the waits above — so this is a chosen retry
+    # policy, not a hard bound on the claim. Sized to fit a cold start in
+    # one attempt so the leg measures provisioning rather than retries.
+    creatingTimeout: "8m"
   resources:
     limits:
       cpu: "500m"
@@ -950,7 +968,16 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: this is a server-side
+    # cap, so a shorter value here expires the queued claim regardless of
+    # how long the client waits (scale-to-zero pools provision on demand).
+    queueTimeout: "20m"
+    # Caps ONE provisioning attempt: past it the operator recycles that
+    # instance as wedged. The claim itself survives and a later attempt can
+    # still serve it, up to the waits above — so this is a chosen retry
+    # policy, not a hard bound on the claim. Sized to fit a cold start in
+    # one attempt so the leg measures provisioning rather than retries.
+    creatingTimeout: "12m"
   resources:
     limits:
       cpu: "500m"

@@ -1668,24 +1668,50 @@ mod tests {
     /// exhaustive match is the enforcement: adding a `BackendType` variant
     /// fails compilation here until the author consciously classifies it —
     /// either naming its CI conformance-matrix leg(s) or documenting why it
-    /// is exempt. Covered legs are cross-checked against the workflow text so
+    /// is exempt. Covered legs are cross-checked against the workflow so
     /// this list can't silently drift from `.github/workflows/ci.yml`.
+    ///
+    /// The cross-check reads the matrix *declaration* specifically, not the
+    /// whole file. Searching the whole file was too weak to enforce
+    /// anything: every backend name appears somewhere in ci.yml's prose, so
+    /// a backend could be classified as covered while having no leg at all —
+    /// which is exactly the state vcluster was in before #31.
     #[test]
     fn backend_conformance_coverage_is_classified() {
         fn conformance_legs(backend: &BackendType) -> Option<&'static [&'static str]> {
             match backend {
-                BackendType::K3s => Some(&["\"k3s\""]),
+                BackendType::K3s => Some(&["k3s"]),
                 BackendType::Vkobe => Some(&["vkobe-etcd", "vkobe-kine"]),
+                BackendType::Vcluster => Some(&["vcluster"]),
                 // Documented exemptions — NOT yet in the matrix:
-                // - vcluster: no e2e harness pool yet (#10 follow-up; must
-                //   join before it carries production load)
                 // - capi: no CI infrastructure provider yet
-                // - k0s: no e2e pool in the harness yet
-                BackendType::Vcluster | BackendType::Capi | BackendType::K0s => None,
+                // - k0s: the harness has an `e2e-k0s` pool, but no smoke
+                //   recipe drives it, so nothing asserts conformance
+                BackendType::Capi | BackendType::K0s => None,
             }
         }
 
         let ci = include_str!("../../.github/workflows/ci.yml");
+
+        // The `backend:` line inside the conformance job's matrix, which
+        // holds the JSON arrays of leg names. Anchoring on it is what makes
+        // this assertion mean "has a leg" rather than "is mentioned".
+        let matrix_line = ci
+            .lines()
+            .find(|l| l.trim_start().starts_with("backend: ${{ fromJSON("))
+            .expect(
+                "conformance matrix's `backend:` line not found in ci.yml — \
+                 if the matrix was restructured, retarget this assertion",
+            );
+
+        // Every leg must also be dispatched to a smoke recipe, or the matrix
+        // entry would just hit the `unknown backend` guard at runtime.
+        let dispatch_arms = ci
+            .lines()
+            .filter(|l| l.contains("mise exec -- just test-smoke"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         // The iteration list may lag a new variant; that's fine — the
         // exhaustive match above is what breaks the build for new variants.
         for backend in [
@@ -1697,11 +1723,18 @@ mod tests {
         ] {
             if let Some(legs) = conformance_legs(&backend) {
                 for leg in legs {
+                    let quoted = format!("\"{leg}\"");
                     assert!(
-                        ci.contains(leg),
+                        matrix_line.contains(&quoted),
                         "{backend:?} is classified as conformance-covered by leg {leg}, \
-                         but ci.yml's conformance matrix does not mention it — update \
-                         the matrix or this classification"
+                         but ci.yml's conformance matrix does not include it — update \
+                         the matrix or this classification.\nmatrix line: {matrix_line}"
+                    );
+                    assert!(
+                        dispatch_arms.contains(&format!("{leg})"))
+                            || dispatch_arms.contains(&format!("{leg}) ")),
+                        "leg {leg} is in the conformance matrix but no case arm runs a \
+                         smoke recipe for it — it would fall through to `unknown backend`"
                     );
                 }
             }

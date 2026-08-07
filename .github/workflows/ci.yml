@@ -171,9 +171,11 @@ jobs:
   # push to main and on release tags, so a conformance regression is caught
   # before (main) or at (tag) the release boundary instead of a day later.
   # The full matrix (k3s + both vkobe datastores) stays nightly + manual; the
-  # vkobe legs run the same gate across etcd + kine/sqlite. vcluster and capi
-  # have no e2e harness/pool yet — tracked as follow-up before they join the
-  # matrix; `backend_conformance_coverage_is_classified` (crd/profile.rs)
+  # vkobe legs run the same gate across etcd + kine/sqlite, and vcluster joins
+  # nightly against the upstream loft-sh chart (#31). capi still has no CI
+  # infrastructure provider, and k0s has a harness pool but no smoke recipe —
+  # both tracked as follow-ups before they join the matrix;
+  # `backend_conformance_coverage_is_classified` (crd/profile.rs)
   # forces every new BackendType to be consciously classified against this
   # matrix. Since #28, reaching Ready on k3s/k0s/vcluster requires the
   # functional admission gates (DNSHealthy + InClusterToken), so every leg
@@ -201,7 +203,7 @@ jobs:
       matrix:
         # k3s-only on push (fast feedback on the production backend); the full
         # matrix nightly / on manual dispatch.
-        backend: ${{ fromJSON(github.event_name == 'push' && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine"]') }}
+        backend: ${{ fromJSON(github.event_name == 'push' && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine", "vcluster"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -239,6 +241,7 @@ jobs:
             k3s)        mise exec -- just test-smoke-k3s "$CLUSTER" ;;
             vkobe-etcd) mise exec -- just test-smoke-vkobe ;;
             vkobe-kine) mise exec -- just test-smoke-vkobe-kine ;;
+            vcluster)   mise exec -- just test-smoke-vcluster ;;
             *) echo "unknown backend ${{ matrix.backend }}" >&2; exit 1 ;;
           esac
 
