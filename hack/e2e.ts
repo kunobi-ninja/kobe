@@ -801,6 +801,11 @@ spec:
     # cap, so a shorter value here expires the queued claim regardless of
     # how long the client waits (scale-to-zero pools provision on demand).
     queueTimeout: "12m"
+    # One provisioning attempt must fit inside this, or the operator
+    # recycles the instance as wedged before the claim can be served —
+    # capping the effective budget below the waits above. Ordering:
+    # creatingTimeout < LEASE_WAIT_TIMEOUT (recipe) < queueTimeout.
+    creatingTimeout: "8m"
   resources:
     limits:
       cpu: "500m"
@@ -882,6 +887,11 @@ spec:
     # cap, so a shorter value here expires the queued claim regardless of
     # how long the client waits (scale-to-zero pools provision on demand).
     queueTimeout: "12m"
+    # One provisioning attempt must fit inside this, or the operator
+    # recycles the instance as wedged before the claim can be served —
+    # capping the effective budget below the waits above. Ordering:
+    # creatingTimeout < LEASE_WAIT_TIMEOUT (recipe) < queueTimeout.
+    creatingTimeout: "8m"
   resources:
     limits:
       cpu: "500m"
@@ -960,6 +970,11 @@ spec:
     # cap, so a shorter value here expires the queued claim regardless of
     # how long the client waits (scale-to-zero pools provision on demand).
     queueTimeout: "20m"
+    # One provisioning attempt must fit inside this, or the operator
+    # recycles the instance as wedged before the claim can be served —
+    # capping the effective budget below the waits above. Ordering:
+    # creatingTimeout < LEASE_WAIT_TIMEOUT (recipe) < queueTimeout.
+    creatingTimeout: "12m"
   resources:
     limits:
       cpu: "500m"
