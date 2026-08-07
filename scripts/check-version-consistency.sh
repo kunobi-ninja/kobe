@@ -108,19 +108,48 @@ elif chart_version != ws_version:
 # (The CHART's own OCI tag is bare semver — a different artifact. Conflating
 # the two is exactly the mistake this check now catches.)
 expected_image_tag = f"v{ws_version}"
-ah_images = re.findall(r"docker\.io/zondax/([\w.-]+):([^\s\"']+)", chart)
-if not ah_images:
+
+# Every first-party image the chart deploys. Asserting the SET, not just the
+# tags of whatever happens to be present: a check that only validated the refs
+# it found would pass just as happily after someone deleted the kobe-sync
+# entry, while still advertising that it protects the image listing.
+REQUIRED_FIRST_PARTY = {"kobe-operator", "kobe-sync"}
+
+# Read the annotation's own block scalar rather than scanning the whole file,
+# so an image-shaped string in a comment or a different annotation cannot
+# satisfy this. The block is the run of more-indented lines after the key.
+images_block = []
+lines = chart.splitlines()
+for i, line in enumerate(lines):
+    m = re.match(r"^(\s*)artifacthub\.io/images:\s*\|", line)
+    if not m:
+        continue
+    key_indent = len(m.group(1))
+    for follow in lines[i + 1 :]:
+        if follow.strip() and (len(follow) - len(follow.lstrip())) <= key_indent:
+            break
+        images_block.append(follow)
+    break
+
+if not images_block:
     errors.append(
-        "charts/kobe/Chart.yaml has no docker.io/zondax/* image refs — the "
-        "artifacthub.io/images annotation was removed or restructured; update "
-        "this check or restore it"
+        "charts/kobe/Chart.yaml has no `artifacthub.io/images: |` block — the "
+        "annotation was removed or restructured; update this check or restore it"
     )
-for image_name, image_tag in ah_images:
-    if image_tag != expected_image_tag:
+else:
+    block = "\n".join(images_block)
+    found = dict(re.findall(r"docker\.io/zondax/([\w.-]+):(\S+)", block))
+    for missing in sorted(REQUIRED_FIRST_PARTY - found.keys()):
         errors.append(
-            f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
-            f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
+            f"Chart.yaml artifacthub.io/images is missing the first-party image "
+            f"{missing!r} — Artifact Hub would not scan it"
         )
+    for image_name, image_tag in sorted(found.items()):
+        if image_tag != expected_image_tag:
+            errors.append(
+                f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
+                f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
+            )
 
 # --- Chart.yaml artifacthub.io/prerelease matches the version ---
 # Artifact Hub surfaces prereleases differently, and rc publishing is a

@@ -22,8 +22,10 @@ maintainers:
     url: https://zondax.ch
 # Artifact Hub reads these off the chart itself when it indexes the OCI
 # repository (#53). Kept here rather than in an artifacthub-repo.yml
-# because that file needs the repositoryID Artifact Hub only issues after
-# the repo is registered in the UI — a separate, human step.
+# because that file's useful content — the repositoryID for the
+# verified-publisher badge — is only issued after the repo is registered
+# in the UI, a separate human step. (An ownership-claim file can be
+# prepared earlier; it just would not carry the ID yet.)
 annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/operator: "true"
