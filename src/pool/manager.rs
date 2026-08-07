@@ -556,6 +556,19 @@ pub fn compute_pool_actions(
             (spec.size, spec.size + 10, 0, None) // no scale-down for fixed pools
         };
 
+    // Queued claims raise the warm target, but only for pools that opted
+    // into autoscaling. A fixed pool's contract is `spec.size` exactly,
+    // and it has no scale-down path (`scale_down_after` is `None` above),
+    // so anything provisioned above `size` on a queue spike would be held
+    // forever with nothing to trim it. Demand-driven provisioning is a
+    // `scaling` feature; leaking it into fixed pools would silently change
+    // what every existing non-scaling pool does.
+    let queue_demand = if spec.scaling.is_some() {
+        state.queue_depth
+    } else {
+        0
+    };
+
     let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
     let counts = count_states(state, Some(&current_hash));
     let total =
@@ -741,7 +754,8 @@ pub fn compute_pool_actions(
     // would never create anything, leaving every claim to sit queued
     // until `queue_timeout` expired it. Still bounded by `max_clusters`
     // and `MAX_BURST`, so a queue spike cannot become a create storm.
-    let warm_target = warm_target + state.queue_depth;
+    // `saturating_add` to match the arithmetic discipline in this block.
+    let warm_target = warm_target.saturating_add(queue_demand);
 
     if counts.ready + counts.creating < warm_target && total < max_clusters {
         let deficit = warm_target.saturating_sub(counts.ready + counts.creating);
@@ -772,7 +786,17 @@ pub fn compute_pool_actions(
             .collect();
         idle_candidates.sort_by_key(|(_, e)| e.idle_since);
 
-        let excess = counts.ready.saturating_sub(min_ready);
+        // Protect the capacity queued claims were counted against, not
+        // just `min_ready`. The scale-up step above treats a queued claim
+        // as covered by an existing Ready cluster and therefore emits no
+        // Create for it; if scale-down then measured excess against
+        // `min_ready` alone, the same reconcile would Delete that very
+        // cluster. The claim would lose the instance about to serve it and
+        // pay a full cold start — and the Delete would race the lease
+        // controller reserving it.
+        let excess = counts
+            .ready
+            .saturating_sub(min_ready.saturating_add(queue_demand));
         let mut deleted_excess = 0u32;
         for (name, entry) in idle_candidates {
             if deleted_excess >= excess {
@@ -1707,6 +1731,92 @@ mod tests {
         assert!(
             !actions.iter().any(|a| matches!(a, PoolAction::Create(_))),
             "the Ready cluster already covers the queued claim, got {actions:?}"
+        );
+    }
+
+    /// Queued demand must not cause the pool to reap the very Ready
+    /// cluster that demand was counted against.
+    ///
+    /// The scale-up gate counts a queued claim against existing warm
+    /// capacity, so a pool with one Ready cluster and one queued claim
+    /// correctly emits no Create. But if idle scale-down still measures
+    /// excess against `min_ready` alone, that same reconcile emits a
+    /// Delete for the cluster — so the claim loses the instance it was
+    /// about to be served by and pays a full cold start, and the Delete
+    /// races the lease controller reserving it.
+    #[test]
+    fn queued_claim_protects_an_idle_ready_cluster_from_scale_down() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 6,
+                scale_up_threshold: 0,
+                scale_down_after: "5m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+        // One Ready cluster, idle well past `scale_down_after`.
+        let mut entry = make_entry(ClusterState::Ready);
+        entry.idle_since = Some(now - chrono::Duration::minutes(30));
+        let mut clusters = HashMap::new();
+        clusters.insert("pool-test-profile-1".into(), entry);
+        let state = PoolState {
+            clusters,
+            queue_depth: 1,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Delete(_))),
+            "a queued claim is counted against this Ready cluster, so scale-down \
+             must not reap it — got {actions:?}"
+        );
+    }
+
+    /// A fixed pool (no `scaling` block) must stay fixed.
+    ///
+    /// `spec.size` is the whole contract for those pools, and they have
+    /// no scale-down path at all (`scale_down_after` is `None`), so any
+    /// cluster provisioned above `size` would be held forever with
+    /// nothing to trim it. Demand-driven provisioning is a `scaling`
+    /// feature; it must not silently change what a fixed pool does.
+    #[test]
+    fn queued_claims_do_not_grow_a_fixed_pool_beyond_its_size() {
+        let profile = make_profile(1, None);
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            make_entry(ClusterState::Ready),
+        );
+        let state = PoolState {
+            clusters,
+            queue_depth: 10,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Create(_))),
+            "a fixed pool at spec.size must not provision above it on queue \
+             pressure — it has no scale-down path to ever trim the excess. \
+             got {actions:?}"
         );
     }
 

@@ -1088,6 +1088,12 @@ async fn reconcile_profile(
     // Same value the warm target was computed against in
     // `build_pool_state` — reused rather than re-LISTed so the status
     // and metric can never disagree with the scale-up decision.
+    //
+    // One consequence of counting it there: if the ClusterInstance LIST
+    // fails, `build_pool_state` bails early and this reports 0 rather
+    // than the true depth. That is a degraded reconcile either way (the
+    // pool state it would act on is empty), and it recovers on the next
+    // pass — but the queueDepth metric does read 0 for that interval.
     let queue_depth = pool_state.queue_depth;
 
     crate::metrics::QUEUE_DEPTH
