@@ -122,6 +122,20 @@ for image_name, image_tag in ah_images:
             f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
         )
 
+# --- Chart.yaml artifacthub.io/prerelease matches the version ---
+# Artifact Hub surfaces prereleases differently, and rc publishing is a
+# supported flow (`just bump 0.38.0-rc.1`), so a static value would advertise
+# every release candidate as stable. `just bump` derives it; this enforces it.
+expected_prerelease = "true" if "-" in ws_version else "false"
+pm = re.search(r'(?m)^\s*artifacthub\.io/prerelease:\s*"?([^"\s]+)"?\s*$', chart)
+if pm is None:
+    errors.append("charts/kobe/Chart.yaml has no `artifacthub.io/prerelease:` annotation")
+elif pm.group(1) != expected_prerelease:
+    errors.append(
+        f"Chart.yaml artifacthub.io/prerelease {pm.group(1)!r} != {expected_prerelease!r} "
+        f"for version {ws_version!r}"
+    )
+
 # --- nix/package.nix version (optional) ---
 nix_pkg = root / "nix" / "package.nix"
 if nix_pkg.exists():

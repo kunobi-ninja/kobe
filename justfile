@@ -178,6 +178,13 @@ bump VERSION:
     # docker-bake.hcl publishes and what the templates deploy — a bare-semver
     # image tag does not exist. check-version-consistency.sh gates this.
     perl -i -pe 's{(docker\.io/zondax/[\w.-]+):\S+}{$1:v{{ VERSION }}}' charts/kobe/Chart.yaml
+    # Artifact Hub shows prereleases differently; a release candidate must not
+    # advertise itself as stable. Derived from the version, gated by the check.
+    case "{{ VERSION }}" in
+      *-*) ah_prerelease=true ;;
+      *)   ah_prerelease=false ;;
+    esac
+    perl -i -pe "s{^(\s*artifacthub\.io/prerelease:).*}{\$1 \"${ah_prerelease}\"}" charts/kobe/Chart.yaml
     cargo update -p kobe-operator -p kobectl --precise "{{ VERSION }}" 2>/dev/null || true
     ./scripts/check-version-consistency.sh
     echo "Bumped to {{ VERSION }}. Review the diff, commit, then \`just release\`."

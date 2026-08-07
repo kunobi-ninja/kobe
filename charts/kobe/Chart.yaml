@@ -27,6 +27,10 @@ maintainers:
 annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/operator: "true"
+  # Tracks the release: `just bump 0.38.0-rc.1` flips this to "true" and
+  # the version gate enforces the pairing. Left static it would advertise
+  # every release candidate as a stable release, and rc chart publishing
+  # is a supported flow.
   artifacthub.io/prerelease: "false"
   artifacthub.io/links: |
     - name: source
@@ -35,14 +39,22 @@ annotations:
       url: https://github.com/kunobi-ninja/kobe/tree/main/docs
     - name: issues
       url: https://github.com/kunobi-ninja/kobe/issues
-  # Every image this chart can deploy, so Artifact Hub can run its
-  # security report against them. The first-party tags carry the `v`
-  # prefix because that is what docker-bake.hcl publishes and what the
-  # templates default to (`printf "v%s" .Chart.AppVersion`) — a bare
-  # `0.37.0` image tag does not exist. The chart's own OCI tag is bare
-  # semver; that is a different artifact, and conflating the two is easy.
-  # The last three are conditional and third-party, so they are
+  # Every image this chart's own templates can deploy, so Artifact Hub
+  # can run its security report against them. The first-party tags carry
+  # the `v` prefix because that is what docker-bake.hcl publishes and
+  # what the templates default to (`printf "v%s" .Chart.AppVersion`) — a
+  # bare `0.37.0` image tag does not exist. The chart's own OCI tag is
+  # bare semver; that is a different artifact, and conflating the two is
+  # easy. The last three are conditional and third-party, so they are
   # whitelisted rather than tracked as ours.
+  #
+  # NOT covered: the optional bundled etcd subchart (`etcd.bundled: true`,
+  # off by default) brings its own bitnami/etcd image. Artifact Hub does
+  # not auto-discover subchart images, and the tag comes from whatever
+  # the floating `~10.0` dependency resolves to — so pinning one here
+  # would be stale on the next resolution and nothing gates it. Users of
+  # the bundled path should scan that image via the etcd chart's own
+  # listing.
   artifacthub.io/images: |
     - name: kobe-operator
       image: docker.io/zondax/kobe-operator:v0.37.0
