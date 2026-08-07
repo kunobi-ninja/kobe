@@ -480,7 +480,7 @@ async function main(): Promise<void> {
     if (message.includes("ended in phase")) {
       errorLine(message);
       await printLeaseWaitDiagnostics(
-        "claim reached a terminal phase before it was usable — if this is Expired, the pool's scaling.queueTimeout is shorter than the cold-provision time",
+        "claim reached a terminal phase before it was usable — if this is Expired, the claim outlived the pool's scaling.queueTimeout (a cold start slower than the budget, contention for capacity, or the pool making no progress at all; the pool state below distinguishes them)",
       );
       process.exitCode = 1;
       return;
