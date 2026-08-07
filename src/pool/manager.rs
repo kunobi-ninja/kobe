@@ -690,15 +690,23 @@ pub fn compute_pool_actions(
     //
     // `.take(max_recycling)` caps the per-reconcile rate; the floor
     // check inside the loop handles the early-break case.
-    // How many Ready members step 4 actually wants to roll. This is NOT
-    // the same as `counts.ready_drifted`: `count_states` partitions purely
-    // on hash equality, so it counts an unstamped legacy member as *clean*
-    // and ignores PKI expiry entirely, whereas the candidate list above
-    // uses `entry_drift_eligible` (which recycles unstamped members past
-    // the grace period) plus `cert_expiring`. Step 6 sizes the surge off
-    // this number, because sizing it off `ready_drifted` would leave both
-    // of those cases with a floor they can never clear — the recycle would
-    // block forever with no surge to buy headroom.
+    // How many Ready members step 4 actually wants to roll. Step 6 sizes
+    // the surge off this rather than off `counts.ready_drifted`, because
+    // the two disagree for *unstamped* members: `count_states` partitions
+    // on hash equality and counts `spec_hash == None` as clean, while
+    // `entry_drift_eligible` recycles it once past the grace period. Sized
+    // off `ready_drifted`, such a pool sees a floor it can never clear —
+    // the recycle blocks with no surge to buy headroom, forever.
+    //
+    // Cert expiry is NOT part of that divergence: `count_states` already
+    // folds `cert_expiring()` into its `drifted` predicate, so PKI-expiring
+    // members were always counted and always got their surge.
+    //
+    // This is a superset of `ready_drifted`, not merely usually larger:
+    // `drifted_ready` is every non-`deleting` Ready member that is
+    // hash-drifted, cert-expiring, or unstamped-past-grace, and nothing
+    // Ready can be in `deleting` before this point. So no `.max()` against
+    // `ready_drifted` is needed — it would always pick this value anyway.
     let recycle_candidates = drifted_ready.len() as u32;
 
     let mut remaining_ready = counts.ready;
@@ -750,14 +758,19 @@ pub fn compute_pool_actions(
     // Surge only fires when there's drift to absorb. A fresh pool
     // boot (no drift) refills exactly to `min_ready`, never above —
     // so existing tests for clean pools see byte-identical behavior.
-    // `recycle_candidates` rather than `counts.ready_drifted`: the two
-    // differ for unstamped legacy members and for PKI-expiring ones, and
-    // in both cases it is the candidate list that decides whether step 4
-    // is trying to recycle. Taking the larger of the two keeps every
-    // hash-drift path byte-identical while ensuring a blocked recycle
-    // always gets its surge. Not creating_drifted — those got Deleted in
+    // `recycle_candidates` rather than `counts.ready_drifted`: it is the
+    // candidate list that decides whether step 4 is trying to recycle, and
+    // for unstamped members the two disagree (see step 4). Identical to
+    // `ready_drifted` on every hash-drift and cert-expiry path, so those
+    // stay byte-identical. Not creating_drifted — those got Deleted in
     // step 3 so they're already accounted for in the deficit calculation.
-    let drift_in_flight = counts.ready_drifted.max(recycle_candidates);
+    //
+    // This also feeds `upgrade_in_progress` in step 7, so a pool holding
+    // unstamped members now suppresses idle scale-down until they are
+    // recycled. That is the intended behaviour — scale-down would
+    // otherwise reap the very surge replacements bought here — but it is a
+    // change for existing pools carrying legacy members.
+    let drift_in_flight = recycle_candidates;
     let warm_target = if drift_in_flight > 0 {
         min_ready + policy.max_surge.min(drift_in_flight)
     } else {
