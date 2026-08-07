@@ -95,6 +95,26 @@ if chart_version is None:
 elif chart_version != ws_version:
     errors.append(f"Chart.yaml version {chart_version!r} != workspace version {ws_version!r}")
 
+# --- Chart.yaml artifacthub.io/images tags ---
+# The Artifact Hub annotation pins fully-qualified image refs so the security
+# report scans the right tags. They are first-party images, so they move with
+# the release and would otherwise silently advertise a stale version forever
+# (`just bump` rewrites them; this is what stops that from being optional).
+# Third-party images (kine, etc.) are deliberately not checked.
+ah_images = re.findall(r"docker\.io/zondax/([\w.-]+):([^\s\"']+)", chart)
+if not ah_images:
+    errors.append(
+        "charts/kobe/Chart.yaml has no docker.io/zondax/* image refs — the "
+        "artifacthub.io/images annotation was removed or restructured; update "
+        "this check or restore it"
+    )
+for image_name, image_tag in ah_images:
+    if image_tag != ws_version:
+        errors.append(
+            f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
+            f"!= workspace version {ws_version!r}"
+        )
+
 # --- nix/package.nix version (optional) ---
 nix_pkg = root / "nix" / "package.nix"
 if nix_pkg.exists():

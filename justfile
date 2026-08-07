@@ -173,6 +173,9 @@ bump VERSION:
     # published from the same release tag, so both track the operator version.
     perl -i -pe 's/^appVersion:.*$/appVersion: "{{ VERSION }}"/' charts/kobe/Chart.yaml
     perl -i -pe 's/^version:.*$/version: {{ VERSION }}/' charts/kobe/Chart.yaml
+    # Artifact Hub's images annotation pins fully-qualified first-party refs, so
+    # they move with the release too. check-version-consistency.sh gates this.
+    perl -i -pe 's{(docker\.io/zondax/[\w.-]+):\S+}{$1:{{ VERSION }}}' charts/kobe/Chart.yaml
     cargo update -p kobe-operator -p kobectl --precise "{{ VERSION }}" 2>/dev/null || true
     ./scripts/check-version-consistency.sh
     echo "Bumped to {{ VERSION }}. Review the diff, commit, then \`just release\`."

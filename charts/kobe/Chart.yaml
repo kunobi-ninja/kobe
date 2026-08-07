@@ -2,7 +2,7 @@ apiVersion: v2
 name: kobe
 description: >-
   Kubernetes operator for instant cluster provisioning via warm pools.
-  Supports multiple backends: k3s, k0s, CAPI, and kobe-sync.
+  Supports multiple backends: k3s, k0s, vcluster, and CAPI.
 type: application
 version: 0.37.0
 appVersion: "0.37.0"
@@ -11,13 +11,82 @@ keywords:
   - operator
   - cluster-pool
   - virtual-cluster
-  - kobe-sync
+  - vcluster
+  - k3s
+  - ephemeral-environments
 home: https://github.com/kunobi-ninja/kobe
 sources:
   - https://github.com/kunobi-ninja/kobe
 maintainers:
   - name: Zondax
     url: https://zondax.ch
+# Artifact Hub reads these off the chart itself when it indexes the OCI
+# repository (#53). Kept here rather than in an artifacthub-repo.yml
+# because that file needs the repositoryID Artifact Hub only issues after
+# the repo is registered in the UI — a separate, human step.
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/operator: "true"
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/kunobi-ninja/kobe
+    - name: documentation
+      url: https://github.com/kunobi-ninja/kobe/tree/main/docs
+    - name: issues
+      url: https://github.com/kunobi-ninja/kobe/issues
+  # Every image this chart can deploy, so Artifact Hub can run its
+  # security report against them. `kine` is only pulled when a KobeStore
+  # selects the kine/sqlite driver; the other two always ship.
+  artifacthub.io/images: |
+    - name: kobe-operator
+      image: docker.io/zondax/kobe-operator:0.37.0
+    - name: kobe-sync
+      image: docker.io/zondax/kobe-sync:0.37.0
+    - name: kine
+      image: docker.io/rancher/kine:v0.13.2
+      whitelisted: true
+  artifacthub.io/crds: |
+    - kind: ClusterPool
+      version: v1alpha1
+      name: clusterpools.kobe.kunobi.ninja
+      displayName: Cluster Pool
+      description: A warm pool of provisioned clusters that leases are served from
+    - kind: ClusterLease
+      version: v1alpha1
+      name: clusterleases.kobe.kunobi.ninja
+      displayName: Cluster Lease
+      description: A time-bounded claim on one cluster from a pool
+    - kind: ClusterInstance
+      version: v1alpha1
+      name: clusterinstances.kobe.kunobi.ninja
+      displayName: Cluster Instance
+      description: A single provisioned cluster belonging to a pool
+    - kind: BootstrapConfig
+      version: v1alpha1
+      name: bootstrapconfigs.kobe.kunobi.ninja
+      displayName: Bootstrap Config
+      description: Manifests applied into a cluster before it is marked Ready
+    - kind: AccessPolicy
+      version: v1alpha1
+      name: accesspolicies.kobe.kunobi.ninja
+      displayName: Access Policy
+      description: Who may lease from which pools, with quotas and TTL ceilings
+    - kind: KobeStore
+      version: v1alpha1
+      name: kobestores.kobe.kunobi.ninja
+      displayName: Kobe Store
+      description: Datastore backing virtual cluster control planes
+    - kind: CIDRPool
+      version: v1alpha1
+      name: cidrpools.kobe.kunobi.ninja
+      displayName: CIDR Pool
+      description: Address space that per-cluster service and pod CIDRs are allocated from
+    - kind: CIDRClaim
+      version: v1alpha1
+      name: cidrclaims.kobe.kunobi.ninja
+      displayName: CIDR Claim
+      description: One allocated CIDR slot held by a cluster instance
 dependencies:
   - name: etcd
     version: "~10.0"
