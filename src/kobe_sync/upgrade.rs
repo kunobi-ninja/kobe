@@ -108,8 +108,28 @@ static UPGRADES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Total number of HTTP Upgrade attempts handled by the subresource proxy",
         // result = success | denied_global | denied_per_identity |
         //          upstream_rejected | upstream_error
+        // NOTE: `success` means "101 handed to the client"; whether the tunnel
+        // then carried bytes is BRIDGE_FAILURES_TOTAL below, deliberately a
+        // separate metric so `result` stays mutually exclusive and summing it
+        // still counts attempts exactly once.
         // protocol = spdy | websocket | other
         &["protocol", "result"]
+    )
+    .unwrap()
+});
+
+/// Tunnels that failed AFTER the 101 was sent, i.e. the client upgrade never
+/// completed. Separate from `UPGRADES_TOTAL` because it is a different phase:
+/// `result="success"` there is recorded when the 101 goes out, so a dead tunnel
+/// would otherwise be counted as a success and nothing would contradict it.
+/// A persistent nonzero rate here with a healthy `success` rate means the
+/// server is not serving connections with upgrade support.
+static BRIDGE_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_sync_proxy_upgrade_bridge_failures_total",
+        "Upgrade tunnels that failed after the 101 was sent to the client",
+        // protocol = spdy | websocket | other (normalized, never the raw header)
+        &["protocol"]
     )
     .unwrap()
 });
@@ -126,6 +146,7 @@ static UPGRADES_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
 /// even before the first request.
 pub fn init_upgrade_metrics() {
     LazyLock::force(&UPGRADES_TOTAL);
+    LazyLock::force(&BRIDGE_FAILURES_TOTAL);
     LazyLock::force(&UPGRADES_ACTIVE);
 }
 
@@ -601,7 +622,13 @@ pub async fn dispatch_upgrade(
     let permit_for_bridge = _permit;
     tokio::spawn(async move {
         let _hold_permit = permit_for_bridge;
-        bridge_upgraded(client_upgrade_fut, upstream_upgraded, proto_for_log).await;
+        bridge_upgraded(
+            client_upgrade_fut,
+            upstream_upgraded,
+            proto_for_log,
+            proto_for_metrics,
+        )
+        .await;
         // _hold_permit drops here, releasing the global + per-identity
         // semaphore slots and decrementing UPGRADES_ACTIVE.
     });
@@ -681,14 +708,36 @@ async fn bridge_upgraded(
     client_upgrade_fut: hyper::upgrade::OnUpgrade,
     upstream_upgraded: hyper::upgrade::Upgraded,
     proto: String,
+    proto_metric: &'static str,
 ) {
     let client_upgraded = match client_upgrade_fut.await {
         Ok(u) => u,
         Err(e) => {
-            // Client never finished the upgrade dance — usually means
-            // it disconnected before hyper flushed our 101. Drop the
-            // upstream side so the apiserver releases the session.
-            debug!(error = %e, protocol = %proto, "client upgrade did not complete; dropping upstream");
+            // Client never finished the upgrade dance. Usually it
+            // disconnected before hyper flushed our 101 — but it is ALSO
+            // what a server-side misconfiguration looks like: if the
+            // accept loop forgets `serve_connection_with_upgrades`, hyper
+            // fails every client upgrade here with "upgrade expected but
+            // low level API in use" and no tunnel ever works.
+            //
+            // That failure used to be invisible: `upgrades_total` is
+            // incremented as `success` when the 101 goes out, before this
+            // bridge runs, and this arm logged at debug. So the metric
+            // read 100% success while every tunnel was dead. Count it and
+            // log it loudly enough to notice.
+            // `proto_metric` (normalized), never `proto` — that is the raw
+            // client `Upgrade` header, so labelling with it would let a caller
+            // mint unbounded metric series.
+            BRIDGE_FAILURES_TOTAL
+                .with_label_values(&[proto_metric])
+                .inc();
+            warn!(
+                error = %e,
+                protocol = %proto,
+                "client upgrade did not complete; dropping upstream (a persistent \
+                 rate here means the server is not serving connections with \
+                 upgrade support)"
+            );
             drop(upstream_upgraded);
             return;
         }
