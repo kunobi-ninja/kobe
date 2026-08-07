@@ -235,11 +235,22 @@ impl ClusterBackend for MockBackend {
 // ---------------------------------------------------------------------------
 
 /// Build a `kube::Client` that talks to a local [`wiremock::MockServer`].
+///
+/// `root_cert: Some(vec![])` hands kube an empty trust store instead of
+/// letting it fall through to rustls' `with_native_roots()`. The mock
+/// server speaks plain HTTP so the store is never consulted, and
+/// skipping the native load avoids a load-dependent flake: under a
+/// heavily parallel `cargo test`, macOS' Security framework
+/// intermittently fails the trust-settings read with `Os(-36) I/O
+/// error`, which surfaces as `RustlsTls(NoValidNativeRootCA)` and fails
+/// whichever wiremock-backed tests happened to build a client at that
+/// moment.
 #[allow(dead_code)]
 pub fn mock_k8s_client(server: &wiremock::MockServer) -> kube::Client {
     let config = kube::Config {
         cluster_url: server.uri().parse().unwrap(),
         default_namespace: "test-ns".into(),
+        root_cert: Some(Vec::new()),
         ..kube::Config::new(server.uri().parse().unwrap())
     };
     kube::Client::try_from(config).unwrap()

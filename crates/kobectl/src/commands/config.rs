@@ -903,18 +903,25 @@ fn print_config(config: &CliConfig, target_override: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// Render a bearer token for display, never revealing enough of it to
+/// be usable.
+///
+/// Tokens longer than 8 characters keep a 4-char head and tail so a user
+/// can tell *which* token is configured; anything shorter is replaced
+/// wholesale, because a 4+4 elision of an 8-char secret would print the
+/// entire value. `None` renders as `(not set)`.
+fn mask_token(token: Option<&str>) -> String {
+    match token {
+        Some(t) if t.len() > 8 => format!("{}...{}", &t[..4], &t[t.len() - 4..]),
+        Some(_) => "****".to_string(),
+        None => "(not set)".to_string(),
+    }
+}
+
 fn print_auth(auth: &AuthMode, token: Option<&str>, ssh_fingerprint: Option<&str>) {
     println!("auth:     {auth}");
     if auth == &AuthMode::Token {
-        let masked = token
-            .map(|t| {
-                if t.len() > 8 {
-                    format!("{}...{}", &t[..4], &t[t.len() - 4..])
-                } else {
-                    "****".to_string()
-                }
-            })
-            .unwrap_or_else(|| "(not set)".to_string());
+        let masked = mask_token(token);
         println!("token:    {masked}");
     }
     if auth == &AuthMode::Ssh {
@@ -935,7 +942,193 @@ pub fn parse_auth_mode(value: &str) -> Result<AuthMode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMode, CliConfig};
+    use super::{AuthMode, CliConfig, KobeTarget, Scope, mask_token, parse_auth_mode};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn target(endpoint: &str) -> KobeTarget {
+        KobeTarget {
+            endpoint: endpoint.to_string(),
+            auth: AuthMode::Oidc,
+            token: None,
+            ssh_fingerprint: None,
+        }
+    }
+
+    fn config_with(targets: &[(&str, &str)]) -> CliConfig {
+        let mut c = CliConfig::default();
+        for (name, endpoint) in targets {
+            c.targets.insert(name.to_string(), target(endpoint));
+            c.target_scopes.insert(name.to_string(), Scope::Global);
+        }
+        c
+    }
+
+    // ── Session isolation ─────────────────────────────────────────────
+    //
+    // `CliConfig::resolve` consults the per-shell session file, so the
+    // resolve tests must not read (or write) the developer's real one.
+    // `KUNOBI_SESSIONS_DIR` redirects it; the mutex serializes the tests
+    // that touch that process-global.
+
+    struct SessionSandbox {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: PathBuf,
+    }
+
+    impl SessionSandbox {
+        /// Point session storage at a fresh empty directory. Nothing in
+        /// it, so `session::load()` reports "no active target".
+        fn new(tag: &str) -> Self {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dir = std::env::temp_dir().join(format!("kobe-cfg-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous = std::env::var_os("KUNOBI_SESSIONS_DIR");
+            // SAFETY: the mutex above guarantees no other test in this
+            // binary reads or writes this variable concurrently, and
+            // nothing else in kobectl touches it.
+            unsafe { std::env::set_var("KUNOBI_SESSIONS_DIR", &dir) };
+            Self {
+                _lock: lock,
+                previous,
+                dir,
+            }
+        }
+    }
+
+    impl Drop for SessionSandbox {
+        fn drop(&mut self) {
+            // SAFETY: same as in `new` — still holding the lock.
+            unsafe {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var("KUNOBI_SESSIONS_DIR", v),
+                    None => std::env::remove_var("KUNOBI_SESSIONS_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // ── overlay: local `.kobe.toml` on top of the global library ──────
+
+    /// A target defined in both files resolves to the **local**
+    /// definition and is flagged `Both`, which is what makes `kobe
+    /// config list` warn about the shadowing instead of silently
+    /// pointing at a different cluster than the user's global config
+    /// says.
+    #[test]
+    fn overlay_local_target_shadows_the_global_one_and_is_marked_both() {
+        let mut global = config_with(&[("prod", "https://global.test")]);
+        let mut local = CliConfig::default();
+        local
+            .targets
+            .insert("prod".to_string(), target("https://local.test"));
+
+        global.overlay(local);
+
+        assert_eq!(global.targets["prod"].endpoint, "https://local.test");
+        assert_eq!(global.target_scopes["prod"], Scope::Both);
+    }
+
+    /// A target that only the project file defines is `Local`, and one
+    /// that only the global library defines stays `Global`. These three
+    /// scopes are the entire contract of the SCOPE column.
+    #[test]
+    fn overlay_tags_local_only_and_global_only_targets_distinctly() {
+        let mut global = config_with(&[("prod", "https://global.test")]);
+        let mut local = CliConfig::default();
+        local
+            .targets
+            .insert("staging".to_string(), target("https://staging.test"));
+
+        global.overlay(local);
+
+        assert_eq!(global.target_scopes["prod"], Scope::Global);
+        assert_eq!(global.target_scopes["staging"], Scope::Local);
+        assert_eq!(global.targets.len(), 2);
+    }
+
+    /// Local values only override when they are actually set. An
+    /// endpoint-only `.kobe.toml` must not blank out a token that lives
+    /// in the global config.
+    #[test]
+    fn overlay_only_applies_local_fields_that_are_set() {
+        let mut global = CliConfig {
+            current_target: Some("prod".to_string()),
+            endpoint: Some("https://global.test".to_string()),
+            token: Some("global-token".to_string()),
+            ssh_fingerprint: Some("SHA256:global".to_string()),
+            ..CliConfig::default()
+        };
+
+        global.overlay(CliConfig::default());
+
+        assert_eq!(global.current_target.as_deref(), Some("prod"));
+        assert_eq!(global.endpoint.as_deref(), Some("https://global.test"));
+        assert_eq!(global.token.as_deref(), Some("global-token"));
+        assert_eq!(global.ssh_fingerprint.as_deref(), Some("SHA256:global"));
+    }
+
+    /// …and when they *are* set, local wins for every legacy field plus
+    /// the active-target name.
+    #[test]
+    fn overlay_local_values_win_when_present() {
+        let mut global = CliConfig {
+            current_target: Some("prod".to_string()),
+            endpoint: Some("https://global.test".to_string()),
+            auth: AuthMode::Oidc,
+            token: Some("global-token".to_string()),
+            ssh_fingerprint: Some("SHA256:global".to_string()),
+            ..CliConfig::default()
+        };
+        let local = CliConfig {
+            current_target: Some("staging".to_string()),
+            endpoint: Some("https://local.test".to_string()),
+            auth: AuthMode::Token,
+            token: Some("local-token".to_string()),
+            ssh_fingerprint: Some("SHA256:local".to_string()),
+            ..CliConfig::default()
+        };
+
+        global.overlay(local);
+
+        assert_eq!(global.current_target.as_deref(), Some("staging"));
+        assert_eq!(global.endpoint.as_deref(), Some("https://local.test"));
+        assert_eq!(global.auth, AuthMode::Token);
+        assert_eq!(global.token.as_deref(), Some("local-token"));
+        assert_eq!(global.ssh_fingerprint.as_deref(), Some("SHA256:local"));
+    }
+
+    /// Documented asymmetry: `auth` is overlaid only when the local
+    /// value differs from the default (`oidc`), because TOML cannot tell
+    /// "absent" from "explicitly oidc". A project file that spells out
+    /// `auth = "oidc"` therefore cannot pull a global `token` target
+    /// back to OIDC. Pinned so the limitation is a decision, not a
+    /// surprise.
+    #[test]
+    fn overlay_cannot_reset_auth_to_the_default_mode() {
+        let mut global = CliConfig {
+            auth: AuthMode::Token,
+            ..CliConfig::default()
+        };
+        let local = CliConfig {
+            auth: AuthMode::Oidc,
+            ..CliConfig::default()
+        };
+
+        global.overlay(local);
+
+        assert_eq!(global.auth, AuthMode::Token);
+    }
+
+    // ── legacy migration ──────────────────────────────────────────────
 
     #[test]
     fn migrates_legacy_flat_config_into_default_target() {
@@ -979,5 +1172,510 @@ mod tests {
             config.endpoint.as_deref(),
             Some("https://legacy.example.test")
         );
+    }
+
+    /// A config that already names a current target has been through the
+    /// migration (or was written by a modern kobe). Re-running it would
+    /// clobber that choice with a synthesised `default`.
+    #[test]
+    fn does_not_migrate_when_a_current_target_is_already_set() {
+        let mut config = CliConfig {
+            current_target: Some("prod".to_string()),
+            endpoint: Some("https://legacy.example.test".to_string()),
+            ..CliConfig::default()
+        };
+
+        assert!(!config.migrate_legacy_to_default_target());
+        assert!(config.targets.is_empty());
+        assert_eq!(config.current_target.as_deref(), Some("prod"));
+    }
+
+    /// A pristine config has nothing to migrate, and `save()` must not
+    /// be triggered — `load_global` writes the file back whenever this
+    /// returns true, so a spurious `true` would rewrite (and re-chmod)
+    /// the user's config on every single command.
+    #[test]
+    fn does_not_migrate_an_empty_config() {
+        let mut config = CliConfig::default();
+        assert!(!config.migrate_legacy_to_default_target());
+        assert!(config.targets.is_empty());
+        assert!(config.current_target.is_none());
+    }
+
+    /// A legacy config with credentials but no endpoint cannot become a
+    /// target (a target requires an endpoint). It must be left exactly
+    /// as it was — in particular *not* half-migrated with the flat
+    /// fields cleared, which would silently destroy the user's token.
+    #[test]
+    fn does_not_migrate_a_legacy_config_that_has_no_endpoint() {
+        let mut config = CliConfig {
+            endpoint: None,
+            auth: AuthMode::Token,
+            token: Some("secret-token".to_string()),
+            ..CliConfig::default()
+        };
+
+        assert!(!config.migrate_legacy_to_default_target());
+        assert!(config.targets.is_empty());
+        assert!(config.current_target.is_none());
+        assert_eq!(config.auth, AuthMode::Token);
+        assert_eq!(config.token.as_deref(), Some("secret-token"));
+    }
+
+    // ── resolve: which endpoint does this invocation talk to? ─────────
+
+    /// `--target` beats the per-shell session *and* the legacy
+    /// `current_target`. It is the documented one-shot escape hatch, so
+    /// it has to sit at the top of the precedence chain.
+    #[test]
+    fn resolve_prefers_the_explicit_target_override() {
+        let _sandbox = SessionSandbox::new("override");
+        let mut config = config_with(&[("prod", "https://prod.test"), ("dev", "https://dev.test")]);
+        config.current_target = Some("prod".to_string());
+        super::session::save(&super::session::SessionState {
+            current_target: "prod".to_string(),
+        })
+        .ok();
+
+        let resolved = config.resolve(Some("dev"), None).unwrap();
+        assert_eq!(resolved.target.as_deref(), Some("dev"));
+        assert_eq!(resolved.endpoint, "https://dev.test");
+    }
+
+    /// With no `--target`, the per-shell session file wins over the
+    /// legacy `current_target` in the config. That is the whole point of
+    /// per-shell sessions: two terminals pointing at different clusters
+    /// while sharing one config file.
+    #[test]
+    fn resolve_prefers_the_session_target_over_the_config_field() {
+        let sandbox = SessionSandbox::new("session-wins");
+        if super::session::save(&super::session::SessionState {
+            current_target: "dev".to_string(),
+        })
+        .is_err()
+        {
+            // Parent PID unavailable (no shell parent) — per-shell state
+            // is genuinely unusable here, nothing to assert.
+            drop(sandbox);
+            return;
+        }
+
+        let mut config = config_with(&[("prod", "https://prod.test"), ("dev", "https://dev.test")]);
+        config.current_target = Some("prod".to_string());
+
+        let resolved = config.resolve(None, None).unwrap();
+        assert_eq!(resolved.target.as_deref(), Some("dev"));
+        assert_eq!(resolved.endpoint, "https://dev.test");
+    }
+
+    /// Without a session file the legacy `current_target` still works —
+    /// configs written before per-shell sessions existed (and `kobe
+    /// config import` payloads) must keep resolving.
+    #[test]
+    fn resolve_falls_back_to_the_legacy_current_target() {
+        let _sandbox = SessionSandbox::new("legacy-current");
+        let mut config = config_with(&[("prod", "https://prod.test")]);
+        config.current_target = Some("prod".to_string());
+
+        let resolved = config.resolve(None, None).unwrap();
+        assert_eq!(resolved.target.as_deref(), Some("prod"));
+        assert_eq!(resolved.endpoint, "https://prod.test");
+    }
+
+    /// The pre-targets flat config still resolves, with no target name.
+    #[test]
+    fn resolve_falls_back_to_the_flat_legacy_endpoint() {
+        let _sandbox = SessionSandbox::new("flat");
+        let config = CliConfig {
+            endpoint: Some("https://legacy.test".to_string()),
+            auth: AuthMode::Token,
+            token: Some("t".to_string()),
+            ..CliConfig::default()
+        };
+
+        let resolved = config.resolve(None, None).unwrap();
+        assert!(resolved.target.is_none());
+        assert_eq!(resolved.endpoint, "https://legacy.test");
+        assert_eq!(resolved.auth, AuthMode::Token);
+        assert_eq!(resolved.token.as_deref(), Some("t"));
+    }
+
+    /// A name that isn't defined is an error, not a silent fallback to
+    /// some other target — pointing a CI job at the wrong cluster is far
+    /// worse than failing.
+    #[test]
+    fn resolve_rejects_an_unknown_target_name() {
+        let _sandbox = SessionSandbox::new("unknown");
+        let config = config_with(&[("prod", "https://prod.test")]);
+
+        let err = config.resolve(Some("nope"), None).unwrap_err().to_string();
+        assert!(err.contains("Unknown target 'nope'"), "got: {err}");
+    }
+
+    /// `-e/--endpoint` overrides only the URL: auth mode, token and SSH
+    /// fingerprint still come from the resolved target. Dropping the
+    /// auth would silently downgrade an authenticated call to anonymous.
+    #[test]
+    fn resolve_endpoint_override_keeps_the_targets_credentials() {
+        let _sandbox = SessionSandbox::new("endpoint-override");
+        let mut config = CliConfig::default();
+        config.targets.insert(
+            "prod".to_string(),
+            KobeTarget {
+                endpoint: "https://prod.test".to_string(),
+                auth: AuthMode::Token,
+                token: Some("prod-token".to_string()),
+                ssh_fingerprint: None,
+            },
+        );
+        config.current_target = Some("prod".to_string());
+
+        let resolved = config.resolve(None, Some("http://127.0.0.1:8080")).unwrap();
+        assert_eq!(resolved.endpoint, "http://127.0.0.1:8080");
+        assert_eq!(resolved.target.as_deref(), Some("prod"));
+        assert_eq!(resolved.auth, AuthMode::Token);
+        assert_eq!(resolved.token.as_deref(), Some("prod-token"));
+    }
+
+    /// `--endpoint` with no target at all resolves anonymously against
+    /// the legacy top-level auth — this is the `kobe -e http://localhost`
+    /// port-forward path, which must work on a machine with no config.
+    #[test]
+    fn resolve_endpoint_override_works_with_no_target_configured() {
+        let _sandbox = SessionSandbox::new("endpoint-only");
+        let config = CliConfig::default();
+
+        let resolved = config.resolve(None, Some("http://127.0.0.1:8080")).unwrap();
+        assert_eq!(resolved.endpoint, "http://127.0.0.1:8080");
+        assert!(resolved.target.is_none());
+        assert_eq!(resolved.auth, AuthMode::Oidc);
+    }
+
+    /// The two "nothing resolved" failures give different advice:
+    /// with targets defined the user needs `kobe config use`, without
+    /// them they need `kobe config set`. Pin both, because the message
+    /// *is* the UX for a first-run user.
+    #[test]
+    fn resolve_error_distinguishes_no_active_target_from_no_config_at_all() {
+        let _sandbox = SessionSandbox::new("errors");
+
+        let with_targets = config_with(&[("prod", "https://prod.test")]);
+        let err = with_targets.resolve(None, None).unwrap_err().to_string();
+        assert!(err.contains("kobe config use <name>"), "got: {err}");
+
+        let empty = CliConfig::default();
+        let err = empty.resolve(None, None).unwrap_err().to_string();
+        assert!(err.contains("kobe config set <name>"), "got: {err}");
+        assert!(
+            !err.contains("kobe config use"),
+            "must not suggest selecting among zero targets: {err}"
+        );
+    }
+
+    // ── Serde: on-disk compatibility of the config file ───────────────
+
+    /// `contexts` / `current_context` are the pre-rename field names.
+    /// Configs written by those versions are still on developers' disks;
+    /// dropping the aliases would silently present them with an empty
+    /// target list.
+    #[test]
+    fn config_still_reads_the_pre_rename_context_field_names() {
+        let config: CliConfig = serde_json::from_str(
+            r#"{
+                "current_context": "prod",
+                "contexts": {
+                    "prod": { "endpoint": "https://prod.test", "auth": "token", "token": "t" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.current_target.as_deref(), Some("prod"));
+        assert_eq!(config.targets["prod"].endpoint, "https://prod.test");
+        assert_eq!(config.targets["prod"].auth, AuthMode::Token);
+    }
+
+    /// A target with no `auth` key predates the auth modes and must
+    /// default to OIDC — the same default a freshly created target gets.
+    #[test]
+    fn target_without_an_auth_key_defaults_to_oidc() {
+        let t: KobeTarget = serde_json::from_str(r#"{ "endpoint": "https://x.test" }"#).unwrap();
+        assert_eq!(t.auth, AuthMode::Oidc);
+        assert!(t.token.is_none());
+        assert!(t.ssh_fingerprint.is_none());
+    }
+
+    /// The saved file stays minimal: the default auth mode, an empty
+    /// target map and unset secrets are all omitted. `target_scopes` is
+    /// runtime-only metadata and must never be written — round-tripping
+    /// it would make a *local* target look global on the next load.
+    #[test]
+    fn saved_config_omits_defaults_and_runtime_only_metadata() {
+        let mut config = config_with(&[("prod", "https://prod.test")]);
+        config.target_scopes.insert("prod".into(), Scope::Local);
+
+        let v: serde_json::Value = serde_json::to_value(&config).unwrap();
+        assert!(v.get("auth").is_none(), "default auth must be omitted: {v}");
+        assert!(v.get("endpoint").is_none(), "unset endpoint omitted: {v}");
+        assert!(v.get("token").is_none(), "unset token omitted: {v}");
+        assert!(
+            v.get("target_scopes").is_none() && v.get("targetScopes").is_none(),
+            "runtime-only scope metadata must never be persisted: {v}"
+        );
+        assert!(v["targets"]["prod"].get("token").is_none());
+
+        let empty = serde_json::to_value(CliConfig::default()).unwrap();
+        assert_eq!(empty, serde_json::json!({}), "a pristine config is `{{}}`");
+    }
+
+    /// Serialized configs round-trip through the JSON the `config
+    /// export` / `config import` pair uses.
+    #[test]
+    fn config_round_trips_through_export_import_json() {
+        let mut config = CliConfig {
+            current_target: Some("prod".to_string()),
+            ..CliConfig::default()
+        };
+        config.targets.insert(
+            "prod".to_string(),
+            KobeTarget {
+                endpoint: "https://prod.test".to_string(),
+                auth: AuthMode::Ssh,
+                token: None,
+                ssh_fingerprint: Some("SHA256:abc".to_string()),
+            },
+        );
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: CliConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.current_target.as_deref(), Some("prod"));
+        assert_eq!(back.targets["prod"].auth, AuthMode::Ssh);
+        assert_eq!(
+            back.targets["prod"].ssh_fingerprint.as_deref(),
+            Some("SHA256:abc")
+        );
+        assert!(
+            back.target_scopes.is_empty(),
+            "scopes are recomputed on load, never read from the file"
+        );
+    }
+
+    /// The local project file is TOML. A target defined there must
+    /// survive `toml::to_string_pretty` → `toml::from_str`, which is
+    /// exactly what `write_target_to_local` does on every
+    /// `kobe config set`.
+    #[test]
+    fn local_target_round_trips_through_toml() {
+        let mut local = CliConfig::default();
+        local.targets.insert(
+            "ci".to_string(),
+            KobeTarget {
+                endpoint: "https://ci.test".to_string(),
+                auth: AuthMode::Token,
+                token: Some("ci-token".to_string()),
+                ssh_fingerprint: None,
+            },
+        );
+
+        let rendered = toml::to_string_pretty(&local).expect("local config must serialize to TOML");
+        let back: CliConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(back.targets["ci"].endpoint, "https://ci.test");
+        assert_eq!(back.targets["ci"].auth, AuthMode::Token);
+        assert_eq!(back.targets["ci"].token.as_deref(), Some("ci-token"));
+    }
+
+    /// `write_target_to_local` re-serializes whatever is already in
+    /// `./.kobe.toml` before adding the new target. If that file still
+    /// carries pre-targets flat keys (`endpoint`, `token`, …), the
+    /// struct now holds a scalar *after* a table — the classic TOML
+    /// "values must be emitted before tables" hazard. `kobe config set`
+    /// must not blow up on such a file.
+    #[test]
+    fn local_config_with_both_flat_legacy_keys_and_targets_still_serializes() {
+        let mut local = CliConfig {
+            endpoint: Some("https://legacy.test".to_string()),
+            auth: AuthMode::Token,
+            token: Some("legacy-token".to_string()),
+            ..CliConfig::default()
+        };
+        local
+            .targets
+            .insert("ci".to_string(), target("https://ci.test"));
+
+        let rendered = toml::to_string_pretty(&local)
+            .expect("a legacy-plus-targets local config must still serialize");
+        let back: CliConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(back.endpoint.as_deref(), Some("https://legacy.test"));
+        assert_eq!(back.token.as_deref(), Some("legacy-token"));
+        assert_eq!(back.targets["ci"].endpoint, "https://ci.test");
+    }
+
+    // ── Auth mode + scope vocabulary ──────────────────────────────────
+
+    /// The four accepted `--auth` spellings, and the exact set. A typo
+    /// must be rejected with a message that lists the valid values
+    /// rather than silently falling back to OIDC.
+    #[test]
+    fn parse_auth_mode_accepts_exactly_the_four_documented_modes() {
+        assert_eq!(parse_auth_mode("none").unwrap(), AuthMode::None);
+        assert_eq!(parse_auth_mode("token").unwrap(), AuthMode::Token);
+        assert_eq!(parse_auth_mode("oidc").unwrap(), AuthMode::Oidc);
+        assert_eq!(parse_auth_mode("ssh").unwrap(), AuthMode::Ssh);
+
+        for bad in ["OIDC", "bearer", "", "oidc "] {
+            let err = parse_auth_mode(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("Valid: none, token, oidc, ssh"),
+                "`{bad}` must be rejected with the valid list; got: {err}"
+            );
+        }
+    }
+
+    /// `AuthMode`'s `Display` (used in `config list`'s AUTH column) and
+    /// its serde form (written to disk and to `--output json`) must
+    /// agree — otherwise the value a user copies out of the table is not
+    /// the value `--auth` accepts back.
+    #[test]
+    fn auth_mode_display_matches_its_serde_form() {
+        for mode in [
+            AuthMode::None,
+            AuthMode::Token,
+            AuthMode::Oidc,
+            AuthMode::Ssh,
+        ] {
+            let wire = serde_json::to_value(&mode).unwrap();
+            assert_eq!(wire, serde_json::json!(mode.to_string()));
+            assert_eq!(parse_auth_mode(&mode.to_string()).unwrap(), mode);
+        }
+        assert_eq!(AuthMode::default(), AuthMode::Oidc);
+    }
+
+    /// Same contract for `Scope`, which appears both in the text table
+    /// and in the `config list --output json` payload.
+    #[test]
+    fn scope_display_matches_its_serde_form() {
+        for scope in [Scope::Global, Scope::Local, Scope::Both] {
+            assert_eq!(
+                serde_json::to_value(scope).unwrap(),
+                serde_json::json!(scope.to_string())
+            );
+        }
+        assert_eq!(Scope::Global.to_string(), "global");
+        assert_eq!(Scope::Local.to_string(), "local");
+        assert_eq!(Scope::Both.to_string(), "both");
+    }
+
+    // ── Secret handling ───────────────────────────────────────────────
+
+    /// `kobe config show` prints the configured bearer token. It must
+    /// never print enough of it to be reusable: short tokens are fully
+    /// elided, and long ones keep only a 4+4 fingerprint. A regression
+    /// here leaks a credential into terminal scrollback and CI logs.
+    #[test]
+    fn token_display_never_reveals_a_usable_secret() {
+        assert_eq!(mask_token(None), "(not set)");
+        // 8 chars or fewer: a 4+4 elision would print the whole thing.
+        assert_eq!(mask_token(Some("")), "****");
+        assert_eq!(mask_token(Some("short")), "****");
+        assert_eq!(mask_token(Some("12345678")), "****");
+        // 9+ chars: head and tail only, and never the middle.
+        assert_eq!(mask_token(Some("123456789")), "1234...6789");
+        let secret = "kobe_live_ABCDEFGHIJKLMNOP";
+        let masked = mask_token(Some(secret));
+        assert_eq!(masked, "kobe...MNOP");
+        assert!(
+            !masked.contains("live_ABCDEFGHIJKL"),
+            "the body of the token must not appear: {masked}"
+        );
+    }
+
+    // ── JSON output shapes ────────────────────────────────────────────
+
+    /// The `legacy` block in `config show --output json` exists only to
+    /// tell a user they still have a pre-targets config. It must be
+    /// absent for a modern config so scripts can use its presence as the
+    /// "needs migration" signal.
+    #[test]
+    fn legacy_json_block_appears_only_for_pre_targets_configs() {
+        assert!(super::legacy_output(&config_with(&[("prod", "https://p.test")])).is_none());
+        assert!(super::legacy_output(&CliConfig::default()).is_none());
+
+        let legacy = CliConfig {
+            endpoint: Some("https://legacy.test".to_string()),
+            ..CliConfig::default()
+        };
+        let out = super::legacy_output(&legacy).expect("legacy block expected");
+        assert_eq!(out.endpoint.as_deref(), Some("https://legacy.test"));
+
+        // A non-default auth alone is enough to count as legacy.
+        let auth_only = CliConfig {
+            auth: AuthMode::Token,
+            ..CliConfig::default()
+        };
+        assert!(super::legacy_output(&auth_only).is_some());
+    }
+
+    /// `config show --output json` is a scripted surface: keys are
+    /// camelCase, absent optionals are omitted (not null), and the
+    /// resolved block reflects the same precedence `resolve` applies.
+    #[test]
+    fn config_view_json_uses_camel_case_and_omits_absent_optionals() {
+        let _sandbox = SessionSandbox::new("view");
+        let mut config = CliConfig::default();
+        config.targets.insert(
+            "prod".to_string(),
+            KobeTarget {
+                endpoint: "https://prod.test".to_string(),
+                auth: AuthMode::Ssh,
+                token: None,
+                ssh_fingerprint: Some("SHA256:abc".to_string()),
+            },
+        );
+        config.current_target = Some("prod".to_string());
+
+        let v = serde_json::to_value(super::config_view_output(&config, None)).unwrap();
+
+        assert_eq!(v["currentTarget"], "prod");
+        assert_eq!(v["targets"]["prod"]["sshFingerprint"], "SHA256:abc");
+        assert!(
+            v["targets"]["prod"].get("token").is_none(),
+            "an unset token must be omitted, not null: {v}"
+        );
+        assert!(v.get("legacy").is_none(), "no legacy block expected: {v}");
+        assert_eq!(v["resolved"]["target"], "prod");
+        assert_eq!(v["resolved"]["endpoint"], "https://prod.test");
+        assert_eq!(v["resolved"]["auth"], "ssh");
+    }
+
+    /// When nothing resolves, the `resolved` key is omitted entirely
+    /// rather than emitted as null — `config show --output json` on a
+    /// fresh machine must still be valid, parseable output.
+    #[test]
+    fn config_view_json_omits_resolved_when_nothing_is_configured() {
+        let _sandbox = SessionSandbox::new("view-empty");
+        let v =
+            serde_json::to_value(super::config_view_output(&CliConfig::default(), None)).unwrap();
+
+        assert!(v.get("resolved").is_none(), "got: {v}");
+        assert!(v.get("currentTarget").is_none(), "got: {v}");
+        assert_eq!(v["targets"], serde_json::json!({}));
+        assert!(v["path"].is_string());
+        assert!(v["exists"].is_boolean());
+    }
+
+    /// Guard against `BTreeMap` being swapped for a `HashMap`: the
+    /// targets map is rendered directly into `config list`, so a
+    /// non-deterministic order would reshuffle the table (and the JSON)
+    /// on every invocation.
+    #[test]
+    fn targets_iterate_in_stable_alphabetical_order() {
+        let config = config_with(&[
+            ("zeta", "https://z.test"),
+            ("alpha", "https://a.test"),
+            ("mid", "https://m.test"),
+        ]);
+        let names: Vec<&str> = config.targets.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
 }
