@@ -690,6 +690,17 @@ pub fn compute_pool_actions(
     //
     // `.take(max_recycling)` caps the per-reconcile rate; the floor
     // check inside the loop handles the early-break case.
+    // How many Ready members step 4 actually wants to roll. This is NOT
+    // the same as `counts.ready_drifted`: `count_states` partitions purely
+    // on hash equality, so it counts an unstamped legacy member as *clean*
+    // and ignores PKI expiry entirely, whereas the candidate list above
+    // uses `entry_drift_eligible` (which recycles unstamped members past
+    // the grace period) plus `cert_expiring`. Step 6 sizes the surge off
+    // this number, because sizing it off `ready_drifted` would leave both
+    // of those cases with a floor they can never clear — the recycle would
+    // block forever with no surge to buy headroom.
+    let recycle_candidates = drifted_ready.len() as u32;
+
     let mut remaining_ready = counts.ready;
     for (name, _entry) in drifted_ready.iter().take(policy.max_recycling as usize) {
         if remaining_ready <= policy.min_ready_during_upgrade {
@@ -739,9 +750,14 @@ pub fn compute_pool_actions(
     // Surge only fires when there's drift to absorb. A fresh pool
     // boot (no drift) refills exactly to `min_ready`, never above —
     // so existing tests for clean pools see byte-identical behavior.
-    let drift_in_flight = counts.ready_drifted; // not creating_drifted —
-    // those got Deleted in step 3 so they're already accounted for in
-    // the deficit calculation.
+    // `recycle_candidates` rather than `counts.ready_drifted`: the two
+    // differ for unstamped legacy members and for PKI-expiring ones, and
+    // in both cases it is the candidate list that decides whether step 4
+    // is trying to recycle. Taking the larger of the two keeps every
+    // hash-drift path byte-identical while ensuring a blocked recycle
+    // always gets its surge. Not creating_drifted — those got Deleted in
+    // step 3 so they're already accounted for in the deficit calculation.
+    let drift_in_flight = counts.ready_drifted.max(recycle_candidates);
     let warm_target = if drift_in_flight > 0 {
         min_ready + policy.max_surge.min(drift_in_flight)
     } else {
@@ -897,9 +913,15 @@ pub fn backoff_delay_for(
     // 2^(n-1), saturating against u32 overflow at n >= 32.
     let shift = consecutive_failures.saturating_sub(1).min(31);
     let factor = (multiplier as u64).saturating_pow(shift);
+    // `factor` is deliberately saturating, so it can be `u64::MAX` for a
+    // large multiplier — and `u64::MAX as i64` is `-1`, which would turn
+    // the whole delay negative. `.min(max)` would not catch that: it only
+    // bounds the result from above, so a negative delay sails through and
+    // `next_attempt_at = now + delay` lands in the past, disabling the
+    // backoff at precisely the failure count it exists to throttle.
     let secs = base
         .num_seconds()
-        .saturating_mul(factor as i64)
+        .saturating_mul(i64::try_from(factor).unwrap_or(i64::MAX))
         .min(max.num_seconds());
     Some(chrono::Duration::seconds(secs))
 }
@@ -2430,6 +2452,110 @@ mod tests {
             backoff_delay_for(&p, 99),
             Some(chrono::Duration::seconds(30))
         );
+    }
+
+    /// A pool of unstamped legacy members must still make progress.
+    ///
+    /// Two predicates decide "is this drifted", and they disagreed about
+    /// `spec_hash == None`: [`entry_drift_eligible`] treats an unstamped
+    /// member past the grace period as drift-eligible (so upgrades clean
+    /// it up automatically), while [`count_states`] counts it as *clean*.
+    ///
+    /// That disagreement deadlocks the rolling recycle. Step 4 finds the
+    /// members recycle-eligible but the `min_ready_during_upgrade` floor
+    /// blocks the Delete, and the surge that is supposed to buy the
+    /// headroom never fires, because it is sized off `ready_drifted` —
+    /// which is 0. The pool then emits no actions at all, forever, and
+    /// the doc-comment promise that legacy members get cleaned up
+    /// "instead of requiring a manual delete" quietly fails to hold.
+    #[test]
+    fn unstamped_legacy_ready_members_surge_instead_of_deadlocking() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 2,
+                max_clusters: 10,
+                scale_up_threshold: 0,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+        // Both members are legacy: no stamped hash, and long past the
+        // grace period that guards a not-yet-round-tripped new cluster.
+        let mut clusters = HashMap::new();
+        for i in 0..2 {
+            let mut e = make_entry(ClusterState::Ready);
+            e.spec_hash = None;
+            e.state_since = Some(now - chrono::Duration::hours(1));
+            clusters.insert(format!("pool-test-profile-{i}"), e);
+        }
+        let state = PoolState { clusters };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        // The floor legitimately blocks deleting either member right now.
+        // What must NOT happen is emitting nothing: without a surge create
+        // the floor can never be cleared, so the pool never converges.
+        assert!(
+            actions.iter().any(|a| matches!(a, PoolAction::Create(_))),
+            "unstamped legacy members are recycle-eligible but blocked by the \
+             floor, so the pool must surge to buy headroom — got {actions:?}"
+        );
+    }
+
+    /// Backoff is a delay, so it must never be negative — otherwise
+    /// `next_attempt_at = now + delay` lands in the *past* and the
+    /// backoff gate stops throttling exactly when it is needed most.
+    ///
+    /// The failure mode this pins is arithmetic, not logical: a large
+    /// multiplier saturates the `u64` growth factor, and reinterpreting
+    /// `u64::MAX` as `i64` yields `-1`. The `.min(max)` cap looks like
+    /// it bounds the result, but it only bounds it from above.
+    #[test]
+    fn backoff_delay_is_never_negative_for_any_multiplier() {
+        for multiplier in [2u32, 3, 5, 10, 100, u32::MAX] {
+            let mut p = make_profile(
+                0,
+                Some(crate::crd::ScalingConfig {
+                    min_ready: 1,
+                    max_clusters: 3,
+                    scale_up_threshold: 0,
+                    scale_down_after: "30m".to_string(),
+                    queue_timeout: "5m".to_string(),
+                    creating_timeout: "10m".to_string(),
+                    failure_backoff: Some(crate::crd::FailureBackoffConfig {
+                        base: "5s".to_string(),
+                        multiplier,
+                        max: "120s".to_string(),
+                    }),
+                }),
+            );
+            p.status = None;
+
+            for failures in 1..=64u32 {
+                let delay = backoff_delay_for(&p, failures).expect("non-zero failures back off");
+                assert!(
+                    delay >= chrono::Duration::zero(),
+                    "multiplier={multiplier} failures={failures} produced a negative \
+                     backoff of {delay:?}, which resolves to a next-attempt time in \
+                     the past and disables throttling"
+                );
+                assert!(
+                    delay <= chrono::Duration::seconds(120),
+                    "multiplier={multiplier} failures={failures} exceeded the \
+                     configured 120s cap with {delay:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -216,6 +216,15 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             Ok(current) => Arc::new(current),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 debug!(lease = %name, "Lease disappeared before reconcile could load current state");
+                // Evict it from the priority queue on the way out. Every
+                // other `remove_from_queue` call site needs a live lease to
+                // reconcile, so a hard DELETE (kubectl, owner GC, or the
+                // loser of a create race) would otherwise strand the entry
+                // permanently. Because the queue sorts oldest-first within a
+                // priority, that ghost sits at the head and every later lease
+                // for the pool sees `is_head == false` — so the pool stops
+                // binding entirely until the operator restarts.
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 return Ok(Action::await_change());
             }
             Err(err) => return Err(LeaseError::Kube(err)),
@@ -1328,6 +1337,93 @@ mod tests {
         let queue = q.get("test-profile").unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].lease_name, "lease-b");
+    }
+
+    /// A lease that disappears while `Pending` must leave the in-memory
+    /// priority queue with it.
+    ///
+    /// Every other eviction site needs a live lease to reconcile, so a
+    /// hard `DELETE` (kubectl, owner GC, or the loser of a create race)
+    /// used to strand its entry forever. That is not a leak so much as a
+    /// deadlock: the queue sorts oldest-first within a priority, so the
+    /// ghost sits at the head, every later lease for the pool computes
+    /// `is_head == false`, and nothing in that pool can bind again until
+    /// the operator restarts — `rebuild_queues` runs only at startup and
+    /// only inserts.
+    #[tokio::test]
+    async fn disappeared_pending_lease_is_evicted_from_the_queue() {
+        let (ctx, server) = test_lease_context().await;
+
+        // The ghost, plus a real lease queued behind it.
+        {
+            let mut q = ctx.queues.write().await;
+            q.insert(
+                "test-profile".to_string(),
+                vec![
+                    PendingLease {
+                        lease_name: "ghost-1".to_string(),
+                        priority: 50,
+                        created_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                    },
+                    PendingLease {
+                        lease_name: "real-1".to_string(),
+                        priority: 50,
+                        created_at: chrono::Utc::now(),
+                    },
+                ],
+            );
+        }
+
+        // A cached object carrying a resourceVersion, so the reconciler
+        // re-reads it from the apiserver — which is where it learns the
+        // lease is gone.
+        let lease: Arc<ClusterLease> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "ghost-1",
+                    "namespace": "test-ns",
+                    "resourceVersion": "42"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "user@test.com" },
+                    "priority": 50
+                },
+                "status": { "phase": "Pending" }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/ghost-1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("clusterleases", "ghost-1")),
+            )
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
+        assert_eq!(action, Action::await_change());
+
+        let queues = ctx.queues.read().await;
+        let queue = queues
+            .get("test-profile")
+            .expect("pool queue still present");
+        assert!(
+            !queue.iter().any(|p| p.lease_name == "ghost-1"),
+            "deleted lease must not remain queued — it would block the pool head forever"
+        );
+        assert_eq!(
+            queue.first().map(|p| p.lease_name.as_str()),
+            Some("real-1"),
+            "the lease behind the ghost must become head and be able to bind"
+        );
     }
 
     #[tokio::test]
