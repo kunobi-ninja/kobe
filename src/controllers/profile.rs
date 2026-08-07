@@ -577,6 +577,128 @@ mod cluster_instance_tests {
         );
     }
 
+    /// A lease that binds mid-reconcile must not be undone by the
+    /// end-of-reconcile status sync.
+    ///
+    /// `reconcile_profile` builds `pool_state` and then does seconds of
+    /// work — bootstrap resolution, per-instance cert reads, a backend
+    /// health probe, creates and deletes. A lease can bind in that
+    /// window: `reserve_ready_instance` sets `phase: Leased` and a
+    /// `leaseRef`. The sync then writes `phase` back from the STALE
+    /// in-memory entry while reading `leaseRef` fresh, leaving the
+    /// instance `Ready` on disk with a live lease attached.
+    ///
+    /// That state is sticky, and `compute_pool_actions` has no lease
+    /// awareness at all — so the next reconcile can drift-recycle or
+    /// idle-scale-down a cluster a tenant is actively holding, breaking
+    /// the invariant its own doc-comment states ("Leased instances are
+    /// never Deleted, regardless of drift").
+    ///
+    /// Same class as the `spec_hash` guard a few lines below it: stale
+    /// in-memory state must not clobber a fresher on-disk value.
+    #[tokio::test]
+    async fn status_sync_does_not_revert_an_instance_that_took_a_lease_mid_reconcile() {
+        let (ctx, server) = test_profile_context().await;
+        let name = "pool-test-profile-0";
+        // What `reserve_ready_instance` stamps atomically with the
+        // reservation. The 2-minute orphan-reclaim grace is measured
+        // against it, so it must survive this sync.
+        let fresh_state_since = chrono::Utc::now().to_rfc3339();
+
+        // On disk the lease controller has already bound this instance.
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": { "name": name, "namespace": "test-ns" },
+                "spec": { "poolRef": { "name": "test-profile" } },
+                "status": {
+                    "phase": "Leased",
+                    "leaseRef": { "name": "lease-abc123def456" },
+                    "stateSince": fresh_state_since,
+                    "provisioned": true
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        // Capture whatever the sync patches back.
+        let patched = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = patched.clone();
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{name}/status"
+            )))
+            .respond_with(move |req: &wiremock::Request| {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                    sink.lock().unwrap().push(v);
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": { "name": name, "namespace": "test-ns" },
+                    "spec": { "poolRef": { "name": "test-profile" } },
+                    "status": { "phase": "Leased" }
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        // The in-memory view is from before the bind: still Ready, and
+        // carrying an idle timestamp the bind has since cleared.
+        let mut entry = crate::pool::manager::ClusterEntry {
+            state: ClusterState::Ready,
+            idle_since: Some(chrono::Utc::now() - chrono::Duration::hours(2)),
+            health_failures: 0,
+            state_since: None,
+            spec_hash: None,
+            scheduling_blocked: false,
+            crashlooping: false,
+            crash_message: None,
+            cert_horizon_secs: None,
+        };
+        // Deliberately STALE, matching the rest of this pre-bind snapshot.
+        // Stamping it `now` here would mask the reservation race below.
+        entry.state_since = Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        let mut clusters = HashMap::new();
+        clusters.insert(name.to_string(), entry);
+        let pool_state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
+
+        sync_cluster_instance_statuses(&ctx.client, "test-ns", &pool_state).await;
+
+        let writes = patched.lock().unwrap().clone();
+        for body in &writes {
+            let phase = body.pointer("/status/phase").and_then(|p| p.as_str());
+            assert_ne!(
+                phase,
+                Some("Ready"),
+                "the sync reverted a leased instance to Ready while its leaseRef \
+                 was still set — the pool manager would then treat it as \
+                 reclaimable. body: {body}"
+            );
+            assert_eq!(
+                body.pointer("/status/stateSince").and_then(|v| v.as_str()),
+                Some(fresh_state_since.as_str()),
+                "the reservation's fresh stateSince must survive — the 2-minute \
+                 orphan-reclaim grace is measured against it, and a stale value \
+                 makes it instantly elapsed so the reclaimer can take a live \
+                 reservation away from a binding lease. body: {body}"
+            );
+            assert!(
+                body.pointer("/status/idleSince")
+                    .is_none_or(|v| v.is_null()),
+                "a leased instance must not be given back a stale idleSince — it \
+                 re-arms idle scale-down against a cluster in use. body: {body}"
+            );
+        }
+    }
+
     /// Queue depth must count *unmet* demand only.
     ///
     /// A `Pending` lease that already carries a `clusterName` has had an
@@ -1755,18 +1877,70 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
             Ok(instance) => instance.status.unwrap_or_default(),
             Err(_) => continue,
         };
+        // A lease can bind between `pool_state` being built and this sync
+        // running — `reconcile_profile` does seconds of I/O in between. In
+        // that window `entry` is stale: it still says Ready, while the
+        // instance on disk is Leased with a `leaseRef`.
+        //
+        // Writing the stale phase back would leave the instance Ready on
+        // disk with a live lease attached, and that state is sticky (the
+        // instance controller's Ready arm never re-derives phase from
+        // `lease_ref`). `compute_pool_actions` has no lease awareness at
+        // all, so the next reconcile could drift-recycle or idle-scale-down
+        // a cluster a tenant is holding — breaking the invariant stated on
+        // that function: "Leased instances are never Deleted, regardless of
+        // drift". Restoring a stale `idle_since` compounds it by re-arming
+        // the idle timer against a cluster in use.
+        //
+        // So while the instance holds a lease, the lease controller owns
+        // its phase and idle timer: preserve what is on disk rather than
+        // overwriting from memory. Same rule as `spec_hash` below — stale
+        // in-memory state must not clobber a fresher on-disk value.
+        let lease_held = current.lease_ref.is_some();
+        let phase = if lease_held {
+            current.phase.clone()
+        } else {
+            cluster_phase_from_state(&entry.state)
+        };
+        let idle_since = if lease_held {
+            current.idle_since.clone()
+        } else {
+            entry.idle_since.map(|ts| ts.to_rfc3339())
+        };
+        // `state_since` is part of the same atomic reservation write, and it is
+        // load-bearing, not cosmetic. The two-phase bind leaves the lease
+        // `Pending` with no `clusterName` between reserving the instance and
+        // patching the lease, so `evaluate_leased_instance` sees
+        // `reservation_orphaned == true` during every NORMAL bind. The only
+        // thing stopping it from releasing the reservation there is the
+        // two-minute `reservation_grace_elapsed` check against this field —
+        // which is exactly why `reserve_ready_instance` stamps it `now`.
+        //
+        // Writing the stale in-memory value back would make that grace
+        // instantly elapsed and let the reclaimer take a live reservation away
+        // from a binding lease. That path only became reachable once this
+        // function started preserving `Leased` (before, the instance was
+        // reverted to `Ready` and the leased arm never ran) — so preserving
+        // phase without preserving this timestamp would trade one bug for a
+        // worse one.
+        let state_since = if lease_held {
+            current.state_since.clone()
+        } else {
+            entry.state_since.map(|ts| ts.to_rfc3339())
+        };
+
         let _ = patch_cluster_instance_status(
             client,
             namespace,
             cluster_name,
             ClusterInstanceStatus {
-                phase: cluster_phase_from_state(&entry.state),
+                phase,
                 provisioned: current.provisioned,
                 bootstrapped: current.bootstrapped,
                 lease_ref: current.lease_ref,
                 active_bootstrap: current.active_bootstrap,
-                idle_since: entry.idle_since.map(|ts| ts.to_rfc3339()),
-                state_since: entry.state_since.map(|ts| ts.to_rfc3339()),
+                idle_since,
+                state_since,
                 health_failures: entry.health_failures,
                 // Prefer the on-disk hash over the in-memory entry: an
                 // operator restart that rebuilds pool_state from the API may
