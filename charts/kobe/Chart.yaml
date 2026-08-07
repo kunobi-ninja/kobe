@@ -49,12 +49,14 @@ annotations:
   # whitelisted rather than tracked as ours.
   #
   # NOT covered: the optional bundled etcd subchart (`etcd.bundled: true`,
-  # off by default) brings its own bitnami/etcd image. Artifact Hub does
-  # not auto-discover subchart images, and the tag comes from whatever
-  # the floating `~10.0` dependency resolves to — so pinning one here
-  # would be stale on the next resolution and nothing gates it. Users of
-  # the bundled path should scan that image via the etcd chart's own
-  # listing.
+  # off by default) brings its own bitnami/etcd image, and Artifact Hub
+  # does not auto-discover subchart images. The subchart version itself
+  # is pinned (Chart.lock, etcd 10.0.11), but the image tag lives inside
+  # that subchart's values — so an entry here would have to be re-checked
+  # by hand on every `helm dependency update`, with nothing gating it.
+  # That is the same silent-staleness failure the first-party tags above
+  # are gated against, so it is left out deliberately: users of the
+  # bundled path should scan that image via the etcd chart's own listing.
   artifacthub.io/images: |
     - name: kobe-operator
       image: docker.io/zondax/kobe-operator:v0.37.0
