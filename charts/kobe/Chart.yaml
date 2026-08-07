@@ -2,7 +2,7 @@ apiVersion: v2
 name: kobe
 description: >-
   Kubernetes operator for instant cluster provisioning via warm pools.
-  Supports multiple backends: k3s, k0s, vcluster, and CAPI.
+  Supports multiple backends: k3s, k0s, vcluster, vkobe, and CAPI.
 type: application
 version: 0.37.0
 appVersion: "0.37.0"
