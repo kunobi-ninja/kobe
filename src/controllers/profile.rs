@@ -122,6 +122,7 @@ mod cluster_instance_tests {
         }));
         let pool_state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let counts = crate::pool::manager::StateCounts::default();
         let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
@@ -142,6 +143,7 @@ mod cluster_instance_tests {
         }));
         let pool_state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let counts = crate::pool::manager::StateCounts::default();
         let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
@@ -211,7 +213,10 @@ mod cluster_instance_tests {
         older.crashlooping = true;
         older.crash_message = Some("older crash".to_string());
         clusters.insert("pool-p-2".to_string(), older);
-        let pool_state = PoolState { clusters };
+        let pool_state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let counts = crate::pool::manager::StateCounts::default();
         let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
 
@@ -245,7 +250,10 @@ mod cluster_instance_tests {
             "pool-p-0".to_string(),
             entry_with_block(ClusterState::Creating, true),
         );
-        let pool_state = PoolState { clusters };
+        let pool_state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let counts = crate::pool::manager::StateCounts::default();
         let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
 
@@ -282,7 +290,10 @@ mod cluster_instance_tests {
             "pool-p-0".to_string(),
             entry_with_block(ClusterState::Creating, false),
         );
-        let pool_state = PoolState { clusters };
+        let pool_state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let counts = crate::pool::manager::StateCounts::default();
         let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
 
@@ -310,7 +321,10 @@ mod cluster_instance_tests {
             "pool-p-0".to_string(),
             entry_with_block(ClusterState::Creating, false),
         );
-        let pool_state = PoolState { clusters };
+        let pool_state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let counts = crate::pool::manager::StateCounts::default();
         let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
 
@@ -351,7 +365,10 @@ mod cluster_instance_tests {
                 format!("pool-{name}-0"),
                 entry_with_block(ClusterState::Creating, false),
             );
-            let pool_state = PoolState { clusters };
+            let pool_state = PoolState {
+                clusters,
+                queue_depth: 0,
+            };
             let counts = crate::pool::manager::StateCounts::default();
             let backoff = compute_backoff_state(&profile, &pool_state, &counts, chrono::Utc::now());
             let reason = backoff
@@ -1068,25 +1085,10 @@ async fn reconcile_profile(
         .with_label_values(&[name.as_str()])
         .set(i64::from(capacity_blocked));
 
-    let queue_depth = {
-        let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={name}"));
-        match leases_api.list(&lp).await {
-            Ok(leases) => leases
-                .iter()
-                .filter(|c| {
-                    c.status
-                        .as_ref()
-                        .map(|s| s.phase == LeasePhase::Pending)
-                        .unwrap_or(true)
-                })
-                .count() as u32,
-            Err(e) => {
-                warn!(profile = %name, "Failed to list leases for queue depth: {e:?}");
-                0
-            }
-        }
-    };
+    // Same value the warm target was computed against in
+    // `build_pool_state` — reused rather than re-LISTed so the status
+    // and metric can never disagree with the scale-up decision.
+    let queue_depth = pool_state.queue_depth;
 
     crate::metrics::QUEUE_DEPTH
         .with_label_values(&[&name])
@@ -1255,7 +1257,10 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
                 profile = profile_name,
                 "Failed to list ClusterInstances during pool rebuild: {e}"
             );
-            return PoolState { clusters };
+            return PoolState {
+                clusters,
+                queue_depth: 0,
+            };
         }
     };
 
@@ -1315,13 +1320,50 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
         );
     }
 
+    let queue_depth = count_pending_claims(ctx, profile_name).await;
+
     info!(
         profile = profile_name,
         discovered = clusters.len(),
+        queue_depth,
         "Pool state refreshed from ClusterInstances"
     );
 
-    PoolState { clusters }
+    PoolState {
+        clusters,
+        queue_depth,
+    }
+}
+
+/// Count claims queued against `profile_name` — leases still in
+/// `Pending`, i.e. demand no instance has been reserved for yet.
+///
+/// Feeds both the warm target in [`crate::pool::manager::compute_pool_actions`]
+/// (so a scale-to-zero pool provisions on demand) and the pool's
+/// `queueDepth` status/metric, which is why it is read once per
+/// reconcile rather than at each use site.
+///
+/// Best-effort: a failed LIST reports 0 rather than failing the
+/// reconcile. Under-reporting only delays scale-up to the next pass,
+/// whereas failing here would block every other pool action.
+async fn count_pending_claims(ctx: &ProfileContext, profile_name: &str) -> u32 {
+    let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/profile={profile_name}"));
+    match leases_api.list(&lp).await {
+        Ok(leases) => leases
+            .iter()
+            .filter(|c| {
+                c.status
+                    .as_ref()
+                    .map(|s| s.phase == LeasePhase::Pending)
+                    .unwrap_or(true)
+            })
+            .count() as u32,
+        Err(e) => {
+            warn!(profile = %profile_name, "Failed to list leases for queue depth: {e:?}");
+            0
+        }
+    }
 }
 
 /// Resolve every `BootstrapConfig` referenced by `profile.spec.bootstraps`,
