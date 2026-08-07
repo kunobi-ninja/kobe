@@ -266,10 +266,17 @@ pub enum ClusterState {
 }
 
 /// Pool state for a single profile.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PoolState {
     /// Map of cluster name → state.
     pub clusters: HashMap<String, ClusterEntry>,
+    /// Claims currently queued against this pool (leases in `Pending`).
+    ///
+    /// Unserved demand, and therefore an input to the warm target: a
+    /// pool whose `min_ready` is 0 has no standing warm target, so
+    /// queued claims are the *only* thing that can make it provision.
+    /// See the scale-up step in [`compute_pool_actions`].
+    pub queue_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +556,19 @@ pub fn compute_pool_actions(
             (spec.size, spec.size + 10, 0, None) // no scale-down for fixed pools
         };
 
+    // Queued claims raise the warm target, but only for pools that opted
+    // into autoscaling. A fixed pool's contract is `spec.size` exactly,
+    // and it has no scale-down path (`scale_down_after` is `None` above),
+    // so anything provisioned above `size` on a queue spike would be held
+    // forever with nothing to trim it. Demand-driven provisioning is a
+    // `scaling` feature; leaking it into fixed pools would silently change
+    // what every existing non-scaling pool does.
+    let queue_demand = if spec.scaling.is_some() {
+        state.queue_depth
+    } else {
+        0
+    };
+
     let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
     let counts = count_states(state, Some(&current_hash));
     let total =
@@ -728,6 +748,15 @@ pub fn compute_pool_actions(
         min_ready
     };
 
+    // Queued claims are demand the standing warm target does not cover,
+    // so they raise it. This is what makes scale-to-zero pools work:
+    // with `min_ready == 0` the gate below reads `0 < 0` and the pool
+    // would never create anything, leaving every claim to sit queued
+    // until `queue_timeout` expired it. Still bounded by `max_clusters`
+    // and `MAX_BURST`, so a queue spike cannot become a create storm.
+    // `saturating_add` to match the arithmetic discipline in this block.
+    let warm_target = warm_target.saturating_add(queue_demand);
+
     if counts.ready + counts.creating < warm_target && total < max_clusters {
         let deficit = warm_target.saturating_sub(counts.ready + counts.creating);
         let room = max_clusters.saturating_sub(total);
@@ -757,7 +786,17 @@ pub fn compute_pool_actions(
             .collect();
         idle_candidates.sort_by_key(|(_, e)| e.idle_since);
 
-        let excess = counts.ready.saturating_sub(min_ready);
+        // Protect the capacity queued claims were counted against, not
+        // just `min_ready`. The scale-up step above treats a queued claim
+        // as covered by an existing Ready cluster and therefore emits no
+        // Create for it; if scale-down then measured excess against
+        // `min_ready` alone, the same reconcile would Delete that very
+        // cluster. The claim would lose the instance about to serve it and
+        // pay a full cold start — and the Delete would race the lease
+        // controller reserving it.
+        let excess = counts
+            .ready
+            .saturating_sub(min_ready.saturating_add(queue_demand));
         let mut deleted_excess = 0u32;
         for (name, entry) in idle_candidates {
             if deleted_excess >= excess {
@@ -1231,7 +1270,10 @@ mod tests {
         clusters.insert("pool-test-0".into(), make_entry(ClusterState::Ready));
         clusters.insert("pool-test-5".into(), make_entry(ClusterState::Leased));
         clusters.insert("pool-test-2".into(), make_entry(ClusterState::Creating));
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         assert_eq!(max_existing_index(&state, "test"), 5);
     }
@@ -1240,6 +1282,7 @@ mod tests {
     fn test_max_existing_index_empty() {
         let state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         assert_eq!(max_existing_index(&state, "test"), 0);
     }
@@ -1290,7 +1333,10 @@ mod tests {
             },
         );
 
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let counts = count_states(&state, None);
 
         assert_eq!(counts.ready, 1);
@@ -1365,7 +1411,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let counts = count_states(&state, Some(&current));
 
         assert_eq!(counts.ready, 3);
@@ -1498,6 +1547,7 @@ mod tests {
         );
         let state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let now = chrono::Utc::now();
 
@@ -1519,6 +1569,284 @@ mod tests {
         }
     }
 
+    /// `scaling.min_ready` fully replaces `spec.size` as the warm
+    /// target: once a `scaling` block is present, `spec.size` is never
+    /// read (see the branch in [`compute_pool_actions`] and the field's
+    /// own doc-comment on `ClusterPoolSpec::size`).
+    ///
+    /// Pinned because the two fields read as additive in YAML, so a
+    /// `size: 3` + `minReady: 0` pool looks like it keeps 3 warm when it
+    /// actually keeps none. Documentation that says otherwise has drifted
+    /// before; this test is what makes the claim enforceable.
+    #[test]
+    fn scaling_min_ready_overrides_spec_size_for_warm_target() {
+        // size=3 says "3 warm", scaling.min_ready=0 says "none".
+        // min_ready wins, so an empty pool must stay empty.
+        let profile = make_profile(
+            3,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 6,
+                scale_up_threshold: 0,
+                scale_down_after: "5m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let state = PoolState {
+            clusters: HashMap::new(),
+            queue_depth: 0,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            actions.is_empty(),
+            "spec.size must not create warm clusters while scaling is set, got {actions:?}"
+        );
+    }
+
+    /// A scale-to-zero pool (`min_ready == 0`) must still provision when
+    /// claims are queued against it.
+    ///
+    /// Without this, `min_ready == 0` makes the scale-up gate
+    /// (`ready + creating < warm_target`) read `0 < 0` — permanently
+    /// false — so the pool never creates a member, every claim queues
+    /// until `queue_timeout` expires it, and the pool is dead config.
+    /// That is the `ready=0 leased=0 creating=0 queue=0` wedge the vkobe
+    /// conformance legs hit.
+    #[test]
+    fn queued_claims_scale_up_a_scale_to_zero_pool() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 6,
+                scale_up_threshold: 0,
+                scale_down_after: "5m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let state = PoolState {
+            clusters: HashMap::new(),
+            queue_depth: 2,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            actions.len(),
+            2,
+            "two queued claims should provision two clusters, got {actions:?}"
+        );
+        assert!(actions.iter().all(|a| matches!(a, PoolAction::Create(_))));
+    }
+
+    /// Demand-driven scale-up stays inside `max_clusters` — a queue
+    /// spike must not become an unbounded create storm.
+    #[test]
+    fn queued_claims_respect_max_clusters() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 1,
+                scale_up_threshold: 0,
+                scale_down_after: "5m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let state = PoolState {
+            clusters: HashMap::new(),
+            queue_depth: 10,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "max_clusters=1 caps the burst regardless of queue depth, got {actions:?}"
+        );
+    }
+
+    /// A queued claim that an already-Ready cluster will serve must not
+    /// trigger a redundant create: the claim is counted against existing
+    /// warm capacity, not on top of it.
+    #[test]
+    fn queued_claim_does_not_double_provision_against_ready_capacity() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 6,
+                scale_up_threshold: 0,
+                scale_down_after: "5m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            make_entry(ClusterState::Ready),
+        );
+        let state = PoolState {
+            clusters,
+            queue_depth: 1,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Create(_))),
+            "the Ready cluster already covers the queued claim, got {actions:?}"
+        );
+    }
+
+    /// Queued demand must not cause the pool to reap the very Ready
+    /// cluster that demand was counted against.
+    ///
+    /// The scale-up gate counts a queued claim against existing warm
+    /// capacity, so a pool with one Ready cluster and one queued claim
+    /// correctly emits no Create. But if idle scale-down still measures
+    /// excess against `min_ready` alone, that same reconcile emits a
+    /// Delete for the cluster — so the claim loses the instance it was
+    /// about to be served by and pays a full cold start, and the Delete
+    /// races the lease controller reserving it.
+    #[test]
+    fn queued_claim_protects_an_idle_ready_cluster_from_scale_down() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 6,
+                scale_up_threshold: 0,
+                scale_down_after: "5m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let now = chrono::Utc::now();
+        // One Ready cluster, idle well past `scale_down_after`.
+        let mut entry = make_entry(ClusterState::Ready);
+        entry.idle_since = Some(now - chrono::Duration::minutes(30));
+        let mut clusters = HashMap::new();
+        clusters.insert("pool-test-profile-1".into(), entry);
+        let state = PoolState {
+            clusters,
+            queue_depth: 1,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Delete(_))),
+            "a queued claim is counted against this Ready cluster, so scale-down \
+             must not reap it — got {actions:?}"
+        );
+    }
+
+    /// A fixed pool (no `scaling` block) must stay fixed.
+    ///
+    /// `spec.size` is the whole contract for those pools, and they have
+    /// no scale-down path at all (`scale_down_after` is `None`), so any
+    /// cluster provisioned above `size` would be held forever with
+    /// nothing to trim it. Demand-driven provisioning is a `scaling`
+    /// feature; it must not silently change what a fixed pool does.
+    #[test]
+    fn queued_claims_do_not_grow_a_fixed_pool_beyond_its_size() {
+        let profile = make_profile(1, None);
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            make_entry(ClusterState::Ready),
+        );
+        let state = PoolState {
+            clusters,
+            queue_depth: 10,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Create(_))),
+            "a fixed pool at spec.size must not provision above it on queue \
+             pressure — it has no scale-down path to ever trim the excess. \
+             got {actions:?}"
+        );
+    }
+
+    /// The converse of [`scaling_min_ready_overrides_spec_size_for_warm_target`]:
+    /// with no `scaling` block, `spec.size` *is* the warm target and the
+    /// pool fills toward it (bounded by `MAX_BURST` per reconcile).
+    #[test]
+    fn fixed_pool_without_scaling_fills_toward_spec_size() {
+        let profile = make_profile(3, None);
+        let state = PoolState {
+            clusters: HashMap::new(),
+            queue_depth: 0,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            actions.len(),
+            MAX_BURST as usize,
+            "fixed pool should burst toward spec.size, got {actions:?}"
+        );
+        assert!(actions.iter().all(|a| matches!(a, PoolAction::Create(_))));
+    }
+
     #[test]
     fn test_no_scale_up_when_enough_ready() {
         let profile = make_profile(
@@ -1536,7 +1864,10 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert("pool-test-0".into(), make_entry(ClusterState::Ready));
         clusters.insert("pool-test-1".into(), make_entry(ClusterState::Ready));
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let now = chrono::Utc::now();
 
         let actions = compute_pool_actions(
@@ -1567,7 +1898,10 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert("pool-test-0".into(), make_entry(ClusterState::Ready));
         clusters.insert("pool-test-1".into(), make_entry(ClusterState::Leased));
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let now = chrono::Utc::now();
 
         let actions = compute_pool_actions(
@@ -1602,7 +1936,10 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert("pool-test-0".into(), make_entry(ClusterState::Leased));
         clusters.insert("pool-test-1".into(), make_entry(ClusterState::Leased));
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let now = chrono::Utc::now();
 
         let actions = compute_pool_actions(
@@ -1662,7 +1999,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         let actions = compute_pool_actions(
             &profile,
@@ -1725,7 +2065,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         let actions = compute_pool_actions(
             &profile,
@@ -1793,7 +2136,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let now = chrono::Utc::now();
 
         let actions = compute_pool_actions(
@@ -2008,7 +2354,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let now = chrono::Utc::now();
 
         let actions = compute_pool_actions(
@@ -2142,6 +2491,7 @@ mod tests {
         let profile = make_profile_with_backoff(1, 3, 2, Some(future));
         let state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let actions = compute_pool_actions(
             &profile,
@@ -2163,6 +2513,7 @@ mod tests {
         let profile = make_profile_with_backoff(1, 3, 2, Some(past));
         let state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let actions = compute_pool_actions(
             &profile,
@@ -2190,6 +2541,7 @@ mod tests {
         );
         let state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let actions = compute_pool_actions(
             &profile,
@@ -2214,6 +2566,7 @@ mod tests {
         let profile = make_profile_with_backoff(1, 3, 0, None);
         let state = PoolState {
             clusters: HashMap::new(),
+            queue_depth: 0,
         };
         let actions = compute_pool_actions(
             &profile,
@@ -2407,7 +2760,10 @@ mod tests {
                 drifted_entry(ClusterState::Ready, i * 100),
             );
         }
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2444,7 +2800,10 @@ mod tests {
             "pool-test-profile-2".into(),
             drifted_entry(ClusterState::Ready, 200),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2491,6 +2850,7 @@ mod tests {
             &profile,
             &PoolState {
                 clusters: clusters.clone(),
+                queue_depth: 0,
             },
             chrono::Utc::now(),
             &test_render_ctx(),
@@ -2521,7 +2881,10 @@ mod tests {
         );
         let actions_t1 = compute_pool_actions(
             &profile,
-            &PoolState { clusters },
+            &PoolState {
+                clusters,
+                queue_depth: 0,
+            },
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
@@ -2561,7 +2924,10 @@ mod tests {
             "pool-test-profile-1".into(),
             drifted_entry(ClusterState::Creating, 50),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2603,7 +2969,10 @@ mod tests {
                 drifted_entry(ClusterState::Ready, i * 100),
             );
         }
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2652,7 +3021,10 @@ mod tests {
             "pool-test-profile-3".into(),
             drifted_entry(ClusterState::Ready, 10),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2703,7 +3075,10 @@ mod tests {
         let mut clean = expiring.clone();
         clean.cert_horizon_secs = None;
         clusters.insert("pool-test-profile-3".into(), clean);
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         let counts = count_states(&state, Some(&current));
         assert_eq!(counts.ready_drifted, 1, "cert-expiring Ready is drifted");
@@ -2761,7 +3136,10 @@ mod tests {
         clusters.insert("pool-test-profile-1".into(), entry(29 * 86_400, 10_000));
         // Younger member, one hour left — must win the single recycle slot.
         clusters.insert("pool-test-profile-2".into(), entry(3_600, 10));
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
 
         let actions = compute_pool_actions(
             &profile,
@@ -2835,7 +3213,10 @@ mod tests {
             "pool-test-profile-3".into(),
             clean_entry(ClusterState::Ready, current),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2881,7 +3262,10 @@ mod tests {
             "pool-test-profile-2".into(),
             drifted_entry(ClusterState::Leased, 200),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2928,7 +3312,10 @@ mod tests {
             "pool-test-profile-2".into(),
             drifted_entry(ClusterState::Unhealthy, 200),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -2983,7 +3370,10 @@ mod tests {
             "pool-test-profile-3".into(),
             drifted_entry(ClusterState::Ready, 100),
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -3104,7 +3494,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -3161,7 +3554,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -3234,7 +3630,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -3313,7 +3712,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,
@@ -3388,7 +3790,10 @@ mod tests {
                 cert_horizon_secs: None,
             },
         );
-        let state = PoolState { clusters };
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
         let actions = compute_pool_actions(
             &profile,
             &state,

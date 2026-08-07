@@ -1254,6 +1254,13 @@ impl JsonSchema for ReadinessGate {
 #[serde(rename_all = "camelCase")]
 pub struct ScalingConfig {
     /// Minimum number of warm (ready) clusters to maintain.
+    ///
+    /// Replaces [`ClusterPoolSpec::size`] entirely — once a `scaling`
+    /// block is present, `size` is never read. Set to 0 for a
+    /// scale-to-zero pool: nothing is kept warm, and clusters are
+    /// provisioned on demand as claims queue (bounded by
+    /// `max_clusters`), at the cost of paying full provisioning
+    /// latency on every claim.
     #[serde(default = "default_min_ready")]
     pub min_ready: u32,
 
@@ -1261,7 +1268,12 @@ pub struct ScalingConfig {
     #[serde(default = "default_max_clusters")]
     pub max_clusters: u32,
 
-    /// Scale up when ready clusters fall to this threshold.
+    /// Reserved; currently has no effect.
+    ///
+    /// Scale-up is driven by `min_ready` plus the pool's queue depth,
+    /// not by a separate threshold — the pool creates whenever
+    /// `ready + creating` falls below that target. The field is kept
+    /// so existing manifests that set it stay valid.
     #[serde(default)]
     pub scale_up_threshold: u32,
 
