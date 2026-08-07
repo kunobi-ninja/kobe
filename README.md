@@ -105,22 +105,28 @@ metadata:
   name: ci-small
   namespace: kunobi-pool
 spec:
-  size: 3                 # warm clusters to keep ready
+  size: 3                 # warm clusters to keep ready (fixed-size pool)
   ttl: "1h"               # default lease duration
   backend:
     type: k3s             # k3s | k0s | vcluster | capi
   cluster:
     version: "v1.31.3+k3s1"
     servers: 1
-  scaling:
-    minReady: 0
-    maxClusters: 6
-    scaleDownAfter: "5m"
-    queueTimeout: "5m"
   resources:
     limits:
       cpu: "1"
       memory: "1Gi"
+```
+
+To autoscale instead of holding a fixed count, add a `scaling` block. It replaces `size` entirely: the warm target becomes `minReady` and the ceiling `maxClusters`, and `size` is ignored for as long as `scaling` is set.
+
+```yaml
+spec:
+  scaling:
+    minReady: 1
+    maxClusters: 6
+    scaleDownAfter: "5m"
+    queueTimeout: "5m"
 ```
 
 ### ClusterLease
