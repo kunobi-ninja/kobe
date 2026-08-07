@@ -797,7 +797,10 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: this is a server-side
+    # cap, so a shorter value here expires the queued claim regardless of
+    # how long the client waits (scale-to-zero pools provision on demand).
+    queueTimeout: "12m"
   resources:
     limits:
       cpu: "500m"
@@ -875,7 +878,10 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: this is a server-side
+    # cap, so a shorter value here expires the queued claim regardless of
+    # how long the client waits (scale-to-zero pools provision on demand).
+    queueTimeout: "12m"
   resources:
     limits:
       cpu: "500m"
@@ -950,7 +956,10 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: this is a server-side
+    # cap, so a shorter value here expires the queued claim regardless of
+    # how long the client waits (scale-to-zero pools provision on demand).
+    queueTimeout: "20m"
   resources:
     limits:
       cpu: "500m"

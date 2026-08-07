@@ -439,7 +439,8 @@ async function main(): Promise<void> {
     );
   }
   if (onDemand) {
-    poolBefore = selectPool(await fetchStatus(), pool);
+    // `poolBefore` is already the status fetched above; nothing has run
+    // since that could have changed it, so no re-fetch.
     info(
       `Pool '${pool}' is on-demand (POOL_ON_DEMAND set): skipping the warm-capacity wait — the lease request below is what drives provisioning.`,
     );
@@ -468,6 +469,19 @@ async function main(): Promise<void> {
     if (message.includes("Timed out waiting for lease")) {
       errorLine(message);
       await printLeaseWaitDiagnostics("lease did not become ready within the acquisition timeout");
+      process.exitCode = 1;
+      return;
+    }
+    // A claim the operator expired server-side (queueTimeout) surfaces as a
+    // terminal phase, NOT as a client timeout — so it would otherwise skip
+    // the diagnostics below and rethrow bare. That is the single most likely
+    // on-demand failure, and the one where "why didn't the pool provision?"
+    // is exactly the question the diagnostics answer.
+    if (message.includes("ended in phase")) {
+      errorLine(message);
+      await printLeaseWaitDiagnostics(
+        "claim reached a terminal phase before it was usable — if this is Expired, the pool's scaling.queueTimeout is shorter than the cold-provision time",
+      );
       process.exitCode = 1;
       return;
     }
