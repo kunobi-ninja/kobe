@@ -400,8 +400,16 @@ mod json_safety_tests {
     }
 
     /// A condition with no recorded transition omits the key rather than
-    /// writing null, so a Merge-Patch can't erase a timestamp another
-    /// writer set. Same rule as `message` and `conditions` above.
+    /// writing an explicit null, so a reader round-tripping the condition
+    /// does not turn "never transitioned" into a stored null.
+    ///
+    /// Note this is NOT the Merge-Patch protection that `message` and
+    /// `conditions` get. JSON Merge Patch replaces arrays wholesale, so a
+    /// patch carrying a `conditions` array at all replaces the stored list
+    /// entirely — omitting a property *inside* an emitted element protects
+    /// nothing. Omitting the whole `conditions` key is what protects the
+    /// list; that is pinned separately by
+    /// `empty_conditions_are_omitted_from_serialized_status`.
     #[test]
     fn condition_omits_last_transition_time_when_unset() {
         let c = ClusterLeaseCondition {
@@ -432,11 +440,18 @@ mod json_safety_tests {
         assert_eq!(st.cluster_name.as_deref(), Some("pool-x-0"));
     }
 
-    /// Serialize → deserialize → serialize is a fixed point, so a
-    /// controller that reads a status and writes it back unchanged does
-    /// not perturb it.
+    /// A fully-populated status survives serialize → deserialize →
+    /// serialize unchanged.
+    ///
+    /// Scoped deliberately to the populated case, which is what a bound
+    /// lease looks like. It is NOT a general fixed-point claim: an input
+    /// with `"conditions": []` comes back without the key, an explicit
+    /// null on a skipped field is likewise dropped, and unknown fields
+    /// from a newer operator are discarded on deserialize (by design —
+    /// see `status_from_a_newer_operator_still_deserializes`). Those are
+    /// intended asymmetries, not regressions this test would catch.
     #[test]
-    fn status_round_trip_is_a_fixed_point() {
+    fn a_populated_status_survives_a_serde_round_trip() {
         let original = ClusterLeaseStatus {
             phase: LeasePhase::Bound,
             cluster_name: Some("pool-x-0".into()),
