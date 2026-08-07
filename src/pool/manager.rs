@@ -707,7 +707,19 @@ pub fn compute_pool_actions(
     // hash-drifted, cert-expiring, or unstamped-past-grace, and nothing
     // Ready can be in `deleting` before this point. So no `.max()` against
     // `ready_drifted` is needed — it would always pick this value anyway.
-    let recycle_candidates = drifted_ready.len() as u32;
+    //
+    // Zero when `max_recycling == 0`, which the CRD documents as pausing
+    // drift recycling. Surging exists to buy headroom for a recycle; with
+    // recycling paused there is no recycle to buy headroom for, and the
+    // surplus would never drain: the candidates cannot be rolled, so they
+    // stay candidates, holding `upgrade_in_progress` true and suppressing
+    // idle scale-down forever. That would turn a kill-switch into a
+    // permanent capacity leak.
+    let recycle_candidates = if policy.max_recycling == 0 {
+        0
+    } else {
+        drifted_ready.len() as u32
+    };
 
     let mut remaining_ready = counts.ready;
     for (name, _entry) in drifted_ready.iter().take(policy.max_recycling as usize) {
@@ -2481,6 +2493,55 @@ mod tests {
     /// which is 0. The pool then emits no actions at all, forever, and
     /// the doc-comment promise that legacy members get cleaned up
     /// "instead of requiring a manual delete" quietly fails to hold.
+    #[test]
+    fn paused_recycling_does_not_surge_for_legacy_members() {
+        // `maxRecycling: 0` is documented as pausing drift recycling. The
+        // surge exists to buy headroom FOR a recycle, so with recycling
+        // paused it must not fire: the candidates cannot be rolled, so the
+        // surplus would never drain, and they would hold
+        // `upgrade_in_progress` true — suppressing idle scale-down forever.
+        // A kill-switch must not become a permanent capacity leak.
+        let mut profile = make_profile_with_upgrade(0, 0, 1, None);
+        profile.spec.scaling = Some(crate::crd::ScalingConfig {
+            min_ready: 2,
+            max_clusters: 10,
+            scale_up_threshold: 0,
+            scale_down_after: "30m".to_string(),
+            queue_timeout: "5m".to_string(),
+            creating_timeout: "10m".to_string(),
+            failure_backoff: None,
+        });
+
+        let now = chrono::Utc::now();
+        let mut clusters = HashMap::new();
+        for i in 0..2 {
+            let mut e = make_entry(ClusterState::Ready);
+            e.spec_hash = None; // legacy, unstamped
+            e.state_since = Some(now - chrono::Duration::hours(1));
+            e.idle_since = Some(now - chrono::Duration::hours(1));
+            clusters.insert(format!("pool-test-profile-{i}"), e);
+        }
+        let state = PoolState { clusters };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            now,
+            &test_render_ctx(),
+            &Default::default(),
+        );
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Create(_))),
+            "recycling is paused, so there is no recycle to buy headroom for — \
+             surging here leaks capacity that can never drain. got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, PoolAction::Delete(_))),
+            "maxRecycling: 0 must not recycle anything. got {actions:?}"
+        );
+    }
+
     #[test]
     fn unstamped_legacy_ready_members_surge_instead_of_deadlocking() {
         let profile = make_profile(
