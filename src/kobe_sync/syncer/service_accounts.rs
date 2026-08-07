@@ -307,4 +307,412 @@ mod tests {
         assert_eq!(labels.get(LABEL_MANAGED).map(String::as_str), Some("true"));
         assert_eq!(labels.get(LABEL_VNS).map(String::as_str), Some("default"));
     }
+
+    /// `automountServiceAccountToken: false` is a deliberate hardening
+    /// choice on the virtual SA. Dropping it (or coercing it to the
+    /// `None` default, which the host apiserver reads as *true*) would
+    /// silently mount a token into every projected pod that opted out.
+    /// Both explicit values must survive verbatim.
+    #[test]
+    fn translate_service_account_preserves_automount_opt_out() {
+        let t = make_translator();
+        for want in [Some(false), Some(true), None] {
+            let sa = ServiceAccount {
+                metadata: ObjectMeta {
+                    name: Some("hardened".into()),
+                    namespace: Some("default".into()),
+                    ..Default::default()
+                },
+                automount_service_account_token: want,
+                ..Default::default()
+            };
+            let host_sa = translate_service_account_to_host(&sa, &t, "default").unwrap();
+            assert_eq!(
+                host_sa.automount_service_account_token, want,
+                "automountServiceAccountToken must round-trip verbatim"
+            );
+        }
+    }
+
+    /// Server-assigned identity from the *virtual* apiserver
+    /// (uid / resourceVersion / creationTimestamp / ownerReferences)
+    /// must not be carried onto the host object. A create carrying a
+    /// foreign `resourceVersion` is rejected outright, and a stale
+    /// `ownerReferences` entry pointing at a virtual object would make
+    /// the host garbage collector delete the SA immediately.
+    #[test]
+    fn translate_service_account_strips_virtual_side_identity() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let t = make_translator();
+        let sa = ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some("owned".into()),
+                namespace: Some("default".into()),
+                uid: Some("11111111-2222-3333-4444-555555555555".into()),
+                resource_version: Some("98765".into()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: "v1".into(),
+                    kind: "Deployment".into(),
+                    name: "virtual-owner".into(),
+                    uid: "deadbeef".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let host_sa = translate_service_account_to_host(&sa, &t, "default").unwrap();
+        assert!(host_sa.metadata.uid.is_none());
+        assert!(host_sa.metadata.resource_version.is_none());
+        assert!(host_sa.metadata.owner_references.is_none());
+        assert!(host_sa.metadata.creation_timestamp.is_none());
+    }
+
+    /// A virtual name carrying the `-x-` translation separator is
+    /// ambiguous (see `translator::to_host_name`), so translation must
+    /// fail loudly rather than produce a host name that could collide
+    /// with a different tenant's object.
+    #[test]
+    fn translate_service_account_rejects_names_containing_the_separator() {
+        let t = make_translator();
+        let sa = ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some("evil-x-sa".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(translate_service_account_to_host(&sa, &t, "default").is_err());
+    }
+
+    // ── Event handling against a fake host apiserver ──────────────────
+
+    use crate::kobe_sync::testkit::{HOST_NS, k8s_not_found, syncer_ctx};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Namespaced ServiceAccount collection path on the fake host.
+    fn sa_collection() -> String {
+        format!("/api/v1/namespaces/{HOST_NS}/serviceaccounts")
+    }
+
+    fn sa_item(name: &str) -> String {
+        format!("{}/{name}", sa_collection())
+    }
+
+    fn virtual_sa(name: &str, ns: &str) -> ServiceAccount {
+        ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                namespace: Some(ns.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// First sight of a virtual SA: the host has nothing, so the syncer
+    /// must CREATE — under the translated name, in the pool's host
+    /// namespace. A wrong name here is exactly the
+    /// `serviceaccount "<sa>" not found` pod-admission failure this
+    /// syncer exists to prevent.
+    #[tokio::test]
+    async fn apply_event_creates_the_host_sa_when_absent() {
+        let server = MockServer::start().await;
+        let host = "source-controller-x-flux-system-x-vc";
+        Mock::given(method("GET"))
+            .and(path(sa_item(host)))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(k8s_not_found("serviceaccounts", host)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(sa_collection()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(virtual_sa(host, HOST_NS)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+        let ev = Event::Apply(virtual_sa("source-controller", "flux-system"));
+
+        handle_service_account_event(&ev, &ctx, &host_api)
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "expected a GET probe then a POST create");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        assert_eq!(body["metadata"]["name"], host);
+        assert_eq!(body["metadata"]["namespace"], HOST_NS);
+    }
+
+    /// When the host SA already exists the syncer must reconcile it with
+    /// a forced server-side apply under the `kobe-sync` field manager —
+    /// not a second create (409 Conflict) and not an unforced patch
+    /// (field-manager conflict after an operator upgrade).
+    #[tokio::test]
+    async fn apply_event_force_applies_the_existing_host_sa() {
+        let server = MockServer::start().await;
+        let host = "my-sa-x-default-x-vc";
+        Mock::given(method("GET"))
+            .and(path(sa_item(host)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(virtual_sa(host, HOST_NS)))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(sa_item(host)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(virtual_sa(host, HOST_NS)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(sa_collection()))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        handle_service_account_event(
+            &Event::Apply(virtual_sa("my-sa", "default")),
+            &ctx,
+            &host_api,
+        )
+        .await
+        .unwrap();
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .expect("a PATCH must have been issued");
+        let query: std::collections::HashMap<_, _> = patch.url.query_pairs().collect();
+        assert_eq!(
+            query.get("fieldManager").map(|v| v.as_ref()),
+            Some("kobe-sync")
+        );
+        assert_eq!(query.get("force").map(|v| v.as_ref()), Some("true"));
+    }
+
+    /// `InitApply` (the replay of the initial list) must take the same
+    /// path as `Apply`. Treating it as a no-op would leave every SA that
+    /// existed before kobe-sync started unmirrored until it happened to
+    /// be edited.
+    #[tokio::test]
+    async fn init_apply_event_syncs_like_apply() {
+        let server = MockServer::start().await;
+        let host = "pre-existing-x-default-x-vc";
+        Mock::given(method("GET"))
+            .and(path(sa_item(host)))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(k8s_not_found("serviceaccounts", host)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(sa_collection()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(virtual_sa(host, HOST_NS)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        handle_service_account_event(
+            &Event::InitApply(virtual_sa("pre-existing", "default")),
+            &ctx,
+            &host_api,
+        )
+        .await
+        .unwrap();
+
+        server.verify().await;
+    }
+
+    /// Namespaces in `skip_namespaces` are invisible to the syncer: not
+    /// even the existence probe may go out. `kube-system` SAs belong to
+    /// the virtual control plane and mirroring them would collide with
+    /// the host's own.
+    #[tokio::test]
+    async fn skipped_namespaces_produce_no_host_traffic_at_all() {
+        let server = MockServer::start().await;
+        let ctx = syncer_ctx(&server, &["kube-system"]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        for ev in [
+            Event::Apply(virtual_sa("default", "kube-system")),
+            Event::InitApply(virtual_sa("default", "kube-system")),
+            Event::Delete(virtual_sa("default", "kube-system")),
+        ] {
+            handle_service_account_event(&ev, &ctx, &host_api)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "skipped namespaces must not reach the host apiserver"
+        );
+    }
+
+    /// Watcher bookmarks carry no object; they must be pure no-ops
+    /// rather than triggering a spurious host call.
+    #[tokio::test]
+    async fn init_and_init_done_bookmarks_are_no_ops() {
+        let server = MockServer::start().await;
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        handle_service_account_event(&Event::Init, &ctx, &host_api)
+            .await
+            .unwrap();
+        handle_service_account_event(&Event::InitDone, &ctx, &host_api)
+            .await
+            .unwrap();
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A virtual delete must delete the *translated* host object.
+    #[tokio::test]
+    async fn delete_event_deletes_the_translated_host_sa() {
+        let server = MockServer::start().await;
+        let host = "gone-x-default-x-vc";
+        Mock::given(method("DELETE"))
+            .and(path(sa_item(host)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(virtual_sa(host, HOST_NS)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        handle_service_account_event(
+            &Event::Delete(virtual_sa("gone", "default")),
+            &ctx,
+            &host_api,
+        )
+        .await
+        .unwrap();
+
+        server.verify().await;
+    }
+
+    /// Deleting an already-absent host SA is the normal race (the host
+    /// object was reaped first, or the watch replayed). It must be
+    /// swallowed, otherwise the syncer logs a spurious error on every
+    /// namespace teardown.
+    #[tokio::test]
+    async fn delete_event_tolerates_a_host_sa_that_is_already_gone() {
+        let server = MockServer::start().await;
+        let host = "vanished-x-default-x-vc";
+        Mock::given(method("DELETE"))
+            .and(path(sa_item(host)))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(k8s_not_found("serviceaccounts", host)),
+            )
+            .mount(&server)
+            .await;
+
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        handle_service_account_event(
+            &Event::Delete(virtual_sa("vanished", "default")),
+            &ctx,
+            &host_api,
+        )
+        .await
+        .expect("404 on delete must be treated as success");
+    }
+
+    /// Any delete failure that is *not* 404 must surface, so the syncer
+    /// loop logs it instead of leaking a host SA forever.
+    #[tokio::test]
+    async fn delete_event_propagates_non_404_failures() {
+        let server = MockServer::start().await;
+        let host = "stuck-x-default-x-vc";
+        Mock::given(method("DELETE"))
+            .and(path(sa_item(host)))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "message": "etcdserver: request timed out", "code": 500,
+            })))
+            .mount(&server)
+            .await;
+
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        assert!(
+            handle_service_account_event(
+                &Event::Delete(virtual_sa("stuck", "default")),
+                &ctx,
+                &host_api
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// An untranslatable virtual name was never mirrored (the apply path
+    /// errored out), so its delete has nothing to do — and must not fire
+    /// a DELETE at a guessed name that could belong to another tenant.
+    #[tokio::test]
+    async fn delete_event_of_an_untranslatable_name_issues_no_request() {
+        let server = MockServer::start().await;
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        handle_service_account_event(
+            &Event::Delete(virtual_sa("evil-x-sa", "default")),
+            &ctx,
+            &host_api,
+        )
+        .await
+        .expect("an untranslatable delete is a no-op, not an error");
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// An untranslatable name on the *apply* path is an error, not a
+    /// silent skip: it means a user created an object kobe-sync cannot
+    /// mirror, and the syncer loop should log it.
+    #[tokio::test]
+    async fn apply_event_of_an_untranslatable_name_errors_without_touching_the_host() {
+        let server = MockServer::start().await;
+        let ctx = syncer_ctx(&server, &[]);
+        let host_api: Api<ServiceAccount> =
+            Api::namespaced(ctx.host_client.clone(), &ctx.host_namespace);
+
+        assert!(
+            handle_service_account_event(
+                &Event::Apply(virtual_sa("evil-x-sa", "default")),
+                &ctx,
+                &host_api
+            )
+            .await
+            .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 }

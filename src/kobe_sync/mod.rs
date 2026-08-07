@@ -18,3 +18,6 @@ pub mod config;
 pub mod proxy;
 pub mod syncer;
 pub mod upgrade;
+
+#[cfg(test)]
+pub mod testkit;

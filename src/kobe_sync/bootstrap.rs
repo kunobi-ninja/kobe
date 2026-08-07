@@ -338,4 +338,290 @@ mod tests {
             Some(KOBE_SYNC_ROLE)
         );
     }
+
+    // ── Privilege containment ─────────────────────────────────────────
+
+    /// The whole point of this module is to avoid running kobe-sync as
+    /// `system:masters`. A wildcard anywhere in the role would quietly
+    /// give it back cluster-admin-equivalent reach on the virtual
+    /// apiserver, so reject `*` in every position.
+    #[test]
+    fn cluster_role_contains_no_wildcards() {
+        for rule in build_cluster_role().rules.unwrap_or_default() {
+            assert!(
+                !rule.verbs.iter().any(|v| v == "*"),
+                "wildcard verb in rule: {rule:?}"
+            );
+            assert!(
+                !rule
+                    .resources
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| r == "*"),
+                "wildcard resource in rule: {rule:?}"
+            );
+            assert!(
+                !rule
+                    .api_groups
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|g| g == "*"),
+                "wildcard apiGroup in rule: {rule:?}"
+            );
+            assert!(
+                rule.resource_names.is_none(),
+                "resourceNames are not used by kobe-sync; an entry here would silently \
+                 narrow a rule the syncers rely on: {rule:?}"
+            );
+        }
+    }
+
+    /// Secrets are watched (the SecretSyncer projects them to the host)
+    /// but never written back to the virtual apiserver. Granting write
+    /// here would let a compromised kobe-sync mint credentials inside a
+    /// leased cluster. Same for the other read-only watch targets.
+    #[test]
+    fn read_only_watch_targets_are_granted_no_write_verbs() {
+        const READ_ONLY: &[&str] = &[
+            "pods",
+            "services",
+            "configmaps",
+            "endpoints",
+            "secrets",
+            "persistentvolumeclaims",
+            "networkpolicies",
+            "ingresses",
+        ];
+        const WRITE_VERBS: &[&str] = &[
+            "create",
+            "update",
+            "patch",
+            "delete",
+            "deletecollection",
+            "*",
+        ];
+
+        for rule in build_cluster_role().rules.unwrap_or_default() {
+            let resources = rule.resources.clone().unwrap_or_default();
+            for res in &resources {
+                if !READ_ONLY.contains(&res.as_str()) {
+                    continue;
+                }
+                for verb in &rule.verbs {
+                    assert!(
+                        !WRITE_VERBS.contains(&verb.as_str()),
+                        "`{res}` is a read-only watch target but the role grants `{verb}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ClusterRole and ClusterRoleBinding are cluster-scoped. A stray
+    /// namespace in `metadata` would make the server-side apply in
+    /// [`ensure_rbac`] target a namespaced path that does not exist.
+    #[test]
+    fn rbac_objects_are_cluster_scoped() {
+        assert!(build_cluster_role().metadata.namespace.is_none());
+        assert!(build_cluster_role_binding().metadata.namespace.is_none());
+        assert_eq!(
+            build_cluster_role_binding().role_ref.api_group,
+            "rbac.authorization.k8s.io"
+        );
+    }
+
+    // ── ensure_rbac against a fake apiserver ──────────────────────────
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client(server: &MockServer) -> kube::Client {
+        crate::kobe_sync::testkit::mock_client(server)
+    }
+
+    const ROLE_PATH: &str = "/apis/rbac.authorization.k8s.io/v1/clusterroles/kobe-sync";
+    const BINDING_PATH: &str = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/kobe-sync";
+
+    /// Both applies succeed, each echoing back the object it was sent —
+    /// which is what a real apiserver does for a server-side apply.
+    async fn mount_happy_path(server: &MockServer) {
+        Mock::given(method("PATCH"))
+            .and(path(ROLE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(build_cluster_role()))
+            .mount(server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(BINDING_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(build_cluster_role_binding()))
+            .mount(server)
+            .await;
+    }
+
+    /// `ensure_rbac` must hit exactly the two cluster-scoped RBAC
+    /// endpoints named after [`KOBE_SYNC_ROLE`], and nothing else — the
+    /// bootstrap client holds `system:masters`, so every extra call it
+    /// makes is privileged.
+    #[tokio::test]
+    async fn ensure_rbac_applies_exactly_the_role_and_the_binding() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(ROLE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(build_cluster_role()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(BINDING_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(build_cluster_role_binding()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        ensure_rbac(&client(&server)).await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "no other apiserver calls may be made");
+        assert_eq!(reqs[0].url.path(), ROLE_PATH);
+        assert_eq!(
+            reqs[1].url.path(),
+            BINDING_PATH,
+            "the role must be applied BEFORE the binding that references it"
+        );
+    }
+
+    /// The two objects go up as **server-side apply** (not a merge
+    /// patch) under the `kobe-sync` field manager, with `force` set.
+    /// Without `force`, a rerun after a kobe upgrade that changes the
+    /// rule set fails with a field-manager conflict and the pod
+    /// crash-loops; without the apply content-type the apiserver
+    /// interprets the body as a merge patch and never prunes removed
+    /// rules.
+    #[tokio::test]
+    async fn ensure_rbac_uses_forced_server_side_apply_as_kobe_sync() {
+        let server = MockServer::start().await;
+        mount_happy_path(&server).await;
+
+        ensure_rbac(&client(&server)).await.unwrap();
+
+        for req in server.received_requests().await.unwrap() {
+            let query: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
+            assert_eq!(
+                query.get("fieldManager").map(|v| v.as_ref()),
+                Some(FIELD_MANAGER),
+                "field manager must be `{FIELD_MANAGER}`; query was {:?}",
+                req.url.query()
+            );
+            assert_eq!(
+                query.get("force").map(|v| v.as_ref()),
+                Some("true"),
+                "apply must be forced; query was {:?}",
+                req.url.query()
+            );
+
+            let ct = req
+                .headers
+                .get("content-type")
+                .expect("content-type must be set")
+                .to_str()
+                .unwrap();
+            assert!(
+                ct.starts_with("application/apply-patch"),
+                "must be a server-side apply patch, got `{ct}`"
+            );
+        }
+    }
+
+    /// Server-side apply is rejected by the apiserver unless the body
+    /// carries `apiVersion` and `kind`. The typed k8s-openapi structs
+    /// supply them; a refactor to a hand-rolled JSON body that dropped
+    /// either would fail at runtime only, inside a bootstrap path that
+    /// runs before any syncer starts.
+    #[tokio::test]
+    async fn ensure_rbac_bodies_carry_api_version_and_kind() {
+        let server = MockServer::start().await;
+        mount_happy_path(&server).await;
+
+        ensure_rbac(&client(&server)).await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let role: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(role["apiVersion"], "rbac.authorization.k8s.io/v1");
+        assert_eq!(role["kind"], "ClusterRole");
+        assert_eq!(role["metadata"]["name"], KOBE_SYNC_ROLE);
+
+        let binding: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        assert_eq!(binding["apiVersion"], "rbac.authorization.k8s.io/v1");
+        assert_eq!(binding["kind"], "ClusterRoleBinding");
+        assert_eq!(binding["subjects"][0]["name"], KOBE_SYNC_USER);
+        assert_eq!(binding["roleRef"]["name"], KOBE_SYNC_ROLE);
+    }
+
+    /// If the ClusterRole apply fails, the binding must NOT be applied:
+    /// a binding pointing at a role that does not exist grants nothing,
+    /// so kobe-sync would start up and 403 on its first list with a
+    /// confusing "forbidden" instead of the actual bootstrap error. The
+    /// error also has to name the object that failed.
+    #[tokio::test]
+    async fn ensure_rbac_aborts_before_the_binding_when_the_role_apply_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(ROLE_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "clusterroles.rbac.authorization.k8s.io is forbidden",
+                "reason": "Forbidden",
+                "code": 403,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(BINDING_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(build_cluster_role_binding()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = ensure_rbac(&client(&server)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("ClusterRole `kobe-sync`"),
+            "error must name the failing object, got: {err}"
+        );
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "binding must not be attempted");
+    }
+
+    /// A failure on the binding is surfaced too — it is the half that
+    /// actually grants the permissions, so swallowing it would leave a
+    /// role nobody is bound to and kobe-sync 403ing at runtime.
+    #[tokio::test]
+    async fn ensure_rbac_surfaces_a_binding_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(ROLE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(build_cluster_role()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(BINDING_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "etcdserver: request timed out",
+                "code": 500,
+            })))
+            .mount(&server)
+            .await;
+
+        let err = ensure_rbac(&client(&server)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("ClusterRoleBinding `kobe-sync`"),
+            "error must name the failing object, got: {err}"
+        );
+    }
 }
