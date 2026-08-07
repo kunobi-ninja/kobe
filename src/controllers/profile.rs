@@ -577,6 +577,68 @@ mod cluster_instance_tests {
         );
     }
 
+    /// Queue depth must count *unmet* demand only.
+    ///
+    /// A `Pending` lease that already carries a `clusterName` has had an
+    /// instance reserved for it — the lease controller recognises that
+    /// state and repairs it to `Bound`. Counting it as queued demand
+    /// during the reserve → patch-status window makes the pool
+    /// provision a replacement for a claim that is already served.
+    #[tokio::test]
+    async fn queue_depth_excludes_pending_leases_that_already_hold_a_cluster() {
+        let (ctx, server) = test_profile_context().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        let lease = |name: &str, phase: &str, cluster: serde_json::Value| {
+            serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": name, "namespace": "test-ns" },
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
+                          "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
+                "status": { "phase": phase, "clusterName": cluster }
+            })
+        };
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![
+                    // Genuinely queued — nothing reserved yet.
+                    lease("waiting", "Pending", serde_json::json!(null)),
+                    // Already reserved, mid two-phase bind. Not demand.
+                    lease(
+                        "assigned",
+                        "Pending",
+                        serde_json::json!("pool-test-profile-0"),
+                    ),
+                    // Bound and Expired are not demand either.
+                    lease("bound", "Bound", serde_json::json!("pool-test-profile-1")),
+                    lease("expired", "Expired", serde_json::json!(null)),
+                ]),
+            ))
+            .mount(&server)
+            .await;
+
+        let pool_state = build_pool_state(&ctx, "test-profile").await;
+
+        assert_eq!(
+            pool_state.queue_depth, 1,
+            "only the unreserved Pending lease is unmet demand"
+        );
+    }
+
     #[tokio::test]
     async fn test_build_pool_state_preserves_instance_status_fields() {
         let (ctx, server) = test_profile_context().await;
@@ -1341,8 +1403,15 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
     }
 }
 
-/// Count claims queued against `profile_name` — leases still in
-/// `Pending`, i.e. demand no instance has been reserved for yet.
+/// Count claims queued against `profile_name` — `Pending` leases that
+/// do not yet hold a cluster, i.e. demand nothing has been reserved for.
+///
+/// The `cluster_name` check is load-bearing, not defensive.
+/// `Pending` + an assigned `clusterName` is a real, expected state: it is
+/// the window between `reserve_ready_instance` claiming an instance and
+/// the lease's status patch landing, and the lease controller repairs it
+/// to `Bound` on sight. Such a claim is already served, so counting it
+/// as demand would make the pool provision a second cluster for it.
 ///
 /// Feeds both the warm target in [`crate::pool::manager::compute_pool_actions`]
 /// (so a scale-to-zero pool provisions on demand) and the pool's
@@ -1359,9 +1428,11 @@ async fn count_pending_claims(ctx: &ProfileContext, profile_name: &str) -> u32 {
         Ok(leases) => leases
             .iter()
             .filter(|c| {
+                // A lease with no status yet has certainly not been
+                // reserved against, so it counts as demand.
                 c.status
                     .as_ref()
-                    .map(|s| s.phase == LeasePhase::Pending)
+                    .map(|s| s.phase == LeasePhase::Pending && s.cluster_name.is_none())
                     .unwrap_or(true)
             })
             .count() as u32,
