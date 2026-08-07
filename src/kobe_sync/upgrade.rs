@@ -107,7 +107,7 @@ static UPGRADES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "kobe_sync_proxy_upgrades_total",
         "Total number of HTTP Upgrade attempts handled by the subresource proxy",
         // result = success | denied_global | denied_per_identity |
-        //          upstream_rejected | upstream_error
+        //          upstream_rejected | upstream_error | bridge_failed
         // protocol = spdy | websocket | other
         &["protocol", "result"]
     )
@@ -685,10 +685,28 @@ async fn bridge_upgraded(
     let client_upgraded = match client_upgrade_fut.await {
         Ok(u) => u,
         Err(e) => {
-            // Client never finished the upgrade dance — usually means
-            // it disconnected before hyper flushed our 101. Drop the
-            // upstream side so the apiserver releases the session.
-            debug!(error = %e, protocol = %proto, "client upgrade did not complete; dropping upstream");
+            // Client never finished the upgrade dance. Usually it
+            // disconnected before hyper flushed our 101 — but it is ALSO
+            // what a server-side misconfiguration looks like: if the
+            // accept loop forgets `serve_connection_with_upgrades`, hyper
+            // fails every client upgrade here with "upgrade expected but
+            // low level API in use" and no tunnel ever works.
+            //
+            // That failure used to be invisible: `upgrades_total` is
+            // incremented as `success` when the 101 goes out, before this
+            // bridge runs, and this arm logged at debug. So the metric
+            // read 100% success while every tunnel was dead. Count it and
+            // log it loudly enough to notice.
+            UPGRADES_TOTAL
+                .with_label_values(&[proto.as_str(), "bridge_failed"])
+                .inc();
+            warn!(
+                error = %e,
+                protocol = %proto,
+                "client upgrade did not complete; dropping upstream (a persistent \
+                 rate here means the server is not serving connections with \
+                 upgrade support)"
+            );
             drop(upstream_upgraded);
             return;
         }

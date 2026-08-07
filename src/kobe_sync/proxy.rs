@@ -701,7 +701,18 @@ impl VirtualClusterProxy {
                         });
 
                         let io = hyper_util::rt::TokioIo::new(tls_stream);
-                        if let Err(e) = builder.serve_connection(io, service).await {
+                        // `_with_upgrades` is required for exec / attach /
+                        // port-forward. Without it hyper finishes the
+                        // connection, sees an upgrade it cannot service, and
+                        // resolves the client's `OnUpgrade` with an error — so
+                        // `dispatch_upgrade` returns 101 and the tunnel dies
+                        // immediately after, with no bytes ever flowing.
+                        //
+                        // The same rule is already applied to the UPSTREAM leg
+                        // in `kobe_sync::upgrade` and `api::upgrade`, both with
+                        // comments calling it critical. This client-facing leg
+                        // was the asymmetry.
+                        if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
                             debug!(peer = %peer_addr, error = %e, "Connection error");
                         }
                     });

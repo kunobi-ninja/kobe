@@ -92,7 +92,19 @@ impl NameTranslator {
         // in `src/api/routes.rs`.
         let hash = fnv1a_hex(virtual_name, virtual_ns);
         let prefix_len = MAX_K8S_NAME_LEN - hash.len() - 1; // -1 for the dash
-        let truncated = &full[..prefix_len];
+        // Walk back to a character boundary before slicing. The syncers only
+        // ever pass apiserver-validated RFC-1123 names (ASCII, so the cut is
+        // always safe), but the proxy also reaches here with raw URL path
+        // segments via `translate_subresource_to_host`, and `http::Uri`
+        // accepts any valid UTF-8 in a path. A byte cut landing inside a
+        // multi-byte character would panic the connection task — reachable
+        // by an unauthenticated client, since the proxy's client verifier
+        // allows unauthenticated peers.
+        let mut cut = prefix_len;
+        while cut > 0 && !full.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let truncated = &full[..cut];
         // Ensure truncated doesn't end with a dash (invalid K8s name).
         let truncated = truncated.trim_end_matches('-');
         Ok(format!("{truncated}-{hash}"))
@@ -527,6 +539,36 @@ mod tests {
         let result = t.to_host_name(&long_name, &long_ns).unwrap();
         assert!(result.len() <= 253);
         assert!(!result.ends_with('-'));
+    }
+
+    /// Truncation must not split a multi-byte character.
+    ///
+    /// Every *syncer* caller feeds apiserver-validated RFC-1123 names,
+    /// which are ASCII — but the proxy also calls this with raw URL path
+    /// segments (`translate_subresource_to_host`), and `http::Uri`
+    /// accepts any valid UTF-8 in a path. A byte-slice truncation
+    /// landing inside a multi-byte character panics, taking down the
+    /// connection task, and the proxy accepts unauthenticated clients.
+    #[test]
+    fn to_host_name_truncates_on_a_character_boundary() {
+        let t = translator();
+        // 235 ASCII bytes then a 2-byte character, so the 236-byte cut
+        // lands mid-character.
+        let name = format!("{}é", "a".repeat(235));
+        let result = t
+            .to_host_name(&name, &"b".repeat(10))
+            .expect("a long multi-byte name must truncate, not panic");
+        assert!(result.len() <= 253);
+        assert!(!result.ends_with('-'));
+
+        // A few more offsets so this isn't pinned to one alignment.
+        for pad in 230..240 {
+            let name = format!("{}日本語", "a".repeat(pad));
+            let out = t
+                .to_host_name(&name, "ns")
+                .unwrap_or_else(|e| panic!("pad={pad} must not fail: {e}"));
+            assert!(out.len() <= 253, "pad={pad} produced {} bytes", out.len());
+        }
     }
 
     #[test]
