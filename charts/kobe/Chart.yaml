@@ -36,15 +36,26 @@ annotations:
     - name: issues
       url: https://github.com/kunobi-ninja/kobe/issues
   # Every image this chart can deploy, so Artifact Hub can run its
-  # security report against them. `kine` is only pulled when a KobeStore
-  # selects the kine/sqlite driver; the other two always ship.
+  # security report against them. The first-party tags carry the `v`
+  # prefix because that is what docker-bake.hcl publishes and what the
+  # templates default to (`printf "v%s" .Chart.AppVersion`) — a bare
+  # `0.37.0` image tag does not exist. The chart's own OCI tag is bare
+  # semver; that is a different artifact, and conflating the two is easy.
+  # The last three are conditional and third-party, so they are
+  # whitelisted rather than tracked as ours.
   artifacthub.io/images: |
     - name: kobe-operator
-      image: docker.io/zondax/kobe-operator:0.37.0
+      image: docker.io/zondax/kobe-operator:v0.37.0
     - name: kobe-sync
-      image: docker.io/zondax/kobe-sync:0.37.0
+      image: docker.io/zondax/kobe-sync:v0.37.0
     - name: kine
       image: docker.io/rancher/kine:v0.13.2
+      whitelisted: true
+    - name: flux-cli
+      image: ghcr.io/fluxcd/flux-cli:v2.2.3
+      whitelisted: true
+    - name: kubectl
+      image: docker.io/rancher/kubectl:v1.34.7
       whitelisted: true
   artifacthub.io/crds: |
     - kind: ClusterPool

@@ -100,7 +100,14 @@ elif chart_version != ws_version:
 # report scans the right tags. They are first-party images, so they move with
 # the release and would otherwise silently advertise a stale version forever
 # (`just bump` rewrites them; this is what stops that from being optional).
-# Third-party images (kine, etc.) are deliberately not checked.
+# Third-party images (kine, flux-cli, kubectl) are deliberately not checked.
+#
+# The expected tag is `v<version>`, NOT the bare version: docker-bake.hcl
+# publishes `v${VERSION}` and the templates default to
+# `printf "v%s" .Chart.AppVersion`, so a bare `0.37.0` image does not exist.
+# (The CHART's own OCI tag is bare semver — a different artifact. Conflating
+# the two is exactly the mistake this check now catches.)
+expected_image_tag = f"v{ws_version}"
 ah_images = re.findall(r"docker\.io/zondax/([\w.-]+):([^\s\"']+)", chart)
 if not ah_images:
     errors.append(
@@ -109,10 +116,10 @@ if not ah_images:
         "this check or restore it"
     )
 for image_name, image_tag in ah_images:
-    if image_tag != ws_version:
+    if image_tag != expected_image_tag:
         errors.append(
             f"Chart.yaml artifacthub.io/images {image_name} tag {image_tag!r} "
-            f"!= workspace version {ws_version!r}"
+            f"!= expected {expected_image_tag!r} (published tags are v-prefixed)"
         )
 
 # --- nix/package.nix version (optional) ---
