@@ -53,15 +53,26 @@ run *args:
 test-smoke pool='ci-small' ttl='2m' *args:
     @mise exec -- bun run ./hack/test-smoke.ts {{ pool }} {{ ttl }} {{ args }}
 
-# Lease a local vkobe warm cluster, verify kubectl can reach it, then release it
+# Lease a local vkobe cluster on demand, verify kubectl can reach it, then
+# release it. The pool is scale-to-zero (scaling.minReady: 0), so the lease
+# request itself is what provisions — hence POOL_ON_DEMAND and a lease wait
+# long enough to cover a cold start.
 [group('dev')]
 test-smoke-vkobe ttl='2m' *args:
-    @mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-etcd {{ ttl }} {{ args }}
+    @env POOL_ON_DEMAND=1 LEASE_WAIT_TIMEOUT=10m mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-etcd {{ ttl }} {{ args }}
 
-# Lease a local vkobe+kine-sqlite warm cluster, verify API discovery, then release it
+# Lease a local vkobe+kine-sqlite cluster on demand, verify API discovery, then release it
 [group('dev')]
 test-smoke-vkobe-kine ttl='2m' *args:
-    @mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-kine-sqlite {{ ttl }} {{ args }}
+    @env POOL_ON_DEMAND=1 LEASE_WAIT_TIMEOUT=10m mise exec -- bun run ./hack/test-smoke.ts e2e-vkobe-kine-sqlite {{ ttl }} {{ args }}
+
+# Lease a local vcluster (upstream loft-sh chart) on demand, verify kubectl
+# can reach it, then release it. Same scale-to-zero shape as the vkobe
+# recipes; the Helm install makes a cold start slower, so the lease wait is
+# correspondingly generous.
+[group('dev')]
+test-smoke-vcluster ttl='2m' *args:
+    @env POOL_ON_DEMAND=1 LEASE_WAIT_TIMEOUT=15m mise exec -- bun run ./hack/test-smoke.ts e2e-vcluster {{ ttl }} {{ args }}
 
 # Lease a local bootstrap-enabled vkobe cluster and verify bootstrap resources exist
 [group('dev')]
