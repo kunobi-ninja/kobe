@@ -216,6 +216,18 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             Ok(current) => Arc::new(current),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 debug!(lease = %name, "Lease disappeared before reconcile could load current state");
+                // Evict on the way out. This covers only the narrow race
+                // where the delete lands after this reconcile was
+                // dispatched (store hit) but before its apiserver GET.
+                // It is NOT the fix for deletes in general: kube-runtime
+                // drives the controller from `applied_objects()`, which
+                // drops Deleted events, and requeues resolve through the
+                // reflector store — so a `kubectl delete` of a queued
+                // lease produces no reconcile here at all. The reaper's
+                // sweep (`prune_queues_against_live`) is what actually
+                // guarantees the entry goes away; this just gets there
+                // sooner when the race does happen.
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 return Ok(Action::await_change());
             }
             Err(err) => return Err(LeaseError::Kube(err)),
@@ -899,6 +911,36 @@ async fn run_reaper<B: ClusterBackend>(
 
         let now = chrono::Utc::now();
 
+        // Reconcile the in-memory queues against what the apiserver
+        // actually holds. This is the only place a lease deleted outside
+        // a reconcile can be evicted — see `prune_queues_against_live`
+        // for why the reconcile path cannot do it — and a stranded entry
+        // head-blocks its whole pool, so it is worth the one pass over an
+        // already-fetched list.
+        {
+            let live_pending: std::collections::HashSet<String> = leases
+                .iter()
+                .filter(|l| {
+                    l.status
+                        .as_ref()
+                        .map(|s| s.phase == LeasePhase::Pending)
+                        .unwrap_or(true)
+                })
+                .map(|l| l.name_any())
+                .collect();
+
+            let evicted = {
+                let mut queues = ctx.queues.write().await;
+                prune_queues_against_live(&mut queues, &live_pending)
+            };
+            if !evicted.is_empty() {
+                warn!(
+                    leases = ?evicted,
+                    "Reaper: evicted queue entries with no live Pending lease (would otherwise head-block the pool)"
+                );
+            }
+        }
+
         for lease in leases {
             let name = lease.name_any();
             let status = lease.status.clone().unwrap_or_default();
@@ -964,6 +1006,45 @@ async fn remove_from_queue(
     if let Some(queue) = queues.get_mut(profile) {
         queue.retain(|p| p.lease_name != lease_name);
     }
+}
+
+/// Drop queue entries whose lease is no longer `Pending` on the
+/// apiserver, returning the names evicted.
+///
+/// This is the authoritative cleanup, and it exists because the
+/// reconcile path cannot be. kube-runtime's `Controller` is driven by
+/// `applied_objects()`, which drops Deleted events, and every scheduled
+/// requeue resolves through the reflector store first — so once a
+/// deleted lease leaves the store, **no reconcile ever runs for it**.
+/// The 404 branch in `reconcile_lease` therefore only catches the narrow
+/// race where a delete lands mid-reconcile; a plain `kubectl delete` of
+/// a queued lease never reaches it.
+///
+/// That matters because a stranded entry is not a leak but a deadlock:
+/// the queue is sorted oldest-first within a priority, so the ghost sits
+/// at the head and every later lease for that pool sees `is_head ==
+/// false` and never binds.
+///
+/// Sweeping from a LIST is safe against the obvious race — a lease
+/// created after the LIST could be pruned here, but the queue insert in
+/// `reconcile_lease` is idempotent and runs on a 5s requeue, so it
+/// re-inserts itself on the next pass. A transient drop self-heals; a
+/// permanent ghost does not.
+fn prune_queues_against_live(
+    queues: &mut HashMap<String, Vec<PendingLease>>,
+    live_pending: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut evicted = Vec::new();
+    for queue in queues.values_mut() {
+        queue.retain(|p| {
+            let keep = live_pending.contains(&p.lease_name);
+            if !keep {
+                evicted.push(p.lease_name.clone());
+            }
+            keep
+        });
+    }
+    evicted
 }
 
 /// Build the `{ "status": { ... } }` merge patch that transitions a lease to
@@ -1328,6 +1409,180 @@ mod tests {
         let queue = q.get("test-profile").unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].lease_name, "lease-b");
+    }
+
+    /// A lease that disappears while `Pending` must leave the in-memory
+    /// priority queue with it.
+    ///
+    /// Every other eviction site needs a live lease to reconcile, so a
+    /// hard `DELETE` (kubectl, owner GC, or the loser of a create race)
+    /// used to strand its entry forever. That is not a leak so much as a
+    /// deadlock: the queue sorts oldest-first within a priority, so the
+    /// ghost sits at the head, every later lease for the pool computes
+    /// `is_head == false`, and nothing in that pool can bind again until
+    /// the operator restarts — `rebuild_queues` runs only at startup and
+    /// only inserts.
+    #[tokio::test]
+    async fn disappeared_pending_lease_is_evicted_from_the_queue() {
+        let (ctx, server) = test_lease_context().await;
+
+        // The ghost, plus a real lease queued behind it.
+        {
+            let mut q = ctx.queues.write().await;
+            q.insert(
+                "test-profile".to_string(),
+                vec![
+                    PendingLease {
+                        lease_name: "ghost-1".to_string(),
+                        priority: 50,
+                        created_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                    },
+                    PendingLease {
+                        lease_name: "real-1".to_string(),
+                        priority: 50,
+                        created_at: chrono::Utc::now(),
+                    },
+                ],
+            );
+        }
+
+        // A cached object carrying a resourceVersion, so the reconciler
+        // re-reads it from the apiserver — which is where it learns the
+        // lease is gone.
+        let lease: Arc<ClusterLease> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "ghost-1",
+                    "namespace": "test-ns",
+                    "resourceVersion": "42"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "user@test.com" },
+                    "priority": 50
+                },
+                "status": { "phase": "Pending" }
+            }))
+            .unwrap(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/ghost-1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("clusterleases", "ghost-1")),
+            )
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
+        assert_eq!(action, Action::await_change());
+
+        let queues = ctx.queues.read().await;
+        let queue = queues
+            .get("test-profile")
+            .expect("pool queue still present");
+        assert!(
+            !queue.iter().any(|p| p.lease_name == "ghost-1"),
+            "deleted lease must not remain queued — it would block the pool head forever"
+        );
+        assert_eq!(
+            queue.first().map(|p| p.lease_name.as_str()),
+            Some("real-1"),
+            "the lease behind the ghost must become head and be able to bind"
+        );
+    }
+
+    /// The reaper sweep is what actually un-wedges a pool after a lease
+    /// is deleted outside a reconcile.
+    ///
+    /// `reconcile_lease`'s 404 branch cannot do it: kube-runtime drives
+    /// the controller from `applied_objects()` (Deleted events dropped),
+    /// and requeues resolve through the reflector store, so a
+    /// `kubectl delete` of a queued lease produces no reconcile at all.
+    /// Only a sweep against a live LIST sees the ghost.
+    #[test]
+    fn prune_evicts_queue_entries_with_no_live_pending_lease() {
+        let mut queues: HashMap<String, Vec<PendingLease>> = HashMap::new();
+        let at = |mins: i64| chrono::Utc::now() - chrono::Duration::minutes(mins);
+        queues.insert(
+            "pool-a".to_string(),
+            vec![
+                // Deleted out from under us — oldest, so it holds the head.
+                PendingLease {
+                    lease_name: "ghost".into(),
+                    priority: 50,
+                    created_at: at(10),
+                },
+                PendingLease {
+                    lease_name: "real".into(),
+                    priority: 50,
+                    created_at: at(1),
+                },
+            ],
+        );
+        // A second pool proves the sweep is not scoped to one queue —
+        // the reconcile path only ever knew about a lease's own pool.
+        queues.insert(
+            "pool-b".to_string(),
+            vec![PendingLease {
+                lease_name: "stale-elsewhere".into(),
+                priority: 50,
+                created_at: at(5),
+            }],
+        );
+
+        let live: std::collections::HashSet<String> = ["real".to_string()].into_iter().collect();
+        let mut evicted = prune_queues_against_live(&mut queues, &live);
+        evicted.sort();
+
+        assert_eq!(
+            evicted,
+            vec!["ghost".to_string(), "stale-elsewhere".to_string()]
+        );
+        assert_eq!(
+            queues["pool-a"]
+                .iter()
+                .map(|p| p.lease_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real"],
+            "the surviving lease must become head and be able to bind"
+        );
+        assert!(queues["pool-b"].is_empty());
+    }
+
+    /// A pool whose queue is entirely live must be left alone — the
+    /// sweep must not churn the common case.
+    #[test]
+    fn prune_leaves_a_fully_live_queue_untouched() {
+        let mut queues: HashMap<String, Vec<PendingLease>> = HashMap::new();
+        queues.insert(
+            "pool-a".to_string(),
+            vec![
+                PendingLease {
+                    lease_name: "a".into(),
+                    priority: 50,
+                    created_at: chrono::Utc::now(),
+                },
+                PendingLease {
+                    lease_name: "b".into(),
+                    priority: 10,
+                    created_at: chrono::Utc::now(),
+                },
+            ],
+        );
+        let live: std::collections::HashSet<String> =
+            ["a".to_string(), "b".to_string()].into_iter().collect();
+
+        let evicted = prune_queues_against_live(&mut queues, &live);
+
+        assert!(evicted.is_empty());
+        assert_eq!(queues["pool-a"].len(), 2);
     }
 
     #[tokio::test]
