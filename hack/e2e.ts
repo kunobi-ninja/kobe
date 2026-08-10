@@ -76,6 +76,10 @@ type Args = {
   namespace: string;
   release: string;
   imageTag: string;
+  /// Conformance backend this environment is being brought up for, when it is
+  /// known. Only used to decide which guest images are worth pre-loading —
+  /// every pool is still applied regardless.
+  backend?: string;
 };
 
 type E2eState = {
@@ -244,7 +248,7 @@ function parseArgs(argv: string[]): Args {
     namespace: DEFAULT_NAMESPACE,
     release: DEFAULT_RELEASE,
     imageTag: DEFAULT_IMAGE_TAG,
-  };
+  } as Args;
 
   const [maybeCommand, ...rest] = argv;
   const tokens = maybeCommand === "up" || maybeCommand === "down" ? rest : argv;
@@ -276,6 +280,11 @@ function parseArgs(argv: string[]): Args {
       i += 1;
       continue;
     }
+    if (token === "--backend" && next) {
+      args.backend = next;
+      i += 1;
+      continue;
+    }
     if (token === "--help" || token === "-h") {
       printHelpAndExit();
     }
@@ -286,7 +295,9 @@ function parseArgs(argv: string[]): Args {
 
 function printHelpAndExit(): never {
   info("Usage:");
-  info("  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG]");
+  info(
+    "  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG] [--backend NAME]",
+  );
   info("  bun run ./hack/e2e.ts down [--cluster NAME]");
   process.exit(0);
 }
@@ -467,7 +478,18 @@ async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<vo
   // pull them inside the smoke gate's wait_ready budget. k3s is launched with
   // the default IfNotPresent pull policy for its tagged image, so a node-local
   // copy means the kubelet never reaches out to the registry.
-  await loadRemoteImagesIntoKind(cluster, [K3S_GUEST_IMAGE, K0S_GUEST_IMAGE]);
+  // k3s is pre-loaded unconditionally because `e2e-k3s` is the one pool with
+  // `scaling.minReady: 1` — it warms in EVERY leg, so every leg needs its
+  // guest image. The scale-to-zero pools only provision when their own leg
+  // leases from them, so pre-loading their images everywhere would tax each
+  // leg with a pull it never uses (and add a registry dependency, which is a
+  // fresh way for an unrelated leg to fail). Pull those only when the leg
+  // that needs them is the one coming up.
+  const guestImages = [K3S_GUEST_IMAGE];
+  if (args.backend === "k0s") {
+    guestImages.push(K0S_GUEST_IMAGE);
+  }
+  await loadRemoteImagesIntoKind(cluster, guestImages);
 }
 
 async function prepareHelm(): Promise<void> {

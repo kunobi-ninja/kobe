@@ -241,7 +241,11 @@ jobs:
       # Per-backend kind cluster name (run id + backend) so concurrent legs and
       # persistent self-hosted runs never collide on a shared cluster name.
       - name: Bring up the e2e harness (kind + chart + pools)
-        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}-${{ matrix.backend }}
+        # `--backend` only selects which guest images are worth pre-loading;
+        # every pool is applied regardless. Scale-to-zero pools provision only
+        # in their own leg, so pre-loading their images in every leg would be a
+        # pull each other leg never uses.
+        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}-${{ matrix.backend }} --backend ${{ matrix.backend }}
 
       # The smoke recipes differ by backend (k3s takes the cluster name; the
       # vkobe recipes target their pool against the current kind context).
