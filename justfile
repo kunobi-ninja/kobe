@@ -74,6 +74,13 @@ test-smoke-vkobe-kine ttl='2m' *args:
 test-smoke-vcluster ttl='2m' *args:
     @env POOL_ON_DEMAND=1 LEASE_WAIT_TIMEOUT=15m mise exec -- bun run ./hack/test-smoke.ts e2e-vcluster {{ ttl }} {{ args }}
 
+# Lease a local k0s cluster on demand, verify kubectl can reach it, then release
+# it. Same scale-to-zero shape as the vkobe/vcluster recipes: the pool keeps
+# nothing warm, so the lease request itself is what provisions.
+[group('dev')]
+test-smoke-k0s ttl='2m' *args:
+    @env POOL_ON_DEMAND=1 LEASE_WAIT_TIMEOUT=10m mise exec -- bun run ./hack/test-smoke.ts e2e-k0s {{ ttl }} {{ args }}
+
 # Lease a local bootstrap-enabled vkobe cluster and verify bootstrap resources exist
 [group('dev')]
 test-smoke-bootstrap-vkobe ttl='2m' *args:

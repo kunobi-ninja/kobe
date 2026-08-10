@@ -1683,11 +1683,10 @@ mod tests {
                 BackendType::K3s => Some(&["k3s"]),
                 BackendType::Vkobe => Some(&["vkobe-etcd", "vkobe-kine"]),
                 BackendType::Vcluster => Some(&["vcluster"]),
-                // Documented exemptions — NOT yet in the matrix:
+                BackendType::K0s => Some(&["k0s"]),
+                // Documented exemption — NOT yet in the matrix:
                 // - capi: no CI infrastructure provider yet
-                // - k0s: the harness has an `e2e-k0s` pool, but no smoke
-                //   recipe drives it, so nothing asserts conformance
-                BackendType::Capi | BackendType::K0s => None,
+                BackendType::Capi => None,
             }
         }
 

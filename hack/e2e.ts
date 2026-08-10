@@ -580,7 +580,14 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: a server-side cap shorter
+    # than the client wait expires the queued claim regardless of how
+    # long the client is willing to wait.
+    queueTimeout: "12m"
+    # Caps ONE provisioning attempt: past it the operator recycles that
+    # instance as wedged. Sized to fit a cold start in one attempt, so
+    # the leg measures provisioning rather than retries.
+    creatingTimeout: "8m"
   resources:
     limits:
       cpu: "1"
