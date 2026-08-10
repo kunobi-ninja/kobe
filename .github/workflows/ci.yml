@@ -155,12 +155,22 @@ jobs:
       - name: Build all images (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from='
 
-  # Backend-agnostic conformance gate (#164): the same provision→Ready→recycle
-  # smoke, run PER BACKEND, so "passes conformance" is provable for each backend
-  # rather than k3s-only. Each leg exercises the real Helm chart (real rbac.yaml)
-  # against a REAL cluster nested-in-pod inside plain kind, catching the two
-  # regression classes unit tests can't: the readiness-probe class (members never
-  # go Ready) and the RBAC-403 recycle-wedge class (instances stuck Recycling).
+  # Backend-agnostic conformance gate (#164), run PER BACKEND so "passes
+  # conformance" is provable for each rather than k3s-only. Every leg exercises
+  # the real Helm chart (real rbac.yaml) against a REAL cluster nested-in-pod
+  # inside plain kind — which is what catches the readiness-probe class of
+  # regression (members never go Ready) that unit tests cannot.
+  #
+  # The legs are NOT equivalent, and it is worth being precise about it:
+  #   - k3s runs `hack/test-e2e-k3s.ts`: provision -> Ready -> recycle, and it
+  #     asserts teardown completed and left no orphaned data PVC. That is the
+  #     leg that covers the RBAC-403 recycle-wedge class (stuck Recycling).
+  #   - every other leg runs the generic `hack/test-smoke.ts`: provision ->
+  #     Ready -> lease -> API reachable -> release. It does NOT wait for or
+  #     assert recycle, so it does not cover the recycle-wedge class.
+  # Extending the generic smoke to assert teardown would make the matrix
+  # uniform; until then, read a green non-k3s leg as "provisions and serves",
+  # not "provisions, serves and reaps".
   #
   # Kept as one dedicated matrix job (cf. how kunobi-ninja/kache#487 kept its
   # audit gate a dedicated, scoped job) — each leg owns an isolated kind cluster

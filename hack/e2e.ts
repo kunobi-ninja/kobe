@@ -14,6 +14,15 @@ const DEMO_TOKEN_SECRET = "e2e-local-token";
 const DEMO_POLICY = "e2e-local-token";
 const DEMO_K0S_POOL = "e2e-k0s";
 const DEMO_K0S_VERSION = "v1.35.1+k0s.0";
+// k0s guest image the k0s backend launches for DEMO_K0S_VERSION. Same `+`->`-`
+// rewrite as k3s, for the same reason: OCI tags forbid `+` (see k0s_image() in
+// src/backend/k0s.rs). Keep in sync with DEMO_K0S_VERSION.
+//
+// Pre-loaded into the kind nodes for the same reason as the k3s image: without
+// it the guest pulls from the registry inside kind at provision time, and that
+// uncontrolled pull sits inside the pool's creatingTimeout — so the k0s leg
+// would be timing a network fetch rather than the backend.
+const K0S_GUEST_IMAGE = "k0sproject/k0s:v1.35.1-k0s.0";
 // Single-server k3s pool exercised by the provision→Ready→recycle CI smoke
 // gate (hack/test-e2e-k3s.ts). Uses embedded SQLite (no shared datastore in
 // kind) and warms one member via scaling.minReady=1. The matching guest image
@@ -458,7 +467,7 @@ async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<vo
   // pull them inside the smoke gate's wait_ready budget. k3s is launched with
   // the default IfNotPresent pull policy for its tagged image, so a node-local
   // copy means the kubelet never reaches out to the registry.
-  await loadRemoteImagesIntoKind(cluster, [K3S_GUEST_IMAGE]);
+  await loadRemoteImagesIntoKind(cluster, [K3S_GUEST_IMAGE, K0S_GUEST_IMAGE]);
 }
 
 async function prepareHelm(): Promise<void> {
@@ -585,8 +594,11 @@ spec:
     # long the client is willing to wait.
     queueTimeout: "12m"
     # Caps ONE provisioning attempt: past it the operator recycles that
-    # instance as wedged. Sized to fit a cold start in one attempt, so
-    # the leg measures provisioning rather than retries.
+    # instance as wedged. The claim itself survives and a later attempt can
+    # still serve it, up to the waits above — so this is a chosen retry
+    # policy, not a hard bound on the claim. Sized to fit a cold start now
+    # that the guest image is pre-loaded into the kind nodes
+    # (K0S_GUEST_IMAGE); without that it would be timing a registry pull.
     creatingTimeout: "8m"
   resources:
     limits:
