@@ -58,7 +58,9 @@ expect() {
     echo "FAIL: $name — expected rc=$want_rc, got rc=$rc"
     echo "      output: $out"
     fail=$((fail + 1))
-  elif [ -n "$want_sub" ] && ! printf '%s' "$out" | grep -qF -- "$want_sub"; then
+  # Match in memory: with pipefail, `grep -q` can close the pipe after a match
+  # and turn printf's resulting SIGPIPE into a false test failure.
+  elif [ -n "$want_sub" ] && [[ "$out" != *"$want_sub"* ]]; then
     echo "FAIL: $name — output did not mention: $want_sub"
     echo "      output: $out"
     fail=$((fail + 1))
