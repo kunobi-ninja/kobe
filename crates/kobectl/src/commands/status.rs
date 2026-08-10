@@ -259,3 +259,37 @@ async fn enrich_leases(
 
     enriched
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SSH hint fires on the one failure it can actually explain, and
+    /// stays quiet otherwise.
+    ///
+    /// "no key found in SSH agent" is the failure a user cannot diagnose from
+    /// the message alone — the fix is environmental (`SSH_AUTH_SOCK`,
+    /// `ssh-add -l`), not something they typed wrong. Attaching that hint to
+    /// unrelated auth failures would send people chasing their agent when the
+    /// real problem is an expired token or a bad issuer.
+    #[test]
+    fn the_ssh_hint_is_offered_only_for_the_failure_it_explains() {
+        assert!(
+            auth_error_hint("no matching key found in SSH agent").is_some(),
+            "the agent-lookup failure is the case this hint exists for"
+        );
+
+        for unrelated in [
+            "token expired",
+            "invalid issuer",
+            "connection refused",
+            "403 Forbidden",
+            "",
+        ] {
+            assert!(
+                auth_error_hint(unrelated).is_none(),
+                "must not offer an SSH-agent hint for: {unrelated:?}"
+            );
+        }
+    }
+}

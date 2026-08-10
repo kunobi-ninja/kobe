@@ -202,3 +202,144 @@ pub enum CIDRPoolPhase {
     /// See `message`.
     Invalid,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The allocated CIDRs must be OMITTED when unset, never serialized as
+    /// null.
+    ///
+    /// This is the allocation record. A controller doing pass-through
+    /// preservation that momentarily reads them as `None` would, with an
+    /// explicit null, erase them via JSON Merge Patch (RFC 7396) — and the
+    /// allocator derives the in-use set by listing bound claims. A cleared
+    /// allocation is therefore not a display bug: the slot looks free and
+    /// gets re-issued to a second cluster, which is the CIDR-collision class
+    /// this type exists to prevent.
+    #[test]
+    fn an_unset_allocation_is_omitted_so_merge_patch_cannot_erase_it() {
+        let unbound = CIDRClaimStatus {
+            phase: CIDRClaimPhase::Pending,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&unbound).unwrap();
+        for key in ["serviceCidr", "clusterCidr", "boundAt", "message"] {
+            assert!(
+                v.get(key).is_none(),
+                "{key} must be omitted when unset, not null: {v}"
+            );
+        }
+
+        let bound = CIDRClaimStatus {
+            phase: CIDRClaimPhase::Bound,
+            service_cidr: Some("10.240.0.0/20".into()),
+            cluster_cidr: Some("10.248.0.0/20".into()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&bound).unwrap();
+        assert_eq!(
+            v.get("serviceCidr").and_then(|x| x.as_str()),
+            Some("10.240.0.0/20")
+        );
+        assert_eq!(
+            v.get("clusterCidr").and_then(|x| x.as_str()),
+            Some("10.248.0.0/20")
+        );
+    }
+
+    /// A claim with no status yet is `Pending`, never `Bound`. Defaulting to
+    /// `Bound` would make an unreconciled claim advertise an allocation it
+    /// does not have — and its `service_cidr` would be `None`, so it would
+    /// claim a slot of nothing.
+    #[test]
+    fn phase_defaults_to_pending() {
+        let st: CIDRClaimStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(st.phase, CIDRClaimPhase::Pending);
+        assert_eq!(CIDRClaimPhase::default(), CIDRClaimPhase::Pending);
+    }
+
+    /// Phase round-trips as the bare variant name for every state. The IPAM
+    /// controller and the pool manager both branch on this value.
+    #[test]
+    fn phase_round_trips_as_the_bare_variant_name() {
+        for (phase, wire) in [
+            (CIDRClaimPhase::Pending, "Pending"),
+            (CIDRClaimPhase::Bound, "Bound"),
+            (CIDRClaimPhase::Conflict, "Conflict"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&phase).unwrap(),
+                serde_json::Value::String(wire.to_string())
+            );
+            let back: CIDRClaimPhase = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(back, phase);
+        }
+    }
+
+    /// Static reservations are requested in camelCase. A snake_case key is
+    /// dropped as unknown, which for an optional field means the pin is
+    /// silently ignored and the allocator hands out a dynamic slot instead
+    /// of the one that was asked for.
+    #[test]
+    fn a_static_reservation_binds_camel_case_only() {
+        let camel: CIDRClaimSpec = serde_json::from_value(serde_json::json!({
+            "requestedServiceCidr": "10.240.0.0/20"
+        }))
+        .unwrap();
+        assert_eq!(
+            camel.requested_service_cidr.as_deref(),
+            Some("10.240.0.0/20")
+        );
+
+        let snake: CIDRClaimSpec = serde_json::from_value(serde_json::json!({
+            "requested_service_cidr": "10.240.0.0/20"
+        }))
+        .unwrap();
+        assert!(
+            snake.requested_service_cidr.is_none(),
+            "snake_case must not bind — pinning would be silently ignored"
+        );
+    }
+
+    /// A status written by a newer operator must still deserialize, or a
+    /// rolling upgrade wedges the older replica on every claim it reads.
+    #[test]
+    fn a_status_from_a_newer_operator_still_deserializes() {
+        let st: CIDRClaimStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Bound",
+            "serviceCidr": "10.240.0.0/20",
+            "someFieldFromTheFuture": true
+        }))
+        .expect("unknown fields must be ignored");
+        assert_eq!(st.phase, CIDRClaimPhase::Bound);
+        assert_eq!(st.service_cidr.as_deref(), Some("10.240.0.0/20"));
+    }
+
+    /// Both IPAM CRDs' public identity, and that the claim carries a real
+    /// status subresource — without it the apiserver drops every allocation
+    /// the controller writes and no claim ever binds.
+    #[test]
+    fn crd_identities_are_stable() {
+        use kube::CustomResourceExt;
+
+        let claim = serde_json::to_value(CIDRClaim::crd()).unwrap();
+        assert_eq!(claim["spec"]["group"], "kobe.kunobi.ninja");
+        assert_eq!(claim["spec"]["names"]["kind"], "CIDRClaim");
+        assert_eq!(claim["spec"]["names"]["plural"], "cidrclaims");
+        assert_eq!(claim["spec"]["names"]["shortNames"][0], "cclaim");
+        assert_eq!(claim["metadata"]["name"], "cidrclaims.kobe.kunobi.ninja");
+        let versions = claim["spec"]["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["name"], "v1alpha1");
+        assert!(
+            versions[0]["subresources"].get("status").is_some(),
+            "CIDRClaim must have a status subresource or allocations are dropped"
+        );
+
+        let pool = serde_json::to_value(CIDRPool::crd()).unwrap();
+        assert_eq!(pool["spec"]["names"]["kind"], "CIDRPool");
+        assert_eq!(pool["spec"]["names"]["plural"], "cidrpools");
+        assert_eq!(pool["spec"]["names"]["shortNames"][0], "cpool");
+    }
+}
