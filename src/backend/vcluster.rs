@@ -160,17 +160,20 @@ fn helm_install_args(
 /// when missing — the same shape of accommodation as `k3s_image()` rewriting
 /// `+` to `-` because OCI tags forbid it.
 ///
-/// This normalizes the PREFIX only. It cannot make an arbitrary string a real
-/// tag: `1.34` becomes `v1.34`, which is still not published (the tags carry a
-/// full patch version). Validating that is the registry's job, and a wrong
-/// value surfaces as a pull failure rather than a silently different cluster.
+/// This normalizes the PREFIX only, and deliberately nothing else. It cannot
+/// make an arbitrary string a real tag: `1.34` becomes `v1.34`, which is still
+/// not published (the tags carry a full patch version).
+///
+/// In particular a k3s/k0s-style `v1.31.3+k3s1` is passed through untouched,
+/// even though `+` is not a legal tag character and the pull will fail. The
+/// tempting rewrite — strip the build metadata and hand over upstream
+/// `v1.31.3` — would be the very thing this function exists to stop: quietly
+/// giving a tenant a different artifact from the one their manifest names. A
+/// k3s build and the upstream release that shares its version are not the same
+/// image. Failing loudly at pull, attributable to the value in the spec, is the
+/// better outcome; correcting it is the operator's call, not ours.
 fn normalize_distro_version(version: &str) -> String {
     let v = version.trim();
-    // Semver build metadata is never part of an upstream tag, and `+` is not
-    // a legal tag character at all. A pool carrying a k3s/k0s-style version
-    // (`v1.31.3+k3s1`) — which this backend ignored until now — resolves to
-    // the real upstream tag rather than an unpullable one.
-    let v = v.split('+').next().unwrap_or(v);
     // Canonicalize to the lowercase `v` the published tags use; preserving an
     // uppercase `V` would just name a tag that does not exist.
     let v = v.strip_prefix(['v', 'V']).unwrap_or(v);
@@ -867,14 +870,16 @@ mod tests {
         assert_eq!(normalize_distro_version("V1.32.3"), "v1.32.3");
     }
 
-    /// Semver build metadata (`+k3s1`) is never part of an upstream image
-    /// tag, and `+` is not even a legal tag character. A pool that copied a
-    /// k3s-style version — which this backend silently ignored until now —
-    /// should resolve to the real upstream tag instead of an unpullable one.
+    /// A k3s/k0s-style build suffix is NOT rewritten away.
+    ///
+    /// Stripping `+k3s1` to reach upstream `v1.31.3` would substitute a
+    /// different artifact for the one the manifest names — the same class of
+    /// silent mismatch this whole change exists to remove. It is passed
+    /// through so the pull fails loudly and points back at the spec value.
     #[test]
-    fn version_drops_semver_build_metadata() {
-        assert_eq!(normalize_distro_version("v1.31.3+k3s1"), "v1.31.3");
-        assert_eq!(normalize_distro_version("1.31.3+k0s.0"), "v1.31.3");
+    fn version_does_not_rewrite_a_build_suffix_into_a_different_release() {
+        assert_eq!(normalize_distro_version("v1.31.3+k3s1"), "v1.31.3+k3s1");
+        assert_eq!(normalize_distro_version("1.31.3+k0s.0"), "v1.31.3+k0s.0");
     }
 
     /// Normalization must not corrupt an input that is already prefixed.
