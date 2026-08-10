@@ -67,6 +67,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Bun for E2E harness tests
+        uses: jdx/mise-action@v2
+        with:
+          install_args: bun
+          cache: false
+
+      - name: Lint and test E2E harness
+        run: |
+          mise exec -- bunx @biomejs/biome@2.3.11 lint --only=correctness/noUndeclaredVariables hack/*.ts
+          mise exec -- bun test ./hack/e2e.test.ts
+
       - name: Add Rust components
         run: rustup component add rustfmt clippy
 
