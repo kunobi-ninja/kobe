@@ -1,0 +1,291 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxpools.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: SandboxPool
+    plural: sandboxpools
+    shortNames:
+    - sp
+    singular: sandboxpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.ready
+      name: Ready
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SandboxPoolSpec via `CustomResource`
+        properties:
+          spec:
+            description: Administrator-owned class of Agent Sandbox capacity.
+            properties:
+              defaultTtl:
+                description: TTL used when a lease request omits one.
+                minLength: 1
+                type: string
+              isolation:
+                description: |-
+                  Claimed workload-isolation mechanism. Hardened tiers carry the exact
+                  administrator-selected RuntimeClass; leases cannot override it.
+                properties:
+                  runtimeClassName:
+                    minLength: 1
+                    type: string
+                  tier:
+                    enum:
+                    - trusted-runc
+                    - gvisor
+                    - kata
+                    type: string
+                required:
+                - tier
+                type: object
+                x-kubernetes-validations:
+                - message: trusted-runc must not set runtimeClassName; hardened tiers must set it
+                  rule: (self.tier == 'trusted-runc' && !has(self.runtimeClassName)) || (self.tier in ['gvisor', 'kata'] && has(self.runtimeClassName))
+              maxTtl:
+                description: Maximum runtime TTL this pool will accept, independent of caller policy.
+                minLength: 1
+                type: string
+              placement:
+                description: |-
+                  Exactly one target class. The tagged enum makes management and child
+                  placement mutually exclusive in both JSON and generated OpenAPI.
+                properties:
+                  clusterPoolRef:
+                    minLength: 1
+                    type: string
+                  type:
+                    enum:
+                    - management
+                    - childCluster
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: management must not set clusterPoolRef; childCluster must set it
+                  rule: (self.type == 'management' && !has(self.clusterPoolRef)) || (self.type == 'childCluster' && has(self.clusterPoolRef))
+              provisioningTimeout:
+                description: |-
+                  Maximum time allowed for placement and Sandbox provisioning. Runtime TTL
+                  starts only after readiness and is therefore separate from this deadline.
+                minLength: 1
+                type: string
+              readiness:
+                description: |-
+                  Pool-specific execution canary used in addition to fixed controller
+                  checks such as upstream readiness and runtime verification.
+                properties:
+                  canary:
+                    properties:
+                      argv:
+                        description: Direct argv vector; no implicit shell expansion.
+                        items:
+                          type: string
+                        minItems: 1
+                        type: array
+                      timeout:
+                        minLength: 1
+                        type: string
+                    required:
+                    - argv
+                    - timeout
+                    type: object
+                required:
+                - canary
+                type: object
+              template:
+                description: |-
+                  Restricted template translated into the controller-owned upstream
+                  `SandboxTemplate`; this is intentionally not a `PodSpec` escape hatch.
+                properties:
+                  containers:
+                    description: |-
+                      Complete bounded set of containers. Environment, mounts, security
+                      context, service accounts, and arbitrary Pod fields are not exposed.
+                    items:
+                      description: One administrator-controlled container in a Sandbox template.
+                      properties:
+                        args:
+                          default: []
+                          items:
+                            type: string
+                          type: array
+                        command:
+                          default: []
+                          description: Executable and arguments, passed directly without an implicit shell.
+                          items:
+                            type: string
+                          type: array
+                        image:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                        resources:
+                          description: |-
+                            Explicit requests and limits. CPU and memory are the only resource
+                            dimensions admitted by the first Sandbox API, keeping quota comparison
+                            deterministic and avoiding arbitrary extended-resource keys.
+                          properties:
+                            limits:
+                              properties:
+                                cpu:
+                                  description: Kubernetes CPU quantity such as `500m` or `2`.
+                                  minLength: 1
+                                  type: string
+                                ephemeralStorage:
+                                  description: Kubernetes ephemeral-storage quantity such as `1Gi`.
+                                  minLength: 1
+                                  type: string
+                                memory:
+                                  description: Kubernetes memory quantity such as `512Mi` or `2Gi`.
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - cpu
+                              - ephemeralStorage
+                              - memory
+                              type: object
+                            requests:
+                              properties:
+                                cpu:
+                                  description: Kubernetes CPU quantity such as `500m` or `2`.
+                                  minLength: 1
+                                  type: string
+                                ephemeralStorage:
+                                  description: Kubernetes ephemeral-storage quantity such as `1Gi`.
+                                  minLength: 1
+                                  type: string
+                                memory:
+                                  description: Kubernetes memory quantity such as `512Mi` or `2Gi`.
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - cpu
+                              - ephemeralStorage
+                              - memory
+                              type: object
+                          required:
+                          - limits
+                          - requests
+                          type: object
+                      required:
+                      - image
+                      - name
+                      - resources
+                      type: object
+                    minItems: 1
+                    type: array
+                  defaultContainer:
+                    description: Container selected by default for execution operations.
+                    minLength: 1
+                    type: string
+                  exposedPorts:
+                    default: []
+                    description: |-
+                      Ports that later access brokers may expose. Any undeclared port remains
+                      unauthorized.
+                    items:
+                      description: One TCP port declared safe for later lease-scoped forwarding.
+                      properties:
+                        container:
+                          minLength: 1
+                          type: string
+                        name:
+                          minLength: 1
+                          type: string
+                        port:
+                          format: uint16
+                          maximum: 65535.0
+                          minimum: 1.0
+                          type: integer
+                      required:
+                      - container
+                      - name
+                      - port
+                      type: object
+                    type: array
+                required:
+                - containers
+                - defaultContainer
+                type: object
+              warmCapacity:
+                description: Desired number of unclaimed upstream Sandboxes kept warm.
+                format: uint32
+                maximum: 2147483647.0
+                minimum: 0.0
+                type: integer
+            required:
+            - defaultTtl
+            - isolation
+            - maxTtl
+            - placement
+            - provisioningTimeout
+            - readiness
+            - template
+            - warmCapacity
+            type: object
+          status:
+            nullable: true
+            properties:
+              allocated:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+              conditions:
+                items:
+                  description: Kubernetes-style condition with the generation from which it was derived.
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              ready:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: SandboxPool
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

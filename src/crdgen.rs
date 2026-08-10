@@ -39,6 +39,14 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::CIDRPool::crd()).unwrap()
         ),
+        "sandboxpools" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::SandboxPool::crd()).unwrap()
+        ),
+        "sandboxleases" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::SandboxLease::crd()).unwrap()
+        ),
         _ => {
             print!(
                 "{}",
@@ -78,6 +86,16 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::CIDRPool::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::SandboxPool::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::SandboxLease::crd()).unwrap()
             );
         }
     }

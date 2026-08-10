@@ -243,6 +243,7 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .route("/v1/pools", get(list_pools::<B>))
         .route("/v1/pools/{name}", get(get_pool::<B>))
         .route("/v1/pools/{name}/leases", get(list_pool_leases::<B>))
+        .merge(crate::api::sandbox::routes::<B>())
         .layer(axum::middleware::from_fn(concurrency_limit));
 
     let connect_routes = Router::new()
@@ -2982,6 +2983,7 @@ mod tests {
 
     fn test_identity() -> AuthIdentity {
         AuthIdentity {
+            provider: "github-actions".to_string(),
             requester_type: "github-actions:ci".to_string(),
             identity: "repo:org/repo:ref:refs/heads/main".to_string(),
             issuer: "https://token.actions.githubusercontent.com".to_string(),
@@ -2991,6 +2993,7 @@ mod tests {
                 max_concurrent_leases: 5,
                 default_priority: 100,
                 max_extensions: 2,
+                sandbox: None,
             },
         }
     }

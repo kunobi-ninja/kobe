@@ -80,6 +80,10 @@ When a client leases a cluster, Kobe binds one from the warm pool instantly. Whe
 | `PATCH` | `/v1/leases/:id` | Extend a lease TTL |
 | `GET` | `/v1/pools` | List available pools with status |
 | `GET` | `/v1/pools/:name` | Get a specific pool's status |
+| `POST` | `/v1/sandbox-leases` | Create caller-safe Sandbox lease intent |
+| `GET` | `/v1/sandbox-leases` | List your Sandbox leases |
+| `GET` | `/v1/sandbox-leases/:id` | Get a Sandbox lease's lifecycle state |
+| `DELETE` | `/v1/sandbox-leases/:id` | Request Sandbox lease release |
 | `GET` | `/v1/status` | Endpoint status + auth methods (no auth required) |
 
 See [docs/kobe-docs/api/reference.mdx](docs/kobe-docs/api/reference.mdx) for full request/response shapes.
@@ -91,6 +95,8 @@ Kobe is driven by a small set of CRDs (group `kobe.kunobi.ninja/v1alpha1`):
 - **`ClusterPool`** — a pool of warm clusters with a backend, sizing, and default TTL.
 - **`ClusterInstance`** — one provisioned cluster, managed by a pool.
 - **`ClusterLease`** — binds a requester to an instance (created by the HTTP API, not authored directly).
+- **`SandboxPool`** — an administrator-owned class of bounded Agent Sandbox capacity and placement.
+- **`SandboxLease`** — caller-safe disposable Sandbox intent (created by the HTTP API).
 - **`AccessPolicy`** — who may lease which pools, with TTL / concurrency / extension caps.
 - **`KobeStore`** — datastore config for backends that externalize control-plane state.
 

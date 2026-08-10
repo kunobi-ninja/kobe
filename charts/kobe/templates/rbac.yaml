@@ -43,6 +43,15 @@ rules:
       - cidrpools
       - cidrpools/status
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Sandbox admission reads administrator-owned pool definitions.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxpools"]
+    verbs: ["get", "list", "watch"]
+  # Sandbox callers create lease intent through the HTTP API. Lifecycle
+  # controllers, not admission, own the status subresource.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxleases"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]
