@@ -529,6 +529,61 @@ mod tests {
         assert_eq!(resolved.pool.metadata.uid.as_deref(), Some("pool-uid"));
     }
 
+    /// The `Access` expiry gate must deny on every non-live outcome, including
+    /// the two "we cannot tell" cases.
+    ///
+    /// This replaces the old `routes::lease_is_expired` helper, which resolved
+    /// a missing or unparseable `expiresAt` to *not expired* and leaned on the
+    /// phase gate. A `Bound` lease with a corrupt timestamp therefore kept
+    /// proxying indefinitely. Uncertainty now denies.
+    #[tokio::test]
+    async fn expiry_gate_fails_closed() {
+        // Live: a future expiry resolves.
+        let (_, mut lease, instance, pool) = exact_objects();
+        lease["status"]["expiresAt"] =
+            serde_json::json!((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        assert!(
+            resolve_objects(lease, instance.clone(), pool.clone(), "lease-uid")
+                .await
+                .is_ok(),
+            "an unexpired Bound lease must resolve"
+        );
+
+        // Past expiry.
+        let (_, mut lease, _, _) = exact_objects();
+        lease["status"]["expiresAt"] =
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        assert_eq!(
+            resolve_objects(lease, instance.clone(), pool.clone(), "lease-uid")
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "expired"
+        );
+
+        // Absent expiry: cannot prove the lease is live.
+        let (_, mut lease, _, _) = exact_objects();
+        lease["status"].as_object_mut().unwrap().remove("expiresAt");
+        assert_eq!(
+            resolve_objects(lease, instance.clone(), pool.clone(), "lease-uid")
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "expiry_missing"
+        );
+
+        // Unparseable expiry: same reasoning.
+        let (_, mut lease, _, _) = exact_objects();
+        lease["status"]["expiresAt"] = serde_json::json!("not-a-timestamp");
+        assert_eq!(
+            resolve_objects(lease, instance, pool, "lease-uid")
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "expiry_malformed"
+        );
+    }
+
     #[tokio::test]
     async fn lease_instance_and_pool_name_reuse_fail_closed() {
         let (_, lease, instance, pool) = exact_objects();

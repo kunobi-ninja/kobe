@@ -39,6 +39,15 @@ pub struct AppState<B: ClusterBackend> {
     pub client: Client,
     pub authenticator: Arc<JwtAuthenticator>,
     pub namespace: String,
+    /// Ambient default backend. **Never an authorization or dispatch input.**
+    ///
+    /// Before #79 the connect proxy fell back to this when pool/backend
+    /// resolution failed, which let a deleted or reconfigured pool silently
+    /// redirect tenant traffic. Dispatch now comes exclusively from the
+    /// immutable `BackendProvenance` recorded on the binding, so nothing reads
+    /// this field. Retained only so the `B: ClusterBackend` plumbing keeps
+    /// compiling; dropping the type parameter is follow-up cleanup.
+    #[allow(dead_code)]
     pub backend: B,
     pub factory: Option<BackendFactory>,
     /// Shared PostgreSQL datastore when one is configured; empty in
@@ -102,7 +111,10 @@ const CONNECT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5)
 /// validate/get/extract/build path; on a `Miss` it runs the full path and
 /// repopulates the entry.
 enum CacheLookup {
-    Hit(ConnectCacheKey, ConnectCtx),
+    // `ConnectCtx` carries a reqwest client and the raw kubeconfig (~500
+    // bytes); boxing it keeps `Miss` — by far the hotter variant on a cold
+    // cache — from paying for that on every lookup.
+    Hit(ConnectCacheKey, Box<ConnectCtx>),
     Miss,
 }
 
@@ -123,7 +135,7 @@ impl ConnectCache {
                     // token that doesn't match what we validated.
                     && kunobi_auth::secret_eq(&entry.token, presented_token)
         }) {
-            Some((key, entry)) => CacheLookup::Hit(key.clone(), entry.clone()),
+            Some((key, entry)) => CacheLookup::Hit(key.clone(), Box::new(entry.clone())),
             _ => CacheLookup::Miss,
         }
     }
@@ -636,16 +648,6 @@ fn binding_resolution_response(err: BindingResolutionError) -> Response {
             "Lease binding is unavailable",
         ),
     }
-}
-
-/// Whether a lease's RFC3339 `expires_at` is in the past. A missing or
-/// unparseable timestamp is treated as not-expired (the phase gate still
-/// applies), so this can only tighten access, never loosen it.
-fn lease_is_expired(expires_at: Option<&str>) -> bool {
-    expires_at
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|expiry| chrono::Utc::now() > expiry)
-        .unwrap_or(false)
 }
 
 /// Build an error response for an internal/infrastructure failure (kube API,
@@ -2033,17 +2035,27 @@ async fn release_lease<B: ClusterBackend>(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let patch = serde_json::json!({
-        "status": { "phase": "Released" }
-    });
+    // Release by exact object, never by name. Between the read above and this
+    // write the lease could be deleted and a same-named one recreated by
+    // another requester; a merge patch would release theirs. The `test` ops
+    // make the API server reject that instead.
+    let (Some(uid), Some(rv)) = (lease.metadata.uid.as_deref(), lease.resource_version()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/status/phase", "value": "Released" }
+    ]));
     if let Err(e) = leases_api
-        .patch_status(
-            &id,
-            &PatchParams::apply("kobe-operator"),
-            &KubePatch::Merge(&patch),
-        )
+        .patch_status(&id, &PatchParams::default(), &KubePatch::<()>::Json(patch))
         .await
     {
+        // A failed precondition means the object we authorized is no longer the
+        // object on the server. Report it as gone rather than retrying blindly.
+        if crate::controllers::lease::optimistic_conflict(&e) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to release lease",
@@ -2093,7 +2105,9 @@ async fn extend_lease<B: ClusterBackend>(
     Json(req): Json<ExtendLeaseRequest>,
 ) -> Response {
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
-    match leases_api.get(&id).await {
+    // Carry the UID of the object we authorized into the mutation, so the
+    // extend cannot land on a same-named lease created after this check.
+    let authorized_uid = match leases_api.get(&id).await {
         Ok(lease) => {
             if lease.spec.requester.identity != identity.identity {
                 return (
@@ -2105,6 +2119,12 @@ async fn extend_lease<B: ClusterBackend>(
                     }),
                 )
                     .into_response();
+            }
+            match lease.metadata.uid.clone() {
+                Some(uid) => uid,
+                None => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
             }
         }
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
@@ -2121,13 +2141,14 @@ async fn extend_lease<B: ClusterBackend>(
         Err(e) => {
             return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
-    }
+    };
 
     match extend_lease_ttl(
         &state.client,
         &state.namespace,
         &id,
         &req.extend_ttl,
+        &authorized_uid,
         &state.authenticator,
     )
     .await
@@ -2750,17 +2771,11 @@ mod tests {
     use axum::http::Method;
     use base64::Engine;
 
-    #[test]
-    fn test_lease_is_expired() {
-        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        assert!(lease_is_expired(Some(&past)), "past expiry is expired");
-        assert!(!lease_is_expired(Some(&future)), "future expiry is live");
-        // Missing / unparseable timestamps must not be treated as expired (the
-        // phase gate still applies); fail-safe toward the existing behavior.
-        assert!(!lease_is_expired(None));
-        assert!(!lease_is_expired(Some("not-a-timestamp")));
-    }
+    // NOTE: the local `lease_is_expired` helper this module used to own is
+    // gone. Expiry is now decided inside `resolve_lease_binding`, which is
+    // strictly stricter: a missing or unparseable `expiresAt` denies instead of
+    // reading as "not expired". `lease_binding::tests::expiry_gate_fails_closed`
+    // pins all three outcomes.
 
     /// Build a `ConnectCtx` for cache tests. `age` ages `cached_at` into the
     /// past so the staleness branch can be exercised without sleeping.
@@ -3105,6 +3120,157 @@ mod tests {
         };
 
         (build_router(state), server)
+    }
+
+    /// Release is a mutation, so it must pin the exact object it authorized.
+    ///
+    /// Reading by name and then patching by name leaves a window: if the lease
+    /// is deleted and another requester creates one with the same name, a merge
+    /// patch releases *their* lease. The `test` ops make the API server refuse
+    /// instead, and a rejected precondition surfaces as 404 rather than 500.
+    #[tokio::test]
+    async fn release_is_uid_fenced() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let state = AppState {
+            client,
+            backend: crate::testutil::MockBackend::new(),
+            namespace: "test-ns".to_string(),
+            authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+        };
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "rel-1",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "rel-1",
+                &test_identity().identity,
+                "Released",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+
+        let response = release_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("rel-1".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|req| req.method == http::Method::PATCH)
+            .expect("release must issue a status PATCH");
+        assert_eq!(
+            patch
+                .headers
+                .get("content-type")
+                .map(|value| value.to_str().unwrap()),
+            Some("application/json-patch+json"),
+            "a merge patch cannot express a precondition; release must use JSON Patch"
+        );
+        let ops: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        let tests: Vec<(&str, &serde_json::Value)> = ops
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|op| op["op"] == "test")
+            .map(|op| (op["path"].as_str().unwrap(), &op["value"]))
+            .collect();
+        assert!(
+            tests.contains(&("/metadata/uid", &serde_json::json!("rel-1-uid"))),
+            "release must pin the exact lease UID: {tests:?}"
+        );
+        assert!(
+            tests
+                .iter()
+                .any(|(path, _)| *path == "/metadata/resourceVersion"),
+            "release must pin the observed resourceVersion: {tests:?}"
+        );
+    }
+
+    /// A rejected precondition means the authorized object is gone; report 404
+    /// (the same answer an unowned lease gets) rather than a 500.
+    #[tokio::test]
+    async fn release_reports_precondition_failure_as_not_found() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let state = AppState {
+            client,
+            backend: crate::testutil::MockBackend::new(),
+            namespace: "test-ns".to_string(),
+            authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+        };
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-2",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "rel-2",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+        // What the API server returns when a JSON Patch `test` op fails.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-2/status",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the object has been modified",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .mount(&server)
+            .await;
+
+        let response = release_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("rel-2".to_string()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a failed precondition must not surface as a 500"
+        );
     }
 
     fn lease_object_json(
@@ -3600,11 +3766,22 @@ mod tests {
         assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
     }
 
-    /// A miss populates the per-lease cache, and a subsequent request HITS it:
-    /// the second request must NOT re-read the connect-token Secret or re-GET
-    /// the lease. We assert this by mounting those two kube mocks with
-    /// `expect(1)` (wiremock fails on drop if they're hit more than once) while
-    /// the backend `/version` mock allows both requests through.
+    /// A miss populates the per-lease cache, and a subsequent request HITS it.
+    ///
+    /// The cache is a *credential* cache, never an *authorization* cache. It
+    /// pins exactly which work a hit is allowed to skip:
+    ///
+    /// - skipped on a hit: the connect-token Secret read and the backend
+    ///   kubeconfig read (both `expect(1)` — the expensive, mintable part);
+    /// - repeated on every hit: the UID-fenced binding resolution, which
+    ///   re-GETs the lease (`expect(2)`) so release, expiry, or a rebind to a
+    ///   different `ClusterInstance` UID is observed on the *next* request
+    ///   rather than at cache-TTL expiry.
+    ///
+    /// wiremock fails on server drop if any count is off, so these numbers are
+    /// the assertion. Dropping the lease GET to 1 would mean a released lease
+    /// keeps proxying until its cache entry ages out — the exact hole #79
+    /// closes.
     #[tokio::test]
     async fn test_connect_proxy_caches_lease_context_across_requests() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3632,8 +3809,8 @@ mod tests {
         use wiremock::matchers::{header, method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
 
-        // The token Secret and lease GETs may happen AT MOST once: the second
-        // request must be served from cache.
+        // Token authentication runs only on the cold miss; the hit reuses the
+        // cached, token-fenced entry.
         Mock::given(method("GET"))
             .and(path_regex(
                 "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
@@ -3642,7 +3819,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
             )
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         mount_exact_connect_objects(&server).await;
@@ -3657,7 +3834,9 @@ mod tests {
                 "Bound",
                 Some("pool-ci-small-6"),
             )))
-            .expect(1)
+            // Once per request: the hit re-runs `resolve_lease_binding` so the
+            // UID fence is re-checked, not trusted from cache.
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
