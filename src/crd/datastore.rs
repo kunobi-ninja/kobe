@@ -168,3 +168,74 @@ impl KobeStoreStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The driver's wire values are kebab-case and explicitly renamed, which
+    /// `rename_all = "camelCase"` would NOT produce for `KineSqlite`.
+    ///
+    /// These strings are what every existing KobeStore has stored. Losing the
+    /// rename would make `kine-sqlite` fail to deserialize, and a KobeStore
+    /// that cannot be read is a datastore the operator stops reconciling —
+    /// while the guests depending on it keep running.
+    #[test]
+    fn driver_wire_values_are_the_kebab_case_names() {
+        for (driver, wire) in [
+            (KobeStoreDriver::Etcd, "etcd"),
+            (KobeStoreDriver::KineSqlite, "kine-sqlite"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&driver).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "{driver:?} must serialize as {wire:?}"
+            );
+            let back: KobeStoreDriver = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(
+                serde_json::to_value(back).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "{wire:?} must round-trip"
+            );
+        }
+
+        // The camelCase spelling is NOT accepted — asserted so that adding a
+        // rename_all here can't silently change the stored vocabulary.
+        assert!(
+            serde_json::from_str::<KobeStoreDriver>("\"kineSqlite\"").is_err(),
+            "camelCase must not be an accepted driver spelling"
+        );
+    }
+
+    /// The supported driver set, pinned. Adding one is a deliberate act with
+    /// backend work behind it (#18 tracks Postgres/MySQL/NATS), so it should
+    /// not be possible to widen this by accident.
+    #[test]
+    fn only_the_two_implemented_drivers_are_accepted() {
+        for unsupported in ["postgres", "postgresql", "mysql", "nats", "sqlite", ""] {
+            assert!(
+                serde_json::from_str::<KobeStoreDriver>(&format!("\"{unsupported}\"")).is_err(),
+                "{unsupported:?} must not deserialize as a driver — it has no backend"
+            );
+        }
+    }
+
+    /// The CRD's public identity.
+    #[test]
+    fn crd_identity_is_stable() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(KobeStore::crd()).unwrap();
+
+        assert_eq!(crd["spec"]["group"], "kobe.kunobi.ninja");
+        assert_eq!(crd["spec"]["names"]["kind"], "KobeStore");
+        assert_eq!(crd["spec"]["names"]["plural"], "kobestores");
+        assert_eq!(crd["spec"]["names"]["shortNames"][0], "ks");
+        assert_eq!(crd["metadata"]["name"], "kobestores.kobe.kunobi.ninja");
+
+        let versions = crd["spec"]["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["name"], "v1alpha1");
+        assert_eq!(versions[0]["served"], true);
+        assert_eq!(versions[0]["storage"], true);
+    }
+}
