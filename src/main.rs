@@ -3,6 +3,7 @@ mod backend;
 mod controllers;
 mod crd;
 mod diagnostics;
+mod lease_binding;
 mod metrics;
 pub mod pki;
 mod pool;

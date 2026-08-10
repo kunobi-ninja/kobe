@@ -1,17 +1,141 @@
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::crd::{
-    Addon, BackendConfig, BootstrapRef, ClusterConfig, HealthCheckConfig, ReadinessGate,
-    SnapshotConfig,
+    Addon, BackendConfig, BackendType, BootstrapRef, CapiConfig, ClusterConfig, HealthCheckConfig,
+    ReadinessGate, SnapshotConfig,
 };
 
 /// Reference to another Kobe-managed resource in the same namespace.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRef {
+    /// Resource name. Names are display and lookup handles, never sufficient
+    /// authority on their own because Kubernetes permits name reuse.
     pub name: String,
+
+    /// Kubernetes UID of the referenced object. New controller-written
+    /// references always set this. `None` is accepted only so pre-UID-fence
+    /// objects remain readable; security-sensitive consumers must fail closed
+    /// or run the proof-based legacy migration before using the reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+}
+
+/// Immutable, non-secret data needed to select the backend that created an
+/// instance without trusting the owning pool's mutable current spec.
+///
+/// `config_digest` covers the complete serialized [`BackendConfig`], including
+/// backend-specific settings, while this status record stores only the bounded
+/// dispatch fields needed after creation. Secret *values* are never copied;
+/// configuration may contain Secret names, and the digest reveals no raw
+/// credential material.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendProvenance {
+    /// Backend implementation that created the instance.
+    #[serde(rename = "type")]
+    pub backend_type: BackendType,
+
+    /// SHA-256 of the canonical JSON serialization of the complete backend
+    /// configuration at creation/bind time. A changed pool backend therefore
+    /// cannot silently redirect access or teardown.
+    pub config_digest: String,
+
+    /// CAPI discovery identity required to reconstruct delete dispatch.
+    /// Provider `infrastructureSpec` is deliberately excluded because it may
+    /// contain sensitive provider data and is not needed for dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capi: Option<CapiBackendProvenance>,
+}
+
+/// Non-secret CAPI resource identity needed to find the exact provider object
+/// during backend dispatch and teardown.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CapiBackendProvenance {
+    pub infrastructure_api_version: String,
+    pub infrastructure_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infrastructure_plural: Option<String>,
+}
+
+impl BackendProvenance {
+    /// Build immutable dispatch provenance from a pool backend configuration.
+    /// Serialization failure is returned rather than replaced with a default:
+    /// provenance is an authorization input, so uncertainty must fail closed.
+    pub fn from_config(config: &BackendConfig) -> Result<Self, serde_json::Error> {
+        let encoded = serde_json::to_vec(config)?;
+        let config_digest = hex::encode(Sha256::digest(encoded));
+        let capi = config.capi.as_ref().map(|capi| CapiBackendProvenance {
+            infrastructure_api_version: capi.infrastructure_api_version.clone(),
+            infrastructure_kind: capi.infrastructure_kind.clone(),
+            infrastructure_plural: capi.infrastructure_plural.clone(),
+        });
+
+        Ok(Self {
+            backend_type: config.backend_type.clone(),
+            config_digest,
+            capi,
+        })
+    }
+
+    /// Reconstruct the minimal backend configuration needed for dispatch.
+    /// Creation-only values are intentionally absent; this is used only after
+    /// the resolver has matched the immutable provenance digest.
+    pub fn dispatch_config(&self) -> Result<BackendConfig, &'static str> {
+        let capi = match (&self.backend_type, &self.capi) {
+            (BackendType::Capi, Some(capi)) => Some(CapiConfig {
+                infrastructure_api_version: capi.infrastructure_api_version.clone(),
+                infrastructure_kind: capi.infrastructure_kind.clone(),
+                infrastructure_spec: None,
+                infrastructure_plural: capi.infrastructure_plural.clone(),
+            }),
+            (BackendType::Capi, None) => return Err("capi_dispatch_missing"),
+            (_, Some(_)) => return Err("unexpected_capi_dispatch"),
+            (_, None) => None,
+        };
+
+        Ok(BackendConfig {
+            backend_type: self.backend_type.clone(),
+            datastore: None,
+            capi,
+            vkobe: None,
+            vcluster: None,
+        })
+    }
+}
+
+/// Exact immutable identity of one lease-to-instance capability.
+///
+/// The same value is written to `ClusterLease.status.binding` and
+/// `ClusterInstance.status.binding`. Every cross-object access or mutation must
+/// validate the complete reciprocal record; `clusterName` and `leaseRef` are
+/// compatibility/display fields only.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseBinding {
+    /// Random immutable identifier unique to this reservation attempt.
+    pub binding_id: String,
+    pub lease: ResourceRef,
+    pub instance: BoundInstanceRef,
+    pub pool: ResourceRef,
+    pub backend: BackendProvenance,
+    /// Instance creation/spec digest observed when the pair was bound.
+    pub instance_spec_digest: String,
+}
+
+/// UID- and generation-fenced identity of the bound `ClusterInstance`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundInstanceRef {
+    pub name: String,
+    pub uid: String,
+    /// `metadata.generation` observed before reservation. Any later spec
+    /// substitution invalidates the capability, even when name and UID remain.
+    pub observed_generation: i64,
 }
 
 /// ClusterInstance is the authoritative inventory record for one provisioned cluster.
@@ -115,14 +239,21 @@ pub struct ClusterInstanceStatus {
     /// Lease currently attached to this instance.
     ///
     /// Intentionally NO `skip_serializing_if`: unlike the write-once
-    /// `spec_hash`/`created_with` fields, `lease_ref` is *actively managed* —
-    /// set when a lease binds and written back to `None` to **clear** it when
-    /// the lease is released/recycled. `None` is a meaningful "clear" signal,
-    /// so it must serialize as `null` (the Merge-Patch delete) rather than be
-    /// omitted. Adding `skip_serializing_if` here would make a released
-    /// instance keep a stale `lease_ref` forever.
+    /// `spec_hash`/`created_with` fields, `lease_ref` is *actively managed*.
+    /// It is set at bind, retained through release/recycling as a teardown
+    /// handle, and cleared only when an exact orphan reservation is safely
+    /// returned to Ready. `None` is therefore a meaningful clear signal and
+    /// must serialize as `null` rather than be omitted.
     #[serde(default)]
     pub lease_ref: Option<ResourceRef>,
+
+    /// Authoritative reciprocal lease binding. New bindings always set this
+    /// before an instance enters `Leased`; it is retained through release and
+    /// recycling until exact teardown deletes the instance. `None` exists only
+    /// for legacy/unbound objects and is omitted from Merge Patches so unrelated
+    /// status writers cannot erase a valid binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<LeaseBinding>,
 
     /// Bootstrap currently running for this instance, if any.
     // skip_serializing_if: informational only (read just for a failure-metric
@@ -314,12 +445,21 @@ pub struct ClusterInstanceProvenance {
     /// resources that must be torn down via the vkobe backend, not
     /// the new pool-level vcluster backend).
     ///
-    /// `None` for instances created by kobe < 0.23.1 — consumers
-    /// should fall back to `ClusterPool.spec.backend.type` for
-    /// backward compatibility (the prior behavior). New instances
-    /// always have this field populated.
+    /// `None` for instances created by kobe < 0.23.1. New instances always
+    /// populate it; security-sensitive access and teardown must fail closed
+    /// when the stronger [`ClusterInstanceProvenance::backend`] is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_type: Option<crate::crd::BackendType>,
+
+    /// UID of the owning pool at instance creation. Missing on legacy or
+    /// standalone instances; pool-managed security-sensitive operations must
+    /// not infer it from a same-named current pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_uid: Option<String>,
+
+    /// Immutable non-secret backend dispatch provenance captured at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendProvenance>,
 }
 
 #[cfg(test)]
@@ -338,7 +478,9 @@ mod tests {
             bootstrapped: true,
             lease_ref: Some(ResourceRef {
                 name: "lease-abc".into(),
+                uid: None,
             }),
+            binding: None,
             active_bootstrap: Some("flux".into()),
             idle_since: Some("2026-01-02T03:04:05Z".into()),
             state_since: Some("2026-01-02T03:04:06Z".into()),
@@ -352,6 +494,8 @@ mod tests {
                 operator_version: "0.37.0".into(),
                 kobe_sync_image: Some("zondax/kobe-sync:v0.16.0".into()),
                 backend_type: Some(BackendType::K0s),
+                pool_uid: None,
+                backend: None,
             }),
             message: Some("running bootstrap 'flux'".into()),
             conditions: vec![ClusterInstanceCondition {
@@ -409,6 +553,7 @@ mod tests {
         for key in [
             "specHash",
             "createdWith",
+            "binding",
             "message",
             "activeBootstrap",
             "network",
@@ -608,6 +753,8 @@ mod tests {
             operator_version: "0.37.0".into(),
             kobe_sync_image: None,
             backend_type: None,
+            pool_uid: None,
+            backend: None,
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["operatorVersion"], "0.37.0");
@@ -616,11 +763,9 @@ mod tests {
         assert_eq!(v.as_object().unwrap().len(), 1);
     }
 
-    /// Instances stamped by kobe < 0.23.1 have no `backendType`. They
-    /// must keep deserializing — consumers fall back to
-    /// `ClusterPool.spec.backend.type` for those. If this ever became a
-    /// hard requirement, every pre-0.23.1 instance would fail to parse
-    /// and the operator would stop reconciling them entirely.
+    /// Instances stamped by kobe < 0.23.1 have no `backendType`. They must
+    /// keep deserializing so the controller can surface/quarantine them; this
+    /// compatibility does not authorize a security-sensitive fallback.
     #[test]
     fn provenance_from_pre_0_23_1_deserializes_without_backend_type() {
         let p: ClusterInstanceProvenance =
@@ -647,12 +792,82 @@ mod tests {
                 operator_version: "0.37.0".into(),
                 kobe_sync_image: None,
                 backend_type: Some(bt),
+                pool_uid: None,
+                backend: None,
             };
             let v = serde_json::to_value(&p).unwrap();
             assert_eq!(v["backendType"], json!(wire));
             let back: ClusterInstanceProvenance = serde_json::from_value(v).unwrap();
             assert_eq!(back, p);
         }
+    }
+
+    #[test]
+    fn backend_provenance_is_stable_and_never_copies_sensitive_config() {
+        let config = BackendConfig {
+            backend_type: BackendType::Capi,
+            capi: Some(CapiConfig {
+                infrastructure_api_version: "infra.example.io/v1".into(),
+                infrastructure_kind: "SecretMachine".into(),
+                infrastructure_plural: Some("secretmachines".into()),
+                infrastructure_spec: Some(json!({
+                    "password": "must-not-appear",
+                    "token": "also-must-not-appear"
+                })),
+            }),
+            ..Default::default()
+        };
+        let first = BackendProvenance::from_config(&config).unwrap();
+        let second = BackendProvenance::from_config(&config).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.config_digest.len(), 64);
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("must-not-appear"));
+        assert!(!encoded.contains("also-must-not-appear"));
+        assert!(encoded.contains("SecretMachine"));
+
+        let dispatch = first.dispatch_config().unwrap();
+        assert_eq!(dispatch.backend_type, BackendType::Capi);
+        assert!(
+            dispatch
+                .capi
+                .as_ref()
+                .is_some_and(|capi| capi.infrastructure_spec.is_none())
+        );
+    }
+
+    #[test]
+    fn reciprocal_binding_wire_shape_contains_every_uid_fence() {
+        let binding = LeaseBinding {
+            binding_id: "binding-1".into(),
+            lease: ResourceRef {
+                name: "lease-a".into(),
+                uid: Some("lease-uid".into()),
+            },
+            instance: BoundInstanceRef {
+                name: "pool-a-0".into(),
+                uid: "instance-uid".into(),
+                observed_generation: 7,
+            },
+            pool: ResourceRef {
+                name: "pool-a".into(),
+                uid: Some("pool-uid".into()),
+            },
+            backend: BackendProvenance::from_config(&BackendConfig::default()).unwrap(),
+            instance_spec_digest: "0123456789abcdef".into(),
+        };
+        let value = serde_json::to_value(&binding).unwrap();
+        assert_eq!(value["bindingId"], "binding-1");
+        assert_eq!(value["lease"]["uid"], "lease-uid");
+        assert_eq!(value["instance"]["uid"], "instance-uid");
+        assert_eq!(value["instance"]["observedGeneration"], 7);
+        assert_eq!(value["pool"]["uid"], "pool-uid");
+        assert_eq!(value["backend"]["type"], "k3s");
+        assert_eq!(value["instanceSpecDigest"], "0123456789abcdef");
+        assert_eq!(
+            serde_json::from_value::<LeaseBinding>(value).unwrap(),
+            binding
+        );
     }
 
     // ── Compatibility ─────────────────────────────────────────────────
@@ -817,6 +1032,7 @@ mod tests {
             "healthFailures",
             "createdWith",
             "activeBootstrap",
+            "binding",
             "conditions",
             "network",
         ] {
@@ -828,17 +1044,25 @@ mod tests {
         }
     }
 
-    /// `ResourceRef` is a one-field wrapper, but it is the shape stored
-    /// in `spec.poolRef` and `status.leaseRef`. Flattening it to a bare
-    /// string would break every existing object.
+    /// Legacy refs omit UID while new refs add it without changing the object
+    /// shape stored in `spec.poolRef` and `status.leaseRef`.
     #[test]
     fn resource_ref_serializes_as_an_object_with_a_name_key() {
         let r = ResourceRef {
             name: "pool-e2e-basic".into(),
+            uid: None,
         };
         assert_eq!(
             serde_json::to_value(&r).unwrap(),
             json!({ "name": "pool-e2e-basic" })
+        );
+        let exact = ResourceRef {
+            name: "pool-e2e-basic".into(),
+            uid: Some("pool-uid".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&exact).unwrap(),
+            json!({ "name": "pool-e2e-basic", "uid": "pool-uid" })
         );
     }
 }

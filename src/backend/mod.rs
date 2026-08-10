@@ -331,7 +331,32 @@ impl BackendFactory {
 
     /// Produce the right backend for a pool based on its `spec.backend.backend_type`.
     pub fn backend_for(&self, profile: &ClusterPool) -> Result<BackendDispatch> {
-        match profile.spec.backend.backend_type {
+        self.backend_for_config(
+            &profile.spec.backend,
+            profile.metadata.name.as_deref().unwrap_or("unknown"),
+        )
+    }
+
+    /// Reconstruct backend dispatch solely from immutable instance/binding
+    /// provenance. This is the only factory entrypoint permitted after a lease
+    /// crosses the tenant-access boundary; it never consults a mutable current
+    /// pool spec or a default backend.
+    pub fn backend_for_provenance(
+        &self,
+        provenance: &crate::crd::BackendProvenance,
+    ) -> Result<BackendDispatch> {
+        let config = provenance
+            .dispatch_config()
+            .map_err(|reason| anyhow::anyhow!("invalid backend dispatch provenance: {reason}"))?;
+        self.backend_for_config(&config, "bound-instance")
+    }
+
+    fn backend_for_config(
+        &self,
+        config: &crate::crd::BackendConfig,
+        owner_name: &str,
+    ) -> Result<BackendDispatch> {
+        match config.backend_type {
             BackendType::K3s => Ok(BackendDispatch::K3s(K3sBackend::new(
                 self.client.clone(),
                 self.datastore.clone(),
@@ -341,10 +366,10 @@ impl BackendFactory {
                 self.datastore.clone(),
             ))),
             BackendType::Capi => {
-                let capi_config = profile.spec.backend.capi.clone().ok_or_else(|| {
+                let capi_config = config.capi.clone().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Pool {} has backend type=capi but no capi config",
-                        profile.metadata.name.as_deref().unwrap_or("unknown")
+                        owner_name
                     )
                 })?;
                 Ok(BackendDispatch::Capi(CapiBackend::new(
@@ -354,11 +379,11 @@ impl BackendFactory {
             }
             BackendType::Vkobe => Ok(BackendDispatch::Vkobe(VkobeBackend::new(
                 self.client.clone(),
-                profile.spec.backend.vkobe.clone(),
+                config.vkobe.clone(),
             ))),
             BackendType::Vcluster => Ok(BackendDispatch::Vcluster(VclusterBackend::new(
                 self.client.clone(),
-                profile.spec.backend.vcluster.clone(),
+                config.vcluster.clone(),
             ))),
         }
     }

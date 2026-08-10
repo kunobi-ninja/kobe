@@ -409,16 +409,19 @@ pub(crate) async fn ensure_lease_connect_token(
 ) -> Result<String> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let name = connect_secret_name(&lease.name_any());
+    let lease_uid = lease
+        .metadata
+        .uid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Lease {} has no UID", lease.name_any()))?;
 
     match secrets.get(&name).await {
-        Ok(secret) => read_token(&secret),
+        Ok(secret) => {
+            require_connect_token_owner(&secret, &lease.name_any(), &lease_uid)?;
+            read_token(&secret)
+        }
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
             let token = random_token();
-            let uid = lease
-                .metadata
-                .uid
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Lease {} has no UID", lease.name_any()))?;
 
             let secret = Secret {
                 metadata: ObjectMeta {
@@ -428,7 +431,7 @@ pub(crate) async fn ensure_lease_connect_token(
                         api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
                         kind: "ClusterLease".to_string(),
                         name: lease.name_any(),
-                        uid,
+                        uid: lease_uid.clone(),
                         controller: Some(false),
                         block_owner_deletion: Some(false),
                     }]),
@@ -450,6 +453,7 @@ pub(crate) async fn ensure_lease_connect_token(
                         .get(&name)
                         .await
                         .with_context(|| format!("Failed to read existing connect token {name}"))?;
+                    require_connect_token_owner(&existing, &lease.name_any(), &lease_uid)?;
                     read_token(&existing)
                 }
                 Err(e) => Err(e).with_context(|| format!("Failed to create connect token {name}")),
@@ -464,17 +468,23 @@ pub(crate) async fn validate_lease_connect_token(
     namespace: &str,
     lease_id: &str,
     presented_token: &str,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let name = connect_secret_name(lease_id);
     match secrets.get(&name).await {
         // Constant-time comparison: this gates connect-proxy access to the
         // leased cluster, so the match must not leak a per-byte timing signal.
-        Ok(secret) => Ok(kunobi_auth::secret_eq(
-            &read_token(&secret)?,
-            presented_token,
-        )),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(false),
+        Ok(secret) => {
+            let Some(lease_uid) = connect_token_owner_uid(&secret, lease_id) else {
+                return Ok(None);
+            };
+            if kunobi_auth::secret_eq(&read_token(&secret)?, presented_token) {
+                Ok(Some(lease_uid.to_string()))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
         Err(e) => Err(e).with_context(|| format!("Failed to read connect token {name}")),
     }
 }
@@ -492,10 +502,29 @@ pub(crate) async fn delete_lease_connect_token(
     client: &Client,
     namespace: &str,
     lease_id: &str,
+    lease_uid: &str,
 ) -> Result<()> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let name = connect_secret_name(lease_id);
-    match secrets.delete(&name, &DeleteParams::default()).await {
+    let secret = match secrets.get(&name).await {
+        Ok(secret) => secret,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read connect token {name}")),
+    };
+    require_connect_token_owner(&secret, lease_id, lease_uid)?;
+    let secret_uid = secret
+        .metadata
+        .uid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Connect token Secret {name} has no UID"))?;
+    let delete_params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(secret_uid),
+            resource_version: secret.resource_version(),
+        }),
+        ..Default::default()
+    };
+    match secrets.delete(&name, &delete_params).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
         Err(e) => Err(e).with_context(|| format!("Failed to delete connect token {name}")),
@@ -504,6 +533,29 @@ pub(crate) async fn delete_lease_connect_token(
 
 fn connect_secret_name(lease_id: &str) -> String {
     format!("{lease_id}-connect-token")
+}
+
+fn connect_token_owner_uid<'a>(secret: &'a Secret, lease_name: &str) -> Option<&'a str> {
+    secret
+        .metadata
+        .owner_references
+        .as_ref()?
+        .iter()
+        .find_map(|owner| {
+            (owner.api_version == "kobe.kunobi.ninja/v1alpha1"
+                && owner.kind == "ClusterLease"
+                && owner.name == lease_name
+                && !owner.uid.is_empty())
+            .then_some(owner.uid.as_str())
+        })
+}
+
+fn require_connect_token_owner(secret: &Secret, lease_name: &str, lease_uid: &str) -> Result<()> {
+    if connect_token_owner_uid(secret, lease_name) == Some(lease_uid) {
+        Ok(())
+    } else {
+        anyhow::bail!("connect token owner UID does not match lease")
+    }
 }
 
 fn read_token(secret: &Secret) -> Result<String> {
