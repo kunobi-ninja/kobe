@@ -166,13 +166,15 @@ fn helm_install_args(
 /// value surfaces as a pull failure rather than a silently different cluster.
 fn normalize_distro_version(version: &str) -> String {
     let v = version.trim();
-    // Case-insensitive: a `V1.32.3` that fell through to the `else` arm would
-    // come back as `vV1.32.3`, which is worse than the input it started from.
-    if v.starts_with(['v', 'V']) {
-        v.to_string()
-    } else {
-        format!("v{v}")
-    }
+    // Semver build metadata is never part of an upstream tag, and `+` is not
+    // a legal tag character at all. A pool carrying a k3s/k0s-style version
+    // (`v1.31.3+k3s1`) — which this backend ignored until now — resolves to
+    // the real upstream tag rather than an unpullable one.
+    let v = v.split('+').next().unwrap_or(v);
+    // Canonicalize to the lowercase `v` the published tags use; preserving an
+    // uppercase `V` would just name a tag that does not exist.
+    let v = v.strip_prefix(['v', 'V']).unwrap_or(v);
+    format!("v{v}")
 }
 
 /// Default vcluster Helm chart version pinned by the operator.
@@ -247,28 +249,52 @@ impl VclusterBackend {
             "https://{name}.vcluster-{name}.svc.cluster.local:443",
             name = _name
         );
-        // Only emit the distro block when a version was actually requested:
-        // an empty `version` would set the image tag to "" and break the
-        // guest, whereas saying nothing leaves the chart's own pinned default.
-        let distro = if config.version.trim().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "  distro:\n    k8s:\n      version: {}\n",
-                normalize_distro_version(&config.version)
-            )
-        };
-        format!(
-            r#"# kobe operator defaults for vcluster
-exportKubeConfig:
-  server: {server}
-controlPlane:
-{distro}  statefulSet:
-    persistence:
-      volumeClaim:
-        enabled: true
-"#
-        )
+        // Built as a structured document and serialized, rather than
+        // interpolated into a string. `version` is user-controlled, and a
+        // value carrying YAML syntax (`1.2.3: bad`, a trailing `# comment`,
+        // an embedded newline) would otherwise restructure the document the
+        // chart receives instead of merely naming a tag that fails to pull.
+        use serde_yaml_ng::{Mapping, Value};
+
+        let mut control_plane = Mapping::new();
+
+        // Only set the distro when a version was actually requested: an empty
+        // string here would set the image tag to "" and break the guest,
+        // whereas saying nothing leaves the chart's own pinned default.
+        if !config.version.trim().is_empty() {
+            let mut k8s = Mapping::new();
+            k8s.insert(
+                Value::from("version"),
+                Value::from(normalize_distro_version(&config.version)),
+            );
+            let mut distro = Mapping::new();
+            distro.insert(Value::from("k8s"), Value::Mapping(k8s));
+            control_plane.insert(Value::from("distro"), Value::Mapping(distro));
+        }
+
+        let mut volume_claim = Mapping::new();
+        volume_claim.insert(Value::from("enabled"), Value::from(true));
+        let mut persistence = Mapping::new();
+        persistence.insert(Value::from("volumeClaim"), Value::Mapping(volume_claim));
+        let mut stateful_set = Mapping::new();
+        stateful_set.insert(Value::from("persistence"), Value::Mapping(persistence));
+        control_plane.insert(Value::from("statefulSet"), Value::Mapping(stateful_set));
+
+        let mut export_kubeconfig = Mapping::new();
+        export_kubeconfig.insert(Value::from("server"), Value::from(server));
+
+        let mut root = Mapping::new();
+        root.insert(
+            Value::from("exportKubeConfig"),
+            Value::Mapping(export_kubeconfig),
+        );
+        root.insert(Value::from("controlPlane"), Value::Mapping(control_plane));
+
+        let body = serde_yaml_ng::to_string(&Value::Mapping(root))
+            // Serializing a mapping of plain scalars cannot fail; fall back to
+            // an empty document rather than panicking in a reconcile.
+            .unwrap_or_default();
+        format!("# kobe operator defaults for vcluster\n{body}")
     }
 
     /// Ensure the Helm repo is registered locally. Idempotent.
@@ -785,16 +811,83 @@ mod tests {
         );
     }
 
-    /// Normalization must not corrupt an input that is already prefixed,
-    /// whatever its case. Garbage still passes through as garbage — the
-    /// registry rejects it, which is the intended failure mode — but a
-    /// value that was fine must not be made worse.
+    /// The version is interpolated into a YAML document, so it must be
+    /// emitted as a SCALAR — not spliced in as raw text. Otherwise a value
+    /// containing YAML syntax rewrites the document: `1.2.3: bad` adds a
+    /// mapping key, `1.2.3 # x` silently truncates at the comment, and a
+    /// newline injects arbitrary structure. Any of those change what the
+    /// chart receives rather than merely naming a tag that fails to pull.
+    #[tokio::test]
+    async fn a_yaml_hostile_version_cannot_restructure_the_values_document() {
+        let b = offline_backend(None);
+        for hostile in [
+            "1.2.3: bad",
+            "1.2.3 # note",
+            "1.2.3\n  enabled: false",
+            "1.2.3\nexportKubeConfig:\n  server: https://evil",
+            "*anchor",
+            "\"quoted\"",
+        ] {
+            let cfg = ClusterConfig {
+                version: hostile.to_string(),
+                servers: 1,
+                ..Default::default()
+            };
+            let yaml = b.default_values_yaml("foo", &cfg);
+            let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("input {hostile:?} produced invalid YAML: {e}\n{yaml}"));
+
+            // The document shape must be untouched by the input.
+            assert_eq!(
+                v["exportKubeConfig"]["server"].as_str(),
+                Some("https://foo.vcluster-foo.svc.cluster.local:443"),
+                "input {hostile:?} rewrote exportKubeConfig: {yaml}"
+            );
+            assert!(
+                v["controlPlane"]["statefulSet"]["persistence"]["volumeClaim"]["enabled"]
+                    .as_bool()
+                    .unwrap_or(false),
+                "input {hostile:?} disturbed the persistence block: {yaml}"
+            );
+            // And the version must round-trip as one scalar string.
+            assert!(
+                v["controlPlane"]["distro"]["k8s"]["version"]
+                    .as_str()
+                    .is_some(),
+                "input {hostile:?} did not yield a scalar version: {yaml}"
+            );
+        }
+    }
+
+    /// Published tags are lowercase-`v`, so an uppercase `V` must be
+    /// canonicalized rather than preserved — preserving it just names a tag
+    /// that does not exist.
+    #[test]
+    fn version_prefix_is_canonicalized_to_lowercase() {
+        assert_eq!(normalize_distro_version("V1.32.3"), "v1.32.3");
+    }
+
+    /// Semver build metadata (`+k3s1`) is never part of an upstream image
+    /// tag, and `+` is not even a legal tag character. A pool that copied a
+    /// k3s-style version — which this backend silently ignored until now —
+    /// should resolve to the real upstream tag instead of an unpullable one.
+    #[test]
+    fn version_drops_semver_build_metadata() {
+        assert_eq!(normalize_distro_version("v1.31.3+k3s1"), "v1.31.3");
+        assert_eq!(normalize_distro_version("1.31.3+k0s.0"), "v1.31.3");
+    }
+
+    /// Normalization must not corrupt an input that is already prefixed.
+    /// Values it cannot interpret still pass through for the registry to
+    /// reject — that is the intended failure mode — but a value that was
+    /// already fine must never be made worse.
     #[test]
     fn version_normalization_is_idempotent_and_case_insensitive() {
         assert_eq!(normalize_distro_version("v1.32.3"), "v1.32.3");
         assert_eq!(normalize_distro_version("1.32.3"), "v1.32.3");
-        // Would become `vV1.32.3` under a case-sensitive check.
-        assert_eq!(normalize_distro_version("V1.32.3"), "V1.32.3");
+        // Canonicalized, not merely accepted: published tags are lowercase-v,
+        // so preserving `V` would name a tag that does not exist.
+        assert_eq!(normalize_distro_version("V1.32.3"), "v1.32.3");
         // Idempotent: normalizing twice must not stack prefixes.
         let once = normalize_distro_version("1.32.3");
         assert_eq!(normalize_distro_version(&once), once);
