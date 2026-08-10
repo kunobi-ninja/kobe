@@ -449,7 +449,7 @@ pub async fn dispatch_upgrade<B: Send + 'static>(
     //    Deciding WHICH authenticated callers may use which subresource
     //    still needs the SubjectAccessReview in this module's TODO. This
     //    only establishes that there is a caller at all.
-    let Some(identity) = identity.filter(|id| !id.is_empty()) else {
+    let Some(identity) = identity.filter(|id| !id.trim().is_empty()) else {
         UPGRADES_TOTAL
             .with_label_values(&[proto_for_metrics, "denied_unauthenticated"])
             .inc();
