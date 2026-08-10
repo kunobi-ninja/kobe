@@ -14,15 +14,17 @@ const DEMO_TOKEN_SECRET = "e2e-local-token";
 const DEMO_POLICY = "e2e-local-token";
 const DEMO_K0S_POOL = "e2e-k0s";
 const DEMO_K0S_VERSION = "v1.35.1+k0s.0";
-// k0s guest image the k0s backend launches for DEMO_K0S_VERSION. Same `+`->`-`
-// rewrite as k3s, for the same reason: OCI tags forbid `+` (see k0s_image() in
-// src/backend/k0s.rs). Keep in sync with DEMO_K0S_VERSION.
+// k0s guest image the k0s backend launches for DEMO_K0S_VERSION.
 //
-// Pre-loaded into the kind nodes for the same reason as the k3s image: without
-// it the guest pulls from the registry inside kind at provision time, and that
-// uncontrolled pull sits inside the pool's creatingTimeout — so the k0s leg
-// would be timing a network fetch rather than the backend.
-const K0S_GUEST_IMAGE = "k0sproject/k0s:v1.35.1-k0s.0";
+// DERIVED, not hand-written: `k0s_image()` (src/backend/k0s.rs) builds the tag
+// as `version.replace('+', "-")` — the `+` build-metadata separator is not a
+// legal OCI tag character. Applying the same transform here means a version
+// bump cannot silently desync the two. A hand-pinned constant could, and the
+// failure would be quiet: the preload would fetch an image nothing launches,
+// the guest would pull from the registry inside kind at provision time, and
+// that uncontrolled fetch would land back inside the pool's creatingTimeout —
+// exactly the problem pre-loading exists to remove.
+const K0S_GUEST_IMAGE = `k0sproject/k0s:${DEMO_K0S_VERSION.replace("+", "-")}`;
 // Single-server k3s pool exercised by the provision→Ready→recycle CI smoke
 // gate (hack/test-e2e-k3s.ts). Uses embedded SQLite (no shared datastore in
 // kind) and warms one member via scaling.minReady=1. The matching guest image
