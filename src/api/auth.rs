@@ -20,6 +20,9 @@ use crate::pool::parse_duration;
 /// Validated identity extracted from a JWT.
 #[derive(Debug, Clone)]
 pub struct AuthIdentity {
+    /// Stable configured provider ID. Unlike `requester_type`, this does not
+    /// include the currently matched rule value and is safe for ownership keys.
+    pub provider: String,
     /// Provider and role: "{provider_name}:{role}" (e.g., "github-actions:ci").
     pub requester_type: String,
     /// Identity string formatted per the provider's identityTemplate.
@@ -535,6 +538,7 @@ impl JwtAuthenticator {
         })?;
 
         Ok(AuthIdentity {
+            provider: verified.provider_name.clone(),
             requester_type: verified.provider_name,
             identity: verified.identity,
             issuer: "ssh".to_string(),
@@ -628,6 +632,7 @@ impl JwtAuthenticator {
             .inc();
 
         Ok(AuthIdentity {
+            provider: kid.provider.clone(),
             requester_type,
             identity,
             issuer,
@@ -728,6 +733,33 @@ fn access_rule_to_policy(rule: &AccessRule) -> crate::api::policy::Policy {
         max_concurrent_leases: rule.max_concurrent_leases,
         default_priority: 50,
         max_extensions: rule.max_extensions,
+        sandbox: rule.sandbox.as_ref().and_then(|grant| {
+            let Some(max_ttl) = parse_duration(&grant.max_ttl) else {
+                warn!(
+                    raw_value = %grant.max_ttl,
+                    "Failed to parse Sandbox max_ttl; dropping Sandbox grant"
+                );
+                return None;
+            };
+            if max_ttl <= chrono::Duration::zero() {
+                warn!(
+                    raw_value = %grant.max_ttl,
+                    "Sandbox max_ttl must be positive; dropping Sandbox grant"
+                );
+                return None;
+            }
+            if let Err(error) = crate::sandbox::parse_resource_ceiling(&grant.resource_ceiling) {
+                warn!(%error, "Invalid Sandbox resource ceiling; dropping Sandbox grant");
+                return None;
+            }
+            Some(crate::api::policy::SandboxPolicy {
+                allowed_pools: grant.pools.clone(),
+                verbs: grant.verbs.clone(),
+                max_ttl,
+                max_concurrent_leases: grant.max_concurrent_leases,
+                resource_ceiling: grant.resource_ceiling.clone(),
+            })
+        }),
     }
 }
 
@@ -892,6 +924,7 @@ mod tests {
             max_ttl: "1h".to_string(),
             max_concurrent_leases: 5,
             max_extensions: 2,
+            sandbox: None,
         }];
         let claims = make_claims("test-sub", HashMap::new());
         let (rule, matched) = match_rule(&rules, &claims).unwrap();
@@ -911,6 +944,7 @@ mod tests {
                 max_ttl: "8h".to_string(),
                 max_concurrent_leases: 10,
                 max_extensions: 5,
+                sandbox: None,
             },
             AccessRule {
                 match_clause: None,
@@ -918,6 +952,7 @@ mod tests {
                 max_ttl: "1h".to_string(),
                 max_concurrent_leases: 3,
                 max_extensions: 1,
+                sandbox: None,
             },
         ];
 
@@ -950,6 +985,7 @@ mod tests {
             max_ttl: "4h".to_string(),
             max_concurrent_leases: 10,
             max_extensions: 5,
+            sandbox: None,
         }];
 
         let mut extra = HashMap::new();
@@ -974,6 +1010,7 @@ mod tests {
             max_ttl: "1h".to_string(),
             max_concurrent_leases: 5,
             max_extensions: 2,
+            sandbox: None,
         }];
         let claims = make_claims("test-sub", HashMap::new());
         assert!(match_rule(&rules, &claims).is_none());
@@ -1118,6 +1155,7 @@ mod tests {
             max_ttl: "2h".to_string(),
             max_concurrent_leases: 5,
             max_extensions: 3,
+            sandbox: None,
         };
         let policy = access_rule_to_policy(&rule);
         assert_eq!(policy.max_ttl, chrono::Duration::hours(2));
@@ -1134,6 +1172,7 @@ mod tests {
             max_ttl: "invalid".to_string(),
             max_concurrent_leases: 1,
             max_extensions: 0,
+            sandbox: None,
         };
         let policy = access_rule_to_policy(&rule);
         // Should default to 1h (3600s) when parsing fails
@@ -1148,10 +1187,76 @@ mod tests {
             max_ttl: "30m".to_string(),
             max_concurrent_leases: 10,
             max_extensions: 2,
+            sandbox: None,
         };
         let policy = access_rule_to_policy(&rule);
         assert_eq!(policy.allowed_pools, vec!["*"]);
         assert_eq!(policy.max_ttl, chrono::Duration::minutes(30));
+    }
+
+    #[test]
+    fn access_rule_to_policy_projects_typed_sandbox_grant() {
+        let rule = AccessRule {
+            match_clause: None,
+            pools: vec!["cluster-*".into()],
+            max_ttl: "2h".into(),
+            max_concurrent_leases: 5,
+            max_extensions: 2,
+            sandbox: Some(crate::crd::SandboxAccessRule {
+                pools: vec!["agent-*".into()],
+                verbs: vec![
+                    crate::crd::SandboxVerb::Lease,
+                    crate::crd::SandboxVerb::Exec,
+                ],
+                max_ttl: "30m".into(),
+                max_concurrent_leases: 3,
+                resource_ceiling: crate::crd::SandboxResourceCeiling {
+                    max_cpu: "2".into(),
+                    max_memory: "4Gi".into(),
+                },
+            }),
+        };
+
+        let policy = access_rule_to_policy(&rule);
+        let sandbox = policy.sandbox.expect("valid grant must be projected");
+        assert_eq!(sandbox.allowed_pools, vec!["agent-*"]);
+        assert_eq!(sandbox.max_ttl, chrono::Duration::minutes(30));
+        assert_eq!(sandbox.max_concurrent_leases, 3);
+        assert_eq!(
+            sandbox.verbs,
+            vec![
+                crate::crd::SandboxVerb::Lease,
+                crate::crd::SandboxVerb::Exec
+            ]
+        );
+        assert_eq!(sandbox.resource_ceiling.max_cpu, "2");
+    }
+
+    #[test]
+    fn invalid_sandbox_grant_fails_closed_without_changing_cluster_policy() {
+        let rule = AccessRule {
+            match_clause: None,
+            pools: vec!["cluster-*".into()],
+            max_ttl: "2h".into(),
+            max_concurrent_leases: 5,
+            max_extensions: 2,
+            sandbox: Some(crate::crd::SandboxAccessRule {
+                pools: vec!["*".into()],
+                verbs: vec![crate::crd::SandboxVerb::Lease],
+                max_ttl: "invalid".into(),
+                max_concurrent_leases: 3,
+                resource_ceiling: crate::crd::SandboxResourceCeiling {
+                    max_cpu: "2".into(),
+                    max_memory: "4Gi".into(),
+                },
+            }),
+        };
+
+        let policy = access_rule_to_policy(&rule);
+        assert!(policy.sandbox.is_none());
+        assert_eq!(policy.allowed_pools, vec!["cluster-*"]);
+        assert_eq!(policy.max_ttl, chrono::Duration::hours(2));
+        assert_eq!(policy.max_concurrent_leases, 5);
     }
 
     // --- JwtAuthenticator async tests ---

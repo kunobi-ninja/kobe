@@ -165,6 +165,65 @@ spec:
                       items:
                         type: string
                       type: array
+                    sandbox:
+                      description: |-
+                        Optional, kind-specific Agent Sandbox permissions. Older policy objects
+                        omit this block and continue authorizing Cluster leases exactly as
+                        before, while Sandbox operations fail closed.
+                      nullable: true
+                      properties:
+                        maxConcurrentLeases:
+                          description: |-
+                            Maximum active Sandbox leases for this identity, separate from Cluster
+                            lease concurrency.
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        maxTtl:
+                          description: Maximum runtime TTL, starting only once the Sandbox is Ready.
+                          minLength: 1
+                          type: string
+                        pools:
+                          description: SandboxPool name patterns; wildcard semantics match Cluster pools.
+                          items:
+                            type: string
+                          minItems: 1
+                          type: array
+                        resourceCeiling:
+                          description: Aggregate per-Sandbox CPU and memory ceiling.
+                          properties:
+                            maxCpu:
+                              minLength: 1
+                              type: string
+                            maxMemory:
+                              minLength: 1
+                              type: string
+                          required:
+                          - maxCpu
+                          - maxMemory
+                          type: object
+                        verbs:
+                          description: Independently authorized Sandbox operations.
+                          items:
+                            description: |-
+                              Agent Sandbox authorization verbs. `lease` includes create and own-object
+                              reads; `release` remains independently revocable.
+                            enum:
+                            - lease
+                            - exec
+                            - logs
+                            - port-forward
+                            - release
+                            type: string
+                          minItems: 1
+                          type: array
+                      required:
+                      - maxConcurrentLeases
+                      - maxTtl
+                      - pools
+                      - resourceCeiling
+                      - verbs
+                      type: object
                   required:
                   - maxConcurrentLeases
                   - maxTtl
