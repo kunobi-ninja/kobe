@@ -166,7 +166,9 @@ fn helm_install_args(
 /// value surfaces as a pull failure rather than a silently different cluster.
 fn normalize_distro_version(version: &str) -> String {
     let v = version.trim();
-    if v.starts_with('v') {
+    // Case-insensitive: a `V1.32.3` that fell through to the `else` arm would
+    // come back as `vV1.32.3`, which is worse than the input it started from.
+    if v.starts_with(['v', 'V']) {
         v.to_string()
     } else {
         format!("v{v}")
@@ -781,6 +783,23 @@ mod tests {
             Some("v1.32.3"),
             "a missing `v` must be added, got: {yaml}"
         );
+    }
+
+    /// Normalization must not corrupt an input that is already prefixed,
+    /// whatever its case. Garbage still passes through as garbage — the
+    /// registry rejects it, which is the intended failure mode — but a
+    /// value that was fine must not be made worse.
+    #[test]
+    fn version_normalization_is_idempotent_and_case_insensitive() {
+        assert_eq!(normalize_distro_version("v1.32.3"), "v1.32.3");
+        assert_eq!(normalize_distro_version("1.32.3"), "v1.32.3");
+        // Would become `vV1.32.3` under a case-sensitive check.
+        assert_eq!(normalize_distro_version("V1.32.3"), "V1.32.3");
+        // Idempotent: normalizing twice must not stack prefixes.
+        let once = normalize_distro_version("1.32.3");
+        assert_eq!(normalize_distro_version(&once), once);
+        // Surrounding whitespace is trimmed, not preserved into the tag.
+        assert_eq!(normalize_distro_version("  1.32.3  "), "v1.32.3");
     }
 
     /// No version requested: say nothing, so the chart's own pinned
