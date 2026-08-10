@@ -187,3 +187,53 @@ async fn wait_for_child_or_signal(child: &mut tokio::process::Child, verbose: bo
     let _ = child.wait().await;
     130
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `with-lease` wraps a user command and becomes its exit status. Anything
+    /// that is not a clean coded exit MUST map to non-zero.
+    ///
+    /// This is the whole contract of the wrapper in CI: `kobe with-lease -- <cmd>`
+    /// stands in for `<cmd>`, so mapping a signal death or a wait failure to 0
+    /// would turn a crashed test suite into a green pipeline — the one failure
+    /// mode a CI wrapper must never have.
+    #[test]
+    fn a_command_that_did_not_exit_cleanly_is_never_reported_as_success() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            // Killed by SIGKILL: no exit code at all.
+            let signalled = std::process::ExitStatus::from_raw(9);
+            assert_eq!(
+                exit_code(Ok(signalled)),
+                1,
+                "a signal-killed child has no exit code and must not read as success"
+            );
+        }
+
+        // The wait itself failed — we never learned the outcome, so assume the
+        // worst rather than claiming success.
+        let failed_wait = Err(std::io::Error::other("wait failed"));
+        assert_eq!(exit_code(failed_wait), 1);
+    }
+
+    /// A clean exit is passed through verbatim, success and failure alike —
+    /// callers branch on the specific code, not just zero/non-zero.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_exit_code_is_propagated_verbatim() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for code in [0, 1, 2, 42, 127] {
+            let status = std::process::ExitStatus::from_raw(code << 8);
+            assert_eq!(
+                exit_code(Ok(status)),
+                code,
+                "exit code {code} must survive the wrapper unchanged"
+            );
+        }
+    }
+}
