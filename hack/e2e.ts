@@ -243,7 +243,7 @@ function canReuseExistingEnvironment(args: Args, fingerprint: string): boolean {
   );
 }
 
-function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: string[]): Args {
   const args = {
     command: "up" as const,
     cluster: DEFAULT_CLUSTER,
@@ -463,7 +463,19 @@ async function loadRemoteImagesIntoKind(cluster: string, images: string[]): Prom
   }
 }
 
-async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<void> {
+export function guestImagesForBackend(backend?: string): string[] {
+  const images = [K3S_GUEST_IMAGE];
+  if (backend === "k0s") {
+    images.push(K0S_GUEST_IMAGE);
+  }
+  return images;
+}
+
+async function loadImagesIntoKind(
+  cluster: string,
+  imageTag: string,
+  backend?: string,
+): Promise<void> {
   step(`Loading images into kind cluster '${cluster}'`);
   await saveImages(imageTag);
 
@@ -487,11 +499,7 @@ async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<vo
   // leg with a pull it never uses (and add a registry dependency, which is a
   // fresh way for an unrelated leg to fail). Pull those only when the leg
   // that needs them is the one coming up.
-  const guestImages = [K3S_GUEST_IMAGE];
-  if (args.backend === "k0s") {
-    guestImages.push(K0S_GUEST_IMAGE);
-  }
-  await loadRemoteImagesIntoKind(cluster, guestImages);
+  await loadRemoteImagesIntoKind(cluster, guestImagesForBackend(backend));
 }
 
 async function prepareHelm(): Promise<void> {
@@ -1190,7 +1198,7 @@ async function up(args: Args): Promise<void> {
 
   await ensureCluster(args.cluster);
   await buildImages(args.imageTag);
-  await loadImagesIntoKind(args.cluster, args.imageTag);
+  await loadImagesIntoKind(args.cluster, args.imageTag, args.backend);
   await prepareHelm();
   await runCommand(["/bin/sh", "-lc", `kubectl --context ${kubeContext(args.cluster)} create namespace ${args.namespace} --dry-run=client -o yaml | kubectl --context ${kubeContext(args.cluster)} apply -f -`], {
     step: `failed to ensure namespace '${args.namespace}'`,
@@ -1234,4 +1242,6 @@ async function main() {
   }
 }
 
-await main();
+if (import.meta.main) {
+  await main();
+}
