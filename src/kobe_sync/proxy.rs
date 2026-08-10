@@ -350,6 +350,22 @@ pub struct SubresourceRequest {
     pub subresource: String,
 }
 
+/// The peer identity to act on, if the request carries a usable one.
+///
+/// Every intercepted subresource is forwarded to the HOST apiserver
+/// authenticated as the kobe-sync ServiceAccount, so the caller's identity
+/// never reaches an authorizer. An authenticated peer is therefore a
+/// precondition for all of them — including `log`, which is not an upgrade
+/// and so is easy to overlook when thinking only about exec/attach.
+///
+/// A certificate with an empty or whitespace-only CN yields no identity:
+/// groups alone are not a caller, and admitting one would attribute the
+/// session to nothing. Legitimate clients always have a CN — the published
+/// kubeconfig carries `client-certificate-data`.
+fn usable_peer_identity(identity: Option<&PeerIdentity>) -> Option<&PeerIdentity> {
+    identity.filter(|id| !id.username.trim().is_empty())
+}
+
 /// Subresources that kobe-sync intercepts and proxies to the host cluster.
 const INTERCEPTED_SUBRESOURCES: &[&str] = &["exec", "attach", "portforward", "log"];
 
@@ -969,6 +985,21 @@ impl VirtualClusterProxy {
         req: Request<Incoming>,
         sub: SubresourceRequest,
     ) -> Result<Response<ProxyBody>, hyper::Error> {
+        // Gate every intercepted subresource, not just the upgrades: all of
+        // them reach the host apiserver as the kobe-sync ServiceAccount.
+        if usable_peer_identity(req.extensions().get::<PeerIdentity>()).is_none() {
+            warn!(
+                virtual_pod = %sub.pod_name,
+                virtual_ns = %sub.namespace,
+                subresource = %sub.subresource,
+                "Refusing subresource request — no authenticated client certificate presented"
+            );
+            return Ok(error_response(
+                StatusCode::UNAUTHORIZED,
+                "a client certificate is required for pod exec, attach, port-forward and log",
+            ));
+        }
+
         let (host_path, _host_ns) = match translate_subresource_to_host(&sub, &self.translator) {
             Ok(translated) => translated,
             Err(e) => {
@@ -1203,6 +1234,50 @@ mod tests {
         assert_eq!(
             host_path,
             "/api/v1/namespaces/pool-dev/pods/web-server-x-staging-x-vc/log"
+        );
+    }
+
+    // -- intercepted-subresource identity gate --
+
+    /// EVERY intercepted subresource — exec, attach, portforward AND log —
+    /// is forwarded to the HOST apiserver as the kobe-sync ServiceAccount,
+    /// so the caller's identity never reaches an authorizer. That makes an
+    /// authenticated peer a precondition for all four, not just the three
+    /// that upgrade. `log` is the easy one to miss: it is not an upgrade,
+    /// so an upgrade-only gate leaves it reading host pod logs with the
+    /// ServiceAccount's reach.
+    #[test]
+    fn intercepted_subresource_requires_a_usable_peer_identity() {
+        assert!(
+            usable_peer_identity(None).is_none(),
+            "no client certificate must not be usable"
+        );
+
+        let empty = PeerIdentity {
+            username: String::new(),
+            groups: vec!["system:masters".to_string()],
+        };
+        assert!(
+            usable_peer_identity(Some(&empty)).is_none(),
+            "an empty CN is not an identity — groups alone must not admit a caller"
+        );
+
+        let blank = PeerIdentity {
+            username: "   ".to_string(),
+            groups: vec![],
+        };
+        assert!(
+            usable_peer_identity(Some(&blank)).is_none(),
+            "a whitespace-only CN must not pass as an identity"
+        );
+
+        let alice = PeerIdentity {
+            username: "alice".to_string(),
+            groups: vec!["devs".to_string()],
+        };
+        assert!(
+            usable_peer_identity(Some(&alice)).is_some(),
+            "a real identity must be admitted — the gate must not reject everyone"
         );
     }
 

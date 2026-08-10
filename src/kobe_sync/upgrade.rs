@@ -106,8 +106,8 @@ static UPGRADES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "kobe_sync_proxy_upgrades_total",
         "Total number of HTTP Upgrade attempts handled by the subresource proxy",
-        // result = success | denied_global | denied_per_identity |
-        //          upstream_rejected | upstream_error
+        // result = success | denied_unauthenticated | denied_global |
+        //          denied_per_identity | upstream_rejected | upstream_error
         // NOTE: `success` means "101 handed to the client"; whether the tunnel
         // then carried bytes is BRIDGE_FAILURES_TOTAL below, deliberately a
         // separate metric so `result` stays mutually exclusive and summing it
@@ -413,8 +413,12 @@ pub struct UpgradeContext {
 /// response returned to the caller carries the host's selected
 /// `Upgrade` and `Sec-WebSocket-Protocol` so kubectl negotiates with
 /// the host's chosen protocol, not whatever the proxy might assume.
-pub async fn dispatch_upgrade(
-    mut req: Request<Incoming>,
+/// Generic over the request body: an upgrade carries none, and the body is
+/// never read here (only headers, extensions, and the `OnUpgrade` handle). The
+/// generic exists so the refusal paths can be driven directly in tests —
+/// `Incoming` cannot be constructed outside hyper.
+pub async fn dispatch_upgrade<B: Send + 'static>(
+    mut req: Request<B>,
     ctx: &UpgradeContext,
     host_path_and_query: &str,
     identity: Option<&str>,
@@ -423,16 +427,54 @@ pub async fn dispatch_upgrade(
     let host_token = ctx.host_token.as_str();
     let tls = Arc::clone(&ctx.tls);
     let limits = Arc::clone(&ctx.limits);
-    // 0. Reserve a permit. Identity is the validated CN from the
-    //    incoming TLS client cert (set by the proxy's TLS layer); for
-    //    unauthenticated callers we attribute usage to a dedicated
-    //    "anonymous" bucket so a single attacker can't exhaust capacity
-    //    by claiming many fake identities — the cap also applies to
-    //    them collectively.
-    let identity_for_limit = identity.unwrap_or("anonymous").to_string();
     let proto_for_metrics = upgrade_protocol(&req)
         .map(|p| classify_protocol(&p))
         .unwrap_or("other");
+
+    // 0. Require an authenticated peer, before anything else.
+    //
+    //    The TLS listener accepts unauthenticated peers on purpose, and
+    //    the non-upgrade path handles that safely: it forwards no
+    //    `X-Remote-*` headers when no client cert was presented, so the
+    //    local apiserver applies its own anonymous-auth policy.
+    //
+    //    This path cannot rely on the same thing. It tunnels to the HOST
+    //    apiserver authenticated as the kobe-sync ServiceAccount, so the
+    //    caller's identity never reaches an authorizer — leaving nothing
+    //    to attribute the session to. Every legitimate client has a cert
+    //    (the published kubeconfig carries `client-certificate-data`), so
+    //    requiring one keeps the SA's reach behind the same mutual-TLS
+    //    boundary as the rest of the proxy and costs real callers nothing.
+    //
+    //    Deciding WHICH authenticated callers may use which subresource
+    //    still needs the SubjectAccessReview in this module's TODO. This
+    //    only establishes that there is a caller at all.
+    let Some(identity) = identity.filter(|id| !id.trim().is_empty()) else {
+        UPGRADES_TOTAL
+            .with_label_values(&[proto_for_metrics, "denied_unauthenticated"])
+            .inc();
+        warn!("Refusing upgrade — no authenticated client certificate presented");
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "metadata": {},
+            "status": "Failure",
+            "message": "a client certificate is required for exec, attach and port-forward",
+            "reason": "Unauthorized",
+            "code": 401,
+        });
+        let resp = Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "application/json")
+            .body(body_from_bytes(Bytes::from(
+                serde_json::to_vec(&body).unwrap_or_default(),
+            )))
+            .context("failed to build unauthenticated-upgrade response")?;
+        return Ok(UpgradeOutcome::NotSwitched(resp));
+    };
+
+    // 1. Reserve a permit, bucketed by that identity.
+    let identity_for_limit = identity.to_string();
 
     let _permit = match limits.try_acquire(&identity_for_limit) {
         Ok(p) => p,
@@ -654,8 +696,8 @@ pub async fn dispatch_upgrade(
 // Internals
 // ---------------------------------------------------------------------------
 
-fn build_upstream_upgrade_request(
-    client_req: &Request<Incoming>,
+fn build_upstream_upgrade_request<B>(
+    client_req: &Request<B>,
     host_path_and_query: &str,
     host_token: &str,
     host_url: &str,
@@ -836,6 +878,147 @@ mod tests {
             b = b.header(*k, *v);
         }
         b.body(Empty::<Bytes>::new()).unwrap()
+    }
+
+    /// A caller with no client certificate must not get a tunnel.
+    ///
+    /// The TLS listener accepts unauthenticated peers on purpose — the
+    /// non-upgrade path needs that, and handles it by forwarding no
+    /// `X-Remote-*` headers so the local apiserver applies its own
+    /// anonymous policy. This path cannot rely on the same thing: it
+    /// tunnels to the HOST apiserver as the kobe-sync ServiceAccount, so
+    /// the caller's identity never reaches an authorizer.
+    ///
+    /// Asserted by counting upstream connections rather than just
+    /// checking the status: the property that matters is that the
+    /// request is refused *before* the host is dialed at all.
+    #[tokio::test]
+    async fn unauthenticated_upgrade_is_refused_without_dialing_the_host() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Stand-in for the host apiserver. Every accept here is a
+        // connection the proxy should never have made.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host_addr = listener.local_addr().unwrap();
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dials_bg = Arc::clone(&dials);
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_ok() {
+                    dials_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let ctx = UpgradeContext {
+            host_url: format!("https://{host_addr}"),
+            host_token: "unused-sa-token".to_string(),
+            tls: Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+            limits: Arc::new(UpgradeLimits::with_caps(10, 10)),
+        };
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/p/exec?command=sh")
+            .header("Upgrade", "SPDY/3.1")
+            .header("Connection", "Upgrade")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        // `Incoming` can't be built directly in a unit test; dispatch_upgrade
+        // only needs the head to make this decision.
+        let (parts, _) = req.into_parts();
+        let req = Request::from_parts(parts, Empty::<Bytes>::new());
+
+        let outcome = dispatch_upgrade(
+            req,
+            &ctx,
+            "/api/v1/namespaces/host-ns/pods/p-x-default-x-vc/exec?command=sh",
+            None, // <- no client certificate was presented
+        )
+        .await
+        .expect("refusing an unauthenticated upgrade is not an error");
+
+        let resp = match outcome {
+            UpgradeOutcome::NotSwitched(r) => r,
+            UpgradeOutcome::Switched(_) => {
+                panic!("an unauthenticated caller was given a tunnel (101 Switching Protocols)")
+            }
+            UpgradeOutcome::Throttled(_) => panic!("expected a refusal, got a throttle"),
+        };
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an upgrade with no client certificate must be refused"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the host apiserver must not be dialed for an unauthenticated caller — \
+             that hop authenticates as the kobe-sync ServiceAccount"
+        );
+    }
+
+    /// The converse: an authenticated caller is NOT refused at this
+    /// gate. Proven by observing that the host apiserver IS dialed —
+    /// the request gets past the identity check and fails later, on the
+    /// deliberately-unusable upstream. Without this, a fix that simply
+    /// rejected everything would look correct.
+    #[tokio::test]
+    async fn authenticated_upgrade_proceeds_to_the_host() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host_addr = listener.local_addr().unwrap();
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dials_bg = Arc::clone(&dials);
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_ok() {
+                    dials_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let ctx = UpgradeContext {
+            host_url: format!("https://{host_addr}"),
+            host_token: "unused-sa-token".to_string(),
+            tls: Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+            limits: Arc::new(UpgradeLimits::with_caps(10, 10)),
+        };
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/p/exec?command=sh")
+            .header("Upgrade", "SPDY/3.1")
+            .header("Connection", "Upgrade")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        // Fails at the upstream hop (no real apiserver there) — the point
+        // is only that it got that far.
+        let _ = dispatch_upgrade(
+            req,
+            &ctx,
+            "/api/v1/namespaces/host-ns/pods/p-x-default-x-vc/exec?command=sh",
+            Some("alice"),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            dials.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "an authenticated caller must still reach the host apiserver —              the identity gate must not reject everyone"
+        );
     }
 
     #[test]
