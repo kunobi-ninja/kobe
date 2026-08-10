@@ -14,6 +14,17 @@ const DEMO_TOKEN_SECRET = "e2e-local-token";
 const DEMO_POLICY = "e2e-local-token";
 const DEMO_K0S_POOL = "e2e-k0s";
 const DEMO_K0S_VERSION = "v1.35.1+k0s.0";
+// k0s guest image the k0s backend launches for DEMO_K0S_VERSION.
+//
+// DERIVED, not hand-written: `k0s_image()` (src/backend/k0s.rs) builds the tag
+// as `version.replace('+', "-")` — the `+` build-metadata separator is not a
+// legal OCI tag character. Applying the same transform here means a version
+// bump cannot silently desync the two. A hand-pinned constant could, and the
+// failure would be quiet: the preload would fetch an image nothing launches,
+// the guest would pull from the registry inside kind at provision time, and
+// that uncontrolled fetch would land back inside the pool's creatingTimeout —
+// exactly the problem pre-loading exists to remove.
+const K0S_GUEST_IMAGE = `k0sproject/k0s:${DEMO_K0S_VERSION.replace("+", "-")}`;
 // Single-server k3s pool exercised by the provision→Ready→recycle CI smoke
 // gate (hack/test-e2e-k3s.ts). Uses embedded SQLite (no shared datastore in
 // kind) and warms one member via scaling.minReady=1. The matching guest image
@@ -67,6 +78,10 @@ type Args = {
   namespace: string;
   release: string;
   imageTag: string;
+  /// Conformance backend this environment is being brought up for, when it is
+  /// known. Only used to decide which guest images are worth pre-loading —
+  /// every pool is still applied regardless.
+  backend?: string;
 };
 
 type E2eState = {
@@ -235,7 +250,7 @@ function parseArgs(argv: string[]): Args {
     namespace: DEFAULT_NAMESPACE,
     release: DEFAULT_RELEASE,
     imageTag: DEFAULT_IMAGE_TAG,
-  };
+  } as Args;
 
   const [maybeCommand, ...rest] = argv;
   const tokens = maybeCommand === "up" || maybeCommand === "down" ? rest : argv;
@@ -267,6 +282,11 @@ function parseArgs(argv: string[]): Args {
       i += 1;
       continue;
     }
+    if (token === "--backend" && next) {
+      args.backend = next;
+      i += 1;
+      continue;
+    }
     if (token === "--help" || token === "-h") {
       printHelpAndExit();
     }
@@ -277,7 +297,9 @@ function parseArgs(argv: string[]): Args {
 
 function printHelpAndExit(): never {
   info("Usage:");
-  info("  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG]");
+  info(
+    "  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG] [--backend NAME]",
+  );
   info("  bun run ./hack/e2e.ts down [--cluster NAME]");
   process.exit(0);
 }
@@ -458,7 +480,18 @@ async function loadImagesIntoKind(cluster: string, imageTag: string): Promise<vo
   // pull them inside the smoke gate's wait_ready budget. k3s is launched with
   // the default IfNotPresent pull policy for its tagged image, so a node-local
   // copy means the kubelet never reaches out to the registry.
-  await loadRemoteImagesIntoKind(cluster, [K3S_GUEST_IMAGE]);
+  // k3s is pre-loaded unconditionally because `e2e-k3s` is the one pool with
+  // `scaling.minReady: 1` — it warms in EVERY leg, so every leg needs its
+  // guest image. The scale-to-zero pools only provision when their own leg
+  // leases from them, so pre-loading their images everywhere would tax each
+  // leg with a pull it never uses (and add a registry dependency, which is a
+  // fresh way for an unrelated leg to fail). Pull those only when the leg
+  // that needs them is the one coming up.
+  const guestImages = [K3S_GUEST_IMAGE];
+  if (args.backend === "k0s") {
+    guestImages.push(K0S_GUEST_IMAGE);
+  }
+  await loadRemoteImagesIntoKind(cluster, guestImages);
 }
 
 async function prepareHelm(): Promise<void> {
@@ -580,7 +613,17 @@ spec:
     maxClusters: 2
     scaleUpThreshold: 0
     scaleDownAfter: "5m"
-    queueTimeout: "5m"
+    # Must exceed the recipe LEASE_WAIT_TIMEOUT: a server-side cap shorter
+    # than the client wait expires the queued claim regardless of how
+    # long the client is willing to wait.
+    queueTimeout: "12m"
+    # Caps ONE provisioning attempt: past it the operator recycles that
+    # instance as wedged. The claim itself survives and a later attempt can
+    # still serve it, up to the waits above — so this is a chosen retry
+    # policy, not a hard bound on the claim. Sized to fit a cold start now
+    # that the guest image is pre-loaded into the kind nodes
+    # (K0S_GUEST_IMAGE); without that it would be timing a registry pull.
+    creatingTimeout: "8m"
   resources:
     limits:
       cpu: "1"
