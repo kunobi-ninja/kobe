@@ -86,6 +86,15 @@ spec:
               enabled: true
 ```
 
+**Kubernetes version.** `cluster.version` selects the guest Kubernetes release. vcluster uses it verbatim as the image tag on `ghcr.io/loft-sh/kubernetes`, so it must name a published tag — `v`-prefixed with a full patch version, e.g. `v1.32.3`. A leading `v` is added if you omit it. Leave `cluster.version` empty to take the chart's own default.
+
+Values that do not name a real tag fail visibly, as an `ImagePullBackOff` on the guest control plane rather than a silently different cluster. Two spellings worth calling out:
+
+- `1.32` — a minor version with no patch is not a published tag.
+- `v1.31.3+k3s1` — a k3s/k0s build suffix. It is **not** rewritten to upstream `v1.31.3`: that is a different image, and substituting it would give you a cluster other than the one your manifest names. Use the upstream version you actually want.
+
+> **Changed behaviour.** Earlier releases ignored `cluster.version` on this backend entirely, so every vcluster pool silently ran the chart default regardless of what its manifest said. If your pool carries a version that was never taking effect, check it names a real tag before upgrading — it now will.
+
 **When to use:** High density and low per-cluster overhead without maintaining an in-house syncer. Note that fidelity boundaries (cloud identity such as IRSA, syncer coverage, version skew) are inherited from vcluster — route tenants who need full cluster semantics to a real-cluster backend.
 
 ## vkobe (on hold)
