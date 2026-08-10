@@ -151,6 +151,28 @@ fn helm_install_args(
     args
 }
 
+/// Normalize a requested Kubernetes version into the form vcluster expects.
+///
+/// vcluster feeds `controlPlane.distro.k8s.version` straight through as the
+/// image tag on `ghcr.io/loft-sh/kubernetes`, and every published tag there is
+/// `v`-prefixed (`v1.32.3`, `v1.34.0`). A bare `1.32.3` therefore resolves to a
+/// tag that does not exist and the guest never starts, so the prefix is added
+/// when missing — the same shape of accommodation as `k3s_image()` rewriting
+/// `+` to `-` because OCI tags forbid it.
+///
+/// This normalizes the PREFIX only. It cannot make an arbitrary string a real
+/// tag: `1.34` becomes `v1.34`, which is still not published (the tags carry a
+/// full patch version). Validating that is the registry's job, and a wrong
+/// value surfaces as a pull failure rather than a silently different cluster.
+fn normalize_distro_version(version: &str) -> String {
+    let v = version.trim();
+    if v.starts_with('v') {
+        v.to_string()
+    } else {
+        format!("v{v}")
+    }
+}
+
 /// Default vcluster Helm chart version pinned by the operator.
 ///
 /// Bumped in lock-step with our integration tests against vcluster
@@ -210,7 +232,7 @@ impl VclusterBackend {
     /// take precedence (Helm `--values` is last-wins for the file given,
     /// so we pass user values in a separate `--values` invocation after
     /// the defaults).
-    fn default_values_yaml(&self, _name: &str, _config: &ClusterConfig) -> String {
+    fn default_values_yaml(&self, _name: &str, config: &ClusterConfig) -> String {
         // Conservative defaults aligned with kobe pool conventions:
         // - sync.toHost.* enabled for the resource types kobe pools
         //   typically want projected
@@ -223,12 +245,23 @@ impl VclusterBackend {
             "https://{name}.vcluster-{name}.svc.cluster.local:443",
             name = _name
         );
+        // Only emit the distro block when a version was actually requested:
+        // an empty `version` would set the image tag to "" and break the
+        // guest, whereas saying nothing leaves the chart's own pinned default.
+        let distro = if config.version.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  distro:\n    k8s:\n      version: {}\n",
+                normalize_distro_version(&config.version)
+            )
+        };
         format!(
             r#"# kobe operator defaults for vcluster
 exportKubeConfig:
   server: {server}
 controlPlane:
-  statefulSet:
+{distro}  statefulSet:
     persistence:
       volumeClaim:
         enabled: true
@@ -703,6 +736,72 @@ mod tests {
     /// well-formed YAML with the keys the chart expects at the right
     /// depth. A stray indent in the `format!` literal is invisible until
     /// helm rejects it at install time.
+    /// A pool that asks for a Kubernetes version must get it.
+    ///
+    /// vcluster takes this at `controlPlane.distro.k8s.version` and uses
+    /// it VERBATIM as the image tag on `ghcr.io/loft-sh/kubernetes`.
+    /// Dropping it silently hands the tenant whatever the pinned chart
+    /// defaults to (v1.35.0 for chart 0.34.0) while the manifest says
+    /// otherwise — the failure mode is a cluster that looks right and is
+    /// not.
+    #[tokio::test]
+    async fn default_values_yaml_sets_the_requested_kubernetes_version() {
+        let b = offline_backend(None);
+        let cfg = ClusterConfig {
+            version: "v1.32.3".to_string(),
+            servers: 1,
+            ..Default::default()
+        };
+        let yaml = b.default_values_yaml("foo", &cfg);
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            v["controlPlane"]["distro"]["k8s"]["version"].as_str(),
+            Some("v1.32.3"),
+            "the requested version must reach the chart, got: {yaml}"
+        );
+    }
+
+    /// The tag is used verbatim, and every published tag is v-prefixed —
+    /// a bare `1.32.3` resolves to a nonexistent image and the guest
+    /// never starts. Accept the un-prefixed spelling rather than turning
+    /// it into an ImagePullBackOff. (This normalizes the prefix only; it
+    /// does not make the value a valid tag — `1.34` is still not one.)
+    #[tokio::test]
+    async fn requested_version_is_v_prefixed_for_the_image_tag() {
+        let b = offline_backend(None);
+        let cfg = ClusterConfig {
+            version: "1.32.3".to_string(),
+            servers: 1,
+            ..Default::default()
+        };
+        let yaml = b.default_values_yaml("foo", &cfg);
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            v["controlPlane"]["distro"]["k8s"]["version"].as_str(),
+            Some("v1.32.3"),
+            "a missing `v` must be added, got: {yaml}"
+        );
+    }
+
+    /// No version requested: say nothing, so the chart's own pinned
+    /// default applies. Emitting an empty string would set the image tag
+    /// to "" and break the guest.
+    #[tokio::test]
+    async fn an_unset_version_leaves_the_chart_default_alone() {
+        let b = offline_backend(None);
+        let cfg = ClusterConfig {
+            version: String::new(),
+            servers: 1,
+            ..Default::default()
+        };
+        let yaml = b.default_values_yaml("foo", &cfg);
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(
+            v["controlPlane"]["distro"].is_null(),
+            "an unset version must not emit a distro block, got: {yaml}"
+        );
+    }
+
     #[tokio::test]
     async fn default_values_yaml_parses_as_yaml_with_the_expected_shape() {
         let b = offline_backend(None);

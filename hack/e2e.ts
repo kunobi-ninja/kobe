@@ -958,7 +958,11 @@ spec:
     # exportKubeConfig.server set to the in-cluster DNS form.
     vcluster: {}
   cluster:
-    version: "1.34"
+    # Used verbatim as the ghcr.io/loft-sh/kubernetes image tag, so it must
+    # be a real published tag: v-prefixed with a full patch version. A bare
+    # "1.34" is not one, and was silently ignored until the backend started
+    # honouring this field.
+    version: "v1.34.0"
     servers: 1
   healthCheck:
     intervalSeconds: 30
@@ -1001,7 +1005,11 @@ spec:
     type: vcluster
     vcluster: {}
   cluster:
-    version: "1.34"
+    # Used verbatim as the ghcr.io/loft-sh/kubernetes image tag, so it must
+    # be a real published tag: v-prefixed with a full patch version. A bare
+    # "1.34" is not one, and was silently ignored until the backend started
+    # honouring this field.
+    version: "v1.34.0"
     servers: 1
   bootstraps:
     - name: ${DEMO_FLUX_BOOTSTRAP_CONFIG}
