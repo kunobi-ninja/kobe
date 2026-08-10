@@ -4,8 +4,8 @@ description: >-
   Kubernetes operator for instant cluster provisioning via warm pools.
   Supports multiple backends: k3s, k0s, vcluster, vkobe, and CAPI.
 type: application
-version: 0.37.0
-appVersion: "0.37.0"
+version: 0.38.0
+appVersion: "0.38.0"
 keywords:
   - kubernetes
   - operator
@@ -61,9 +61,9 @@ annotations:
   # bundled path should scan that image via the etcd chart's own listing.
   artifacthub.io/images: |
     - name: kobe-operator
-      image: docker.io/zondax/kobe-operator:v0.37.0
+      image: docker.io/zondax/kobe-operator:v0.38.0
     - name: kobe-sync
-      image: docker.io/zondax/kobe-sync:v0.37.0
+      image: docker.io/zondax/kobe-sync:v0.38.0
     - name: kine
       image: docker.io/rancher/kine:v0.13.2
       whitelisted: true
