@@ -9,7 +9,7 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, PodSpec, PodTemplateSpec, SecretVolumeSource, Volume, VolumeMount,
 };
-use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::core::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
@@ -24,8 +24,8 @@ use crate::backend::{
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
     ClusterConfig, ClusterInstance, ClusterInstanceCondition, ClusterInstanceNetwork,
-    ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool, HealthCheckConfig,
-    LeasePhase, ReadinessGate, SnapshotConfig,
+    ClusterInstancePhase, ClusterInstanceStatus, ClusterPool, HealthCheckConfig, LeasePhase,
+    ReadinessGate, SnapshotConfig,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -240,6 +240,10 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 phase = ?status.phase,
                 "ClusterInstance deletion requested; running backend cleanup before releasing finalizer"
             );
+            if let Err(reason) = verify_bound_instance_for_teardown(&ctx, &instance, &ns).await {
+                warn!(instance = %name, reason, "Deletion fenced: exact lease binding is not verifiable");
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
             match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
                 Ok(()) => {
                     cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
@@ -318,6 +322,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 provisioned: false,
                                 bootstrapped: false,
                                 lease_ref: status.lease_ref.clone(),
+                                binding: status.binding.clone(),
                                 active_bootstrap: None,
                                 idle_since: status.idle_since.clone(),
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
@@ -747,7 +752,26 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         }
         ClusterInstancePhase::Recycling => {
             info!(instance = %name, owner = %owner, "Deleting backend resources");
-            match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
+            if let Err(reason) = verify_bound_instance_for_teardown(&ctx, &instance, &ns).await {
+                warn!(instance = %name, reason, "Recycle fenced: exact lease binding is not verifiable");
+                patch_instance_message_fenced(
+                    &ctx,
+                    &instance,
+                    &format!("binding unverified: {reason}"),
+                )
+                .await?;
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
+            // Re-fetch immediately before the destructive boundary and require
+            // the same UID. Kubernetes cannot create a replacement while this
+            // exact CR still exists; the UID-preconditioned delete below closes
+            // the remaining stale-reconcile window.
+            let current = instances_api.get(&name).await?;
+            if current.metadata.uid != instance.metadata.uid {
+                warn!(instance = %name, reason = "instance_uid_mismatch", "Refusing to delete same-named replacement");
+                return Ok(Action::await_change());
+            }
+            match delete_instance_backend(&ctx, &config, &current, &name, &ns).await {
                 Ok(()) => {
                     // Best-effort cleanup of host-side resources that the
                     // backend's own delete() doesn't own. See
@@ -757,7 +781,14 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     // projected workload pods over 8 days of cycling).
                     cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
 
-                    instances_api.delete(&name, &Default::default()).await?;
+                    let delete_params = DeleteParams {
+                        preconditions: Some(Preconditions {
+                            uid: current.metadata.uid.clone(),
+                            resource_version: current.resource_version(),
+                        }),
+                        ..Default::default()
+                    };
+                    instances_api.delete(&name, &delete_params).await?;
                     Ok(Action::await_change())
                 }
                 Err(e) => {
@@ -863,166 +894,187 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     namespace: &str,
     status: &ClusterInstanceStatus,
 ) -> Result<Action, InstanceError> {
-    let Some(lease_ref) = &status.lease_ref else {
-        warn!(instance = %name, "Leased instance is missing lease_ref, recycling");
-        observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
-        let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
-        patch_instance_status(
-            &instances_api,
+    let Some(binding) = status.binding.as_ref() else {
+        warn!(instance = %name, reason = "binding_missing", "Legacy/invalid leased instance kept unavailable");
+        patch_instance_message_fenced(
+            ctx,
             instance,
-            ClusterInstanceStatus {
-                phase: ClusterInstancePhase::Recycling,
-                provisioned: status.provisioned,
-                bootstrapped: status.bootstrapped,
-                lease_ref: None,
-                active_bootstrap: None,
-                idle_since: None,
-                state_since: Some(chrono::Utc::now().to_rfc3339()),
-                health_failures: status.health_failures,
-                spec_hash: status.spec_hash.clone(),
-                message: Some("recycling: leased instance lost its lease reference".into()),
-                ..Default::default()
-            },
+            "binding unverified; unavailable; recycle/quarantine required",
         )
         .await?;
-        return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
     };
+    let Some(lease_uid) = binding.lease.uid.as_deref() else {
+        patch_instance_message_fenced(ctx, instance, "binding unverified: lease UID missing")
+            .await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+    if status.lease_ref.as_ref().is_none_or(|reference| {
+        reference.name != binding.lease.name || reference.uid != binding.lease.uid
+    }) {
+        patch_instance_message_fenced(
+            ctx,
+            instance,
+            "binding unverified: reciprocal lease reference mismatch",
+        )
+        .await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    }
 
-    let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
-    match leases_api.get(&lease_ref.name).await {
-        Ok(lease) => {
-            let lease_status = lease.status.unwrap_or_default();
-            let should_recycle = matches!(
+    match crate::lease_binding::resolve_lease_binding(
+        &ctx.client,
+        namespace,
+        &binding.lease.name,
+        lease_uid,
+        crate::lease_binding::BindingResolveMode::Lifecycle,
+    )
+    .await
+    {
+        Ok(resolved) => {
+            let lease_status = resolved.lease.status.unwrap_or_default();
+            if matches!(
                 lease_status.phase,
                 LeasePhase::Released | LeasePhase::Expired | LeasePhase::Recycling
-            );
-            if should_recycle {
+            ) {
                 info!(
                     instance = %name,
-                    lease = %lease_ref.name,
+                    lease = %binding.lease.name,
                     phase = %lease_status.phase,
-                    "Lease is terminating, recycling instance"
+                    "Exact bound lease is terminating; recycling instance"
                 );
                 observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
-                let instances_api: Api<ClusterInstance> =
-                    Api::namespaced(ctx.client.clone(), namespace);
-                let message = Some(format!(
-                    "recycling: lease '{}' is {}",
-                    lease_ref.name, lease_status.phase
+                let mut next = status.clone();
+                next.phase = ClusterInstancePhase::Recycling;
+                next.idle_since = None;
+                next.state_since = Some(chrono::Utc::now().to_rfc3339());
+                next.message = Some(format!(
+                    "recycling: exact lease '{}' is {}",
+                    binding.lease.name, lease_status.phase
                 ));
-                patch_instance_status(
-                    &instances_api,
-                    instance,
-                    ClusterInstanceStatus {
-                        phase: ClusterInstancePhase::Recycling,
-                        provisioned: status.provisioned,
-                        bootstrapped: status.bootstrapped,
-                        lease_ref: None,
-                        active_bootstrap: None,
-                        idle_since: None,
-                        state_since: Some(chrono::Utc::now().to_rfc3339()),
-                        health_failures: status.health_failures,
-                        spec_hash: status.spec_hash.clone(),
-                        message,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                Ok(Action::requeue(std::time::Duration::from_secs(10)))
-            } else {
-                // Detect an orphaned reservation. Binding is two steps — mark the
-                // instance Leased, then patch the lease to Bound+clusterName. If
-                // the operator dies between them, the instance is stuck Leased
-                // pointing at a lease that stays Pending with no clusterName, and
-                // nothing reclaims it (the pool/lease reapers don't cover this
-                // case) — the warm cluster is lost from the pool forever.
-                //
-                // After a grace window (the normal bind completes in ms), release
-                // such an instance back to Ready so the still-Pending lease can be
-                // re-bound. Only act when the lease is Pending AND not bound to us,
-                // so a normal in-flight bind is never disturbed.
-                let bound_to_us = lease_status.cluster_name.as_deref() == Some(name);
-                let reservation_orphaned =
-                    lease_status.phase == LeasePhase::Pending && !bound_to_us;
-                let grace = chrono::Duration::minutes(2);
-                if reservation_orphaned
-                    && reservation_grace_elapsed(
-                        status.state_since.as_deref(),
-                        chrono::Utc::now(),
-                        grace,
-                    )
-                {
-                    warn!(
-                        instance = %name,
-                        lease = %lease_ref.name,
-                        "Leased instance points at a lease that never finished binding; \
-                         releasing the reservation back to the pool"
-                    );
-                    let instances_api: Api<ClusterInstance> =
-                        Api::namespaced(ctx.client.clone(), namespace);
-                    patch_instance_status(
-                        &instances_api,
-                        instance,
-                        ClusterInstanceStatus {
-                            // The cluster was reserved but never handed to a tenant
-                            // (the lease never reached Bound), so it is clean —
-                            // return it to Ready rather than recycling.
-                            phase: ClusterInstancePhase::Ready,
-                            provisioned: status.provisioned,
-                            bootstrapped: status.bootstrapped,
-                            lease_ref: None,
-                            active_bootstrap: None,
-                            idle_since: Some(chrono::Utc::now().to_rfc3339()),
-                            state_since: Some(chrono::Utc::now().to_rfc3339()),
-                            health_failures: status.health_failures,
-                            spec_hash: status.spec_hash.clone(),
-                            message: Some(
-                                "ready; reclaimed from an orphaned lease reservation".into(),
-                            ),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
-                }
-                Ok(Action::requeue(std::time::Duration::from_secs(30)))
+                // Keep lease_ref + binding until verified teardown deletes the
+                // exact instance; they are cleanup handles, not idle state.
+                patch_exact_binding_status(ctx, instance, binding, next).await?;
+                return Ok(Action::requeue(std::time::Duration::from_secs(10)));
             }
+
+            // Pending with the same persisted intent is the normal crash window
+            // between the instance reservation and lease finalization. Leave it
+            // intact so the lease controller finishes this exact pair. Bound is
+            // the steady state. Any other phase remains unavailable.
+            Ok(Action::requeue(std::time::Duration::from_secs(30)))
         }
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+        Err(crate::lease_binding::BindingResolutionError::LeaseNotFound) => {
+            let grace = chrono::Duration::minutes(2);
+            if !reservation_grace_elapsed(status.state_since.as_deref(), chrono::Utc::now(), grace)
+            {
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
             warn!(
                 instance = %name,
-                lease = %lease_ref.name,
-                "Lease CR not found for leased instance, recycling"
+                lease = %binding.lease.name,
+                reason = "exact_lease_gone",
+                "Releasing only the exact orphan reservation"
             );
-            observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
-            let instances_api: Api<ClusterInstance> =
-                Api::namespaced(ctx.client.clone(), namespace);
-            let message = Some(format!(
-                "recycling: lease '{}' no longer exists",
-                lease_ref.name
-            ));
-            patch_instance_status(
-                &instances_api,
+            let mut next = status.clone();
+            next.phase = ClusterInstancePhase::Ready;
+            next.lease_ref = None;
+            next.binding = None;
+            next.idle_since = Some(chrono::Utc::now().to_rfc3339());
+            next.state_since = Some(chrono::Utc::now().to_rfc3339());
+            next.message = Some("ready; exact orphan reservation released".into());
+            patch_exact_binding_status(ctx, instance, binding, next).await?;
+            Ok(Action::requeue(std::time::Duration::from_secs(5)))
+        }
+        Err(err) => {
+            warn!(
+                instance = %name,
+                binding_id = %binding.binding_id,
+                reason = err.reason_code(),
+                "Invalid binding kept unavailable"
+            );
+            patch_instance_message_fenced(
+                ctx,
                 instance,
-                ClusterInstanceStatus {
-                    phase: ClusterInstancePhase::Recycling,
-                    provisioned: status.provisioned,
-                    bootstrapped: status.bootstrapped,
-                    lease_ref: None,
-                    active_bootstrap: None,
-                    idle_since: None,
-                    state_since: Some(chrono::Utc::now().to_rfc3339()),
-                    health_failures: status.health_failures,
-                    spec_hash: status.spec_hash.clone(),
-                    message,
-                    ..Default::default()
-                },
+                &format!("binding unverified: {}", err.reason_code()),
             )
             .await?;
-            Ok(Action::requeue(std::time::Duration::from_secs(10)))
+            Ok(Action::requeue(std::time::Duration::from_secs(30)))
         }
-        Err(e) => Err(e.into()),
     }
+}
+
+async fn patch_instance_message_fenced<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    message: &str,
+) -> Result<(), InstanceError> {
+    let uid = instance
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("instance missing UID"))?;
+    let rv = instance
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
+    let patch: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/status/message", "value": message }
+    ]))
+    .expect("instance message JSON Patch is static");
+    let namespace = instance
+        .namespace()
+        .unwrap_or_else(|| ctx.namespace.clone());
+    let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &namespace);
+    instances
+        .patch_status(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn patch_exact_binding_status<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    binding: &crate::crd::LeaseBinding,
+    mut next: ClusterInstanceStatus,
+) -> Result<(), InstanceError> {
+    let uid = instance
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("instance missing UID"))?;
+    let rv = instance
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
+    let prev = instance
+        .status
+        .as_ref()
+        .map(|current| current.conditions.as_slice())
+        .unwrap_or(&[]);
+    next.conditions = derive_instance_conditions(&next, prev, &chrono::Utc::now().to_rfc3339());
+    let patch: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "add", "path": "/status", "value": next }
+    ]))
+    .expect("exact binding JSON Patch is static");
+    let namespace = instance
+        .namespace()
+        .unwrap_or_else(|| ctx.namespace.clone());
+    let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &namespace);
+    instances
+        .patch_status(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Inject a per-backend default readiness gate when a pool declares
@@ -1110,7 +1162,7 @@ async fn resolve_instance_config(
                 // already pins the backend via `created_with`), so teardown
                 // can still tear down the right backend resources and then
                 // release the finalizer.
-                return Ok(deletion_fallback_config(instance, &pool_ref.name));
+                return deletion_fallback_config(instance, &pool_ref.name);
             }
             None => {
                 return Err(anyhow::anyhow!("Owning pool {} not found", pool_ref.name).into());
@@ -1176,39 +1228,27 @@ async fn resolve_instance_config(
 }
 
 /// Build a minimal [`ResolvedInstanceConfig`] for the delete path when the
-/// owning pool is gone. Only `backend.backend_type` and `owner_name` are
-/// load-bearing for teardown — `delete_instance_backend` reads the backend
-/// type (further refined by `status.created_with` pinning) and ignores the
-/// cluster/addon/bootstrap fields. We seed the backend type from
-/// `status.created_with.backend_type` (the authoritative provenance), then
-/// fall back to the instance's own `spec.backend` for pre-provenance
-/// instances, defaulting otherwise.
+/// owning pool is gone. Missing or malformed immutable backend provenance is
+/// an error: a destructive path must never guess a default backend.
 fn deletion_fallback_config(
     instance: &ClusterInstance,
     owner_name: &str,
-) -> ResolvedInstanceConfig {
-    let backend_type = instance
+) -> Result<ResolvedInstanceConfig, InstanceError> {
+    let provenance = instance
         .status
         .as_ref()
         .and_then(|s| s.created_with.as_ref())
-        .and_then(|cw| cw.backend_type.clone())
-        .or_else(|| {
-            instance
-                .spec
-                .backend
-                .as_ref()
-                .map(|b| b.backend_type.clone())
-        })
-        .unwrap_or_default();
+        .and_then(|created| created.backend.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "owning pool is gone and instance lacks immutable backend provenance; refusing teardown"
+            )
+        })?;
+    let backend = provenance
+        .dispatch_config()
+        .map_err(|reason| anyhow::anyhow!("invalid backend provenance: {reason}"))?;
 
-    // Carry through any per-instance backend config (capi/vkobe/vcluster) the
-    // instance itself recorded, so `backend_dispatch_for_config` can construct
-    // the backend without the pool. Pool-backed instances usually have an
-    // empty `spec.backend`; the backend constructors tolerate `None` configs.
-    let mut backend = instance.spec.backend.clone().unwrap_or_default();
-    backend.backend_type = backend_type;
-
-    ResolvedInstanceConfig {
+    Ok(ResolvedInstanceConfig {
         owner_name: owner_name.to_string(),
         backend,
         cluster: instance.spec.cluster.clone().unwrap_or_default(),
@@ -1217,7 +1257,7 @@ fn deletion_fallback_config(
         health_check: None,
         readiness_gates: Vec::new(),
         snapshot: None,
-    }
+    })
 }
 
 /// Read the owning ClusterPool's `status.goldenGeneration` — the generation at
@@ -1732,43 +1772,59 @@ async fn delete_instance_backend<B: ClusterBackend + Clone>(
     name: &str,
     namespace: &str,
 ) -> Result<(), anyhow::Error> {
-    if ctx.factory.is_some() {
-        // Backend pinning: when the instance's status records a
-        // `created_with.backend_type`, dispatch via that backend rather
-        // than the pool's *current* spec. Otherwise a pool-level
-        // backend migration (e.g., vkobe→vcluster) would route the
-        // delete through the wrong backend, leaving the original
-        // resources orphaned and the new backend hitting "release not
-        // found" / "namespace doesn't exist" errors in a tight loop.
-        //
-        // Fallback to pool-spec backend for instances created by
-        // kobe < 0.23.1 (when this field was introduced).
-        let pinned = instance
-            .status
-            .as_ref()
-            .and_then(|s| s.created_with.as_ref())
-            .and_then(|cw| cw.backend_type.as_ref());
-        let backend = if let Some(pinned_type) = pinned
-            && *pinned_type != config.backend.backend_type
-        {
-            // Pool spec drifted; construct a config with the pinned
-            // backend type so the dispatch picks the right backend.
-            let mut overridden = config.clone();
-            overridden.backend.backend_type = pinned_type.clone();
-            tracing::debug!(
-                instance = %name,
-                pinned = ?pinned_type,
-                pool_backend = ?config.backend.backend_type,
-                "delete using pinned backend (overrides pool spec backend)"
-            );
-            backend_dispatch_for_config(ctx, &overridden)?
+    if let Some(factory) = &ctx.factory {
+        let backend = if instance.spec.pool_ref.is_some() {
+            let provenance = instance
+                .status
+                .as_ref()
+                .and_then(|status| status.created_with.as_ref())
+                .and_then(|created| created.backend.as_ref())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pool-managed instance missing immutable backend provenance; refusing delete"
+                    )
+                })?;
+            factory.backend_for_provenance(provenance)?
         } else {
+            // Standalone instances carry their backend configuration directly
+            // in their own spec and do not cross the lease/pool boundary.
             backend_dispatch_for_config(ctx, config)?
         };
         backend.delete(name, namespace).await
     } else {
         ctx.backend.delete(name, namespace).await
     }
+}
+
+async fn verify_bound_instance_for_teardown<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    namespace: &str,
+) -> Result<(), &'static str> {
+    let Some(binding) = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.as_ref())
+    else {
+        // An unbound pool member or standalone instance has no tenant binding
+        // to cross. Pool-managed backend dispatch is still provenance-pinned by
+        // `delete_instance_backend`.
+        return Ok(());
+    };
+    let lease_uid = binding.lease.uid.as_deref().ok_or("lease_uid_missing")?;
+    let resolved = crate::lease_binding::resolve_lease_binding(
+        &ctx.client,
+        namespace,
+        &binding.lease.name,
+        lease_uid,
+        crate::lease_binding::BindingResolveMode::Lifecycle,
+    )
+    .await
+    .map_err(|err| err.reason_code())?;
+    if resolved.instance.metadata.uid != instance.metadata.uid || resolved.binding != *binding {
+        return Err("instance_uid_mismatch");
+    }
+    Ok(())
 }
 
 /// Best-effort cleanup of host-side resources that a backend's `delete()`
@@ -2098,11 +2154,8 @@ fn claim_resolution(claim: &CIDRClaim) -> ClaimResolution {
 
 /// Add `finalizer` to the instance's `metadata.finalizers` list, idempotently.
 ///
-/// Uses a JSON Merge Patch that REPLACES the entire `finalizers` array with
-/// the existing values plus our finalizer. RFC 7396 specifies that arrays
-/// in a Merge Patch overwrite the target rather than merging element-wise,
-/// so we read-modify-write the whole list. The read is already done by the
-/// caller (the `instance` Arc), so there's no extra round-trip.
+/// Uses UID/resourceVersion tests so a stale reconcile cannot add the
+/// finalizer to a same-named replacement.
 async fn add_finalizer(
     instances_api: &Api<ClusterInstance>,
     instance: &ClusterInstance,
@@ -2113,21 +2166,32 @@ async fn add_finalizer(
         return Ok(());
     }
     finalizers.push(finalizer.to_string());
-    let patch = serde_json::json!({
-        "metadata": { "finalizers": finalizers }
-    });
+    let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other("instance missing UID")))
+    })?;
+    let rv = instance.resource_version().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other(
+            "instance missing resourceVersion",
+        )))
+    })?;
+    let patch: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+    ]))
+    .expect("finalizer JSON Patch is static");
     instances_api
         .patch(
             &instance.name_any(),
             &PatchParams::default(),
-            &Patch::Merge(&patch),
+            &Patch::<()>::Json(patch),
         )
         .await?;
     Ok(())
 }
 
 /// Remove `finalizer` from the instance's `metadata.finalizers` list,
-/// idempotently. Same array-replace semantics as `add_finalizer`.
+/// idempotently, fenced by UID and resourceVersion.
 async fn remove_finalizer(
     instances_api: &Api<ClusterInstance>,
     instance: &ClusterInstance,
@@ -2145,14 +2209,25 @@ async fn remove_finalizer(
         // Finalizer wasn't present — nothing to do, avoid a no-op patch.
         return Ok(());
     }
-    let patch = serde_json::json!({
-        "metadata": { "finalizers": remaining }
-    });
+    let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other("instance missing UID")))
+    })?;
+    let rv = instance.resource_version().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other(
+            "instance missing resourceVersion",
+        )))
+    })?;
+    let patch: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/metadata/finalizers", "value": remaining }
+    ]))
+    .expect("finalizer JSON Patch is static");
     instances_api
         .patch(
             &instance.name_any(),
             &PatchParams::default(),
-            &Patch::Merge(&patch),
+            &Patch::<()>::Json(patch),
         )
         .await?;
     Ok(())
@@ -2304,7 +2379,7 @@ fn error_policy<B: ClusterBackend>(
 mod tests {
     use super::*;
     use crate::testutil::MockBackend;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Find a derived condition by type. Panics if absent (tests assert
@@ -2592,6 +2667,8 @@ mod tests {
                 "metadata": {
                     "name": name,
                     "namespace": "test-ns",
+                    "uid": format!("{name}-uid"),
+                    "resourceVersion": "10",
                     // Pre-stamp the finalizer so the reconciler exits its
                     // "add finalizer" short-circuit and proceeds to the
                     // phase logic the test is actually exercising.
@@ -2634,7 +2711,9 @@ mod tests {
             "kind": "ClusterInstance",
             "metadata": {
                 "name": name,
-                "namespace": "test-ns"
+                "namespace": "test-ns",
+                "uid": format!("{name}-uid"),
+                "resourceVersion": "11"
             },
             "spec": {
                 "backend": { "type": "k3s" },
@@ -2759,6 +2838,14 @@ mod tests {
         let instance =
             standalone_instance("standalone-4", ClusterInstancePhase::Recycling, true, 0);
 
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/standalone-4",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*instance))
+            .mount(&server)
+            .await;
+
         Mock::given(method("DELETE"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/standalone-4",
@@ -2776,7 +2863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leased_instance_with_missing_lease_recycles() {
+    async fn legacy_leased_instance_with_missing_binding_stays_unavailable() {
         let (ctx, server, backend) = test_instance_context().await;
         let instance = Arc::new(
             serde_json::from_value(serde_json::json!({
@@ -2785,6 +2872,8 @@ mod tests {
                 "metadata": {
                     "name": "leased-1",
                     "namespace": "test-ns",
+                    "uid": "leased-1-uid",
+                    "resourceVersion": "10",
                     "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
@@ -2801,38 +2890,25 @@ mod tests {
             .unwrap(),
         );
 
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-gone",
-            ))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
         Mock::given(method("PATCH"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/leased-1/status",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "status": {
-                    "phase": "Recycling",
-                    "leaseRef": null
-                }
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("leased-1")))
+            .expect(1)
             .mount(&server)
             .await;
 
         let action = reconcile_instance(instance, ctx).await.unwrap();
 
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
         let calls = backend.call_count();
         assert_eq!(calls.check_health, 0);
         assert_eq!(calls.delete, 0);
     }
 
     #[tokio::test]
-    async fn leased_instance_with_released_lease_recycles() {
+    async fn legacy_leased_instance_is_not_authorized_by_same_name_released_lease() {
         let (ctx, server, backend) = test_instance_context().await;
         let instance = Arc::new(
             serde_json::from_value(serde_json::json!({
@@ -2841,6 +2917,8 @@ mod tests {
                 "metadata": {
                     "name": "leased-2",
                     "namespace": "test-ns",
+                    "uid": "leased-2-uid",
+                    "resourceVersion": "10",
                     "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
@@ -2857,46 +2935,18 @@ mod tests {
             .unwrap(),
         );
 
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-released",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": {
-                    "name": "lease-released",
-                    "namespace": "test-ns"
-                },
-                "spec": {
-                    "poolRef": "ci-small",
-                    "ttl": "1h",
-                    "requester": { "type": "ssh:user", "identity": "user" }
-                },
-                "status": {
-                    "phase": "Released"
-                }
-            })))
-            .mount(&server)
-            .await;
-
         Mock::given(method("PATCH"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/leased-2/status",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "status": {
-                    "phase": "Recycling",
-                    "leaseRef": null
-                }
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("leased-2")))
+            .expect(1)
             .mount(&server)
             .await;
 
         let action = reconcile_instance(instance, ctx).await.unwrap();
 
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
         let calls = backend.call_count();
         assert_eq!(calls.check_health, 0);
         assert_eq!(calls.delete, 0);
@@ -3036,6 +3086,8 @@ mod tests {
         let mut metadata = serde_json::json!({
             "name": name,
             "namespace": "test-ns",
+            "uid": format!("{name}-uid"),
+            "resourceVersion": "10",
             "finalizers": finalizers,
         });
         if let Some(ts) = deletion_timestamp {
@@ -3080,9 +3132,11 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/no-finalizer-1",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "metadata": { "finalizers": [INSTANCE_FINALIZER] }
-            })))
+            .and(body_json(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": "no-finalizer-1-uid" },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": "10" },
+                { "op": "add", "path": "/metadata/finalizers", "value": [INSTANCE_FINALIZER] }
+            ])))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("no-finalizer-1")))
             .expect(1)
             .mount(&server)
@@ -3119,9 +3173,11 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/deleting-1",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "metadata": { "finalizers": [] }
-            })))
+            .and(body_json(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": "deleting-1-uid" },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": "10" },
+                { "op": "add", "path": "/metadata/finalizers", "value": [] }
+            ])))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(instance_api_response("deleting-1")),
             )
@@ -3194,11 +3250,11 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/multi-final",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "metadata": {
-                    "finalizers": ["other-controller/finalizer", INSTANCE_FINALIZER]
-                }
-            })))
+            .and(body_json(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": "multi-final-uid" },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": "10" },
+                { "op": "add", "path": "/metadata/finalizers", "value": ["other-controller/finalizer", INSTANCE_FINALIZER] }
+            ])))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(instance_api_response("multi-final")),
             )
@@ -3226,9 +3282,11 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/multi-final-rm",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "metadata": { "finalizers": ["other-controller/finalizer"] }
-            })))
+            .and(body_json(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": "multi-final-rm-uid" },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": "10" },
+                { "op": "add", "path": "/metadata/finalizers", "value": ["other-controller/finalizer"] }
+            ])))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("multi-final-rm")))
             .expect(1)
             .mount(&server)
@@ -3244,6 +3302,8 @@ mod tests {
     /// FIX 2). Carries `status.created_with.backend_type` so the delete
     /// path can pin the backend without the pool.
     fn pool_managed_deleting_instance(name: &str, pool: &str) -> Arc<ClusterInstance> {
+        let backend = crate::crd::BackendProvenance::from_config(&BackendConfig::default())
+            .expect("default backend provenance");
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
@@ -3251,18 +3311,25 @@ mod tests {
                 "metadata": {
                     "name": name,
                     "namespace": "test-ns",
+                    "uid": format!("{name}-uid"),
+                    "resourceVersion": "10",
                     "deletionTimestamp": "2026-05-21T10:00:00Z",
                     "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
-                    "poolRef": { "name": pool },
+                    "poolRef": { "name": pool, "uid": "gone-pool-uid" },
                     "addons": [],
                     "readinessGates": []
                 },
                 "status": {
                     "phase": "Creating",
                     "provisioned": true,
-                    "createdWith": { "operatorVersion": "0.23.1", "type": "k3s" },
+                    "createdWith": {
+                        "operatorVersion": "0.37.0",
+                        "backendType": "k3s",
+                        "poolUid": "gone-pool-uid",
+                        "backend": backend
+                    },
                     "network": {
                         "serviceCidr": "10.240.0.0/20",
                         "clusterCidr": "10.248.0.0/20"
@@ -3302,9 +3369,11 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/orphan-deleting",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "metadata": { "finalizers": [] }
-            })))
+            .and(body_json(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": "orphan-deleting-uid" },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": "10" },
+                { "op": "add", "path": "/metadata/finalizers", "value": [] }
+            ])))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(instance_api_response("orphan-deleting")),
             )
