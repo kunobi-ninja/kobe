@@ -1872,7 +1872,20 @@ impl ClusterBackend for K3sBackend {
         // replica count of a live StatefulSet in place.
         let datastore_endpoint = if let Some((pool, base_url)) = self.datastore.current() {
             datastore::create_database(&pool, name, "k3s_").await?;
-            let endpoint = datastore::cluster_endpoint(&base_url, name, "k3s_")?;
+            // The endpoint below is readable by the tenant: it lands on the k3s
+            // server command line, and the server node is schedulable and
+            // untainted by default. So it must carry a per-cluster credential,
+            // never the shared admin one — otherwise editing the database name
+            // in it reaches every other tenant's cluster.
+            let password = super::ensure_datastore_password(
+                &self.client,
+                name,
+                namespace,
+                Self::cluster_labels(name, None),
+            )
+            .await?;
+            datastore::ensure_cluster_role(&pool, name, "k3s_", &password).await?;
+            let endpoint = datastore::cluster_endpoint_as_role(&base_url, name, "k3s_", &password)?;
             Some(endpoint)
         } else {
             None
@@ -2064,12 +2077,18 @@ impl ClusterBackend for K3sBackend {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-token")).await?;
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-kubeconfig")).await?;
+        Self::delete_ignoring_not_found(&secrets, &format!("{name}-datastore")).await?;
 
         // Drop database if PostgreSQL is configured
-        if let Some((pool, _)) = self.datastore.current()
-            && let Err(e) = datastore::drop_database(&pool, name, "k3s_").await
-        {
-            warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
+        if let Some((pool, _)) = self.datastore.current() {
+            if let Err(e) = datastore::drop_database(&pool, name, "k3s_").await {
+                warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
+            }
+            // AFTER the database: PostgreSQL refuses to drop a role that still
+            // owns objects, and ensure_cluster_role transfers ownership to it.
+            if let Err(e) = datastore::drop_cluster_role(&pool, name, "k3s_").await {
+                warn!(cluster = name, error = %e, "Failed to drop datastore role (may not exist)");
+            }
         }
 
         // Force-delete any leftover pods carrying our cluster label.
