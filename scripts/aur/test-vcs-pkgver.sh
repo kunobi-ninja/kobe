@@ -109,26 +109,34 @@ expect_failure "a missing path is refused" "does not exist" "/nonexistent/nope"
 # installs another, and version comparison stops meaning anything. Run the
 # real pkgver() from the shipped PKGBUILD against the same repo and demand
 # byte-identical output.
-pkgbuild="$repo_root/aur/kobe-git/PKGBUILD"
+pkgbuild="$(echo "$repo_root"/aur/*-git/PKGBUILD)"
 if [ -f "$pkgbuild" ]; then
-  r="$(make_repo 4 v2.5.1)"
-  holder="$(mktemp -d)"
-  cp -R "$r" "$holder/kobe"
-  from_pkgbuild="$(
-    srcdir="$holder"
-    export srcdir
-    eval "$(sed -n '/^pkgver() {/,/^}/p' "$pkgbuild")"
-    pkgver 2>/dev/null
-  )"
-  from_script="$("$script" "$holder/kobe" 2>&1)"
-  if [ "$from_pkgbuild" = "$from_script" ] && [ -n "$from_script" ]; then
-    ok "output matches the PKGBUILD's own pkgver() byte for byte"
+  # pkgver() does `cd "$srcdir/<name>"`, where <name> comes from the PKGBUILD's
+  # own source= line. Derive it rather than hardcoding, so this file stays
+  # identical across repos that vendor it.
+  srcname="$(sed -n 's/^source=("\([^:]*\)::git+.*/\1/p' "$pkgbuild" | head -1)"
+  if [ -z "$srcname" ]; then
+    no "source= names a git checkout directory" "could not parse it from $pkgbuild"
   else
-    no "output matches the PKGBUILD's own pkgver() byte for byte" \
-      "PKGBUILD gave '$from_pkgbuild', script gave '$from_script'"
+    r="$(make_repo 4 v2.5.1)"
+    holder="$(mktemp -d)"
+    cp -R "$r" "$holder/$srcname"
+    from_pkgbuild="$(
+      srcdir="$holder"
+      export srcdir
+      eval "$(sed -n '/^pkgver() {/,/^}/p' "$pkgbuild")"
+      pkgver 2>/dev/null
+    )"
+    from_script="$("$script" "$holder/$srcname" 2>&1)"
+    if [ "$from_pkgbuild" = "$from_script" ] && [ -n "$from_script" ]; then
+      ok "output matches the PKGBUILD's own pkgver() byte for byte"
+    else
+      no "output matches the PKGBUILD's own pkgver() byte for byte" \
+        "PKGBUILD gave '$from_pkgbuild', script gave '$from_script'"
+    fi
   fi
 else
-  no "aur/kobe-git/PKGBUILD is present" "not found at $pkgbuild"
+  no "an aur/*-git/PKGBUILD is present" "not found under $repo_root/aur"
 fi
 
 echo
