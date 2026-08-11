@@ -17,7 +17,6 @@ use kube::api::{
     Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -363,7 +362,7 @@ async fn create_sandbox_lease<B: ClusterBackend>(
         }
     };
 
-    if let Err(err) = admit_sandbox_lease(&leases, &created).await {
+    if let Err(err) = admit_sandbox_lease(&leases, &reservations, &created).await {
         if matches!(err, SandboxLeaseMutationError::AdmissionNotCommitted) {
             if let Err(cleanup_err) =
                 release_admission_reservations(&reservations, &admission_reservations).await
@@ -534,7 +533,8 @@ async fn release_sandbox_lease<B: ClusterBackend>(
         .map(String::as_str)
         != Some(SANDBOX_ADMISSION_ADMITTED)
     {
-        return match delete_exact_pending_lease(&leases, &lease).await {
+        let reservations: Api<Lease> = Api::namespaced(state.client.clone(), &state.namespace);
+        return match delete_exact_pending_lease(&leases, &reservations, &lease).await {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(err) => sandbox_infra_error("Failed to remove unadmitted Sandbox lease", err),
         };
@@ -735,6 +735,7 @@ fn sandbox_pool_reference(pool: &SandboxPool) -> Result<SandboxPoolReference, St
 
 async fn admit_sandbox_lease(
     leases: &Api<SandboxLease>,
+    reservations: &Api<Lease>,
     lease: &SandboxLease,
 ) -> Result<(), SandboxLeaseMutationError> {
     let name = lease.name_any();
@@ -774,7 +775,7 @@ async fn admit_sandbox_lease(
                 }
                 Some(SANDBOX_ADMISSION_PENDING) => {
                     validate_lease_shape(lease, &current, SANDBOX_ADMISSION_PENDING)?;
-                    delete_exact_pending_lease(leases, &current).await?;
+                    delete_exact_pending_lease(leases, reservations, &current).await?;
                     Err(SandboxLeaseMutationError::AdmissionNotCommitted)
                 }
                 _ => Err(SandboxLeaseMutationError::UnexpectedAdmissionState),
@@ -783,14 +784,300 @@ async fn admit_sandbox_lease(
     }
 }
 
+/// One reservation this request actually created, recorded so it can be
+/// released by exact identity. The UID matters: releasing by name alone could
+/// delete a *replacement* reservation another request created after ours was
+/// already gone.
+#[derive(Debug, Clone)]
+struct AdmissionReservation {
+    name: String,
+    uid: String,
+}
+
+/// Why admission could not reserve its slot. Both refusals are ordinary,
+/// caller-visible outcomes rather than faults — the caller is over quota, or
+/// picked an alias someone else is already using.
+#[derive(Debug, Error)]
+enum AdmissionReservationError {
+    #[error("concurrent Sandbox lease quota is exhausted")]
+    QuotaExhausted,
+    #[error("Sandbox lease alias is already active")]
+    AliasTaken,
+    #[error("SandboxLease has no UID to fence its reservations against")]
+    MissingLeaseUid,
+    #[error(transparent)]
+    Kubernetes(#[from] kube::Error),
+}
+
+/// Quota slots are named per principal and per slot index, so acquiring one is
+/// a race for a *specific* name. `CREATE` is the atomic primitive: two API
+/// replicas contending for the last slot cannot both succeed, because the
+/// second gets 409 from the API server.
+fn quota_reservation_name(principal: &str, slot: u32) -> String {
+    format!("sbx-quota-{principal}-{slot}")
+}
+
+/// Aliases are validated DNS labels (<=63 chars) before we get here, so they can
+/// be embedded directly rather than hashed — which keeps the reservation name
+/// legible to an operator debugging a stuck alias.
+fn alias_reservation_name(principal: &str, alias: &str) -> String {
+    format!("sbx-alias-{principal}-{alias}")
+}
+
+/// Build a coordination `Lease` used purely as a compare-and-swap token.
+///
+/// The owner reference is the crash-safety net: if the `SandboxLease` is
+/// deleted by any path we did not anticipate, Kubernetes garbage-collects the
+/// reservations with it, so a slot cannot leak and permanently consume quota.
+fn build_admission_reservation(
+    name: String,
+    reservation_type: &str,
+    lease: &SandboxLease,
+    principal: &str,
+) -> Result<Lease, AdmissionReservationError> {
+    let lease_uid = lease
+        .uid()
+        .ok_or(AdmissionReservationError::MissingLeaseUid)?;
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(
+        SANDBOX_RESERVATION_TYPE_LABEL.to_string(),
+        reservation_type.to_string(),
+    );
+    labels.insert(
+        SANDBOX_RESERVATION_LEASE_UID_LABEL.to_string(),
+        lease_uid.clone(),
+    );
+    labels.insert(REQUESTER_HASH_LABEL.to_string(), principal.to_string());
+    let mut annotations = std::collections::BTreeMap::new();
+    annotations.insert(
+        SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION.to_string(),
+        lease.name_any(),
+    );
+
+    Ok(Lease {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace: lease.namespace(),
+            labels: Some(labels),
+            annotations: Some(annotations),
+            owner_references: Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
+                    kind: "SandboxLease".to_string(),
+                    name: lease.name_any(),
+                    uid: lease_uid,
+                    controller: Some(false),
+                    block_owner_deletion: Some(false),
+                },
+            ]),
+            ..Default::default()
+        },
+        // The token carries no lease semantics; existence *is* the claim.
+        spec: Some(LeaseSpec::default()),
+    })
+}
+
+/// Reserve this lease's admission atomically across every API replica.
+///
+/// Advisory `LIST` checks earlier in the request improve error latency, but
+/// they cannot be authoritative: two replicas can both read "one slot free" and
+/// both admit. Only the `CREATE` calls below decide, because the API server
+/// serializes them on object name.
+///
+/// Alias is reserved first. A taken alias is a deterministic, user-fixable
+/// conflict, so failing on it before consuming a quota slot avoids a pointless
+/// acquire-then-release round trip against the shared quota namespace.
+async fn acquire_admission_reservations(
+    reservations: &Api<Lease>,
+    lease: &SandboxLease,
+    identity: &AuthIdentity,
+    alias: Option<&str>,
+    max_concurrent_leases: u32,
+) -> Result<Vec<AdmissionReservation>, AdmissionReservationError> {
+    let principal = principal_hash(identity);
+    let mut acquired: Vec<AdmissionReservation> = Vec::new();
+
+    if let Some(alias) = alias {
+        let reservation = build_admission_reservation(
+            alias_reservation_name(&principal, alias),
+            SANDBOX_RESERVATION_ALIAS,
+            lease,
+            &principal,
+        )?;
+        match reservations
+            .create(&PostParams::default(), &reservation)
+            .await
+        {
+            Ok(created) => acquired.push(AdmissionReservation {
+                name: created.name_any(),
+                uid: created.uid().unwrap_or_default(),
+            }),
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                return Err(AdmissionReservationError::AliasTaken);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    // Advisory short-circuit. Scanning for a free slot costs one CREATE per
+    // taken slot, so a caller at a 256-slot limit would otherwise pay 256 round
+    // trips just to be told they are over quota. One LIST answers the common
+    // case. It is deliberately NOT authoritative — a slot can free or fill
+    // between this read and the CREATE below, which is exactly why the CREATE
+    // still decides.
+    match reservations
+        .list(&ListParams::default().labels(&format!(
+            "{SANDBOX_RESERVATION_TYPE_LABEL}={SANDBOX_RESERVATION_QUOTA},{REQUESTER_HASH_LABEL}={principal}"
+        )))
+        .await
+    {
+        Ok(existing) if existing.items.len() as u32 >= max_concurrent_leases => {
+            rollback_partial_reservations(reservations, &acquired).await;
+            return Err(AdmissionReservationError::QuotaExhausted);
+        }
+        Ok(_) => {}
+        // A failed advisory read must not fail the request: fall through to the
+        // authoritative scan, which is correct on its own.
+        Err(error) => {
+            error!(error = %error, "Advisory Sandbox quota read failed; falling back to slot scan");
+        }
+    }
+
+    // First free index wins. Slots are dense and bounded by policy, and
+    // `max_concurrent_leases` is capped at MAX_SANDBOX_CONCURRENCY_SLOTS by the
+    // caller, so this loop is bounded regardless of what a policy asks for.
+    let mut slot_taken = false;
+    for slot in 0..max_concurrent_leases {
+        let reservation = build_admission_reservation(
+            quota_reservation_name(&principal, slot),
+            SANDBOX_RESERVATION_QUOTA,
+            lease,
+            &principal,
+        )?;
+        match reservations
+            .create(&PostParams::default(), &reservation)
+            .await
+        {
+            Ok(created) => {
+                acquired.push(AdmissionReservation {
+                    name: created.name_any(),
+                    uid: created.uid().unwrap_or_default(),
+                });
+                slot_taken = true;
+                break;
+            }
+            // This slot belongs to another live lease; try the next one.
+            Err(kube::Error::Api(error)) if error.code == 409 => continue,
+            Err(error) => {
+                // Never leave a partially-acquired alias behind: it would block
+                // the caller's own retry with a spurious 409.
+                rollback_partial_reservations(reservations, &acquired).await;
+                return Err(error.into());
+            }
+        }
+    }
+
+    if !slot_taken {
+        rollback_partial_reservations(reservations, &acquired).await;
+        return Err(AdmissionReservationError::QuotaExhausted);
+    }
+
+    Ok(acquired)
+}
+
+/// Best-effort unwind of reservations taken earlier in a failed acquire.
+///
+/// Deliberately swallows errors: the caller is already returning a failure, and
+/// the owner reference guarantees Kubernetes reaps anything left behind when
+/// the pending lease is removed. Losing the original error to a cleanup error
+/// would be strictly worse for the caller.
+async fn rollback_partial_reservations(
+    reservations: &Api<Lease>,
+    acquired: &[AdmissionReservation],
+) {
+    if let Err(error) = release_admission_reservations(reservations, acquired).await {
+        error!(error = %error, "Failed to roll back partial Sandbox admission reservations");
+    }
+}
+
+/// Release exactly the reservations we hold. A UID precondition means a
+/// reservation that was already reaped and recreated by a different request is
+/// left alone rather than stolen from its new owner.
+async fn release_admission_reservations(
+    reservations: &Api<Lease>,
+    acquired: &[AdmissionReservation],
+) -> Result<(), AdmissionReservationError> {
+    for reservation in acquired {
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(reservation.uid.clone()),
+                resource_version: None,
+            }),
+            ..Default::default()
+        };
+        match reservations.delete(&reservation.name, &params).await {
+            Ok(_) => {}
+            // 404: already gone. 409: the name now holds someone else's
+            // reservation. Both mean "ours is not there", which is the goal.
+            Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Release every reservation owned by one exact lease UID.
+///
+/// Used on the cleanup path, where we hold the lease rather than the list of
+/// reservations we created. Selecting on the UID label (not the name) is what
+/// keeps a recreated same-named lease from dropping its predecessor's slots.
+async fn release_reservations_for_lease(
+    reservations: &Api<Lease>,
+    lease_uid: &str,
+) -> Result<(), SandboxLeaseMutationError> {
+    let params = ListParams::default().labels(&format!(
+        "{SANDBOX_RESERVATION_LEASE_UID_LABEL}={lease_uid}"
+    ));
+    let owned = reservations.list(&params).await?;
+    let held: Vec<AdmissionReservation> = owned
+        .into_iter()
+        .filter_map(|reservation| {
+            Some(AdmissionReservation {
+                name: reservation.name_any(),
+                uid: reservation.uid()?,
+            })
+        })
+        .collect();
+    if let Err(error) = release_admission_reservations(reservations, &held).await {
+        return match error {
+            AdmissionReservationError::Kubernetes(error) => Err(error.into()),
+            // The other variants cannot arise from a release.
+            other => {
+                error!(error = %other, "Unexpected Sandbox reservation release failure");
+                Ok(())
+            }
+        };
+    }
+    Ok(())
+}
+
+/// Remove a still-unadmitted lease and free whatever it reserved.
+///
+/// Reservations are released *after* the lease is gone. Doing it in the other
+/// order would briefly leave an admitted-looking lease with no quota slot,
+/// which a concurrent request could then double-book.
 async fn delete_exact_pending_lease(
     leases: &Api<SandboxLease>,
+    reservations: &Api<Lease>,
     lease: &SandboxLease,
 ) -> Result<(), SandboxLeaseMutationError> {
     let expected_uid = lease.uid().ok_or(SandboxLeaseMutationError::MissingUid)?;
     let current = match leases.get(&lease.name_any()).await {
         Ok(current) => current,
-        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            // The lease is already gone; its reservations may not be.
+            return release_reservations_for_lease(reservations, &expected_uid).await;
+        }
         Err(error) => return Err(error.into()),
     };
     validate_lease_shape(lease, &current, SANDBOX_ADMISSION_PENDING)?;
@@ -802,13 +1089,13 @@ async fn delete_exact_pending_lease(
         .ok_or(SandboxLeaseMutationError::MissingResourceVersion)?;
     let params = DeleteParams {
         preconditions: Some(Preconditions {
-            uid: Some(expected_uid),
+            uid: Some(expected_uid.clone()),
             resource_version: Some(resource_version),
         }),
         ..Default::default()
     };
     leases.delete(&current.name_any(), &params).await?;
-    Ok(())
+    release_reservations_for_lease(reservations, &expected_uid).await
 }
 
 fn validate_lease_shape(
@@ -855,10 +1142,6 @@ enum SandboxLeaseMutationError {
     MissingUid,
     #[error("SandboxLease has no resourceVersion")]
     MissingResourceVersion,
-    #[error("current SandboxLease was absent from the admission verification list")]
-    CurrentLeaseMissing,
-    #[error("current SandboxLease appeared more than once in the admission verification list")]
-    DuplicateCurrentLease,
     #[error("SandboxLease identity or server-owned admission fields changed")]
     LeaseShapeChanged,
     #[error("SandboxLease UID changed")]
@@ -1055,12 +1338,6 @@ mod tests {
         })
     }
 
-    fn sandbox_lease_from_json(mut value: serde_json::Value, admission: &str) -> SandboxLease {
-        value["metadata"]["annotations"][SANDBOX_ADMISSION_ANNOTATION] =
-            serde_json::json!(admission);
-        serde_json::from_value(value).unwrap()
-    }
-
     async fn response_json(response: Response) -> serde_json::Value {
         let bytes = body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1068,13 +1345,172 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// Mock the coordination-Lease API with the semantics the CAS ledger
+    /// depends on:
+    ///
+    /// - `CREATE` succeeds on a free name and returns 409 on a taken one,
+    ///   exactly as the API server serializes competing writers;
+    /// - `LIST` honours `labelSelector`. This matters: the release path selects
+    ///   on the lease-UID label, so a mock that ignored selectors would let one
+    ///   lease's cleanup delete another lease's reservations and hide a real
+    ///   fencing bug.
+    ///
+    /// `preheld` simulates reservations another lease already owns, which is how
+    /// quota exhaustion and alias conflicts are provoked deterministically
+    /// without running concurrent requests. They are labelled with a foreign
+    /// lease UID, so correct code must leave them alone.
+    ///
+    /// Returns the live ledger so a test can assert what was acquired and,
+    /// crucially, what was released again.
+    async fn mount_reservation_api(
+        server: &MockServer,
+        preheld: &[String],
+    ) -> Arc<Mutex<std::collections::BTreeMap<String, serde_json::Value>>> {
+        const RESERVATIONS: &str = "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases";
+        const FOREIGN_LEASE_UID: &str = "preheld-foreign-lease-uid";
+
+        // Reconstruct the labels a real reservation would carry from its name
+        // (`sbx-<type>-<principal>-<suffix>`), so selector filtering behaves.
+        let seeded: std::collections::BTreeMap<String, serde_json::Value> = preheld
+            .iter()
+            .map(|name| {
+                let parts: Vec<&str> = name.splitn(4, '-').collect();
+                let reservation_type = parts.get(1).copied().unwrap_or_default();
+                let principal = parts.get(2).copied().unwrap_or_default();
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "apiVersion": "coordination.k8s.io/v1",
+                        "kind": "Lease",
+                        "metadata": {
+                            "name": name,
+                            "namespace": "test-ns",
+                            "uid": format!("{name}-uid"),
+                            "labels": {
+                                SANDBOX_RESERVATION_TYPE_LABEL: reservation_type,
+                                SANDBOX_RESERVATION_LEASE_UID_LABEL: FOREIGN_LEASE_UID,
+                                REQUESTER_HASH_LABEL: principal,
+                            }
+                        }
+                    }),
+                )
+            })
+            .collect();
+        let held = Arc::new(Mutex::new(seeded));
+
+        let create_state = Arc::clone(&held);
+        Mock::given(method("POST"))
+            .and(path(RESERVATIONS))
+            .respond_with(move |request: &wiremock::Request| {
+                let mut object: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let name = object["metadata"]["name"].as_str().unwrap().to_string();
+                let mut state = create_state.lock().unwrap();
+                if state.contains_key(&name) {
+                    return ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "reason": "AlreadyExists",
+                        "message": format!("leases.coordination.k8s.io \"{name}\" already exists"),
+                        "code": 409
+                    }));
+                }
+                object["metadata"]["uid"] = serde_json::json!(format!("{name}-uid"));
+                object["metadata"]["resourceVersion"] = serde_json::json!("1");
+                state.insert(name, object.clone());
+                ResponseTemplate::new(201).set_body_json(object)
+            })
+            .mount(server)
+            .await;
+
+        let delete_state = Arc::clone(&held);
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/apis/coordination\.k8s\.io/v1/namespaces/test-ns/leases/.+$",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let name = request
+                    .url
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if delete_state.lock().unwrap().remove(&name).is_some() {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Success"
+                    }))
+                } else {
+                    ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "reason": "NotFound", "code": 404
+                    }))
+                }
+            })
+            .mount(server)
+            .await;
+
+        let list_state = Arc::clone(&held);
+        Mock::given(method("GET"))
+            .and(path(RESERVATIONS))
+            .respond_with(move |request: &wiremock::Request| {
+                let selector = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "labelSelector")
+                    .map(|(_, value)| value.to_string())
+                    .unwrap_or_default();
+                let required: Vec<(String, String)> = selector
+                    .split(',')
+                    .filter(|term| !term.is_empty())
+                    .filter_map(|term| {
+                        term.split_once('=')
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                    })
+                    .collect();
+                let items: Vec<serde_json::Value> = list_state
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|object| {
+                        required.iter().all(|(key, value)| {
+                            object["metadata"]["labels"][key].as_str() == Some(value.as_str())
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(crate::testutil::k8s_list_response(items))
+            })
+            .mount(server)
+            .await;
+
+        held
+    }
+
+    /// Full create-path harness: CRDs, an empty reservation ledger, and the
+    /// SandboxLease object mocks.
     async fn mount_create_api(
         server: &MockServer,
         relist_created: bool,
         ambiguous_admit_response: bool,
     ) -> Arc<Mutex<Option<serde_json::Value>>> {
-        let lease_state = Arc::new(Mutex::new(None::<serde_json::Value>));
         mount_sandbox_crds(server).await;
+        mount_reservation_api(server, &[]).await;
+        mount_create_lease_objects(server, relist_created, ambiguous_admit_response).await
+    }
+
+    /// Just the SandboxLease object mocks, for tests that mount their own
+    /// reservation ledger with pre-held slots.
+    async fn mount_create_lease_only(server: &MockServer) -> Arc<Mutex<Option<serde_json::Value>>> {
+        mount_create_lease_objects(server, true, false).await
+    }
+
+    async fn mount_create_lease_objects(
+        server: &MockServer,
+        relist_created: bool,
+        ambiguous_admit_response: bool,
+    ) -> Arc<Mutex<Option<serde_json::Value>>> {
+        let lease_state = Arc::new(Mutex::new(None::<serde_json::Value>));
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
@@ -1250,30 +1686,12 @@ mod tests {
         assert!(!json.to_ascii_lowercase().contains("kubeconfig"));
     }
 
-    #[test]
-    fn quota_race_resolution_is_deterministic() {
-        let pending = sandbox_lease_from_json(
-            lease_json("sandbox-a", "alice@example.com", "Pending"),
-            SANDBOX_ADMISSION_PENDING,
-        );
-        let admitted = sandbox_lease_from_json(
-            lease_json("sandbox-z", "alice@example.com", "Pending"),
-            SANDBOX_ADMISSION_ADMITTED,
-        );
-        let active = vec![admitted, pending.clone()];
-        assert!(lease_exceeds_quota(&active, &pending, 1).unwrap());
-        assert!(matches!(
-            lease_exceeds_quota(
-                &active,
-                &sandbox_lease_from_json(
-                    lease_json("sandbox-missing", "alice@example.com", "Pending"),
-                    SANDBOX_ADMISSION_PENDING,
-                ),
-                2
-            ),
-            Err(SandboxLeaseMutationError::CurrentLeaseMissing)
-        ));
-    }
+    // NOTE: `quota_race_resolution_is_deterministic` lived here and is gone.
+    // It exercised `lease_exceeds_quota`, an advisory list-then-rank check from
+    // the design this branch replaced. Ranking a LIST cannot decide admission:
+    // two API replicas can both observe a free slot and both admit. The
+    // coordination-Lease CAS ledger above is authoritative instead, so the old
+    // test pinned a contract that no longer exists.
 
     #[test]
     fn principal_hash_separates_providers_and_issuers() {
@@ -1372,10 +1790,28 @@ mod tests {
         );
     }
 
+    // NOTE: `create_fails_closed_and_removes_lease_missing_from_relist` was
+    // here and is gone with the design it tested. It asserted that a lease
+    // absent from a post-create LIST fails closed — the verification step of
+    // the list-then-rank quota scheme this branch replaces. Under the CAS
+    // ledger the LIST is not a verification step at all (it cannot be: two
+    // replicas can both read a free slot), so the relist result no longer
+    // decides admission. The tests below pin the mechanism that does.
+
+    /// Quota is decided by CREATE contention on a per-slot name, not by
+    /// counting. With every slot pre-held, admission must refuse, and must not
+    /// leave the caller's pending lease behind.
     #[tokio::test]
-    async fn create_fails_closed_and_removes_lease_missing_from_relist() {
+    async fn create_refuses_when_every_quota_slot_is_held() {
         let server = MockServer::start().await;
-        mount_create_api(&server, false, false).await;
+        mount_sandbox_crds(&server).await;
+        let principal = principal_hash(&identity());
+        // The policy in `identity()` allows 2 concurrent Sandbox leases.
+        let preheld: Vec<String> = (0..2)
+            .map(|slot| quota_reservation_name(&principal, slot))
+            .collect();
+        mount_reservation_api(&server, &preheld).await;
+        mount_create_lease_only(&server).await;
 
         let response = create_sandbox_lease::<crate::testutil::MockBackend>(
             State(test_state(&server)),
@@ -1387,14 +1823,99 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
             server
                 .received_requests()
                 .await
                 .unwrap()
                 .iter()
-                .any(|request| request.method.as_str() == "DELETE")
+                .any(|request| request.method.as_str() == "DELETE"
+                    && request.url.path().contains("/sandboxleases/")),
+            "the unadmitted lease must be removed when its quota reservation fails"
+        );
+    }
+
+    /// An alias already held by another live lease is a conflict, and it must be
+    /// detected without burning one of the caller's quota slots.
+    #[tokio::test]
+    async fn create_refuses_a_taken_alias_without_consuming_a_quota_slot() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let principal = principal_hash(&identity());
+        let held =
+            mount_reservation_api(&server, &[alias_reservation_name(&principal, "review")]).await;
+        mount_create_lease_only(&server).await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: Some("review".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let remaining = held.lock().unwrap().clone();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the pre-existing alias should remain; no quota slot may be consumed: {remaining:?}"
+        );
+        assert!(remaining.contains_key(&alias_reservation_name(&principal, "review")));
+    }
+
+    /// The happy path must take exactly one quota slot and one alias, so a
+    /// caller's second lease cannot silently reuse the first one's slot.
+    #[tokio::test]
+    async fn create_acquires_exactly_one_quota_slot_and_one_alias() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let held = mount_reservation_api(&server, &[]).await;
+        mount_create_lease_only(&server).await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: Some("review".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let principal = principal_hash(&identity());
+        let remaining = held.lock().unwrap().clone();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "expected one slot + one alias: {remaining:?}"
+        );
+        assert!(remaining.contains_key(&quota_reservation_name(&principal, 0)));
+        assert!(remaining.contains_key(&alias_reservation_name(&principal, "review")));
+    }
+
+    /// Reservations are fenced to the lease UID, so a different principal's
+    /// identical alias is a different reservation name and does not collide.
+    #[test]
+    fn reservation_names_are_scoped_per_principal() {
+        let alice = principal_hash(&identity());
+        let bob = principal_hash(&AuthIdentity {
+            identity: "bob@example.com".into(),
+            ..identity()
+        });
+        assert_ne!(alice, bob);
+        assert_ne!(
+            alias_reservation_name(&alice, "review"),
+            alias_reservation_name(&bob, "review")
+        );
+        assert_ne!(
+            quota_reservation_name(&alice, 0),
+            quota_reservation_name(&bob, 0)
         );
     }
 

@@ -36,23 +36,50 @@ spec:
                 nullable: true
                 type: string
               poolRef:
-                minLength: 1
-                type: string
+                description: |-
+                  Exact SandboxPool admitted by Kobe. UID and generation fence pool
+                  recreation or mutation between HTTP admission and placement.
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
               requester:
                 description: |-
                   Set by Kobe from the authenticated principal, never trusted from an HTTP
-                  request body.
+                  request body. Ownership uses the complete tuple, not the display
+                  identity alone.
                 properties:
                   identity:
-                    description: |-
-                      Identity string (e.g. "repo:org/repo:ref:refs/heads/main" for GitHub,
-                      or user ID for Clerk).
+                    minLength: 1
+                    type: string
+                  issuer:
+                    minLength: 1
+                    type: string
+                  provider:
+                    description: Stable configured authentication provider ID.
+                    minLength: 1
                     type: string
                   type:
-                    description: 'Type of requester: "{provider}:{role}" (e.g. "github-actions:ci", "clerk:admin").'
+                    minLength: 1
                     type: string
                 required:
                 - identity
+                - issuer
+                - provider
                 - type
                 type: object
               ttl:
@@ -71,17 +98,24 @@ spec:
                   description: Kubernetes-style condition with the generation from which it was derived.
                   properties:
                     lastTransitionTime:
+                      format: date-time
                       nullable: true
                       type: string
                     message:
                       type: string
                     observedGeneration:
                       format: int64
+                      minimum: 0.0
                       nullable: true
                       type: integer
                     reason:
                       type: string
                     status:
+                      description: Kubernetes Condition status values.
+                      enum:
+                      - 'True'
+                      - 'False'
+                      - Unknown
                       type: string
                     type:
                       type: string
@@ -92,12 +126,17 @@ spec:
                   - type
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               expiresAt:
                 description: Set only when the upstream Sandbox becomes Ready.
+                format: date-time
                 nullable: true
                 type: string
               observedGeneration:
                 format: int64
+                minimum: 0.0
                 nullable: true
                 type: integer
               phase:
@@ -125,6 +164,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -159,9 +199,11 @@ spec:
                   rule: (self.type == 'management' && !has(self.clusterPool)) || (self.type == 'childCluster' && has(self.clusterPool))
               provisioningDeadline:
                 description: Absolute bound for setup. This is not the runtime expiry.
+                format: date-time
                 nullable: true
                 type: string
               readyAt:
+                format: date-time
                 nullable: true
                 type: string
               target:
@@ -179,6 +221,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -209,6 +252,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -242,6 +286,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -272,6 +317,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -302,6 +348,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -332,6 +379,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:
@@ -362,6 +410,7 @@ spec:
                         type: string
                       generation:
                         format: int64
+                        minimum: 0.0
                         nullable: true
                         type: integer
                       kind:

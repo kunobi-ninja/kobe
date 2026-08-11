@@ -764,9 +764,9 @@ fn validate_reference(
         });
     }
     if generation_required
-        && !reference
+        && reference
             .generation
-            .is_some_and(|generation| generation > 0)
+            .is_none_or(|generation| generation <= 0)
     {
         return Err(SandboxProvenanceError::InvalidReference {
             field,

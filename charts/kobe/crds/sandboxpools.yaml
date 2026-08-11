@@ -38,7 +38,9 @@ spec:
                   administrator-selected RuntimeClass; leases cannot override it.
                 properties:
                   runtimeClassName:
+                    maxLength: 253
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                   tier:
                     enum:
@@ -62,7 +64,9 @@ spec:
                   placement mutually exclusive in both JSON and generated OpenAPI.
                 properties:
                   clusterPoolRef:
+                    maxLength: 63
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   type:
                     enum:
@@ -91,7 +95,10 @@ spec:
                       argv:
                         description: Direct argv vector; no implicit shell expansion.
                         items:
+                          maxLength: 4096
+                          minLength: 1
                           type: string
+                        maxItems: 64
                         minItems: 1
                         type: array
                       timeout:
@@ -119,19 +126,27 @@ spec:
                         args:
                           default: []
                           items:
+                            maxLength: 4096
                             type: string
+                          maxItems: 256
                           type: array
                         command:
                           default: []
                           description: Executable and arguments, passed directly without an implicit shell.
                           items:
+                            maxLength: 4096
+                            minLength: 1
                             type: string
+                          maxItems: 64
                           type: array
                         image:
+                          maxLength: 2048
                           minLength: 1
                           type: string
                         name:
+                          maxLength: 63
                           minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         resources:
                           description: |-
@@ -186,11 +201,14 @@ spec:
                       - name
                       - resources
                       type: object
+                    maxItems: 16
                     minItems: 1
                     type: array
                   defaultContainer:
                     description: Container selected by default for execution operations.
+                    maxLength: 63
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   exposedPorts:
                     default: []
@@ -201,10 +219,14 @@ spec:
                       description: One TCP port declared safe for later lease-scoped forwarding.
                       properties:
                         container:
+                          maxLength: 63
                           minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         name:
+                          maxLength: 15
                           minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         port:
                           format: uint16
@@ -216,11 +238,25 @@ spec:
                       - name
                       - port
                       type: object
+                    maxItems: 64
                     type: array
                 required:
                 - containers
                 - defaultContainer
                 type: object
+                x-kubernetes-validations:
+                - message: defaultContainer must name one declared container
+                  rule: self.containers.exists(c, c.name == self.defaultContainer)
+                - message: container names must be unique
+                  rule: self.containers.all(c, self.containers.filter(other, other.name == c.name).size() == 1)
+                - message: every exposed port must name one declared container
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.containers.exists(c, c.name == p.container))'
+                - message: exposed port names must be unique
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.exposedPorts.filter(other, other.name == p.name).size() == 1)'
+                - message: a container port may be declared only once
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, self.exposedPorts.filter(other, other.container == p.container && other.port == p.port).size() == 1)'
+                - message: exposed port names must contain a letter and cannot contain consecutive hyphens
+                  rule: '!has(self.exposedPorts) || self.exposedPorts.all(p, p.name.matches(''.*[a-z].*'') && !p.name.contains(''--''))'
               warmCapacity:
                 description: Desired number of unclaimed upstream Sandboxes kept warm.
                 format: uint32
@@ -250,17 +286,24 @@ spec:
                   description: Kubernetes-style condition with the generation from which it was derived.
                   properties:
                     lastTransitionTime:
+                      format: date-time
                       nullable: true
                       type: string
                     message:
                       type: string
                     observedGeneration:
                       format: int64
+                      minimum: 0.0
                       nullable: true
                       type: integer
                     reason:
                       type: string
                     status:
+                      description: Kubernetes Condition status values.
+                      enum:
+                      - 'True'
+                      - 'False'
+                      - Unknown
                       type: string
                     type:
                       type: string
@@ -271,8 +314,12 @@ spec:
                   - type
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               observedGeneration:
                 format: int64
+                minimum: 0.0
                 nullable: true
                 type: integer
               ready:
