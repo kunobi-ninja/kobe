@@ -190,14 +190,21 @@ impl TeardownReceipt {
     /// - the recorded verdict agreeing with the checks;
     /// - identity matching `expected` exactly, so a receipt from another
     ///   attempt or a same-named replacement cannot be replayed;
-    /// - exactly one check per expected subject, each `Verified` or
-    ///   `NotApplicable` — no missing subjects, no duplicates, no extras.
+    /// - exactly one `Verified` check per expected subject — no missing
+    ///   subjects, no duplicates, no extras, and no `NotApplicable` standing in
+    ///   for a subject the scope says was created.
     pub fn permits_release_for(&self, expected: &TeardownScope<'_>) -> bool {
         if self.schema_version != TEARDOWN_RECEIPT_SCHEMA_VERSION
             || self.completed_at.is_none()
             || self.outcome != TeardownOutcome::Verified
             || Self::outcome_for(&self.checks) != TeardownOutcome::Verified
         {
+            return false;
+        }
+        // A reference without a UID cannot fence anything: two `None` UIDs
+        // compare equal, so a same-named replacement would satisfy the match
+        // that is supposed to exclude it.
+        if self.lease.uid.is_none() || self.instance.uid.is_none() || self.pool.uid.is_none() {
             return false;
         }
         // Identity, not just shape: a valid receipt for a *different* subject
@@ -226,11 +233,13 @@ impl TeardownReceipt {
             };
             // Exactly one: duplicates could otherwise pair a Verified with a
             // silently ignored second opinion.
-            matching.next().is_none()
-                && matches!(
-                    check.result,
-                    CheckResult::Verified | CheckResult::NotApplicable
-                )
+            //
+            // And it must be Verified, not merely "not Unknown". Accepting
+            // NotApplicable here would let a receipt mark the database and
+            // credentials as never-created and still release the lease. A
+            // footprint that genuinely was never created belongs OUT of
+            // `required_subjects` — that is what the scope is for.
+            matching.next().is_none() && check.result == CheckResult::Verified
         })
     }
 }
@@ -522,9 +531,22 @@ mod tests {
             TeardownSubject::KubeconfigSecret,
         ];
 
-        // Every required subject accounted for: two verified, one genuinely
-        // never created.
+        // Every required subject positively verified.
         let complete = receipt(
+            vec![
+                check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+                check(TeardownSubject::Database, CheckResult::Verified),
+                check(TeardownSubject::KubeconfigSecret, CheckResult::Verified),
+            ],
+            TeardownOutcome::Verified,
+        );
+        assert!(complete.permits_release_for(&scope(&required, &refs)));
+
+        // NotApplicable must NOT satisfy a subject the scope says was created:
+        // otherwise a receipt marks the database "never existed" and releases
+        // the lease anyway. A genuinely absent footprint belongs out of the
+        // scope, not explained away inside the receipt.
+        let excused = receipt(
             vec![
                 check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
                 check(TeardownSubject::Database, CheckResult::NotApplicable),
@@ -532,7 +554,10 @@ mod tests {
             ],
             TeardownOutcome::Verified,
         );
-        assert!(complete.permits_release_for(&scope(&required, &refs)));
+        assert!(
+            !excused.permits_release_for(&scope(&required, &refs)),
+            "NotApplicable cannot stand in for a subject the scope says was created"
+        );
 
         // One subject simply missing — the defect this test exists for.
         let partial = receipt(
@@ -595,6 +620,32 @@ mod tests {
         let mut drifted = scope(&required, &refs);
         drifted.config_digest = "other-digest";
         assert!(!valid.permits_release_for(&drifted));
+
+        // A reference with no UID cannot fence anything: two `None`s compare
+        // equal, so this would otherwise "match" any same-named object.
+        let unfenced_refs = (
+            lease_ref(),
+            ResourceRef {
+                name: "pool-p-0".into(),
+                uid: None,
+            },
+            pool_ref(),
+        );
+        let mut unfenced = receipt(
+            vec![check(
+                TeardownSubject::ServerStatefulSet,
+                CheckResult::Verified,
+            )],
+            TeardownOutcome::Verified,
+        );
+        unfenced.instance = ResourceRef {
+            name: "pool-p-0".into(),
+            uid: None,
+        };
+        assert!(
+            !unfenced.permits_release_for(&scope(&required, &unfenced_refs)),
+            "a receipt without UIDs must never release capacity"
+        );
     }
 
     /// Verdict, evidence, schema, and completeness each fail closed on their own.

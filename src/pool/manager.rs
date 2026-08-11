@@ -583,8 +583,16 @@ pub fn compute_pool_actions(
 
     let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
     let counts = count_states(state, Some(&current_hash));
-    let total =
-        counts.creating + counts.ready + counts.leased + counts.unhealthy + counts.recycling;
+    // Quarantined counts toward the ceiling. Its backend resources still
+    // exist — that is the whole point, the cleanup handle is being held — so
+    // excluding it would let the pool create a replacement and exceed
+    // maxClusters in real capacity every time a teardown could not be proven.
+    let total = counts.creating
+        + counts.ready
+        + counts.leased
+        + counts.unhealthy
+        + counts.recycling
+        + counts.quarantined;
     let policy = resolved_upgrade_policy(profile, min_ready);
 
     // === 2. Backoff early-return for drift recycle and scale-up. ===
@@ -3228,6 +3236,58 @@ mod tests {
         assert_eq!(
             counts.unhealthy, 0,
             "quarantined must be distinguishable from ordinary churn"
+        );
+    }
+
+    /// Quarantined capacity must count against the pool ceiling.
+    ///
+    /// Protecting it from deletion is only half the job: its backend resources
+    /// still exist — holding them is the entire point — so if the ceiling
+    /// ignores it, the pool creates a replacement and the operator ends up with
+    /// more physical clusters than `maxClusters` allows. Every failed teardown
+    /// would then quietly grow real resource usage.
+    #[test]
+    fn quarantined_capacity_counts_against_the_pool_ceiling() {
+        // An AUTOSCALED pool whose hard ceiling is one member, and whose one
+        // member is quarantined. (A fixed pool deliberately allows `size + 10`
+        // headroom, so its ceiling is not the binding constraint here.)
+        let profile = make_profile(
+            1,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 1,
+                max_clusters: 1,
+                scale_up_threshold: 1,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-0".into(),
+            make_entry(ClusterState::Quarantined),
+        );
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let creates = actions
+            .iter()
+            .filter(|action| matches!(action, PoolAction::Create(_)))
+            .count();
+        assert_eq!(
+            creates, 0,
+            "a quarantined member already occupies the pool's only slot; \
+             replacing it would exceed maxClusters in real resources"
         );
     }
 
