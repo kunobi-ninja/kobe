@@ -169,7 +169,18 @@ pub fn sanitize_db_name(cluster_name: &str, prefix: &str) -> Result<String> {
     }
 
     let mut db_name = format!("{prefix}{cleaned}");
-    db_name.truncate(MAX_IDENT_LEN);
+    if db_name.len() > MAX_IDENT_LEN {
+        // Plain truncation makes two distinct clusters share one identifier —
+        // and since the role now shares that identifier, the second cluster's
+        // `ensure_cluster_role` would reset the FIRST cluster's role password
+        // and hand its owner credential to a different tenant. Keep a digest of
+        // the full name so distinct inputs stay distinct.
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(db_name.as_bytes()));
+        db_name.truncate(MAX_IDENT_LEN - 9);
+        db_name.push('_');
+        db_name.push_str(&digest[..8]);
+    }
     Ok(db_name)
 }
 
@@ -200,14 +211,14 @@ pub async fn create_database(pool: &PgPool, cluster_name: &str, prefix: &str) ->
     match sqlx::query(&sql).execute(pool).await {
         Ok(_) => {
             debug!(db = %db_name, "Database created");
-            Ok(())
+            revoke_public_connect(pool, &db_name).await
         }
         Err(e) => {
             if let Some(dberr) = e.as_database_error()
                 && is_duplicate_db_error(dberr.code().as_deref())
             {
                 debug!(db = %db_name, "Database already exists, treating create as idempotent no-op");
-                return Ok(());
+                return revoke_public_connect(pool, &db_name).await;
             }
             Err(e).with_context(|| format!("Failed to create database {db_name}"))
         }
@@ -271,6 +282,34 @@ pub async fn unmark_template(pool: &PgPool, cluster_name: &str, prefix: &str) ->
 }
 
 /// Drop a cluster's database, disconnecting any active sessions first.
+/// Take ownership of a cluster database back before dropping it.
+///
+/// `ensure_cluster_role` transfers ownership to the per-cluster role so kine can
+/// create its tables. `DROP DATABASE` then requires the caller to own it or be a
+/// superuser — and membership granted via `GRANT ... TO CURRENT_USER` is NOT
+/// enough on PostgreSQL 16, where `createrole_self_grant` defaults to empty and
+/// the membership carries no inherited privileges. Without reclaiming ownership
+/// first, a non-superuser operator silently orphans a database and then a role
+/// on every teardown.
+///
+/// Best-effort: on a superuser operator this is redundant, and if it fails the
+/// drop below reports the real problem.
+pub async fn reclaim_database_ownership(
+    pool: &PgPool,
+    cluster_name: &str,
+    prefix: &str,
+) -> Result<()> {
+    let db_name = sanitize_db_name(cluster_name, prefix)?;
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{db_name}\" OWNER TO CURRENT_USER"
+    ))
+    .execute(pool)
+    .await
+    .with_context(|| format!("Failed to reclaim ownership of database {db_name}"))?;
+    debug!(db = %db_name, "Ownership reclaimed for drop");
+    Ok(())
+}
+
 pub async fn drop_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
     info!(db = %db_name, "Dropping database");
@@ -290,6 +329,27 @@ pub async fn drop_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> R
         .with_context(|| format!("Failed to drop database {db_name}"))?;
 
     debug!(db = %db_name, "Database dropped");
+    Ok(())
+}
+
+/// Drop PostgreSQL's default `CONNECT` grant to `PUBLIC` on a database.
+///
+/// Runs immediately after `CREATE DATABASE`, in the same function, so no
+/// Kubernetes round-trip sits between creating the database and locking it
+/// down: during such a window every other tenant role can still connect.
+///
+/// NOTE: this does not revoke `CREATE` on the `public` SCHEMA, which would
+/// require a second connection into the new database. PostgreSQL 15 removed
+/// that default grant; on 14 and older, or a cluster upgraded from one, a
+/// connected role could still create objects there. kobe targets 15+.
+async fn revoke_public_connect(pool: &PgPool, db_name: &str) -> Result<()> {
+    sqlx::query(&format!(
+        "REVOKE CONNECT ON DATABASE \"{db_name}\" FROM PUBLIC"
+    ))
+    .execute(pool)
+    .await
+    .with_context(|| format!("Failed to revoke PUBLIC connect on database {db_name}"))?;
+    debug!(db = %db_name, "PUBLIC connect revoked");
     Ok(())
 }
 
@@ -379,19 +439,23 @@ pub async fn ensure_cluster_role(
         }
     }
 
+    // `ALTER DATABASE ... OWNER TO` requires the caller to be a MEMBER of the
+    // target role (or superuser). A plain CREATEDB/CREATEROLE operator account
+    // is neither, so grant membership first or ownership transfer fails and
+    // provisioning breaks outright.
+    sqlx::query(&format!("GRANT \"{name}\" TO CURRENT_USER"))
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to grant membership of {name} to the operator role"))?;
+
     // Ownership lets kine create its own tables in the database.
     sqlx::query(&format!("ALTER DATABASE \"{name}\" OWNER TO \"{name}\""))
         .execute(pool)
         .await
         .with_context(|| format!("Failed to give {name} ownership of its database"))?;
 
-    sqlx::query(&format!(
-        "REVOKE CONNECT ON DATABASE \"{name}\" FROM PUBLIC"
-    ))
-    .execute(pool)
-    .await
-    .with_context(|| format!("Failed to revoke PUBLIC connect on database {name}"))?;
-
+    // PUBLIC connect is revoked in `create_database`, immediately after the
+    // database exists, so there is no window here.
     Ok(name)
 }
 
@@ -579,5 +643,41 @@ mod tests {
         assert!(is_duplicate_role_error(Some("42710")));
         assert!(!is_duplicate_role_error(Some("42P04")));
         assert!(!is_duplicate_role_error(None));
+    }
+
+    /// Two cluster names that share a long prefix must not collapse onto one
+    /// identifier: the role now shares that identifier too, so the second
+    /// cluster's `ensure_cluster_role` would reset the FIRST cluster's role
+    /// password and hand its owner credential to a different tenant.
+    #[test]
+    fn long_names_sharing_a_prefix_do_not_collide() {
+        let a = format!("{}xxxx", "a".repeat(59));
+        let b = format!("{}yyyy", "a".repeat(59));
+        let da = sanitize_db_name(&a, "k3s_").unwrap();
+        let db = sanitize_db_name(&b, "k3s_").unwrap();
+        assert_ne!(da, db, "distinct clusters collapsed onto {da}");
+        assert!(da.len() <= MAX_IDENT_LEN);
+        assert!(db.len() <= MAX_IDENT_LEN);
+    }
+
+    /// Same input must always map to the same identifier, or a reconcile would
+    /// provision a second database for an existing cluster.
+    #[test]
+    fn truncated_identifiers_are_deterministic() {
+        let n = "b".repeat(80);
+        assert_eq!(
+            sanitize_db_name(&n, "k0s_").unwrap(),
+            sanitize_db_name(&n, "k0s_").unwrap()
+        );
+    }
+
+    /// Names short enough not to truncate must be untouched, so this change
+    /// cannot rename the database of any already-provisioned cluster.
+    #[test]
+    fn short_names_are_unchanged_by_the_collision_guard() {
+        assert_eq!(
+            sanitize_db_name("my-cluster", "k3s_").unwrap(),
+            "k3s_my_cluster"
+        );
     }
 }

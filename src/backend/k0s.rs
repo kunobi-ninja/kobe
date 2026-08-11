@@ -1308,10 +1308,14 @@ impl ClusterBackend for K0sBackend {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-token")).await?;
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-kubeconfig")).await?;
-        Self::delete_ignoring_not_found(&secrets, &format!("{name}-datastore")).await?;
 
         // Drop database if PostgreSQL is configured
         if let Some((pool, _)) = self.datastore.current() {
+            // Reclaim ownership first: the per-cluster role owns the database,
+            // and a non-superuser operator cannot drop what it does not own.
+            if let Err(e) = datastore::reclaim_database_ownership(&pool, name, DB_PREFIX).await {
+                warn!(cluster = name, error = %e, "Failed to reclaim database ownership");
+            }
             if let Err(e) = datastore::drop_database(&pool, name, DB_PREFIX).await {
                 warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
             }
@@ -1321,6 +1325,11 @@ impl ClusterBackend for K0sBackend {
                 warn!(cluster = name, error = %e, "Failed to drop datastore role (may not exist)");
             }
         }
+
+        // Delete the password Secret LAST. It is the only record of the role's
+        // credential, so removing it before the drops would leave a live
+        // database and role behind with no way to reconstruct access to them.
+        Self::delete_ignoring_not_found(&secrets, &format!("{name}-datastore")).await?;
 
         // Force-delete any leftover pods carrying our cluster label.
         // See doc-comment on force_delete_instance_pods for rationale.
