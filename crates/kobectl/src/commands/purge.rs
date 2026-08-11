@@ -79,13 +79,14 @@ pub async fn purge(
         }
     }
 
-    forget_endpoint_kubeconfigs(endpoint)?;
-    let mut removed_paths = Vec::new();
-    for path in dedupe_paths(removable_files) {
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            removed_paths.push(path);
-        }
+    let (removed_paths, failures) = remove_kubeconfig_files(dedupe_paths(removable_files));
+
+    // Drop the tracking entries only once the files are actually gone. Wiping
+    // them up front means a failed removal leaves a file on disk that nothing
+    // points at any more — the same silent leak `purge_orphans_only` was fixed
+    // for. Leaving them lets the next run re-detect the stragglers.
+    if failures.is_empty() {
+        forget_endpoint_kubeconfigs(endpoint)?;
     }
 
     match output {
@@ -102,6 +103,12 @@ pub async fn purge(
                     println!("  {}", path.display());
                 }
             }
+            if !failures.is_empty() {
+                eprintln!("Failed to remove {} file(s):", failures.len());
+                for (path, err) in &failures {
+                    eprintln!("  {}: {err}", path.display());
+                }
+            }
         }
         OutputFormat::Json => print_json(&PurgeOutput {
             released_leases: released,
@@ -110,6 +117,10 @@ pub async fn purge(
                 .map(|path| path.display().to_string())
                 .collect(),
         })?,
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!("Failed to remove {} kubeconfig file(s)", failures.len());
     }
 
     Ok(())
@@ -233,6 +244,28 @@ pub(crate) fn live_lease_ids(leases: &[LeaseSummary]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Remove each file, collecting failures instead of aborting on the first.
+///
+/// Same policy as `purge_orphans_only`: one unremovable file must not abandon
+/// every file after it. Returns the paths actually removed and the ones that
+/// could not be.
+fn remove_kubeconfig_files(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, std::io::Error)>) {
+    let mut removed_paths = Vec::new();
+    let mut failures = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed_paths.push(path),
+            // Vanished between the check and the removal — the desired state.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push((path, err)),
+        }
+    }
+    (removed_paths, failures)
+}
+
 fn dedupe_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
     let mut deduped = Vec::new();
@@ -260,6 +293,80 @@ fn confirm_purge(active_leases: usize, kubeconfigs: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch of paths where the middle entry cannot be removed.
+    ///
+    /// `remove_file` on a *directory* fails on every supported platform and
+    /// needs no permission games, so it stays correct when the suite runs as
+    /// root (a chmod-based fixture would silently stop failing there).
+    fn batch_with_an_unremovable_middle() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("kobe-lease-first.yaml");
+        let blocked = dir.path().join("kobe-lease-blocked.yaml");
+        let last = dir.path().join("kobe-lease-last.yaml");
+        std::fs::write(&first, "a").unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(&last, "c").unwrap();
+        (dir, vec![first, blocked, last])
+    }
+
+    /// The regression this fixes.
+    ///
+    /// `purge_orphans_only` collects per-file failures and keeps going,
+    /// deliberately — its comment records that aborting "turned a single I/O
+    /// error into a permanent silent leak". The full-purge path had never
+    /// adopted that policy: it propagated with `?`, so one unremovable file
+    /// abandoned every file after it, while `forget_endpoint_kubeconfigs` had
+    /// already dropped the tracking entries for all of them.
+    #[test]
+    fn one_unremovable_file_does_not_abandon_the_rest_of_the_batch() {
+        let (dir, paths) = batch_with_an_unremovable_middle();
+        let (first, blocked, last) = (paths[0].clone(), paths[1].clone(), paths[2].clone());
+
+        let (removed, failures) = remove_kubeconfig_files(paths);
+
+        assert_eq!(removed, vec![first.clone(), last.clone()]);
+        assert!(!first.exists());
+        assert!(!last.exists(), "the file after the failure must still go");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, blocked);
+        drop(dir);
+    }
+
+    #[test]
+    fn missing_paths_are_skipped_without_being_reported_as_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("kobe-lease-here.yaml");
+        std::fs::write(&present, "x").unwrap();
+        let absent = dir.path().join("kobe-lease-gone.yaml");
+
+        let (removed, failures) = remove_kubeconfig_files(vec![absent, present.clone()]);
+
+        assert_eq!(removed, vec![present]);
+        assert!(
+            failures.is_empty(),
+            "an already-absent file is the goal state"
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_is_not_a_failure() {
+        let (removed, failures) = remove_kubeconfig_files(Vec::new());
+        assert!(removed.is_empty());
+        assert!(failures.is_empty());
+    }
+
+    /// `purge` chains state-tracked paths with the ~/.kube glob, so the same
+    /// file arrives twice whenever a tracked kubeconfig also matches the
+    /// naming pattern. Deduping is what stops the second pass reporting a
+    /// spurious failure for a file the first pass already removed.
+    #[test]
+    fn dedupe_paths_keeps_first_occurrence_order() {
+        let a = PathBuf::from("/tmp/kobe-a.yaml");
+        let b = PathBuf::from("/tmp/kobe-b.yaml");
+        let deduped = dedupe_paths(vec![a.clone(), b.clone(), a.clone(), b.clone()]);
+        assert_eq!(deduped, vec![a, b]);
+    }
 
     #[test]
     fn active_lease_filter_rejects_terminal_phases() {
