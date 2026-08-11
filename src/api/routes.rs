@@ -2748,6 +2748,10 @@ fn build_lease_crd(
                 identity: identity.identity.clone(),
             },
             priority,
+            // Callers cannot request verified teardown: it is an internal
+            // composition detail of #74's child placement, not tenant-facing
+            // intent. Absent means Standard, so behaviour is unchanged.
+            cleanup_mode: None,
         },
         status: None,
     }

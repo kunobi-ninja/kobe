@@ -1026,6 +1026,7 @@ spec:
                 - Recycling
                 - Unhealthy
                 - Failed
+                - Quarantined
                 type: string
               provisioned:
                 default: false

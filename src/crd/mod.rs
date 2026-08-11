@@ -7,6 +7,12 @@ pub mod instance;
 pub mod lease;
 pub mod profile;
 pub mod sandbox;
+// The verified-teardown vocabulary is defined ahead of the k3s provider and the
+// controllers that consume it, so these types have no callers in this change.
+// Same pattern as `datastore` above. `crdgen` also compiles `src/crd` alone, so
+// anything used only by controllers looks dead in that unit regardless.
+#[allow(dead_code)]
+pub mod teardown;
 
 pub use access_policy::*;
 pub use bootstrap_config::*;
@@ -17,6 +23,8 @@ pub use instance::*;
 pub use lease::*;
 pub use profile::*;
 pub use sandbox::*;
+#[allow(unused_imports)]
+pub use teardown::*;
 
 /// Schema helper for `serde_json::Value` fields that need an explicit `type: object`
 /// in the OpenAPI spec. Without this, schemars emits `{}` which K8s rejects.
