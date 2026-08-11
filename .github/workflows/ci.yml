@@ -2,7 +2,12 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    # `epic/**` keeps CI running for work that accumulates on a long-lived
+    # integration branch instead of landing on main one PR at a time. Without
+    # it a stacked epic gets NO checks until the whole thing merges — which is
+    # exactly backwards, since the point of holding work off main is to prove
+    # it carries no regressions first.
+    branches: [main, "epic/**"]
     paths:
       - "src/**"
       - "crates/**"
