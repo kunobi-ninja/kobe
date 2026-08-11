@@ -74,6 +74,19 @@ spec:
               value: {{ .Values.poolPublisherServiceAccount | default (printf "%s-pool-publisher" (include "kobe.fullname" .)) | quote }}
             - name: KUBECONFIG_PUBLISHER_IMAGE
               value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+            # The vcluster backend shells out to `helm`, which writes its
+            # repository list, cache and data under $HOME by default. The
+            # operator runs as uid 65534 with readOnlyRootFilesystem, so that
+            # write fails and `helm repo add` silently registers nothing —
+            # leaving `helm repo update` to report "no repositories found" and
+            # every vcluster provisioning attempt to fail (#92). Point all three
+            # homes at the existing /tmp emptyDir.
+            - name: HELM_CACHE_HOME
+              value: /tmp/helm/cache
+            - name: HELM_CONFIG_HOME
+              value: /tmp/helm/config
+            - name: HELM_DATA_HOME
+              value: /tmp/helm/data
             {{- if .Values.postgres.urlSecret.name }}
             - name: POSTGRES_URL_DIR
               value: {{ .Values.postgres.urlSecret.mountPath | quote }}
