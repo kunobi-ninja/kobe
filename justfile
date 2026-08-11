@@ -207,6 +207,21 @@ bump VERSION:
     ./scripts/check-version-consistency.sh
     echo "Bumped to {{ VERSION }}. Review the diff, commit, then \`just release\`."
 
+# Deliberately read-only: the value is only correct once HEAD is the tagged
+# release commit, so package-publish computes it at publish time rather than
+# committing it here. Run from a full clone — it refuses a shallow one.
+# Show the pkgver the -git AUR packages will be published with
+[group('release')]
+aur-pkgver:
+    @./scripts/aur/vcs-pkgver.sh .
+
+# Runs in CI on every change: the value it guards is only ever seen as AUR
+# metadata, so a wrong one publishes cleanly and no build fails.
+# Test the -git pkgver computation
+[group('release')]
+test-aur-pkgver:
+    @./scripts/aur/test-vcs-pkgver.sh
+
 # Cut a release: validate clean tree / on main / in sync, run the version gate,
 # and push the tag. The tag push fires CI (build+sign), package-publish, and the
 # crates.io publish.

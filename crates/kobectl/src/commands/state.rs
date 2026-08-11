@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -64,24 +64,43 @@ pub(crate) fn forget_kubeconfig(endpoint: &str, lease_id: &str) -> Result<()> {
 }
 
 pub(crate) fn remove_kubeconfig(endpoint: &str, lease_id: &str) -> Result<Option<PathBuf>> {
-    let recorded = if let Ok(state) = CliState::load() {
-        state
-            .lease_artifacts
-            .get(&lease_key(endpoint, lease_id))
-            .map(|artifact| PathBuf::from(&artifact.kubeconfig_path))
-    } else {
-        None
-    };
-
-    forget_kubeconfig(endpoint, lease_id)?;
+    // Load state up front and propagate a failure BEFORE deleting anything.
+    //
+    // This used to tolerate an unreadable state file and fall through to the
+    // guessed default path, which was harmless only because the subsequent
+    // `forget_kubeconfig` re-read the file and errored out before the removal.
+    // Now that the removal happens first, that tolerance would delete a
+    // kubeconfig on the strength of a guess — and `release` calls this before
+    // it validates the DELETE response and discards the error, so a corrupt
+    // state file plus a failed release would remove the local kubeconfig for a
+    // lease that is still active.
+    let state = CliState::load()?;
+    let recorded = state
+        .lease_artifacts
+        .get(&lease_key(endpoint, lease_id))
+        .map(|artifact| PathBuf::from(&artifact.kubeconfig_path));
 
     let path = recorded.unwrap_or_else(|| default_kubeconfig_path(lease_id));
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-        return Ok(Some(path));
-    }
 
-    Ok(None)
+    // Remove the file FIRST, and drop the tracking entry only once it is
+    // actually gone. Forgetting first — as this did — meant that a file which
+    // could not be removed (a custom `--kubeconfig` path that is now a
+    // directory, or one the user made read-only) lost the state entry pointing
+    // at it, so `purge --orphans-only` could never rediscover it, and a custom
+    // path outside `~/.kube/kobe-*.yaml` escaped a future full purge too. Same
+    // ordering rule `purge_orphans_only` already documents.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            forget_kubeconfig(endpoint, lease_id)?;
+            Ok(Some(path))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing on disk, so the entry is stale — dropping it is correct.
+            forget_kubeconfig(endpoint, lease_id)?;
+            Ok(None)
+        }
+        Err(err) => Err(err).with_context(|| format!("remove kubeconfig {}", path.display())),
+    }
 }
 
 pub(crate) fn endpoint_kubeconfigs(endpoint: &str) -> Result<Vec<PathBuf>> {
@@ -116,7 +135,7 @@ pub(crate) fn find_orphan_kubeconfigs(
             continue;
         }
         let path = PathBuf::from(&artifact.kubeconfig_path);
-        if !path.exists() {
+        if !path_is_present(&path) {
             continue;
         }
         orphans.push(OrphanKubeconfig {
@@ -193,6 +212,16 @@ pub(crate) fn default_kubeconfig_path(lease_id: &str) -> PathBuf {
         .join(format!("kobe-{lease_id}"))
 }
 
+/// Whether something exists at `path`, INCLUDING a broken symlink.
+///
+/// `Path::exists()` follows symlinks and reports false for a dangling one, so
+/// using it here made orphan discovery skip exactly the case `purge` was fixed
+/// to clean up: the link stayed on disk, its tracking entry stayed behind it,
+/// and `--orphans-only` reported "No orphan kubeconfigs found".
+fn path_is_present(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
 fn lease_key(endpoint: &str, lease_id: &str) -> String {
     format!("{endpoint}::{lease_id}")
 }
@@ -201,4 +230,46 @@ fn state_path() -> Result<PathBuf> {
     let dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     Ok(dir.join("kobe").join("state.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_is_present_for_an_ordinary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("kobe-lease-x.yaml");
+        std::fs::write(&f, "x").unwrap();
+        assert!(path_is_present(&f));
+    }
+
+    #[test]
+    fn path_is_absent_when_nothing_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!path_is_present(&dir.path().join("nope.yaml")));
+    }
+
+    /// The case orphan discovery used to skip. `Path::exists()` is false here,
+    /// which is why it must not be the predicate.
+    #[test]
+    #[cfg(unix)]
+    fn path_is_present_for_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("kobe-lease-dangling.yaml");
+        std::os::unix::fs::symlink(dir.path().join("missing"), &link).unwrap();
+        assert!(!link.exists(), "precondition: exists() is false");
+        assert!(
+            path_is_present(&link),
+            "a dangling symlink is still on disk and must be discoverable"
+        );
+    }
+
+    #[test]
+    fn lease_key_is_endpoint_scoped() {
+        assert_eq!(lease_key("https://a", "lease-1"), "https://a::lease-1");
+        // The separator is what stops one endpoint's prefix matching another's
+        // keys when one endpoint string is a prefix of the other.
+        assert!(!lease_key("https://a/api", "lease-1").starts_with("https://a::"));
+    }
 }

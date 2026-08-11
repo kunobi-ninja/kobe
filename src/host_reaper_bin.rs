@@ -23,7 +23,10 @@ mod reaper;
 
 use clap::Parser;
 use kube::Client;
-use reaper::{sweep::sweep_once, unmount::LibcUnmount};
+use reaper::{
+    sweep::{SweepParams, sweep_once},
+    unmount::LibcUnmount,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -115,15 +118,24 @@ async fn main() -> anyhow::Result<()> {
     // Option<Client> through sweep_once.
     let client = Client::try_default().await?;
 
+    // Read the escape hatch once, here at the composition root. `set_var` is
+    // unsafe because the harness runs tests on concurrent threads while other
+    // threads call getenv, so the flag is threaded through as a parameter and
+    // the tests never touch the environment.
+    let skip_get = std::env::var("KOBE_REAPER_SKIP_GET").as_deref() == Ok("1");
+
     loop {
         match sweep_once(
             &client,
-            &args.lease_root,
-            &args.live_set_path,
-            args.mtime_skip,
-            args.dry_run,
             &unmounter,
-            &args.mountinfo_path,
+            &SweepParams {
+                lease_root: &args.lease_root,
+                live_set_path: &args.live_set_path,
+                mountinfo_path: &args.mountinfo_path,
+                mtime_skip: args.mtime_skip,
+                dry_run: args.dry_run,
+                skip_get,
+            },
         )
         .await
         {
