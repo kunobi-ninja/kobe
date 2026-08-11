@@ -6,6 +6,7 @@ pub mod datastore;
 pub mod instance;
 pub mod lease;
 pub mod profile;
+pub mod sandbox;
 
 pub use access_policy::*;
 pub use bootstrap_config::*;
@@ -15,6 +16,7 @@ pub use datastore::*;
 pub use instance::*;
 pub use lease::*;
 pub use profile::*;
+pub use sandbox::*;
 
 /// Schema helper for `serde_json::Value` fields that need an explicit `type: object`
 /// in the OpenAPI spec. Without this, schemars emits `{}` which K8s rejects.

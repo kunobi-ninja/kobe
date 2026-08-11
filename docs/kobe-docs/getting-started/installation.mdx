@@ -140,7 +140,7 @@ You should see the list of available subcommands. If the command isn't found, ma
 The `kobe-operator` binary runs in your host Kubernetes cluster. Refer to the Helm chart or Flux deployment in the kobe repository for production setup. The operator requires:
 
 - A host Kubernetes cluster (k3s, k0s, EKS, GKE, or any conformant cluster)
-- Permission to manage `ClusterPool`, `ClusterLease`, `ClusterInstance`, `AccessPolicy`, and `KobeStore` CRDs
+- Permission to manage Kobe CRDs, including `ClusterPool`, `ClusterLease`, `ClusterInstance`, `SandboxPool`, `SandboxLease`, `AccessPolicy`, and `KobeStore`
 - Network access between the operator and a kobe endpoint your clients can reach
 
 Install the CRDs:
@@ -150,3 +150,14 @@ cargo run --bin crdgen -- all | kubectl apply -f -
 ```
 
 Or apply them from the Helm chart, which bundles the generated CRD manifests.
+
+Helm does not upgrade objects from a chart's `crds/` directory. Before upgrading
+an existing Kobe release to a version that adds CRDs, apply the new chart's CRD
+manifests explicitly, then upgrade the operator.
+
+`SandboxPool` and `SandboxLease` are deliberately not operator startup
+prerequisites, so existing cluster-lease endpoints can remain available during
+a staged upgrade. Until both Sandbox CRDs are installed and established, the
+Sandbox API is unavailable; a `503 Service Unavailable` means Kobe could not
+verify Sandbox admission against Kubernetes. Install the CRDs before enabling
+Sandbox API clients.

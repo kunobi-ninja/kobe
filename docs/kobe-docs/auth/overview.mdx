@@ -47,6 +47,16 @@ spec:
       maxTtl: 1h
       maxConcurrentLeases: 3
       maxExtensions: 2
+      # Optional and kind-specific. Omitting this block denies Sandbox APIs
+      # without changing the Cluster lease grant above.
+      sandbox:
+        pools: ["agent-*"]
+        verbs: [lease, exec, logs, port-forward, release]
+        maxTtl: 2h
+        maxConcurrentLeases: 2
+        resourceCeiling:
+          maxCpu: "4"
+          maxMemory: 8Gi
 ```
 
 ## Authorization rules
@@ -59,6 +69,18 @@ Rules control what an authenticated caller can do. Fields:
 | `maxTtl` | Maximum TTL the caller can request. Requests for longer TTLs are capped to this value. |
 | `maxConcurrentLeases` | How many active leases this identity can hold simultaneously. |
 | `maxExtensions` | How many times a lease can be extended via `PATCH /v1/leases/:id`. |
+| `sandbox` | Optional, independent Sandbox grant. Missing means Sandbox access is denied. |
+
+The `sandbox` block scopes `SandboxPool` names and verbs separately from cluster
+pools. `lease` permits create plus read/list of the caller's own Sandbox leases;
+`release` is independently revocable. `exec`, `logs`, and `port-forward` are
+consumed by the restricted Sandbox execution API.
+
+`resourceCeiling.maxCpu` and `maxMemory` are Kubernetes quantities compared
+against the sum of all container limits in the selected `SandboxPool`. Invalid
+quantities fail closed. Sandbox concurrency is also counted separately from
+`ClusterLease` concurrency, and a quarantined Sandbox continues consuming its
+quota until cleanup is proven.
 
 For OIDC policies, a `match` clause lets you apply different rules to different roles or repositories within the same provider. The first rule whose `match` clause passes is used. Rules without a `match` clause always apply.
 

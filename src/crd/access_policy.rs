@@ -2,6 +2,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::SandboxResourceCeiling;
+
 /// AccessPolicy configures authentication and authorization for cluster lease requests.
 ///
 /// Each AccessPolicy represents one authentication method (OIDC provider, static token,
@@ -139,6 +141,44 @@ pub struct AccessRule {
     /// Maximum TTL extensions per lease.
     #[serde(default = "default_max_extensions")]
     pub max_extensions: u32,
+
+    /// Optional, kind-specific Agent Sandbox permissions. Older policy objects
+    /// omit this block and continue authorizing Cluster leases exactly as
+    /// before, while Sandbox operations fail closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxAccessRule>,
+}
+
+/// Bounded Agent Sandbox grant attached to one existing identity rule.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxAccessRule {
+    /// SandboxPool name patterns; wildcard semantics match Cluster pools.
+    #[schemars(length(min = 1))]
+    pub pools: Vec<String>,
+    /// Independently authorized Sandbox operations.
+    #[schemars(length(min = 1))]
+    pub verbs: Vec<SandboxVerb>,
+    /// Maximum runtime TTL, starting only once the Sandbox is Ready.
+    #[schemars(length(min = 1))]
+    pub max_ttl: String,
+    /// Maximum active Sandbox leases for this identity, separate from Cluster
+    /// lease concurrency.
+    pub max_concurrent_leases: u32,
+    /// Aggregate per-Sandbox CPU and memory ceiling.
+    pub resource_ceiling: SandboxResourceCeiling,
+}
+
+/// Agent Sandbox authorization verbs. `lease` includes create and own-object
+/// reads; `release` remains independently revocable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxVerb {
+    Lease,
+    Exec,
+    Logs,
+    PortForward,
+    Release,
 }
 
 /// Claim-based match condition for OIDC rules.
@@ -356,5 +396,43 @@ mod tests {
         }))
         .expect("unknown fields must be ignored, not rejected");
         assert_eq!(spec.rules.len(), 1);
+    }
+
+    #[test]
+    fn legacy_access_rule_omits_sandbox_and_denies_by_shape() {
+        let rule: AccessRule = serde_json::from_value(serde_json::json!({
+            "pools": ["ci-*"],
+            "maxTtl": "1h",
+            "maxConcurrentLeases": 2
+        }))
+        .unwrap();
+
+        assert!(rule.sandbox.is_none());
+        assert!(serde_json::to_value(rule).unwrap().get("sandbox").is_none());
+    }
+
+    #[test]
+    fn typed_sandbox_grant_round_trips_and_rejects_unknown_fields() {
+        let value = serde_json::json!({
+            "pools": ["ci-*"],
+            "maxTtl": "1h",
+            "maxConcurrentLeases": 2,
+            "sandbox": {
+                "pools": ["agent-*"],
+                "verbs": ["lease", "exec", "logs", "port-forward", "release"],
+                "maxTtl": "30m",
+                "maxConcurrentLeases": 4,
+                "resourceCeiling": { "maxCpu": "2", "maxMemory": "4Gi" }
+            }
+        });
+        let rule: AccessRule = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(rule).unwrap()["sandbox"],
+            value["sandbox"]
+        );
+
+        let mut invalid = value;
+        invalid["sandbox"]["namespace"] = serde_json::json!("kube-system");
+        assert!(serde_json::from_value::<AccessRule>(invalid).is_err());
     }
 }

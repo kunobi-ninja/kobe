@@ -1,0 +1,446 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxleases.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: SandboxLease
+    plural: sandboxleases
+    shortNames:
+    - sl
+    singular: sandboxlease
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.expiresAt
+      name: Expires
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SandboxLeaseSpec via `CustomResource`
+        properties:
+          spec:
+            description: Caller-safe intent for one disposable Sandbox.
+            properties:
+              alias:
+                minLength: 1
+                nullable: true
+                type: string
+              poolRef:
+                description: |-
+                  Exact SandboxPool admitted by Kobe. UID and generation fence pool
+                  recreation or mutation between HTTP admission and placement.
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+              requester:
+                description: |-
+                  Set by Kobe from the authenticated principal, never trusted from an HTTP
+                  request body. Ownership uses the complete tuple, not the display
+                  identity alone.
+                properties:
+                  identity:
+                    minLength: 1
+                    type: string
+                  issuer:
+                    minLength: 1
+                    type: string
+                  provider:
+                    description: Stable configured authentication provider ID.
+                    minLength: 1
+                    type: string
+                  type:
+                    minLength: 1
+                    type: string
+                required:
+                - identity
+                - issuer
+                - provider
+                - type
+                type: object
+              ttl:
+                minLength: 1
+                type: string
+            required:
+            - poolRef
+            - requester
+            - ttl
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                items:
+                  description: Kubernetes-style condition with the generation from which it was derived.
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      nullable: true
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      description: Kubernetes Condition status values.
+                      enum:
+                      - 'True'
+                      - 'False'
+                      - Unknown
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              expiresAt:
+                description: Set only when the upstream Sandbox becomes Ready.
+                format: date-time
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              phase:
+                default: Pending
+                description: |-
+                  Stable public phases. `Released` and `Expired` are clean terminal states;
+                  uncertain teardown remains `Quarantined` and continues consuming capacity.
+                enum:
+                - Pending
+                - Provisioning
+                - Ready
+                - Releasing
+                - Released
+                - Expired
+                - Quarantined
+                type: string
+              placement:
+                nullable: true
+                properties:
+                  clusterPool:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  type:
+                    enum:
+                    - management
+                    - childCluster
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: resolved childCluster placement requires the exact ClusterPool reference
+                  rule: (self.type == 'management' && !has(self.clusterPool)) || (self.type == 'childCluster' && has(self.clusterPool))
+              provisioningDeadline:
+                description: Absolute bound for setup. This is not the runtime expiry.
+                format: date-time
+                nullable: true
+                type: string
+              readyAt:
+                format: date-time
+                nullable: true
+                type: string
+              target:
+                description: |-
+                  Restart-safe, non-secret target provenance. Fields are filled monotonically:
+                  once a reference is present its name and UID may never be cleared or changed.
+                nullable: true
+                properties:
+                  childClusterInstance:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  childClusterLease:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  namespace:
+                    minLength: 1
+                    type: string
+                  pod:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandbox:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandboxClaim:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandboxTemplate:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandboxWarmPool:
+                    description: Non-secret identity of one exact Kubernetes object.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                required:
+                - namespace
+                type: object
+            type: object
+        required:
+        - spec
+        title: SandboxLease
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

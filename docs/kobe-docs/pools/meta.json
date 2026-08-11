@@ -1,4 +1,4 @@
 {
   "title": "Pools",
-  "pages": ["overview", "backends"]
+  "pages": ["overview", "backends", "sandbox-pools"]
 }

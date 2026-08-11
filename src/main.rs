@@ -7,6 +7,7 @@ mod lease_binding;
 mod metrics;
 pub mod pki;
 mod pool;
+mod sandbox;
 mod telemetry;
 mod velero;
 
