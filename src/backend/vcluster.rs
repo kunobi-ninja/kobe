@@ -190,12 +190,37 @@ const DEFAULT_CHART_VERSION: &str = "0.34.0";
 /// Helm repository alias the operator uses internally.
 const HELM_REPO_ALIAS: &str = "kobe-loft-sh";
 
-/// Cap on how much helm stderr is carried into an error.
+/// Cap on how much helm stderr is carried into an error message.
 ///
-/// The message reaches ClusterInstance status and the pool's
-/// `lastFailureReason`, which is surfaced to lease clients — so an unbounded
-/// helm dump would bloat those objects on every failed attempt.
+/// The message reaches `ClusterInstance.status.message`, which is rewritten on
+/// every failed attempt, so an unbounded helm dump would bloat that object.
+///
+/// It does NOT reach the pool's `lastFailureReason`: `reconcile_profile` builds
+/// that string from pool-level counters and only cites a member's message when
+/// the instance controller stamped a `crash_message`, which a provisioning
+/// failure never sets. Lease clients therefore still see the generic
+/// "N instance(s) not reaching Ready" text — improving that is a separate
+/// change to the pool controller, not something this cap implies.
+///
+/// The cap bounds what is STORED and LOGGED, not what is buffered: `.output()`
+/// reads helm's stderr in full before this applies. That is acceptable here
+/// because helm is a trusted local binary whose diagnostics are small; it is
+/// not a defence against a hostile subprocess.
 const HELM_STDERR_LIMIT: usize = 800;
+
+/// Trim and cap helm stderr for embedding in a message, on a char boundary.
+fn clip_helm_stderr(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let text = text.trim();
+    if text.len() <= HELM_STDERR_LIMIT {
+        return text.to_string();
+    }
+    let mut end = HELM_STDERR_LIMIT;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} […truncated]", &text[..end])
+}
 
 /// Build the error for a failed helm invocation, including what helm wrote to
 /// stderr.
@@ -210,21 +235,9 @@ fn helm_command_error(what: &str, output: &std::process::Output) -> anyhow::Erro
         .code()
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".to_string());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
+    let stderr = clip_helm_stderr(&output.stderr);
     if stderr.is_empty() {
         return anyhow!("{what} returned non-zero status (exit {code}), with no stderr");
-    }
-    if stderr.len() > HELM_STDERR_LIMIT {
-        // Cut on a char boundary — helm output can carry non-ASCII.
-        let mut end = HELM_STDERR_LIMIT;
-        while end > 0 && !stderr.is_char_boundary(end) {
-            end -= 1;
-        }
-        return anyhow!(
-            "{what} returned non-zero status (exit {code}): {} […truncated]",
-            &stderr[..end]
-        );
     }
     anyhow!("{what} returned non-zero status (exit {code}): {stderr}")
 }
@@ -353,7 +366,7 @@ impl VclusterBackend {
         // genuine failure here is otherwise invisible until `update` fails.
         if !output.status.success() {
             debug!(
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                stderr = %clip_helm_stderr(&output.stderr),
                 "helm repo add returned non-zero (likely already registered); continuing"
             );
         }
