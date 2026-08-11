@@ -12,16 +12,33 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
-/// One sweep tick. Returns the number of stale entries cleaned (for metrics).
+/// Inputs for one sweep tick, bundled so the entry point stays readable.
+pub struct SweepParams<'a> {
+    pub lease_root: &'a Path,
+    pub live_set_path: &'a Path,
+    pub mountinfo_path: &'a Path,
+    pub mtime_skip: Duration,
+    pub dry_run: bool,
+    /// Skip the synchronous apiserver check in `process_stale`. Read from
+    /// `KOBE_REAPER_SKIP_GET` at the composition root and threaded through as
+    /// data, so tests never mutate the process environment.
+    pub skip_get: bool,
+}
+
+/// One sweep tick. Returns the number of stale entries actually reaped.
 pub async fn sweep_once(
     client: &Client,
-    lease_root: &Path,
-    live_set_path: &Path,
-    mtime_skip: Duration,
-    dry_run: bool,
     unmounter: &dyn Unmount,
-    mountinfo_path: &Path,
+    params: &SweepParams<'_>,
 ) -> Result<usize> {
+    let SweepParams {
+        lease_root,
+        live_set_path,
+        mountinfo_path,
+        mtime_skip,
+        dry_run,
+        skip_get,
+    } = *params;
     if std::env::var("KOBE_REAPER_DISABLE").as_deref() == Ok("1") {
         info!("KOBE_REAPER_DISABLE=1 set; sweep skipped");
         return Ok(0);
@@ -44,7 +61,7 @@ pub async fn sweep_once(
 
     let mut cleaned = 0;
     for s in stale {
-        match process_stale(client, &s, mountinfo_path, dry_run, unmounter).await {
+        match process_stale(client, &s, mountinfo_path, dry_run, unmounter, skip_get).await {
             Ok(SweepOutcome::Reaped) => cleaned += 1,
             // Deliberate skips — apiserver unreachable, the CR still exists,
             // umount failed, rm -rf failed, or this is a dry run. None of
@@ -120,8 +137,9 @@ async fn process_stale(
     mountinfo_path: &Path,
     dry_run: bool,
     unmounter: &dyn Unmount,
+    skip_get: bool,
 ) -> Result<SweepOutcome> {
-    if std::env::var("KOBE_REAPER_SKIP_GET").as_deref() == Ok("1") {
+    if skip_get {
         tracing::warn!(
             name = stale.name,
             "KOBE_REAPER_SKIP_GET=1; proceeding without apiserver final check (TEST USE ONLY)"
@@ -265,10 +283,12 @@ mod tests {
 
     /// A client that is never dialled.
     ///
-    /// Every test here sets `KOBE_REAPER_SKIP_GET=1`, so `process_stale`
-    /// returns before touching the apiserver. The address is unroutable on
-    /// purpose: if a change ever makes this path reach the network, these
-    /// tests fail rather than silently depending on a live cluster.
+    /// Every test here passes `skip_get = true`, so `process_stale` returns
+    /// before touching the apiserver. The address is unroutable on purpose, but
+    /// note it is defence in depth only, NOT an assertion: a request to it
+    /// fails, and the failure branch returns `Skipped` — which is what the
+    /// EBUSY test already expects. Do not read these tests as proving the
+    /// apiserver is never dialled.
     fn offline_client() -> Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let kubeconfig = kube::config::Kubeconfig {
@@ -321,7 +341,6 @@ mod tests {
     // constrains the umount EBUSY → skip rm path.
     #[tokio::test]
     async fn umount_ebusy_aborts_rm_and_leaves_dir_for_retry() {
-        unsafe { std::env::set_var("KOBE_REAPER_SKIP_GET", "1") };
         let tmp = TempDir::new().unwrap();
         let (stale, stale_path, mountinfo_path) = stale_fixture(&tmp, "stale-a");
         let mp = stale_path.join("kubelets/podX/vol");
@@ -333,6 +352,7 @@ mod tests {
             &mountinfo_path,
             false,
             &unmounter,
+            true,
         )
         .await
         .unwrap();
@@ -352,7 +372,6 @@ mod tests {
     /// that was never going to be removed anyway.
     #[tokio::test]
     async fn successful_unmount_reaps_the_directory() {
-        unsafe { std::env::set_var("KOBE_REAPER_SKIP_GET", "1") };
         let tmp = TempDir::new().unwrap();
         let (stale, stale_path, mountinfo_path) = stale_fixture(&tmp, "stale-b");
 
@@ -362,6 +381,7 @@ mod tests {
             &mountinfo_path,
             false,
             &MockUnmount::new(),
+            true,
         )
         .await
         .unwrap();
@@ -373,7 +393,6 @@ mod tests {
     /// Dry run must touch nothing — and must not claim it cleaned anything.
     #[tokio::test]
     async fn dry_run_removes_nothing_and_reports_skipped() {
-        unsafe { std::env::set_var("KOBE_REAPER_SKIP_GET", "1") };
         let tmp = TempDir::new().unwrap();
         let (stale, stale_path, mountinfo_path) = stale_fixture(&tmp, "stale-c");
 
@@ -383,11 +402,57 @@ mod tests {
             &mountinfo_path,
             true,
             &MockUnmount::new(),
+            true,
         )
         .await
         .unwrap();
 
         assert!(stale_path.exists(), "dry run must not remove anything");
         assert_eq!(outcome, SweepOutcome::Skipped);
+    }
+
+    /// The accounting fix lives in `sweep_once`, not in `process_stale`, and
+    /// every other test here calls the latter. Without this, re-adding
+    /// `cleaned += 1` for the Skipped arm would pass the whole suite — the
+    /// same gap that made the original umount test worthless.
+    #[tokio::test]
+    async fn sweep_once_counts_only_entries_it_actually_reaped() {
+        let tmp = TempDir::new().unwrap();
+        let lease_root = make_dir(tmp.path(), "leases");
+        // Two stale dirs: neither is in the live set, both are old enough.
+        let reapable = make_dir(&lease_root, "gone-a");
+        let blocked = make_dir(&lease_root, "gone-b");
+        let blocked_mp = blocked.join("kubelets/podX/vol");
+        fs::create_dir_all(&blocked_mp).unwrap();
+
+        let live_set = make_live_set(tmp.path(), "");
+        let mountinfo_path = tmp.path().join("mountinfo");
+        fs::write(
+            &mountinfo_path,
+            format!("36 35 98:0 / {} rw -\n", blocked_mp.display()),
+        )
+        .unwrap();
+
+        // gone-b has a mount that refuses to unmount, so it must be skipped.
+        let unmounter = MockUnmount::new().fail_on(&blocked_mp);
+
+        let cleaned = sweep_once(
+            &offline_client(),
+            &unmounter,
+            &SweepParams {
+                lease_root: &lease_root,
+                live_set_path: &live_set,
+                mountinfo_path: &mountinfo_path,
+                mtime_skip: Duration::from_secs(0),
+                dry_run: false,
+                skip_get: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!reapable.exists(), "the unblocked entry should be gone");
+        assert!(blocked.exists(), "the blocked entry must survive");
+        assert_eq!(cleaned, 1, "only the reaped entry may be counted");
     }
 }
