@@ -2253,17 +2253,10 @@ fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {
         ClusterInstancePhase::Recycling => ClusterState::Recycling,
         ClusterInstancePhase::Unhealthy => ClusterState::Unhealthy,
         ClusterInstancePhase::Failed => ClusterState::Unhealthy,
-        // PLACEHOLDER. `ClusterState` has no Quarantined variant yet, and adding
-        // one touches ~109 call sites across pool scaling — that belongs with
-        // the controller work that can actually reason about quarantined
-        // capacity, not here.
-        //
-        // `Unhealthy` is the safe interim: it is excluded from Ready capacity,
-        // so a quarantined instance can never be leased. It is NOT correct
-        // long-term, because Unhealthy is replacement-eligible and quarantined
-        // capacity must never be silently deleted. Nothing sets Quarantined in
-        // this change, so this arm is currently unreachable.
-        ClusterInstancePhase::Quarantined => ClusterState::Unhealthy,
+        // Quarantined maps to its own state, never to Unhealthy: Unhealthy is
+        // deleted unconditionally by the pool manager, which would destroy the
+        // cleanup handle and let the ordinary recycle path resume.
+        ClusterInstancePhase::Quarantined => ClusterState::Quarantined,
     }
 }
 
@@ -2274,6 +2267,7 @@ fn cluster_phase_from_state(state: &ClusterState) -> ClusterInstancePhase {
         ClusterState::Leased => ClusterInstancePhase::Leased,
         ClusterState::Recycling => ClusterInstancePhase::Recycling,
         ClusterState::Unhealthy => ClusterInstancePhase::Unhealthy,
+        ClusterState::Quarantined => ClusterInstancePhase::Quarantined,
     }
 }
 

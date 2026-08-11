@@ -263,6 +263,16 @@ pub enum ClusterState {
     /// Being deleted and recreated.
     #[allow(dead_code)]
     Recycling,
+    /// Teardown could not be proven complete.
+    ///
+    /// Distinct from `Unhealthy` on purpose: `Unhealthy` is
+    /// replacement-eligible and is deleted unconditionally below, which would
+    /// destroy the cleanup handle and let the ordinary 404-based recycle path
+    /// resume — exactly what a quarantine exists to prevent. Quarantined
+    /// capacity is never deleted, replaced, scaled down, or counted as
+    /// available; it leaves only when the same exact subject produces a
+    /// verified teardown receipt.
+    Quarantined,
 }
 
 /// Pool state for a single profile.
@@ -534,6 +544,8 @@ pub fn compute_pool_actions(
     let metric_profile = profile.metadata.name.clone().unwrap_or_default();
 
     // === 1. Unhealthy: always Delete (unbounded). ===
+    // Quarantined is deliberately NOT included: deleting it would remove the
+    // cleanup handle that proves whether the tenant's data is actually gone.
     for (name, entry) in &state.clusters {
         if entry.state == ClusterState::Unhealthy {
             actions.push(PoolAction::Delete(name.clone()));
@@ -1127,6 +1139,10 @@ pub struct StateCounts {
     pub leased: u32,
     pub unhealthy: u32,
     pub recycling: u32,
+    /// Capacity held back because its teardown could not be proven. Counted
+    /// separately from `unhealthy` so an operator can see stuck evidence
+    /// rather than mistaking it for ordinary churn.
+    pub quarantined: u32,
     /// Ready instances whose `spec_hash` matches `current_hash`. Zero
     /// when `count_states` was called without a `current_hash`.
     pub ready_clean: u32,
@@ -1164,6 +1180,7 @@ pub fn count_states(state: &PoolState, current_hash: Option<&SpecHash>) -> State
             ClusterState::Leased => c.leased += 1,
             ClusterState::Unhealthy => c.unhealthy += 1,
             ClusterState::Recycling => c.recycling += 1,
+            ClusterState::Quarantined => c.quarantined += 1,
         }
         // Only an entry with both a `current_hash` to compare against
         // AND its own stamped hash can hash-drift. Unstamped entries
@@ -3155,6 +3172,63 @@ mod tests {
         );
         // It was NOT counted toward `max_recycling=1`, but the budget
         // is still 1 here because there are no drifted Ready candidates.
+    }
+
+    /// Quarantined capacity must never be deleted by the pool manager.
+    ///
+    /// This is the boundary that matters. `Unhealthy` is deleted
+    /// unconditionally ("always Delete (unbounded)"), so had `Quarantined`
+    /// been folded into it, the first reconcile after a failed teardown would
+    /// destroy the very object holding the evidence — and the ordinary
+    /// 404-based recycle path would then treat the capacity as clean.
+    ///
+    /// Asserting only on a phase→state mapping helper would not catch that:
+    /// the deletion decision lives here, in `compute_pool_actions`.
+    #[test]
+    fn quarantined_instances_are_never_deleted_or_counted_available() {
+        let profile = make_profile_with_upgrade(4, 1, 1, Some(1));
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "pool-test-profile-1".into(),
+            make_entry(ClusterState::Quarantined),
+        );
+        clusters.insert(
+            "pool-test-profile-2".into(),
+            make_entry(ClusterState::Ready),
+        );
+        let state = PoolState {
+            clusters,
+            queue_depth: 0,
+        };
+
+        let actions = compute_pool_actions(
+            &profile,
+            &state,
+            chrono::Utc::now(),
+            &test_render_ctx(),
+            &Default::default(),
+        );
+        let deletes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PoolAction::Delete(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !deletes.contains(&"pool-test-profile-1".to_string()),
+            "quarantined capacity must never be deleted — that destroys the \
+             cleanup handle proving the tenant's data is gone; got {deletes:?}"
+        );
+
+        // It must also not read as available capacity.
+        let counts = count_states(&state, None);
+        assert_eq!(counts.quarantined, 1);
+        assert_eq!(counts.ready, 1, "only the genuinely Ready member counts");
+        assert_eq!(
+            counts.unhealthy, 0,
+            "quarantined must be distinguishable from ordinary churn"
+        );
     }
 
     /// Unhealthy instances are recycled aggressively without

@@ -170,16 +170,91 @@ impl TeardownReceipt {
         }
     }
 
-    /// Whether this receipt permits releasing the final cleanup handle.
+    /// Whether this receipt releases the exact footprint described by
+    /// `expected`.
     ///
-    /// Requires an explicitly recorded verdict *and* agreement with the checks,
-    /// so a hand-edited or truncated receipt cannot unlock capacity.
-    pub fn permits_release(&self) -> bool {
-        self.schema_version == TEARDOWN_RECEIPT_SCHEMA_VERSION
-            && self.outcome == TeardownOutcome::Verified
-            && Self::outcome_for(&self.checks) == TeardownOutcome::Verified
-            && !self.checks.is_empty()
+    /// A receipt is only proof of *what it actually covers*. An earlier version
+    /// asked only "no `Unknown`, and not empty", which meant a receipt carrying
+    /// one `serverStatefulSet=verified` check released capacity while saying
+    /// nothing about the database, credentials, volumes, or Pods. Absence of
+    /// evidence read as evidence of absence — the exact inversion receipts
+    /// exist to prevent.
+    ///
+    /// `expected` must come from controller-owned bind-time state, never from
+    /// the receipt being validated: a receipt that vouches for its own scope
+    /// proves nothing.
+    ///
+    /// Requires all of:
+    /// - a schema version this build understands;
+    /// - a completion timestamp — an unfinished attempt is not proof;
+    /// - the recorded verdict agreeing with the checks;
+    /// - identity matching `expected` exactly, so a receipt from another
+    ///   attempt or a same-named replacement cannot be replayed;
+    /// - exactly one check per expected subject, each `Verified` or
+    ///   `NotApplicable` — no missing subjects, no duplicates, no extras.
+    pub fn permits_release_for(&self, expected: &TeardownScope<'_>) -> bool {
+        if self.schema_version != TEARDOWN_RECEIPT_SCHEMA_VERSION
+            || self.completed_at.is_none()
+            || self.outcome != TeardownOutcome::Verified
+            || Self::outcome_for(&self.checks) != TeardownOutcome::Verified
+        {
+            return false;
+        }
+        // Identity, not just shape: a valid receipt for a *different* subject
+        // must not release this one.
+        if self.lease != *expected.lease
+            || self.instance != *expected.instance
+            || self.pool != *expected.pool
+            || self.backend_type != expected.backend_type
+            || self.config_digest != expected.config_digest
+            || self.instance_spec_digest != expected.instance_spec_digest
+        {
+            return false;
+        }
+        if expected.required_subjects.is_empty() {
+            // Nothing to prove means nothing was proven. Fail closed rather
+            // than treat an empty plan as a clean bill of health.
+            return false;
+        }
+        if self.checks.len() != expected.required_subjects.len() {
+            return false;
+        }
+        expected.required_subjects.iter().all(|subject| {
+            let mut matching = self.checks.iter().filter(|check| check.subject == *subject);
+            let Some(check) = matching.next() else {
+                return false;
+            };
+            // Exactly one: duplicates could otherwise pair a Verified with a
+            // silently ignored second opinion.
+            matching.next().is_none()
+                && matches!(
+                    check.result,
+                    CheckResult::Verified | CheckResult::NotApplicable
+                )
+        })
     }
+}
+
+/// The exact footprint a receipt must account for, derived from
+/// controller-owned bind-time state.
+///
+/// Separate from [`TeardownReceipt`] on purpose. The receipt is mutable status
+/// written by the teardown path; the scope is the trusted record of what that
+/// path was supposed to destroy. Validating a receipt against fields carried
+/// inside itself would let a truncated or replayed receipt define its own
+/// success criteria.
+#[derive(Debug, Clone, Copy)]
+pub struct TeardownScope<'a> {
+    pub lease: &'a ResourceRef,
+    pub instance: &'a ResourceRef,
+    pub pool: &'a ResourceRef,
+    pub backend_type: &'a str,
+    pub config_digest: &'a str,
+    pub instance_spec_digest: &'a str,
+    /// Every subject this instance actually created. Optional footprints that
+    /// were never created are simply absent — which is why the list must come
+    /// from the creation record, not be inferred at teardown time.
+    pub required_subjects: &'a [TeardownSubject],
 }
 
 /// Why a pool's footprint cannot support [`CleanupMode::VerifiedDestroy`].
@@ -389,34 +464,175 @@ mod tests {
         }
     }
 
-    /// A receipt may only unlock capacity when its recorded verdict and its own
-    /// evidence agree, so a hand-edited or truncated receipt cannot release it.
+    fn check(subject: TeardownSubject, result: CheckResult) -> TeardownCheck {
+        TeardownCheck {
+            subject,
+            result,
+            reason: None,
+        }
+    }
+
+    fn lease_ref() -> ResourceRef {
+        ResourceRef {
+            name: "lease-a".into(),
+            uid: Some("lease-uid".into()),
+        }
+    }
+    fn instance_ref() -> ResourceRef {
+        ResourceRef {
+            name: "pool-p-0".into(),
+            uid: Some("instance-uid".into()),
+        }
+    }
+    fn pool_ref() -> ResourceRef {
+        ResourceRef {
+            name: "p".into(),
+            uid: Some("pool-uid".into()),
+        }
+    }
+
+    fn scope<'a>(
+        required: &'a [TeardownSubject],
+        refs: &'a (ResourceRef, ResourceRef, ResourceRef),
+    ) -> TeardownScope<'a> {
+        TeardownScope {
+            lease: &refs.0,
+            instance: &refs.1,
+            pool: &refs.2,
+            backend_type: "k3s",
+            config_digest: "digest",
+            instance_spec_digest: "spec-digest",
+            required_subjects: required,
+        }
+    }
+
+    /// A receipt releases capacity only if it accounts for EVERY subject the
+    /// instance actually created.
+    ///
+    /// The earlier rule was "no Unknown, and not empty", which let a receipt
+    /// carrying a single `serverStatefulSet=verified` check release a lease
+    /// while saying nothing about the database, credentials, volumes, or Pods —
+    /// absence of evidence read as evidence of absence.
+    #[test]
+    fn partial_evidence_cannot_release_capacity() {
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [
+            TeardownSubject::ServerStatefulSet,
+            TeardownSubject::Database,
+            TeardownSubject::KubeconfigSecret,
+        ];
+
+        // Every required subject accounted for: two verified, one genuinely
+        // never created.
+        let complete = receipt(
+            vec![
+                check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+                check(TeardownSubject::Database, CheckResult::NotApplicable),
+                check(TeardownSubject::KubeconfigSecret, CheckResult::Verified),
+            ],
+            TeardownOutcome::Verified,
+        );
+        assert!(complete.permits_release_for(&scope(&required, &refs)));
+
+        // One subject simply missing — the defect this test exists for.
+        let partial = receipt(
+            vec![
+                check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+                check(TeardownSubject::Database, CheckResult::Verified),
+            ],
+            TeardownOutcome::Verified,
+        );
+        assert!(
+            !partial.permits_release_for(&scope(&required, &refs)),
+            "a receipt that omits a required subject must not release capacity"
+        );
+
+        // Duplicates must not let a second opinion hide behind the first.
+        let duplicated = receipt(
+            vec![
+                check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+                check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+                check(TeardownSubject::Database, CheckResult::Verified),
+            ],
+            TeardownOutcome::Verified,
+        );
+        assert!(!duplicated.permits_release_for(&scope(&required, &refs)));
+
+        // An empty plan is not a clean bill of health.
+        assert!(!complete.permits_release_for(&scope(&[], &refs)));
+    }
+
+    /// A receipt is proof about ONE subject. It must not be replayable against
+    /// another lease, instance, pool, or a same-named replacement.
+    #[test]
+    fn a_receipt_cannot_be_replayed_against_another_subject() {
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [TeardownSubject::ServerStatefulSet];
+        let valid = receipt(
+            vec![check(
+                TeardownSubject::ServerStatefulSet,
+                CheckResult::Verified,
+            )],
+            TeardownOutcome::Verified,
+        );
+        assert!(valid.permits_release_for(&scope(&required, &refs)));
+
+        // Same name, different UID — a replacement object.
+        let replaced = (
+            lease_ref(),
+            ResourceRef {
+                name: "pool-p-0".into(),
+                uid: Some("replacement-instance-uid".into()),
+            },
+            pool_ref(),
+        );
+        assert!(
+            !valid.permits_release_for(&scope(&required, &replaced)),
+            "a same-named replacement is a different subject"
+        );
+
+        // Drifted provenance must also refuse.
+        let mut drifted = scope(&required, &refs);
+        drifted.config_digest = "other-digest";
+        assert!(!valid.permits_release_for(&drifted));
+    }
+
+    /// Verdict, evidence, schema, and completeness each fail closed on their own.
     #[test]
     fn release_requires_evidence_that_matches_the_verdict() {
-        let verified = TeardownCheck {
-            subject: TeardownSubject::ServerStatefulSet,
-            result: CheckResult::Verified,
-            reason: None,
-        };
-        let unknown = TeardownCheck {
-            subject: TeardownSubject::Database,
-            result: CheckResult::Unknown,
-            reason: Some("datastore_unreachable".into()),
-        };
-
-        assert!(receipt(vec![verified.clone()], TeardownOutcome::Verified).permits_release());
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [
+            TeardownSubject::ServerStatefulSet,
+            TeardownSubject::Database,
+        ];
 
         // Verdict claims success while the evidence says otherwise.
+        let contradicted = receipt(
+            vec![
+                check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+                check(TeardownSubject::Database, CheckResult::Unknown),
+            ],
+            TeardownOutcome::Verified,
+        );
         assert!(
-            !receipt(vec![verified.clone(), unknown], TeardownOutcome::Verified).permits_release(),
+            !contradicted.permits_release_for(&scope(&required, &refs)),
             "a Verified verdict must not override an Unknown check"
         );
-        // No evidence at all is not proof of absence.
-        assert!(!receipt(Vec::new(), TeardownOutcome::Verified).permits_release());
+
+        let good = vec![
+            check(TeardownSubject::ServerStatefulSet, CheckResult::Verified),
+            check(TeardownSubject::Database, CheckResult::Verified),
+        ];
+
         // An unrecognised schema must not be read as complete.
-        let mut future = receipt(vec![verified], TeardownOutcome::Verified);
+        let mut future = receipt(good.clone(), TeardownOutcome::Verified);
         future.schema_version = TEARDOWN_RECEIPT_SCHEMA_VERSION + 1;
-        assert!(!future.permits_release());
+        assert!(!future.permits_release_for(&scope(&required, &refs)));
+
+        // An attempt that never finished is not proof.
+        let mut unfinished = receipt(good, TeardownOutcome::Verified);
+        unfinished.completed_at = None;
+        assert!(!unfinished.permits_release_for(&scope(&required, &refs)));
     }
 
     #[test]
