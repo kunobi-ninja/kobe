@@ -711,6 +711,21 @@ fn requester_list_params(identity: &AuthIdentity) -> ListParams {
 ///
 /// Components are length-prefixed so `("ab", "c")` and `("a", "bc")` cannot
 /// produce the same digest.
+///
+/// # Changing this function is a migration
+///
+/// The output names the reservation objects AND the label selector used to find
+/// them, so changing it renames every quota slot and alias at once. Objects
+/// created under the previous scheme become invisible: they still occupy
+/// backend resources, but the new selector cannot see them, so a principal
+/// could acquire their full limit again in the new namespace and re-take an
+/// alias someone still holds — a quota and alias bypass.
+///
+/// That was safe to ignore for the FNV-to-SHA-256 change only because
+/// `SandboxLease` had never shipped: it is absent from `main`, from `v0.38.0`,
+/// and from the released chart, so no object could exist under the old scheme.
+/// Once this ships, any further change needs a versioned migration that keeps
+/// enforcing against legacy reservations until they are drained.
 fn principal_hash(identity: &AuthIdentity) -> String {
     let mut hasher = Sha256::new();
     for component in [
