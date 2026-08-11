@@ -2,6 +2,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::crd::LeaseBinding;
+
 /// ClusterLease is the internal representation of a cluster lease.
 ///
 /// Created when a user/CI leases a cluster via the HTTP API.
@@ -59,6 +61,16 @@ pub struct ClusterLeaseStatus {
     // via a JSON-Merge-Patch null (RFC 7396). Only ever set, never cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_name: Option<String>,
+
+    /// Authoritative UID-fenced reciprocal binding. It may be present while the
+    /// lease is still `Pending` as a crash-safe reservation intent; access is
+    /// authorized only after the lease reaches `Bound` and the exact same value
+    /// exists on the referenced `ClusterInstance`.
+    ///
+    /// `clusterName` remains for compatibility and display, but must never be
+    /// used alone for access, mutation, rollback, release, or teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<LeaseBinding>,
 
     /// When the lease was bound to a vcluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +194,7 @@ fn default_priority() -> u32 {
 #[cfg(test)]
 mod json_safety_tests {
     use super::*;
+    use kube::CustomResourceExt;
 
     #[test]
     fn status_omits_none_preserve_fields_so_merge_patch_cannot_erase_them() {
@@ -210,6 +223,10 @@ mod json_safety_tests {
         assert!(
             v.get("diagnosticsUrl").is_none(),
             "diagnosticsUrl must be omitted when None"
+        );
+        assert!(
+            v.get("binding").is_none(),
+            "binding must be omitted when None"
         );
 
         // Set values are still serialized.
@@ -399,6 +416,41 @@ mod json_safety_tests {
         );
     }
 
+    #[test]
+    fn crd_schema_exposes_typed_uid_fenced_binding() {
+        let crd = serde_json::to_value(ClusterLease::crd()).unwrap();
+        let binding = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["binding"];
+        let properties = &binding["properties"];
+        for key in [
+            "bindingId",
+            "lease",
+            "instance",
+            "pool",
+            "backend",
+            "instanceSpecDigest",
+        ] {
+            assert!(
+                properties.get(key).is_some(),
+                "missing binding.{key}: {binding}"
+            );
+        }
+        assert_eq!(properties["lease"]["properties"]["uid"]["type"], "string");
+        assert_eq!(
+            properties["instance"]["properties"]["uid"]["type"],
+            "string"
+        );
+        assert_eq!(
+            properties["instance"]["properties"]["observedGeneration"]["format"],
+            "int64"
+        );
+        assert_eq!(properties["pool"]["properties"]["uid"]["type"], "string");
+        assert_eq!(
+            properties["backend"]["properties"]["type"]["type"],
+            "string"
+        );
+    }
+
     /// A condition with no recorded transition omits the key rather than
     /// writing an explicit null, so a reader round-tripping the condition
     /// does not turn "never transitioned" into a stored null.
@@ -455,6 +507,7 @@ mod json_safety_tests {
         let original = ClusterLeaseStatus {
             phase: LeasePhase::Bound,
             cluster_name: Some("pool-x-0".into()),
+            binding: None,
             bound_at: Some("2026-06-04T00:00:00Z".into()),
             expires_at: Some("2026-06-04T01:00:00Z".into()),
             queue_position: 0,

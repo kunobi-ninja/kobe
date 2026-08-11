@@ -25,8 +25,10 @@ use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{
-    ClusterLease, ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeasePhase, Requester,
+    ClusterLease, ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase,
+    Requester,
 };
+use crate::lease_binding::{BindingResolutionError, BindingResolveMode, resolve_lease_binding};
 use crate::metrics;
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use kunobi_auth::server::{AuthnProvider, OptionalAuth};
@@ -37,6 +39,15 @@ pub struct AppState<B: ClusterBackend> {
     pub client: Client,
     pub authenticator: Arc<JwtAuthenticator>,
     pub namespace: String,
+    /// Ambient default backend. **Never an authorization or dispatch input.**
+    ///
+    /// Before #79 the connect proxy fell back to this when pool/backend
+    /// resolution failed, which let a deleted or reconfigured pool silently
+    /// redirect tenant traffic. Dispatch now comes exclusively from the
+    /// immutable `BackendProvenance` recorded on the binding, so nothing reads
+    /// this field. Retained only so the `B: ClusterBackend` plumbing keeps
+    /// compiling; dropping the type parameter is follow-up cleanup.
+    #[allow(dead_code)]
     pub backend: B,
     pub factory: Option<BackendFactory>,
     /// Shared PostgreSQL datastore when one is configured; empty in
@@ -50,11 +61,21 @@ pub struct AppState<B: ClusterBackend> {
 }
 
 /// Per-lease connect-proxy context cache. Newtype over a shared, mutex-guarded
-/// map keyed by `lease_id`. `std` only — entries are tiny and short-lived (5s
-/// TTL), so a coarse `Mutex` around a `HashMap` is more than enough and avoids
-/// pulling in an external cache crate.
+/// map keyed by the lease name plus the exact lease and instance UIDs. `std`
+/// only — entries are tiny and short-lived (5s TTL), so a coarse `Mutex` around
+/// a `HashMap` is more than enough and avoids pulling in an external cache
+/// crate.
 #[derive(Clone, Default)]
-pub struct ConnectCache(Arc<std::sync::Mutex<std::collections::HashMap<String, ConnectCtx>>>);
+pub struct ConnectCache(
+    Arc<std::sync::Mutex<std::collections::HashMap<ConnectCacheKey, ConnectCtx>>>,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConnectCacheKey {
+    lease_name: String,
+    lease_uid: String,
+    instance_uid: String,
+}
 
 /// One cached connect-proxy context for a lease. Everything here was validated
 /// fresh at `cached_at`; on a hit we re-enforce the security gates (token match,
@@ -67,9 +88,10 @@ struct ConnectCtx {
     /// `secret_eq` on every hit; a mismatch is a cache MISS (full revalidate).
     token: String,
     cluster_name: String,
-    /// Lease expiry (RFC3339), re-checked freshly against `now()` each hit.
-    expires_at: Option<String>,
-    phase: LeasePhase,
+    /// Complete fence validated when this context was populated. Cache hits
+    /// re-run the shared resolver and require byte-for-byte identity before
+    /// reusing the credential-bearing backend context.
+    binding: LeaseBinding,
     /// reqwest client + server + bearer — cheap to clone (Arc-internal client).
     backend: BackendAccess,
     /// Raw backend kubeconfig, retained for the upgrade path's
@@ -89,7 +111,10 @@ const CONNECT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5)
 /// validate/get/extract/build path; on a `Miss` it runs the full path and
 /// repopulates the entry.
 enum CacheLookup {
-    Hit(ConnectCtx),
+    // `ConnectCtx` carries a reqwest client and the raw kubeconfig (~500
+    // bytes); boxing it keeps `Miss` — by far the hotter variant on a cold
+    // cache — from paying for that on every lookup.
+    Hit(ConnectCacheKey, Box<ConnectCtx>),
     Miss,
 }
 
@@ -102,16 +127,15 @@ impl ConnectCache {
     /// forced back through full revalidation.
     fn lookup(&self, lease_id: &str, presented_token: &str) -> CacheLookup {
         let map = self.0.lock().expect("connect cache mutex poisoned");
-        match map.get(lease_id) {
-            Some(entry)
-                if entry.cached_at.elapsed() < CONNECT_CACHE_TTL
+        match map.iter().find(|(key, entry)| {
+            key.lease_name == lease_id
+                && entry.cached_at.elapsed() < CONNECT_CACHE_TTL
                     // Constant-time compare: never short-circuit on the first
                     // differing byte, and never serve a cached backend to a
                     // token that doesn't match what we validated.
-                    && kunobi_auth::secret_eq(&entry.token, presented_token) =>
-            {
-                CacheLookup::Hit(entry.clone())
-            }
+                    && kunobi_auth::secret_eq(&entry.token, presented_token)
+        }) {
+            Some((key, entry)) => CacheLookup::Hit(key.clone(), Box::new(entry.clone())),
             _ => CacheLookup::Miss,
         }
     }
@@ -121,7 +145,7 @@ impl ConnectCache {
         self.0
             .lock()
             .expect("connect cache mutex poisoned")
-            .remove(lease_id);
+            .retain(|key, _| key.lease_name != lease_id);
     }
 
     /// Insert/refresh a lease's entry after a full revalidation. Opportunistically
@@ -130,7 +154,20 @@ impl ConnectCache {
     fn insert(&self, lease_id: String, ctx: ConnectCtx) {
         let mut map = self.0.lock().expect("connect cache mutex poisoned");
         map.retain(|_, entry| entry.cached_at.elapsed() < CONNECT_CACHE_TTL);
-        map.insert(lease_id, ctx);
+        // A binding is immutable for one lease UID. Remove any stale name-keyed
+        // context before inserting the exact UID-fenced key.
+        map.retain(|key, _| key.lease_name != lease_id);
+        let key = ConnectCacheKey {
+            lease_name: lease_id,
+            lease_uid: ctx
+                .binding
+                .lease
+                .uid
+                .clone()
+                .expect("resolver accepted a binding without lease UID"),
+            instance_uid: ctx.binding.instance.uid.clone(),
+        };
+        map.insert(key, ctx);
     }
 }
 
@@ -577,14 +614,40 @@ fn connect_reject(
     connect_error(status, message)
 }
 
-/// Whether a lease's RFC3339 `expires_at` is in the past. A missing or
-/// unparseable timestamp is treated as not-expired (the phase gate still
-/// applies), so this can only tighten access, never loosen it.
-fn lease_is_expired(expires_at: Option<&str>) -> bool {
-    expires_at
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|expiry| chrono::Utc::now() > expiry)
-        .unwrap_or(false)
+/// Convert a typed exact-binding denial into the stable public connect
+/// contract. Details stay in the bounded resolver reason code logged by the
+/// caller; clients never receive UIDs, provenance, object internals, or raw
+/// Kubernetes errors.
+fn binding_resolution_response(err: BindingResolutionError) -> Response {
+    match err {
+        BindingResolutionError::LeaseNotFound => connect_reject(
+            metrics::ConnectOutcome::LeaseNotFound,
+            StatusCode::NOT_FOUND,
+            "Lease not found",
+        ),
+        BindingResolutionError::LeaseNotBound => connect_reject(
+            metrics::ConnectOutcome::PhaseNotBound,
+            StatusCode::CONFLICT,
+            "Lease is not active",
+        ),
+        BindingResolutionError::Expired => connect_reject(
+            metrics::ConnectOutcome::Expired,
+            StatusCode::GONE,
+            "Lease has expired",
+        ),
+        BindingResolutionError::LeaseLookup(_)
+        | BindingResolutionError::InstanceLookup(_)
+        | BindingResolutionError::PoolLookup(_) => connect_reject(
+            metrics::ConnectOutcome::BackendError,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve lease binding",
+        ),
+        _ => connect_reject(
+            metrics::ConnectOutcome::BackendError,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Lease binding is unavailable",
+        ),
+    }
 }
 
 /// Build an error response for an internal/infrastructure failure (kube API,
@@ -1246,10 +1309,25 @@ async fn get_lease<B: ClusterBackend>(
                     .into_response();
             }
 
-            let status = lease.status.clone().unwrap_or_default();
+            let mut status = lease.status.clone().unwrap_or_default();
 
             let kubeconfig = if status.phase == LeasePhase::Bound {
-                if let Some(ref cluster_name) = status.cluster_name {
+                let lease_uid = lease.metadata.uid.as_deref();
+                let resolved = match lease_uid {
+                    Some(uid) => {
+                        resolve_lease_binding(
+                            &state.client,
+                            &state.namespace,
+                            &id,
+                            uid,
+                            BindingResolveMode::Access,
+                        )
+                        .await
+                    }
+                    None => Err(BindingResolutionError::LeaseUidMismatch),
+                };
+                if let Ok(resolved) = resolved {
+                    let cluster_name = resolved.binding.instance.name;
                     match connect_server_url(&headers, &id) {
                         Ok(server_url) => match ensure_lease_connect_token(
                             &state.client,
@@ -1262,7 +1340,7 @@ async fn get_lease<B: ClusterBackend>(
                                 match build_connect_kubeconfig(
                                     &server_url,
                                     &id,
-                                    Some(cluster_name),
+                                    Some(&cluster_name),
                                     &connect_token,
                                 ) {
                                     Ok(kubeconfig) => Some(kubeconfig),
@@ -1304,6 +1382,10 @@ async fn get_lease<B: ClusterBackend>(
                         }
                     }
                 } else {
+                    let reason = resolved.unwrap_err().reason_code();
+                    state.connect_cache.evict(&id);
+                    warn!(lease_id = %id, reason, "Owned lease binding is unavailable; kubeconfig withheld");
+                    status.message = Some(format!("binding unavailable: {reason}"));
                     None
                 }
             } else {
@@ -1414,16 +1496,13 @@ async fn connect_proxy_inner<B: ClusterBackend>(
 
     // ── Per-lease connect-context cache ──────────────────────────────────
     //
-    // A single `kubectl` fans out into dozens of API calls through one lease;
-    // without a cache each pays 3 serial kube GETs (token Secret, lease,
-    // kubeconfig Secret) + a fresh reqwest client build. We cache the validated
-    // context for `CONNECT_CACHE_TTL` (5s) keyed by lease_id. SECURITY: a hit
-    // STILL re-enforces the token match (constant-time, in `lookup`), the Bound
-    // phase, and lease expiry (against the current wall clock) — only the
-    // *phase decision* and the backend connection are reused with up-to-5s
-    // staleness; expiry and token are never stale. The 5s revocation-staleness
-    // tradeoff: deleting the connect-token Secret or releasing the lease takes
-    // up to 5s to fully cut off in-flight cache holders.
+    // A single `kubectl` fans out into dozens of API calls through one lease.
+    // The cache avoids repeated kubeconfig Secret extraction/parsing and client
+    // construction, but it never caches authorization: every hit re-runs the
+    // exact resolver and compares the complete immutable binding before the
+    // credential-bearing backend context is reused. Phase, expiry, lease UID,
+    // instance UID/generation, reciprocal binding, pool UID, and provenance are
+    // therefore fresh on every request.
     //
     // These are owned so both the hit and miss branches converge on the same
     // bindings (a hit has no `lease` object to borrow from).
@@ -1434,51 +1513,53 @@ async fn connect_proxy_inner<B: ClusterBackend>(
     let backend: BackendAccess;
 
     match state.connect_cache.lookup(&lease_id, connect_token) {
-        CacheLookup::Hit(ctx) => {
+        CacheLookup::Hit(cache_key, ctx) => {
             metrics::CONNECT_PROXY_CACHE_TOTAL
                 .with_label_values(&["hit"])
                 .inc();
 
-            // Re-enforce the gates freshly even on a hit. Phase must still be
-            // Bound (same rejection as the cold path).
-            if ctx.phase != LeasePhase::Bound {
-                warn!(
-                    request_id = %request_id,
-                    lease_id = %lease_id,
-                    phase = %ctx.phase,
-                    "Connect proxy rejected lease outside Bound phase (cached)"
-                );
-                return connect_reject(
-                    metrics::ConnectOutcome::PhaseNotBound,
-                    StatusCode::CONFLICT,
-                    format!("Lease is not active (phase {})", ctx.phase),
-                );
-            }
+            let resolved = match resolve_lease_binding(
+                &state.client,
+                &state.namespace,
+                &lease_id,
+                &cache_key.lease_uid,
+                BindingResolveMode::Access,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    state.connect_cache.evict(&lease_id);
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        reason = err.reason_code(),
+                        "Connect proxy exact binding resolution failed (cached entry evicted)"
+                    );
+                    return binding_resolution_response(err);
+                }
+            };
 
-            // Expiry is re-evaluated against `now()` on EVERY request. An
-            // expired hit evicts the entry so a stale context can't be served
-            // again, then rejects with the same 410/Gone the cold path uses.
-            if lease_is_expired(ctx.expires_at.as_deref()) {
+            if resolved.binding != ctx.binding
+                || resolved.binding.instance.uid != cache_key.instance_uid
+            {
                 state.connect_cache.evict(&lease_id);
                 warn!(
                     request_id = %request_id,
                     lease_id = %lease_id,
-                    expires_at = ?ctx.expires_at,
-                    "Connect proxy rejected expired lease (cached, evicted)"
+                    reason = "cache_fence_mismatch",
+                    "Connect proxy cache fence changed (entry evicted)"
                 );
                 return connect_reject(
-                    metrics::ConnectOutcome::Expired,
-                    StatusCode::GONE,
-                    "Lease has expired",
+                    metrics::ConnectOutcome::BackendError,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Lease binding is unavailable",
                 );
             }
 
             cluster_name = ctx.cluster_name;
-            // `chosen_backend` is a logging-only label; the cached path reuses
-            // the backend connection without re-resolving the pool, so report
-            // "cached" to make the fast path visible in logs.
             chosen_backend = "cached".to_string();
-            pool_ref = String::new();
+            pool_ref = resolved.pool.name_any();
             raw_kubeconfig = ctx.raw_kubeconfig;
             backend = ctx.backend;
         }
@@ -1487,10 +1568,10 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 .with_label_values(&["miss"])
                 .inc();
 
-            // ── Full cold path: validate token, load lease, check phase +
-            // expiry, extract kubeconfig, build BackendAccess, then populate
-            // the cache. ─────────────────────────────────────────────────
-            let token_is_valid = match validate_lease_connect_token(
+            // ── Full cold path: authenticate the token to its owner lease UID,
+            // run exact resolution, dispatch from immutable provenance, then
+            // extract/build/cache the backend context. ─────────────────────
+            let authenticated_lease_uid = match validate_lease_connect_token(
                 &state.client,
                 &state.namespace,
                 &lease_id,
@@ -1498,8 +1579,24 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             )
             .await
             {
-                Ok(valid) => valid,
+                Ok(Some(uid)) => uid,
+                Ok(None) => {
+                    state.connect_cache.evict(&lease_id);
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        method = %method,
+                        path = %request_path,
+                        "Connect proxy rejected invalid lease token"
+                    );
+                    return connect_reject(
+                        metrics::ConnectOutcome::InvalidToken,
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid lease token",
+                    );
+                }
                 Err(err) => {
+                    state.connect_cache.evict(&lease_id);
                     warn!(
                         request_id = %request_id,
                         lease_id = %lease_id,
@@ -1514,212 +1611,79 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 }
             };
 
-            if !token_is_valid {
-                warn!(
-                    request_id = %request_id,
-                    lease_id = %lease_id,
-                    method = %method,
-                    path = %request_path,
-                    "Connect proxy rejected invalid lease token"
-                );
-                return connect_reject(
-                    metrics::ConnectOutcome::InvalidToken,
-                    StatusCode::UNAUTHORIZED,
-                    "Invalid lease token",
-                );
-            }
-
-            let leases_api: Api<ClusterLease> =
-                Api::namespaced(state.client.clone(), &state.namespace);
-            let lease = match leases_api.get(&lease_id).await {
-                Ok(lease) => lease,
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                    warn!(
-                        request_id = %request_id,
-                        lease_id = %lease_id,
-                        "Connect proxy lease not found"
-                    );
-                    return connect_reject(
-                        metrics::ConnectOutcome::LeaseNotFound,
-                        StatusCode::NOT_FOUND,
-                        "Lease not found",
-                    );
-                }
+            let resolved = match resolve_lease_binding(
+                &state.client,
+                &state.namespace,
+                &lease_id,
+                &authenticated_lease_uid,
+                BindingResolveMode::Access,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
                 Err(err) => {
+                    state.connect_cache.evict(&lease_id);
                     warn!(
                         request_id = %request_id,
                         lease_id = %lease_id,
-                        error = %err,
-                        "Connect proxy failed to load lease"
+                        reason = err.reason_code(),
+                        "Connect proxy exact binding resolution failed"
                     );
-                    return connect_infra_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to load lease",
-                        &err,
-                    );
+                    return binding_resolution_response(err);
                 }
             };
-
-            let status = lease.status.clone().unwrap_or_default();
-            if status.phase != LeasePhase::Bound {
+            let cluster = resolved.binding.instance.name.as_str();
+            let resolved_backend = format!("{:?}", resolved.binding.backend.backend_type);
+            let Some(factory) = state.factory.as_ref() else {
+                state.connect_cache.evict(&lease_id);
                 warn!(
                     request_id = %request_id,
                     lease_id = %lease_id,
-                    phase = %status.phase,
-                    "Connect proxy rejected lease outside Bound phase"
-                );
-                return connect_reject(
-                    metrics::ConnectOutcome::PhaseNotBound,
-                    StatusCode::CONFLICT,
-                    format!("Lease is not active (phase {})", status.phase),
-                );
-            }
-
-            // Enforce TTL synchronously on the request path. The phase only flips
-            // to Expired on the next ~30s reconcile / 60s reaper sweep, so without
-            // this an expired holder retains full API access during the lag — in a
-            // multi-tenant pool the cluster may already be slated for recycle/handoff.
-            if lease_is_expired(status.expires_at.as_deref()) {
-                warn!(
-                    request_id = %request_id,
-                    lease_id = %lease_id,
-                    expires_at = ?status.expires_at,
-                    "Connect proxy rejected expired lease"
-                );
-                return connect_reject(
-                    metrics::ConnectOutcome::Expired,
-                    StatusCode::GONE,
-                    "Lease has expired",
-                );
-            }
-
-            let Some(cluster) = status.cluster_name.as_deref() else {
-                warn!(
-                    request_id = %request_id,
-                    lease_id = %lease_id,
-                    "Connect proxy found bound lease without cluster name"
+                    reason = "backend_factory_unavailable",
+                    "Connect proxy cannot reconstruct provenance-pinned backend"
                 );
                 return connect_reject(
                     metrics::ConnectOutcome::BackendError,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Lease is bound without a cluster name",
+                    "Lease backend provenance is unavailable",
                 );
             };
-
-            let mut resolved_backend = "fallback".to_string();
-            let raw = if let Some(factory) = state.factory.as_ref() {
-                let pools_api: Api<ClusterPool> =
-                    Api::namespaced(state.client.clone(), &state.namespace);
-                match pools_api.get(&lease.spec.pool_ref).await {
-                    Ok(pool) => {
-                        resolved_backend = format!("{:?}", pool.spec.backend.backend_type);
-                        match factory.backend_for(&pool) {
-                            Ok(b) => match b.extract_kubeconfig(cluster, &state.namespace).await {
-                                Ok(kubeconfig) => kubeconfig,
-                                Err(err) => {
-                                    warn!(
-                                        request_id = %request_id,
-                                        lease_id = %lease_id,
-                                        pool = %lease.spec.pool_ref,
-                                        cluster = %cluster,
-                                        backend = %resolved_backend,
-                                        error = %err,
-                                        "Connect proxy failed to extract backend kubeconfig"
-                                    );
-                                    return connect_infra_error(
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        "Failed to extract backend kubeconfig",
-                                        &err,
-                                    );
-                                }
-                            },
-                            Err(err) => {
-                                warn!(
-                                    request_id = %request_id,
-                                    lease_id = %lease_id,
-                                    pool = %lease.spec.pool_ref,
-                                    cluster = %cluster,
-                                    error = %err,
-                                    "Connect proxy failed to resolve backend for pool, falling back"
-                                );
-                                resolved_backend = "fallback".to_string();
-                                match state
-                                    .backend
-                                    .extract_kubeconfig(cluster, &state.namespace)
-                                    .await
-                                {
-                                    Ok(kubeconfig) => kubeconfig,
-                                    Err(err) => {
-                                        warn!(
-                                            request_id = %request_id,
-                                            lease_id = %lease_id,
-                                            cluster = %cluster,
-                                            error = %err,
-                                            "Connect proxy failed to extract backend kubeconfig"
-                                        );
-                                        return connect_infra_error(
-                                            StatusCode::SERVICE_UNAVAILABLE,
-                                            "Failed to extract backend kubeconfig",
-                                            &err,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            request_id = %request_id,
-                            lease_id = %lease_id,
-                            pool = %lease.spec.pool_ref,
-                            cluster = %cluster,
-                            error = %err,
-                            "Connect proxy failed to load pool for backend resolution, falling back"
-                        );
-                        match state
-                            .backend
-                            .extract_kubeconfig(cluster, &state.namespace)
-                            .await
-                        {
-                            Ok(kubeconfig) => kubeconfig,
-                            Err(err) => {
-                                warn!(
-                                    request_id = %request_id,
-                                    lease_id = %lease_id,
-                                    cluster = %cluster,
-                                    error = %err,
-                                    "Connect proxy failed to extract backend kubeconfig"
-                                );
-                                return connect_infra_error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "Failed to extract backend kubeconfig",
-                                    &err,
-                                );
-                            }
-                        }
-                    }
+            let dispatch = match factory.backend_for_provenance(&resolved.binding.backend) {
+                Ok(dispatch) => dispatch,
+                Err(err) => {
+                    state.connect_cache.evict(&lease_id);
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        reason = "backend_dispatch_invalid",
+                        error = %err,
+                        "Connect proxy failed to reconstruct provenance-pinned backend"
+                    );
+                    return connect_reject(
+                        metrics::ConnectOutcome::BackendError,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Lease backend provenance is unavailable",
+                    );
                 }
-            } else {
-                match state
-                    .backend
-                    .extract_kubeconfig(cluster, &state.namespace)
-                    .await
-                {
-                    Ok(kubeconfig) => kubeconfig,
-                    Err(err) => {
-                        warn!(
-                            request_id = %request_id,
-                            lease_id = %lease_id,
-                            cluster = %cluster,
-                            error = %err,
-                            "Connect proxy failed to extract backend kubeconfig"
-                        );
-                        return connect_infra_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Failed to extract backend kubeconfig",
-                            &err,
-                        );
-                    }
+            };
+            let raw = match dispatch.extract_kubeconfig(cluster, &state.namespace).await {
+                Ok(kubeconfig) => kubeconfig,
+                Err(err) => {
+                    state.connect_cache.evict(&lease_id);
+                    warn!(
+                        request_id = %request_id,
+                        lease_id = %lease_id,
+                        pool = %resolved.binding.pool.name,
+                        cluster = %cluster,
+                        backend = %resolved_backend,
+                        error = %err,
+                        "Connect proxy failed to extract backend kubeconfig"
+                    );
+                    return connect_infra_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Failed to extract backend kubeconfig",
+                        &err,
+                    );
                 }
             };
 
@@ -1749,8 +1713,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     cached_at: Instant::now(),
                     token: connect_token.to_string(),
                     cluster_name: cluster.to_string(),
-                    expires_at: status.expires_at.clone(),
-                    phase: status.phase.clone(),
+                    binding: resolved.binding.clone(),
                     backend: built.clone(),
                     raw_kubeconfig: raw.clone(),
                 },
@@ -1758,7 +1721,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
 
             cluster_name = cluster.to_string();
             chosen_backend = resolved_backend;
-            pool_ref = lease.spec.pool_ref.clone();
+            pool_ref = resolved.binding.pool.name;
             raw_kubeconfig = raw;
             backend = built;
         }
@@ -2072,17 +2035,27 @@ async fn release_lease<B: ClusterBackend>(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let patch = serde_json::json!({
-        "status": { "phase": "Released" }
-    });
+    // Release by exact object, never by name. Between the read above and this
+    // write the lease could be deleted and a same-named one recreated by
+    // another requester; a merge patch would release theirs. The `test` ops
+    // make the API server reject that instead.
+    let (Some(uid), Some(rv)) = (lease.metadata.uid.as_deref(), lease.resource_version()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/status/phase", "value": "Released" }
+    ]));
     if let Err(e) = leases_api
-        .patch_status(
-            &id,
-            &PatchParams::apply("kobe-operator"),
-            &KubePatch::Merge(&patch),
-        )
+        .patch_status(&id, &PatchParams::default(), &KubePatch::<()>::Json(patch))
         .await
     {
+        // A failed precondition means the object we authorized is no longer the
+        // object on the server. Report it as gone rather than retrying blindly.
+        if crate::controllers::lease::optimistic_conflict(&e) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return infra_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to release lease",
@@ -2132,7 +2105,9 @@ async fn extend_lease<B: ClusterBackend>(
     Json(req): Json<ExtendLeaseRequest>,
 ) -> Response {
     let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
-    match leases_api.get(&id).await {
+    // Carry the UID of the object we authorized into the mutation, so the
+    // extend cannot land on a same-named lease created after this check.
+    let authorized_uid = match leases_api.get(&id).await {
         Ok(lease) => {
             if lease.spec.requester.identity != identity.identity {
                 return (
@@ -2144,6 +2119,12 @@ async fn extend_lease<B: ClusterBackend>(
                     }),
                 )
                     .into_response();
+            }
+            match lease.metadata.uid.clone() {
+                Some(uid) => uid,
+                None => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
             }
         }
         Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
@@ -2160,13 +2141,14 @@ async fn extend_lease<B: ClusterBackend>(
         Err(e) => {
             return infra_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get lease", e);
         }
-    }
+    };
 
     match extend_lease_ttl(
         &state.client,
         &state.namespace,
         &id,
         &req.extend_ttl,
+        &authorized_uid,
         &state.authenticator,
     )
     .await
@@ -2789,27 +2771,41 @@ mod tests {
     use axum::http::Method;
     use base64::Engine;
 
-    #[test]
-    fn test_lease_is_expired() {
-        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        assert!(lease_is_expired(Some(&past)), "past expiry is expired");
-        assert!(!lease_is_expired(Some(&future)), "future expiry is live");
-        // Missing / unparseable timestamps must not be treated as expired (the
-        // phase gate still applies); fail-safe toward the existing behavior.
-        assert!(!lease_is_expired(None));
-        assert!(!lease_is_expired(Some("not-a-timestamp")));
-    }
+    // NOTE: the local `lease_is_expired` helper this module used to own is
+    // gone. Expiry is now decided inside `resolve_lease_binding`, which is
+    // strictly stricter: a missing or unparseable `expiresAt` denies instead of
+    // reading as "not expired". `lease_binding::tests::expiry_gate_fails_closed`
+    // pins all three outcomes.
 
     /// Build a `ConnectCtx` for cache tests. `age` ages `cached_at` into the
     /// past so the staleness branch can be exercised without sleeping.
-    fn test_ctx(token: &str, expires_at: Option<&str>, phase: LeasePhase) -> ConnectCtx {
+    fn test_ctx(lease_name: &str, token: &str) -> ConnectCtx {
+        let binding = LeaseBinding {
+            binding_id: format!("binding-{lease_name}"),
+            lease: crate::crd::ResourceRef {
+                name: lease_name.to_string(),
+                uid: Some(format!("{lease_name}-uid")),
+            },
+            instance: crate::crd::BoundInstanceRef {
+                name: "pool-ci-small-6".to_string(),
+                uid: format!("{lease_name}-instance-uid"),
+                observed_generation: 1,
+            },
+            pool: crate::crd::ResourceRef {
+                name: "ci-small".to_string(),
+                uid: Some("pool-uid".to_string()),
+            },
+            backend: crate::crd::BackendProvenance::from_config(
+                &crate::crd::BackendConfig::default(),
+            )
+            .unwrap(),
+            instance_spec_digest: "0123456789abcdef".to_string(),
+        };
         ConnectCtx {
             cached_at: Instant::now(),
             token: token.to_string(),
             cluster_name: "pool-ci-small-6".to_string(),
-            expires_at: expires_at.map(str::to_string),
-            phase,
+            binding,
             backend: BackendAccess {
                 server: "https://backend.svc:6443".to_string(),
                 client: reqwest::Client::new(),
@@ -2822,13 +2818,12 @@ mod tests {
     #[test]
     fn connect_cache_hit_within_ttl_matching_token() {
         let cache = ConnectCache::default();
-        cache.insert(
-            "lease-1".to_string(),
-            test_ctx("good-token", None, LeasePhase::Bound),
-        );
+        cache.insert("lease-1".to_string(), test_ctx("lease-1", "good-token"));
 
         match cache.lookup("lease-1", "good-token") {
-            CacheLookup::Hit(ctx) => {
+            CacheLookup::Hit(key, ctx) => {
+                assert_eq!(key.lease_uid, "lease-1-uid");
+                assert_eq!(key.instance_uid, "lease-1-instance-uid");
                 assert_eq!(ctx.cluster_name, "pool-ci-small-6");
                 assert_eq!(ctx.backend.server, "https://backend.svc:6443");
                 assert_eq!(ctx.backend.bearer_token.as_deref(), Some("backend-bearer"));
@@ -2843,10 +2838,7 @@ mod tests {
         // A presented token that does not match the cached token must MISS so it
         // is forced back through full revalidation — never served cached context.
         let cache = ConnectCache::default();
-        cache.insert(
-            "lease-1".to_string(),
-            test_ctx("good-token", None, LeasePhase::Bound),
-        );
+        cache.insert("lease-1".to_string(), test_ctx("lease-1", "good-token"));
 
         assert!(
             matches!(cache.lookup("lease-1", "wrong-token"), CacheLookup::Miss),
@@ -2854,7 +2846,7 @@ mod tests {
         );
         // The non-matching lookup must not have evicted the valid entry.
         assert!(
-            matches!(cache.lookup("lease-1", "good-token"), CacheLookup::Hit(_)),
+            matches!(cache.lookup("lease-1", "good-token"), CacheLookup::Hit(..)),
             "the original entry should still be present after a mismatch"
         );
     }
@@ -2862,14 +2854,11 @@ mod tests {
     #[test]
     fn connect_cache_miss_when_stale() {
         let cache = ConnectCache::default();
-        cache.insert(
-            "lease-1".to_string(),
-            test_ctx("good-token", None, LeasePhase::Bound),
-        );
+        cache.insert("lease-1".to_string(), test_ctx("lease-1", "good-token"));
         // Age the entry past the TTL without sleeping.
         {
             let mut map = cache.0.lock().unwrap();
-            let entry = map.get_mut("lease-1").unwrap();
+            let entry = map.values_mut().next().unwrap();
             entry.cached_at = Instant::now()
                 .checked_sub(CONNECT_CACHE_TTL + std::time::Duration::from_secs(1))
                 .expect("instant underflow");
@@ -2892,18 +2881,11 @@ mod tests {
         // Mirrors the expired-on-hit path: a hit that is then found expired
         // evicts the entry so a stale context can't be served again.
         let cache = ConnectCache::default();
-        let past = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
-        cache.insert(
-            "lease-1".to_string(),
-            test_ctx("good-token", Some(&past), LeasePhase::Bound),
-        );
+        cache.insert("lease-1".to_string(), test_ctx("lease-1", "good-token"));
 
-        // The entry is a fresh, token-matching hit...
-        let CacheLookup::Hit(ctx) = cache.lookup("lease-1", "good-token") else {
+        let CacheLookup::Hit(_, _) = cache.lookup("lease-1", "good-token") else {
             panic!("expected a hit");
         };
-        // ...but its lease has expired, which the handler re-checks per request.
-        assert!(lease_is_expired(ctx.expires_at.as_deref()));
         cache.evict("lease-1");
 
         assert!(
@@ -2917,21 +2899,48 @@ mod tests {
         // `insert` opportunistically prunes entries older than the TTL while it
         // holds the lock, so the map only ever retains active leases.
         let cache = ConnectCache::default();
-        cache.insert("stale".to_string(), test_ctx("t", None, LeasePhase::Bound));
+        cache.insert("stale".to_string(), test_ctx("stale", "t"));
         {
             let mut map = cache.0.lock().unwrap();
-            let entry = map.get_mut("stale").unwrap();
+            let entry = map.values_mut().next().unwrap();
             entry.cached_at = Instant::now()
                 .checked_sub(CONNECT_CACHE_TTL + std::time::Duration::from_secs(1))
                 .expect("instant underflow");
         }
 
         // Inserting a fresh, unrelated lease should prune the stale one.
-        cache.insert("fresh".to_string(), test_ctx("t2", None, LeasePhase::Bound));
+        cache.insert("fresh".to_string(), test_ctx("fresh", "t2"));
 
         let map = cache.0.lock().unwrap();
-        assert!(!map.contains_key("stale"), "stale entry should be pruned");
-        assert!(map.contains_key("fresh"), "fresh entry should remain");
+        assert!(
+            !map.keys().any(|key| key.lease_name == "stale"),
+            "stale entry should be pruned"
+        );
+        assert!(
+            map.keys().any(|key| key.lease_name == "fresh"),
+            "fresh entry should remain"
+        );
+    }
+
+    #[test]
+    fn connect_cache_replaces_same_name_when_uid_fence_changes() {
+        let cache = ConnectCache::default();
+        cache.insert("lease-1".to_string(), test_ctx("lease-1", "old-token"));
+        let mut replacement = test_ctx("lease-1", "new-token");
+        replacement.binding.lease.uid = Some("replacement-lease-uid".to_string());
+        replacement.binding.instance.uid = "replacement-instance-uid".to_string();
+        cache.insert("lease-1".to_string(), replacement);
+
+        assert!(matches!(
+            cache.lookup("lease-1", "old-token"),
+            CacheLookup::Miss
+        ));
+        let CacheLookup::Hit(key, _) = cache.lookup("lease-1", "new-token") else {
+            panic!("replacement fence should be cached");
+        };
+        assert_eq!(key.lease_uid, "replacement-lease-uid");
+        assert_eq!(key.instance_uid, "replacement-instance-uid");
+        assert_eq!(cache.0.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3113,12 +3122,164 @@ mod tests {
         (build_router(state), server)
     }
 
+    /// Release is a mutation, so it must pin the exact object it authorized.
+    ///
+    /// Reading by name and then patching by name leaves a window: if the lease
+    /// is deleted and another requester creates one with the same name, a merge
+    /// patch releases *their* lease. The `test` ops make the API server refuse
+    /// instead, and a rejected precondition surfaces as 404 rather than 500.
+    #[tokio::test]
+    async fn release_is_uid_fenced() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let state = AppState {
+            client,
+            backend: crate::testutil::MockBackend::new(),
+            namespace: "test-ns".to_string(),
+            authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+        };
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "rel-1",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "rel-1",
+                &test_identity().identity,
+                "Released",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+
+        let response = release_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("rel-1".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|req| req.method == http::Method::PATCH)
+            .expect("release must issue a status PATCH");
+        assert_eq!(
+            patch
+                .headers
+                .get("content-type")
+                .map(|value| value.to_str().unwrap()),
+            Some("application/json-patch+json"),
+            "a merge patch cannot express a precondition; release must use JSON Patch"
+        );
+        let ops: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        let tests: Vec<(&str, &serde_json::Value)> = ops
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|op| op["op"] == "test")
+            .map(|op| (op["path"].as_str().unwrap(), &op["value"]))
+            .collect();
+        assert!(
+            tests.contains(&("/metadata/uid", &serde_json::json!("rel-1-uid"))),
+            "release must pin the exact lease UID: {tests:?}"
+        );
+        assert!(
+            tests
+                .iter()
+                .any(|(path, _)| *path == "/metadata/resourceVersion"),
+            "release must pin the observed resourceVersion: {tests:?}"
+        );
+    }
+
+    /// A rejected precondition means the authorized object is gone; report 404
+    /// (the same answer an unowned lease gets) rather than a 500.
+    #[tokio::test]
+    async fn release_reports_precondition_failure_as_not_found() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let state = AppState {
+            client,
+            backend: crate::testutil::MockBackend::new(),
+            namespace: "test-ns".to_string(),
+            authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+        };
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-2",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object_json(
+                "rel-2",
+                &test_identity().identity,
+                "Bound",
+                Some("pool-ci-small-6"),
+            )))
+            .mount(&server)
+            .await;
+        // What the API server returns when a JSON Patch `test` op fails.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/rel-2/status",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the object has been modified",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .mount(&server)
+            .await;
+
+        let response = release_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Path("rel-2".to_string()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a failed precondition must not surface as a 500"
+        );
+    }
+
     fn lease_object_json(
         name: &str,
         requester_identity: &str,
         phase: &str,
         cluster_name: Option<&str>,
     ) -> serde_json::Value {
+        let binding = cluster_name.map(|cluster_name| exact_connect_binding(name, cluster_name));
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "ClusterLease",
@@ -3126,6 +3287,7 @@ mod tests {
                 "name": name,
                 "namespace": "test-ns",
                 "uid": format!("{name}-uid"),
+                "resourceVersion": "10",
             },
             "spec": {
                 "poolRef": "ci-small",
@@ -3139,6 +3301,7 @@ mod tests {
             "status": {
                 "phase": phase,
                 "clusterName": cluster_name,
+                "binding": binding,
                 // Future expiry so the connect proxy's TTL gate treats it as live.
                 "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
                 "queuePosition": 0
@@ -3147,18 +3310,165 @@ mod tests {
     }
 
     fn secret_object_json(name: &str, token: &str) -> serde_json::Value {
+        let lease_name = name.strip_suffix("-connect-token").unwrap_or(name);
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
             "metadata": {
                 "name": name,
                 "namespace": "test-ns",
+                "uid": format!("{name}-uid"),
+                "resourceVersion": "5",
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterLease",
+                    "name": lease_name,
+                    "uid": format!("{lease_name}-uid")
+                }]
             },
             "data": {
                 "token": base64::engine::general_purpose::STANDARD.encode(token)
             },
             "type": "Opaque"
         })
+    }
+
+    fn exact_connect_binding(lease_name: &str, cluster_name: &str) -> LeaseBinding {
+        LeaseBinding {
+            binding_id: format!("binding-{lease_name}"),
+            lease: crate::crd::ResourceRef {
+                name: lease_name.to_string(),
+                uid: Some(format!("{lease_name}-uid")),
+            },
+            instance: crate::crd::BoundInstanceRef {
+                name: cluster_name.to_string(),
+                uid: format!("{cluster_name}-uid"),
+                observed_generation: 1,
+            },
+            pool: crate::crd::ResourceRef {
+                name: "ci-small".to_string(),
+                uid: Some("ci-small-uid".to_string()),
+            },
+            backend: crate::crd::BackendProvenance::from_config(
+                &crate::crd::BackendConfig::default(),
+            )
+            .unwrap(),
+            instance_spec_digest: "0123456789abcdef".to_string(),
+        }
+    }
+
+    fn exact_connect_instance_json(lease_name: &str, cluster_name: &str) -> serde_json::Value {
+        let binding = exact_connect_binding(lease_name, cluster_name);
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": cluster_name,
+                "namespace": "test-ns",
+                "uid": format!("{cluster_name}-uid"),
+                "resourceVersion": "20",
+                "generation": 1,
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterPool",
+                    "name": "ci-small",
+                    "uid": "ci-small-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "poolRef": { "name": "ci-small", "uid": "ci-small-uid" } },
+            "status": {
+                "phase": "Leased",
+                "provisioned": true,
+                "bootstrapped": true,
+                "leaseRef": { "name": lease_name, "uid": format!("{lease_name}-uid") },
+                "binding": binding,
+                "specHash": "0123456789abcdef",
+                "createdWith": {
+                    "operatorVersion": "v0.37.0",
+                    "backendType": "k3s",
+                    "poolUid": "ci-small-uid",
+                    "backend": crate::crd::BackendProvenance::from_config(
+                        &crate::crd::BackendConfig::default(),
+                    ).unwrap()
+                }
+            }
+        })
+    }
+
+    fn exact_connect_pool_json() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "metadata": {
+                "name": "ci-small",
+                "namespace": "test-ns",
+                "uid": "ci-small-uid",
+                "resourceVersion": "30"
+            },
+            "spec": {
+                "size": 1,
+                "backend": { "type": "k3s" },
+                "cluster": { "version": "v1.32.0" }
+            }
+        })
+    }
+
+    fn kubeconfig_secret_json(cluster_name: &str, kubeconfig: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": format!("{cluster_name}-kubeconfig"),
+                "namespace": "test-ns",
+                "uid": format!("{cluster_name}-kubeconfig-uid")
+            },
+            "data": {
+                "kubeconfig": base64::engine::general_purpose::STANDARD.encode(kubeconfig)
+            }
+        })
+    }
+
+    async fn mount_exact_connect_objects(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-ci-small-6",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(exact_connect_instance_json(
+                "lease-abc",
+                "pool-ci-small-6",
+            )))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/ci-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(exact_connect_pool_json()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_backend_kubeconfig(
+        server: &wiremock::MockServer,
+        kubeconfig: &str,
+        expected_reads: std::ops::RangeInclusive<u64>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/pool-ci-small-6-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(kubeconfig_secret_json("pool-ci-small-6", kubeconfig)),
+            )
+            .expect(expected_reads)
+            .mount(server)
+            .await;
     }
 
     async fn response_json(response: Response) -> serde_json::Value {
@@ -3356,6 +3666,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_exact_connect_objects(&server).await;
 
         let mut headers = HeaderMap::new();
         headers.insert(HOST, "kobe.example".parse().unwrap());
@@ -3385,18 +3696,21 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
         let backend = crate::testutil::MockBackend::new();
-        backend.set_kubeconfig(&format!(
+        let backend_kubeconfig = format!(
             "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
             server.uri()
-        ));
+        );
+        backend.set_kubeconfig(&backend_kubeconfig);
         let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let datastore = crate::backend::datastore::SharedDatastore::default();
+        let factory = BackendFactory::new(client.clone(), datastore.clone());
         let state = AppState {
             client,
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
-            factory: None,
-            datastore: Default::default(),
+            factory: Some(factory),
+            datastore,
             connect_cache: Default::default(),
         };
 
@@ -3413,6 +3727,8 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_exact_connect_objects(&server).await;
+        mount_backend_kubeconfig(&server, &backend_kubeconfig, 1..=1).await;
         Mock::given(method("GET"))
             .and(path_regex(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
@@ -3450,37 +3766,51 @@ mod tests {
         assert_eq!(response_text(response).await, r#"{"gitVersion":"v1.32.0"}"#);
     }
 
-    /// A miss populates the per-lease cache, and a subsequent request HITS it:
-    /// the second request must NOT re-read the connect-token Secret or re-GET
-    /// the lease. We assert this by mounting those two kube mocks with
-    /// `expect(1)` (wiremock fails on drop if they're hit more than once) while
-    /// the backend `/version` mock allows both requests through.
+    /// A miss populates the per-lease cache, and a subsequent request HITS it.
+    ///
+    /// The cache is a *credential* cache, never an *authorization* cache. It
+    /// pins exactly which work a hit is allowed to skip:
+    ///
+    /// - skipped on a hit: the connect-token Secret read and the backend
+    ///   kubeconfig read (both `expect(1)` — the expensive, mintable part);
+    /// - repeated on every hit: the UID-fenced binding resolution, which
+    ///   re-GETs the lease (`expect(2)`) so release, expiry, or a rebind to a
+    ///   different `ClusterInstance` UID is observed on the *next* request
+    ///   rather than at cache-TTL expiry.
+    ///
+    /// wiremock fails on server drop if any count is off, so these numbers are
+    /// the assertion. Dropping the lease GET to 1 would mean a released lease
+    /// keeps proxying until its cache entry ages out — the exact hole #79
+    /// closes.
     #[tokio::test]
     async fn test_connect_proxy_caches_lease_context_across_requests() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
         let backend = crate::testutil::MockBackend::new();
-        backend.set_kubeconfig(&format!(
+        let backend_kubeconfig = format!(
             "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
             server.uri()
-        ));
+        );
+        backend.set_kubeconfig(&backend_kubeconfig);
         let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let datastore = crate::backend::datastore::SharedDatastore::default();
+        let factory = BackendFactory::new(client.clone(), datastore.clone());
         let state = AppState {
             client,
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
-            factory: None,
-            datastore: Default::default(),
+            factory: Some(factory),
+            datastore,
             connect_cache: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
 
-        // The token Secret and lease GETs may happen AT MOST once: the second
-        // request must be served from cache.
+        // Token authentication runs only on the cold miss; the hit reuses the
+        // cached, token-fenced entry.
         Mock::given(method("GET"))
             .and(path_regex(
                 "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
@@ -3492,6 +3822,8 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        mount_exact_connect_objects(&server).await;
+        mount_backend_kubeconfig(&server, &backend_kubeconfig, 1..=1).await;
         Mock::given(method("GET"))
             .and(path_regex(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",
@@ -3502,7 +3834,9 @@ mod tests {
                 "Bound",
                 Some("pool-ci-small-6"),
             )))
-            .expect(1)
+            // Once per request: the hit re-runs `resolve_lease_binding` so the
+            // UID fence is re-checked, not trusted from cache.
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -3532,7 +3866,7 @@ mod tests {
         assert!(
             matches!(
                 state.connect_cache.lookup("lease-abc", "lease-token"),
-                CacheLookup::Hit(_)
+                CacheLookup::Hit(..)
             ),
             "the miss should have populated the cache"
         );
@@ -3557,18 +3891,21 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
         let backend = crate::testutil::MockBackend::new();
-        backend.set_kubeconfig(&format!(
+        let backend_kubeconfig = format!(
             "apiVersion: v1\nkind: Config\nclusters:\n- name: default\n  cluster:\n    server: {}\nusers:\n- name: default\n  user:\n    token: backend-token\n",
             server.uri()
-        ));
+        );
+        backend.set_kubeconfig(&backend_kubeconfig);
         let authenticator = Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string()));
+        let datastore = crate::backend::datastore::SharedDatastore::default();
+        let factory = BackendFactory::new(client.clone(), datastore.clone());
         let state = AppState {
             client,
             backend,
             namespace: "test-ns".to_string(),
             authenticator,
-            factory: None,
-            datastore: Default::default(),
+            factory: Some(factory),
+            datastore,
             connect_cache: Default::default(),
         };
 
@@ -3585,6 +3922,8 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_exact_connect_objects(&server).await;
+        mount_backend_kubeconfig(&server, &backend_kubeconfig, 1..=1).await;
         Mock::given(method("GET"))
             .and(path_regex(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterleases/lease-abc",

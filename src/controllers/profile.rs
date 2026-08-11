@@ -1682,6 +1682,13 @@ async fn ensure_cluster_instance(
     // `CARGO_PKG_VERSION` here would always stamp `"0.0.0"`, defeating
     // the entire point of provenance. Same env var that
     // `kobe --version` prints, so the two surfaces stay in sync.
+    let pool_uid = profile
+        .metadata
+        .uid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ClusterPool {} has no UID", profile.name_any()))?;
+    let backend_provenance = crate::crd::BackendProvenance::from_config(&profile.spec.backend)
+        .map_err(|err| anyhow::anyhow!("failed to encode backend provenance: {err}"))?;
     let provenance = crate::crd::ClusterInstanceProvenance {
         operator_version: env!("BUILD_VERSION").to_string(),
         kobe_sync_image: matches!(
@@ -1693,6 +1700,8 @@ async fn ensure_cluster_instance(
         // delete / health / addon dispatches use the right backend
         // even after a pool-level backend migration.
         backend_type: Some(profile.spec.backend.backend_type.clone()),
+        pool_uid: Some(pool_uid.clone()),
+        backend: Some(backend_provenance),
     };
 
     let initial_status = ClusterInstanceStatus {
@@ -1724,6 +1733,7 @@ async fn ensure_cluster_instance(
         spec: crate::crd::ClusterInstanceSpec {
             pool_ref: Some(ResourceRef {
                 name: profile.name_any(),
+                uid: Some(pool_uid),
             }),
             backend: None,
             cluster: None,
@@ -1896,7 +1906,10 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
         // its phase and idle timer: preserve what is on disk rather than
         // overwriting from memory. Same rule as `spec_hash` below — stale
         // in-memory state must not clobber a fresher on-disk value.
-        let lease_held = current.lease_ref.is_some();
+        // Either reciprocal handle fences the instance out of the warm pool.
+        // In particular, an invalid/legacy binding must remain unavailable
+        // even if its display-only leaseRef is missing or stale.
+        let lease_held = current.lease_ref.is_some() || current.binding.is_some();
         let phase = if lease_held {
             current.phase.clone()
         } else {

@@ -557,6 +557,17 @@ spec:
                 nullable: true
                 properties:
                   name:
+                    description: |-
+                      Resource name. Names are display and lookup handles, never sufficient
+                      authority on their own because Kubernetes permits name reuse.
+                    type: string
+                  uid:
+                    description: |-
+                      Kubernetes UID of the referenced object. New controller-written
+                      references always set this. `None` is accepted only so pre-UID-fence
+                      objects remain readable; security-sensitive consumers must fail closed
+                      or run the proof-based legacy migration before using the reference.
+                    nullable: true
                     type: string
                 required:
                 - name
@@ -633,6 +644,133 @@ spec:
                 description: Bootstrap currently running for this instance, if any.
                 nullable: true
                 type: string
+              binding:
+                description: |-
+                  Authoritative reciprocal lease binding. New bindings always set this
+                  before an instance enters `Leased`; it is retained through release and
+                  recycling until exact teardown deletes the instance. `None` exists only
+                  for legacy/unbound objects and is omitted from Merge Patches so unrelated
+                  status writers cannot erase a valid binding.
+                nullable: true
+                properties:
+                  backend:
+                    description: |-
+                      Immutable, non-secret data needed to select the backend that created an
+                      instance without trusting the owning pool's mutable current spec.
+
+                      `config_digest` covers the complete serialized [`BackendConfig`], including
+                      backend-specific settings, while this status record stores only the bounded
+                      dispatch fields needed after creation. Secret *values* are never copied;
+                      configuration may contain Secret names, and the digest reveals no raw
+                      credential material.
+                    properties:
+                      capi:
+                        description: |-
+                          CAPI discovery identity required to reconstruct delete dispatch.
+                          Provider `infrastructureSpec` is deliberately excluded because it may
+                          contain sensitive provider data and is not needed for dispatch.
+                        nullable: true
+                        properties:
+                          infrastructureApiVersion:
+                            type: string
+                          infrastructureKind:
+                            type: string
+                          infrastructurePlural:
+                            nullable: true
+                            type: string
+                        required:
+                        - infrastructureApiVersion
+                        - infrastructureKind
+                        type: object
+                      configDigest:
+                        description: |-
+                          SHA-256 of the canonical JSON serialization of the complete backend
+                          configuration at creation/bind time. A changed pool backend therefore
+                          cannot silently redirect access or teardown.
+                        type: string
+                      type:
+                        description: Backend implementation that created the instance.
+                        enum:
+                        - k3s
+                        - k0s
+                        - capi
+                        - vkobe
+                        - vcluster
+                        type: string
+                    required:
+                    - configDigest
+                    - type
+                    type: object
+                  bindingId:
+                    description: Random immutable identifier unique to this reservation attempt.
+                    type: string
+                  instance:
+                    description: UID- and generation-fenced identity of the bound `ClusterInstance`.
+                    properties:
+                      name:
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          `metadata.generation` observed before reservation. Any later spec
+                          substitution invalidates the capability, even when name and UID remain.
+                        format: int64
+                        type: integer
+                      uid:
+                        type: string
+                    required:
+                    - name
+                    - observedGeneration
+                    - uid
+                    type: object
+                  instanceSpecDigest:
+                    description: Instance creation/spec digest observed when the pair was bound.
+                    type: string
+                  lease:
+                    description: Reference to another Kobe-managed resource in the same namespace.
+                    properties:
+                      name:
+                        description: |-
+                          Resource name. Names are display and lookup handles, never sufficient
+                          authority on their own because Kubernetes permits name reuse.
+                        type: string
+                      uid:
+                        description: |-
+                          Kubernetes UID of the referenced object. New controller-written
+                          references always set this. `None` is accepted only so pre-UID-fence
+                          objects remain readable; security-sensitive consumers must fail closed
+                          or run the proof-based legacy migration before using the reference.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  pool:
+                    description: Reference to another Kobe-managed resource in the same namespace.
+                    properties:
+                      name:
+                        description: |-
+                          Resource name. Names are display and lookup handles, never sufficient
+                          authority on their own because Kubernetes permits name reuse.
+                        type: string
+                      uid:
+                        description: |-
+                          Kubernetes UID of the referenced object. New controller-written
+                          references always set this. `None` is accepted only so pre-UID-fence
+                          objects remain readable; security-sensitive consumers must fail closed
+                          or run the proof-based legacy migration before using the reference.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - backend
+                - bindingId
+                - instance
+                - instanceSpecDigest
+                - lease
+                - pool
+                type: object
               bootstrapped:
                 default: false
                 description: Whether all configured bootstrap steps have completed successfully.
@@ -717,6 +855,47 @@ spec:
                   preserves the original write through every subsequent patch.
                 nullable: true
                 properties:
+                  backend:
+                    description: Immutable non-secret backend dispatch provenance captured at creation.
+                    nullable: true
+                    properties:
+                      capi:
+                        description: |-
+                          CAPI discovery identity required to reconstruct delete dispatch.
+                          Provider `infrastructureSpec` is deliberately excluded because it may
+                          contain sensitive provider data and is not needed for dispatch.
+                        nullable: true
+                        properties:
+                          infrastructureApiVersion:
+                            type: string
+                          infrastructureKind:
+                            type: string
+                          infrastructurePlural:
+                            nullable: true
+                            type: string
+                        required:
+                        - infrastructureApiVersion
+                        - infrastructureKind
+                        type: object
+                      configDigest:
+                        description: |-
+                          SHA-256 of the canonical JSON serialization of the complete backend
+                          configuration at creation/bind time. A changed pool backend therefore
+                          cannot silently redirect access or teardown.
+                        type: string
+                      type:
+                        description: Backend implementation that created the instance.
+                        enum:
+                        - k3s
+                        - k0s
+                        - capi
+                        - vkobe
+                        - vcluster
+                        type: string
+                    required:
+                    - configDigest
+                    - type
+                    type: object
                   backendType:
                     description: Which backend to use for cluster provisioning.
                     enum:
@@ -740,6 +919,13 @@ spec:
                       Semver of the kobe-operator binary that created this instance,
                       taken from `env!("CARGO_PKG_VERSION")` at create time. Example:
                       `"0.17.0"`.
+                    type: string
+                  poolUid:
+                    description: |-
+                      UID of the owning pool at instance creation. Missing on legacy or
+                      standalone instances; pool-managed security-sensitive operations must
+                      not infer it from a same-named current pool.
+                    nullable: true
                     type: string
                 required:
                 - operatorVersion
@@ -767,15 +953,25 @@ spec:
                   Lease currently attached to this instance.
 
                   Intentionally NO `skip_serializing_if`: unlike the write-once
-                  `spec_hash`/`created_with` fields, `lease_ref` is *actively managed* —
-                  set when a lease binds and written back to `None` to **clear** it when
-                  the lease is released/recycled. `None` is a meaningful "clear" signal,
-                  so it must serialize as `null` (the Merge-Patch delete) rather than be
-                  omitted. Adding `skip_serializing_if` here would make a released
-                  instance keep a stale `lease_ref` forever.
+                  `spec_hash`/`created_with` fields, `lease_ref` is *actively managed*.
+                  It is set at bind, retained through release/recycling as a teardown
+                  handle, and cleared only when an exact orphan reservation is safely
+                  returned to Ready. `None` is therefore a meaningful clear signal and
+                  must serialize as `null` rather than be omitted.
                 nullable: true
                 properties:
                   name:
+                    description: |-
+                      Resource name. Names are display and lookup handles, never sufficient
+                      authority on their own because Kubernetes permits name reuse.
+                    type: string
+                  uid:
+                    description: |-
+                      Kubernetes UID of the referenced object. New controller-written
+                      references always set this. `None` is accepted only so pre-UID-fence
+                      objects remain readable; security-sensitive consumers must fail closed
+                      or run the proof-based legacy migration before using the reference.
+                    nullable: true
                     type: string
                 required:
                 - name

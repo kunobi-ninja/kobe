@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
 use kube::{Client, ResourceExt};
@@ -13,8 +13,9 @@ use tracing::{debug, error, info, warn};
 use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
-    ClusterInstance, ClusterInstancePhase, ClusterLease, ClusterLeaseCondition, ClusterLeaseStatus,
-    ClusterPool, ClusterPoolPhase, ClusterPoolStatus, LeasePhase,
+    BackendProvenance, BoundInstanceRef, ClusterInstance, ClusterInstancePhase, ClusterLease,
+    ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase, ClusterPoolStatus,
+    LeaseBinding, LeasePhase, ResourceRef,
 };
 use crate::diagnostics;
 use crate::pool::{PoolState, parse_duration};
@@ -22,6 +23,11 @@ use crate::pool::{PoolState, parse_duration};
 /// Shared state for the lease controller.
 pub struct LeaseContext<B: ClusterBackend> {
     pub client: Client,
+    /// Ambient default backend. **Never an authorization or dispatch input.**
+    /// Teardown and access dispatch resolve through the binding's immutable
+    /// `BackendProvenance` (see #79), so production code no longer reads this;
+    /// only the controller tests still inspect it for call counts.
+    #[allow(dead_code)]
     pub backend: B,
     /// Legacy shared pool cache kept during the ClusterInstance migration.
     #[allow(dead_code)]
@@ -237,42 +243,25 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     };
 
     let status = lease.status.clone().unwrap_or_default();
-    if status.phase == LeasePhase::Pending && status.cluster_name.is_some() {
-        info!(
-            lease = %name,
-            cluster = ?status.cluster_name,
-            "Lease has an assigned cluster while still marked Pending; restoring Bound phase"
-        );
 
-        let mut repaired_status = ClusterLeaseStatus {
-            phase: LeasePhase::Bound,
-            cluster_name: status.cluster_name.clone(),
-            bound_at: status.bound_at.clone(),
-            expires_at: status.expires_at.clone(),
-            queue_position: 0,
-            diagnostics_url: status.diagnostics_url.clone(),
-            extensions_count: status.extensions_count,
-            max_extensions: status.max_extensions,
-            // Now bound: clear any stale "no Ready cluster" exhaustion message.
-            message: None,
-            conditions: Vec::new(),
-        };
-        repaired_status.conditions = derive_lease_conditions(
-            &repaired_status,
-            &status.conditions,
-            None,
-            &chrono::Utc::now().to_rfc3339(),
-        );
-
-        leases_api
-            .patch_status(
-                &name,
-                &PatchParams::apply("kobe-operator"),
-                &Patch::Merge(&serde_json::json!({ "status": repaired_status })),
-            )
-            .await?;
-        remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    // Pre-UID-fence controllers could crash after writing only clusterName.
+    // Never "repair" that name into authority. Backfill is permitted only
+    // after proving a unique reciprocal pair and immutable pool provenance.
+    if status.phase == LeasePhase::Pending
+        && status.cluster_name.is_some()
+        && status.binding.is_none()
+    {
+        match backfill_legacy_binding(&ctx.client, &ns, &lease).await? {
+            Some(binding) => {
+                finalize_binding(&ctx, &ns, &binding, created_at_for(&lease)).await?;
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+            }
+            None => {
+                mark_binding_unverified(&leases_api, &lease, "legacy_binding_unverified").await?;
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
+        }
     }
 
     let phase = &status.phase;
@@ -326,7 +315,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     "queuePosition": position
                 }
             });
-            leases_api
+            let queued_lease = leases_api
                 .patch_status(
                     &name,
                     &PatchParams::apply("kobe-operator"),
@@ -362,86 +351,16 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 return Ok(Action::requeue(std::time::Duration::from_secs(5)));
             }
 
-            let reserved_cluster =
-                reserve_ready_instance(&ctx.client, &ns, &lease.spec.pool_ref, &name).await?;
+            let reserved_binding = reserve_ready_instance(&ctx.client, &ns, &queued_lease).await?;
 
-            if let Some(cluster_name) = reserved_cluster {
-                let ttl =
-                    parse_duration(&lease.spec.ttl).unwrap_or_else(|| chrono::Duration::hours(1));
-                let now = chrono::Utc::now();
-                let expires_at = now + ttl;
-
-                let policy = ctx
-                    .authenticator
-                    .policy_for_requester_type(&lease.spec.requester.requester_type)
-                    .await;
-                let max_extensions = policy.map(|p| p.max_extensions).unwrap_or(2);
-                let mut new_status = ClusterLeaseStatus {
-                    phase: LeasePhase::Bound,
-                    cluster_name: Some(cluster_name.clone()),
-                    bound_at: Some(now.to_rfc3339()),
-                    expires_at: Some(expires_at.to_rfc3339()),
-                    queue_position: 0,
-                    diagnostics_url: None,
-                    extensions_count: 0,
-                    max_extensions,
-                    // Bound now: clear any prior "no Ready cluster" message.
-                    message: None,
-                    conditions: Vec::new(),
-                };
-                new_status.conditions = derive_lease_conditions(
-                    &new_status,
-                    &status.conditions,
-                    None,
-                    &now.to_rfc3339(),
-                );
-
-                let patch = serde_json::json!({ "status": new_status });
-                match leases_api
-                    .patch_status(
-                        &name,
-                        &PatchParams::apply("kobe-operator"),
-                        &Patch::Merge(&patch),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-
-                        let bind_duration =
-                            (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
-                        crate::metrics::CLAIM_BIND_DURATION
-                            .with_label_values(&[&lease.spec.pool_ref])
-                            .observe(bind_duration);
-
-                        // Same elapsed value as CLAIM_BIND_DURATION, but into the
-                        // wide-bucket, outcome-labelled backlog histogram so a
-                        // long queued wait doesn't saturate the fast-path SLI's
-                        // 30s ceiling (#189).
-                        crate::metrics::LEASE_QUEUE_WAIT_SECONDS
-                            .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
-                            .observe(bind_duration);
-
-                        crate::metrics::CLAIMS_TOTAL
-                            .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
-                            .inc();
-
-                        info!(
-                            lease = %name,
-                            cluster = %cluster_name,
-                            expires_at = %expires_at,
-                            bind_seconds = bind_duration,
-                            "Lease bound to cluster"
-                        );
-
-                        Ok(Action::requeue(std::time::Duration::from_secs(60)))
-                    }
-                    Err(e) => {
-                        warn!(lease = %name, cluster = %cluster_name, "Bind patch failed, rolling back reservation");
-                        rollback_instance_reservation(&ctx.client, &ns, &cluster_name).await;
-                        Err(LeaseError::Kube(e))
-                    }
-                }
+            if let Some(binding) = reserved_binding {
+                // The instance reservation is durable. If this final status
+                // write fails or the process stops, the next reconcile sees
+                // the same lease-side intent and finishes the same pair. It
+                // must not roll back on an uncertain response.
+                finalize_binding(&ctx, &ns, &binding, created_at).await?;
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                Ok(Action::requeue(std::time::Duration::from_secs(60)))
             } else {
                 // No Ready cluster to bind. Populate status.message with the
                 // pool's health so a client can tell "warming up" from "this
@@ -578,6 +497,11 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
             remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
+            let Some(lease_uid) = lease.metadata.uid.as_deref() else {
+                mark_binding_unverified(&leases_api, &lease, "lease_uid_missing").await?;
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            };
+
             // Explicitly delete the lease's connect-token Secret now, rather
             // than waiting for owner-ref GC when the lease CRD is deleted at the
             // end of Recycling (#178). Closes the window where a released lease's
@@ -585,10 +509,27 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             // also bounded per-request by the proxy phase/expiry re-check (#116).
             // Best-effort: a failure must not abort recycling.
             if let Err(e) =
-                crate::api::connect::delete_lease_connect_token(&ctx.client, &ns, &name).await
+                crate::api::connect::delete_lease_connect_token(&ctx.client, &ns, &name, lease_uid)
+                    .await
             {
                 warn!(lease = %name, "best-effort connect-token delete failed (continuing): {e:#}");
             }
+
+            let resolved = match crate::lease_binding::resolve_lease_binding(
+                &ctx.client,
+                &ns,
+                &name,
+                lease_uid,
+                crate::lease_binding::BindingResolveMode::Lifecycle,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    mark_binding_unverified(&leases_api, &lease, err.reason_code()).await?;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                }
+            };
 
             // Capture diagnostics BEFORE flipping to Recycling: the cluster is
             // still alive (we mark the instance recycling only after the patch
@@ -597,83 +538,102 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             // `?` below, while the lease is still Released/Expired — instead of
             // losing the URL (the Recycling arm never re-captures).
             let mut diag_url: Option<String> = None;
-            if let Some(cluster_name) = &status.cluster_name {
-                let profile = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await;
-                if let Some(ref profile) = profile
-                    && let Some(ref diag_config) = profile.spec.diagnostics
-                    && diag_config.enabled
-                {
-                    info!(lease = %name, "Capturing diagnostic bundle");
-                    match diagnostics::capture_bundle(
-                        cluster_name,
-                        &ns,
-                        diag_config,
-                        &name,
-                        &ctx.backend,
-                    )
+            let cluster_name = &resolved.binding.instance.name;
+            if let Some(ref diag_config) = resolved.pool.spec.diagnostics
+                && diag_config.enabled
+            {
+                let factory = ctx.factory.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("backend factory unavailable for pinned diagnostics")
+                })?;
+                let backend = factory
+                    .backend_for_provenance(&resolved.binding.backend)
+                    .map_err(LeaseError::Lifecycle)?;
+                info!(lease = %name, "Capturing diagnostic bundle");
+                match diagnostics::capture_bundle(cluster_name, &ns, diag_config, &name, &backend)
                     .await
-                    {
-                        Ok(url) => diag_url = Some(url),
-                        Err(e) => warn!(
-                            lease = %name,
-                            cluster = %cluster_name,
-                            "Failed to capture diagnostic bundle: {e:#}"
-                        ),
-                    }
+                {
+                    Ok(url) => diag_url = Some(url),
+                    Err(e) => warn!(
+                        lease = %name,
+                        cluster = %cluster_name,
+                        "Failed to capture diagnostic bundle: {e:#}"
+                    ),
                 }
             }
 
-            let recycling_status = ClusterLeaseStatus {
-                phase: LeasePhase::Recycling,
-                ..Default::default()
-            };
+            if !mark_instance_recycling(&ctx.client, &ns, &resolved.binding).await? {
+                mark_binding_unverified(&leases_api, &lease, "instance_recycle_fence_failed")
+                    .await?;
+                return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+            }
+
+            let mut recycling_status = status.clone();
+            recycling_status.phase = LeasePhase::Recycling;
+            if diag_url.is_some() {
+                recycling_status.diagnostics_url = diag_url;
+            }
             let conditions = derive_lease_conditions(
                 &recycling_status,
                 &status.conditions,
                 None,
                 &chrono::Utc::now().to_rfc3339(),
             );
-            let mut status_fields =
-                serde_json::json!({ "phase": "Recycling", "conditions": conditions });
-            if let Some(url) = &diag_url {
-                status_fields["diagnosticsUrl"] = serde_json::Value::String(url.clone());
-            }
+            recycling_status.conditions = conditions;
+            let lease_rv = lease
+                .resource_version()
+                .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+            let patch = json_patch(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+                { "op": "test", "path": "/status/binding", "value": resolved.binding },
+                { "op": "add", "path": "/status", "value": recycling_status }
+            ]));
             leases_api
-                .patch_status(
-                    &name,
-                    &PatchParams::apply("kobe-operator"),
-                    &Patch::Merge(&serde_json::json!({ "status": status_fields })),
-                )
+                .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
                 .await?;
-
-            if let Some(cluster_name) = &status.cluster_name {
-                mark_instance_recycling(&ctx.client, &ns, cluster_name).await;
-                debug!(cluster = %cluster_name, "Marked ClusterInstance recycling");
-            } else {
-                info!(lease = %name, "No cluster to recycle, lease will be cleaned up");
-            }
+            debug!(cluster = %cluster_name, "Marked exact ClusterInstance recycling");
 
             Ok(Action::requeue(std::time::Duration::from_secs(10)))
         }
 
         LeasePhase::Recycling => {
-            let cluster_gone = if let Some(cluster_name) = &status.cluster_name {
+            let cluster_gone = if let Some(binding) = &status.binding {
                 let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
-                match instances_api.get(cluster_name).await {
-                    Ok(_) => false,
+                match instances_api.get(&binding.instance.name).await {
+                    Ok(instance) => {
+                        if instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str()) {
+                            warn!(
+                                lease = %name,
+                                cluster = %binding.instance.name,
+                                reason = "instance_uid_mismatch",
+                                "Same-named replacement is not recycling completion"
+                            );
+                        } else if !mark_instance_recycling(&ctx.client, &ns, binding).await? {
+                            warn!(lease = %name, reason = "reciprocal_binding_mismatch", "Exact instance is not safe to recycle");
+                        }
+                        false
+                    }
                     Err(kube::Error::Api(ae)) if ae.code == 404 => true,
                     Err(e) => {
-                        warn!(lease = %name, cluster = %cluster_name, "Failed to query ClusterInstance during recycle: {e}");
+                        warn!(lease = %name, cluster = %binding.instance.name, "Failed to query ClusterInstance during recycle: {e}");
                         false
                     }
                 }
             } else {
-                true
+                mark_binding_unverified(&leases_api, &lease, "binding_missing").await?;
+                false
             };
 
             if cluster_gone {
                 info!(lease = %name, "Recycling complete, deleting lease CRD");
-                match leases_api.delete(&name, &Default::default()).await {
+                let delete_params = DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: lease.metadata.uid.clone(),
+                        resource_version: lease.resource_version(),
+                    }),
+                    ..Default::default()
+                };
+                match leases_api.delete(&name, &delete_params).await {
                     Ok(_) => {}
                     Err(kube::Error::Api(ae)) if ae.code == 404 => {
                         // Already deleted, that's fine
@@ -697,10 +657,23 @@ pub async fn extend_lease_ttl(
     namespace: &str,
     lease_name: &str,
     extend_by: &str,
+    expected_lease_uid: &str,
     authenticator: &JwtAuthenticator,
 ) -> Result<String, LeaseError> {
     let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
     let lease = leases_api.get(lease_name).await?;
+
+    // The caller authorized a specific object, not a name. A name-reused
+    // replacement belongs to whoever created it, so deny before touching it.
+    if lease.metadata.uid.as_deref() != Some(expected_lease_uid) {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "Cannot extend TTL: lease identity changed"
+        )));
+    }
+    let lease_rv = lease
+        .resource_version()
+        .ok_or_else(|| LeaseError::Lifecycle(anyhow::anyhow!("Lease has no resourceVersion")))?;
+
     let status = lease.status.clone().unwrap_or_default();
 
     if status.phase != LeasePhase::Bound {
@@ -763,17 +736,22 @@ pub async fn extend_lease_ttl(
         )));
     }
 
-    let patch = serde_json::json!({
-        "status": {
-            "expiresAt": new_expiry.to_rfc3339(),
-            "extensionsCount": status.extensions_count + 1
-        }
-    });
+    // JSON Patch, not Merge: `extensionsCount` is a read-modify-write, so the
+    // write must be conditional on the exact object and count we read.
+    // Otherwise two concurrent extends both observe N and both write N+1,
+    // spending one extension and letting the pair slip past `maxExtensions`.
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": expected_lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+        { "op": "test", "path": "/status/extensionsCount", "value": status.extensions_count },
+        { "op": "add", "path": "/status/expiresAt", "value": new_expiry.to_rfc3339() },
+        { "op": "add", "path": "/status/extensionsCount", "value": status.extensions_count + 1 }
+    ]));
     leases_api
         .patch_status(
             lease_name,
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
         )
         .await?;
 
@@ -791,18 +769,284 @@ pub async fn extend_lease_ttl(
     Ok(new_expiry.to_rfc3339())
 }
 
+fn created_at_for(lease: &ClusterLease) -> chrono::DateTime<chrono::Utc> {
+    lease
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .and_then(|timestamp| {
+            chrono::DateTime::parse_from_rfc3339(&timestamp.0.to_string())
+                .ok()
+                .map(|value| value.with_timezone(&chrono::Utc))
+        })
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// Complete a previously persisted two-sided reservation. The full status is
+/// replaced under UID/resourceVersion/phase/binding tests, so a replay either
+/// finishes this exact pair or conflicts without erasing newer state.
+async fn finalize_binding<B: ClusterBackend>(
+    ctx: &LeaseContext<B>,
+    namespace: &str,
+    binding: &LeaseBinding,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), LeaseError> {
+    let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    let lease = leases_api.get(&binding.lease.name).await?;
+    if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref() {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "lease UID changed while finalizing binding"
+        )));
+    }
+    let status = lease.status.clone().unwrap_or_default();
+    if status.phase == LeasePhase::Bound && status.binding.as_ref() == Some(binding) {
+        return Ok(());
+    }
+    if status.phase != LeasePhase::Pending || status.binding.as_ref() != Some(binding) {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "lease binding intent changed before finalization"
+        )));
+    }
+
+    let lease_uid = binding
+        .lease
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("binding missing lease UID"))?;
+    let lease_rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let ttl = parse_duration(&lease.spec.ttl).unwrap_or_else(|| chrono::Duration::hours(1));
+    let now = chrono::Utc::now();
+    let expires_at = now + ttl;
+    let max_extensions = ctx
+        .authenticator
+        .policy_for_requester_type(&lease.spec.requester.requester_type)
+        .await
+        .map(|policy| policy.max_extensions)
+        .unwrap_or(2);
+    let mut new_status = ClusterLeaseStatus {
+        phase: LeasePhase::Bound,
+        cluster_name: Some(binding.instance.name.clone()),
+        binding: Some(binding.clone()),
+        bound_at: Some(now.to_rfc3339()),
+        expires_at: Some(expires_at.to_rfc3339()),
+        queue_position: 0,
+        diagnostics_url: None,
+        extensions_count: 0,
+        max_extensions,
+        message: None,
+        conditions: Vec::new(),
+    };
+    new_status.conditions =
+        derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
+
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "add", "path": "/status", "value": new_status }
+    ]));
+    leases_api
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?;
+
+    let bind_duration = (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
+    crate::metrics::CLAIM_BIND_DURATION
+        .with_label_values(&[lease.spec.pool_ref.as_str()])
+        .observe(bind_duration);
+    crate::metrics::LEASE_QUEUE_WAIT_SECONDS
+        .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
+        .observe(bind_duration);
+    crate::metrics::CLAIMS_TOTAL
+        .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
+        .inc();
+    info!(
+        lease = %binding.lease.name,
+        cluster = %binding.instance.name,
+        expires_at = %expires_at,
+        bind_seconds = bind_duration,
+        "Lease bound to exact ClusterInstance"
+    );
+    Ok(())
+}
+
+async fn mark_binding_unverified(
+    leases_api: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    reason: &'static str,
+) -> Result<(), LeaseError> {
+    let uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("lease missing UID"))?;
+    let rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/status/message", "value": "binding unverified; access revoked; recycle/quarantine required" }
+    ]));
+    match leases_api
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => {
+            warn!(lease = %lease.name_any(), reason, "Lease binding is unavailable");
+            Ok(())
+        }
+        Err(err) if optimistic_conflict(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Upgrade a pre-schema name-only pair only when it is unique and all current
+/// immutable identities/provenance agree. Ambiguity returns `None` and leaves
+/// the objects unavailable for later verified teardown/quarantine.
+async fn backfill_legacy_binding(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+) -> Result<Option<LeaseBinding>, LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let Some(cluster_name) = status.cluster_name.as_deref() else {
+        return Ok(None);
+    };
+    if status.phase != LeasePhase::Pending || status.binding.is_some() {
+        return Ok(None);
+    }
+
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let instances = instances_api
+        .list(
+            &ListParams::default()
+                .labels(&format!("kobe.kunobi.ninja/pool={}", lease.spec.pool_ref)),
+        )
+        .await?;
+    let candidates: Vec<ClusterInstance> = instances
+        .into_iter()
+        .filter(|instance| {
+            instance.name_any() == cluster_name
+                && instance.status.as_ref().is_some_and(|instance_status| {
+                    instance_status.phase == ClusterInstancePhase::Leased
+                        && instance_status.binding.is_none()
+                        && instance_status.lease_ref.as_ref().is_some_and(|reference| {
+                            reference.name == lease.name_any() && reference.uid.is_none()
+                        })
+                })
+        })
+        .collect();
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+
+    // Prove there is no second lease claiming the same display handle.
+    let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let claims = leases_api.list(&ListParams::default()).await?;
+    let claimants = claims
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .status
+                .as_ref()
+                .and_then(|candidate_status| candidate_status.cluster_name.as_deref())
+                == Some(cluster_name)
+        })
+        .count();
+    if claimants != 1 {
+        return Ok(None);
+    }
+
+    let pools_api: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
+    let pool = pools_api.get(&lease.spec.pool_ref).await?;
+    let binding = match binding_from_observation(lease, &candidates[0], &pool) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            warn!(lease = %lease.name_any(), reason, "Legacy binding proof failed");
+            return Ok(None);
+        }
+    };
+    let lease_uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("lease missing UID"))?;
+    let lease_rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let intent_patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/clusterName", "value": cluster_name },
+        { "op": "add", "path": "/status/binding", "value": binding }
+    ]));
+    match leases_api
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(intent_patch),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) if optimistic_conflict(&err) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    if reserve_binding_instance(client, namespace, &binding).await? {
+        Ok(Some(binding))
+    } else {
+        clear_lease_binding_intent(client, namespace, lease_uid, &binding).await?;
+        Ok(None)
+    }
+}
+
 async fn reserve_ready_instance(
     client: &Client,
     namespace: &str,
-    pool_ref: &str,
-    lease_name: &str,
-) -> Result<Option<String>, LeaseError> {
+    lease: &ClusterLease,
+) -> Result<Option<LeaseBinding>, LeaseError> {
+    if let Some(binding) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.clone())
+    {
+        return if reserve_binding_instance(client, namespace, &binding).await? {
+            Ok(Some(binding))
+        } else {
+            clear_lease_binding_intent(client, namespace, lease_uid_for(lease)?, &binding).await?;
+            Ok(None)
+        };
+    }
+
     let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("kobe.kunobi.ninja/pool={pool_ref}"));
+    let lp =
+        ListParams::default().labels(&format!("kobe.kunobi.ninja/pool={}", lease.spec.pool_ref));
     let instances = instances_api.list(&lp).await?;
     let mut ready: Vec<ClusterInstance> = instances
         .into_iter()
         .filter(|instance| {
+            // An instance under deletion is not free capacity, however idle its
+            // status looks. Between `deletionTimestamp` being set and the
+            // finalizer completing, phase can still read Ready with no
+            // leaseRef; binding there would hand a tenant a cluster that is
+            // going away, and `resolve_lease_binding` would then refuse the
+            // connection (`InstanceDeleting`) on a lease that already reached
+            // Bound and consumed pool capacity.
+            if instance.metadata.deletion_timestamp.is_some() {
+                return false;
+            }
             instance
                 .status
                 .as_ref()
@@ -819,68 +1063,366 @@ async fn reserve_ready_instance(
         .collect();
     ready.sort_by_key(|instance| instance.name_any());
 
-    let Some(instance) = ready.first() else {
+    if ready.is_empty() {
         return Ok(None);
+    }
+
+    let lease_uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("lease missing UID"))?;
+    let lease_rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let pools_api: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
+    let pool = pools_api.get(&lease.spec.pool_ref).await?;
+
+    for instance in ready {
+        let binding = match binding_from_observation(lease, &instance, &pool) {
+            Ok(binding) => binding,
+            Err(reason) => {
+                warn!(
+                    lease = %lease.name_any(),
+                    instance = %instance.name_any(),
+                    reason,
+                    "Skipping Ready instance without provable UID/backend provenance"
+                );
+                continue;
+            }
+        };
+
+        let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+        let intent_patch = json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+            { "op": "test", "path": "/status/phase", "value": "Pending" },
+            { "op": "add", "path": "/status/binding", "value": binding }
+        ]));
+        match leases_api
+            .patch_status(
+                &lease.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(intent_patch),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(err) if optimistic_conflict(&err) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+
+        if reserve_binding_instance(client, namespace, &binding).await? {
+            return Ok(Some(binding));
+        }
+
+        // The intended instance was won by another lease. Remove only this
+        // exact still-Pending intent; resourceVersion + full binding tests mean
+        // a concurrent finalization or replacement cannot be erased.
+        clear_lease_binding_intent(client, namespace, lease_uid, &binding).await?;
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
+fn lease_uid_for(lease: &ClusterLease) -> Result<&str, LeaseError> {
+    lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| LeaseError::Lifecycle(anyhow::anyhow!("lease missing UID")))
+}
+
+/// Reserve the exact instance named by an already-persisted lease intent.
+/// Returns `false` on an optimistic conflict/occupied instance and leaves
+/// uncertain transport failures for the next reconcile to recover.
+async fn reserve_binding_instance(
+    client: &Client,
+    namespace: &str,
+    binding: &LeaseBinding,
+) -> Result<bool, LeaseError> {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let instance = match instances_api.get(&binding.instance.name).await {
+        Ok(instance) => instance,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(false),
+        Err(err) => return Err(err.into()),
     };
-
-    let cluster_name = instance.name_any();
-    let current = instance.status.clone().unwrap_or_default();
-    let patch = serde_json::json!({
-        "status": {
-            "phase": "Leased",
-            "leaseRef": { "name": lease_name },
-            "idleSince": serde_json::Value::Null,
-            "stateSince": chrono::Utc::now().to_rfc3339(),
-            "healthFailures": current.health_failures,
-            "specHash": current.spec_hash
-        }
+    if !instance_matches_binding_subject(&instance, binding) {
+        return Ok(false);
+    }
+    let status = instance.status.clone().unwrap_or_default();
+    let lease_ref_exact = status.lease_ref.as_ref().is_some_and(|reference| {
+        reference.name == binding.lease.name && reference.uid == binding.lease.uid
     });
-    instances_api
+    if status.phase == ClusterInstancePhase::Leased
+        && status.binding.as_ref() == Some(binding)
+        && lease_ref_exact
+    {
+        return Ok(true);
+    }
+
+    let is_free = status.phase == ClusterInstancePhase::Ready
+        && status.binding.is_none()
+        && status.lease_ref.is_none();
+    let is_provable_legacy_pair = status.phase == ClusterInstancePhase::Leased
+        && status.binding.is_none()
+        && status.lease_ref.as_ref().is_some_and(|reference| {
+            reference.name == binding.lease.name && reference.uid.is_none()
+        });
+    if !is_free && !is_provable_legacy_pair {
+        return Ok(false);
+    }
+
+    let uid = instance
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("instance missing UID"))?;
+    let rv = instance
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
+    let expected_phase = if is_free { "Ready" } else { "Leased" };
+    let expected_lease_ref = if is_free {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!({ "name": binding.lease.name })
+    };
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "test", "path": "/status/phase", "value": expected_phase },
+        { "op": "test", "path": "/status/leaseRef", "value": expected_lease_ref },
+        { "op": "add", "path": "/status/phase", "value": "Leased" },
+        { "op": "add", "path": "/status/leaseRef", "value": binding.lease },
+        { "op": "add", "path": "/status/binding", "value": binding },
+        { "op": "add", "path": "/status/idleSince", "value": null },
+        { "op": "add", "path": "/status/stateSince", "value": chrono::Utc::now().to_rfc3339() }
+    ]));
+    match instances_api
         .patch_status(
-            &cluster_name,
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
+            &binding.instance.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
         )
-        .await?;
-    Ok(Some(cluster_name))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if optimistic_conflict(&err) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
-async fn rollback_instance_reservation(client: &Client, namespace: &str, cluster_name: &str) {
-    let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
-    let patch = serde_json::json!({
-        "status": {
-            "phase": "Ready",
-            "leaseRef": serde_json::Value::Null,
-            "idleSince": chrono::Utc::now().to_rfc3339(),
-            "stateSince": chrono::Utc::now().to_rfc3339()
-        }
-    });
-    let _ = instances_api
+async fn clear_lease_binding_intent(
+    client: &Client,
+    namespace: &str,
+    lease_uid: &str,
+    binding: &LeaseBinding,
+) -> Result<(), LeaseError> {
+    let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let lease = match leases_api.get(&binding.lease.name).await {
+        Ok(lease) => lease,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if lease.metadata.uid.as_deref() != Some(lease_uid)
+        || lease.status.as_ref().and_then(|s| s.binding.as_ref()) != Some(binding)
+        || lease.status.as_ref().map(|s| &s.phase) != Some(&LeasePhase::Pending)
+    {
+        return Ok(());
+    }
+    let rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "remove", "path": "/status/binding" }
+    ]));
+    match leases_api
         .patch_status(
-            cluster_name,
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
         )
-        .await;
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if optimistic_conflict(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
-async fn mark_instance_recycling(client: &Client, namespace: &str, cluster_name: &str) {
+// NOTE: the lease-side `rollback_instance_reservation` that `main` called on a
+// failed bind patch is deliberately gone. Under the two-sided reservation the
+// instance record is durable, so an uncertain bind response must NOT roll back
+// (see `finalize_binding` — a replay finishes the same exact pair). Reclaiming
+// a reservation whose lease never materialized now belongs to the instance
+// controller's `LeaseNotFound` arm, which is grace-gated and UID-fenced and
+// still fires if this controller dies mid-bind.
+
+async fn mark_instance_recycling(
+    client: &Client,
+    namespace: &str,
+    binding: &LeaseBinding,
+) -> Result<bool, LeaseError> {
     let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
-    let patch = serde_json::json!({
-        "status": {
-            "phase": "Recycling",
-            "leaseRef": serde_json::Value::Null,
-            "idleSince": serde_json::Value::Null,
-            "stateSince": chrono::Utc::now().to_rfc3339()
-        }
-    });
-    let _ = instances_api
+    let instance = match instances_api.get(&binding.instance.name).await {
+        Ok(instance) => instance,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let status = instance.status.clone().unwrap_or_default();
+    if instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str())
+        || instance.metadata.generation != Some(binding.instance.observed_generation)
+        || status.binding.as_ref() != Some(binding)
+        || status.lease_ref.as_ref().is_none_or(|reference| {
+            reference.name != binding.lease.name || reference.uid != binding.lease.uid
+        })
+    {
+        return Ok(false);
+    }
+    if status.phase == ClusterInstancePhase::Recycling {
+        return Ok(true);
+    }
+    if status.phase != ClusterInstancePhase::Leased {
+        return Ok(false);
+    }
+    let rv = instance
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": binding.instance.uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "test", "path": "/status/phase", "value": "Leased" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "add", "path": "/status/phase", "value": "Recycling" },
+        { "op": "add", "path": "/status/idleSince", "value": null },
+        { "op": "add", "path": "/status/stateSince", "value": chrono::Utc::now().to_rfc3339() }
+    ]));
+    match instances_api
         .patch_status(
-            cluster_name,
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
+            &binding.instance.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
         )
-        .await;
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if optimistic_conflict(&err) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn binding_from_observation(
+    lease: &ClusterLease,
+    instance: &ClusterInstance,
+    pool: &ClusterPool,
+) -> Result<LeaseBinding, &'static str> {
+    let lease_uid = lease.metadata.uid.clone().ok_or("lease_uid_missing")?;
+    let pool_uid = pool.metadata.uid.clone().ok_or("pool_uid_missing")?;
+    if pool.name_any() != lease.spec.pool_ref || pool.metadata.deletion_timestamp.is_some() {
+        return Err("pool_identity_mismatch");
+    }
+    let instance_uid = instance
+        .metadata
+        .uid
+        .clone()
+        .ok_or("instance_uid_missing")?;
+    let instance_generation = instance
+        .metadata
+        .generation
+        .filter(|generation| *generation > 0)
+        .ok_or("instance_generation_missing")?;
+    let instance_status = instance.status.as_ref().ok_or("instance_status_missing")?;
+    let spec_digest = instance_status
+        .spec_hash
+        .clone()
+        .ok_or("instance_spec_digest_missing")?;
+    let created_with = instance_status
+        .created_with
+        .as_ref()
+        .ok_or("instance_provenance_missing")?;
+    let backend = created_with
+        .backend
+        .clone()
+        .ok_or("backend_provenance_missing")?;
+    let current_backend =
+        BackendProvenance::from_config(&pool.spec.backend).map_err(|_| "backend_digest_failed")?;
+    if backend != current_backend
+        || created_with.pool_uid.as_deref() != Some(pool_uid.as_str())
+        || created_with.backend_type.as_ref() != Some(&backend.backend_type)
+    {
+        return Err("backend_provenance_mismatch");
+    }
+    if !instance.spec.pool_ref.as_ref().is_some_and(|reference| {
+        reference.name == pool.name_any() && reference.uid.as_deref() == Some(pool_uid.as_str())
+    }) {
+        return Err("pool_reference_mismatch");
+    }
+    if !instance
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners.iter().any(|owner| {
+                owner.api_version == "kobe.kunobi.ninja/v1alpha1"
+                    && owner.kind == "ClusterPool"
+                    && owner.name == pool.name_any()
+                    && owner.uid == pool_uid
+            })
+        })
+    {
+        return Err("pool_owner_mismatch");
+    }
+
+    Ok(LeaseBinding {
+        binding_id: uuid::Uuid::new_v4().to_string(),
+        lease: ResourceRef {
+            name: lease.name_any(),
+            uid: Some(lease_uid),
+        },
+        instance: BoundInstanceRef {
+            name: instance.name_any(),
+            uid: instance_uid,
+            observed_generation: instance_generation,
+        },
+        pool: ResourceRef {
+            name: pool.name_any(),
+            uid: Some(pool_uid),
+        },
+        backend,
+        instance_spec_digest: spec_digest,
+    })
+}
+
+fn instance_matches_binding_subject(instance: &ClusterInstance, binding: &LeaseBinding) -> bool {
+    let status = instance.status.as_ref();
+    instance.name_any() == binding.instance.name
+        && instance.metadata.uid.as_deref() == Some(binding.instance.uid.as_str())
+        && instance.metadata.generation == Some(binding.instance.observed_generation)
+        && instance.spec.pool_ref.as_ref().is_some_and(|reference| {
+            reference.name == binding.pool.name && reference.uid == binding.pool.uid
+        })
+        && status.and_then(|s| s.spec_hash.as_deref())
+            == Some(binding.instance_spec_digest.as_str())
+        && status
+            .and_then(|s| s.created_with.as_ref())
+            .is_some_and(|created| {
+                created.pool_uid == binding.pool.uid
+                    && created.backend.as_ref() == Some(&binding.backend)
+                    && created.backend_type.as_ref() == Some(&binding.backend.backend_type)
+            })
+}
+
+pub(crate) fn optimistic_conflict(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(response) if response.code == 409 || response.code == 422)
+}
+
+pub(crate) fn json_patch(value: serde_json::Value) -> json_patch::Patch {
+    serde_json::from_value(value).expect("controller JSON Patch must be well formed")
 }
 
 /// Background reaper that force-expires overdue Bound leases.
@@ -1249,6 +1791,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
+
         let backend = MockBackend::new();
         let pools = Arc::new(RwLock::new(HashMap::new()));
         let authenticator = Arc::new(JwtAuthenticator::new("test".to_string()));
@@ -1266,6 +1809,108 @@ mod tests {
         (ctx, server)
     }
 
+    /// An instance that is already being torn down must not be handed to a new
+    /// tenant, even while it still looks idle.
+    ///
+    /// Deletion is not instantaneous: once `deletionTimestamp` is set the
+    /// object lingers until its finalizer runs, and during that window its
+    /// status can still read `Ready` with no `leaseRef`. Reserving it binds a
+    /// tenant to a cluster that is disappearing — the lease reaches `Bound`,
+    /// consumes pool capacity, and then fails at connect time, because
+    /// `resolve_lease_binding` separately refuses a deleting instance.
+    ///
+    /// The fixture is byte-for-byte the one `reserve_ready_instance` accepts in
+    /// `bind_records_exact_binding_on_both_sides`, plus `deletionTimestamp`, so
+    /// the timestamp is the only thing that can cause the rejection.
+    #[tokio::test]
+    async fn reserve_skips_instance_being_deleted() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = make_test_lease("bind-del", "Pending");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+        let backend =
+            BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap();
+        let deleting_instance = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": "pool-test-1",
+                "namespace": "test-ns",
+                "uid": "instance-uid",
+                "resourceVersion": "20",
+                "generation": 1,
+                "labels": { "kobe.kunobi.ninja/pool": "test-profile" },
+                // Teardown has started; the finalizer has not run yet.
+                "deletionTimestamp": "2026-01-01T00:00:00Z",
+                "finalizers": ["kobe.kunobi.ninja/cleanup"],
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterPool",
+                    "name": "test-profile",
+                    "uid": "test-profile-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "poolRef": { "name": "test-profile", "uid": "test-profile-uid" } },
+            // Still looks idle.
+            "status": {
+                "phase": "Ready",
+                "provisioned": true,
+                "leaseRef": null,
+                "specHash": "0000000000000001",
+                "createdWith": {
+                    "operatorVersion": "v0.37.0",
+                    "backendType": "k3s",
+                    "poolUid": "test-profile-uid",
+                    "backend": backend
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![deleting_instance.clone()]),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(deleting_instance.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_test_profile()))
+            .mount(&server)
+            .await;
+        // Deliberately mounted: if the candidate filter lets a deleting
+        // instance through, the reservation PATCH succeeds and the assertion
+        // below fails loudly instead of erroring on an unmatched request.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&deleting_instance))
+            .mount(&server)
+            .await;
+
+        let result = reserve_ready_instance(&ctx.client, "test-ns", &lease).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "an instance with a deletionTimestamp must not be reserved, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn reserve_skips_ready_instance_with_stale_lease_ref() {
         // A Ready instance that still carries a leaseRef (e.g. a stale phase
@@ -1274,6 +1919,47 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
+
+        let lease: ClusterLease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": "lease-new",
+                "namespace": "test-ns",
+                "uid": "lease-uid",
+                "resourceVersion": "10"
+            },
+            "spec": {
+                "poolRef": "p",
+                "ttl": "1h",
+                "requester": { "type": "test:admin", "identity": "test" }
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-new",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/p",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "metadata": { "name": "p", "namespace": "test-ns", "uid": "pool-uid" },
+                "spec": {
+                    "size": 1,
+                    "backend": { "type": "k3s" },
+                    "cluster": { "version": "v1.32.0" }
+                }
+            })))
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path(
@@ -1295,10 +1981,174 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&client, "test-ns", "p", "lease-new").await;
+        let result = reserve_ready_instance(&client, "test-ns", &lease).await;
         assert!(
             matches!(result, Ok(None)),
             "a Ready instance still carrying a leaseRef must not be reserved, got {result:?}"
+        );
+    }
+
+    fn exact_test_binding(lease_name: &str, lease_uid: &str) -> LeaseBinding {
+        LeaseBinding {
+            binding_id: format!("binding-{lease_name}"),
+            lease: ResourceRef {
+                name: lease_name.into(),
+                uid: Some(lease_uid.into()),
+            },
+            instance: BoundInstanceRef {
+                name: "pool-test-1".into(),
+                uid: "instance-uid".into(),
+                observed_generation: 1,
+            },
+            pool: ResourceRef {
+                name: "test-profile".into(),
+                uid: Some("test-profile-uid".into()),
+            },
+            backend: BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap(),
+            instance_spec_digest: "0000000000000001".into(),
+        }
+    }
+
+    fn exact_instance_for_binding(
+        binding: Option<&LeaseBinding>,
+        phase: &str,
+    ) -> serde_json::Value {
+        let lease_ref = binding.map(|binding| binding.lease.clone());
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": "pool-test-1",
+                "namespace": "test-ns",
+                "uid": "instance-uid",
+                "resourceVersion": "20",
+                "generation": 1,
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterPool",
+                    "name": "test-profile",
+                    "uid": "test-profile-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "poolRef": { "name": "test-profile", "uid": "test-profile-uid" } },
+            "status": {
+                "phase": phase,
+                "provisioned": true,
+                "bootstrapped": true,
+                "leaseRef": lease_ref,
+                "binding": binding,
+                "specHash": "0000000000000001",
+                "createdWith": {
+                    "operatorVersion": "v0.37.0",
+                    "backendType": "k3s",
+                    "poolUid": "test-profile-uid",
+                    "backend": BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap()
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn two_competing_reservations_have_exactly_one_patch_winner() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let first = exact_test_binding("lease-a", "lease-a-uid");
+        let second = exact_test_binding("lease-b", "lease-b-uid");
+        let ready = exact_instance_for_binding(None, "Ready");
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let won = reserve_binding_instance(&client, "test-ns", &first)
+            .await
+            .unwrap();
+        let lost = reserve_binding_instance(&client, "test-ns", &second)
+            .await
+            .unwrap();
+        assert!(won);
+        assert!(!lost);
+
+        let requests = server.received_requests().await.unwrap();
+        let patches: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.method == http::Method::PATCH)
+            .filter_map(|request| serde_json::from_slice(&request.body).ok())
+            .collect();
+        assert_eq!(patches.len(), 2);
+        for patch in patches {
+            let ops = patch.as_array().expect("reservation uses JSON Patch");
+            for path in [
+                "/metadata/uid",
+                "/metadata/resourceVersion",
+                "/status/phase",
+                "/status/leaseRef",
+                "/status/binding",
+            ] {
+                assert!(
+                    ops.iter().any(|op| op["path"] == path),
+                    "missing {path}: {patch}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replayed_lease_intent_resumes_only_the_same_exact_instance() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        let leased = exact_instance_for_binding(Some(&binding), "Leased");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(leased))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut lease = make_test_lease("lease-a", "Pending");
+        Arc::make_mut(&mut lease).status.as_mut().unwrap().binding = Some(binding.clone());
+        let resumed = reserve_ready_instance(&client, "test-ns", &lease)
+            .await
+            .unwrap();
+        assert_eq!(resumed, Some(binding));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "replay must not list or reserve another instance"
         );
     }
 
@@ -1324,7 +2174,8 @@ mod tests {
                 "kind": "ClusterLease",
                 "metadata": {
                     "name": name,
-                    "namespace": "test-ns"
+                    "namespace": "test-ns",
+                    "uid": format!("{name}-uid")
                 },
                 "spec": {
                     "poolRef": "test-profile",
@@ -1352,11 +2203,14 @@ mod tests {
             "kind": "ClusterPool",
             "metadata": {
                 "name": "test-profile",
-                "namespace": "test-ns"
+                "namespace": "test-ns",
+                "uid": "test-profile-uid",
+                "resourceVersion": "20"
             },
             "spec": {
                 "size": 3,
                 "ttl": "2h",
+                "backend": { "type": "k3s" },
                 "cluster": {
                     "version": "v1.31.3+k3s1"
                 }
@@ -1656,25 +2510,44 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_pending_lease_binds_to_ready_cluster() {
+    async fn reservation_writes_uid_fenced_pair_for_ready_cluster() {
         let (ctx, server) = test_lease_context().await;
-        let lease = make_test_lease("bind-1", "Pending");
-
-        // Mock PATCH for queue-position status update.
-        Mock::given(method("PATCH"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1/status",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": { "name": "bind-1", "namespace": "test-ns" },
-                "spec": { "poolRef": "test-profile", "ttl": "1h",
-                           "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
-                "status": { "phase": "Bound", "clusterName": "pool-test-1" }
-            })))
-            .mount(&server)
-            .await;
+        let mut lease = make_test_lease("bind-1", "Pending");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+        let backend =
+            BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap();
+        let ready_instance = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": "pool-test-1",
+                "namespace": "test-ns",
+                "uid": "instance-uid",
+                "resourceVersion": "20",
+                "generation": 1,
+                "labels": { "kobe.kunobi.ninja/pool": "test-profile" },
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterPool",
+                    "name": "test-profile",
+                    "uid": "test-profile-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "poolRef": { "name": "test-profile", "uid": "test-profile-uid" } },
+            "status": {
+                "phase": "Ready",
+                "provisioned": true,
+                "leaseRef": null,
+                "specHash": "0000000000000001",
+                "createdWith": {
+                    "operatorVersion": "v0.37.0",
+                    "backendType": "k3s",
+                    "poolUid": "test-profile-uid",
+                    "backend": backend
+                }
+            }
+        });
 
         Mock::given(method("GET"))
             .and(path(
@@ -1685,26 +2558,16 @@ mod tests {
                 "kobe.kunobi.ninja/pool=test-profile",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(
-                crate::testutil::k8s_list_response(vec![serde_json::json!({
-                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                    "kind": "ClusterInstance",
-                    "metadata": {
-                        "name": "pool-test-1",
-                        "namespace": "test-ns",
-                        "labels": { "kobe.kunobi.ninja/pool": "test-profile" }
-                    },
-                    "spec": { "poolRef": { "name": "test-profile" } },
-                    "status": {
-                        "phase": "Ready",
-                        "provisioned": true,
-                        "leaseRef": null,
-                        "idleSince": chrono::Utc::now().to_rfc3339(),
-                        "stateSince": chrono::Utc::now().to_rfc3339(),
-                        "healthFailures": 0,
-                        "specHash": "0000000000000001"
-                    }
-                })]),
+                crate::testutil::k8s_list_response(vec![ready_instance.clone()]),
             ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready_instance.clone()))
             .mount(&server)
             .await;
 
@@ -1715,30 +2578,55 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterInstance",
-                "metadata": { "name": "pool-test-1", "namespace": "test-ns" },
-                "spec": { "poolRef": { "name": "test-profile" } },
-                "status": { "phase": "Leased", "provisioned": true, "leaseRef": { "name": "bind-1" } }
+                "metadata": { "name": "pool-test-1", "namespace": "test-ns", "uid": "instance-uid", "resourceVersion": "21", "generation": 1 },
+                "spec": { "poolRef": { "name": "test-profile", "uid": "test-profile-uid" } },
+                "status": { "phase": "Leased", "provisioned": true }
             })))
             .mount(&server)
             .await;
 
-        // Mock GET for profile (404 — no profile, no queue timeout).
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/test-profile",
             ))
-            .respond_with(
-                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
-                    "clusterpools",
-                    "test-profile",
-                )),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_test_profile()))
             .mount(&server)
             .await;
 
-        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
-        // Successful bind → requeue at 60s.
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
+        let binding = reserve_ready_instance(&ctx.client, "test-ns", &lease)
+            .await
+            .unwrap()
+            .expect("ready instance should be reserved");
+        assert_eq!(binding.lease.uid.as_deref(), Some("bind-1-uid"));
+        assert_eq!(binding.instance.uid, "instance-uid");
+        assert_eq!(binding.instance.observed_generation, 1);
+        assert_eq!(binding.pool.uid.as_deref(), Some("test-profile-uid"));
+
+        let requests = server.received_requests().await.unwrap();
+        let patches: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.method == http::Method::PATCH)
+            .filter_map(|request| serde_json::from_slice(&request.body).ok())
+            .collect();
+        assert!(
+            patches
+                .iter()
+                .any(|patch| patch.as_array().is_some_and(|ops| {
+                    ops.iter().any(|op| op["path"] == "/metadata/uid")
+                        && ops
+                            .iter()
+                            .any(|op| op["path"] == "/metadata/resourceVersion")
+                        && ops.iter().any(|op| op["path"] == "/status/binding")
+                }))
+        );
     }
 
     #[tokio::test]
@@ -1819,7 +2707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_repairs_pending_lease_with_assigned_cluster() {
+    async fn ambiguous_legacy_name_only_binding_stays_unavailable() {
         let (ctx, server) = test_lease_context().await;
         let lease: Arc<ClusterLease> = Arc::new(
             serde_json::from_value(serde_json::json!({
@@ -1828,6 +2716,7 @@ mod tests {
                 "metadata": {
                     "name": "repair-1",
                     "namespace": "test-ns",
+                    "uid": "repair-1-uid",
                     "resourceVersion": "1"
                 },
                 "spec": {
@@ -1859,6 +2748,7 @@ mod tests {
                 "metadata": {
                     "name": "repair-1",
                     "namespace": "test-ns",
+                    "uid": "repair-1-uid",
                     "resourceVersion": "1"
                 },
                 "spec": {
@@ -1877,6 +2767,16 @@ mod tests {
                     "maxExtensions": 2
                 }
             })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
             .mount(&server)
             .await;
 
@@ -1906,7 +2806,7 @@ mod tests {
             .await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(60)));
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
     }
 
     // -----------------------------------------------------------------------
@@ -1983,7 +2883,16 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_released_lease() {
         let (ctx, server) = test_lease_context().await;
-        let lease = make_test_lease("released-1", "Released");
+        let mut lease = make_test_lease("released-1", "Released");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/released-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
 
         // Mock PATCH for status update to Recycling.
         Mock::given(method("PATCH"))
@@ -2024,8 +2933,31 @@ mod tests {
             .mount(&server)
             .await;
 
-        // The connect-token Secret must be explicitly deleted at release (#178),
-        // not left to owner-ref GC. expect(1) verifies the controller issues it.
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/released-1-connect-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "released-1-connect-token",
+                    "namespace": "test-ns",
+                    "uid": "secret-uid",
+                    "resourceVersion": "5",
+                    "ownerReferences": [{
+                        "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                        "kind": "ClusterLease",
+                        "name": "released-1",
+                        "uid": "released-1-uid"
+                    }]
+                },
+                "data": { "token": "dG9rZW4=" }
+            })))
+            .mount(&server)
+            .await;
+
+        // The exact owner-fenced connect-token Secret is explicitly deleted.
         Mock::given(method("DELETE"))
             .and(path(
                 "/api/v1/namespaces/test-ns/secrets/released-1-connect-token",
@@ -2040,7 +2972,7 @@ mod tests {
             .await;
 
         let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
         let calls = ctx.backend.call_count();
         assert_eq!(calls.delete, 0);
     }
@@ -2050,9 +2982,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_recycling_lease_cluster_gone() {
+    async fn legacy_recycling_lease_without_binding_is_not_deleted() {
         let (ctx, server) = test_lease_context().await;
-        let lease = make_test_lease("recycling-1", "Recycling");
+        let mut lease = make_test_lease("recycling-1", "Recycling");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/recycling-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/recycling-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
 
         // Pool state has NO entry for the cluster (it's gone).
         // (pools is already empty by default.)
@@ -2074,7 +3022,7 @@ mod tests {
             .await;
 
         let action = reconcile_lease(lease, ctx).await.unwrap();
-        assert_eq!(action, Action::await_change());
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(15)));
     }
 
     // -----------------------------------------------------------------------
@@ -2082,9 +3030,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_reconcile_recycling_lease_cluster_still_present() {
+    async fn legacy_recycling_lease_does_not_mutate_same_named_instance() {
         let (ctx, server) = test_lease_context().await;
-        let lease = make_test_lease("recycling-2", "Recycling");
+        let mut lease = make_test_lease("recycling-2", "Recycling");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/recycling-2",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/recycling-2/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path(
@@ -2146,7 +3110,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "extend-1", "namespace": "test-ns" },
+                "metadata": { "name": "extend-1", "namespace": "test-ns", "uid": "extend-1-uid", "resourceVersion": "10" },
                 "spec": {
                     "poolRef": "test-profile",
                     "ttl": "1h",
@@ -2173,7 +3137,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "extend-1", "namespace": "test-ns" },
+                "metadata": { "name": "extend-1", "namespace": "test-ns", "uid": "extend-1-uid", "resourceVersion": "10" },
                 "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": {
@@ -2189,6 +3153,7 @@ mod tests {
             "test-ns",
             "extend-1",
             "30m",
+            "extend-1-uid",
             &ctx.authenticator,
         )
         .await;
@@ -2196,6 +3161,236 @@ mod tests {
         // The returned string should be a valid RFC3339 timestamp.
         let new_expiry_str = result.unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(&new_expiry_str).is_ok());
+    }
+
+    /// Extension is a mutation, so it must carry the same UID fence every other
+    /// cross-object write in #79 carries.
+    ///
+    /// Two holes without it:
+    /// 1. **Name reuse.** The lease is read by name and patched by name. If it
+    ///    is deleted and a same-named lease is recreated by another requester in
+    ///    between, the merge patch silently extends the *new* owner's lease.
+    /// 2. **Lost update.** `extensionsCount` is a read-modify-write; two
+    ///    concurrent extends both read N and write N+1, so the pair costs one
+    ///    extension and `maxExtensions` can be exceeded.
+    ///
+    /// Both close by patching under `test` ops on uid, resourceVersion, and the
+    /// observed `extensionsCount`.
+    #[tokio::test]
+    async fn extend_is_uid_and_count_fenced() {
+        let (ctx, server) = test_lease_context().await;
+        let policy: crate::crd::access_policy::AccessPolicy =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "AccessPolicy",
+                "metadata": { "name": "test" },
+                "spec": {
+                    "auth": { "oidc": {
+                        "issuer": "https://issuer.example.com",
+                        "audience": ["test"],
+                        "algorithms": ["RS256"]
+                    }},
+                    "rules": [{ "pools": ["*"], "maxTtl": "4h",
+                                "maxConcurrentLeases": 5, "maxExtensions": 2 }]
+                }
+            }))
+            .unwrap();
+        ctx.authenticator
+            .update_policies(vec![policy], std::collections::HashMap::new())
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/extend-fence",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "extend-fence",
+                    "namespace": "test-ns",
+                    "uid": "extend-fence-uid",
+                    "resourceVersion": "77"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test", "identity": "u" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Bound",
+                    "clusterName": "pool-test-1",
+                    "boundAt": (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339(),
+                    "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/extend-fence/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "extend-fence", "namespace": "test-ns" },
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
+                          "requester": {"type": "test", "identity": "u"}, "priority": 50 },
+                "status": { "phase": "Bound", "extensionsCount": 1 }
+            })))
+            .mount(&server)
+            .await;
+
+        extend_lease_ttl(
+            &ctx.client,
+            "test-ns",
+            "extend-fence",
+            "30m",
+            "extend-fence-uid",
+            &ctx.authenticator,
+        )
+        .await
+        .expect("extending the exact observed lease should succeed");
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|req| req.method == http::Method::PATCH)
+            .expect("extend must issue a status PATCH");
+        assert_eq!(
+            patch
+                .headers
+                .get("content-type")
+                .map(|value| value.to_str().unwrap()),
+            Some("application/json-patch+json"),
+            "a merge patch cannot express a precondition; extend must use JSON Patch"
+        );
+        let ops: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        let tests: Vec<(&str, &serde_json::Value)> = ops
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|op| op["op"] == "test")
+            .map(|op| (op["path"].as_str().unwrap(), &op["value"]))
+            .collect();
+        assert!(
+            tests.contains(&("/metadata/uid", &serde_json::json!("extend-fence-uid"))),
+            "extend must pin the exact lease UID, else a same-named replacement is extended: {tests:?}"
+        );
+        assert!(
+            tests.contains(&("/metadata/resourceVersion", &serde_json::json!("77"))),
+            "extend must pin the observed resourceVersion: {tests:?}"
+        );
+        assert!(
+            tests.contains(&("/status/extensionsCount", &serde_json::json!(0))),
+            "extend must pin the observed extensionsCount so concurrent extends cannot lose an increment: {tests:?}"
+        );
+    }
+
+    /// A lease whose UID changed under us (name reuse) must not be extended.
+    ///
+    /// Every other gate is deliberately satisfied — resolvable policy, `Bound`
+    /// phase, extensions remaining, and a PATCH mock that would return 200 — so
+    /// the UID fence is the only thing that can produce the denial. Without
+    /// that setup the test passes for the wrong reason (an unresolvable policy
+    /// also yields `Lifecycle`) and stops detecting a dropped fence.
+    #[tokio::test]
+    async fn extend_denies_uid_mismatch() {
+        let (ctx, server) = test_lease_context().await;
+        let policy: crate::crd::access_policy::AccessPolicy =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "AccessPolicy",
+                "metadata": { "name": "test" },
+                "spec": {
+                    "auth": { "oidc": {
+                        "issuer": "https://issuer.example.com",
+                        "audience": ["test"],
+                        "algorithms": ["RS256"]
+                    }},
+                    "rules": [{ "pools": ["*"], "maxTtl": "4h",
+                                "maxConcurrentLeases": 5, "maxExtensions": 2 }]
+                }
+            }))
+            .unwrap();
+        ctx.authenticator
+            .update_policies(vec![policy], std::collections::HashMap::new())
+            .await;
+        // Would succeed if the fence were removed.
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/reused/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "reused", "namespace": "test-ns" },
+                "spec": { "poolRef": "test-profile", "ttl": "1h",
+                          "requester": {"type": "test", "identity": "someone-else"},
+                          "priority": 50 },
+                "status": { "phase": "Bound", "extensionsCount": 1 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/reused",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "reused",
+                    "namespace": "test-ns",
+                    // A different tenant recreated this name after we observed it.
+                    "uid": "replacement-uid",
+                    "resourceVersion": "1"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test", "identity": "someone-else" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Bound",
+                    "boundAt": chrono::Utc::now().to_rfc3339(),
+                    "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "extensionsCount": 0,
+                    "maxExtensions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let err = extend_lease_ttl(
+            &ctx.client,
+            "test-ns",
+            "reused",
+            "30m",
+            "original-uid",
+            &ctx.authenticator,
+        )
+        .await
+        .expect_err("a replaced lease must not be extendable");
+        assert!(
+            matches!(err, LeaseError::Lifecycle(_)),
+            "expected a lifecycle denial, got {err:?}"
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|req| req.method == http::Method::PATCH),
+            "a UID mismatch must deny before any mutation"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2219,7 +3414,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "extend-2", "namespace": "test-ns" },
+                "metadata": { "name": "extend-2", "namespace": "test-ns", "uid": "extend-2-uid", "resourceVersion": "10" },
                 "spec": { "poolRef": "test-profile", "ttl": "1h",
                           "requester": {"type": "stale-provider:admin", "identity": "u"},
                           "priority": 50 },
@@ -2237,6 +3432,7 @@ mod tests {
             "test-ns",
             "extend-2",
             "30m",
+            "extend-2-uid",
             &ctx.authenticator,
         )
         .await;
@@ -2264,7 +3460,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "pending-ext", "namespace": "test-ns" },
+                "metadata": { "name": "pending-ext", "namespace": "test-ns", "uid": "pending-ext-uid", "resourceVersion": "10" },
                 "spec": {
                     "poolRef": "test-profile",
                     "ttl": "1h",
@@ -2285,6 +3481,7 @@ mod tests {
             "test-ns",
             "pending-ext",
             "30m",
+            "pending-ext-uid",
             &ctx.authenticator,
         )
         .await;
@@ -2314,7 +3511,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "maxext-1", "namespace": "test-ns" },
+                "metadata": { "name": "maxext-1", "namespace": "test-ns", "uid": "maxext-1-uid", "resourceVersion": "10" },
                 "spec": {
                     "poolRef": "test-profile",
                     "ttl": "1h",
@@ -2337,6 +3534,7 @@ mod tests {
             "test-ns",
             "maxext-1",
             "30m",
+            "maxext-1-uid",
             &ctx.authenticator,
         )
         .await;
