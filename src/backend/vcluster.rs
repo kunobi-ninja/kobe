@@ -190,6 +190,45 @@ const DEFAULT_CHART_VERSION: &str = "0.34.0";
 /// Helm repository alias the operator uses internally.
 const HELM_REPO_ALIAS: &str = "kobe-loft-sh";
 
+/// Cap on how much helm stderr is carried into an error.
+///
+/// The message reaches ClusterInstance status and the pool's
+/// `lastFailureReason`, which is surfaced to lease clients — so an unbounded
+/// helm dump would bloat those objects on every failed attempt.
+const HELM_STDERR_LIMIT: usize = 800;
+
+/// Build the error for a failed helm invocation, including what helm wrote to
+/// stderr.
+///
+/// Previously both helm calls sent stderr to `Stdio::null()` and reported only
+/// "returned non-zero status". That made provisioning failures undiagnosable
+/// from the operator log: a DNS failure, a TLS error and a 404 were
+/// indistinguishable, which is exactly what happened in #92.
+fn helm_command_error(what: &str, output: &std::process::Output) -> anyhow::Error {
+    let code = output
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return anyhow!("{what} returned non-zero status (exit {code}), with no stderr");
+    }
+    if stderr.len() > HELM_STDERR_LIMIT {
+        // Cut on a char boundary — helm output can carry non-ASCII.
+        let mut end = HELM_STDERR_LIMIT;
+        while end > 0 && !stderr.is_char_boundary(end) {
+            end -= 1;
+        }
+        return anyhow!(
+            "{what} returned non-zero status (exit {code}): {} […truncated]",
+            &stderr[..end]
+        );
+    }
+    anyhow!("{what} returned non-zero status (exit {code}): {stderr}")
+}
+
 /// Helm repository URL for upstream vcluster charts.
 const HELM_REPO_URL: &str = "https://charts.loft.sh";
 
@@ -302,29 +341,33 @@ impl VclusterBackend {
 
     /// Ensure the Helm repo is registered locally. Idempotent.
     async fn ensure_helm_repo(&self) -> Result<()> {
-        let status = Command::new("helm")
+        let output = Command::new("helm")
             .args(["repo", "add", HELM_REPO_ALIAS, HELM_REPO_URL])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::piped())
+            .output()
             .await
             .context("failed to spawn `helm repo add`")?;
-        // Non-zero is normal if the repo is already registered. We don't
-        // distinguish that case from real errors here because `helm repo
-        // update` will fail downstream with a clearer message.
-        if !status.success() {
-            debug!("helm repo add returned non-zero (likely already registered); continuing");
+        // Non-zero is normal if the repo is already registered, so this is not
+        // fatal — but log what helm said rather than discarding it, since a
+        // genuine failure here is otherwise invisible until `update` fails.
+        if !output.status.success() {
+            debug!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "helm repo add returned non-zero (likely already registered); continuing"
+            );
         }
-        let status = Command::new("helm")
+        let output = Command::new("helm")
             .args(["repo", "update", HELM_REPO_ALIAS])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::piped())
+            .output()
             .await
             .context("failed to spawn `helm repo update`")?;
-        if !status.success() {
-            return Err(anyhow!(
-                "helm repo update for {HELM_REPO_ALIAS} returned non-zero status"
+        if !output.status.success() {
+            return Err(helm_command_error(
+                &format!("helm repo update for {HELM_REPO_ALIAS}"),
+                &output,
             ));
         }
         Ok(())
@@ -1500,5 +1543,61 @@ mod tests {
             format!("{err:#}").contains("kubeconfig Secret get failed"),
             "unexpected error: {err:#}"
         );
+    }
+
+    // --- helm stderr capture -------------------------------------------
+
+    fn output_with(stderr: &[u8], code: i32) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn helm_error_includes_what_helm_actually_said() {
+        let err = helm_command_error(
+            "helm repo update for kobe-loft-sh",
+            &output_with(
+                b"Error: looks like \"https://charts.loft.sh\" is not a valid chart repository",
+                1,
+            ),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("helm repo update for kobe-loft-sh"), "{msg}");
+        assert!(msg.contains("not a valid chart repository"), "{msg}");
+    }
+
+    #[test]
+    fn helm_error_trims_surrounding_whitespace() {
+        let err = helm_command_error("helm repo add", &output_with(b"\n\n  boom  \n\n", 1));
+        assert!(err.to_string().ends_with("boom"), "{err}");
+    }
+
+    /// The message lands in ClusterInstance status and in the pool's
+    /// lastFailureReason, which is surfaced to lease clients. An unbounded
+    /// helm dump there bloats the object on every failed attempt.
+    #[test]
+    fn helm_error_truncates_a_very_long_stderr() {
+        let long = vec![b'x'; 10_000];
+        let msg = helm_command_error("helm repo update", &output_with(&long, 1)).to_string();
+        assert!(msg.len() < 1_200, "message was {} bytes", msg.len());
+        assert!(msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn helm_error_without_stderr_still_reports_the_exit_code() {
+        let msg = helm_command_error("helm repo update", &output_with(b"", 3)).to_string();
+        assert!(msg.contains("helm repo update"), "{msg}");
+        assert!(msg.contains('3'), "expected the exit code in: {msg}");
+    }
+
+    #[test]
+    fn helm_error_survives_non_utf8_stderr() {
+        let msg = helm_command_error("helm repo add", &output_with(&[0xff, 0xfe, b'h', b'i'], 1))
+            .to_string();
+        assert!(msg.contains("hi"), "{msg}");
     }
 }
