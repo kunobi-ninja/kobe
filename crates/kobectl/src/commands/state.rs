@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -73,15 +73,27 @@ pub(crate) fn remove_kubeconfig(endpoint: &str, lease_id: &str) -> Result<Option
         None
     };
 
-    forget_kubeconfig(endpoint, lease_id)?;
-
     let path = recorded.unwrap_or_else(|| default_kubeconfig_path(lease_id));
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-        return Ok(Some(path));
-    }
 
-    Ok(None)
+    // Remove the file FIRST, and drop the tracking entry only once it is
+    // actually gone. Forgetting first — as this did — meant that a file which
+    // could not be removed (a custom `--kubeconfig` path that is now a
+    // directory, or one the user made read-only) lost the state entry pointing
+    // at it, so `purge --orphans-only` could never rediscover it, and a custom
+    // path outside `~/.kube/kobe-*.yaml` escaped a future full purge too. Same
+    // ordering rule `purge_orphans_only` already documents.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            forget_kubeconfig(endpoint, lease_id)?;
+            Ok(Some(path))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing on disk, so the entry is stale — dropping it is correct.
+            forget_kubeconfig(endpoint, lease_id)?;
+            Ok(None)
+        }
+        Err(err) => Err(err).with_context(|| format!("remove kubeconfig {}", path.display())),
+    }
 }
 
 pub(crate) fn endpoint_kubeconfigs(endpoint: &str) -> Result<Vec<PathBuf>> {

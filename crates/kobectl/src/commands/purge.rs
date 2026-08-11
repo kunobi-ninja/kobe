@@ -253,12 +253,15 @@ fn remove_kubeconfig_files(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, 
     let mut removed_paths = Vec::new();
     let mut failures = Vec::new();
     for path in paths {
-        if !path.exists() {
-            continue;
-        }
+        // Attempt the removal unconditionally rather than gating on
+        // `Path::exists()`. That call follows symlinks and reports false for a
+        // broken one, and also returns false when the metadata lookup itself
+        // fails (a permission error on the parent, say) — both of which then
+        // looked like "already gone" and let the caller clear its tracking
+        // state for a file still on disk. NotFound from the removal is the only
+        // thing that actually proves absence.
         match std::fs::remove_file(&path) {
             Ok(()) => removed_paths.push(path),
-            // Vanished between the check and the removal — the desired state.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => failures.push((path, err)),
         }
@@ -449,5 +452,25 @@ mod tests {
         );
         assert!(!live.contains("released"));
         assert!(!live.contains("expired"));
+    }
+
+    /// `Path::exists()` follows symlinks and returns false for a broken one,
+    /// so a dangling kubeconfig symlink was skipped, counted as absent, and
+    /// left on disk forever — while the caller saw no failure and cleared the
+    /// endpoint's tracking state. `remove_file` unlinks the symlink itself.
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_symlink_is_removed_not_silently_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("kobe-lease-dangling.yaml");
+        std::os::unix::fs::symlink(dir.path().join("no-such-target"), &link).unwrap();
+        assert!(!link.exists(), "precondition: exists() is false for it");
+        assert!(link.symlink_metadata().is_ok(), "precondition: it is there");
+
+        let (removed, failures) = remove_kubeconfig_files(vec![link.clone()]);
+
+        assert!(failures.is_empty());
+        assert_eq!(removed, vec![link.clone()], "it should be reported removed");
+        assert!(link.symlink_metadata().is_err(), "the link must be gone");
     }
 }
