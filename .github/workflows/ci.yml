@@ -98,6 +98,11 @@ jobs:
       - name: Version-consistency gate tests
         run: ./scripts/test-version-consistency.sh
 
+      # Same reasoning: the -git pkgver is only ever visible as AUR metadata,
+      # so a wrong value publishes cleanly and no build ever fails on it.
+      - name: AUR -git pkgver tests
+        run: ./scripts/aur/test-vcs-pkgver.sh
+
       - name: Security audit
         run: |
           cargo install cargo-audit --locked || true
