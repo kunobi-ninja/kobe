@@ -25,6 +25,95 @@ use crate::crd::{
     ClusterPool, InterInstanceSpread, PersistenceConfig, ReadinessGate, SpreadStrength,
 };
 
+/// Fetch, or create once, the per-cluster PostgreSQL password.
+///
+/// The guest control plane is handed a datastore URL it can read (k3s puts it
+/// on the server command line; k0s writes it into a ConfigMap), so that URL
+/// must not carry the shared admin credential — see
+/// `datastore::cluster_endpoint_as_role`. Each cluster therefore gets its own
+/// role, and the role needs a password that survives operator restarts.
+///
+/// It is persisted in a `{name}-datastore` Secret rather than derived from the
+/// admin credential, because the admin credential is expected to rotate
+/// (`SharedDatastore::current` re-reads it precisely so rotation is picked up).
+/// A derived password would silently change on rotation and break the kine
+/// connection of every already-running cluster, which never re-enters `create`.
+///
+/// Create-once with read-back, matching the node-token Secret pattern: a
+/// concurrent creator wins the 409 and we adopt its value.
+pub(crate) async fn ensure_datastore_password(
+    client: &Client,
+    name: &str,
+    namespace: &str,
+    labels: BTreeMap<String, String>,
+) -> Result<String> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret_name = format!("{name}-datastore");
+
+    if let Some(existing) = read_datastore_password(&secrets, &secret_name).await? {
+        return Ok(existing);
+    }
+
+    let password = {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
+        hex::encode(bytes)
+    };
+
+    let secret = Secret {
+        metadata: ObjectMeta {
+            name: Some(secret_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        string_data: Some({
+            let mut data = BTreeMap::new();
+            data.insert("password".to_string(), password.clone());
+            data
+        }),
+        ..Default::default()
+    };
+
+    match secrets.create(&Default::default(), &secret).await {
+        Ok(_) => Ok(password),
+        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+            // Lost the race. The other writer's password is the one the role
+            // will be created with, so adopt it rather than overwriting.
+            read_datastore_password(&secrets, &secret_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Secret {secret_name} vanished after a 409"))
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to create Secret {secret_name}")),
+    }
+}
+
+async fn read_datastore_password(
+    secrets: &Api<Secret>,
+    secret_name: &str,
+) -> Result<Option<String>> {
+    match secrets.get(secret_name).await {
+        Ok(existing) => {
+            let raw = existing
+                .data
+                .as_ref()
+                .and_then(|d| d.get("password"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Secret {secret_name} exists but has no `password` key")
+                })?;
+            let pw = String::from_utf8(raw.0.clone())
+                .with_context(|| format!("Secret {secret_name} password is not valid UTF-8"))?;
+            if pw.is_empty() {
+                anyhow::bail!("Secret {secret_name} has an empty password");
+            }
+            Ok(Some(pw))
+        }
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Failed to read Secret {secret_name}")),
+    }
+}
+
 pub use capi::CapiBackend;
 pub use k0s::K0sBackend;
 pub use k3s::K3sBackend;

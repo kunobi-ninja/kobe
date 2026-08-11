@@ -1163,7 +1163,21 @@ impl ClusterBackend for K0sBackend {
         // current connection each time so a rotated credential is picked up.
         let datastore_endpoint = if let Some((pool, base_url)) = self.datastore.current() {
             datastore::create_database(&pool, name, DB_PREFIX).await?;
-            let endpoint = datastore::cluster_endpoint(&base_url, name, DB_PREFIX)?;
+            // The endpoint below is written into the k0s config ConfigMap and
+            // is therefore readable by anything that can read the guest's
+            // config. It must carry a per-cluster credential, never the shared
+            // admin one — otherwise editing the database name in it reaches
+            // every other tenant's cluster.
+            let password = super::ensure_datastore_password(
+                &self.client,
+                name,
+                namespace,
+                Self::cluster_labels(name, None),
+            )
+            .await?;
+            datastore::ensure_cluster_role(&pool, name, DB_PREFIX, &password).await?;
+            let endpoint =
+                datastore::cluster_endpoint_as_role(&base_url, name, DB_PREFIX, &password)?;
             Some(endpoint)
         } else {
             None
@@ -1296,11 +1310,26 @@ impl ClusterBackend for K0sBackend {
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-kubeconfig")).await?;
 
         // Drop database if PostgreSQL is configured
-        if let Some((pool, _)) = self.datastore.current()
-            && let Err(e) = datastore::drop_database(&pool, name, DB_PREFIX).await
-        {
-            warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
+        if let Some((pool, _)) = self.datastore.current() {
+            // Reclaim ownership first: the per-cluster role owns the database,
+            // and a non-superuser operator cannot drop what it does not own.
+            if let Err(e) = datastore::reclaim_database_ownership(&pool, name, DB_PREFIX).await {
+                warn!(cluster = name, error = %e, "Failed to reclaim database ownership");
+            }
+            if let Err(e) = datastore::drop_database(&pool, name, DB_PREFIX).await {
+                warn!(cluster = name, error = %e, "Failed to drop database (may not exist)");
+            }
+            // AFTER the database: PostgreSQL refuses to drop a role that still
+            // owns objects, and ensure_cluster_role transfers ownership to it.
+            if let Err(e) = datastore::drop_cluster_role(&pool, name, DB_PREFIX).await {
+                warn!(cluster = name, error = %e, "Failed to drop datastore role (may not exist)");
+            }
         }
+
+        // Delete the password Secret LAST. It is the only record of the role's
+        // credential, so removing it before the drops would leave a live
+        // database and role behind with no way to reconstruct access to them.
+        Self::delete_ignoring_not_found(&secrets, &format!("{name}-datastore")).await?;
 
         // Force-delete any leftover pods carrying our cluster label.
         // See doc-comment on force_delete_instance_pods for rationale.
