@@ -199,17 +199,8 @@ async fn main() -> Result<()> {
     //    twice would put two watchers on the same virtual-apiserver
     //    stream, racing to handle each event and potentially
     //    double-applying or thrashing on patch conflicts.
-    let configurable_syncers: Vec<String> = config
-        .enabled_syncers
-        .iter()
-        .filter(|name| !always_on.contains(name))
-        .cloned()
-        .collect();
-    let suppressed: Vec<&String> = config
-        .enabled_syncers
-        .iter()
-        .filter(|name| always_on.contains(name))
-        .collect();
+    let (configurable_syncers, suppressed) =
+        split_requested_syncers(&config.enabled_syncers, &always_on);
     if !suppressed.is_empty() {
         info!(
             ?suppressed,
@@ -354,10 +345,7 @@ async fn main() -> Result<()> {
 /// uses self-signed TLS and we don't want to pull in a full HTTP client just
 /// for the readiness check.
 async fn wait_for_apiserver(url: &str) -> Result<()> {
-    // Extract host:port from the URL (e.g., "https://localhost:6443" -> "localhost:6443")
-    let addr = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    let addr = apiserver_addr(url);
 
     for attempt in 0..120u32 {
         match tokio::net::TcpStream::connect(addr).await {
@@ -381,6 +369,45 @@ async fn wait_for_apiserver(url: &str) -> Result<()> {
     }
 
     anyhow::bail!("Timed out waiting for virtual kube-apiserver at {url}")
+}
+
+/// Reduce an apiserver URL to the `host:port` authority that
+/// [`tokio::net::TcpStream::connect`] accepts.
+fn apiserver_addr(url: &str) -> &str {
+    let authority = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+
+    // Stop at the path. `TcpStream::connect` parses its argument as a socket
+    // address, so a trailing slash or a path segment makes every attempt fail
+    // to parse — indistinguishable, from the logs, from an apiserver that
+    // never came up.
+    match authority.find('/') {
+        Some(i) => &authority[..i],
+        None => authority,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: split the requested syncer list against the always-on set
+// ---------------------------------------------------------------------------
+
+/// Split the user's requested syncer list into the ones that still need
+/// starting and the ones already covered by the always-on set.
+///
+/// Returning the suppressed names (rather than silently dropping them) is
+/// what lets startup log the overlap — an operator who lists `status` in
+/// `spec.backend.vkobe.syncers` should be able to see that their entry was
+/// a no-op rather than assume it took effect.
+fn split_requested_syncers(
+    requested: &[String],
+    always_on: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let (suppressed, configurable): (Vec<String>, Vec<String>) = requested
+        .iter()
+        .cloned()
+        .partition(|name| always_on.contains(name));
+    (configurable, suppressed)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,4 +453,100 @@ fn load_host_config() -> Result<(String, String)> {
         .context("Failed to read ServiceAccount token -- are we running in-cluster?")?;
 
     Ok((format!("https://{host}:{port}"), token.trim().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // apiserver_addr
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn apiserver_addr_strips_the_scheme() {
+        assert_eq!(apiserver_addr("https://localhost:6443"), "localhost:6443");
+        assert_eq!(apiserver_addr("http://localhost:6443"), "localhost:6443");
+        assert_eq!(apiserver_addr("https://10.0.0.1:6443"), "10.0.0.1:6443");
+    }
+
+    #[test]
+    fn apiserver_addr_accepts_a_bare_authority() {
+        // The ConfigMap path lets an operator write the authority alone.
+        assert_eq!(apiserver_addr("localhost:6443"), "localhost:6443");
+    }
+
+    /// A trailing slash is an ordinary way to write a URL, and both the
+    /// `KOBE_SYNC_VIRTUAL_API_URL` env var and the ConfigMap `virtual_api_url`
+    /// key are operator-supplied. Leaving the slash on produces
+    /// `connect("localhost:6443/")`, which is not a parseable socket address,
+    /// so every one of the 120 attempts fails instantly and startup dies two
+    /// minutes later blaming a kube-apiserver that was healthy the whole time.
+    #[test]
+    fn apiserver_addr_drops_a_trailing_slash() {
+        assert_eq!(apiserver_addr("https://localhost:6443/"), "localhost:6443");
+    }
+
+    /// Same failure, via a URL that carries a path.
+    #[test]
+    fn apiserver_addr_drops_a_path() {
+        assert_eq!(
+            apiserver_addr("https://localhost:6443/healthz"),
+            "localhost:6443"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // split_requested_syncers
+    // -----------------------------------------------------------------
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The dedup that keeps two watchers off the same virtual-apiserver
+    /// stream. Without it both copies race to handle each event and thrash
+    /// on patch conflicts.
+    #[test]
+    fn split_requested_syncers_removes_the_always_on_overlap() {
+        let always_on = names(&["fake_nodes", "status", "service_accounts"]);
+        let (configurable, suppressed) =
+            split_requested_syncers(&names(&["pods", "status", "secrets"]), &always_on);
+
+        assert_eq!(configurable, names(&["pods", "secrets"]));
+        assert_eq!(suppressed, names(&["status"]));
+    }
+
+    #[test]
+    fn split_requested_syncers_passes_through_a_disjoint_list() {
+        let always_on = names(&["fake_nodes", "status", "service_accounts"]);
+        let (configurable, suppressed) =
+            split_requested_syncers(&names(&["pods", "services"]), &always_on);
+
+        assert_eq!(configurable, names(&["pods", "services"]));
+        assert!(suppressed.is_empty());
+    }
+
+    /// An empty request list must not disturb the always-on set — this is
+    /// the shape that produced the v0.22.x nodeless-cluster regression, where
+    /// a manifest omitting `service_accounts` left vkobe with no fake nodes.
+    #[test]
+    fn split_requested_syncers_handles_an_empty_request() {
+        let always_on = names(&["fake_nodes", "status", "service_accounts"]);
+        let (configurable, suppressed) = split_requested_syncers(&[], &always_on);
+
+        assert!(configurable.is_empty());
+        assert!(suppressed.is_empty());
+    }
+
+    #[test]
+    fn split_requested_syncers_preserves_the_requested_order() {
+        let always_on = names(&["status"]);
+        let (configurable, _) = split_requested_syncers(
+            &names(&["secrets", "status", "pods", "configmaps"]),
+            &always_on,
+        );
+
+        assert_eq!(configurable, names(&["secrets", "pods", "configmaps"]));
+    }
 }
