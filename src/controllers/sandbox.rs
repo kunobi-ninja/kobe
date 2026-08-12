@@ -688,17 +688,23 @@ fn is_child_placed(status: &crate::crd::SandboxLeaseStatus) -> bool {
     )
 }
 
-/// Tear down a child composition by destroying its cluster.
+/// Tear a child composition down, and complete only against its receipt.
 ///
 /// The internal `ClusterLease` was created with `CleanupMode::VerifiedDestroy`,
-/// so releasing it is what puts #80's machinery to work: the cluster's
+/// so *releasing* it is what puts #80's machinery to work: the cluster's exact
 /// footprint must be observed gone before its capacity returns to the
-/// `ClusterPool`. Destroying the cluster destroys the Sandbox inside it, which
-/// is why this replaces — rather than accompanies — the claim delete.
+/// `ClusterPool`, and the evidence is written to the lease as a receipt.
+/// Destroying the cluster destroys the Sandbox inside it, which is why this
+/// replaces — rather than accompanies — the claim delete.
 ///
-/// The quota slot is released only once the internal lease is observed absent.
-/// Anything less would return capacity while a tenant's cluster was still
-/// running.
+/// The internal lease is **released, never deleted**. Deleting the object would
+/// destroy the receipt along with it, at exactly the moment the evidence
+/// matters; it is collected later by its owner reference, once the Sandbox
+/// lease itself goes.
+///
+/// The quota slot returns only once a receipt proves the exact recorded
+/// instance gone. The disappearance of a name is not evidence — a same-named
+/// replacement is fresh capacity, not proof that the original was destroyed.
 async fn release_child_composition(
     lease: &SandboxLease,
     ctx: &SandboxContext,
@@ -708,7 +714,7 @@ async fn release_child_composition(
     let status = lease.status.clone().unwrap_or_default();
 
     // Act on the exact recorded identity. A same-named ClusterLease composed
-    // for a later Sandbox is somebody else's cluster, and deleting it would
+    // for a later Sandbox is somebody else's cluster, and releasing it would
     // destroy a running tenant's work.
     let Some(recorded) = status
         .target
@@ -720,38 +726,57 @@ async fn release_child_composition(
         debug!(lease = %name, "no child composition recorded; nothing to destroy");
         return finish_release(lease, ctx, reason).await;
     };
+    let recorded_instance = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_instance.as_ref());
 
     let internal: Api<crate::crd::ClusterLease> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match internal.get(&recorded.name).await {
         Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
-            let delete = DeleteParams {
-                preconditions: Some(kube::api::Preconditions {
-                    uid: Some(recorded.uid.clone()),
-                    resource_version: None,
-                }),
-                ..Default::default()
-            };
-            match internal.delete(&recorded.name, &delete).await {
-                Ok(_) => {}
-                // 404 or 409: ours is not there, which is the goal. Either way
-                // the check below is what decides, not this call.
-                Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {}
-                Err(error) => {
-                    warn!(lease = %name, error = %error, "could not release child cluster lease");
-                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                }
+            let child_status = current.status.clone().unwrap_or_default();
+
+            // #80 could not prove the cluster's own teardown. Nothing this
+            // controller can do makes that evidence appear.
+            if child_status.phase == crate::crd::LeasePhase::Quarantined {
+                return quarantine_lease(lease, ctx, "child_teardown_quarantined").await;
             }
-            // Destroying a cluster is not instantaneous, and #80 will not let
-            // its capacity return until the footprint is proven gone. Wait.
-            debug!(lease = %name, "child cluster still being destroyed");
+
+            match child_status.teardown_receipt.as_ref() {
+                Some(receipt) if receipt_proves_child_gone(receipt, recorded_instance) => {
+                    info!(lease = %name, "child teardown receipt verified");
+                    return finish_release(lease, ctx, reason).await;
+                }
+                // A receipt exists but is not about this instance, or does not
+                // say Verified. Present-but-wrong is worse than absent: it is
+                // the case a laxer check would accept.
+                Some(_) => {
+                    return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
+                }
+                None => {}
+            }
+
+            // No receipt yet. Ask for release if nobody has, then wait —
+            // destroying a cluster and proving it gone both take time.
+            if !matches!(
+                child_status.phase,
+                crate::crd::LeasePhase::Released
+                    | crate::crd::LeasePhase::Expired
+                    | crate::crd::LeasePhase::Recycling
+            ) {
+                request_child_release(&internal, &current).await?;
+            }
+            debug!(lease = %name, "waiting for the child teardown receipt");
             Ok(Action::requeue(std::time::Duration::from_secs(30)))
         }
-        // Gone, or replaced by a different object under the same name. Either
-        // way THIS lease's cluster is not there.
-        Ok(_) => finish_release(lease, ctx, reason).await,
+        // The recorded lease is gone, or a different object holds its name. Its
+        // receipt went with it, so there is nothing left that can prove this
+        // lease's cluster was destroyed — and #74 is explicit that the
+        // disappearance of a name is not evidence.
+        Ok(_) => quarantine_lease(lease, ctx, "child_receipt_unavailable").await,
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            finish_release(lease, ctx, reason).await
+            quarantine_lease(lease, ctx, "child_receipt_unavailable").await
         }
         // Cannot tell whether the tenant's cluster is still running.
         Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
@@ -761,6 +786,73 @@ async fn release_child_composition(
             warn!(lease = %name, error = %error, "could not check child cluster lease");
             Ok(Action::requeue(std::time::Duration::from_secs(15)))
         }
+    }
+}
+
+/// Whether a child teardown receipt proves THIS lease's cluster gone.
+///
+/// #80's own gate already ran inside the `ClusterLease` controller before the
+/// receipt was written; this is the outer lease checking the one thing that
+/// gate cannot know — that the evidence is about the instance this Sandbox was
+/// actually placed on.
+///
+/// A same-named replacement instance is fresh capacity, not proof the original
+/// was reset, so the UID recorded at composition time is what must match. An
+/// unrecorded instance UID fails closed: two absent UIDs would otherwise
+/// compare equal and any receipt would satisfy any lease.
+fn receipt_proves_child_gone(
+    receipt: &crate::crd::TeardownReceipt,
+    recorded_instance: Option<&crate::crd::SandboxObjectReference>,
+) -> bool {
+    if receipt.outcome != crate::crd::TeardownOutcome::Verified
+        || receipt.completed_at.is_none()
+        || crate::crd::TeardownReceipt::outcome_for(&receipt.checks)
+            != crate::crd::TeardownOutcome::Verified
+        || receipt.schema_version != crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION
+    {
+        return false;
+    }
+    let Some(expected) = recorded_instance else {
+        return false;
+    };
+    let Some(proven) = receipt.instance.uid.as_deref() else {
+        return false;
+    };
+    !expected.uid.is_empty() && proven == expected.uid && receipt.instance.name == expected.name
+}
+
+/// Ask the internal lease to release, fenced on the exact object.
+///
+/// The same UID and resourceVersion test ops the public release path uses:
+/// between the read and this write the lease could be deleted and a same-named
+/// one composed for another Sandbox, and a merge patch would release theirs.
+async fn request_child_release(
+    internal: &Api<crate::crd::ClusterLease>,
+    current: &crate::crd::ClusterLease,
+) -> Result<(), SandboxPlacementError> {
+    let (Some(uid), Some(resource_version)) = (current.uid(), current.resource_version()) else {
+        return Err(SandboxPlacementError::Invalid(
+            "child cluster lease has no UID or resourceVersion to fence on".into(),
+        ));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status/phase", "value": "Released" }
+    ]));
+    match internal
+        .patch_status(
+            &current.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        // Lost the race: somebody already moved it on. The next reconcile reads
+        // whatever they wrote, which is exactly what should decide.
+        Err(kube::Error::Api(error)) if error.code == 409 || error.code == 404 => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -2241,7 +2333,14 @@ pub(crate) mod tests {
                 uid: cluster_lease_uid.into(),
                 generation: Some(1),
             }),
-            child_cluster_instance: None,
+            child_cluster_instance: Some(crate::crd::SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterInstance".into(),
+                namespace: Some(NS.into()),
+                name: "kobe-abc123".into(),
+                uid: "child-instance-uid".into(),
+                generation: Some(2),
+            }),
             sandbox_template: None,
             sandbox_warm_pool: None,
             sandbox_claim: None,
@@ -2253,6 +2352,65 @@ pub(crate) mod tests {
             chrono::Utc::now().to_rfc3339(),
         );
         lease
+    }
+
+    async fn mount_child_release_patch(server: &MockServer) {
+        Mock::given(method("PATCH"))
+            .and(path(format!("{CLUSTER_LEASE_PATH}/status")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Released",
+                    None,
+                )),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn child_cluster_lease(
+        uid: &str,
+        phase: &str,
+        receipt: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut status = serde_json::json!({ "phase": phase });
+        if let Some(receipt) = receipt {
+            status["teardownReceipt"] = receipt;
+        }
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": "kobe-sbx-sbx-1",
+                "namespace": NS,
+                "uid": uid,
+                "resourceVersion": "42",
+            },
+            "spec": {
+                "poolRef": "children",
+                "ttl": "2h",
+                "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" },
+            },
+            "status": status,
+        })
+    }
+
+    /// A receipt about the exact instance recorded at composition time.
+    fn verified_receipt(instance_name: &str, instance_uid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION,
+            "attemptId": "attempt-1",
+            "lease": { "name": "kobe-sbx-sbx-1", "uid": "child-lease-uid" },
+            "instance": { "name": instance_name, "uid": instance_uid },
+            "pool": { "name": "children", "uid": "cluster-pool-uid" },
+            "backendType": "k3s",
+            "configDigest": "digest",
+            "instanceSpecDigest": "spec-digest",
+            "startedAt": "2026-01-01T00:00:00Z",
+            "completedAt": "2026-01-01T00:05:00Z",
+            "checks": [{ "subject": "serverStatefulSet", "result": "verified" }],
+            "outcome": "verified",
+        })
     }
 
     const CLUSTER_LEASE_PATH: &str =
@@ -2274,28 +2432,16 @@ pub(crate) mod tests {
         // their Sandbox inside it, are still running.
         Mock::given(method("GET"))
             .and(path(CLUSTER_LEASE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": {
-                    "name": "kobe-sbx-sbx-1",
-                    "namespace": NS,
-                    "uid": "child-lease-uid",
-                },
-                "spec": { "poolRef": "children", "ttl": "2h",
-                          "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" } },
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Bound",
+                    None,
+                )),
+            )
             .mount(&server)
             .await;
-        Mock::given(method("DELETE"))
-            .and(path(CLUSTER_LEASE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": { "name": "kobe-sbx-sbx-1", "namespace": NS },
-            })))
-            .mount(&server)
-            .await;
+        mount_child_release_patch(&server).await;
 
         reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
             .await
@@ -2305,6 +2451,12 @@ pub(crate) mod tests {
             requests_to(&server, "DELETE", CLAIM_PATH).await,
             0,
             "the claim is in the child cluster; nothing here may stand in for it"
+        );
+        assert_eq!(
+            requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await,
+            0,
+            "the internal lease is RELEASED, never deleted: deleting it destroys \
+             the receipt at exactly the moment the evidence matters"
         );
         assert_eq!(
             requests_to(
@@ -2320,31 +2472,28 @@ pub(crate) mod tests {
         assert_eq!(phases, vec!["Releasing".to_string()]);
     }
 
-    /// Teardown acts on the recorded UID, not the recorded name.
+    /// Teardown acts on the recorded UID, not the recorded name — and a name
+    /// that now belongs to somebody else is not evidence of anything.
     ///
-    /// If the composed cluster lease is gone and a DIFFERENT object now holds
-    /// its name, that object belongs to a later Sandbox. Deleting it would
-    /// destroy a running tenant's cluster; treating its presence as "ours is
-    /// still up" would strand this lease forever. Neither: this lease's
-    /// cluster is provably not there, so the release completes.
+    /// A different object under the same name belongs to a later Sandbox.
+    /// Releasing it would destroy a running tenant's cluster. But its presence
+    /// also does not prove OURS was destroyed: our lease is gone and its
+    /// receipt went with it. #74 is explicit that the disappearance of a name
+    /// is not evidence, so this quarantines rather than completing.
     #[tokio::test]
     async fn a_name_reused_by_a_later_composition_is_not_this_leases_cluster() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
         Mock::given(method("GET"))
             .and(path(CLUSTER_LEASE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                "kind": "ClusterLease",
-                "metadata": {
-                    "name": "kobe-sbx-sbx-1",
-                    "namespace": NS,
-                    // Somebody else's composition, under a reused name.
-                    "uid": "a-completely-different-uid",
-                },
-                "spec": { "poolRef": "children", "ttl": "2h",
-                          "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" } },
-            })))
+            // Somebody else's composition, under a reused name.
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "a-completely-different-uid",
+                    "Bound",
+                    None,
+                )),
+            )
             .mount(&server)
             .await;
 
@@ -2358,9 +2507,24 @@ pub(crate) mod tests {
             "a cluster this lease does not own must never be destroyed"
         );
         assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0,
+            "nor may it be released"
+        );
+        assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
-            Some("Released"),
-            "this lease's own cluster is provably absent"
+            Some("Quarantined"),
+            "our own cluster's receipt is gone; absence of a name proves nothing"
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            0,
+            "capacity is withheld precisely because nothing proved it safe"
         );
     }
 
@@ -2434,6 +2598,180 @@ pub(crate) mod tests {
             1,
             "the slot it was holding must come back"
         );
+    }
+
+    /// Capacity returns only against a receipt for the exact instance.
+    ///
+    /// This is the point of composing through a `VerifiedDestroy` lease at all:
+    /// the caller had a whole cluster to themselves, and the next caller gets
+    /// it only once somebody proved the previous tenant's footprint is gone.
+    #[tokio::test]
+    async fn a_verified_receipt_for_the_recorded_instance_completes_the_release() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Released",
+                    Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Released")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            1
+        );
+    }
+
+    /// A receipt for a DIFFERENT instance must not release this lease.
+    ///
+    /// The child cluster can be destroyed and replaced under the same lease
+    /// name — that is what recycling does. A receipt proving the replacement
+    /// gone says nothing about the instance this Sandbox actually ran on, and
+    /// accepting it would return capacity on the strength of evidence about
+    /// somebody else's cluster. Present-but-wrong is the dangerous case,
+    /// because it is the one a laxer check accepts.
+    #[tokio::test]
+    async fn a_receipt_for_another_instance_does_not_release_this_lease() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Released",
+                    Some(verified_receipt("kobe-later", "a-later-instance-uid")),
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            0
+        );
+    }
+
+    /// A child whose own teardown quarantined cannot release the outer lease.
+    #[tokio::test]
+    async fn a_quarantined_child_quarantines_the_sandbox_lease() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Quarantined",
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+    }
+
+    /// Everything short of a complete, verified, correctly-addressed receipt
+    /// fails closed.
+    ///
+    /// Each of these is a receipt that *looks* like evidence. A quarantined
+    /// outcome, an unfinished attempt, a check that came back Unknown, or a
+    /// schema this build does not understand are all "we could not prove it" —
+    /// and an unrecorded instance UID is worse still, because two absent UIDs
+    /// compare equal and any receipt would satisfy any lease.
+    #[test]
+    fn only_a_complete_receipt_about_this_instance_counts() {
+        let recorded = crate::crd::SandboxObjectReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some(NS.into()),
+            name: "kobe-abc123".into(),
+            uid: "child-instance-uid".into(),
+            generation: Some(2),
+        };
+        let parse = |value: serde_json::Value| -> crate::crd::TeardownReceipt {
+            serde_json::from_value(value).expect("receipt fixture parses")
+        };
+
+        let good = parse(verified_receipt("kobe-abc123", "child-instance-uid"));
+        assert!(receipt_proves_child_gone(&good, Some(&recorded)));
+
+        // No recorded instance: nothing to compare against.
+        assert!(!receipt_proves_child_gone(&good, None));
+
+        // An empty recorded UID must not be satisfiable.
+        let mut blank = recorded.clone();
+        blank.uid = String::new();
+        let mut blank_receipt = good.clone();
+        blank_receipt.instance.uid = Some(String::new());
+        assert!(!receipt_proves_child_gone(&blank_receipt, Some(&blank)));
+
+        let mut quarantined = good.clone();
+        quarantined.outcome = crate::crd::TeardownOutcome::Quarantined;
+        assert!(!receipt_proves_child_gone(&quarantined, Some(&recorded)));
+
+        let mut unfinished = good.clone();
+        unfinished.completed_at = None;
+        assert!(!receipt_proves_child_gone(&unfinished, Some(&recorded)));
+
+        // Outcome says Verified but the evidence does not agree. The receipt is
+        // not trusted over its own checks.
+        let mut inconsistent = good.clone();
+        inconsistent.checks = vec![crate::crd::TeardownCheck {
+            subject: crate::crd::TeardownSubject::ServerStatefulSet,
+            result: crate::crd::CheckResult::Unknown,
+            reason: Some("api_error".into()),
+        }];
+        assert!(!receipt_proves_child_gone(&inconsistent, Some(&recorded)));
+
+        let mut future_schema = good.clone();
+        future_schema.schema_version = crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION + 1;
+        assert!(!receipt_proves_child_gone(&future_schema, Some(&recorded)));
+
+        // Right UID, wrong name — a shape mismatch that should never occur, and
+        // must not be resolved in favour of releasing capacity.
+        let mut renamed = good.clone();
+        renamed.instance.name = "kobe-something-else".into();
+        assert!(!receipt_proves_child_gone(&renamed, Some(&recorded)));
     }
 
     /// The pinned upstream version must match what #72 validates at startup.
