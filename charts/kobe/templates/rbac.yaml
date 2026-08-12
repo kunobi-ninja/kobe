@@ -48,10 +48,22 @@ rules:
     resources: ["sandboxpools"]
     verbs: ["get", "list", "watch"]
   # Sandbox callers create lease intent through the HTTP API. Lifecycle
-  # controllers, not admission, own the status subresource.
+  # controllers, not admission, own the status subresource — which needs its
+  # own rule: `/status` is a separate resource to RBAC, so a controller with
+  # `patch` on `sandboxleases` alone still 403s on every phase transition.
   - apiGroups: ["kobe.kunobi.ninja"]
-    resources: ["sandboxleases"]
+    resources: ["sandboxleases", "sandboxleases/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Upstream Agent Sandbox objects, created and owned by the placement
+  # controller. Kobe never installs these CRDs (`agentSandbox.mode=external`
+  # means the operator owns the runtime); it only writes the objects it
+  # created, all of which carry a `kobe-` name and an owner reference to their
+  # Kobe parent. `delete` is what makes verified teardown possible: without it
+  # a released lease could never prove its Sandbox was gone, and its capacity
+  # would be withheld forever.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]
