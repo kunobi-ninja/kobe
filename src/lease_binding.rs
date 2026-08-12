@@ -27,6 +27,10 @@ pub(crate) enum BindingResolveMode {
 #[derive(Debug)]
 pub(crate) struct ResolvedLeaseBinding {
     pub lease: ClusterLease,
+    /// `#[allow(dead_code)]`: callers work off the validated `binding`, but the
+    /// resolved object stays part of the tuple so a caller needing live
+    /// instance state does not re-fetch it unvalidated.
+    #[allow(dead_code)]
     pub instance: ClusterInstance,
     pub pool: ClusterPool,
     pub binding: LeaseBinding,
@@ -73,6 +77,8 @@ pub(crate) enum BindingResolutionError {
     InstancePhaseMismatch,
     #[error("instance reciprocal binding does not match")]
     ReciprocalBindingMismatch,
+    #[error("lease is still bound to this instance")]
+    LeaseStillBound,
     #[error("instance lease reference does not match binding")]
     LeaseRefMismatch,
     #[error("instance pool reference does not match binding")]
@@ -120,6 +126,7 @@ impl BindingResolutionError {
             Self::InstanceDeleting => "instance_deleting",
             Self::InstancePhaseMismatch => "instance_phase_mismatch",
             Self::ReciprocalBindingMismatch => "reciprocal_binding_mismatch",
+            Self::LeaseStillBound => "lease_still_bound",
             Self::LeaseRefMismatch => "lease_ref_mismatch",
             Self::InstancePoolMismatch => "instance_pool_mismatch",
             Self::InstanceOwnerMismatch => "instance_owner_mismatch",
@@ -297,6 +304,96 @@ pub(crate) async fn resolve_lease_binding(
         pool,
         binding,
     })
+}
+
+/// Verify that a bound `ClusterInstance` is safe to tear down.
+///
+/// # Why this is not `resolve_lease_binding(_, Lifecycle)`
+///
+/// Teardown runs on an instance that is already being destroyed, so the
+/// resolver's live-pair invariants are unsatisfiable by construction:
+///
+/// * Kubernetes bumps `metadata.generation` when it stamps `deletionTimestamp`
+///   on a finalizer-bearing object, so a deleting instance always reads
+///   `generation == observedGeneration + 1` → `InstanceGenerationMismatch`.
+/// * The resolver rejects any instance carrying a `deletionTimestamp`
+///   outright → `InstanceDeleting`.
+/// * The paired lease CR is deleted at the end of recycling →
+///   `LeaseNotFound`.
+///
+/// Each denial fenced the finalizer path *permanently*: the cleanup finalizer
+/// was never released, the `ClusterInstance` stayed in `Recycling` forever,
+/// and the pool filled with undeletable members until every request failed
+/// `pool_exhausted`. The resolver fails closed on *absence*, which is right
+/// for granting tenant access and exactly wrong for reclaiming a corpse.
+///
+/// Teardown therefore fences only on positive evidence that this instance is
+/// the wrong target — a binding describing a different object, or a lease that
+/// is still live and still points here — and fails open on absence.
+pub(crate) async fn verify_instance_teardown(
+    client: &Client,
+    namespace: &str,
+    instance: &ClusterInstance,
+) -> Result<(), BindingResolutionError> {
+    let Some(binding) = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.as_ref())
+    else {
+        // An unbound pool member or standalone instance has no tenant binding
+        // to cross. Backend dispatch stays provenance-pinned by the caller.
+        return Ok(());
+    };
+
+    // Self-consistency: the binding must describe *this* CR. A binding naming
+    // another object is the copy/stale-object case the UID fence exists for.
+    if instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str())
+        || instance.name_any() != binding.instance.name
+    {
+        return Err(BindingResolutionError::InstanceUidMismatch);
+    }
+
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let lease = match leases.get(&binding.lease.name).await {
+        Ok(lease) => lease,
+        // The lease is gone, so no tenant can still be holding this instance.
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(()),
+        // A lookup failure is not evidence either way; the caller requeues.
+        Err(err) => return Err(BindingResolutionError::LeaseLookup(err)),
+    };
+
+    // A same-named replacement lease is somebody else's binding, not a live
+    // claim on this instance.
+    if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref() {
+        return Ok(());
+    }
+    if lease.metadata.deletion_timestamp.is_some() {
+        return Ok(());
+    }
+
+    let lease_status = lease.status.clone().unwrap_or_default();
+    if lease_status.phase != LeasePhase::Bound {
+        return Ok(());
+    }
+    // Only an unexpired `Bound` lease can still be serving a tenant. An absent
+    // or malformed expiry cannot prove liveness, and unlike the access path a
+    // wrong guess here strands a cluster instead of leaking one — so
+    // uncertainty releases.
+    let live = lease_status
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|expires_at| chrono::Utc::now() < expires_at.with_timezone(&chrono::Utc));
+    if !live {
+        return Ok(());
+    }
+    // Live, and still reciprocally bound to this exact instance: a tenant is
+    // using it. This fence is self-clearing — the lease expires on its TTL.
+    if lease_status.binding.as_ref() == Some(binding) {
+        return Err(BindingResolutionError::LeaseStillBound);
+    }
+
+    Ok(())
 }
 
 fn validate_binding_shape(binding: &LeaseBinding) -> Result<(), BindingResolutionError> {
@@ -718,5 +815,160 @@ mod tests {
                 .reason_code(),
             "binding_malformed"
         );
+    }
+
+    /// Run `verify_instance_teardown` against a mock apiserver that serves
+    /// `lease` for `lease-a` (or 404s when `lease` is `None`).
+    async fn teardown_verdict(
+        instance: serde_json::Value,
+        lease: Option<serde_json::Value>,
+    ) -> Result<(), BindingResolutionError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let response = match lease {
+            Some(lease) => ResponseTemplate::new(200).set_body_json(lease),
+            None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": "not found", "reason": "NotFound", "code": 404
+            })),
+        };
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let instance: ClusterInstance = serde_json::from_value(instance).unwrap();
+        verify_instance_teardown(&client, "test-ns", &instance).await
+    }
+
+    /// The production deadlock: an instance whose delete is already in flight
+    /// reads one generation ahead of its binding (the apiserver bumps
+    /// `metadata.generation` when it stamps `deletionTimestamp` on a
+    /// finalizer-bearing object) and its lease has moved on. The live-pair
+    /// resolver denied both facts, so the cleanup finalizer was never
+    /// released: every bound instance became undeletable, the pool filled with
+    /// them, and all leases failed `pool_exhausted`.
+    #[tokio::test]
+    async fn teardown_releases_a_deleting_instance_whose_lease_terminated() {
+        let (_, mut lease, mut instance, _) = exact_objects();
+        instance["metadata"]["deletionTimestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+        instance["metadata"]["generation"] = serde_json::json!(2);
+        instance["metadata"]["finalizers"] =
+            serde_json::json!(["kobe.kunobi.ninja/instance-cleanup"]);
+        instance["status"]["phase"] = serde_json::json!("Recycling");
+        lease["status"]["phase"] = serde_json::json!("Recycling");
+
+        assert!(
+            teardown_verdict(instance.clone(), Some(lease))
+                .await
+                .is_ok(),
+            "a deleting instance whose lease is recycling must tear down"
+        );
+
+        // The same instance once the lease CR itself is gone.
+        assert!(
+            teardown_verdict(instance, None).await.is_ok(),
+            "a missing lease is not evidence of a live tenant"
+        );
+    }
+
+    /// Absence releases, but positive evidence of the wrong target still
+    /// fences: a binding that names another object must never authorise a
+    /// teardown of this one.
+    #[tokio::test]
+    async fn teardown_fences_a_binding_that_describes_another_instance() {
+        let (_, lease, instance, _) = exact_objects();
+        let mut foreign_uid = instance.clone();
+        foreign_uid["status"]["binding"]["instance"]["uid"] = serde_json::json!("other-uid");
+        assert_eq!(
+            teardown_verdict(foreign_uid, Some(lease.clone()))
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "instance_uid_mismatch"
+        );
+
+        let mut foreign_name = instance;
+        foreign_name["status"]["binding"]["instance"]["name"] = serde_json::json!("pool-p-9");
+        assert_eq!(
+            teardown_verdict(foreign_name, Some(lease))
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "instance_uid_mismatch"
+        );
+    }
+
+    /// A live `Bound` lease still pointing here means a tenant is using the
+    /// cluster. That fence stays — it is self-clearing at the lease TTL, and
+    /// only an unexpired reciprocal lease can hold it.
+    #[tokio::test]
+    async fn teardown_fences_only_a_live_reciprocal_lease() {
+        let (_, mut lease, instance, _) = exact_objects();
+        lease["status"]["expiresAt"] =
+            serde_json::json!((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        assert_eq!(
+            teardown_verdict(instance.clone(), Some(lease.clone()))
+                .await
+                .unwrap_err()
+                .reason_code(),
+            "lease_still_bound"
+        );
+
+        // Expired, so no tenant is served even though the phase still reads Bound.
+        let mut expired = lease.clone();
+        expired["status"]["expiresAt"] =
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        assert!(
+            teardown_verdict(instance.clone(), Some(expired))
+                .await
+                .is_ok()
+        );
+
+        // Unprovable liveness releases here (the access path denies instead).
+        let mut malformed = lease.clone();
+        malformed["status"]["expiresAt"] = serde_json::json!("not-a-timestamp");
+        assert!(
+            teardown_verdict(instance.clone(), Some(malformed))
+                .await
+                .is_ok()
+        );
+
+        // A same-named replacement lease is somebody else's binding.
+        let mut replacement = lease.clone();
+        replacement["metadata"]["uid"] = serde_json::json!("replacement-lease-uid");
+        assert!(
+            teardown_verdict(instance.clone(), Some(replacement))
+                .await
+                .is_ok()
+        );
+
+        // A live lease that has moved on to another instance does not hold this one.
+        let mut rebound = lease.clone();
+        rebound["status"]["binding"]["bindingId"] = serde_json::json!("other-binding");
+        assert!(
+            teardown_verdict(instance.clone(), Some(rebound))
+                .await
+                .is_ok()
+        );
+
+        // A lease being deleted cannot keep serving it either.
+        let mut deleting = lease;
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+        assert!(teardown_verdict(instance, Some(deleting)).await.is_ok());
+    }
+
+    /// An unbound pool member has no tenant binding to cross.
+    #[tokio::test]
+    async fn teardown_releases_an_unbound_instance_without_a_lease_lookup() {
+        let (_, _, mut instance, _) = exact_objects();
+        instance["status"]
+            .as_object_mut()
+            .unwrap()
+            .remove("binding");
+        assert!(teardown_verdict(instance, None).await.is_ok());
     }
 }
