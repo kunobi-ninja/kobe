@@ -2015,14 +2015,42 @@ async fn quarantine_instance<B: ClusterBackend>(
     next.phase = ClusterInstancePhase::Quarantined;
     next.state_since = Some(chrono::Utc::now().to_rfc3339());
     next.message = Some(format!("quarantined: {reason}"));
-    let patch = serde_json::json!({ "status": next });
-    instances_api
-        .patch_status(
-            name,
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
-        )
-        .await?;
+
+    // Fenced, not a bare merge patch. Two ways an unfenced write goes wrong:
+    // a stale reconcile holding an older view could overwrite `Quarantined`
+    // with whatever phase it believed, handing unproven capacity back to the
+    // pool; and a name-addressed write could land on a same-named replacement
+    // instance that has nothing to do with this teardown.
+    let (Some(uid), Some(resource_version)) = (
+        instance.metadata.uid.as_deref(),
+        instance.resource_version(),
+    ) else {
+        // Without an identity to fence against we cannot safely mark anything.
+        // Requeue rather than write blind; the finalizer still holds.
+        warn!(
+            instance = %name,
+            "cannot fence the quarantine write; retrying rather than writing unfenced"
+        );
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": next }
+    ]));
+    match instances_api
+        .patch_status(name, &PatchParams::default(), &Patch::<()>::Json(patch))
+        .await
+    {
+        Ok(_) => {}
+        // The object moved under us. Re-reconcile against the new state rather
+        // than forcing a phase derived from a view that is now stale.
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => {
+            debug!(instance = %name, "quarantine write conflicted; re-reading");
+            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+        }
+        Err(error) => return Err(error.into()),
+    }
     // Bounded backoff: a transient API failure may resolve, and the same exact
     // subject can then produce a verified receipt.
     Ok(Action::requeue(std::time::Duration::from_secs(120)))
