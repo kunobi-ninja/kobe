@@ -273,7 +273,16 @@ impl TeardownReceipt {
             // credentials as never-created and still release the lease. A
             // footprint that genuinely was never created belongs OUT of
             // `required_subjects` — that is what the scope is for.
-            matching.next().is_none() && check.result == CheckResult::Verified
+            if matching.next().is_some() || check.result != CheckResult::Verified {
+                return false;
+            }
+            // Where the name is derivable, the check must actually name it.
+            // Otherwise `ServerStatefulSet = Verified` proves only that
+            // *something* of that category was inspected.
+            match expected_identity_for(*subject, expected.instance_name) {
+                Some(expected_name) => check.verified.contains(&expected_name),
+                None => true,
+            }
         })
     }
 }
@@ -298,6 +307,43 @@ pub struct TeardownScope<'a> {
     /// were never created are simply absent — which is why the list must come
     /// from the creation record, not be inferred at teardown time.
     pub required_subjects: &'a [TeardownSubject],
+    /// Used to derive the expected resource names. Comes from controller-owned
+    /// bind-time state like the rest of this scope, never from the receipt.
+    pub instance_name: &'a str,
+}
+
+/// The name a subject's resource must have, where naming is deterministic.
+///
+/// This is the non-circular half of identity checking: it comes from the
+/// recorded plan and the instance name, never from the receipt being validated.
+/// A receipt claiming `ServerStatefulSet = Verified` while naming some other
+/// object therefore fails, rather than being accepted because the category
+/// matched.
+///
+/// `None` for subjects whose identity cannot be derived — the bound PV names
+/// are assigned by the provisioner, and the Pod set is a label selector. Those
+/// are still RECORDED in the receipt for audit; they simply cannot be
+/// pre-computed here.
+pub fn expected_identity_for(subject: TeardownSubject, instance: &str) -> Option<String> {
+    let name = match subject {
+        TeardownSubject::AgentDeployment => format!("{instance}-agent"),
+        TeardownSubject::ServerStatefulSet => format!("{instance}-server"),
+        TeardownSubject::Service => format!("{instance}-server"),
+        TeardownSubject::PodDisruptionBudget => format!("{instance}-server"),
+        TeardownSubject::PublisherConfigMap => format!("{instance}-kubeconfig-publisher"),
+        TeardownSubject::RegistriesConfigMap => format!("{instance}-registries"),
+        TeardownSubject::TokenSecret => format!("{instance}-token"),
+        TeardownSubject::KubeconfigSecret => format!("{instance}-kubeconfig"),
+        TeardownSubject::ConnectTokenSecret => format!("{instance}-connect-token"),
+        TeardownSubject::CidrClaim => instance.to_string(),
+        TeardownSubject::Database => format!("database:k3s_{instance}"),
+        TeardownSubject::DatabaseRole => format!("role:k3s_{instance}"),
+        // Provisioner-assigned or selector-based; recorded, not derivable.
+        TeardownSubject::ServerPods
+        | TeardownSubject::ServerDataPvcs
+        | TeardownSubject::ServerDataVolumes => return None,
+    };
+    Some(name)
 }
 
 /// Derive the exact set of footprints a k3s instance creates, from the config
@@ -710,7 +756,11 @@ mod tests {
             subject,
             result,
             reason: None,
-            verified: Vec::new(),
+            // Name what a real provider would have named, so these fixtures
+            // satisfy the identity comparison the way production does.
+            verified: expected_identity_for(subject, "pool-p-0")
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -745,6 +795,7 @@ mod tests {
             config_digest: "digest",
             instance_spec_digest: "spec-digest",
             required_subjects: required,
+            instance_name: "pool-p-0",
         }
     }
 
@@ -818,6 +869,67 @@ mod tests {
 
         // An empty plan is not a clean bill of health.
         assert!(!complete.permits_release_for(&scope(&[], &refs)));
+    }
+
+    /// A check must name the resource its subject actually designates.
+    ///
+    /// Without this, `ServerStatefulSet = Verified` proves only that *something*
+    /// of that category was inspected — a receipt could verify a different
+    /// instance's StatefulSet, or one of several resources when the footprint
+    /// had more, and still release capacity. The expected name is derived from
+    /// controller-owned state and the instance name, never from the receipt.
+    #[test]
+    fn a_check_naming_the_wrong_resource_does_not_release() {
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [TeardownSubject::ServerStatefulSet];
+
+        let correct = receipt(
+            vec![check(
+                TeardownSubject::ServerStatefulSet,
+                CheckResult::Verified,
+            )],
+            TeardownOutcome::Verified,
+        );
+        assert!(correct.permits_release_for(&scope(&required, &refs)));
+
+        // Right category, wrong object — another instance's StatefulSet.
+        let wrong = receipt(
+            vec![TeardownCheck {
+                subject: TeardownSubject::ServerStatefulSet,
+                result: CheckResult::Verified,
+                reason: None,
+                verified: vec!["some-other-instance-server".into()],
+            }],
+            TeardownOutcome::Verified,
+        );
+        assert!(
+            !wrong.permits_release_for(&scope(&required, &refs)),
+            "a check must name the resource its subject designates"
+        );
+
+        // Claiming the category with no identity at all is equally unproven.
+        let unnamed = receipt(
+            vec![TeardownCheck {
+                subject: TeardownSubject::ServerStatefulSet,
+                result: CheckResult::Verified,
+                reason: None,
+                verified: Vec::new(),
+            }],
+            TeardownOutcome::Verified,
+        );
+        assert!(!unnamed.permits_release_for(&scope(&required, &refs)));
+    }
+
+    /// Subjects whose names are provisioner-assigned cannot be pre-derived, so
+    /// they must not be blocked by the identity check — only recorded.
+    #[test]
+    fn provisioner_assigned_subjects_are_not_name_checked() {
+        assert!(expected_identity_for(TeardownSubject::ServerDataVolumes, "pool-p-0").is_none());
+        assert!(expected_identity_for(TeardownSubject::ServerPods, "pool-p-0").is_none());
+        assert_eq!(
+            expected_identity_for(TeardownSubject::Database, "pool-p-0").as_deref(),
+            Some("database:k3s_pool-p-0")
+        );
     }
 
     /// A receipt is proof about ONE subject. It must not be replayable against
