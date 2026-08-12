@@ -8,6 +8,7 @@ mod metrics;
 pub mod pki;
 mod pool;
 mod sandbox;
+mod sandbox_runtime;
 mod telemetry;
 mod velero;
 
@@ -46,7 +47,40 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting kobe-operator");
 
+    // Refuse an unimplemented or unrecognised Agent Sandbox mode at STARTUP.
+    // Deferring it to the first Sandbox request would leave a cluster running
+    // that looks healthy and fails only when someone tries to use it.
+    let agent_sandbox_mode = match sandbox_runtime::mode_from_env() {
+        Ok(mode) => {
+            info!(?mode, "Agent Sandbox runtime mode");
+            mode
+        }
+        Err(err) => {
+            error!(reason = err.reason_code(), "{err}");
+            std::process::exit(1);
+        }
+    };
+
     let client = Client::try_default().await?;
+
+    // In `external` mode the runtime is the operator's to install, so verify it
+    // is actually there and compatible before anything depends on it. Refused
+    // at startup rather than per-request: a cluster that looks healthy and only
+    // fails when someone tries to use Sandbox is the worse failure.
+    //
+    // Deliberately no create/delete canary — writing a real SandboxClaim is one
+    // of the effects paused on #72. Presence and version are a weaker signal
+    // than a canary, and that limit is stated rather than hidden.
+    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+        match sandbox_runtime::validate_external_runtime(&client).await {
+            Ok(()) => info!("Agent Sandbox runtime validated (external, operator-installed)"),
+            Err(err) => {
+                error!(reason = err.reason_code(), "{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
     let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
 
