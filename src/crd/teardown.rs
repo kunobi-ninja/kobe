@@ -25,7 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::ResourceRef;
-use super::profile::{ClusterConfig, DiagnosticsConfig};
+use super::profile::{BackendType, ClusterConfig, DiagnosticsConfig};
 
 /// How thoroughly a lease's capacity must be torn down before it can be reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -77,6 +77,14 @@ pub enum TeardownSubject {
     ServerDataVolumes,
     /// The exact `k3s_<instance>` database.
     Database,
+    /// The per-cluster PostgreSQL role that owns that database.
+    ///
+    /// Added after `fix(datastore): give each cluster its own PostgreSQL role`
+    /// landed on main: k3s teardown now reclaims ownership, drops the database,
+    /// *and* drops a role. Without this subject a leaked role would sit inside
+    /// a receipt that claims the footprint is gone — the database would be
+    /// proven absent while a credential-bearing role survived.
+    DatabaseRole,
 }
 
 /// Outcome of proving one subject absent.
@@ -309,10 +317,19 @@ impl VerifiedDestroyIneligible {
 /// because the datastore connection lives outside the CRD; the caller knows
 /// whether the exact database identity needed to verify absence was captured.
 pub fn verified_destroy_eligibility(
+    backend: &BackendType,
     cluster: &ClusterConfig,
     diagnostics: Option<&DiagnosticsConfig>,
     external_datastore_identity_recorded: bool,
 ) -> Result<(), VerifiedDestroyIneligible> {
+    // Only k3s can produce evidence. Every other backend must be refused here
+    // rather than degrade to Standard cleanup while still claiming a verified
+    // mode. Previously this variant existed but was unreachable, because the
+    // function had no backend to judge — so a non-k3s pool received Ok(()).
+    if *backend != BackendType::K3s {
+        return Err(VerifiedDestroyIneligible::UnsupportedBackend);
+    }
+
     // Host-side kubelet trees survive object deletion and are not part of any
     // subject we can observe from the API, so their presence makes "the
     // footprint is absent" unprovable. Re-admissible once the host reaper's
@@ -361,7 +378,7 @@ mod tests {
 
     #[test]
     fn ephemeral_k3s_with_recorded_datastore_is_eligible() {
-        assert!(verified_destroy_eligibility(&cluster(), None, true).is_ok());
+        assert!(verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, true).is_ok());
     }
 
     /// Each rejection must be derived from configuration alone, so an ineligible
@@ -375,7 +392,7 @@ mod tests {
             ..serde_json::from_value(serde_json::json!({})).unwrap()
         });
         assert_eq!(
-            verified_destroy_eligibility(&shared_mount, None, true).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &shared_mount, None, true).unwrap_err(),
             VerifiedDestroyIneligible::KubeletSharedMount
         );
 
@@ -384,7 +401,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verified_destroy_eligibility(&cluster(), Some(&capture), true).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &cluster(), Some(&capture), true)
+                .unwrap_err(),
             VerifiedDestroyIneligible::DiagnosticsEnabled
         );
 
@@ -395,14 +413,38 @@ mod tests {
             storage_request_size: None,
         });
         assert_eq!(
-            verified_destroy_eligibility(&retained, None, true).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &retained, None, true).unwrap_err(),
             VerifiedDestroyIneligible::UnverifiableStorage
         );
 
         assert_eq!(
-            verified_destroy_eligibility(&cluster(), None, false).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, false).unwrap_err(),
             VerifiedDestroyIneligible::DatastoreProvenanceMissing
         );
+    }
+
+    /// A backend that cannot produce evidence must be refused at bind time.
+    ///
+    /// This variant existed before but was unreachable: the function took no
+    /// backend, so a k0s or vcluster pool asking for verified teardown got
+    /// `Ok(())` and would only discover mid-teardown that no evidence was
+    /// possible — stranding the lease in quarantine through no fault of its
+    /// caller.
+    #[test]
+    fn only_k3s_can_promise_verified_teardown() {
+        for backend in [
+            BackendType::K0s,
+            BackendType::Capi,
+            BackendType::Vkobe,
+            BackendType::Vcluster,
+        ] {
+            assert_eq!(
+                verified_destroy_eligibility(&backend, &cluster(), None, true).unwrap_err(),
+                VerifiedDestroyIneligible::UnsupportedBackend,
+                "{backend:?} cannot produce a receipt and must be refused"
+            );
+        }
+        assert!(verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, true).is_ok());
     }
 
     /// Disabled diagnostics must not disqualify a pool — only active capture
@@ -413,7 +455,10 @@ mod tests {
             serde_json::json!({ "enabled": false, "storage": "s3://bucket/" }),
         )
         .unwrap();
-        assert!(verified_destroy_eligibility(&cluster(), Some(&disabled), true).is_ok());
+        assert!(
+            verified_destroy_eligibility(&BackendType::K3s, &cluster(), Some(&disabled), true)
+                .is_ok()
+        );
     }
 
     /// A single `Unknown` must dominate, however many subjects verified: the
