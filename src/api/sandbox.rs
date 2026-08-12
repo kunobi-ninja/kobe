@@ -1030,7 +1030,12 @@ async fn admit_sandbox_lease(
                     validate_lease_shape(lease, &current, SANDBOX_ADMISSION_ADMITTED)
                 }
                 Some(SANDBOX_ADMISSION_PENDING) => {
-                    validate_lease_shape(lease, &current, SANDBOX_ADMISSION_PENDING)?;
+                    // The safety property is "never delete an ADMITTED lease by this path",
+                    // not "the annotation must read exactly `pending`". Demanding the latter
+                    // bricked any lease whose annotation went missing or corrupt: the release
+                    // handler routes everything not-admitted here, and this then refused it
+                    // forever, so the object could not be removed through the API at all.
+                    validate_lease_shape_unadmitted(lease, &current)?;
                     delete_exact_pending_lease(leases, reservations, &current).await?;
                     Err(SandboxLeaseMutationError::AdmissionNotCommitted)
                 }
@@ -1391,6 +1396,29 @@ async fn delete_exact_pending_lease(
     };
     leases.delete(&current.name_any(), &params).await?;
     release_reservations_for_lease(reservations, lease, &expected_uid).await
+}
+
+/// Validate everything `validate_lease_shape` does, except that the admission
+/// annotation need only be **not admitted** rather than exactly `pending`.
+///
+/// Used on the delete path. An admitted lease must never be removed this way —
+/// that is the invariant worth keeping — but a lease stuck with a missing or
+/// unrecognised annotation is unadmitted by definition and has to remain
+/// deletable, or it becomes permanently stuck holding its principal's quota.
+fn validate_lease_shape_unadmitted(
+    expected: &SandboxLease,
+    actual: &SandboxLease,
+) -> Result<(), SandboxLeaseMutationError> {
+    let admission = actual
+        .annotations()
+        .get(SANDBOX_ADMISSION_ANNOTATION)
+        .map(String::as_str);
+    if admission == Some(SANDBOX_ADMISSION_ADMITTED) {
+        return Err(SandboxLeaseMutationError::UnexpectedAdmissionState);
+    }
+    // Reuse the strict checks for identity and shape by passing whatever the
+    // object actually carries, so only the admission comparison is relaxed.
+    validate_lease_shape(expected, actual, admission.unwrap_or_default())
 }
 
 fn validate_lease_shape(
@@ -2510,6 +2538,60 @@ mod tests {
             remaining.is_empty(),
             "the stranded principal's quota must be released even though they never retried:              {remaining:?}"
         );
+    }
+
+    /// A lease with a corrupted admission annotation must stay deletable.
+    ///
+    /// The release handler routes everything not-`admitted` to the delete path,
+    /// which used to demand the annotation read exactly `pending`. So a lease
+    /// whose annotation went missing or unrecognised could not be removed
+    /// through the API at all — it 503'd forever, holding its principal's quota
+    /// with no operator recourse short of editing etcd.
+    ///
+    /// Relaxing this must NOT weaken the real invariant: an admitted lease is
+    /// still refused, because deleting one here would drop a live sandbox's
+    /// record while its workload runs.
+    #[test]
+    fn a_corrupted_annotation_stays_deletable_but_an_admitted_lease_does_not() {
+        let base = sandbox_lease_from_json_with_admission(
+            lease_json("sandbox-x", "alice@example.com", "Pending"),
+            SANDBOX_ADMISSION_PENDING,
+        );
+
+        // Normal case still works.
+        assert!(validate_lease_shape_unadmitted(&base, &base).is_ok());
+
+        // Corrupted / unrecognised annotation: deletable.
+        let corrupted = sandbox_lease_from_json_with_admission(
+            lease_json("sandbox-x", "alice@example.com", "Pending"),
+            "garbage-value",
+        );
+        assert!(
+            validate_lease_shape_unadmitted(&corrupted, &corrupted).is_ok(),
+            "an unrecognised annotation is still unadmitted, so it must be removable"
+        );
+
+        // Admitted: still refused. This is the invariant the relaxation keeps.
+        let admitted = sandbox_lease_from_json_with_admission(
+            lease_json("sandbox-x", "alice@example.com", "Pending"),
+            SANDBOX_ADMISSION_ADMITTED,
+        );
+        assert!(
+            matches!(
+                validate_lease_shape_unadmitted(&admitted, &admitted),
+                Err(SandboxLeaseMutationError::UnexpectedAdmissionState)
+            ),
+            "an admitted lease must never be removed by the unadmitted delete path"
+        );
+    }
+
+    fn sandbox_lease_from_json_with_admission(
+        mut object: serde_json::Value,
+        admission: &str,
+    ) -> SandboxLease {
+        object["metadata"]["annotations"] =
+            serde_json::json!({ SANDBOX_ADMISSION_ANNOTATION: admission });
+        serde_json::from_value(object).expect("lease fixture must deserialize")
     }
 
     /// An object carrying our UID label but NOT our name shape must survive.
