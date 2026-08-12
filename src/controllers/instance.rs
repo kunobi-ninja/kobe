@@ -23,9 +23,10 @@ use crate::backend::{
 };
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
-    ClusterConfig, ClusterInstance, ClusterInstanceCondition, ClusterInstanceNetwork,
-    ClusterInstancePhase, ClusterInstanceStatus, ClusterPool, HealthCheckConfig, LeasePhase,
-    ReadinessGate, SnapshotConfig,
+    CheckResult, CleanupMode, ClusterConfig, ClusterInstance, ClusterInstanceCondition,
+    ClusterInstanceNetwork, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
+    HealthCheckConfig, LeasePhase, ReadinessGate, SnapshotConfig, TEARDOWN_RECEIPT_SCHEMA_VERSION,
+    TeardownOutcome, TeardownReceipt,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -244,6 +245,15 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 warn!(instance = %name, reason, "Deletion fenced: exact lease binding is not verifiable");
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             }
+            // Receipt-required teardown decides here, not after the fact: the
+            // finalizer is the last handle on this capacity, and releasing it
+            // on an accepted DELETE is exactly what makes "cleanup complete" a
+            // guess. A lease asking for VerifiedDestroy must produce evidence
+            // before the handle goes.
+            if let Some(outcome) = verified_teardown_gate(&ctx, &instance, &name, &ns).await {
+                return outcome;
+            }
+
             match delete_instance_backend(&ctx, &config, &instance, &name, &ns).await {
                 Ok(()) => {
                     cleanup_orphan_projected_resources(&ctx.client, &name, &ns).await;
@@ -335,6 +345,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 // is preserved (we never want to overwrite it
                                 // from an instance-controller patch).
                                 created_with: None,
+                                teardown_identities: Vec::new(),
                                 message: Some("network allocated; awaiting provisioning".into()),
                                 // Overwritten centrally in patch_instance_status.
                                 conditions: Vec::new(),
@@ -742,6 +753,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Ready => {
+            // Record provisioner-assigned identities while the instance is
+            // healthy. Doing this at teardown would let the teardown path
+            // choose its own scope; recorded here, a later receipt has to
+            // account for what was captured long before it ran.
+            capture_teardown_identities_once(&ctx, &instance, &name, &ns, &status).await;
             let next =
                 evaluate_ready_instance(&ctx, &config, &instance, &name, &ns, &status).await?;
             Ok(next)
@@ -749,6 +765,34 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
         ClusterInstancePhase::Leased => {
             let next = evaluate_leased_instance(&ctx, &instance, &name, &ns, &status).await?;
             Ok(next)
+        }
+        // Quarantine has exactly ONE way out: the same exact subject producing
+        // a verified receipt. Retrying is safe and idempotent — the provider
+        // re-runs delete and re-observes absence — so a transient RBAC or
+        // datastore failure that caused the quarantine can resolve itself.
+        //
+        // What must never happen is leaving by any other route: no timeout, no
+        // operator patch of the phase, no "it has been stuck a while" fallback.
+        // Those would return capacity to the pool on exactly the evidence the
+        // quarantine exists to demand.
+        ClusterInstancePhase::Quarantined => {
+            debug!(
+                instance = %name,
+                "quarantined: retrying teardown verification for the same exact subject"
+            );
+            // Only the deletion path can produce a receipt, so a quarantined
+            // instance that is not being deleted simply waits. It holds its
+            // finalizer and binding, so it is never selectable as capacity.
+            if instance.metadata.deletion_timestamp.is_none() {
+                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+            }
+            match verified_teardown_gate(&ctx, &instance, &name, &ns).await {
+                Some(outcome) => outcome,
+                // Not receipt-required after all (the lease changed or is
+                // gone): fall back to the ordinary path rather than holding
+                // capacity hostage forever.
+                None => Ok(Action::requeue(std::time::Duration::from_secs(30))),
+            }
         }
         ClusterInstancePhase::Recycling => {
             info!(instance = %name, owner = %owner, "Deleting backend resources");
@@ -1794,6 +1838,327 @@ async fn delete_instance_backend<B: ClusterBackend + Clone>(
     } else {
         ctx.backend.delete(name, namespace).await
     }
+}
+
+/// Gate finalizer release on evidence, for leases that asked for it.
+///
+/// Returns `None` when this instance is not receipt-required, so the ordinary
+/// teardown path runs unchanged — every existing lease keeps today's behaviour.
+///
+/// When it *is* required, this is the only place the last cleanup handle can be
+/// released, and it is released only against a receipt whose checks cover the
+/// plan recorded at creation. Anything else — a missing plan, an unsupported
+/// backend, a check that came back `Unknown` — quarantines the instance and
+/// keeps the finalizer, because a handle dropped on unproven capacity cannot be
+/// taken back.
+async fn verified_teardown_gate<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+) -> Option<Result<Action, InstanceError>> {
+    let status = instance.status.as_ref()?;
+    let binding = status.binding.as_ref()?;
+
+    // An instance that is ALREADY quarantined got there because evidence was
+    // required and missing. It must never fall back to the unverified path,
+    // whatever happens to its lease afterwards — otherwise deleting the
+    // ClusterLease becomes a way to launder unproven capacity back into the
+    // pool, which is a bypass of the whole mechanism rather than an edge case.
+    let already_quarantined = status.phase == ClusterInstancePhase::Quarantined;
+
+    // Does the bound lease actually ask for this?
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    let lease = match leases.get(&binding.lease.name).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            if already_quarantined {
+                warn!(
+                    instance = %name,
+                    error = %error,
+                    "quarantined instance's lease is unreadable; holding quarantine rather \
+                     than releasing on the unverified path"
+                );
+                return Some(
+                    quarantine_instance(ctx, instance, name, namespace, "lease_unreadable").await,
+                );
+            }
+            return None;
+        }
+    };
+    if lease.spec.cleanup_mode.unwrap_or_default() != CleanupMode::VerifiedDestroy {
+        if already_quarantined {
+            warn!(
+                instance = %name,
+                "quarantined instance's lease no longer requests verified teardown; \
+                 holding quarantine — capacity still has unproven state"
+            );
+            return Some(
+                quarantine_instance(ctx, instance, name, namespace, "mode_downgraded").await,
+            );
+        }
+        return None;
+    }
+
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    // The plan must come from what creation recorded. An instance created
+    // before verified teardown existed has no plan, and verifying it against a
+    // reconstructed guess would prove only that the guess was satisfied.
+    let Some(plan) = status
+        .created_with
+        .as_ref()
+        .and_then(|created| created.teardown_plan.clone())
+    else {
+        warn!(
+            instance = %name,
+            "verified teardown requested but no creation-time plan was recorded; quarantining"
+        );
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "teardown_plan_missing").await,
+        );
+    };
+
+    let checks = match resolve_verified_backend(ctx, instance).await {
+        Some(backend) => match backend.delete_verified(name, namespace, &plan).await {
+            Ok(checks) => checks,
+            Err(_) => {
+                warn!(
+                    instance = %name,
+                    "backend cannot produce teardown evidence; quarantining rather than \
+                     falling back to unverified cleanup"
+                );
+                return Some(
+                    quarantine_instance(ctx, instance, name, namespace, "backend_unsupported")
+                        .await,
+                );
+            }
+        },
+        None => {
+            return Some(
+                quarantine_instance(ctx, instance, name, namespace, "backend_unresolvable").await,
+            );
+        }
+    };
+
+    let outcome = TeardownReceipt::outcome_for(&checks);
+    let receipt = TeardownReceipt {
+        schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
+        attempt_id: uuid::Uuid::new_v4().to_string(),
+        lease: binding.lease.clone(),
+        instance: crate::crd::ResourceRef {
+            name: binding.instance.name.clone(),
+            uid: Some(binding.instance.uid.clone()),
+        },
+        pool: binding.pool.clone(),
+        backend_type: format!("{:?}", binding.backend.backend_type).to_lowercase(),
+        config_digest: binding.backend.config_digest.clone(),
+        instance_spec_digest: binding.instance_spec_digest.clone(),
+        started_at,
+        completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        checks,
+        retry_count: 0,
+        outcome,
+    };
+
+    // Persist the evidence BEFORE releasing anything. A receipt written after
+    // the finalizer is gone can be lost with the object it describes, and the
+    // whole point is that it outlives the instance.
+    if let Err(error) = record_teardown_receipt(ctx, &lease, &receipt, namespace).await {
+        warn!(instance = %name, error = %error, "could not persist teardown receipt; retrying");
+        return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
+    }
+
+    if outcome != TeardownOutcome::Verified {
+        let unproven: Vec<&str> = receipt
+            .checks
+            .iter()
+            .filter(|check| check.result == CheckResult::Unknown)
+            .map(|check| check.reason.as_deref().unwrap_or("unknown"))
+            .collect();
+        warn!(
+            instance = %name,
+            reasons = ?unproven,
+            "teardown could not be proven complete; quarantining capacity"
+        );
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "teardown_unverified").await,
+        );
+    }
+
+    info!(instance = %name, "teardown verified; releasing the cleanup handle");
+    cleanup_orphan_projected_resources(&ctx.client, name, namespace).await;
+    let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+    if let Err(error) = remove_finalizer(&instances_api, instance, INSTANCE_FINALIZER).await {
+        return Some(Err(error.into()));
+    }
+    Some(Ok(Action::await_change()))
+}
+
+/// Record the provisioner-assigned identities this instance owns, once.
+///
+/// Best-effort and idempotent: a failed capture leaves the list empty and is
+/// retried on the next reconcile, and a non-empty list is never rewritten —
+/// shrinking it later would silently narrow what a receipt must prove.
+///
+/// Only meaningful for a backend that can produce evidence; everything else
+/// returns an empty list from the default implementation.
+async fn capture_teardown_identities_once<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+    status: &ClusterInstanceStatus,
+) {
+    if !status.teardown_identities.is_empty() {
+        return;
+    }
+    // Only instances whose plan includes a provisioner-assigned footprint have
+    // anything to capture.
+    let wants_volumes = status
+        .created_with
+        .as_ref()
+        .and_then(|created| created.teardown_plan.as_ref())
+        .is_some_and(|plan| plan.contains(&crate::crd::TeardownSubject::ServerDataVolumes));
+    if !wants_volumes {
+        return;
+    }
+    let Some(backend) = resolve_verified_backend(ctx, instance).await else {
+        return;
+    };
+    let identities = match backend.capture_teardown_identities(name, namespace).await {
+        Ok(identities) if !identities.is_empty() => identities,
+        // Empty or failed: retry next reconcile rather than recording a list
+        // that understates the footprint.
+        _ => return,
+    };
+
+    let (Some(uid), Some(resource_version)) = (
+        instance.metadata.uid.as_deref(),
+        instance.resource_version(),
+    ) else {
+        return;
+    };
+    let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status/teardownIdentities", "value": identities }
+    ]));
+    match instances_api
+        .patch_status(name, &PatchParams::default(), &Patch::<()>::Json(patch))
+        .await
+    {
+        Ok(_) => info!(
+            instance = %name,
+            "recorded provisioner-assigned teardown identities"
+        ),
+        Err(error) => debug!(
+            instance = %name,
+            error = %error,
+            "could not record teardown identities; will retry"
+        ),
+    }
+}
+
+/// Resolve the backend through immutable provenance, same fence as
+/// `delete_instance_backend`.
+async fn resolve_verified_backend<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+) -> Option<crate::backend::BackendDispatch> {
+    let factory = ctx.factory.as_ref()?;
+    let provenance = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.created_with.as_ref())
+        .and_then(|created| created.backend.as_ref())?;
+    factory.backend_for_provenance(provenance).ok()
+}
+
+/// Write the receipt onto the lease, fenced to the exact lease UID.
+async fn record_teardown_receipt<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    lease: &ClusterLease,
+    receipt: &TeardownReceipt,
+    namespace: &str,
+) -> Result<(), anyhow::Error> {
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    let uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("lease has no UID"))?;
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "add", "path": "/status/teardownReceipt", "value": receipt }
+    ]));
+    leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Hold the capacity back and keep every cleanup handle.
+///
+/// Deliberately does NOT remove the finalizer or clear the binding: those are
+/// what a later retry needs to address the same exact subject, and what stops
+/// the ordinary 404-based recycle path from treating the capacity as clean.
+async fn quarantine_instance<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+    reason: &str,
+) -> Result<Action, InstanceError> {
+    let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut next = instance.status.clone().unwrap_or_default();
+    next.phase = ClusterInstancePhase::Quarantined;
+    next.state_since = Some(chrono::Utc::now().to_rfc3339());
+    next.message = Some(format!("quarantined: {reason}"));
+
+    // Fenced, not a bare merge patch. Two ways an unfenced write goes wrong:
+    // a stale reconcile holding an older view could overwrite `Quarantined`
+    // with whatever phase it believed, handing unproven capacity back to the
+    // pool; and a name-addressed write could land on a same-named replacement
+    // instance that has nothing to do with this teardown.
+    let (Some(uid), Some(resource_version)) = (
+        instance.metadata.uid.as_deref(),
+        instance.resource_version(),
+    ) else {
+        // Without an identity to fence against we cannot safely mark anything.
+        // Requeue rather than write blind; the finalizer still holds.
+        warn!(
+            instance = %name,
+            "cannot fence the quarantine write; retrying rather than writing unfenced"
+        );
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": next }
+    ]));
+    match instances_api
+        .patch_status(name, &PatchParams::default(), &Patch::<()>::Json(patch))
+        .await
+    {
+        Ok(_) => {}
+        // The object moved under us. Re-reconcile against the new state rather
+        // than forcing a phase derived from a view that is now stale.
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => {
+            debug!(instance = %name, "quarantine write conflicted; re-reading");
+            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // Bounded backoff: a transient API failure may resolve, and the same exact
+    // subject can then produce a verified receipt.
+    Ok(Action::requeue(std::time::Duration::from_secs(120)))
 }
 
 async fn verify_bound_instance_for_teardown<B: ClusterBackend>(

@@ -572,6 +572,7 @@ mod json_safety_tests {
                     subject: crate::crd::TeardownSubject::ServerStatefulSet,
                     result: crate::crd::CheckResult::Verified,
                     reason: None,
+                    verified: Vec::new(),
                 }],
                 retry_count: 0,
                 outcome: crate::crd::TeardownOutcome::Verified,

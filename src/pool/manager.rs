@@ -1081,6 +1081,11 @@ pub fn compute_pool_phase(
         && counts.creating == 0
         && counts.recycling == 0
         && counts.unhealthy == 0
+        // Quarantined members are NOT idle: their backend resources still
+        // exist and are being held deliberately. Reporting Idle here would
+        // tell an operator the pool is empty while it is actually holding
+        // capacity it could not prove it destroyed.
+        && counts.quarantined == 0
         && min_ready == 0
     {
         return ClusterPoolPhase::Idle;
@@ -3236,6 +3241,47 @@ mod tests {
         assert_eq!(
             counts.unhealthy, 0,
             "quarantined must be distinguishable from ordinary churn"
+        );
+    }
+
+    /// A pool holding quarantined capacity must never report Idle.
+    ///
+    /// Idle means "empty, nothing running". A quarantined member's backend
+    /// resources still exist — holding them is the point — so reporting Idle
+    /// tells an operator the pool is empty while it is actually sitting on
+    /// capacity it could not prove it destroyed. That is the one state where a
+    /// human most needs to look.
+    #[test]
+    fn a_pool_holding_quarantined_capacity_is_not_idle() {
+        let profile = make_profile(
+            0,
+            Some(crate::crd::ScalingConfig {
+                min_ready: 0,
+                max_clusters: 4,
+                scale_up_threshold: 1,
+                scale_down_after: "30m".to_string(),
+                queue_timeout: "5m".to_string(),
+                creating_timeout: "10m".to_string(),
+                failure_backoff: None,
+            }),
+        );
+
+        // Genuinely empty scale-to-zero pool: Idle is correct.
+        let empty = StateCounts::default();
+        assert_eq!(
+            compute_pool_phase(&profile, &empty, 0, None, chrono::Utc::now()),
+            crate::crd::ClusterPoolPhase::Idle
+        );
+
+        // Same pool, one member held back.
+        let holding = StateCounts {
+            quarantined: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_pool_phase(&profile, &holding, 0, None, chrono::Utc::now()),
+            crate::crd::ClusterPoolPhase::Idle,
+            "a pool holding unreclaimed capacity must not read as empty"
         );
     }
 

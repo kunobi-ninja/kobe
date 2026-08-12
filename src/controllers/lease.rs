@@ -15,7 +15,7 @@ use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
     BackendProvenance, BoundInstanceRef, ClusterInstance, ClusterInstancePhase, ClusterLease,
     ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase, ClusterPoolStatus,
-    LeaseBinding, LeasePhase, ResourceRef,
+    LeaseBinding, LeasePhase, ResourceRef, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
 };
 use crate::diagnostics;
 use crate::pool::{PoolState, parse_duration};
@@ -632,6 +632,27 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             };
 
             if cluster_gone {
+                // A receipt-required lease carries the ONLY durable proof that
+                // its capacity was destroyed, and it is read after the instance
+                // is gone — which is exactly the moment this branch fires. So
+                // deleting the lease here would destroy the evidence at the
+                // instant it becomes relevant, and #74's owning SandboxLease
+                // would have nothing to consume.
+                //
+                // Retain it until a consumer acknowledges. Deliberately not a
+                // timeout: evidence that expires on a clock is evidence you
+                // cannot rely on having.
+                if status.teardown_receipt.is_some()
+                    && !lease
+                        .annotations()
+                        .contains_key(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+                {
+                    debug!(
+                        lease = %name,
+                        "retaining recycled lease: its teardown receipt has not been consumed"
+                    );
+                    return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+                }
                 info!(lease = %name, "Recycling complete, deleting lease CRD");
                 let delete_params = DeleteParams {
                     preconditions: Some(Preconditions {

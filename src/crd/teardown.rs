@@ -25,7 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::ResourceRef;
-use super::profile::{ClusterConfig, DiagnosticsConfig};
+use super::profile::{BackendType, ClusterConfig, DiagnosticsConfig};
 
 /// How thoroughly a lease's capacity must be torn down before it can be reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -77,6 +77,14 @@ pub enum TeardownSubject {
     ServerDataVolumes,
     /// The exact `k3s_<instance>` database.
     Database,
+    /// The per-cluster PostgreSQL role that owns that database.
+    ///
+    /// Added after `fix(datastore): give each cluster its own PostgreSQL role`
+    /// landed on main: k3s teardown now reclaims ownership, drops the database,
+    /// *and* drops a role. Without this subject a leaked role would sit inside
+    /// a receipt that claims the footprint is gone — the database would be
+    /// proven absent while a credential-bearing role survived.
+    DatabaseRole,
 }
 
 /// Outcome of proving one subject absent.
@@ -116,6 +124,21 @@ pub struct TeardownCheck {
     /// `datastore_unreachable`). Never a raw provider response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+
+    /// The concrete resources this check actually looked at.
+    ///
+    /// A [`TeardownSubject`] is a category. On its own,
+    /// `Database = Verified` asserts that *a* database is gone without saying
+    /// which — so a receipt could be satisfied by checking the wrong one, or by
+    /// checking one of several when the footprint had more. Recording the exact
+    /// identities makes the claim auditable after the fact, which is the whole
+    /// point of keeping evidence that outlives the instance.
+    ///
+    /// Names only: object names, PV names, the database and role identifiers.
+    /// Never connection strings, credentials, or anything that would turn a
+    /// receipt into a secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified: Vec<String>,
 }
 
 /// Durable proof that one exact lease-owned footprint is gone.
@@ -149,6 +172,17 @@ pub struct TeardownReceipt {
     pub retry_count: u32,
     pub outcome: TeardownOutcome,
 }
+
+/// Set by a consumer once it has read and acted on a lease's teardown receipt.
+///
+/// Until this is present, a receipt-carrying lease is retained after recycling
+/// rather than deleted — the receipt is the only durable proof its capacity was
+/// destroyed, and it is read precisely when the instance is already gone.
+///
+/// An annotation rather than a timeout: evidence that expires on a clock is
+/// evidence you cannot rely on having when you need it.
+pub const TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION: &str =
+    "kobe.kunobi.ninja/teardown-receipt-acknowledged";
 
 /// Current schema version emitted by this build.
 pub const TEARDOWN_RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -226,6 +260,23 @@ impl TeardownReceipt {
         if self.checks.len() != expected.required_subjects.len() {
             return false;
         }
+        // Every recorded identity must appear in some verified check. A receipt
+        // that proved three of four volumes gone would otherwise pass, leaving
+        // the fourth — and the tenant data on it — behind.
+        let proven: Vec<&String> = self
+            .checks
+            .iter()
+            .filter(|check| check.result == CheckResult::Verified)
+            .flat_map(|check| check.verified.iter())
+            .collect();
+        if !expected
+            .recorded_identities
+            .iter()
+            .all(|identity| proven.contains(&identity))
+        {
+            return false;
+        }
+
         expected.required_subjects.iter().all(|subject| {
             let mut matching = self.checks.iter().filter(|check| check.subject == *subject);
             let Some(check) = matching.next() else {
@@ -239,7 +290,16 @@ impl TeardownReceipt {
             // credentials as never-created and still release the lease. A
             // footprint that genuinely was never created belongs OUT of
             // `required_subjects` — that is what the scope is for.
-            matching.next().is_none() && check.result == CheckResult::Verified
+            if matching.next().is_some() || check.result != CheckResult::Verified {
+                return false;
+            }
+            // Where the name is derivable, the check must actually name it.
+            // Otherwise `ServerStatefulSet = Verified` proves only that
+            // *something* of that category was inspected.
+            match expected_identity_for(*subject, expected.instance_name) {
+                Some(expected_name) => check.verified.contains(&expected_name),
+                None => true,
+            }
         })
     }
 }
@@ -264,6 +324,122 @@ pub struct TeardownScope<'a> {
     /// were never created are simply absent — which is why the list must come
     /// from the creation record, not be inferred at teardown time.
     pub required_subjects: &'a [TeardownSubject],
+    /// Used to derive the expected resource names. Comes from controller-owned
+    /// bind-time state like the rest of this scope, never from the receipt.
+    pub instance_name: &'a str,
+    /// Provisioner-assigned identities recorded while the instance was healthy
+    /// — the PersistentVolumes its claims were bound to.
+    ///
+    /// These cannot be derived from a name, so they are the one part of the
+    /// footprint a teardown could otherwise quietly omit. Recorded long before
+    /// teardown runs, they are something a receipt must account for rather than
+    /// something it gets to choose.
+    pub recorded_identities: &'a [String],
+}
+
+/// The name a subject's resource must have, where naming is deterministic.
+///
+/// This is the non-circular half of identity checking: it comes from the
+/// recorded plan and the instance name, never from the receipt being validated.
+/// A receipt claiming `ServerStatefulSet = Verified` while naming some other
+/// object therefore fails, rather than being accepted because the category
+/// matched.
+///
+/// `None` for subjects whose identity cannot be derived — the bound PV names
+/// are assigned by the provisioner, and the Pod set is a label selector. Those
+/// are still RECORDED in the receipt for audit; they simply cannot be
+/// pre-computed here.
+pub fn expected_identity_for(subject: TeardownSubject, instance: &str) -> Option<String> {
+    let name = match subject {
+        TeardownSubject::AgentDeployment => format!("{instance}-agent"),
+        TeardownSubject::ServerStatefulSet => format!("{instance}-server"),
+        TeardownSubject::Service => format!("{instance}-server"),
+        TeardownSubject::PodDisruptionBudget => format!("{instance}-server"),
+        TeardownSubject::PublisherConfigMap => format!("{instance}-kubeconfig-publisher"),
+        TeardownSubject::RegistriesConfigMap => format!("{instance}-registries"),
+        TeardownSubject::TokenSecret => format!("{instance}-token"),
+        TeardownSubject::KubeconfigSecret => format!("{instance}-kubeconfig"),
+        TeardownSubject::ConnectTokenSecret => format!("{instance}-connect-token"),
+        TeardownSubject::CidrClaim => instance.to_string(),
+        TeardownSubject::Database => format!("database:k3s_{instance}"),
+        TeardownSubject::DatabaseRole => format!("role:k3s_{instance}"),
+        // Provisioner-assigned or selector-based; recorded, not derivable.
+        TeardownSubject::ServerPods
+        | TeardownSubject::ServerDataPvcs
+        | TeardownSubject::ServerDataVolumes => return None,
+    };
+    Some(name)
+}
+
+/// Derive the exact set of footprints a k3s instance creates, from the config
+/// it is being created with.
+///
+/// Called at **creation** and stamped into immutable provenance — never
+/// recomputed at teardown. Recomputing later would read whatever the config
+/// says *then*, so a pool that stopped setting `registryMirrors` after an
+/// instance was made would drop that ConfigMap from the plan and never verify
+/// it. The plan has to describe what was built, not what would be built now.
+///
+/// Subjects that are always created are unconditional; the rest are included
+/// only when the config that creates them is present. A footprint absent from
+/// this list is not "excused" at teardown — it is simply not part of what this
+/// instance made.
+pub fn k3s_teardown_plan(
+    cluster: &ClusterConfig,
+    has_external_datastore: bool,
+) -> Vec<TeardownSubject> {
+    let mut plan = vec![
+        // Always created by the k3s backend.
+        TeardownSubject::ServerStatefulSet,
+        TeardownSubject::ServerPods,
+        TeardownSubject::Service,
+        TeardownSubject::PublisherConfigMap,
+        TeardownSubject::TokenSecret,
+        TeardownSubject::KubeconfigSecret,
+        TeardownSubject::ConnectTokenSecret,
+    ];
+
+    // Agents are a separate Deployment only when the pool asks for them.
+    if cluster.agents.is_some_and(|agents| agents > 0) {
+        plan.push(TeardownSubject::AgentDeployment);
+    }
+    // The HA PodDisruptionBudget exists only for multi-server pools.
+    if cluster.servers > 1 {
+        plan.push(TeardownSubject::PodDisruptionBudget);
+    }
+    if cluster
+        .registry_mirrors
+        .as_ref()
+        .is_some_and(|mirrors| !mirrors.is_empty())
+    {
+        plan.push(TeardownSubject::RegistriesConfigMap);
+    }
+    // Persistent storage means PVCs and the volumes behind them. Both, always
+    // together: proving the claim gone while its volume survives is precisely
+    // the gap that makes a receipt a lie.
+    if cluster
+        .persistence
+        .as_ref()
+        .is_some_and(|persistence| !storage_is_ephemeral(persistence))
+    {
+        plan.push(TeardownSubject::ServerDataPvcs);
+        plan.push(TeardownSubject::ServerDataVolumes);
+    }
+    // A per-cluster database always comes with the role that owns it.
+    if has_external_datastore {
+        plan.push(TeardownSubject::Database);
+        plan.push(TeardownSubject::DatabaseRole);
+    }
+    plan
+}
+
+/// Whether a persistence config allocates no durable volume.
+fn storage_is_ephemeral(persistence: &super::profile::PersistenceConfig) -> bool {
+    persistence
+        .storage_type
+        .as_deref()
+        .unwrap_or("emptyDir")
+        .eq_ignore_ascii_case("emptydir")
 }
 
 /// Why a pool's footprint cannot support [`CleanupMode::VerifiedDestroy`].
@@ -309,10 +485,19 @@ impl VerifiedDestroyIneligible {
 /// because the datastore connection lives outside the CRD; the caller knows
 /// whether the exact database identity needed to verify absence was captured.
 pub fn verified_destroy_eligibility(
+    backend: &BackendType,
     cluster: &ClusterConfig,
     diagnostics: Option<&DiagnosticsConfig>,
     external_datastore_identity_recorded: bool,
 ) -> Result<(), VerifiedDestroyIneligible> {
+    // Only k3s can produce evidence. Every other backend must be refused here
+    // rather than degrade to Standard cleanup while still claiming a verified
+    // mode. Previously this variant existed but was unreachable, because the
+    // function had no backend to judge — so a non-k3s pool received Ok(()).
+    if *backend != BackendType::K3s {
+        return Err(VerifiedDestroyIneligible::UnsupportedBackend);
+    }
+
     // Host-side kubelet trees survive object deletion and are not part of any
     // subject we can observe from the API, so their presence makes "the
     // footprint is absent" unprovable. Re-admissible once the host reaper's
@@ -361,7 +546,7 @@ mod tests {
 
     #[test]
     fn ephemeral_k3s_with_recorded_datastore_is_eligible() {
-        assert!(verified_destroy_eligibility(&cluster(), None, true).is_ok());
+        assert!(verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, true).is_ok());
     }
 
     /// Each rejection must be derived from configuration alone, so an ineligible
@@ -375,7 +560,7 @@ mod tests {
             ..serde_json::from_value(serde_json::json!({})).unwrap()
         });
         assert_eq!(
-            verified_destroy_eligibility(&shared_mount, None, true).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &shared_mount, None, true).unwrap_err(),
             VerifiedDestroyIneligible::KubeletSharedMount
         );
 
@@ -384,7 +569,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verified_destroy_eligibility(&cluster(), Some(&capture), true).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &cluster(), Some(&capture), true)
+                .unwrap_err(),
             VerifiedDestroyIneligible::DiagnosticsEnabled
         );
 
@@ -395,14 +581,125 @@ mod tests {
             storage_request_size: None,
         });
         assert_eq!(
-            verified_destroy_eligibility(&retained, None, true).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &retained, None, true).unwrap_err(),
             VerifiedDestroyIneligible::UnverifiableStorage
         );
 
         assert_eq!(
-            verified_destroy_eligibility(&cluster(), None, false).unwrap_err(),
+            verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, false).unwrap_err(),
             VerifiedDestroyIneligible::DatastoreProvenanceMissing
         );
+    }
+
+    /// The plan must describe what was BUILT, not what the config says later.
+    ///
+    /// Optional footprints appear only when the config that creates them is
+    /// present — and because the plan is stamped at creation, a pool that later
+    /// stops setting `registryMirrors` cannot retroactively drop that ConfigMap
+    /// from an existing instance's plan and leave it unverified.
+    #[test]
+    fn the_plan_covers_exactly_what_this_config_creates() {
+        // Minimal ephemeral cluster, no datastore.
+        let minimal: ClusterConfig =
+            serde_json::from_value(serde_json::json!({ "version": "v1.32.0" })).unwrap();
+        let plan = k3s_teardown_plan(&minimal, false);
+
+        // Always built.
+        for required in [
+            TeardownSubject::ServerStatefulSet,
+            TeardownSubject::ServerPods,
+            TeardownSubject::Service,
+            TeardownSubject::TokenSecret,
+            TeardownSubject::KubeconfigSecret,
+            TeardownSubject::ConnectTokenSecret,
+        ] {
+            assert!(plan.contains(&required), "{required:?} is always created");
+        }
+        // Never built by this config — and therefore not something a receipt
+        // has to excuse. Absent from the plan, not marked NotApplicable.
+        for absent in [
+            TeardownSubject::AgentDeployment,
+            TeardownSubject::PodDisruptionBudget,
+            TeardownSubject::RegistriesConfigMap,
+            TeardownSubject::ServerDataPvcs,
+            TeardownSubject::ServerDataVolumes,
+            TeardownSubject::Database,
+            TeardownSubject::DatabaseRole,
+        ] {
+            assert!(!plan.contains(&absent), "{absent:?} was never created");
+        }
+    }
+
+    /// Persistent storage must pull in BOTH the claim and its volume, and a
+    /// datastore must pull in BOTH the database and its role. Proving one half
+    /// while the other survives is exactly the leak a receipt would otherwise
+    /// hide.
+    #[test]
+    fn paired_footprints_are_never_planned_alone() {
+        let persistent: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "version": "v1.32.0",
+            "servers": 3,
+            "agents": 2,
+            "persistence": { "storageType": "dynamic" },
+            "registryMirrors": { "docker.io": ["https://mirror.example"] }
+        }))
+        .unwrap();
+        let plan = k3s_teardown_plan(&persistent, true);
+
+        assert!(plan.contains(&TeardownSubject::ServerDataPvcs));
+        assert!(
+            plan.contains(&TeardownSubject::ServerDataVolumes),
+            "a claim without its volume proves only that the pointer is gone"
+        );
+        assert!(plan.contains(&TeardownSubject::Database));
+        assert!(
+            plan.contains(&TeardownSubject::DatabaseRole),
+            "a database without its role leaves credentials behind"
+        );
+        // Config-gated extras now present.
+        assert!(plan.contains(&TeardownSubject::AgentDeployment));
+        assert!(plan.contains(&TeardownSubject::PodDisruptionBudget));
+        assert!(plan.contains(&TeardownSubject::RegistriesConfigMap));
+    }
+
+    /// A single-server pool has no PodDisruptionBudget, and emptyDir storage
+    /// has no volume to reclaim.
+    #[test]
+    fn single_server_ephemeral_pools_plan_no_pdb_or_volumes() {
+        let single: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "version": "v1.32.0",
+            "servers": 1,
+            "persistence": { "storageType": "emptyDir" }
+        }))
+        .unwrap();
+        let plan = k3s_teardown_plan(&single, false);
+        assert!(!plan.contains(&TeardownSubject::PodDisruptionBudget));
+        assert!(!plan.contains(&TeardownSubject::ServerDataPvcs));
+        assert!(!plan.contains(&TeardownSubject::ServerDataVolumes));
+    }
+
+    /// A backend that cannot produce evidence must be refused at bind time.
+    ///
+    /// This variant existed before but was unreachable: the function took no
+    /// backend, so a k0s or vcluster pool asking for verified teardown got
+    /// `Ok(())` and would only discover mid-teardown that no evidence was
+    /// possible — stranding the lease in quarantine through no fault of its
+    /// caller.
+    #[test]
+    fn only_k3s_can_promise_verified_teardown() {
+        for backend in [
+            BackendType::K0s,
+            BackendType::Capi,
+            BackendType::Vkobe,
+            BackendType::Vcluster,
+        ] {
+            assert_eq!(
+                verified_destroy_eligibility(&backend, &cluster(), None, true).unwrap_err(),
+                VerifiedDestroyIneligible::UnsupportedBackend,
+                "{backend:?} cannot produce a receipt and must be refused"
+            );
+        }
+        assert!(verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, true).is_ok());
     }
 
     /// Disabled diagnostics must not disqualify a pool — only active capture
@@ -413,7 +710,10 @@ mod tests {
             serde_json::json!({ "enabled": false, "storage": "s3://bucket/" }),
         )
         .unwrap();
-        assert!(verified_destroy_eligibility(&cluster(), Some(&disabled), true).is_ok());
+        assert!(
+            verified_destroy_eligibility(&BackendType::K3s, &cluster(), Some(&disabled), true)
+                .is_ok()
+        );
     }
 
     /// A single `Unknown` must dominate, however many subjects verified: the
@@ -424,16 +724,19 @@ mod tests {
             subject: TeardownSubject::ServerStatefulSet,
             result: CheckResult::Verified,
             reason: None,
+            verified: Vec::new(),
         };
         let not_applicable = TeardownCheck {
             subject: TeardownSubject::RegistriesConfigMap,
             result: CheckResult::NotApplicable,
             reason: None,
+            verified: Vec::new(),
         };
         let unknown = TeardownCheck {
             subject: TeardownSubject::Database,
             result: CheckResult::Unknown,
             reason: Some("datastore_unreachable".into()),
+            verified: Vec::new(),
         };
 
         assert_eq!(
@@ -478,6 +781,11 @@ mod tests {
             subject,
             result,
             reason: None,
+            // Name what a real provider would have named, so these fixtures
+            // satisfy the identity comparison the way production does.
+            verified: expected_identity_for(subject, "pool-p-0")
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -512,6 +820,8 @@ mod tests {
             config_digest: "digest",
             instance_spec_digest: "spec-digest",
             required_subjects: required,
+            instance_name: "pool-p-0",
+            recorded_identities: &[],
         }
     }
 
@@ -585,6 +895,119 @@ mod tests {
 
         // An empty plan is not a clean bill of health.
         assert!(!complete.permits_release_for(&scope(&[], &refs)));
+    }
+
+    /// A check must name the resource its subject actually designates.
+    ///
+    /// Without this, `ServerStatefulSet = Verified` proves only that *something*
+    /// of that category was inspected — a receipt could verify a different
+    /// instance's StatefulSet, or one of several resources when the footprint
+    /// had more, and still release capacity. The expected name is derived from
+    /// controller-owned state and the instance name, never from the receipt.
+    #[test]
+    fn a_check_naming_the_wrong_resource_does_not_release() {
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [TeardownSubject::ServerStatefulSet];
+
+        let correct = receipt(
+            vec![check(
+                TeardownSubject::ServerStatefulSet,
+                CheckResult::Verified,
+            )],
+            TeardownOutcome::Verified,
+        );
+        assert!(correct.permits_release_for(&scope(&required, &refs)));
+
+        // Right category, wrong object — another instance's StatefulSet.
+        let wrong = receipt(
+            vec![TeardownCheck {
+                subject: TeardownSubject::ServerStatefulSet,
+                result: CheckResult::Verified,
+                reason: None,
+                verified: vec!["some-other-instance-server".into()],
+            }],
+            TeardownOutcome::Verified,
+        );
+        assert!(
+            !wrong.permits_release_for(&scope(&required, &refs)),
+            "a check must name the resource its subject designates"
+        );
+
+        // Claiming the category with no identity at all is equally unproven.
+        let unnamed = receipt(
+            vec![TeardownCheck {
+                subject: TeardownSubject::ServerStatefulSet,
+                result: CheckResult::Verified,
+                reason: None,
+                verified: Vec::new(),
+            }],
+            TeardownOutcome::Verified,
+        );
+        assert!(!unnamed.permits_release_for(&scope(&required, &refs)));
+    }
+
+    /// Every identity recorded while the instance was healthy must be proven
+    /// absent.
+    ///
+    /// Bound PV names cannot be derived from the instance name, so they are the
+    /// one part of the footprint a teardown could quietly omit — verify three of
+    /// four volumes and the fourth, with the tenant's data on it, survives while
+    /// the receipt reads clean. Recording them at Ready and requiring coverage
+    /// here is what closes that.
+    #[test]
+    fn every_recorded_identity_must_be_proven_absent() {
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [TeardownSubject::ServerDataVolumes];
+        let recorded = vec!["pvc-aaa".to_string(), "pvc-bbb".to_string()];
+
+        let volumes_check = |names: Vec<&str>| TeardownCheck {
+            subject: TeardownSubject::ServerDataVolumes,
+            result: CheckResult::Verified,
+            reason: None,
+            verified: names.into_iter().map(String::from).collect(),
+        };
+        let with_recorded = |identities: &'static [String]| TeardownScope {
+            lease: &refs.0,
+            instance: &refs.1,
+            pool: &refs.2,
+            backend_type: "k3s",
+            config_digest: "digest",
+            instance_spec_digest: "spec-digest",
+            required_subjects: &required,
+            instance_name: "pool-p-0",
+            recorded_identities: identities,
+        };
+        // Leaked to satisfy the 'static bound in this helper; test-only.
+        let recorded_static: &'static [String] = Box::leak(recorded.clone().into_boxed_slice());
+
+        // Both volumes proven: releases.
+        let complete = receipt(
+            vec![volumes_check(vec!["pvc-aaa", "pvc-bbb"])],
+            TeardownOutcome::Verified,
+        );
+        assert!(complete.permits_release_for(&with_recorded(recorded_static)));
+
+        // One volume unaccounted for: must not release.
+        let partial = receipt(
+            vec![volumes_check(vec!["pvc-aaa"])],
+            TeardownOutcome::Verified,
+        );
+        assert!(
+            !partial.permits_release_for(&with_recorded(recorded_static)),
+            "a volume recorded at Ready but never proven absent must block release"
+        );
+    }
+
+    /// Subjects whose names are provisioner-assigned cannot be pre-derived, so
+    /// they must not be blocked by the identity check — only recorded.
+    #[test]
+    fn provisioner_assigned_subjects_are_not_name_checked() {
+        assert!(expected_identity_for(TeardownSubject::ServerDataVolumes, "pool-p-0").is_none());
+        assert!(expected_identity_for(TeardownSubject::ServerPods, "pool-p-0").is_none());
+        assert_eq!(
+            expected_identity_for(TeardownSubject::Database, "pool-p-0").as_deref(),
+            Some("database:k3s_pool-p-0")
+        );
     }
 
     /// A receipt is proof about ONE subject. It must not be replayable against

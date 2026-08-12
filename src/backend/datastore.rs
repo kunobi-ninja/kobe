@@ -461,6 +461,41 @@ pub async fn ensure_cluster_role(
 
 /// Drop the per-cluster role. Call AFTER `drop_database`: PostgreSQL refuses to
 /// drop a role that still owns objects.
+/// Whether this cluster's database still exists.
+///
+/// Verification, not cleanup: `DROP DATABASE IF EXISTS` succeeding proves the
+/// statement ran, not that the database is gone — a concurrent recreate, a
+/// failed drop that only warned, or a connection to a different server all
+/// leave it present. Teardown evidence has to come from a separate read.
+///
+/// An error is deliberately propagated rather than reported as "absent". A
+/// query that could not run is uncertainty, and uncertainty must quarantine.
+pub async fn database_exists(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<bool> {
+    let db_name = sanitize_db_name(cluster_name, prefix)?;
+    let found: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(&db_name)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("Failed to check whether database {db_name} exists"))?;
+    Ok(found.is_some())
+}
+
+/// Whether this cluster's per-cluster role still exists.
+///
+/// Separate from the database on purpose: a role can outlive the database it
+/// owned, and it carries credentials. Dropping the database while leaving the
+/// role behind is exactly the leak that would otherwise sit inside a receipt
+/// claiming the footprint is gone.
+pub async fn cluster_role_exists(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<bool> {
+    let role_name = sanitize_db_name(cluster_name, prefix)?;
+    let found: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_roles WHERE rolname = $1")
+        .bind(&role_name)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("Failed to check whether role {role_name} exists"))?;
+    Ok(found.is_some())
+}
+
 pub async fn drop_cluster_role(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let name = sanitize_db_name(cluster_name, prefix)?;
     info!(role = %name, "Dropping per-cluster datastore role");

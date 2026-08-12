@@ -1237,6 +1237,11 @@ async fn reconcile_profile(
     pool_size_set("leased", counts.leased);
     pool_size_set("unhealthy", counts.unhealthy);
     pool_size_set("recycling", counts.recycling);
+    // Emitted separately from `unhealthy` so an alert can distinguish capacity
+    // that is churning from capacity that is stuck holding unproven state.
+    // A rising `quarantined` means teardown evidence is failing, which no
+    // other dimension reveals.
+    pool_size_set("quarantined", counts.quarantined);
 
     // Surface hidden CPU over-reservation (issue #189): a pool that sets
     // `resources.limits` with empty `requests` makes the kubelet copy each
@@ -1372,6 +1377,7 @@ async fn reconcile_profile(
         creating: counts.creating,
         recycling: counts.recycling,
         unhealthy: counts.unhealthy,
+        quarantined: counts.quarantined,
         queue_depth,
         golden_backup: existing_golden_backup,
         golden_generation: existing_golden_generation,
@@ -1727,6 +1733,23 @@ async fn ensure_cluster_instance(
         .map_err(|err| anyhow::anyhow!("failed to encode backend provenance: {err}"))?;
     let provenance = crate::crd::ClusterInstanceProvenance {
         operator_version: env!("BUILD_VERSION").to_string(),
+        // Record what this instance is about to create, while we still know.
+        // Recomputing this at teardown would read whatever the pool config says
+        // *then* — so a pool that stopped setting `registryMirrors` after this
+        // instance was built would silently drop that ConfigMap from the plan
+        // and never verify it. Only k3s can be verified, so only k3s gets a
+        // plan; anything else stays `None` and is refused a receipt-required
+        // lease at bind time.
+        teardown_plan: matches!(
+            profile.spec.backend.backend_type,
+            crate::crd::BackendType::K3s
+        )
+        .then(|| {
+            crate::crd::k3s_teardown_plan(
+                &profile.spec.cluster,
+                profile.spec.backend.datastore.is_some(),
+            )
+        }),
         kobe_sync_image: matches!(
             profile.spec.backend.backend_type,
             crate::crd::BackendType::Vkobe
