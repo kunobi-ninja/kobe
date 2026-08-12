@@ -5,6 +5,7 @@ pub mod routes;
 pub mod sandbox;
 pub mod sandbox_access;
 pub mod sandbox_credentials;
+pub mod sandbox_executions;
 pub mod sandbox_streams;
 pub mod sandbox_transport;
 pub mod upgrade;

@@ -54,6 +54,12 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxleases", "sandboxleases/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Durable execution records (#82). The reservation is a `create` on a derived
+  # name, which is what makes two concurrent retries of one idempotency key
+  # race for a single object instead of spawning twice.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxexecutions", "sandboxexecutions/status"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
   # Upstream Agent Sandbox objects, created and owned by the placement
   # controller. Kobe never installs these CRDs (`agentSandbox.mode=external`
   # means the operator owns the runtime); it only writes the objects it

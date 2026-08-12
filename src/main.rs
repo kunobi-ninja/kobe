@@ -265,6 +265,24 @@ async fn main() -> anyhow::Result<()> {
         // cancel connections it is holding itself — the socket lives in one
         // process — so a leader-elected revoker would leave live streams on
         // every other replica with nobody watching them.
+        // Executions left Running by a process that disappeared are settled
+        // here. The reserve-then-spawn order buys "never a duplicate spawn"
+        // and pays for it with records nobody is left to finish; this is what
+        // turns those into an honest `Unknown` rather than a poll that never
+        // ends.
+        let execution_reaper_client = client.clone();
+        let execution_reaper_ns = namespace.clone();
+        let execution_reaper_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            api::sandbox_executions::run_execution_reaper(
+                execution_reaper_client,
+                &execution_reaper_ns,
+                std::time::Duration::from_secs(60),
+                execution_reaper_shutdown,
+            )
+            .await;
+        });
+
         let revoker_client = client.clone();
         let revoker_ns = namespace.clone();
         let revoker_shutdown = shutdown.clone();
