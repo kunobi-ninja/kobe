@@ -91,11 +91,24 @@ fn sandbox_resource() -> ApiResource {
 /// guessed from a naming convention: a convention that upstream changes would
 /// silently start selecting the wrong Pod, and the wrong Pod is one belonging
 /// to another tenant.
+/// The exact upstream objects behind one claim.
+///
+/// Identities, not just names: #81 resolves every Sandbox operation through
+/// these UIDs, and a name that was reused between placement and access would
+/// otherwise route a caller's exec into somebody else's Pod.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSandboxPod {
+    pub sandbox_name: String,
+    pub sandbox_uid: String,
+    pub pod_name: String,
+    pub pod_uid: String,
+}
+
 pub async fn resolve_sandbox_pod(
     client: &Client,
     namespace: &str,
     claim: &DynamicObject,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ResolvedSandboxPod>, String> {
     let Some(sandbox_name) = claim
         .data
         .get("status")
@@ -149,7 +162,18 @@ pub async fn resolve_sandbox_pod(
     if running.next().is_some() {
         return Err("sandbox selector matched more than one running pod".to_string());
     }
-    Ok(Some(pod.name_any()))
+
+    // A Pod with no UID cannot be fenced, and an unfenceable target is one a
+    // later same-named Pod could impersonate.
+    let (Some(sandbox_uid), Some(pod_uid)) = (sandbox.uid(), pod.uid()) else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedSandboxPod {
+        sandbox_name: sandbox_name.to_string(),
+        sandbox_uid,
+        pod_name: pod.name_any(),
+        pod_uid,
+    }))
 }
 
 /// Run one pool-declared canary inside the Sandbox Pod.
@@ -251,7 +275,7 @@ pub async fn evaluate_readiness_canary(
     canary: &SandboxExecutionCanary,
 ) -> CanaryOutcome {
     let pod = match resolve_sandbox_pod(client, namespace, claim).await {
-        Ok(Some(pod)) => pod,
+        Ok(Some(resolved)) => resolved.pod_name,
         Ok(None) => {
             debug!(claim = %claim.name_any(), "sandbox pod not resolvable yet");
             return CanaryOutcome::Inconclusive {

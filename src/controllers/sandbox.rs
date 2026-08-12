@@ -362,6 +362,15 @@ pub async fn reconcile_lease(
         debug!(lease = %name, "readiness canary passed");
     }
 
+    // Record exactly which objects this lease resolved to. #81 routes every
+    // Sandbox operation through these UIDs rather than through names, because
+    // a name reused between placement and access would send a caller's exec
+    // into somebody else's Pod. Recorded here, where the objects have just
+    // been observed, rather than looked up again at access time.
+    if let Some(provenance) = observed_provenance(&target, &claim, &lease).await {
+        patch_lease_status(&ctx, &name, &serde_json::json!({ "target": provenance })).await?;
+    }
+
     // Runtime TTL starts HERE, at observed readiness — not when the request
     // arrived. A caller must not be billed for however long placement and
     // provisioning took, which is the whole reason the provisioning deadline
@@ -1001,6 +1010,81 @@ fn with_condition(
         last_transition_time,
     });
     conditions
+}
+
+/// Build the full target provenance for a placed, ready lease.
+///
+/// Monotonic: whatever was already recorded — the child cluster identities for
+/// a composition — is preserved, and only the upstream references are added.
+/// Provenance that could be *cleared* would let a teardown lose the very
+/// identity it has to prove absent.
+///
+/// Returns `None` when the objects cannot be identified. Recording a reference
+/// without a UID is worse than recording nothing: two absent UIDs compare
+/// equal, so any later same-named object would satisfy a check meant to
+/// exclude it.
+async fn observed_provenance(
+    target: &Target,
+    claim: &DynamicObject,
+    lease: &SandboxLease,
+) -> Option<crate::crd::SandboxTargetProvenance> {
+    let claim_uid = claim.uid()?;
+    let resolved = crate::controllers::sandbox_canary::resolve_sandbox_pod(
+        &target.client,
+        &target.namespace,
+        claim,
+    )
+    .await
+    .ok()
+    .flatten()?;
+
+    let existing = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.clone());
+    let reference =
+        |api_version: &str, kind: &str, name: &str, uid: &str| crate::crd::SandboxObjectReference {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: Some(target.namespace.clone()),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            generation: None,
+        };
+
+    Some(crate::crd::SandboxTargetProvenance {
+        namespace: target.namespace.clone(),
+        child_cluster_lease: existing
+            .as_ref()
+            .and_then(|existing| existing.child_cluster_lease.clone()),
+        child_cluster_instance: existing
+            .as_ref()
+            .and_then(|existing| existing.child_cluster_instance.clone()),
+        sandbox_template: existing
+            .as_ref()
+            .and_then(|existing| existing.sandbox_template.clone()),
+        sandbox_warm_pool: existing
+            .as_ref()
+            .and_then(|existing| existing.sandbox_warm_pool.clone()),
+        sandbox_claim: Some(reference(
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &claim.name_any(),
+            &claim_uid,
+        )),
+        sandbox: Some(reference(
+            crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+            crate::controllers::sandbox_canary::SANDBOX_KIND,
+            &resolved.sandbox_name,
+            &resolved.sandbox_uid,
+        )),
+        pod: Some(reference(
+            "v1",
+            "Pod",
+            &resolved.pod_name,
+            &resolved.pod_uid,
+        )),
+    })
 }
 
 /// Where one lease's Sandbox is placed.

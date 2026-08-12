@@ -6,7 +6,7 @@
 //! or expose upstream Agent Sandbox objects. Placement controllers in #73/#74
 //! own those transitions.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -64,6 +64,113 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
             "/v1/sandbox-leases/{id}",
             get(get_sandbox_lease::<B>).delete(release_sandbox_lease::<B>),
         )
+        .route("/v1/sandbox-leases/{id}/logs", get(sandbox_logs::<B>))
+}
+
+/// Read a bounded tail of one Sandbox's output.
+///
+/// The first operation to go through #81's resolver: principal → owned, Ready,
+/// unexpired lease → recorded provenance → the exact Pod and container. It
+/// selects no default at any step, and the denial vocabulary is deliberately
+/// coarse where it faces the caller — an unowned lease answers exactly as an
+/// absent one does.
+///
+/// Management and child placement are not handled separately here. Both
+/// resolve through the same interface; only the client differs, and that is
+/// Kobe's business rather than the caller's.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_logs<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Query(query): Query<crate::api::sandbox_access::SandboxLogsQuery>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+
+    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+        return response;
+    }
+    if !is_valid_k8s_name(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let (_lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "logs", denied),
+        };
+
+    let container = match target.resolve_container(query.container.as_deref()) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+    };
+
+    // Child-placed Sandboxes live in a cluster this API server reaches with a
+    // different client. Resolving that is #74's composition, not something the
+    // logs path may improvise, so it is refused explicitly rather than read
+    // from the wrong cluster — which would return another workload's output or
+    // a misleading 404.
+    if target.placement != access::TargetPlacement::Management {
+        return sandbox_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Sandbox logs are not yet available for child placement",
+            None,
+        );
+    }
+
+    match access::read_sandbox_logs(
+        &state.client,
+        &target,
+        &container,
+        access::clamp_tail(query.tail),
+    )
+    .await
+    {
+        Ok(logs) => {
+            // Audited by identity and outcome, never by content: the body is
+            // the workload's own output and can contain anything.
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                pod_uid = %target.pod_uid,
+                operation = "logs",
+                outcome = "allowed",
+                "Sandbox access"
+            );
+            (StatusCode::OK, logs).into_response()
+        }
+        Err(denied) => access_denied(&identity, &id, "logs", denied),
+    }
+}
+
+/// Record and answer one denied Sandbox operation.
+///
+/// The audit line carries the principal, lease, operation and a bounded reason
+/// code — never a credential, a command, or any of the workload's own output.
+/// The reason code is finer-grained than the caller-facing status on purpose:
+/// an operator needs to tell "expired" from "never placed" when somebody
+/// reports that access stopped working, while the caller must not be able to.
+fn access_denied(
+    identity: &AuthIdentity,
+    lease: &str,
+    operation: &'static str,
+    denied: crate::api::sandbox_access::SandboxAccessDenied,
+) -> Response {
+    info!(
+        principal = %identity.identity,
+        lease = %lease,
+        operation,
+        outcome = "denied",
+        reason = denied.reason_code(),
+        "Sandbox access"
+    );
+    let status = denied.http_status();
+    if status == StatusCode::NOT_FOUND {
+        // No body: a message would distinguish "not yours" from "not there".
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    sandbox_error(status, denied.to_string(), None)
 }
 
 /// Caller-safe lease intent. Unknown fields are rejected so a caller cannot
@@ -869,6 +976,15 @@ async fn reap_abandoned_pending_leases(
             ),
         }
     }
+}
+
+/// Whether this principal owns the lease, by the complete identity tuple.
+///
+/// Exposed for #81's resolver so ownership is decided in exactly one place: a
+/// second implementation is a second chance to compare on identity alone and
+/// let one provider's `alice` reach another's.
+pub(crate) fn principal_owns_lease(lease: &SandboxLease, identity: &AuthIdentity) -> bool {
+    principal_matches(&lease.spec.requester, identity)
 }
 
 fn principal_matches(requester: &SandboxPrincipal, identity: &AuthIdentity) -> bool {
