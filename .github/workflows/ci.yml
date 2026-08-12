@@ -65,10 +65,10 @@ jobs:
       image: rust:1.94-bookworm
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Bun for E2E harness tests
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
         with:
           install_args: bun
           cache: false
@@ -117,7 +117,7 @@ jobs:
             --ignore RUSTSEC-2026-0104
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Verify Helm chart renders
         run: |
@@ -141,7 +141,7 @@ jobs:
     runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Authenticated pulls avoid Docker Hub's anonymous rate limit (~100/6h per
       # IP), which the shared self-hosted runner egress IP intermittently trips —
@@ -149,14 +149,14 @@ jobs:
       # dry-run did not. `continue-on-error` keeps fork PRs (no secrets) working
       # via anonymous pulls, exactly as before.
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         continue-on-error: true
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build all images (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from='
@@ -222,13 +222,13 @@ jobs:
         # matrix nightly / on manual dispatch.
         backend: ${{ fromJSON(github.event_name == 'push' && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine", "vcluster", "k0s"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Provides bun + helm + kind + just + kubectl (and rust, per mise.toml).
       # The e2e harness resolves these via `mise which`, and `just` runs the
       # recipe.
       - name: Set up mise tools
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
 
       # The vkobe smokes build the `kobe` CLI from source (cargo run -p
       # kobectl), which needs a host C toolchain for proc-macro build scripts —
@@ -242,7 +242,7 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Per-backend kind cluster name (run id + backend) so concurrent legs and
       # persistent self-hosted runs never collide on a shared cluster name.
@@ -278,7 +278,7 @@ jobs:
 
       - name: Upload kind logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kind-logs-${{ github.run_id }}-${{ matrix.backend }}
           path: /tmp/kind-logs
@@ -302,15 +302,15 @@ jobs:
     runs-on: kunobi-runners
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Extract version from release tag
         if: startsWith(github.ref, 'refs/tags/v')
@@ -342,9 +342,9 @@ jobs:
     runs-on: kunobi-runners
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
 
       - name: Package & push Helm chart (OCI)
         env:
@@ -367,7 +367,7 @@ jobs:
       image: rust:1.94-bookworm
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check tag == manifests
         run: ./scripts/check-version-consistency.sh "${{ github.ref_name }}"
 

@@ -67,7 +67,7 @@ jobs:
       channel: ${{ steps.resolve.outputs.channel }}
     steps:
       - name: Checkout (for scripts)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve version and channel
         id: resolve
@@ -91,7 +91,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout (for scripts)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Wait for the release build to finish uploading assets
         if: github.event_name == 'release'
         env:
@@ -111,7 +111,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install apt-repo tooling
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends reprepro rclone gnupg dpkg-dev
@@ -221,7 +221,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Trigger Homebrew formula update
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.HOMEBREW_DISPATCH_TOKEN }}
           repository: kunobi-ninja/homebrew-kunobi
@@ -337,7 +337,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Trigger Scoop bucket autoupdate
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           # SCOOP_DISPATCH_TOKEN: PAT with contents:write on kunobi-ninja/scoop-kunobi
           # (classic `repo`, or a fine-grained token scoped to that repo). Distinct
@@ -385,7 +385,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Trigger Chocolatey package update
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           # CHOCO_DISPATCH_TOKEN: PAT with contents:write on kunobi-ninja/chocolatey-kunobi.
           token: ${{ secrets.CHOCO_DISPATCH_TOKEN }}
@@ -420,7 +420,7 @@ jobs:
     outputs:
       pkgs: ${{ steps.list.outputs.pkgs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: list
         run: |
           set -euo pipefail
@@ -441,7 +441,7 @@ jobs:
       # fetch-depth: 0 is load-bearing for the -git packages below: their
       # pkgver embeds `git rev-list --count HEAD`, and the default depth-1
       # checkout would count 1 commit no matter the real history.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
