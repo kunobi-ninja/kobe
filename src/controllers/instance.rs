@@ -1801,30 +1801,14 @@ async fn verify_bound_instance_for_teardown<B: ClusterBackend>(
     instance: &ClusterInstance,
     namespace: &str,
 ) -> Result<(), &'static str> {
-    let Some(binding) = instance
-        .status
-        .as_ref()
-        .and_then(|status| status.binding.as_ref())
-    else {
-        // An unbound pool member or standalone instance has no tenant binding
-        // to cross. Pool-managed backend dispatch is still provenance-pinned by
-        // `delete_instance_backend`.
-        return Ok(());
-    };
-    let lease_uid = binding.lease.uid.as_deref().ok_or("lease_uid_missing")?;
-    let resolved = crate::lease_binding::resolve_lease_binding(
-        &ctx.client,
-        namespace,
-        &binding.lease.name,
-        lease_uid,
-        crate::lease_binding::BindingResolveMode::Lifecycle,
-    )
-    .await
-    .map_err(|err| err.reason_code())?;
-    if resolved.instance.metadata.uid != instance.metadata.uid || resolved.binding != *binding {
-        return Err("instance_uid_mismatch");
-    }
-    Ok(())
+    // Teardown-specific policy: fence on positive evidence of the wrong
+    // target, release on absence. The live-pair resolver used here before
+    // could never pass once deletion started — see `verify_instance_teardown`
+    // for the three unsatisfiable gates and the pool-exhaustion deadlock they
+    // produced.
+    crate::lease_binding::verify_instance_teardown(&ctx.client, namespace, instance)
+        .await
+        .map_err(|err| err.reason_code())
 }
 
 /// Best-effort cleanup of host-side resources that a backend's `delete()`

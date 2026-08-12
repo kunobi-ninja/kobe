@@ -1275,8 +1275,16 @@ async fn mark_instance_recycling(
         Err(err) => return Err(err.into()),
     };
     let status = instance.status.clone().unwrap_or_default();
+    // The generation equality holds only while the instance is live: the
+    // apiserver bumps `metadata.generation` when it stamps `deletionTimestamp`
+    // on a finalizer-bearing object, so an instance whose delete is already in
+    // flight reads one generation ahead of the binding and would be judged
+    // "not safe to recycle" forever. Identity is still pinned by the UID,
+    // reciprocal-binding, and lease-reference checks around it.
+    let generation_matches = instance.metadata.deletion_timestamp.is_some()
+        || instance.metadata.generation == Some(binding.instance.observed_generation);
     if instance.metadata.uid.as_deref() != Some(binding.instance.uid.as_str())
-        || instance.metadata.generation != Some(binding.instance.observed_generation)
+        || !generation_matches
         || status.binding.as_ref() != Some(binding)
         || status.lease_ref.as_ref().is_none_or(|reference| {
             reference.name != binding.lease.name || reference.uid != binding.lease.uid
@@ -2975,6 +2983,59 @@ mod tests {
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
         let calls = ctx.backend.call_count();
         assert_eq!(calls.delete, 0);
+    }
+
+    /// Recycling must survive the generation bump that deletion itself causes.
+    ///
+    /// The apiserver increments `metadata.generation` when it stamps
+    /// `deletionTimestamp` on a finalizer-bearing object, so an instance whose
+    /// delete is already in flight reads one generation ahead of the binding
+    /// that named it. Requiring equality there judged the exact instance "not
+    /// safe to recycle" on every pass, so the lease never observed recycling
+    /// completion — the other half of the pool-exhaustion deadlock. Drift on a
+    /// *live* instance is still refused.
+    #[tokio::test]
+    async fn deleting_instance_is_still_recyclable_despite_the_deletion_generation_bump() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+
+        let mut deleting = exact_instance_for_binding(Some(&binding), "Recycling");
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+        deleting["metadata"]["finalizers"] =
+            serde_json::json!(["kobe.kunobi.ninja/instance-cleanup"]);
+        deleting["metadata"]["generation"] = serde_json::json!(2);
+
+        let mut live_drift = exact_instance_for_binding(Some(&binding), "Recycling");
+        live_drift["metadata"]["generation"] = serde_json::json!(2);
+
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(deleting))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(live_drift))
+            .mount(&server)
+            .await;
+
+        assert!(
+            mark_instance_recycling(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            "a deleting instance must still count as the exact recycle subject"
+        );
+        assert!(
+            !mark_instance_recycling(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            "generation drift on a live instance stays fenced"
+        );
     }
 
     // -----------------------------------------------------------------------
