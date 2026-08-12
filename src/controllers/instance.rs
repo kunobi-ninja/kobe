@@ -2244,6 +2244,7 @@ fn phase_reason(phase: &ClusterInstancePhase) -> &'static str {
         ClusterInstancePhase::Recycling => "Recycling",
         ClusterInstancePhase::Unhealthy => "Unhealthy",
         ClusterInstancePhase::Failed => "Failed",
+        ClusterInstancePhase::Quarantined => "Quarantined",
     }
 }
 

@@ -45,6 +45,42 @@ pub struct ProfileContext {
 }
 
 #[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    /// Quarantined capacity must never present as leasable. `ClusterState` has
+    /// no Quarantined variant yet, so this pins the interim mapping: whatever it
+    /// maps to, it must not be `Ready` or `Leased`, or unproven capacity would
+    /// be handed to the next caller.
+    #[test]
+    fn quarantined_never_maps_to_usable_capacity() {
+        let state = cluster_state_from_phase(&ClusterInstancePhase::Quarantined);
+        assert_ne!(state, ClusterState::Ready);
+        assert_ne!(state, ClusterState::Leased);
+    }
+
+    /// The reverse mapping must never *produce* Quarantined, because that would
+    /// mean in-memory pool state could invent a quarantine that no teardown
+    /// evidence supports.
+    #[test]
+    fn pool_state_cannot_invent_a_quarantine() {
+        for state in [
+            ClusterState::Creating,
+            ClusterState::Ready,
+            ClusterState::Leased,
+            ClusterState::Unhealthy,
+            ClusterState::Recycling,
+        ] {
+            assert_ne!(
+                cluster_phase_from_state(&state),
+                ClusterInstancePhase::Quarantined,
+                "{state:?} must not round-trip into Quarantined"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod cluster_instance_tests {
     use super::*;
     use std::collections::HashMap;
@@ -1910,7 +1946,14 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
         // In particular, an invalid/legacy binding must remain unavailable
         // even if its display-only leaseRef is missing or stale.
         let lease_held = current.lease_ref.is_some() || current.binding.is_some();
-        let phase = if lease_held {
+        // Quarantined is preserved explicitly, not just incidentally. A
+        // quarantined instance keeps its binding as a cleanup handle, so
+        // `lease_held` happens to cover it today — but relying on that would
+        // mean a future change to binding retention silently downgrades
+        // Quarantined to whatever the in-memory pool state says, handing
+        // unproven capacity back to the pool.
+        let quarantined = current.phase == ClusterInstancePhase::Quarantined;
+        let phase = if lease_held || quarantined {
             current.phase.clone()
         } else {
             cluster_phase_from_state(&entry.state)
@@ -2210,6 +2253,10 @@ fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {
         ClusterInstancePhase::Recycling => ClusterState::Recycling,
         ClusterInstancePhase::Unhealthy => ClusterState::Unhealthy,
         ClusterInstancePhase::Failed => ClusterState::Unhealthy,
+        // Quarantined maps to its own state, never to Unhealthy: Unhealthy is
+        // deleted unconditionally by the pool manager, which would destroy the
+        // cleanup handle and let the ordinary recycle path resume.
+        ClusterInstancePhase::Quarantined => ClusterState::Quarantined,
     }
 }
 
@@ -2220,6 +2267,7 @@ fn cluster_phase_from_state(state: &ClusterState) -> ClusterInstancePhase {
         ClusterState::Leased => ClusterInstancePhase::Leased,
         ClusterState::Recycling => ClusterInstancePhase::Recycling,
         ClusterState::Unhealthy => ClusterInstancePhase::Unhealthy,
+        ClusterState::Quarantined => ClusterInstancePhase::Quarantined,
     }
 }
 

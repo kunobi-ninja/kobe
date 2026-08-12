@@ -596,6 +596,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             Ok(Action::requeue(std::time::Duration::from_secs(10)))
         }
 
+        // Terminal until the same exact subject produces a verified receipt.
+        // Access is already revoked and the binding/finalizers are deliberately
+        // retained as cleanup handles, so there is nothing to reconcile here.
+        // The transitions INTO this phase, and the retry that can leave it,
+        // belong to the verified-teardown controller work.
+        LeasePhase::Quarantined => Ok(Action::requeue(std::time::Duration::from_secs(300))),
+
         LeasePhase::Recycling => {
             let cluster_gone = if let Some(binding) = &status.binding {
                 let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
@@ -837,6 +844,7 @@ async fn finalize_binding<B: ClusterBackend>(
         max_extensions,
         message: None,
         conditions: Vec::new(),
+        teardown_receipt: None,
     };
     new_status.conditions =
         derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());

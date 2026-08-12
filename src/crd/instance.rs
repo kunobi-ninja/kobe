@@ -203,6 +203,12 @@ pub enum ClusterInstancePhase {
     Recycling,
     Unhealthy,
     Failed,
+    /// Teardown could not be proven complete. Access stays revoked, finalizers
+    /// and binding provenance are retained, and the unit is never Ready, never
+    /// rebound, and never counted as clean replacement capacity. It may leave
+    /// this phase only when the same exact subject produces a fully verified
+    /// receipt.
+    Quarantined,
 }
 
 /// Network ranges reserved for one ClusterInstance.
