@@ -64,6 +64,23 @@ rules:
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The upstream `Sandbox` object itself, in the CORE Agent Sandbox group.
+  # Read-only: Kobe creates Sandboxes only indirectly, through claims. It is
+  # read to find the Pod behind a claim, via upstream's own `status.selector`.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+  # The readiness canary runs an administrator-declared command inside the
+  # Sandbox. Upstream `Ready` describes the container, not the agent in it —
+  # a crash-looped or wedged agent satisfies it, and believing it starts a
+  # paid runtime TTL on a Sandbox that cannot serve.
+  #
+  # `pods/exec` is a powerful verb, so what bounds it matters: the argv comes
+  # from the `SandboxPool` spec, which only an administrator can write, and a
+  # lease selects a pool and nothing else. No caller input reaches this.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]

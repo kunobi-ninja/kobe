@@ -6,3 +6,4 @@ pub mod lease;
 pub mod live_set;
 pub mod profile;
 pub mod sandbox;
+pub mod sandbox_canary;

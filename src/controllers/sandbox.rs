@@ -252,6 +252,57 @@ pub async fn reconcile_lease(
         return Ok(Action::requeue(std::time::Duration::from_secs(10)));
     }
 
+    // Upstream `Ready` is a statement about the container, not the agent inside
+    // it. A Pod whose entrypoint crash-looped, whose weights failed to mount,
+    // or whose agent is wedged on a lock satisfies it — and believing it starts
+    // a paid runtime TTL on a Sandbox that cannot serve. The pool's own canary
+    // asks the workload directly.
+    //
+    // The pass is recorded on the lease before anything else, and a recorded
+    // pass is not re-run. Re-executing an administrator's command inside a live
+    // tenant workload on every requeue is not a health check — it is a repeated
+    // side effect on somebody else's Sandbox — and a controller that restarted
+    // between the canary and the Ready write must not run it a second time.
+    let status = lease.status.clone().unwrap_or_default();
+    if !canary_already_passed(&status) {
+        let outcome = crate::controllers::sandbox_canary::evaluate_readiness_canary(
+            &ctx.client,
+            &ctx.namespace,
+            &claim,
+            &pool.spec.template.default_container,
+            &pool.spec.readiness.canary,
+        )
+        .await;
+        if !outcome.is_pass() {
+            // Not ready, and deliberately not an error either way: a failing
+            // canary is a Sandbox that has not come up yet, and an unrunnable
+            // one is no evidence at all. The provisioning deadline already
+            // bounds how long this may repeat, so a Sandbox that never passes
+            // ends as an expiry rather than as a lease that hangs.
+            debug!(
+                lease = %name,
+                outcome = outcome.reason_code(),
+                "readiness canary did not pass; TTL clock has not started"
+            );
+            return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+        }
+        patch_lease_status(
+            &ctx,
+            &name,
+            &serde_json::json!({
+                "conditions": with_condition(
+                    &lease,
+                    READINESS_CANARY_CONDITION,
+                    crate::crd::SandboxConditionStatus::True,
+                    "CanaryPassed",
+                    "Pool readiness canary exited zero inside the Sandbox",
+                ),
+            }),
+        )
+        .await?;
+        debug!(lease = %name, "readiness canary passed");
+    }
+
     // Runtime TTL starts HERE, at observed readiness — not when the request
     // arrived. A caller must not be billed for however long placement and
     // provisioning took, which is the whole reason the provisioning deadline
@@ -259,7 +310,6 @@ pub async fn reconcile_lease(
     let runtime_ttl = crate::pool::parse_duration(&lease.spec.ttl).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("lease {name} has an invalid TTL"))
     })?;
-    let status = lease.status.clone().unwrap_or_default();
     let observed_generation = lease.metadata.generation.unwrap_or_default();
     // An already-Ready lease reuses its PERSISTED readiness instant. Passing a
     // fresh `now()` on every requeue would make the transition non-idempotent:
@@ -615,8 +665,31 @@ async fn quarantine_lease(
 }
 
 const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
+/// Durable record that the pool's canary already ran and passed.
+///
+/// Durable rather than in-memory because the alternative is running an
+/// administrator's command inside a live tenant workload again after every
+/// controller restart.
+const READINESS_CANARY_CONDITION: &str = "ReadinessCanary";
 
-/// Build the whole condition list, with `CleanupVerified` upserted into it.
+/// Whether the readiness canary has already been observed to pass.
+fn canary_already_passed(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.condition_type == READINESS_CANARY_CONDITION
+            && condition.status == crate::crd::SandboxConditionStatus::True
+    })
+}
+
+fn with_cleanup_condition(
+    lease: &SandboxLease,
+    status: crate::crd::SandboxConditionStatus,
+    reason: &str,
+    message: &str,
+) -> Vec<crate::crd::SandboxCondition> {
+    with_condition(lease, CLEANUP_VERIFIED_CONDITION, status, reason, message)
+}
+
+/// Build the whole condition list, with one condition upserted into it.
 ///
 /// The full list is rebuilt because the status patch is a JSON merge patch,
 /// which REPLACES an array rather than merging it: sending one condition alone
@@ -626,8 +699,9 @@ const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
 /// Kubernetes convention — a timestamp that advanced on every requeue would
 /// make a condition that has been stable for an hour look like it just
 /// flipped.
-fn with_cleanup_condition(
+fn with_condition(
     lease: &SandboxLease,
+    condition_type: &str,
     status: crate::crd::SandboxConditionStatus,
     reason: &str,
     message: &str,
@@ -639,7 +713,7 @@ fn with_cleanup_condition(
         .unwrap_or_default();
     let previous = existing
         .iter()
-        .find(|condition| condition.condition_type == CLEANUP_VERIFIED_CONDITION);
+        .find(|condition| condition.condition_type == condition_type);
     let last_transition_time = match previous {
         Some(previous) if previous.status == status => previous.last_transition_time.clone(),
         _ => Some(chrono::Utc::now().to_rfc3339()),
@@ -647,10 +721,10 @@ fn with_cleanup_condition(
 
     let mut conditions: Vec<_> = existing
         .into_iter()
-        .filter(|condition| condition.condition_type != CLEANUP_VERIFIED_CONDITION)
+        .filter(|condition| condition.condition_type != condition_type)
         .collect();
     conditions.push(crate::crd::SandboxCondition {
-        condition_type: CLEANUP_VERIFIED_CONDITION.into(),
+        condition_type: condition_type.to_string(),
         status,
         reason: reason.to_string(),
         message: message.to_string(),
@@ -994,6 +1068,26 @@ mod tests {
         }
     }
 
+    /// A lease whose canary pass is already recorded.
+    ///
+    /// The canary execs over a websocket, which the HTTP mock cannot serve — so
+    /// tests about what happens *after* readiness record the pass the same way
+    /// a previous reconcile would have, which is also the production path after
+    /// any controller restart.
+    fn lease_past_the_canary() -> SandboxLease {
+        let lease = admitted_lease();
+        let conditions = with_condition(
+            &lease,
+            READINESS_CANARY_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "CanaryPassed",
+            "recorded by an earlier reconcile",
+        );
+        let mut lease = lease;
+        lease.status.as_mut().unwrap().conditions = conditions;
+        lease
+    }
+
     fn claim_json(status: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": AGENT_SANDBOX_API_VERSION,
@@ -1111,7 +1205,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reconcile_lease(Arc::new(admitted_lease()), ctx).await;
+        let result = reconcile_lease(Arc::new(lease_past_the_canary()), ctx).await;
         assert!(result.is_err(), "a failed backstop must fail the reconcile");
         assert_eq!(
             requests_to(&server, "PATCH", LEASE_STATUS_PATH).await,
@@ -1207,6 +1301,114 @@ mod tests {
                 .is_empty(),
             "placement must decline before it touches the API at all"
         );
+    }
+
+    /// A Sandbox upstream calls Ready is not yet a Sandbox that works.
+    ///
+    /// Upstream's condition is about the container. A Pod whose agent
+    /// crash-looped, whose weights failed to mount, or which is wedged on a
+    /// lock satisfies it — and the moment Kobe believes it, the caller's paid
+    /// runtime TTL starts on something that cannot serve. Until the pool's own
+    /// canary passes, nothing is written: no clock, no shutdown time, no Ready.
+    #[tokio::test]
+    async fn upstream_ready_alone_does_not_start_the_clock() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        // Upstream says Ready — and says nothing about the agent inside.
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": [{ "type": "Ready", "status": "True" }],
+                    "sandbox": { "name": "sbx" },
+                }))),
+            )
+            .mount(&server)
+            .await;
+        // The Sandbox object is unreachable, so the canary cannot run. That is
+        // absence of evidence, and absence of evidence is not readiness.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(Arc::new(admitted_lease()), ctx)
+            .await
+            .unwrap();
+        assert_ne!(
+            action,
+            Action::await_change(),
+            "the canary must be re-tried"
+        );
+
+        assert_eq!(
+            requests_to(&server, "PATCH", CLAIM_PATH).await,
+            0,
+            "no shutdown time until the workload itself answers"
+        );
+        assert_eq!(
+            requests_to(&server, "PATCH", LEASE_STATUS_PATH).await,
+            0,
+            "an unproven Sandbox must not be marked Ready"
+        );
+    }
+
+    /// A recorded canary pass is not re-run.
+    ///
+    /// The canary executes an administrator-declared command inside a live
+    /// tenant workload. Repeating it on every requeue would turn a health check
+    /// into a recurring side effect on somebody else's Sandbox — and a
+    /// controller that restarted after a pass must not run it again either,
+    /// which is why the record lives on the lease rather than in memory.
+    #[test]
+    fn a_recorded_canary_pass_is_durable() {
+        use crate::crd::SandboxConditionStatus;
+
+        assert!(!canary_already_passed(&Default::default()));
+
+        let lease = lease_past_the_canary();
+        assert!(canary_already_passed(lease.status.as_ref().unwrap()));
+
+        // A recorded FAILURE is not a pass. Only True counts.
+        let mut failed = admitted_lease();
+        failed.status.as_mut().unwrap().conditions = with_condition(
+            &failed,
+            READINESS_CANARY_CONDITION,
+            SandboxConditionStatus::False,
+            "CanaryFailed",
+            "exited non-zero",
+        );
+        assert!(!canary_already_passed(failed.status.as_ref().unwrap()));
+
+        // Nor is somebody else's condition.
+        let mut unrelated = admitted_lease();
+        unrelated.status.as_mut().unwrap().conditions = with_condition(
+            &unrelated,
+            "CleanupVerified",
+            SandboxConditionStatus::True,
+            "TeardownVerified",
+            "gone",
+        );
+        assert!(!canary_already_passed(unrelated.status.as_ref().unwrap()));
     }
 
     // -----------------------------------------------------------------------

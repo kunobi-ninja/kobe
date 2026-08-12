@@ -55,10 +55,30 @@ pub const REQUIRED_AGENT_SANDBOX_API_VERSION: &str = "extensions.agents.x-k8s.io
 
 /// The upstream CRDs Kobe consumes. All three are required: a runtime with
 /// claims but no warm pools would pass a laxer check and then fail to serve.
-pub const REQUIRED_AGENT_SANDBOX_CRDS: &[&str] = &[
-    "sandboxtemplates.extensions.agents.x-k8s.io",
-    "sandboxwarmpools.extensions.agents.x-k8s.io",
-    "sandboxclaims.extensions.agents.x-k8s.io",
+/// The core Agent Sandbox group. The `Sandbox` object itself lives here, not
+/// in the `extensions.` group its templates, warm pools and claims are in.
+pub const CORE_AGENT_SANDBOX_API_VERSION: &str = "agents.x-k8s.io/v1beta1";
+
+/// The upstream CRDs Kobe consumes, each with the API version it is consumed
+/// at. All are required: a runtime missing any one of them passes a laxer
+/// check and then fails to serve — and `sandboxes` in particular fails
+/// *silently*, because it is read to find the Pod behind a claim, so its
+/// absence surfaces as leases that never pass readiness rather than as an
+/// error anyone can act on.
+pub const REQUIRED_AGENT_SANDBOX_CRDS: &[(&str, &str)] = &[
+    (
+        "sandboxtemplates.extensions.agents.x-k8s.io",
+        REQUIRED_AGENT_SANDBOX_API_VERSION,
+    ),
+    (
+        "sandboxwarmpools.extensions.agents.x-k8s.io",
+        REQUIRED_AGENT_SANDBOX_API_VERSION,
+    ),
+    (
+        "sandboxclaims.extensions.agents.x-k8s.io",
+        REQUIRED_AGENT_SANDBOX_API_VERSION,
+    ),
+    ("sandboxes.agents.x-k8s.io", CORE_AGENT_SANDBOX_API_VERSION),
 ];
 
 /// Why an operator-installed runtime cannot be used.
@@ -127,6 +147,7 @@ pub fn mode_from_env() -> Result<AgentSandboxMode, AgentSandboxUnusable> {
 /// supplies what the API server reported.
 pub fn crd_is_compatible(
     crd: &str,
+    expected_api_version: &str,
     established: bool,
     served_versions: &[String],
 ) -> Result<(), AgentSandboxUnusable> {
@@ -136,10 +157,7 @@ pub fn crd_is_compatible(
         });
     }
     // The pinned constant is `group/version`; a CRD reports versions alone.
-    let expected_version = REQUIRED_AGENT_SANDBOX_API_VERSION
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
+    let expected_version = expected_api_version.rsplit('/').next().unwrap_or_default();
     if served_versions
         .iter()
         .any(|version| version == expected_version)
@@ -148,7 +166,7 @@ pub fn crd_is_compatible(
     }
     Err(AgentSandboxUnusable::VersionMismatch {
         crd: crd.to_string(),
-        expected: REQUIRED_AGENT_SANDBOX_API_VERSION.to_string(),
+        expected: expected_api_version.to_string(),
         found: if served_versions.is_empty() {
             "none".to_string()
         } else {
@@ -167,7 +185,7 @@ pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), Agen
     use kube::api::Api;
 
     let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
-    for name in REQUIRED_AGENT_SANDBOX_CRDS {
+    for (name, expected_api_version) in REQUIRED_AGENT_SANDBOX_CRDS {
         let observed = crds.get(name).await.ok();
         let established = observed.as_ref().is_some_and(|crd| {
             crd.status
@@ -190,7 +208,7 @@ pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), Agen
                     .collect()
             })
             .unwrap_or_default();
-        crd_is_compatible(name, established, &served)?;
+        crd_is_compatible(name, expected_api_version, established, &served)?;
     }
     Ok(())
 }
@@ -241,11 +259,14 @@ mod tests {
     fn a_different_upstream_version_is_refused() {
         let crd = "sandboxclaims.extensions.agents.x-k8s.io";
 
-        assert!(crd_is_compatible(crd, true, &["v1beta1".into()]).is_ok());
+        let expected = REQUIRED_AGENT_SANDBOX_API_VERSION;
+        assert!(crd_is_compatible(crd, expected, true, &["v1beta1".into()]).is_ok());
         // Serving several versions is fine as long as ours is among them.
-        assert!(crd_is_compatible(crd, true, &["v1alpha1".into(), "v1beta1".into()]).is_ok());
+        assert!(
+            crd_is_compatible(crd, expected, true, &["v1alpha1".into(), "v1beta1".into()]).is_ok()
+        );
 
-        let err = crd_is_compatible(crd, true, &["v1alpha1".into()]).unwrap_err();
+        let err = crd_is_compatible(crd, expected, true, &["v1alpha1".into()]).unwrap_err();
         assert!(matches!(err, AgentSandboxUnusable::VersionMismatch { .. }));
         assert_eq!(err.reason_code(), "version_mismatch");
         // The found version belongs in the message: "incompatible" without it
@@ -257,8 +278,13 @@ mod tests {
     /// or a failed upgrade it can be present and not yet serving.
     #[test]
     fn an_unestablished_crd_is_not_usable() {
-        let err =
-            crd_is_compatible("sandboxclaims.extensions.agents.x-k8s.io", false, &[]).unwrap_err();
+        let err = crd_is_compatible(
+            "sandboxclaims.extensions.agents.x-k8s.io",
+            REQUIRED_AGENT_SANDBOX_API_VERSION,
+            false,
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err, AgentSandboxUnusable::CrdMissing { .. }));
         assert_eq!(err.reason_code(), "crd_missing");
     }
@@ -266,10 +292,24 @@ mod tests {
     /// All three CRDs are required. A runtime with claims but no warm pools
     /// would pass a laxer check and then fail to serve.
     #[test]
-    fn every_consumed_crd_is_required() {
-        assert_eq!(REQUIRED_AGENT_SANDBOX_CRDS.len(), 3);
-        for crd in REQUIRED_AGENT_SANDBOX_CRDS {
-            assert!(crd.ends_with(".extensions.agents.x-k8s.io"), "{crd}");
+    fn every_consumed_crd_is_required_at_the_version_it_is_consumed_at() {
+        assert_eq!(REQUIRED_AGENT_SANDBOX_CRDS.len(), 4);
+        for (crd, expected) in REQUIRED_AGENT_SANDBOX_CRDS {
+            // The name must sit under the group it is validated against;
+            // otherwise a CRD could pass a version check that never applied
+            // to it.
+            let group = expected.rsplit_once('/').unwrap().0;
+            assert!(crd.ends_with(&format!(".{group}")), "{crd} vs {expected}");
         }
+
+        // `sandboxes` lives in the CORE group, and is the one whose absence
+        // fails silently: it is read to find the Pod behind a claim, so a
+        // runtime without it yields leases that never pass readiness rather
+        // than an error.
+        assert!(
+            REQUIRED_AGENT_SANDBOX_CRDS
+                .contains(&("sandboxes.agents.x-k8s.io", CORE_AGENT_SANDBOX_API_VERSION)),
+            "the canary reads Sandbox objects, so the runtime must serve them"
+        );
     }
 }
