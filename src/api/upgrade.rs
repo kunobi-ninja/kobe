@@ -122,6 +122,14 @@ pub(crate) async fn tunnel_upgrade(
                 lease_id = %lease_id,
                 "Connect proxy upgrade rejected — concurrency cap reached"
             );
+            // BOTH counters. Recording only the reason drops a saturated
+            // proxy's 503s out of request-volume and success-rate dashboards
+            // entirely — the same silent undercount #107 is about, one path
+            // over. Two independent reviews caught this; my first attempt to
+            // fix it matched no text after a reformat and silently did nothing.
+            crate::metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+                .with_label_values(&[crate::metrics::ConnectOutcome::BackendError.as_str()])
+                .inc();
             crate::metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
                 .with_label_values(&[crate::metrics::ConnectErrorReason::UpgradeCapacity.as_str()])
                 .inc();
@@ -280,12 +288,22 @@ pub(crate) async fn tunnel_upgrade(
         );
         let client_status =
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return upgrade_failure(
+        // Counted `ok`, deliberately, to match the buffered path — which
+        // documents that "even a 5xx FROM the leased cluster is a successful
+        // proxy outcome; the rejection counter is for the proxy's own
+        // accept/reject decisions". The proxy dialled, handshook and relayed;
+        // the backend said no.
+        //
+        // Counting this `backend_error` would also hand every lease holder a
+        // way to inflate that series on demand — `kubectl exec` at a pod that
+        // does not exist — turning an infrastructure alert into something a
+        // tenant can trigger.
+        crate::metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+            .with_label_values(&[crate::metrics::ConnectOutcome::Ok.as_str()])
+            .inc();
+        return upgrade_error(
             client_status,
             "Leased cluster rejected the streaming request",
-            crate::metrics::ConnectErrorReason::UpgradeRejected,
-            request_id,
-            lease_id,
         );
     }
 
@@ -357,13 +375,18 @@ pub(crate) async fn tunnel_upgrade(
         }
         Err(err) => {
             warn!(error = %err, "Connect proxy upgrade: failed to build 101 response");
-            upgrade_failure(
-                StatusCode::BAD_GATEWAY,
-                "Failed to establish stream",
-                crate::metrics::ConnectErrorReason::Other,
-                request_id,
-                lease_id,
-            )
+            {
+                // NOT pre-tunnel: the bridge task is already spawned above, so
+                // this does not go through `upgrade_failure` (whose log line
+                // says "before the tunnel was established"). Count it directly.
+                crate::metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+                    .with_label_values(&[crate::metrics::ConnectOutcome::BackendError.as_str()])
+                    .inc();
+                crate::metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+                    .with_label_values(&[crate::metrics::ConnectErrorReason::Other.as_str()])
+                    .inc();
+                upgrade_error(StatusCode::BAD_GATEWAY, "Failed to establish stream")
+            }
         }
     }
 }

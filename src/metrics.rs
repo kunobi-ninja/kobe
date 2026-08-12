@@ -701,9 +701,6 @@ pub enum ConnectErrorReason {
     UpgradeTimeout,
     /// Upgrade path: concurrency cap reached before a slot was available.
     UpgradeCapacity,
-    /// Upgrade path: the leased cluster answered, but not with 101 (it rejected
-    /// the streaming request — 401/403/404 and similar).
-    UpgradeRejected,
     /// Upgrade path: sending the request on the already-established HTTP/1
     /// connection failed. Distinct from the handshake, which had succeeded.
     UpgradeRequest,
@@ -735,7 +732,6 @@ impl ConnectErrorReason {
             Self::UpgradeHandshake => "upgrade_handshake",
             Self::UpgradeTimeout => "upgrade_timeout",
             Self::UpgradeCapacity => "upgrade_capacity",
-            Self::UpgradeRejected => "upgrade_rejected",
             Self::UpgradeRequest => "upgrade_request",
             Self::UpstreamUnreachable => "upstream_unreachable",
             Self::BindingResolution => "binding_resolution",
@@ -1760,27 +1756,42 @@ mod tests {
     /// Every reason must render to a distinct, stable string. A duplicate would
     /// silently merge two causes back into one bucket — the exact defect #106
     /// exists to fix.
+    const ALL_CONNECT_ERROR_REASONS: [ConnectErrorReason; 18] = [
+        ConnectErrorReason::UnsupportedMethod,
+        ConnectErrorReason::RequestBody,
+        ConnectErrorReason::KubeconfigUnavailable,
+        ConnectErrorReason::KubeconfigParse,
+        ConnectErrorReason::UpstreamConfig,
+        ConnectErrorReason::LeaseLookup,
+        ConnectErrorReason::UpstreamResponse,
+        ConnectErrorReason::UpgradeDial,
+        ConnectErrorReason::UpgradeTls,
+        ConnectErrorReason::UpgradeHandshake,
+        ConnectErrorReason::UpgradeTimeout,
+        ConnectErrorReason::UpgradeCapacity,
+        ConnectErrorReason::UpgradeRequest,
+        ConnectErrorReason::UpstreamUnreachable,
+        ConnectErrorReason::BindingResolution,
+        ConnectErrorReason::CacheFence,
+        ConnectErrorReason::BackendReconstruct,
+        ConnectErrorReason::Other,
+    ];
+
+    /// Every reason must render to a distinct, stable string. A duplicate would
+    /// silently merge two causes back into one bucket — the exact defect #106
+    /// exists to fix.
     #[test]
     fn connect_error_reasons_are_distinct() {
         use std::collections::BTreeSet;
-        let all = [
-            ConnectErrorReason::UnsupportedMethod,
-            ConnectErrorReason::RequestBody,
-            ConnectErrorReason::KubeconfigUnavailable,
-            ConnectErrorReason::KubeconfigParse,
-            ConnectErrorReason::UpstreamConfig,
-            ConnectErrorReason::LeaseLookup,
-            ConnectErrorReason::UpstreamResponse,
-            ConnectErrorReason::UpgradeDial,
-            ConnectErrorReason::UpgradeTls,
-            ConnectErrorReason::UpgradeHandshake,
-            ConnectErrorReason::UpgradeTimeout,
-            ConnectErrorReason::UpgradeCapacity,
-            ConnectErrorReason::UpgradeRejected,
-            ConnectErrorReason::Other,
-        ];
-        let rendered: BTreeSet<&str> = all.iter().map(|r| r.as_str()).collect();
-        assert_eq!(rendered.len(), all.len(), "two reasons share a label");
+        let rendered: BTreeSet<&str> = ALL_CONNECT_ERROR_REASONS
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            ALL_CONNECT_ERROR_REASONS.len(),
+            "two reasons share a label"
+        );
     }
 
     /// Labels are a metric dimension, so they must stay low-cardinality and
@@ -1790,7 +1801,6 @@ mod tests {
         for r in [
             ConnectErrorReason::UnsupportedMethod,
             ConnectErrorReason::UpgradeDial,
-            ConnectErrorReason::UpgradeRejected,
             ConnectErrorReason::Other,
         ] {
             let s = r.as_str();
