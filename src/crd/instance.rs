@@ -1,3 +1,4 @@
+use crate::crd::teardown::TeardownSubject;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -440,6 +441,21 @@ pub struct ClusterInstanceProvenance {
     /// `"0.17.0"`.
     pub operator_version: String,
 
+    /// Exactly which footprints this instance created, recorded at creation.
+    ///
+    /// This is the trust boundary for verified teardown. A receipt only proves
+    /// what it covers, so the list of subjects it must cover cannot come from
+    /// the receipt, nor from whatever the teardown path happens to look for
+    /// later — an optional resource whose config changed after creation would
+    /// then be quietly dropped from the plan and never verified.
+    ///
+    /// Stamped once alongside the rest of this provenance and never
+    /// overwritten. `None` means the instance predates verified teardown; such
+    /// an instance is ineligible for [`CleanupMode::VerifiedDestroy`] rather
+    /// than being verified against a guessed plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_plan: Option<Vec<TeardownSubject>>,
+
     /// kobe-sync sidecar image used at create time. Recorded for
     /// `Vkobe` backends only (other backends don't run kobe-sync).
     /// Format matches the operator's `KOBE_SYNC_IMAGE` env var, e.g.
@@ -504,6 +520,7 @@ mod tests {
             }),
             created_with: Some(ClusterInstanceProvenance {
                 operator_version: "0.37.0".into(),
+                teardown_plan: None,
                 kobe_sync_image: Some("zondax/kobe-sync:v0.16.0".into()),
                 backend_type: Some(BackendType::K0s),
                 pool_uid: None,
@@ -763,6 +780,7 @@ mod tests {
     fn provenance_omits_unknown_components() {
         let p = ClusterInstanceProvenance {
             operator_version: "0.37.0".into(),
+            teardown_plan: None,
             kobe_sync_image: None,
             backend_type: None,
             pool_uid: None,
@@ -802,6 +820,7 @@ mod tests {
         ] {
             let p = ClusterInstanceProvenance {
                 operator_version: "0.37.0".into(),
+                teardown_plan: None,
                 kobe_sync_image: None,
                 backend_type: Some(bt),
                 pool_uid: None,

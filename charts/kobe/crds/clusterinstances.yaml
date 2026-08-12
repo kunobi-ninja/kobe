@@ -927,6 +927,46 @@ spec:
                       not infer it from a same-named current pool.
                     nullable: true
                     type: string
+                  teardownPlan:
+                    description: |-
+                      Exactly which footprints this instance created, recorded at creation.
+
+                      This is the trust boundary for verified teardown. A receipt only proves
+                      what it covers, so the list of subjects it must cover cannot come from
+                      the receipt, nor from whatever the teardown path happens to look for
+                      later — an optional resource whose config changed after creation would
+                      then be quietly dropped from the plan and never verified.
+
+                      Stamped once alongside the rest of this provenance and never
+                      overwritten. `None` means the instance predates verified teardown; such
+                      an instance is ineligible for [`CleanupMode::VerifiedDestroy`] rather
+                      than being verified against a guessed plan.
+                    items:
+                      description: |-
+                        One thing whose absence must be proven.
+
+                        Enumerated rather than free-text so a receipt cannot be satisfied by an
+                        unrecognised or invented subject, and so adding a resource to the teardown
+                        path is a deliberate, reviewable change to this list.
+                      enum:
+                      - agentDeployment
+                      - serverStatefulSet
+                      - serverPods
+                      - service
+                      - podDisruptionBudget
+                      - publisherConfigMap
+                      - registriesConfigMap
+                      - tokenSecret
+                      - kubeconfigSecret
+                      - cidrClaim
+                      - connectTokenSecret
+                      - serverDataPvcs
+                      - serverDataVolumes
+                      - database
+                      - databaseRole
+                      type: string
+                    nullable: true
+                    type: array
                 required:
                 - operatorVersion
                 type: object

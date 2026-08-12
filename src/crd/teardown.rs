@@ -274,6 +274,77 @@ pub struct TeardownScope<'a> {
     pub required_subjects: &'a [TeardownSubject],
 }
 
+/// Derive the exact set of footprints a k3s instance creates, from the config
+/// it is being created with.
+///
+/// Called at **creation** and stamped into immutable provenance — never
+/// recomputed at teardown. Recomputing later would read whatever the config
+/// says *then*, so a pool that stopped setting `registryMirrors` after an
+/// instance was made would drop that ConfigMap from the plan and never verify
+/// it. The plan has to describe what was built, not what would be built now.
+///
+/// Subjects that are always created are unconditional; the rest are included
+/// only when the config that creates them is present. A footprint absent from
+/// this list is not "excused" at teardown — it is simply not part of what this
+/// instance made.
+pub fn k3s_teardown_plan(
+    cluster: &ClusterConfig,
+    has_external_datastore: bool,
+) -> Vec<TeardownSubject> {
+    let mut plan = vec![
+        // Always created by the k3s backend.
+        TeardownSubject::ServerStatefulSet,
+        TeardownSubject::ServerPods,
+        TeardownSubject::Service,
+        TeardownSubject::PublisherConfigMap,
+        TeardownSubject::TokenSecret,
+        TeardownSubject::KubeconfigSecret,
+        TeardownSubject::ConnectTokenSecret,
+    ];
+
+    // Agents are a separate Deployment only when the pool asks for them.
+    if cluster.agents.is_some_and(|agents| agents > 0) {
+        plan.push(TeardownSubject::AgentDeployment);
+    }
+    // The HA PodDisruptionBudget exists only for multi-server pools.
+    if cluster.servers > 1 {
+        plan.push(TeardownSubject::PodDisruptionBudget);
+    }
+    if cluster
+        .registry_mirrors
+        .as_ref()
+        .is_some_and(|mirrors| !mirrors.is_empty())
+    {
+        plan.push(TeardownSubject::RegistriesConfigMap);
+    }
+    // Persistent storage means PVCs and the volumes behind them. Both, always
+    // together: proving the claim gone while its volume survives is precisely
+    // the gap that makes a receipt a lie.
+    if cluster
+        .persistence
+        .as_ref()
+        .is_some_and(|persistence| !storage_is_ephemeral(persistence))
+    {
+        plan.push(TeardownSubject::ServerDataPvcs);
+        plan.push(TeardownSubject::ServerDataVolumes);
+    }
+    // A per-cluster database always comes with the role that owns it.
+    if has_external_datastore {
+        plan.push(TeardownSubject::Database);
+        plan.push(TeardownSubject::DatabaseRole);
+    }
+    plan
+}
+
+/// Whether a persistence config allocates no durable volume.
+fn storage_is_ephemeral(persistence: &super::profile::PersistenceConfig) -> bool {
+    persistence
+        .storage_type
+        .as_deref()
+        .unwrap_or("emptyDir")
+        .eq_ignore_ascii_case("emptydir")
+}
+
 /// Why a pool's footprint cannot support [`CleanupMode::VerifiedDestroy`].
 ///
 /// Rejected **before binding**. An ineligible pool must never accept a
@@ -421,6 +492,93 @@ mod tests {
             verified_destroy_eligibility(&BackendType::K3s, &cluster(), None, false).unwrap_err(),
             VerifiedDestroyIneligible::DatastoreProvenanceMissing
         );
+    }
+
+    /// The plan must describe what was BUILT, not what the config says later.
+    ///
+    /// Optional footprints appear only when the config that creates them is
+    /// present — and because the plan is stamped at creation, a pool that later
+    /// stops setting `registryMirrors` cannot retroactively drop that ConfigMap
+    /// from an existing instance's plan and leave it unverified.
+    #[test]
+    fn the_plan_covers_exactly_what_this_config_creates() {
+        // Minimal ephemeral cluster, no datastore.
+        let minimal: ClusterConfig =
+            serde_json::from_value(serde_json::json!({ "version": "v1.32.0" })).unwrap();
+        let plan = k3s_teardown_plan(&minimal, false);
+
+        // Always built.
+        for required in [
+            TeardownSubject::ServerStatefulSet,
+            TeardownSubject::ServerPods,
+            TeardownSubject::Service,
+            TeardownSubject::TokenSecret,
+            TeardownSubject::KubeconfigSecret,
+            TeardownSubject::ConnectTokenSecret,
+        ] {
+            assert!(plan.contains(&required), "{required:?} is always created");
+        }
+        // Never built by this config — and therefore not something a receipt
+        // has to excuse. Absent from the plan, not marked NotApplicable.
+        for absent in [
+            TeardownSubject::AgentDeployment,
+            TeardownSubject::PodDisruptionBudget,
+            TeardownSubject::RegistriesConfigMap,
+            TeardownSubject::ServerDataPvcs,
+            TeardownSubject::ServerDataVolumes,
+            TeardownSubject::Database,
+            TeardownSubject::DatabaseRole,
+        ] {
+            assert!(!plan.contains(&absent), "{absent:?} was never created");
+        }
+    }
+
+    /// Persistent storage must pull in BOTH the claim and its volume, and a
+    /// datastore must pull in BOTH the database and its role. Proving one half
+    /// while the other survives is exactly the leak a receipt would otherwise
+    /// hide.
+    #[test]
+    fn paired_footprints_are_never_planned_alone() {
+        let persistent: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "version": "v1.32.0",
+            "servers": 3,
+            "agents": 2,
+            "persistence": { "storageType": "dynamic" },
+            "registryMirrors": { "docker.io": ["https://mirror.example"] }
+        }))
+        .unwrap();
+        let plan = k3s_teardown_plan(&persistent, true);
+
+        assert!(plan.contains(&TeardownSubject::ServerDataPvcs));
+        assert!(
+            plan.contains(&TeardownSubject::ServerDataVolumes),
+            "a claim without its volume proves only that the pointer is gone"
+        );
+        assert!(plan.contains(&TeardownSubject::Database));
+        assert!(
+            plan.contains(&TeardownSubject::DatabaseRole),
+            "a database without its role leaves credentials behind"
+        );
+        // Config-gated extras now present.
+        assert!(plan.contains(&TeardownSubject::AgentDeployment));
+        assert!(plan.contains(&TeardownSubject::PodDisruptionBudget));
+        assert!(plan.contains(&TeardownSubject::RegistriesConfigMap));
+    }
+
+    /// A single-server pool has no PodDisruptionBudget, and emptyDir storage
+    /// has no volume to reclaim.
+    #[test]
+    fn single_server_ephemeral_pools_plan_no_pdb_or_volumes() {
+        let single: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "version": "v1.32.0",
+            "servers": 1,
+            "persistence": { "storageType": "emptyDir" }
+        }))
+        .unwrap();
+        let plan = k3s_teardown_plan(&single, false);
+        assert!(!plan.contains(&TeardownSubject::PodDisruptionBudget));
+        assert!(!plan.contains(&TeardownSubject::ServerDataPvcs));
+        assert!(!plan.contains(&TeardownSubject::ServerDataVolumes));
     }
 
     /// A backend that cannot produce evidence must be refused at bind time.
