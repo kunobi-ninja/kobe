@@ -92,10 +92,26 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # Leader election
+  # Verified teardown must observe that a PVC's backing PersistentVolume is
+  # actually gone — a claim can be deleted under a `Retain` reclaim policy while
+  # the volume, and the tenant's data, survive. Read-only: kobe never deletes a
+  # PV directly, it only proves absence. Without this the volume check 403s,
+  # which correctly reads as "cannot verify" and would quarantine every
+  # persistent pool forever.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  # Leader election, AND the Sandbox admission ledger.
+  #
+  # `list` and `delete` are load-bearing for admission, not leader election:
+  # quota and alias reservations are coordination Leases, released by deleting
+  # them and found by listing on the owning lease's UID label. Without both,
+  # every release 403s and a caller's quota is consumed permanently on the
+  # first teardown — a failure no unit test sees, because it only exists once
+  # real RBAC applies.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update", "patch"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
   # CRD discovery (Velero detection)
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
