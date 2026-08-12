@@ -124,6 +124,21 @@ pub struct TeardownCheck {
     /// `datastore_unreachable`). Never a raw provider response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+
+    /// The concrete resources this check actually looked at.
+    ///
+    /// A [`TeardownSubject`] is a category. On its own,
+    /// `Database = Verified` asserts that *a* database is gone without saying
+    /// which — so a receipt could be satisfied by checking the wrong one, or by
+    /// checking one of several when the footprint had more. Recording the exact
+    /// identities makes the claim auditable after the fact, which is the whole
+    /// point of keeping evidence that outlives the instance.
+    ///
+    /// Names only: object names, PV names, the database and role identifiers.
+    /// Never connection strings, credentials, or anything that would turn a
+    /// receipt into a secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified: Vec<String>,
 }
 
 /// Durable proof that one exact lease-owned footprint is gone.
@@ -627,16 +642,19 @@ mod tests {
             subject: TeardownSubject::ServerStatefulSet,
             result: CheckResult::Verified,
             reason: None,
+            verified: Vec::new(),
         };
         let not_applicable = TeardownCheck {
             subject: TeardownSubject::RegistriesConfigMap,
             result: CheckResult::NotApplicable,
             reason: None,
+            verified: Vec::new(),
         };
         let unknown = TeardownCheck {
             subject: TeardownSubject::Database,
             result: CheckResult::Unknown,
             reason: Some("datastore_unreachable".into()),
+            verified: Vec::new(),
         };
 
         assert_eq!(
@@ -681,6 +699,7 @@ mod tests {
             subject,
             result,
             reason: None,
+            verified: Vec::new(),
         }
     }
 

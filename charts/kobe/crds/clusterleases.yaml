@@ -370,6 +370,23 @@ spec:
                           - database
                           - databaseRole
                           type: string
+                        verified:
+                          description: |-
+                            The concrete resources this check actually looked at.
+
+                            A [`TeardownSubject`] is a category. On its own,
+                            `Database = Verified` asserts that *a* database is gone without saying
+                            which — so a receipt could be satisfied by checking the wrong one, or by
+                            checking one of several when the footprint had more. Recording the exact
+                            identities makes the claim auditable after the fact, which is the whole
+                            point of keeping evidence that outlives the instance.
+
+                            Names only: object names, PV names, the database and role identifiers.
+                            Never connection strings, credentials, or anything that would turn a
+                            receipt into a secret.
+                          items:
+                            type: string
+                          type: array
                       required:
                       - result
                       - subject

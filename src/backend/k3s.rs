@@ -1826,44 +1826,57 @@ impl K3sBackend {
                 subject,
                 result: CheckResult::Unknown,
                 reason: Some("delete_failed".into()),
+                verified: Vec::new(),
             };
         }
 
+        // Recorded alongside the verdict so the receipt says WHICH resources
+        // were inspected, not merely that some resource of this category was.
+        let mut verified: Vec<String> = Vec::new();
         let (result, reason) = match subject {
             TeardownSubject::AgentDeployment => {
                 let api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-agent"));
                 Self::absent_by_name(&api, &format!("{name}-agent")).await
             }
             TeardownSubject::ServerStatefulSet => {
                 let api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-server"));
                 Self::absent_by_name(&api, &format!("{name}-server")).await
             }
             TeardownSubject::Service => {
                 let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-server"));
                 Self::absent_by_name(&api, &format!("{name}-server")).await
             }
             TeardownSubject::PodDisruptionBudget => {
                 let api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-server"));
                 Self::absent_by_name(&api, &format!("{name}-server")).await
             }
             TeardownSubject::PublisherConfigMap => {
                 let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-kubeconfig-publisher"));
                 Self::absent_by_name(&api, &format!("{name}-kubeconfig-publisher")).await
             }
             TeardownSubject::RegistriesConfigMap => {
                 let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-registries"));
                 Self::absent_by_name(&api, &format!("{name}-registries")).await
             }
             TeardownSubject::TokenSecret => {
                 let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-token"));
                 Self::absent_by_name(&api, &format!("{name}-token")).await
             }
             TeardownSubject::KubeconfigSecret => {
                 let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-kubeconfig"));
                 Self::absent_by_name(&api, &format!("{name}-kubeconfig")).await
             }
             TeardownSubject::ConnectTokenSecret => {
                 let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-connect-token"));
                 Self::absent_by_name(&api, &format!("{name}-connect-token")).await
             }
             // Pods are label-selected rather than named: a StatefulSet's pods
@@ -1872,6 +1885,7 @@ impl K3sBackend {
             TeardownSubject::ServerPods => {
                 let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
                 let selector = format!("kobe.kunobi.ninja/cluster={name}");
+                verified.push(selector.clone());
                 match pods.list(&ListParams::default().labels(&selector)).await {
                     Ok(list) if list.items.is_empty() => (CheckResult::Verified, None),
                     Ok(_) => (CheckResult::Unknown, Some("pods_still_present".into())),
@@ -1879,6 +1893,7 @@ impl K3sBackend {
                 }
             }
             TeardownSubject::ServerDataPvcs => {
+                verified.push(format!("data-{name}-server-*"));
                 let pvcs: Api<PersistentVolumeClaim> =
                     Api::namespaced(self.client.clone(), namespace);
                 match pvcs.list(&ListParams::default()).await {
@@ -1904,6 +1919,9 @@ impl K3sBackend {
                 Err(reason) => (CheckResult::Unknown, Some(reason.clone())),
                 Ok(volumes) if volumes.is_empty() => (CheckResult::Verified, None),
                 Ok(volumes) => {
+                    // The captured PV names, so the receipt says exactly which
+                    // volumes were proven reclaimed.
+                    verified.extend(volumes.iter().cloned());
                     let api: Api<k8s_openapi::api::core::v1::PersistentVolume> =
                         Api::all(self.client.clone());
                     let mut verdict = (CheckResult::Verified, None);
@@ -1924,11 +1942,14 @@ impl K3sBackend {
             }
             TeardownSubject::Database => match self.datastore.current() {
                 None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
-                Some((pool, _)) => match datastore::database_exists(&pool, name, "k3s_").await {
-                    Ok(false) => (CheckResult::Verified, None),
-                    Ok(true) => (CheckResult::Unknown, Some("database_still_present".into())),
-                    Err(_) => (CheckResult::Unknown, Some("datastore_unreachable".into())),
-                },
+                Some((pool, _)) => {
+                    verified.push(format!("database:k3s_{name}"));
+                    match datastore::database_exists(&pool, name, "k3s_").await {
+                        Ok(false) => (CheckResult::Verified, None),
+                        Ok(true) => (CheckResult::Unknown, Some("database_still_present".into())),
+                        Err(_) => (CheckResult::Unknown, Some("datastore_unreachable".into())),
+                    }
+                }
             },
             TeardownSubject::DatabaseRole => match self.datastore.current() {
                 None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
@@ -1945,6 +1966,14 @@ impl K3sBackend {
         TeardownCheck {
             subject,
             result,
+            // Only claim to have verified something if we actually did. A
+            // failed or uncertain check must not leave identities behind that
+            // read as proof.
+            verified: if result == CheckResult::Verified {
+                verified
+            } else {
+                Vec::new()
+            },
             reason,
         }
     }
@@ -3287,6 +3316,82 @@ mod tests {
 
         assert_eq!(check.result, CheckResult::Unknown);
         assert_eq!(check.reason.as_deref(), Some("still_present"));
+    }
+
+    /// A verified check must name WHAT it verified.
+    ///
+    /// `Database = Verified` on its own asserts that *a* database is gone
+    /// without saying which — so the claim cannot be audited after the instance
+    /// is gone, which is exactly when the receipt is read. Recording the
+    /// concrete identity is what makes the evidence mean something later.
+    #[tokio::test]
+    async fn a_verified_check_records_what_it_actually_inspected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/c1-server",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerStatefulSet,
+                &Ok(Vec::new()),
+                &Ok(()),
+            )
+            .await;
+
+        assert_eq!(check.result, CheckResult::Verified);
+        assert_eq!(
+            check.verified,
+            vec!["c1-server".to_string()],
+            "the receipt must say which object was proven absent"
+        );
+    }
+
+    /// An UNVERIFIED check must not carry identities that read as proof.
+    ///
+    /// Otherwise a quarantining receipt would list the very resources it failed
+    /// to verify, and a later reader could mistake the list for evidence.
+    #[tokio::test]
+    async fn an_unverified_check_claims_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/c1-server",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "apps/v1", "kind": "StatefulSet",
+                "metadata": { "name": "c1-server", "namespace": "test-ns" }
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerStatefulSet,
+                &Ok(Vec::new()),
+                &Ok(()),
+            )
+            .await;
+
+        assert_eq!(check.result, CheckResult::Unknown);
+        assert!(
+            check.verified.is_empty(),
+            "a check that did not verify must claim nothing: {:?}",
+            check.verified
+        );
     }
 
     /// Only a 404 proves absence. An RBAC denial or a timeout tells us nothing
