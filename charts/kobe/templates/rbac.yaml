@@ -87,6 +87,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Per-lease scoped credentials (#81). Kobe mints a ServiceAccount whose Role
+  # names exactly one Pod, then a short-lived token for it, and reaches the
+  # tenant's Sandbox as THAT identity rather than as itself.
+  #
+  # `serviceaccounts/token` is the mint. It is bounded by RBAC's own escalation
+  # rule: a Role may only be created granting permissions the creator already
+  # holds, so this cannot manufacture authority the operator lacks — it can
+  # only hand out less.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]

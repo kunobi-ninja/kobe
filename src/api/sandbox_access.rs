@@ -408,6 +408,140 @@ pub async fn read_sandbox_logs(
         .map_err(|_| SandboxAccessDenied::Backend)
 }
 
+/// The largest command output one exec response may carry.
+///
+/// The caller controls what they run, so they control how much it prints.
+/// Without a cap, `cat /dev/urandom` is a way to make the operator buffer
+/// unbounded memory on request — from inside a sandbox that exists precisely
+/// because its occupant is not trusted.
+pub const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxExecRequest {
+    /// argv. Executed directly — never through a shell, which would make
+    /// quoting the security boundary.
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SandboxExecResponse {
+    pub stdout: String,
+    pub stderr: String,
+    /// Whether the command exited zero. A numeric exit code is not always
+    /// available over this protocol, and inventing one would be worse than
+    /// reporting what is actually known.
+    pub success: bool,
+    /// Whether output was cut off at the cap. Reported rather than silently
+    /// truncated: a caller parsing partial output as complete is how a
+    /// truncation becomes a wrong answer instead of an obvious one.
+    pub truncated: bool,
+}
+
+/// Run one command inside the Sandbox and return its bounded output.
+///
+/// No stdin and no TTY: this is the request/response surface, and both of those
+/// need a stream protocol with its own revocation story (#83). No shell either
+/// — argv is executed directly, so quoting is never the security boundary.
+pub async fn exec_in_sandbox(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    command: &[String],
+    timeout: std::time::Duration,
+) -> Result<SandboxExecResponse, SandboxAccessDenied> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::AttachParams;
+    if command.is_empty() || command.iter().any(|argument| argument.is_empty()) {
+        return Err(SandboxAccessDenied::NotDeclared { what: "command" });
+    }
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &target.namespace);
+    // The name resolved at placement; the identity must still match, or this is
+    // a different workload wearing the same name.
+    let pod = pods
+        .get(&target.pod_name)
+        .await
+        .map_err(|_| SandboxAccessDenied::TargetUnresolved)?;
+    if pod.uid().as_deref() != Some(target.pod_uid.as_str()) {
+        return Err(SandboxAccessDenied::TargetUnresolved);
+    }
+
+    let params = AttachParams::default()
+        .container(container)
+        .stdin(false)
+        .stdout(true)
+        .stderr(true)
+        .tty(false);
+
+    let mut attached = tokio::time::timeout(timeout, pods.exec(&target.pod_name, command, &params))
+        .await
+        .map_err(|_| SandboxAccessDenied::Backend)?
+        .map_err(|_| SandboxAccessDenied::Backend)?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut truncated = false;
+    if let Some(mut stream) = attached.stdout() {
+        truncated |= read_capped(&mut stream, &mut stdout, MAX_EXEC_OUTPUT_BYTES, timeout).await;
+    }
+    if let Some(mut stream) = attached.stderr() {
+        truncated |= read_capped(&mut stream, &mut stderr, MAX_EXEC_OUTPUT_BYTES, timeout).await;
+    }
+
+    let status = tokio::time::timeout(timeout, attached.take_status().unwrap()).await;
+    let success = match status {
+        Ok(Some(status)) => status.status.as_deref() == Some("Success"),
+        // Wedged or unreported. Not a success: the caller must not read
+        // "we could not tell" as "it worked".
+        _ => {
+            attached.abort();
+            false
+        }
+    };
+
+    Ok(SandboxExecResponse {
+        // Lossy on purpose: a sandboxed command's output is arbitrary bytes,
+        // and refusing to return anything because byte 900k was not UTF-8
+        // would lose the 899k that were.
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        success,
+        truncated,
+    })
+}
+
+/// Read at most `cap` bytes, reporting whether more was waiting.
+///
+/// Stops reading at the cap rather than reading everything and truncating
+/// afterwards — the memory is spent either way if you read first.
+async fn read_capped<R>(
+    stream: &mut R,
+    into: &mut Vec<u8>,
+    cap: usize,
+    timeout: std::time::Duration,
+) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut limited = stream.take((cap + 1) as u64);
+    if tokio::time::timeout(timeout, limited.read_to_end(into))
+        .await
+        .is_err()
+    {
+        return true;
+    }
+    if into.len() > cap {
+        into.truncate(cap);
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +762,184 @@ mod tests {
                 port: 3000
             }]
         );
+    }
+
+    /// A caller cannot ask the operator to buffer an unbounded log.
+    ///
+    /// They control neither how much their agent writes nor how often they
+    /// ask. Clamping rather than rejecting is deliberate: refusing an
+    /// over-large request teaches callers to retry in a loop, which costs more
+    /// than serving the cap once.
+    #[test]
+    fn a_log_tail_is_always_bounded() {
+        assert_eq!(clamp_tail(None), 200);
+        assert_eq!(clamp_tail(Some(50)), 50);
+        assert_eq!(clamp_tail(Some(MAX_LOG_TAIL_LINES)), MAX_LOG_TAIL_LINES);
+
+        for requested in [MAX_LOG_TAIL_LINES + 1, i64::MAX, 0, -1, i64::MIN] {
+            let clamped = clamp_tail(Some(requested));
+            assert!(
+                (1..=MAX_LOG_TAIL_LINES).contains(&clamped),
+                "tail {requested} clamped to {clamped}, outside the permitted range"
+            );
+        }
+    }
+
+    /// Unknown log options are refused, not ignored.
+    ///
+    /// `follow`, `previous`, `sinceSeconds` and `limitBytes` are all real
+    /// `LogParams` options. Silently dropping one a caller sent means they
+    /// believe they set a bound that was never applied.
+    #[test]
+    fn unknown_log_options_are_refused_rather_than_ignored() {
+        assert!(
+            serde_json::from_value::<SandboxLogsQuery>(
+                serde_json::json!({ "tail": 10, "container": "agent" })
+            )
+            .is_ok()
+        );
+
+        for smuggled in [
+            "follow",
+            "previous",
+            "sinceSeconds",
+            "limitBytes",
+            "podName",
+        ] {
+            assert!(
+                serde_json::from_value::<SandboxLogsQuery>(serde_json::json!({ smuggled: "true" }))
+                    .is_err(),
+                "{smuggled} must be refused, not ignored"
+            );
+        }
+    }
+
+    /// A command must be argv, and must not be empty.
+    ///
+    /// An empty argv, or one with an empty element, is a request whose meaning
+    /// is decided by the container runtime rather than by the caller — and
+    /// there is no reading of "run nothing" that should reach a tenant's
+    /// workload.
+    #[tokio::test]
+    async fn an_empty_command_is_refused_before_the_pod_is_touched() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let target = target_from_provenance(&ready_lease(), &pool(), now()).unwrap();
+
+        for command in [
+            vec![],
+            vec![String::new()],
+            vec!["sh".into(), String::new()],
+        ] {
+            let error = exec_in_sandbox(
+                &client,
+                &target,
+                "agent",
+                &command,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error,
+                SandboxAccessDenied::NotDeclared { what: "command" },
+                "command {command:?} must be refused"
+            );
+        }
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a malformed command is refused before the Pod is touched"
+        );
+    }
+
+    /// Exec requests carry argv and nothing else.
+    ///
+    /// `tty`, `stdin`, `pod` and `namespace` are all things a caller might try
+    /// to send. Silently ignoring one means they believe they set something
+    /// that was never applied; accepting one would be worse.
+    #[test]
+    fn exec_requests_cannot_smuggle_execution_settings() {
+        assert!(
+            serde_json::from_value::<SandboxExecRequest>(
+                serde_json::json!({ "command": ["/agent", "status"] })
+            )
+            .is_ok()
+        );
+
+        for smuggled in [
+            "tty",
+            "stdin",
+            "pod",
+            "namespace",
+            "container_name",
+            "shell",
+        ] {
+            assert!(
+                serde_json::from_value::<SandboxExecRequest>(
+                    serde_json::json!({ "command": ["true"], smuggled: "x" })
+                )
+                .is_err(),
+                "{smuggled} must be refused, not ignored"
+            );
+        }
+
+        // `command` is not optional: there is no default command.
+        assert!(serde_json::from_value::<SandboxExecRequest>(serde_json::json!({})).is_err());
+    }
+
+    /// Output is capped, and the cap is reported.
+    ///
+    /// The caller chooses what runs, so they choose how much it prints —
+    /// `cat /dev/urandom` from inside a sandbox is otherwise a way to make the
+    /// operator buffer unbounded memory on request. Reporting the truncation
+    /// matters as much as applying it: a caller parsing partial output as
+    /// complete turns a cap into a wrong answer.
+    #[tokio::test]
+    async fn command_output_is_capped_and_the_truncation_is_reported() {
+        let mut into = Vec::new();
+        let mut source = std::io::Cursor::new(vec![b'x'; MAX_EXEC_OUTPUT_BYTES * 2]);
+        let truncated = read_capped(
+            &mut source,
+            &mut into,
+            MAX_EXEC_OUTPUT_BYTES,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(truncated, "the caller must be told output was cut off");
+        assert_eq!(into.len(), MAX_EXEC_OUTPUT_BYTES);
+
+        // Output that fits is returned whole, and not flagged.
+        let mut into = Vec::new();
+        let mut source = std::io::Cursor::new(b"hello".to_vec());
+        let truncated = read_capped(
+            &mut source,
+            &mut into,
+            MAX_EXEC_OUTPUT_BYTES,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!truncated);
+        assert_eq!(into, b"hello");
+
+        // Exactly at the cap is not truncation.
+        let mut into = Vec::new();
+        let mut source = std::io::Cursor::new(vec![b'x'; MAX_EXEC_OUTPUT_BYTES]);
+        assert!(
+            !read_capped(
+                &mut source,
+                &mut into,
+                MAX_EXEC_OUTPUT_BYTES,
+                std::time::Duration::from_secs(5)
+            )
+            .await
+        );
+        assert_eq!(into.len(), MAX_EXEC_OUTPUT_BYTES);
     }
 
     /// Absent and unowned are the same answer to a caller.

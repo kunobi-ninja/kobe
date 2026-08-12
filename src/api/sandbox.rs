@@ -65,6 +65,92 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
             get(get_sandbox_lease::<B>).delete(release_sandbox_lease::<B>),
         )
         .route("/v1/sandbox-leases/{id}/logs", get(sandbox_logs::<B>))
+        .route("/v1/sandbox-leases/{id}/exec", post(sandbox_exec::<B>))
+}
+
+/// How long one exec may run before it is abandoned.
+///
+/// The caller chooses the command, so they choose how long it takes. Without a
+/// bound, `sleep infinity` holds an API worker permanently — from inside a
+/// sandbox that exists precisely because its occupant is not trusted.
+const SANDBOX_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run one command inside a Sandbox and return its bounded output.
+///
+/// Request/response only: no stdin, no TTY, no shell. Those need a stream
+/// protocol with its own revocation story, which is #83, and a shell would make
+/// quoting the security boundary.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_exec<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Json(request): Json<crate::api::sandbox_access::SandboxExecRequest>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+    use crate::api::sandbox_credentials as credentials;
+
+    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+        return response;
+    }
+    if !is_valid_k8s_name(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let (_lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "exec", denied),
+        };
+    let container = match target.resolve_container(request.container.as_deref()) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return access_denied(&identity, &id, "exec", denied),
+    };
+    if target.placement != access::TargetPlacement::Management {
+        return sandbox_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Sandbox exec is not yet available for child placement",
+            None,
+        );
+    }
+
+    let scoped = match credentials::scoped_client(
+        &state.client,
+        &target,
+        credentials::SandboxOperation::Exec,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(denied) => return access_denied(&identity, &id, "exec", denied),
+    };
+
+    match access::exec_in_sandbox(
+        &scoped,
+        &target,
+        &container,
+        &request.command,
+        SANDBOX_EXEC_TIMEOUT,
+    )
+    .await
+    {
+        Ok(result) => {
+            // The command and its output are the caller's own data and are
+            // never audited. Identity, target and outcome are.
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                pod_uid = %target.pod_uid,
+                operation = "exec",
+                outcome = "allowed",
+                success = result.success,
+                "Sandbox access"
+            );
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(denied) => access_denied(&identity, &id, "exec", denied),
+    }
 }
 
 /// Read a bounded tail of one Sandbox's output.
@@ -119,13 +205,23 @@ async fn sandbox_logs<B: ClusterBackend>(
         );
     }
 
-    match access::read_sandbox_logs(
+    // The read runs under a credential that cannot name a second Pod, rather
+    // than under the operator's own authority. The resolver has already denied
+    // everything it should — this is the layer that makes a bug in the request
+    // path a 403 instead of a privilege escalation.
+    let scoped = match crate::api::sandbox_credentials::scoped_client(
         &state.client,
         &target,
-        &container,
-        access::clamp_tail(query.tail),
+        crate::api::sandbox_credentials::SandboxOperation::Logs,
     )
     .await
+    {
+        Ok(client) => client,
+        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+    };
+
+    match access::read_sandbox_logs(&scoped, &target, &container, access::clamp_tail(query.tail))
+        .await
     {
         Ok(logs) => {
             // Audited by identity and outcome, never by content: the body is
