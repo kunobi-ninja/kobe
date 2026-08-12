@@ -258,7 +258,7 @@ pub async fn mint_scoped_token(
 /// so a deployment that never serves a Sandbox operation does not require it.
 static BASE_CONFIG: tokio::sync::OnceCell<kube::Config> = tokio::sync::OnceCell::const_new();
 
-async fn base_config() -> Result<&'static kube::Config, SandboxAccessDenied> {
+pub async fn operator_config() -> Result<&'static kube::Config, SandboxAccessDenied> {
     BASE_CONFIG
         .get_or_try_init(|| async {
             kube::Config::infer()
@@ -276,13 +276,17 @@ async fn base_config() -> Result<&'static kube::Config, SandboxAccessDenied> {
 /// out-rank the bearer token and silently restore the operator's authority,
 /// which is the one thing this function exists to remove.
 pub async fn scoped_client(
-    base: &kube::Client,
+    cluster: &crate::api::sandbox_access::TargetCluster,
     target: &SandboxTarget,
     operation: SandboxOperation,
 ) -> Result<kube::Client, SandboxAccessDenied> {
-    let token = mint_scoped_token(base, target, operation).await?;
+    // Minted in the cluster the Pod is in — for a child composition that is the
+    // child cluster, not Kobe's. A token issued by the management cluster would
+    // not authenticate there at all, and reaching the child as its admin
+    // identity is exactly what this replaces.
+    let token = mint_scoped_token(&cluster.admin, target, operation).await?;
 
-    let mut config = base_config().await?.clone();
+    let mut config = cluster.config.clone();
     config.auth_info = kube::config::AuthInfo {
         token: Some(token.into()),
         ..Default::default()

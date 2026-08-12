@@ -350,6 +350,114 @@ pub async fn resolve_sandbox_target(
     Ok((lease, target))
 }
 
+/// The cluster a resolved target's operations run against.
+///
+/// Both variants carry a `Config` rather than only a `Client` because #81
+/// re-authenticates: it mints a per-lease token and needs the endpoint and
+/// trust anchors *without* the identity that came with them.
+pub struct TargetCluster {
+    /// Admin-capable client for the cluster the Pod is in. Used only to mint
+    /// the scoped credential, never to touch the Pod.
+    pub admin: kube::Client,
+    /// The configuration a scoped client is rebuilt from.
+    pub config: kube::Config,
+}
+
+/// Resolve the cluster one target's operations run against.
+///
+/// Management placement is the operator's own cluster. Child placement follows
+/// the provenance recorded at composition — and re-verifies it, because the
+/// composition may have been recycled since: the internal `ClusterLease` must
+/// still exist with the recorded UID, and its binding must still name the
+/// recorded instance.
+///
+/// A child cluster is never resolved by *name*. The recorded UIDs are what
+/// stop a recycled cluster, or a later Sandbox's composition reusing the name,
+/// from receiving this caller's exec.
+///
+/// Constructed per request rather than cached. A cache here would have to be
+/// invalidated on lease expiry, revocation, and any UID or provenance change —
+/// #83 requires exactly that — and a cache that outlives one of those is worse
+/// than no cache at all, because it hands a caller access their lease no longer
+/// grants.
+pub async fn resolve_target_cluster(
+    client: &kube::Client,
+    namespace: &str,
+    lease: &SandboxLease,
+    target: &SandboxTarget,
+) -> Result<TargetCluster, SandboxAccessDenied> {
+    if target.placement == TargetPlacement::Management {
+        let config = crate::api::sandbox_credentials::operator_config()
+            .await
+            .map_err(|_| SandboxAccessDenied::Backend)?
+            .clone();
+        return Ok(TargetCluster {
+            admin: client.clone(),
+            config,
+        });
+    }
+
+    let provenance = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.as_ref())
+        .ok_or(SandboxAccessDenied::TargetUnresolved)?;
+    let recorded_lease = provenance
+        .child_cluster_lease
+        .as_ref()
+        .ok_or(SandboxAccessDenied::ProvenanceIncomplete)?;
+    let recorded_instance = provenance
+        .child_cluster_instance
+        .as_ref()
+        .ok_or(SandboxAccessDenied::ProvenanceIncomplete)?;
+    if recorded_lease.uid.is_empty() || recorded_instance.uid.is_empty() {
+        return Err(SandboxAccessDenied::ProvenanceIncomplete);
+    }
+
+    // The internal lease must still be the exact one this Sandbox was composed
+    // onto. A same-named lease belonging to a later composition is somebody
+    // else's cluster.
+    let internal: Api<crate::crd::ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let current = match internal.get(&recorded_lease.name).await {
+        Ok(current) => current,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Err(SandboxAccessDenied::TargetUnresolved);
+        }
+        Err(_) => return Err(SandboxAccessDenied::Backend),
+    };
+    if current.uid().as_deref() != Some(recorded_lease.uid.as_str()) {
+        return Err(SandboxAccessDenied::TargetUnresolved);
+    }
+
+    // And it must still be bound to the recorded instance. A recycled cluster
+    // keeps the lease name and changes the instance underneath it, which is
+    // precisely the substitution the recorded UID exists to catch.
+    let binding = current
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.as_ref())
+        .ok_or(SandboxAccessDenied::TargetUnresolved)?;
+    if binding.instance.uid != recorded_instance.uid
+        || binding.instance.name != recorded_instance.name
+    {
+        return Err(SandboxAccessDenied::TargetUnresolved);
+    }
+
+    // The kubeconfig is read into memory and never leaves it. The error is
+    // swallowed rather than propagated: its context can carry the Secret's own
+    // contents, and this value reaches a caller-facing status.
+    let kubeconfig =
+        crate::backend::read_kubeconfig_secret(client, &recorded_instance.name, namespace)
+            .await
+            .map_err(|_| SandboxAccessDenied::Backend)?;
+    let config = crate::backend::virtual_config_from_kubeconfig(&kubeconfig)
+        .await
+        .map_err(|_| SandboxAccessDenied::Backend)?;
+    let admin = kube::Client::try_from(config.clone()).map_err(|_| SandboxAccessDenied::Backend)?;
+
+    Ok(TargetCluster { admin, config })
+}
+
 /// How much of a Sandbox's output one request may return.
 ///
 /// Bounded because the caller controls neither how much their agent writes nor
@@ -985,6 +1093,169 @@ mod tests {
             .await
         );
         assert_eq!(into.len(), MAX_EXEC_OUTPUT_BYTES);
+    }
+
+    fn child_lease_with(cluster_lease_uid: &str, instance_uid: &str) -> SandboxLease {
+        let mut lease = ready_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.placement = Some(ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: reference("ClusterPool", "children", "cluster-pool-uid"),
+        });
+        let target = status.target.as_mut().unwrap();
+        target.child_cluster_lease = Some(reference(
+            "ClusterLease",
+            "kobe-sbx-sbx-1",
+            cluster_lease_uid,
+        ));
+        target.child_cluster_instance =
+            Some(reference("ClusterInstance", "kobe-abc123", instance_uid));
+        lease
+    }
+
+    fn cluster_lease_json(uid: &str, instance_name: &str, instance_uid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": { "name": "kobe-sbx-sbx-1", "namespace": "kobe", "uid": uid },
+            "spec": {
+                "poolRef": "children",
+                "ttl": "2h",
+                "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" },
+            },
+            "status": {
+                "phase": "Bound",
+                "binding": {
+                    "bindingId": "binding-1",
+                    "lease": { "name": "kobe-sbx-sbx-1", "uid": uid },
+                    "instance": {
+                        "name": instance_name,
+                        "uid": instance_uid,
+                        "observedGeneration": 2,
+                    },
+                    "pool": { "name": "children", "uid": "cluster-pool-uid" },
+                    "backend": { "type": "k3s", "configDigest": "digest" },
+                    "instanceSpecDigest": "spec-digest",
+                },
+            },
+        })
+    }
+
+    const CLUSTER_LEASE_PATH: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe/clusterleases/kobe-sbx-sbx-1";
+
+    /// A recycled child cluster must not receive this lease's operations.
+    ///
+    /// The internal `ClusterLease` name survives a recycle; the instance
+    /// underneath it does not. Resolving by name would send a caller's exec
+    /// into whatever cluster now answers to it — a different tenant's, or a
+    /// fresh one their lease was never placed on.
+    #[tokio::test]
+    async fn a_recycled_child_cluster_is_refused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        // The lease is still there under the recorded UID, but it is now bound
+        // to a different instance.
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(cluster_lease_json(
+                "child-lease-uid",
+                "kobe-recycled",
+                "a-different-instance-uid",
+            )))
+            .mount(&server)
+            .await;
+
+        let lease = child_lease_with("child-lease-uid", "child-instance-uid");
+        let target = target_from_provenance(&lease, &pool(), now()).unwrap();
+        let error = resolve_target_cluster(&client, "kobe", &lease, &target)
+            .await
+            .err()
+            .expect("a recycled instance must not resolve");
+        assert_eq!(error, SandboxAccessDenied::TargetUnresolved);
+
+        // Nothing was read from the child: no kubeconfig Secret was fetched,
+        // so no credential could have been minted against the wrong cluster.
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path().contains("/secrets/"))
+                .count(),
+            0
+        );
+    }
+
+    /// A composition whose lease was replaced under the same name is refused.
+    #[tokio::test]
+    async fn a_name_reused_by_a_later_composition_is_refused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(cluster_lease_json(
+                "somebody-elses-lease-uid",
+                "kobe-abc123",
+                "child-instance-uid",
+            )))
+            .mount(&server)
+            .await;
+
+        let lease = child_lease_with("child-lease-uid", "child-instance-uid");
+        let target = target_from_provenance(&lease, &pool(), now()).unwrap();
+        assert_eq!(
+            resolve_target_cluster(&client, "kobe", &lease, &target)
+                .await
+                .err()
+                .expect("a reused name must not resolve"),
+            SandboxAccessDenied::TargetUnresolved
+        );
+    }
+
+    /// Provenance without UIDs cannot fence a child cluster at all.
+    ///
+    /// Two absent UIDs compare equal, so a check written against them would
+    /// accept any cluster — which is the whole failure this resolution exists
+    /// to prevent.
+    #[tokio::test]
+    async fn child_provenance_without_uids_is_refused() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        for (lease_uid, instance_uid) in [("", "instance"), ("lease", ""), ("", "")] {
+            let lease = child_lease_with(lease_uid, instance_uid);
+            // `target_from_provenance` is unaffected — the Pod refs are intact —
+            // so the refusal has to come from cluster resolution itself.
+            let target = target_from_provenance(&lease, &pool(), now()).unwrap();
+            assert_eq!(
+                resolve_target_cluster(&client, "kobe", &lease, &target)
+                    .await
+                    .err()
+                    .expect("an unfenced child must not resolve"),
+                SandboxAccessDenied::ProvenanceIncomplete
+            );
+        }
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "unfenced provenance is refused before anything is looked up"
+        );
     }
 
     /// Absent and unowned are the same answer to a caller.

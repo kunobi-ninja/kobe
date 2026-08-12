@@ -120,7 +120,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
         return Err(StatusCode::NOT_FOUND.into_response());
     }
 
-    let (_lease, target) =
+    let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, id, identity).await {
             Ok(resolved) => resolved,
             Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
@@ -129,14 +129,6 @@ async fn prepare_upgrade<B: ClusterBackend>(
         Ok(container) => container.to_string(),
         Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
     };
-    if target.placement != access::TargetPlacement::Management {
-        return Err(sandbox_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "Interactive Sandbox access is not yet available for child placement",
-            None,
-        ));
-    }
-
     // Concurrency is checked before the upgrade, so a caller over the limit
     // gets a status rather than a socket that closes immediately.
     if !crate::api::sandbox_streams::may_start_stream(
@@ -155,10 +147,22 @@ async fn prepare_upgrade<B: ClusterBackend>(
         ));
     }
 
+    // Both placements go through the same resolution. Child composition
+    // changes which cluster the Pod is in; it changes nothing about what the
+    // caller may do, which is the equivalence #76 sets out to prove.
+    let cluster = match access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+    };
     let scoped =
-        match crate::api::sandbox_credentials::scoped_client(&state.client, &target, operation)
-            .await
-        {
+        match crate::api::sandbox_credentials::scoped_client(&cluster, &target, operation).await {
             Ok(client) => client,
             Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
         };
@@ -359,7 +363,7 @@ async fn sandbox_exec<B: ClusterBackend>(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let (_lease, target) =
+    let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
         {
             Ok(resolved) => resolved,
@@ -369,24 +373,24 @@ async fn sandbox_exec<B: ClusterBackend>(
         Ok(container) => container.to_string(),
         Err(denied) => return access_denied(&identity, &id, "exec", denied),
     };
-    if target.placement != access::TargetPlacement::Management {
-        return sandbox_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "Sandbox exec is not yet available for child placement",
-            None,
-        );
-    }
-
-    let scoped = match credentials::scoped_client(
+    let cluster = match access::resolve_target_cluster(
         &state.client,
+        &state.namespace,
+        &lease,
         &target,
-        credentials::SandboxOperation::Exec,
     )
     .await
     {
-        Ok(client) => client,
+        Ok(cluster) => cluster,
         Err(denied) => return access_denied(&identity, &id, "exec", denied),
     };
+    let scoped =
+        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
+            .await
+        {
+            Ok(client) => client,
+            Err(denied) => return access_denied(&identity, &id, "exec", denied),
+        };
 
     // Registered for the duration, so releasing or expiring the lease cancels
     // the command rather than letting it run on inside a workload that is
@@ -477,7 +481,7 @@ async fn sandbox_logs<B: ClusterBackend>(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let (_lease, target) =
+    let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
         {
             Ok(resolved) => resolved,
@@ -489,25 +493,23 @@ async fn sandbox_logs<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "logs", denied),
     };
 
-    // Child-placed Sandboxes live in a cluster this API server reaches with a
-    // different client. Resolving that is #74's composition, not something the
-    // logs path may improvise, so it is refused explicitly rather than read
-    // from the wrong cluster — which would return another workload's output or
-    // a misleading 404.
-    if target.placement != access::TargetPlacement::Management {
-        return sandbox_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "Sandbox logs are not yet available for child placement",
-            None,
-        );
-    }
-
     // The read runs under a credential that cannot name a second Pod, rather
     // than under the operator's own authority. The resolver has already denied
     // everything it should — this is the layer that makes a bug in the request
     // path a 403 instead of a privilege escalation.
-    let scoped = match crate::api::sandbox_credentials::scoped_client(
+    let cluster = match access::resolve_target_cluster(
         &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+    };
+    let scoped = match crate::api::sandbox_credentials::scoped_client(
+        &cluster,
         &target,
         crate::api::sandbox_credentials::SandboxOperation::Logs,
     )
