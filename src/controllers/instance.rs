@@ -760,6 +760,34 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             let next = evaluate_leased_instance(&ctx, &instance, &name, &ns, &status).await?;
             Ok(next)
         }
+        // Quarantine has exactly ONE way out: the same exact subject producing
+        // a verified receipt. Retrying is safe and idempotent — the provider
+        // re-runs delete and re-observes absence — so a transient RBAC or
+        // datastore failure that caused the quarantine can resolve itself.
+        //
+        // What must never happen is leaving by any other route: no timeout, no
+        // operator patch of the phase, no "it has been stuck a while" fallback.
+        // Those would return capacity to the pool on exactly the evidence the
+        // quarantine exists to demand.
+        ClusterInstancePhase::Quarantined => {
+            debug!(
+                instance = %name,
+                "quarantined: retrying teardown verification for the same exact subject"
+            );
+            // Only the deletion path can produce a receipt, so a quarantined
+            // instance that is not being deleted simply waits. It holds its
+            // finalizer and binding, so it is never selectable as capacity.
+            if instance.metadata.deletion_timestamp.is_none() {
+                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+            }
+            match verified_teardown_gate(&ctx, &instance, &name, &ns).await {
+                Some(outcome) => outcome,
+                // Not receipt-required after all (the lease changed or is
+                // gone): fall back to the ordinary path rather than holding
+                // capacity hostage forever.
+                None => Ok(Action::requeue(std::time::Duration::from_secs(30))),
+            }
+        }
         ClusterInstancePhase::Recycling => {
             info!(instance = %name, owner = %owner, "Deleting backend resources");
             if let Err(reason) = verify_bound_instance_for_teardown(&ctx, &instance, &ns).await {

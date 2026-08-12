@@ -916,6 +916,18 @@ spec:
                 - Idle
                 nullable: true
                 type: string
+              quarantined:
+                default: 0
+                description: |-
+                  Members held back because their teardown could not be proven complete.
+
+                  Separate from `recycling` on purpose: recycling is transient churn that
+                  resolves itself, while a quarantined member is stuck until the same
+                  exact subject produces a verified receipt. Reporting them together would
+                  make a pool bleeding capacity look merely busy.
+                format: uint32
+                minimum: 0.0
+                type: integer
               queueDepth:
                 default: 0
                 description: Current queue depth (claims waiting for clusters).
