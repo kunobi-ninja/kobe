@@ -260,7 +260,7 @@ pub(crate) async fn tunnel_upgrade(
             return upgrade_failure(
                 StatusCode::BAD_GATEWAY,
                 "Failed to reach leased cluster",
-                crate::metrics::ConnectErrorReason::UpgradeHandshake,
+                crate::metrics::ConnectErrorReason::UpgradeRequest,
                 request_id,
                 lease_id,
             );
@@ -340,11 +340,16 @@ pub(crate) async fn tunnel_upgrade(
     }
     match builder.body(Body::empty()) {
         Ok(resp) => {
-            // The last point at which this can still fail. Everything up to
-            // here — dial, TLS, HTTP/1 handshake, the backend's 101 — has
-            // succeeded and the byte bridge is spawned, so THIS is what earns
-            // `outcome="ok"`. The old hand-off counted it before the dial had
-            // even been attempted (#107).
+            // Everything that can still be turned into an error response has
+            // succeeded: dial, TLS, HTTP/1 handshake, the backend's 101, and
+            // building our own 101. That is what `outcome="ok"` means here.
+            //
+            // It does NOT mean bytes flowed. The bridge spawned above can still
+            // fail waiting on either upgraded stream, and by then the 101 is
+            // sent so it cannot become a 502. Post-101 stream health is the
+            // bridge's own concern (see BRIDGE_FAILURES_TOTAL); this counter is
+            // about whether a tunnel was established. The bug fixed in #107 was
+            // counting `ok` before the dial had even been attempted.
             crate::metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
                 .with_label_values(&[crate::metrics::ConnectOutcome::Ok.as_str()])
                 .inc();

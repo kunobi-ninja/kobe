@@ -618,9 +618,29 @@ fn connect_reject(
     status: StatusCode,
     message: impl Into<String>,
 ) -> Response {
+    connect_reject_with_reason(outcome, status, message, None)
+}
+
+/// As `connect_reject`, but also records WHY when the outcome is
+/// `backend_error`.
+///
+/// Every `backend_error` exit must supply a reason: the enum's contract is
+/// "why a connect-proxy request produced backend_error", and a path that skips
+/// it silently stays in the opaque bucket #106 exists to break up.
+fn connect_reject_with_reason(
+    outcome: metrics::ConnectOutcome,
+    status: StatusCode,
+    message: impl Into<String>,
+    reason: Option<metrics::ConnectErrorReason>,
+) -> Response {
     metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
         .with_label_values(&[outcome.as_str()])
         .inc();
+    if let Some(reason) = reason {
+        metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
     connect_error(status, message)
 }
 
@@ -647,15 +667,17 @@ fn binding_resolution_response(err: BindingResolutionError) -> Response {
         ),
         BindingResolutionError::LeaseLookup(_)
         | BindingResolutionError::InstanceLookup(_)
-        | BindingResolutionError::PoolLookup(_) => connect_reject(
+        | BindingResolutionError::PoolLookup(_) => connect_reject_with_reason(
             metrics::ConnectOutcome::BackendError,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to resolve lease binding",
+            Some(metrics::ConnectErrorReason::BindingResolution),
         ),
-        _ => connect_reject(
+        _ => connect_reject_with_reason(
             metrics::ConnectOutcome::BackendError,
             StatusCode::SERVICE_UNAVAILABLE,
             "Lease binding is unavailable",
+            Some(metrics::ConnectErrorReason::BindingResolution),
         ),
     }
 }
@@ -1560,10 +1582,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     reason = "cache_fence_mismatch",
                     "Connect proxy cache fence changed (entry evicted)"
                 );
-                return connect_reject(
+                return connect_reject_with_reason(
                     metrics::ConnectOutcome::BackendError,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Lease binding is unavailable",
+                    Some(metrics::ConnectErrorReason::CacheFence),
                 );
             }
 
@@ -1653,10 +1676,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     reason = "backend_factory_unavailable",
                     "Connect proxy cannot reconstruct provenance-pinned backend"
                 );
-                return connect_reject(
+                return connect_reject_with_reason(
                     metrics::ConnectOutcome::BackendError,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Lease backend provenance is unavailable",
+                    Some(metrics::ConnectErrorReason::BackendReconstruct),
                 );
             };
             let dispatch = match factory.backend_for_provenance(&resolved.binding.backend) {
@@ -1670,10 +1694,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         error = %err,
                         "Connect proxy failed to reconstruct provenance-pinned backend"
                     );
-                    return connect_reject(
+                    return connect_reject_with_reason(
                         metrics::ConnectOutcome::BackendError,
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Lease backend provenance is unavailable",
+                        Some(metrics::ConnectErrorReason::BackendReconstruct),
                     );
                 }
             };
@@ -1908,7 +1933,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::BAD_GATEWAY,
                 "Failed to reach leased cluster",
                 &err,
-                metrics::ConnectErrorReason::UpgradeDial,
+                metrics::ConnectErrorReason::UpstreamUnreachable,
             );
         }
     };

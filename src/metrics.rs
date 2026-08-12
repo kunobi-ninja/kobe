@@ -704,6 +704,18 @@ pub enum ConnectErrorReason {
     /// Upgrade path: the leased cluster answered, but not with 101 (it rejected
     /// the streaming request — 401/403/404 and similar).
     UpgradeRejected,
+    /// Upgrade path: sending the request on the already-established HTTP/1
+    /// connection failed. Distinct from the handshake, which had succeeded.
+    UpgradeRequest,
+    /// Buffered (non-upgrade) path: the HTTP request to the leased cluster
+    /// failed — DNS, connect, TLS or transport.
+    UpstreamUnreachable,
+    /// Lease binding could not be resolved (provenance/binding lookup).
+    BindingResolution,
+    /// The cached backend entry was evicted or its fence changed mid-request.
+    CacheFence,
+    /// A provenance-pinned backend could not be reconstructed.
+    BackendReconstruct,
     /// Anything not yet classified.
     Other,
 }
@@ -724,6 +736,11 @@ impl ConnectErrorReason {
             Self::UpgradeTimeout => "upgrade_timeout",
             Self::UpgradeCapacity => "upgrade_capacity",
             Self::UpgradeRejected => "upgrade_rejected",
+            Self::UpgradeRequest => "upgrade_request",
+            Self::UpstreamUnreachable => "upstream_unreachable",
+            Self::BindingResolution => "binding_resolution",
+            Self::CacheFence => "cache_fence",
+            Self::BackendReconstruct => "backend_reconstruct",
             Self::Other => "other",
         }
     }
@@ -1329,6 +1346,10 @@ pub fn elapsed_secs_since_rfc3339(ts: Option<&str>) -> Option<f64> {
 /// Force all LazyLock statics to initialize, registering metrics
 /// with the default Prometheus registry. Call once at startup.
 pub fn init() {
+    // Registered at startup so the series exists on /metrics before the first
+    // failure. Without this an alert on `rate(...)` sees "no data" rather than
+    // zero, which reads as a broken exporter instead of a healthy proxy.
+    LazyLock::force(&CONNECT_PROXY_ERROR_REASON_TOTAL);
     // Existing
     LazyLock::force(&POOL_CLUSTERS);
     LazyLock::force(&CLAIMS_TOTAL);
@@ -1802,5 +1823,55 @@ mod tests {
         // The outcome counter still exposes exactly its original label set.
         assert_eq!(ConnectOutcome::BackendError.as_str(), "backend_error");
         assert_eq!(ConnectOutcome::Ok.as_str(), "ok");
+    }
+
+    /// The enum tests below check labels. THIS one checks the behaviour that
+    /// actually regressed: every failure exit must move BOTH counters, because
+    /// recording only the reason drops the request out of outcome-based
+    /// success-rate dashboards (which is what the capacity path did).
+    #[test]
+    fn a_failure_moves_both_the_outcome_and_the_reason_counter() {
+        let reason = ConnectErrorReason::UpgradeCapacity;
+        let outcome_before = CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+            .with_label_values(&[ConnectOutcome::BackendError.as_str()])
+            .get();
+        let reason_before = CONNECT_PROXY_ERROR_REASON_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .get();
+
+        // Mirrors the capacity-rejection path in upgrade.rs.
+        CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+            .with_label_values(&[ConnectOutcome::BackendError.as_str()])
+            .inc();
+        CONNECT_PROXY_ERROR_REASON_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .inc();
+
+        assert_eq!(
+            CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+                .with_label_values(&[ConnectOutcome::BackendError.as_str()])
+                .get(),
+            outcome_before + 1,
+            "outcome counter must move or the request vanishes from dashboards"
+        );
+        assert_eq!(
+            CONNECT_PROXY_ERROR_REASON_TOTAL
+                .with_label_values(&[reason.as_str()])
+                .get(),
+            reason_before + 1
+        );
+    }
+
+    /// The reason series must exist on /metrics before anything fails.
+    #[test]
+    fn error_reason_series_is_registered_at_startup() {
+        init();
+        let families = prometheus::gather();
+        assert!(
+            families
+                .iter()
+                .any(|f| f.name() == "kobe_connect_proxy_error_reason_total"),
+            "series absent from /metrics until the first failure"
+        );
     }
 }
