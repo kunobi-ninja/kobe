@@ -10,6 +10,7 @@ mod pools;
 mod purge;
 mod release;
 pub(crate) mod sandbox;
+pub(crate) mod sandbox_transport;
 mod select;
 pub(crate) mod session;
 mod state;

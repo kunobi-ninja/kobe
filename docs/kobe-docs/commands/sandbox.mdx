@@ -135,6 +135,53 @@ may have run. It is deliberately **not** reported as a failure, because a
 failure invites an automatic retry of something that may already have had
 effects. Deciding what to do is yours.
 
+## `kobe sandbox attach`
+
+An interactive session inside the sandbox.
+
+```bash
+kobe sandbox attach dev                      # attach to the running process
+kobe sandbox attach dev -- /bin/bash         # start a shell instead
+kobe sandbox attach dev --no-tty < input.txt # pipe input, no terminal
+```
+
+The terminal goes into raw mode, so **Ctrl-C reaches your workload** rather
+than killing `kobe`. Resizing the window is forwarded, so a shell inside keeps
+rendering to the size you can actually see.
+
+The terminal is restored on every exit path, including a panic — a process
+that dies in raw mode leaves you with a terminal that does not echo.
+
+If the session is cut off rather than ending normally — your lease was
+released, or a limit was reached — `kobe` prints the reason and exits `125`:
+
+```
+kobe: session ended: idle_timeout
+```
+
+## `kobe sandbox port-forward`
+
+Forward a **pool-declared** port to a local one.
+
+```bash
+kobe sandbox port-forward dev 8080:http    # by declared name
+kobe sandbox port-forward dev 8080:3000    # by declared number
+```
+
+Only ports the pool published resolve. Anything else is refused — without
+that, a forward would be a general tunnel into the sandbox's network
+namespace, reaching a debug listener or a metrics endpoint the administrator
+never meant to publish.
+
+The listener binds `127.0.0.1` unless you pass `--bind`. A forward reachable
+from the network turns "a port on my machine" into "a port on the office LAN",
+and the sandbox behind it is yours alone.
+
+One connection is forwarded at a time. Each local connection needs its own
+upstream stream, and those count against your lease's concurrency limit — a
+browser opening six sockets would exhaust it, and the failures would look like
+the sandbox misbehaving.
+
 ## Aliases
 
 Any command that takes a lease id also takes an **alias** — the name you gave

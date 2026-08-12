@@ -189,6 +189,33 @@ enum SandboxAction {
         #[arg(long)]
         execution: String,
     },
+    /// Open an interactive session in a sandbox.
+    ///
+    /// With no command, attaches to the container's existing process.
+    Attach {
+        lease: String,
+        #[arg(long)]
+        container: Option<String>,
+        /// Run without a terminal. Useful when piping input, where raw mode
+        /// would be meaningless.
+        #[arg(long)]
+        no_tty: bool,
+        /// Command to run instead of attaching. Everything after `--`.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Forward a pool-declared sandbox port to a local one.
+    ///
+    /// `LOCAL:REMOTE`, where REMOTE is a declared port name or number.
+    PortForward {
+        lease: String,
+        /// e.g. `8080:http` or `8080:3000`.
+        spec: String,
+        /// Local bind address. Defaults to loopback: a forward reachable from
+        /// the network turns a port on your machine into a port on the LAN.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -249,6 +276,13 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Two rustls crypto providers are compiled in — ring via reqwest, aws-lc-rs
+    // via the WebSocket client's TLS feature — and rustls refuses to choose
+    // between them, panicking on the first TLS connection. Installing one here
+    // makes that choice deterministic. Ignoring the error is correct: it only
+    // fails if a provider is already installed, which is the desired state.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Reap session files whose parent shell has exited. Cheap (one
     // readdir + a process-existence check per file) and idempotent;
     // running it on every invocation keeps the cache directory tidy
@@ -354,6 +388,33 @@ async fn main() -> anyhow::Result<()> {
                     commands::sandbox::cancel(&lease, &execution, target, endpoint, output)
                         .await
                         .map(|()| 0)
+                }
+                SandboxAction::Attach {
+                    lease,
+                    container,
+                    no_tty,
+                    command,
+                } => {
+                    commands::sandbox_transport::attach(
+                        &lease,
+                        &command,
+                        container.as_deref(),
+                        !no_tty,
+                        target,
+                        endpoint,
+                    )
+                    .await
+                }
+                SandboxAction::PortForward { lease, spec, bind } => {
+                    match commands::sandbox_transport::split_forward_spec(&spec) {
+                        Ok((local, remote)) => {
+                            commands::sandbox_transport::port_forward(
+                                &lease, local, &remote, &bind, target, endpoint, output,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
             };
             match code {

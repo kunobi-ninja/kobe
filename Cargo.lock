@@ -1107,6 +1107,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags",
  "crossterm_winapi",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
@@ -2729,14 +2730,17 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "futures-util",
  "kunobi-auth",
  "ratatui",
  "reqwest 0.12.28",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "url",
 ]
@@ -5372,8 +5376,12 @@ checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5629,6 +5637,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.2",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
