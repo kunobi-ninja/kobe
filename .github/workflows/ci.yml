@@ -67,37 +67,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # `cache: false` meant every single run re-downloaded bun, so one bad
-      # minute on the tool host took the whole required check down — as it did
-      # on 2026-08-12, when `mise install bun` failed instantly with an HTTP/2
-      # `refused stream` on every branch for the better part of an hour and
-      # nothing could merge. The tool is version-pinned in mise.toml, so the
-      # cache key is exact and a hit is the normal path.
-      - name: Set up mise
-        uses: jdx/mise-action@v4
-        with:
-          install: false
-          cache: true
-
-      # Retried separately rather than via `install_args`: a transient refusal
-      # on the download is not a reason to fail a Rust check, and the action
-      # itself has no retry. Bounded — three attempts, then the failure is
-      # real and the log shows all of them.
-      - name: Install bun for the E2E harness tests
-        run: |
-          for attempt in 1 2 3; do
-            if mise install bun; then exit 0; fi
-            echo "::warning::bun install attempt ${attempt} failed; retrying"
-            sleep $((attempt * 15))
-          done
-          echo "::error::bun could not be installed after 3 attempts"
-          exit 1
-
-      - name: Lint and test E2E harness
-        run: |
-          mise exec -- bunx @biomejs/biome@2.3.11 lint --only=correctness/noUndeclaredVariables hack/*.ts
-          mise exec -- bun test ./hack/e2e.test.ts
-
       - name: Add Rust components
         run: rustup component add rustfmt clippy
 
@@ -154,6 +123,45 @@ jobs:
               exit 1
             }
           done
+
+  # Split out of `checks` on 2026-08-12. The harness needs bun, bun is fetched
+  # from release-assets.githubusercontent.com, and the self-hosted fleet's
+  # egress refuses that host outright (instant HTTP/2 `refused stream`, not a
+  # timeout) for stretches at a time. While it did, the ONLY required Rust
+  # check on every branch was red — a TypeScript lint took a production hotfix
+  # hostage. GitHub-hosted egress reaches the host fine, and a separate job
+  # means the blast radius of the next tool-host outage is this job alone.
+  #
+  # Retries stay (three bounded attempts) because the refusal also flaps, and
+  # the mise cache stays on because the tools are pinned in mise.toml, so a
+  # warm run needs no network for them at all.
+  e2e-harness:
+    name: E2E harness lint and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up mise
+        uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+
+      - name: Install bun
+        run: |
+          for attempt in 1 2 3; do
+            if mise install bun; then exit 0; fi
+            echo "::warning::bun install attempt ${attempt} failed; retrying"
+            sleep $((attempt * 15))
+          done
+          echo "::error::bun could not be installed after 3 attempts"
+          exit 1
+
+      - name: Lint and test E2E harness
+        run: |
+          mise exec -- bunx @biomejs/biome@2.3.11 lint --only=correctness/noUndeclaredVariables hack/*.ts
+          mise exec -- bun test ./hack/e2e.test.ts
 
   docker-dry-run:
     if: github.event_name == 'pull_request'
