@@ -169,7 +169,18 @@ pub fn sanitize_db_name(cluster_name: &str, prefix: &str) -> Result<String> {
     }
 
     let mut db_name = format!("{prefix}{cleaned}");
-    db_name.truncate(MAX_IDENT_LEN);
+    if db_name.len() > MAX_IDENT_LEN {
+        // Plain truncation makes two distinct clusters share one identifier —
+        // and since the role now shares that identifier, the second cluster's
+        // `ensure_cluster_role` would reset the FIRST cluster's role password
+        // and hand its owner credential to a different tenant. Keep a digest of
+        // the full name so distinct inputs stay distinct.
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(db_name.as_bytes()));
+        db_name.truncate(MAX_IDENT_LEN - 9);
+        db_name.push('_');
+        db_name.push_str(&digest[..8]);
+    }
     Ok(db_name)
 }
 
@@ -200,14 +211,14 @@ pub async fn create_database(pool: &PgPool, cluster_name: &str, prefix: &str) ->
     match sqlx::query(&sql).execute(pool).await {
         Ok(_) => {
             debug!(db = %db_name, "Database created");
-            Ok(())
+            revoke_public_connect(pool, &db_name).await
         }
         Err(e) => {
             if let Some(dberr) = e.as_database_error()
                 && is_duplicate_db_error(dberr.code().as_deref())
             {
                 debug!(db = %db_name, "Database already exists, treating create as idempotent no-op");
-                return Ok(());
+                return revoke_public_connect(pool, &db_name).await;
             }
             Err(e).with_context(|| format!("Failed to create database {db_name}"))
         }
@@ -271,6 +282,34 @@ pub async fn unmark_template(pool: &PgPool, cluster_name: &str, prefix: &str) ->
 }
 
 /// Drop a cluster's database, disconnecting any active sessions first.
+/// Take ownership of a cluster database back before dropping it.
+///
+/// `ensure_cluster_role` transfers ownership to the per-cluster role so kine can
+/// create its tables. `DROP DATABASE` then requires the caller to own it or be a
+/// superuser — and membership granted via `GRANT ... TO CURRENT_USER` is NOT
+/// enough on PostgreSQL 16, where `createrole_self_grant` defaults to empty and
+/// the membership carries no inherited privileges. Without reclaiming ownership
+/// first, a non-superuser operator silently orphans a database and then a role
+/// on every teardown.
+///
+/// Best-effort: on a superuser operator this is redundant, and if it fails the
+/// drop below reports the real problem.
+pub async fn reclaim_database_ownership(
+    pool: &PgPool,
+    cluster_name: &str,
+    prefix: &str,
+) -> Result<()> {
+    let db_name = sanitize_db_name(cluster_name, prefix)?;
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{db_name}\" OWNER TO CURRENT_USER"
+    ))
+    .execute(pool)
+    .await
+    .with_context(|| format!("Failed to reclaim ownership of database {db_name}"))?;
+    debug!(db = %db_name, "Ownership reclaimed for drop");
+    Ok(())
+}
+
 pub async fn drop_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
     info!(db = %db_name, "Dropping database");
@@ -293,16 +332,143 @@ pub async fn drop_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> R
     Ok(())
 }
 
-/// Rewrite a base PostgreSQL connection URL to point at a per-cluster database.
+/// Drop PostgreSQL's default `CONNECT` grant to `PUBLIC` on a database.
 ///
-/// Given `postgres://user:pass@host:5432/admin_db` and cluster name `my-cluster`,
-/// returns `postgres://user:pass@host:5432/k3s_my_cluster`.
-pub fn cluster_endpoint(base_url: &str, cluster_name: &str, prefix: &str) -> Result<String> {
+/// Runs immediately after `CREATE DATABASE`, in the same function, so no
+/// Kubernetes round-trip sits between creating the database and locking it
+/// down: during such a window every other tenant role can still connect.
+///
+/// NOTE: this does not revoke `CREATE` on the `public` SCHEMA, which would
+/// require a second connection into the new database. PostgreSQL 15 removed
+/// that default grant; on 14 and older, or a cluster upgraded from one, a
+/// connected role could still create objects there. kobe targets 15+.
+async fn revoke_public_connect(pool: &PgPool, db_name: &str) -> Result<()> {
+    sqlx::query(&format!(
+        "REVOKE CONNECT ON DATABASE \"{db_name}\" FROM PUBLIC"
+    ))
+    .execute(pool)
+    .await
+    .with_context(|| format!("Failed to revoke PUBLIC connect on database {db_name}"))?;
+    debug!(db = %db_name, "PUBLIC connect revoked");
+    Ok(())
+}
+
+/// True iff `code` is PostgreSQL's `duplicate_object` SQLSTATE (`42710`),
+/// i.e. `CREATE ROLE` failed only because the role already exists.
+fn is_duplicate_role_error(code: Option<&str>) -> bool {
+    code == Some("42710")
+}
+
+/// Rewrite a base PostgreSQL URL to point at a per-cluster database AS a
+/// per-cluster role.
+///
+/// This is the isolation boundary. `cluster_endpoint` (below) only swapped the
+/// database path and left `user:pass` identical for every cluster — so any
+/// tenant who could read their own endpoint could reach every other tenant's
+/// database by editing the path. The guest control plane must therefore be
+/// handed a credential that is useless anywhere but its own database.
+///
+/// Assume the guest sees this string: the k3s server takes it as
+/// `--datastore-endpoint=` on its command line, and the k3s server node is
+/// schedulable and untainted by default, so a tenant with cluster-admin can
+/// read it out of `/proc`. k0s writes it into its config ConfigMap. Neither is
+/// a secret from the tenant, and neither can be.
+pub fn cluster_endpoint_as_role(
+    base_url: &str,
+    cluster_name: &str,
+    prefix: &str,
+    password: &str,
+) -> Result<String> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
     let mut parsed = url::Url::parse(base_url)
         .with_context(|| format!("Invalid base PostgreSQL URL: {base_url}"))?;
     parsed.set_path(&format!("/{db_name}"));
+    // The role shares the database's identifier: PostgreSQL keeps roles and
+    // databases in separate namespaces, so no suffix is needed — and a suffix
+    // could push past the 63-character identifier limit that sanitize_db_name
+    // already truncates to.
+    parsed
+        .set_username(&db_name)
+        .map_err(|()| anyhow::anyhow!("Cannot set username on base URL: {base_url}"))?;
+    parsed
+        .set_password(Some(password))
+        .map_err(|()| anyhow::anyhow!("Cannot set password on base URL: {base_url}"))?;
     Ok(parsed.to_string())
+}
+
+/// Create (or update the password of) the per-cluster login role, make it own
+/// the cluster database, and revoke the default `PUBLIC` connect privilege.
+///
+/// Idempotent for the same reason `create_database` is: `create()` re-runs on
+/// every `Creating && !provisioned` reconcile re-entry, so an existing role is
+/// a no-op that refreshes the password rather than an error.
+///
+/// `REVOKE CONNECT ... FROM PUBLIC` matters because PostgreSQL grants CONNECT
+/// to PUBLIC on every new database by default. Without it, one cluster's role
+/// could still connect to another cluster's database.
+pub async fn ensure_cluster_role(
+    pool: &PgPool,
+    cluster_name: &str,
+    prefix: &str,
+    password: &str,
+) -> Result<String> {
+    let name = sanitize_db_name(cluster_name, prefix)?;
+    info!(role = %name, cluster = cluster_name, "Ensuring per-cluster datastore role");
+
+    // Passwords are generated by the caller and never interpolated from user
+    // input, but quote defensively anyway: a literal `'` would otherwise end
+    // the string and change the statement.
+    let quoted_password = password.replace('\'', "''");
+
+    let create = format!("CREATE ROLE \"{name}\" LOGIN PASSWORD '{quoted_password}'");
+    match sqlx::query(&create).execute(pool).await {
+        Ok(_) => debug!(role = %name, "Role created"),
+        Err(e) => {
+            let duplicate = e
+                .as_database_error()
+                .is_some_and(|dberr| is_duplicate_role_error(dberr.code().as_deref()));
+            if !duplicate {
+                return Err(e).with_context(|| format!("Failed to create role {name}"));
+            }
+            debug!(role = %name, "Role exists; refreshing password");
+            let alter = format!("ALTER ROLE \"{name}\" LOGIN PASSWORD '{quoted_password}'");
+            sqlx::query(&alter)
+                .execute(pool)
+                .await
+                .with_context(|| format!("Failed to refresh password for role {name}"))?;
+        }
+    }
+
+    // `ALTER DATABASE ... OWNER TO` requires the caller to be a MEMBER of the
+    // target role (or superuser). A plain CREATEDB/CREATEROLE operator account
+    // is neither, so grant membership first or ownership transfer fails and
+    // provisioning breaks outright.
+    sqlx::query(&format!("GRANT \"{name}\" TO CURRENT_USER"))
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to grant membership of {name} to the operator role"))?;
+
+    // Ownership lets kine create its own tables in the database.
+    sqlx::query(&format!("ALTER DATABASE \"{name}\" OWNER TO \"{name}\""))
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to give {name} ownership of its database"))?;
+
+    // PUBLIC connect is revoked in `create_database`, immediately after the
+    // database exists, so there is no window here.
+    Ok(name)
+}
+
+/// Drop the per-cluster role. Call AFTER `drop_database`: PostgreSQL refuses to
+/// drop a role that still owns objects.
+pub async fn drop_cluster_role(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
+    let name = sanitize_db_name(cluster_name, prefix)?;
+    info!(role = %name, "Dropping per-cluster datastore role");
+    sqlx::query(&format!("DROP ROLE IF EXISTS \"{name}\""))
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to drop role {name}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -373,35 +539,6 @@ mod tests {
 
     // -- cluster_endpoint tests --
 
-    #[test]
-    fn test_cluster_endpoint_basic() {
-        let result = cluster_endpoint(
-            "postgres://user:pass@pghost:5432/admin",
-            "my-cluster",
-            "k3s_",
-        )
-        .unwrap();
-        assert_eq!(result, "postgres://user:pass@pghost:5432/k3s_my_cluster");
-    }
-
-    #[test]
-    fn test_cluster_endpoint_no_path() {
-        let result =
-            cluster_endpoint("postgres://user:pass@pghost:5432", "test-01", "k3s_").unwrap();
-        assert_eq!(result, "postgres://user:pass@pghost:5432/k3s_test_01");
-    }
-
-    #[test]
-    fn test_cluster_endpoint_invalid_url() {
-        assert!(cluster_endpoint("not-a-url", "test", "k3s_").is_err());
-    }
-
-    #[test]
-    fn test_cluster_endpoint_k0s_prefix() {
-        let result = cluster_endpoint("postgres://u:p@h:5432/admin", "cl-1", "k0s_").unwrap();
-        assert_eq!(result, "postgres://u:p@h:5432/k0s_cl_1");
-    }
-
     /// `create_database` is idempotent: only PostgreSQL's `duplicate_database`
     /// SQLSTATE (`42P04`) is swallowed. We can't easily fabricate a live sqlx
     /// `DatabaseError` in a unit test, so we lock the pure detector instead.
@@ -411,5 +548,136 @@ mod tests {
         assert!(!is_duplicate_db_error(Some("42501"))); // insufficient_privilege
         assert!(!is_duplicate_db_error(Some("")));
         assert!(!is_duplicate_db_error(None));
+    }
+
+    // ── per-cluster role isolation ────────────────────────────────────
+
+    /// The regression this exists to prevent.
+    ///
+    /// `cluster_endpoint` swapped only the database path, so every cluster was
+    /// handed the same `user:pass`. A tenant who could read their own endpoint
+    /// could edit the path and reach any other tenant's database. The guest CAN
+    /// read it: k3s takes it as `--datastore-endpoint=` on a server node that is
+    /// schedulable and untainted by default, and k0s writes it into a ConfigMap.
+    #[test]
+    fn role_endpoint_does_not_carry_the_admin_credential() {
+        let base = "postgres://kobeadmin:supersecret@pg.internal:5432/postgres";
+        let ep = cluster_endpoint_as_role(base, "my-cluster", "k3s_", "perclusterpw").unwrap();
+
+        assert!(!ep.contains("kobeadmin"), "admin user leaked into {ep}");
+        assert!(
+            !ep.contains("supersecret"),
+            "admin password leaked into {ep}"
+        );
+        assert!(ep.contains("k3s_my_cluster:perclusterpw@"), "{ep}");
+        assert!(ep.ends_with("/k3s_my_cluster"), "{ep}");
+    }
+
+    /// Two clusters must not receive interchangeable credentials.
+    #[test]
+    fn two_clusters_get_distinct_roles() {
+        let base = "postgres://admin:pw@pg:5432/postgres";
+        let a = cluster_endpoint_as_role(base, "alpha", "k3s_", "pw-a").unwrap();
+        let b = cluster_endpoint_as_role(base, "beta", "k3s_", "pw-b").unwrap();
+        assert!(a.contains("k3s_alpha:pw-a@"), "{a}");
+        assert!(b.contains("k3s_beta:pw-b@"), "{b}");
+        assert_ne!(a, b);
+    }
+
+    /// The role reuses the database identifier, so it inherits the same 63-char
+    /// truncation. A suffix would risk exceeding PostgreSQL's identifier limit
+    /// and silently producing a role name that does not match the database.
+    #[test]
+    fn role_name_matches_the_database_name_exactly() {
+        let long = "a".repeat(80);
+        let db = sanitize_db_name(&long, "k3s_").unwrap();
+        let ep =
+            cluster_endpoint_as_role("postgres://a:b@h:5432/postgres", &long, "k3s_", "x").unwrap();
+        assert!(db.len() <= MAX_IDENT_LEN);
+        assert!(
+            ep.contains(&format!("{db}:x@")),
+            "role must equal db name: {ep}"
+        );
+        assert!(ep.ends_with(&format!("/{db}")), "{ep}");
+    }
+
+    /// A password containing URL-significant characters must survive intact.
+    #[test]
+    fn role_password_is_percent_encoded_in_the_url() {
+        let ep = cluster_endpoint_as_role(
+            "postgres://a:b@h:5432/postgres",
+            "c",
+            "k3s_",
+            "p@ss:w/rd?x#y",
+        )
+        .unwrap();
+        // Round-trip through the parser: whatever encoding is applied, the
+        // password must decode back to the original or kine cannot connect.
+        let parsed = url::Url::parse(&ep).unwrap();
+        let decoded = percent_decode(parsed.password().expect("password present"));
+        assert_eq!(decoded, "p@ss:w/rd?x#y", "password mangled in {ep}");
+        assert_eq!(parsed.username(), "k3s_c");
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn duplicate_role_sqlstate_is_recognised() {
+        assert!(is_duplicate_role_error(Some("42710")));
+        assert!(!is_duplicate_role_error(Some("42P04")));
+        assert!(!is_duplicate_role_error(None));
+    }
+
+    /// Two cluster names that share a long prefix must not collapse onto one
+    /// identifier: the role now shares that identifier too, so the second
+    /// cluster's `ensure_cluster_role` would reset the FIRST cluster's role
+    /// password and hand its owner credential to a different tenant.
+    #[test]
+    fn long_names_sharing_a_prefix_do_not_collide() {
+        let a = format!("{}xxxx", "a".repeat(59));
+        let b = format!("{}yyyy", "a".repeat(59));
+        let da = sanitize_db_name(&a, "k3s_").unwrap();
+        let db = sanitize_db_name(&b, "k3s_").unwrap();
+        assert_ne!(da, db, "distinct clusters collapsed onto {da}");
+        assert!(da.len() <= MAX_IDENT_LEN);
+        assert!(db.len() <= MAX_IDENT_LEN);
+    }
+
+    /// Same input must always map to the same identifier, or a reconcile would
+    /// provision a second database for an existing cluster.
+    #[test]
+    fn truncated_identifiers_are_deterministic() {
+        let n = "b".repeat(80);
+        assert_eq!(
+            sanitize_db_name(&n, "k0s_").unwrap(),
+            sanitize_db_name(&n, "k0s_").unwrap()
+        );
+    }
+
+    /// Names short enough not to truncate must be untouched, so this change
+    /// cannot rename the database of any already-provisioned cluster.
+    #[test]
+    fn short_names_are_unchanged_by_the_collision_guard() {
+        assert_eq!(
+            sanitize_db_name("my-cluster", "k3s_").unwrap(),
+            "k3s_my_cluster"
+        );
     }
 }

@@ -16,6 +16,21 @@ logLevel: "kobe_operator=info"
 operatorNamespace: "kunobi-pool"
 
 # Optional PostgreSQL connection for direct-k3s/k0s backends
+#
+# REQUIRED PRIVILEGES. This account provisions a database AND a login role per
+# cluster, so it needs CREATEDB and CREATEROLE. A superuser is recommended:
+# each cluster database is owned by its own role so kine can create its tables,
+# and dropping it on teardown means reclaiming ownership first. A non-superuser
+# can do that only through role membership, which on PostgreSQL 16 carries no
+# inherited privileges by default (`createrole_self_grant` is empty) — so
+# teardown may leave the database and role behind. They are harmless
+# (CONNECT is revoked from PUBLIC) but they accumulate.
+#
+# UPGRADE NOTE. Clusters provisioned before per-cluster roles existed still
+# hold the shared admin credential in their control-plane configuration, and
+# that credential reaches any other cluster's database. Recycle datastore-backed
+# pools after upgrading to re-provision them; the operator does not restart live
+# control planes on its own.
 postgres:
   # Static connection URL, injected as the POSTGRES_URL env var. Frozen at pod
   # start — a Postgres password rotation requires an operator restart to pick up.

@@ -370,14 +370,21 @@ impl VclusterBackend {
             .await
             .context("failed to spawn `helm repo add`")?;
         // Non-zero is normal if the repo is already registered, so this is not
-        // fatal — but log what helm said rather than discarding it, since a
-        // genuine failure here is otherwise invisible until `update` fails.
-        if !output.status.success() {
+        // fatal on its own — but keep what helm said. If `update` then fails,
+        // this is very often the real cause and the update error alone points
+        // at the wrong command: in #92 `add` could not write its repository
+        // list, so `update` truthfully reported "no repositories found" while
+        // the actionable failure had already been discarded here.
+        let add_failure = if output.status.success() {
+            None
+        } else {
+            let stderr = clip_helm_stderr(&output.stderr);
             debug!(
-                stderr = %clip_helm_stderr(&output.stderr),
-                "helm repo add returned non-zero (likely already registered); continuing"
+                stderr = %stderr,
+                "helm repo add returned non-zero (may just be already registered); continuing"
             );
-        }
+            Some(stderr)
+        };
         let output = Command::new("helm")
             .args(["repo", "update", HELM_REPO_ALIAS])
             .stdout(Stdio::null())
@@ -386,10 +393,12 @@ impl VclusterBackend {
             .await
             .context("failed to spawn `helm repo update`")?;
         if !output.status.success() {
-            return Err(helm_command_error(
-                &format!("helm repo update for {HELM_REPO_ALIAS}"),
-                &output,
-            ));
+            let err =
+                helm_command_error(&format!("helm repo update for {HELM_REPO_ALIAS}"), &output);
+            return Err(match add_failure {
+                Some(add) => err.context(format!("`helm repo add` had already failed: {add}")),
+                None => err,
+            });
         }
         Ok(())
     }

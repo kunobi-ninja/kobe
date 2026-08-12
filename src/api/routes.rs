@@ -591,10 +591,20 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
 /// server-side and returns ONLY the generic `message` to the client, never the
 /// raw string (which leaks operator namespaces, in-cluster endpoints, and CRD
 /// details to a low-trust caller — possibly before lease-token validation).
-fn connect_infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -> Response {
-    warn!(error = %err, "{message}");
+fn connect_infra_error(
+    status: StatusCode,
+    message: &str,
+    err: impl std::fmt::Display,
+    reason: metrics::ConnectErrorReason,
+) -> Response {
+    warn!(error = %err, reason = reason.as_str(), "{message}");
     metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
         .with_label_values(&[metrics::ConnectOutcome::BackendError.as_str()])
+        .inc();
+    // Alongside, never instead: the outcome counter keeps its existing shape so
+    // dashboards and alerts built on it are unaffected (#106).
+    metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+        .with_label_values(&[reason.as_str()])
         .inc();
     connect_error(status, message)
 }
@@ -609,9 +619,29 @@ fn connect_reject(
     status: StatusCode,
     message: impl Into<String>,
 ) -> Response {
+    connect_reject_with_reason(outcome, status, message, None)
+}
+
+/// As `connect_reject`, but also records WHY when the outcome is
+/// `backend_error`.
+///
+/// Every `backend_error` exit must supply a reason: the enum's contract is
+/// "why a connect-proxy request produced backend_error", and a path that skips
+/// it silently stays in the opaque bucket #106 exists to break up.
+fn connect_reject_with_reason(
+    outcome: metrics::ConnectOutcome,
+    status: StatusCode,
+    message: impl Into<String>,
+    reason: Option<metrics::ConnectErrorReason>,
+) -> Response {
     metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
         .with_label_values(&[outcome.as_str()])
         .inc();
+    if let Some(reason) = reason {
+        metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
     connect_error(status, message)
 }
 
@@ -638,15 +668,17 @@ fn binding_resolution_response(err: BindingResolutionError) -> Response {
         ),
         BindingResolutionError::LeaseLookup(_)
         | BindingResolutionError::InstanceLookup(_)
-        | BindingResolutionError::PoolLookup(_) => connect_reject(
+        | BindingResolutionError::PoolLookup(_) => connect_reject_with_reason(
             metrics::ConnectOutcome::BackendError,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to resolve lease binding",
+            Some(metrics::ConnectErrorReason::BindingResolution),
         ),
-        _ => connect_reject(
+        _ => connect_reject_with_reason(
             metrics::ConnectOutcome::BackendError,
             StatusCode::SERVICE_UNAVAILABLE,
             "Lease binding is unavailable",
+            Some(metrics::ConnectErrorReason::BindingResolution),
         ),
     }
 }
@@ -1551,10 +1583,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     reason = "cache_fence_mismatch",
                     "Connect proxy cache fence changed (entry evicted)"
                 );
-                return connect_reject(
+                return connect_reject_with_reason(
                     metrics::ConnectOutcome::BackendError,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Lease binding is unavailable",
+                    Some(metrics::ConnectErrorReason::CacheFence),
                 );
             }
 
@@ -1608,6 +1641,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to validate lease token",
                         &err,
+                        metrics::ConnectErrorReason::LeaseLookup,
                     );
                 }
             };
@@ -1643,10 +1677,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     reason = "backend_factory_unavailable",
                     "Connect proxy cannot reconstruct provenance-pinned backend"
                 );
-                return connect_reject(
+                return connect_reject_with_reason(
                     metrics::ConnectOutcome::BackendError,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Lease backend provenance is unavailable",
+                    Some(metrics::ConnectErrorReason::BackendReconstruct),
                 );
             };
             let dispatch = match factory.backend_for_provenance(&resolved.binding.backend) {
@@ -1660,10 +1695,11 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         error = %err,
                         "Connect proxy failed to reconstruct provenance-pinned backend"
                     );
-                    return connect_reject(
+                    return connect_reject_with_reason(
                         metrics::ConnectOutcome::BackendError,
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Lease backend provenance is unavailable",
+                        Some(metrics::ConnectErrorReason::BackendReconstruct),
                     );
                 }
             };
@@ -1684,6 +1720,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Failed to extract backend kubeconfig",
                         &err,
+                        metrics::ConnectErrorReason::KubeconfigUnavailable,
                     );
                 }
             };
@@ -1702,6 +1739,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to parse backend kubeconfig",
                         &err,
+                        metrics::ConnectErrorReason::KubeconfigParse,
                     );
                 }
             };
@@ -1742,6 +1780,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to build backend request",
                 &err,
+                metrics::ConnectErrorReason::UpstreamConfig,
             );
         }
     };
@@ -1772,6 +1811,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to build backend TLS config",
                     &err,
+                    metrics::ConnectErrorReason::UpstreamConfig,
                 );
             }
         };
@@ -1789,14 +1829,23 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             protocol = %protocol,
             "Connect proxy tunneling HTTP upgrade (exec/attach/port-forward)"
         );
-        // Upgrade tunnel handed off: count as a successful connect outcome.
-        // Any failure inside the tunnel is its own concern (the request was
-        // accepted and proxied); the outcome counter tracks the proxy's
-        // accept/reject decision, not upstream stream health.
-        metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
-            .with_label_values(&[metrics::ConnectOutcome::Ok.as_str()])
-            .inc();
-        return crate::api::upgrade::tunnel_upgrade(request, upgrade_access, &path_and_query).await;
+        // The outcome is recorded INSIDE tunnel_upgrade, not here.
+        //
+        // This used to count Ok before handing off, reasoning that "any failure
+        // inside the tunnel is its own concern". That holds for failures in an
+        // established tunnel — but the dial, TLS handshake and HTTP/1 handshake
+        // all happen BEFORE any tunnel exists, and each returns 502/504 to the
+        // caller. Counting those as successes made a real outage invisible:
+        // callers saw "Failed to reach leased cluster" while the success rate
+        // stayed flat (#107).
+        return crate::api::upgrade::tunnel_upgrade(
+            request,
+            upgrade_access,
+            &path_and_query,
+            request_id,
+            &lease_id,
+        )
+        .await;
     }
 
     info!(
@@ -1829,6 +1878,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Failed to read request body",
                 &err,
+                metrics::ConnectErrorReason::RequestBody,
             );
         }
     };
@@ -1844,7 +1894,12 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy received unsupported HTTP method"
             );
-            return connect_infra_error(StatusCode::METHOD_NOT_ALLOWED, "Unsupported method", &err);
+            return connect_infra_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Unsupported method",
+                &err,
+                metrics::ConnectErrorReason::UnsupportedMethod,
+            );
         }
     };
 
@@ -1879,6 +1934,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::BAD_GATEWAY,
                 "Failed to reach leased cluster",
                 &err,
+                metrics::ConnectErrorReason::UpstreamUnreachable,
             );
         }
     };
@@ -1919,6 +1975,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     StatusCode::BAD_GATEWAY,
                     "Failed to read leased cluster response",
                     &err,
+                    metrics::ConnectErrorReason::UpstreamResponse,
                 );
             }
         };
