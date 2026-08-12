@@ -726,6 +726,47 @@ fn requester_list_params(identity: &AuthIdentity) -> ListParams {
 /// and from the released chart, so no object could exist under the old scheme.
 /// Once this ships, any further change needs a versioned migration that keeps
 /// enforcing against legacy reservations until they are drained.
+/// Whether a reservation name is one this principal could legitimately own.
+///
+/// Names are deterministic (`sbx-quota-{hash}-{slot}`,
+/// `sbx-alias-{hash}-{alias}`), so an object that does not match either shape
+/// for this exact principal is not ours to delete — however it is labelled.
+fn reservation_name_belongs_to(name: &str, principal: &str) -> bool {
+    if let Some(slot) = name.strip_prefix(&format!("sbx-{SANDBOX_RESERVATION_QUOTA}-{principal}-"))
+    {
+        // A slot index and nothing else, so a crafted suffix cannot ride along.
+        return !slot.is_empty() && slot.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if let Some(alias) = name.strip_prefix(&format!("sbx-{SANDBOX_RESERVATION_ALIAS}-{principal}-"))
+    {
+        // Aliases are validated DNS labels at admission; re-check the shape
+        // here so a name that merely starts correctly cannot slip through.
+        return is_valid_k8s_name(alias);
+    }
+    false
+}
+
+/// The same digest as [`principal_hash`], over a stored principal rather than a
+/// live authenticated identity. Cleanup runs from the persisted object, not
+/// from a request, so it needs this form.
+fn principal_hash_for(requester: &SandboxPrincipal) -> String {
+    let mut hasher = Sha256::new();
+    for component in [
+        requester.provider.as_bytes(),
+        requester.issuer.as_bytes(),
+        requester.identity.as_bytes(),
+    ] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn principal_hash(identity: &AuthIdentity) -> String {
     let mut hasher = Sha256::new();
     for component in [
@@ -1170,14 +1211,37 @@ async fn release_admission_reservations(
 /// keeps a recreated same-named lease from dropping its predecessor's slots.
 async fn release_reservations_for_lease(
     reservations: &Api<Lease>,
+    lease: &SandboxLease,
     lease_uid: &str,
 ) -> Result<(), SandboxLeaseMutationError> {
     let params = ListParams::default().labels(&format!(
         "{SANDBOX_RESERVATION_LEASE_UID_LABEL}={lease_uid}"
     ));
     let owned = reservations.list(&params).await?;
+
+    // A label is caller-supplied data, not an integrity check. Deleting
+    // everything a selector returns makes this a confused deputy: anyone able
+    // to create a coordination Lease in this namespace could label an unrelated
+    // object with a victim's SandboxLease UID and have Kobe's privileged
+    // credentials delete it during that victim's cleanup.
+    //
+    // So the selector only narrows the search. What may actually be deleted is
+    // decided here, from names derived from THIS lease's own principal.
+    let principal = principal_hash_for(&lease.spec.requester);
     let held: Vec<AdmissionReservation> = owned
         .into_iter()
+        .filter(|reservation| {
+            let name = reservation.name_any();
+            if !reservation_name_belongs_to(&name, &principal) {
+                warn!(
+                    reservation = %name,
+                    "refusing to delete a reservation whose name does not match this lease's \
+                     principal; it carries our UID label but is not ours"
+                );
+                return false;
+            }
+            true
+        })
         .filter_map(|reservation| {
             Some(AdmissionReservation {
                 name: reservation.name_any(),
@@ -1213,7 +1277,7 @@ async fn delete_exact_pending_lease(
         Ok(current) => current,
         Err(kube::Error::Api(error)) if error.code == 404 => {
             // The lease is already gone; its reservations may not be.
-            return release_reservations_for_lease(reservations, &expected_uid).await;
+            return release_reservations_for_lease(reservations, lease, &expected_uid).await;
         }
         Err(error) => return Err(error.into()),
     };
@@ -1232,7 +1296,7 @@ async fn delete_exact_pending_lease(
         ..Default::default()
     };
     leases.delete(&current.name_any(), &params).await?;
-    release_reservations_for_lease(reservations, &expected_uid).await
+    release_reservations_for_lease(reservations, lease, &expected_uid).await
 }
 
 fn validate_lease_shape(
@@ -2271,6 +2335,72 @@ mod tests {
             held.lock().unwrap().contains_key(&contested),
             "the current owner's reservation must survive a stale release"
         );
+    }
+
+    /// An object carrying our UID label but NOT our name shape must survive.
+    ///
+    /// The label is caller-supplied data. Anyone able to create a coordination
+    /// Lease in this namespace could stamp a victim's SandboxLease UID onto an
+    /// unrelated object and have Kobe's privileged credentials delete it during
+    /// that victim's cleanup — a confused deputy. Only names derived from this
+    /// lease's own principal may be deleted.
+    #[test]
+    fn only_names_derived_from_our_principal_may_be_deleted() {
+        let principal = principal_hash(&identity());
+
+        // Ours.
+        assert!(reservation_name_belongs_to(
+            &quota_reservation_name(&principal, 0),
+            &principal
+        ));
+        assert!(reservation_name_belongs_to(
+            &alias_reservation_name(&principal, "review"),
+            &principal
+        ));
+
+        // An injected object that merely carries our label.
+        assert!(!reservation_name_belongs_to(
+            "important-system-lease",
+            &principal
+        ));
+        assert!(!reservation_name_belongs_to(
+            "kube-controller-manager",
+            &principal
+        ));
+
+        // Another principal's reservations are not ours to release.
+        let other = principal_hash(&AuthIdentity {
+            identity: "mallory@example.com".into(),
+            ..identity()
+        });
+        assert!(!reservation_name_belongs_to(
+            &quota_reservation_name(&other, 0),
+            &principal
+        ));
+
+        // Right prefix, wrong shape: a crafted suffix must not ride along.
+        assert!(!reservation_name_belongs_to(
+            &format!("sbx-quota-{principal}-0-extra"),
+            &principal
+        ));
+        assert!(!reservation_name_belongs_to(
+            &format!("sbx-quota-{principal}-"),
+            &principal
+        ));
+    }
+
+    /// The persisted-principal digest must agree with the live-identity one, or
+    /// cleanup would compute names that never match what admission created.
+    #[test]
+    fn stored_and_live_principal_digests_agree() {
+        let live = identity();
+        let stored = SandboxPrincipal {
+            provider: live.provider.clone(),
+            requester_type: live.requester_type.clone(),
+            issuer: live.issuer.clone(),
+            identity: live.identity.clone(),
+        };
+        assert_eq!(principal_hash(&live), principal_hash_for(&stored));
     }
 
     /// Reservations are fenced to the lease UID, so a different principal's
