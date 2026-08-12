@@ -262,6 +262,26 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    // Start Sandbox placement, but ONLY when a validated runtime is present.
+    // Spawning it in `disabled` mode would have it watch CRDs that may not
+    // exist and log errors forever; spawning it without the #72 validation
+    // would let it write objects an incompatible runtime cannot reconcile.
+    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+        let sandbox_client = client.clone();
+        let sandbox_ns = namespace.clone();
+        let sandbox_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            controllers::sandbox::run_sandbox_controller(
+                sandbox_client,
+                &sandbox_ns,
+                sandbox_shutdown,
+            )
+            .await;
+        });
+    } else {
+        info!("Sandbox placement not started (agentSandbox.mode is not external)");
+    }
+
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
     // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller
     // creates one claim per `ClusterInstance` (with ownerReference);
