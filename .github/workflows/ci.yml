@@ -67,11 +67,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up Bun for E2E harness tests
+      # `cache: false` meant every single run re-downloaded bun, so one bad
+      # minute on the tool host took the whole required check down — as it did
+      # on 2026-08-12, when `mise install bun` failed instantly with an HTTP/2
+      # `refused stream` on every branch for the better part of an hour and
+      # nothing could merge. The tool is version-pinned in mise.toml, so the
+      # cache key is exact and a hit is the normal path.
+      - name: Set up mise
         uses: jdx/mise-action@v4
         with:
-          install_args: bun
-          cache: false
+          install: false
+          cache: true
+
+      # Retried separately rather than via `install_args`: a transient refusal
+      # on the download is not a reason to fail a Rust check, and the action
+      # itself has no retry. Bounded — three attempts, then the failure is
+      # real and the log shows all of them.
+      - name: Install bun for the E2E harness tests
+        run: |
+          for attempt in 1 2 3; do
+            if mise install bun; then exit 0; fi
+            echo "::warning::bun install attempt ${attempt} failed; retrying"
+            sleep $((attempt * 15))
+          done
+          echo "::error::bun could not be installed after 3 attempts"
+          exit 1
 
       - name: Lint and test E2E harness
         run: |
