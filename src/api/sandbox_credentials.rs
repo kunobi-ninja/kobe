@@ -57,6 +57,7 @@ pub const TOKEN_LIFETIME_SECONDS: i64 = 600;
 pub enum SandboxOperation {
     Logs,
     Exec,
+    PortForward,
 }
 
 impl SandboxOperation {
@@ -67,6 +68,7 @@ impl SandboxOperation {
             // returning output, and that read must not need a broader rule.
             Self::Logs => &[("pods", "get"), ("pods/log", "get")],
             Self::Exec => &[("pods", "get"), ("pods/exec", "create")],
+            Self::PortForward => &[("pods", "get"), ("pods/portforward", "create")],
         }
     }
 
@@ -75,6 +77,7 @@ impl SandboxOperation {
         match self {
             Self::Logs => "logs",
             Self::Exec => "exec",
+            Self::PortForward => "port-forward",
         }
     }
 }
@@ -316,7 +319,11 @@ mod tests {
     /// that rule being loosened.
     #[test]
     fn every_rule_is_pinned_to_exactly_one_pod() {
-        for operation in [SandboxOperation::Logs, SandboxOperation::Exec] {
+        for operation in [
+            SandboxOperation::Logs,
+            SandboxOperation::Exec,
+            SandboxOperation::PortForward,
+        ] {
             let rules = scoped_rules(&target(), operation);
             assert!(!rules.is_empty(), "{operation:?} must grant something");
             for rule in &rules {
@@ -364,11 +371,14 @@ mod tests {
 
         let exec = verbs(SandboxOperation::Exec);
         assert!(exec.contains(&"pods/exec:create".to_string()));
-        assert!(!exec.iter().any(|granted| granted.contains("/log")));
+        assert!(!exec.iter().any(|granted| granted.contains("portforward")));
 
-        // Port-forward lands with #83, which consumes it. It is deliberately
-        // absent rather than declared-but-unused: an operation nothing can
-        // request should not have a rule set waiting for it.
+        let forward = verbs(SandboxOperation::PortForward);
+        assert!(forward.contains(&"pods/portforward:create".to_string()));
+        assert!(
+            !forward.iter().any(|granted| granted.contains("exec")),
+            "forwarding a port must not carry the verb that runs commands: {forward:?}"
+        );
     }
 
     /// Nothing a Sandbox operation does requires the dangerous verbs.
@@ -378,7 +388,11 @@ mod tests {
     /// than in an audit.
     #[test]
     fn scoped_rules_reach_nothing_beyond_one_pod() {
-        for operation in [SandboxOperation::Logs, SandboxOperation::Exec] {
+        for operation in [
+            SandboxOperation::Logs,
+            SandboxOperation::Exec,
+            SandboxOperation::PortForward,
+        ] {
             for rule in scoped_rules(&target(), operation) {
                 let resources = rule.resources.clone().unwrap_or_default();
                 for forbidden in [

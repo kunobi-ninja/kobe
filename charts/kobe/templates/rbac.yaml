@@ -79,7 +79,7 @@ rules:
   # from the `SandboxPool` spec, which only an administrator can write, and a
   # lease selects a pool and nothing else. No caller input reaches this.
   - apiGroups: [""]
-    resources: ["pods/exec"]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
     verbs: ["create"]
   # Sandbox log reads (#81). Separate from `pods` above because `pods/log` is
   # its own resource to RBAC — and worth stating explicitly: this is the verb

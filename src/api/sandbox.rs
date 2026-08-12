@@ -66,6 +66,268 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
         )
         .route("/v1/sandbox-leases/{id}/logs", get(sandbox_logs::<B>))
         .route("/v1/sandbox-leases/{id}/exec", post(sandbox_exec::<B>))
+        .route("/v1/sandbox-leases/{id}/attach", get(sandbox_attach::<B>))
+        .route(
+            "/v1/sandbox-leases/{id}/port-forward",
+            get(sandbox_port_forward::<B>),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxAttachQuery {
+    /// argv to run. Absent attaches to the container's existing process
+    /// instead of starting a new one.
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    container: Option<String>,
+    /// Allocate a terminal. Off by default: a TTY merges stderr into stdout
+    /// and changes how the workload buffers, so it must be asked for.
+    #[serde(default)]
+    tty: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxPortForwardQuery {
+    /// A pool-declared port name or number. Nothing else resolves.
+    port: String,
+}
+
+/// Everything an interactive operation needs, resolved before the upgrade.
+///
+/// Resolution happens *before* the WebSocket handshake completes on purpose:
+/// a denial has to be an HTTP status the caller's client understands, not a
+/// close frame delivered a moment after a successful-looking upgrade.
+struct UpgradeContext {
+    target: crate::api::sandbox_access::SandboxTarget,
+    container: String,
+    scoped: kube::Client,
+}
+
+async fn prepare_upgrade<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    operation: crate::api::sandbox_credentials::SandboxOperation,
+    requested_container: Option<&str>,
+) -> Result<UpgradeContext, Response> {
+    use crate::api::sandbox_access as access;
+
+    require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await?;
+    if !is_valid_k8s_name(id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+
+    let (_lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, id, identity).await {
+            Ok(resolved) => resolved,
+            Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        };
+    let container = match target.resolve_container(requested_container) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+    };
+    if target.placement != access::TargetPlacement::Management {
+        return Err(sandbox_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Interactive Sandbox access is not yet available for child placement",
+            None,
+        ));
+    }
+
+    // Concurrency is checked before the upgrade, so a caller over the limit
+    // gets a status rather than a socket that closes immediately.
+    if !crate::api::sandbox_streams::may_start_stream(
+        crate::api::sandbox_streams::registry(),
+        &target.lease_uid,
+    )
+    .await
+    {
+        return Err(access_denied_with(
+            identity,
+            id,
+            operation.as_str(),
+            "concurrency_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many concurrent operations for this Sandbox lease",
+        ));
+    }
+
+    let scoped =
+        match crate::api::sandbox_credentials::scoped_client(&state.client, &target, operation)
+            .await
+        {
+            Ok(client) => client,
+            Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        };
+
+    Ok(UpgradeContext {
+        target,
+        container,
+        scoped,
+    })
+}
+
+/// Interactive exec or attach over a bounded WebSocket.
+///
+/// The caller's socket never reaches the API server: Kobe terminates it,
+/// opens a separate connection with a credential scoped to one Pod, and copies
+/// bytes. Nothing the caller sends becomes part of a Kubernetes request.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_attach<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Query(query): Query<SandboxAttachQuery>,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> Response {
+    use crate::api::sandbox_credentials::SandboxOperation;
+    use crate::api::sandbox_transport as transport;
+
+    if let Some(command) = query.command.as_ref()
+        && (command.is_empty() || command.iter().any(String::is_empty))
+    {
+        return sandbox_error(
+            StatusCode::BAD_REQUEST,
+            "command must be non-empty argv",
+            None,
+        );
+    }
+
+    let context = match prepare_upgrade(
+        &state,
+        &identity,
+        &id,
+        SandboxOperation::Exec,
+        query.container.as_deref(),
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+
+    let principal = identity.identity.clone();
+    upgrade.on_upgrade(move |mut socket| async move {
+        let guard = crate::api::sandbox_streams::registry()
+            .register(&context.target.lease_uid)
+            .await;
+        let revoked = guard.cancelled();
+
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+        let params = kube::api::AttachParams::default()
+            .container(&context.container)
+            .stdin(true)
+            .stdout(true)
+            // A TTY merges stderr into stdout at the kernel level, so asking
+            // for both is a contradiction rather than a preference.
+            .stderr(!query.tty)
+            .tty(query.tty);
+
+        let attached = match query.command.as_ref() {
+            Some(command) => pods.exec(&context.target.pod_name, command, &params).await,
+            None => pods.attach(&context.target.pod_name, &params).await,
+        };
+        let mut attached = match attached {
+            Ok(attached) => attached,
+            Err(_) => {
+                transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+        };
+
+        let mut limits = transport::StreamLimits::new(
+            transport::IDLE_TIMEOUT,
+            transport::MAX_STREAM_DURATION,
+            transport::MAX_STREAM_BYTES,
+        );
+        let end = transport::pump_attached(&mut socket, &mut attached, &mut limits, revoked).await;
+        attached.abort();
+        transport::close_with(&mut socket, end).await;
+
+        info!(
+            principal = %principal,
+            lease = %id,
+            pod_uid = %context.target.pod_uid,
+            operation = "attach",
+            outcome = "closed",
+            reason = end.code(),
+            caller_fault = end.is_caller_fault(),
+            "Sandbox stream"
+        );
+    })
+}
+
+/// Forward one pool-declared port over a bounded WebSocket.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_port_forward<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Query(query): Query<SandboxPortForwardQuery>,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> Response {
+    use crate::api::sandbox_credentials::SandboxOperation;
+    use crate::api::sandbox_transport as transport;
+
+    let context =
+        match prepare_upgrade(&state, &identity, &id, SandboxOperation::PortForward, None).await {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
+
+    // Only what the pool declared. Without this the forward is a general
+    // tunnel into the Pod's network namespace, reaching a debug listener or a
+    // metrics endpoint the administrator never meant to publish.
+    let port = match context.target.resolve_port(&query.port) {
+        Ok(port) => port,
+        Err(denied) => return access_denied(&identity, &id, "port-forward", denied),
+    };
+
+    let principal = identity.identity.clone();
+    upgrade.on_upgrade(move |mut socket| async move {
+        let guard = crate::api::sandbox_streams::registry()
+            .register(&context.target.lease_uid)
+            .await;
+        let revoked = guard.cancelled();
+
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+        let mut forwarder = match pods.portforward(&context.target.pod_name, &[port]).await {
+            Ok(forwarder) => forwarder,
+            Err(_) => {
+                transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+        };
+        let Some(mut stream) = forwarder.take_stream(port) else {
+            transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+            return;
+        };
+
+        let mut limits = transport::StreamLimits::new(
+            transport::IDLE_TIMEOUT,
+            transport::MAX_STREAM_DURATION,
+            transport::MAX_STREAM_BYTES,
+        );
+        let end = transport::pump_duplex(&mut socket, &mut stream, &mut limits, revoked).await;
+        transport::close_with(&mut socket, end).await;
+
+        info!(
+            principal = %principal,
+            lease = %id,
+            pod_uid = %context.target.pod_uid,
+            operation = "port-forward",
+            port,
+            outcome = "closed",
+            reason = end.code(),
+            caller_fault = end.is_caller_fault(),
+            "Sandbox stream"
+        );
+    })
 }
 
 /// How long one exec may run before it is abandoned.

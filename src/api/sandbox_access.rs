@@ -280,6 +280,24 @@ pub fn target_from_provenance(
 }
 
 impl SandboxTarget {
+    /// Resolve a caller-named port against the pool's declaration.
+    ///
+    /// Accepts a declared name or a declared number, and nothing else. Without
+    /// this, port-forward is a general tunnel into the Pod's network namespace
+    /// — reaching a debug listener, a metrics endpoint, or anything else bound
+    /// on localhost that the administrator never meant to publish.
+    pub fn resolve_port(&self, requested: &str) -> Result<u16, SandboxAccessDenied> {
+        if let Some(port) = self.ports.iter().find(|port| port.name == requested) {
+            return Ok(port.port);
+        }
+        if let Ok(number) = requested.parse::<u16>()
+            && let Some(port) = self.ports.iter().find(|port| port.port == number)
+        {
+            return Ok(port.port);
+        }
+        Err(SandboxAccessDenied::NotDeclared { what: "port" })
+    }
+
     /// Resolve a caller-named container against the allowlist.
     ///
     /// `None` means "the default", which is the only container a caller may
@@ -744,6 +762,33 @@ mod tests {
                 "container {other:?} must be refused"
             );
         }
+    }
+
+    /// Only pool-declared ports are forwardable.
+    ///
+    /// Without this, port-forward is a general tunnel into the Pod's network
+    /// namespace — reaching a debug listener, a metrics endpoint, or anything
+    /// else bound on localhost that the administrator never meant to publish.
+    #[test]
+    fn only_declared_ports_are_forwardable() {
+        let target = target_from_provenance(&ready_lease(), &pool(), now()).unwrap();
+
+        assert_eq!(target.resolve_port("http").unwrap(), 3000);
+        assert_eq!(target.resolve_port("3000").unwrap(), 3000);
+
+        for undeclared in ["9090", "22", "ssh", "", "3000 ", "0"] {
+            assert_eq!(
+                target.resolve_port(undeclared).unwrap_err(),
+                SandboxAccessDenied::NotDeclared { what: "port" },
+                "port {undeclared:?} must be refused"
+            );
+        }
+
+        // Alternate spellings of a DECLARED port are fine, and deliberately
+        // so: the allowlist is checked against the resolved number, not the
+        // string. Refusing `03000` would reject a request for a port the pool
+        // published, which is a usability bug rather than a boundary.
+        assert_eq!(target.resolve_port("03000").unwrap(), 3000);
     }
 
     /// The forwardable set is exactly what the pool declared.
