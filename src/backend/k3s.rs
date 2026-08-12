@@ -30,6 +30,9 @@ use kube::api::{
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
+use crate::backend::VerifiedDestroyUnsupported;
+use crate::crd::{CheckResult, TeardownCheck, TeardownSubject};
+
 use crate::crd::{
     Addon, ClusterConfig, IntraPlacementMode, KubeletSharedMountConfig, Placement, ReadinessGate,
 };
@@ -1762,6 +1765,205 @@ impl K3sBackend {
     /// prefix would also match the PVCs of a *different* cluster literally named
     /// `{cluster}-server` (whose PVCs are `data-{cluster}-server-server-{n}`), so
     /// without it `delete("foo")` could reap `foo-server`'s volumes.
+    /// Record which PersistentVolumes this cluster's data PVCs are bound to.
+    ///
+    /// Must run BEFORE deletion. A PVC's `spec.volumeName` is the only link to
+    /// its backing PV, and it disappears with the PVC — so a receipt that did
+    /// not capture this first could never prove the volume was reclaimed, only
+    /// that the claim object vanished. That distinction is the difference
+    /// between "the pointer is gone" and "the tenant's data is gone".
+    ///
+    /// Returns `Err` when the PVCs could not be listed at all: not knowing what
+    /// existed is uncertainty, and the caller turns it into `Unknown`.
+    async fn capture_bound_volumes(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        let list = pvcs
+            .list(&ListParams::default())
+            .await
+            .map_err(|_| "pvc_list_failed".to_string())?;
+
+        let mut volumes = Vec::new();
+        for pvc in list.items {
+            let Some(pvc_name) = pvc.metadata.name.as_deref() else {
+                continue;
+            };
+            if !Self::is_server_data_pvc(pvc_name, name) {
+                continue;
+            }
+            match pvc.spec.as_ref().and_then(|spec| spec.volume_name.clone()) {
+                Some(volume) => volumes.push(volume),
+                // A data PVC with no bound volume is either still provisioning
+                // or bound to something we cannot name. Either way we cannot
+                // later prove that volume is gone.
+                None => return Err("pvc_unbound_volume_unknown".to_string()),
+            }
+        }
+        Ok(volumes)
+    }
+
+    /// Prove one subject absent, or report why we cannot.
+    ///
+    /// Every arm answers the same question — "can I *observe* that this is
+    /// gone?" — and returns `Unknown` rather than guessing. A read that errors
+    /// is never absence.
+    async fn verify_subject_absent(
+        &self,
+        name: &str,
+        namespace: &str,
+        subject: TeardownSubject,
+        bound_volumes: &std::result::Result<Vec<String>, String>,
+        delete_outcome: &Result<()>,
+    ) -> TeardownCheck {
+        // A failed delete means the footprint was never fully addressed, so no
+        // subject can be claimed absent on the strength of this attempt.
+        if let Err(error) = delete_outcome {
+            debug!(cluster = name, error = %error, "teardown delete failed; subject unverifiable");
+            return TeardownCheck {
+                subject,
+                result: CheckResult::Unknown,
+                reason: Some("delete_failed".into()),
+            };
+        }
+
+        let (result, reason) = match subject {
+            TeardownSubject::AgentDeployment => {
+                let api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-agent")).await
+            }
+            TeardownSubject::ServerStatefulSet => {
+                let api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-server")).await
+            }
+            TeardownSubject::Service => {
+                let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-server")).await
+            }
+            TeardownSubject::PodDisruptionBudget => {
+                let api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-server")).await
+            }
+            TeardownSubject::PublisherConfigMap => {
+                let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-kubeconfig-publisher")).await
+            }
+            TeardownSubject::RegistriesConfigMap => {
+                let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-registries")).await
+            }
+            TeardownSubject::TokenSecret => {
+                let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-token")).await
+            }
+            TeardownSubject::KubeconfigSecret => {
+                let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-kubeconfig")).await
+            }
+            TeardownSubject::ConnectTokenSecret => {
+                let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, &format!("{name}-connect-token")).await
+            }
+            // Pods are label-selected rather than named: a StatefulSet's pods
+            // outlive its deletion while terminating, which is precisely the
+            // window an accepted DELETE would have hidden.
+            TeardownSubject::ServerPods => {
+                let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+                let selector = format!("kobe.kunobi.ninja/cluster={name}");
+                match pods.list(&ListParams::default().labels(&selector)).await {
+                    Ok(list) if list.items.is_empty() => (CheckResult::Verified, None),
+                    Ok(_) => (CheckResult::Unknown, Some("pods_still_present".into())),
+                    Err(_) => (CheckResult::Unknown, Some("pod_list_failed".into())),
+                }
+            }
+            TeardownSubject::ServerDataPvcs => {
+                let pvcs: Api<PersistentVolumeClaim> =
+                    Api::namespaced(self.client.clone(), namespace);
+                match pvcs.list(&ListParams::default()).await {
+                    Ok(list) => {
+                        let remaining = list.items.iter().any(|pvc| {
+                            pvc.metadata
+                                .name
+                                .as_deref()
+                                .is_some_and(|pvc_name| Self::is_server_data_pvc(pvc_name, name))
+                        });
+                        if remaining {
+                            (CheckResult::Unknown, Some("pvc_still_present".into()))
+                        } else {
+                            (CheckResult::Verified, None)
+                        }
+                    }
+                    Err(_) => (CheckResult::Unknown, Some("pvc_list_failed".into())),
+                }
+            }
+            // The captured PVs must be gone too. A PVC deleted under a `Retain`
+            // reclaim policy leaves its volume — and the tenant's data — intact.
+            TeardownSubject::ServerDataVolumes => match bound_volumes {
+                Err(reason) => (CheckResult::Unknown, Some(reason.clone())),
+                Ok(volumes) if volumes.is_empty() => (CheckResult::Verified, None),
+                Ok(volumes) => {
+                    let api: Api<k8s_openapi::api::core::v1::PersistentVolume> =
+                        Api::all(self.client.clone());
+                    let mut verdict = (CheckResult::Verified, None);
+                    for volume in volumes {
+                        let (result, reason) = Self::absent_by_name(&api, volume).await;
+                        if result != CheckResult::Verified {
+                            verdict = (result, reason.or_else(|| Some("pv_still_present".into())));
+                            break;
+                        }
+                    }
+                    verdict
+                }
+            },
+            TeardownSubject::CidrClaim => {
+                let api: Api<crate::crd::CIDRClaim> =
+                    Api::namespaced(self.client.clone(), namespace);
+                Self::absent_by_name(&api, name).await
+            }
+            TeardownSubject::Database => match self.datastore.current() {
+                None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
+                Some((pool, _)) => match datastore::database_exists(&pool, name, "k3s_").await {
+                    Ok(false) => (CheckResult::Verified, None),
+                    Ok(true) => (CheckResult::Unknown, Some("database_still_present".into())),
+                    Err(_) => (CheckResult::Unknown, Some("datastore_unreachable".into())),
+                },
+            },
+            TeardownSubject::DatabaseRole => match self.datastore.current() {
+                None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
+                Some((pool, _)) => {
+                    match datastore::cluster_role_exists(&pool, name, "k3s_").await {
+                        Ok(false) => (CheckResult::Verified, None),
+                        Ok(true) => (CheckResult::Unknown, Some("role_still_present".into())),
+                        Err(_) => (CheckResult::Unknown, Some("datastore_unreachable".into())),
+                    }
+                }
+            },
+        };
+
+        TeardownCheck {
+            subject,
+            result,
+            reason,
+        }
+    }
+
+    /// A 404 is the ONLY proof of absence. Any other error is uncertainty —
+    /// an RBAC denial or a timeout tells us nothing about whether the object
+    /// is there, and must never read as a clean teardown.
+    async fn absent_by_name<K>(api: &Api<K>, name: &str) -> (CheckResult, Option<String>)
+    where
+        K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+        <K as kube::Resource>::DynamicType: Default,
+    {
+        match api.get_opt(name).await {
+            Ok(None) => (CheckResult::Verified, None),
+            Ok(Some(_)) => (CheckResult::Unknown, Some("still_present".into())),
+            Err(_) => (CheckResult::Unknown, Some("lookup_failed".into())),
+        }
+    }
+
     fn is_server_data_pvc(pvc_name: &str, cluster: &str) -> bool {
         let prefix = format!("data-{cluster}-server-");
         pvc_name.strip_prefix(&prefix).is_some_and(|ordinal| {
@@ -2106,6 +2308,54 @@ impl ClusterBackend for K3sBackend {
 
         info!(cluster = name, "k3s cluster deleted");
         Ok(())
+    }
+
+    fn supports_verified_destroy(&self) -> bool {
+        true
+    }
+
+    /// Tear down and then *prove* the footprint is absent.
+    ///
+    /// The ordering matters and is the whole contract:
+    ///
+    /// 1. **Capture** what cannot be observed after deletion — chiefly the PVs
+    ///    the data PVCs are bound to. Once a PVC is gone its `volumeName` is
+    ///    unrecoverable, so a receipt written without capturing it first can
+    ///    never prove the backing volume was reclaimed.
+    /// 2. **Delete** via the ordinary path, so verified and unverified teardown
+    ///    cannot diverge in what they remove.
+    /// 3. **Poll to confirmed absence.** An accepted DELETE is not evidence:
+    ///    finalizers, terminating Pods and PV reclaim all complete
+    ///    asynchronously, and `delete()` today returns before any of it.
+    ///
+    /// Anything that cannot be observed becomes [`CheckResult::Unknown`], which
+    /// quarantines the capacity. That is the intended outcome, not a failure of
+    /// this function.
+    async fn delete_verified(
+        &self,
+        name: &str,
+        namespace: &str,
+        plan: &[TeardownSubject],
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        // Captured BEFORE deletion; unrecoverable afterwards.
+        let bound_volumes = self.capture_bound_volumes(name, namespace).await;
+
+        let delete_outcome = self.delete(name, namespace).await;
+
+        let mut checks = Vec::with_capacity(plan.len());
+        for subject in plan {
+            checks.push(
+                self.verify_subject_absent(
+                    name,
+                    namespace,
+                    *subject,
+                    &bound_volumes,
+                    &delete_outcome,
+                )
+                .await,
+            );
+        }
+        Ok(checks)
     }
 
     #[tracing::instrument(skip(self), fields(cluster = name, namespace))]
@@ -2999,6 +3249,175 @@ mod tests {
             "kind": "Secret",
             "metadata": { "name": name, "namespace": namespace }
         })
+    }
+
+    /// An object that is STILL THERE after teardown must not read as verified.
+    ///
+    /// This is the defect the whole receipt design exists for: `delete()`
+    /// returns as soon as the DELETE requests are accepted, while finalizers
+    /// and terminating Pods complete asynchronously. A provider that reported
+    /// success on an accepted request would hand back capacity that still has
+    /// the tenant's workload running on it.
+    #[tokio::test]
+    async fn a_surviving_object_is_unknown_not_verified() {
+        let server = MockServer::start().await;
+        // The StatefulSet is still present when we look.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/c1-server",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": { "name": "c1-server", "namespace": "test-ns" }
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerStatefulSet,
+                &Ok(Vec::new()),
+                &Ok(()),
+            )
+            .await;
+
+        assert_eq!(check.result, CheckResult::Unknown);
+        assert_eq!(check.reason.as_deref(), Some("still_present"));
+    }
+
+    /// Only a 404 proves absence. An RBAC denial or a timeout tells us nothing
+    /// about whether the object exists — treating either as "gone" is how a
+    /// broken permission silently becomes a clean bill of health.
+    #[tokio::test]
+    async fn a_failed_lookup_is_uncertainty_not_absence() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/c1-server",
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "Forbidden", "code": 403
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerStatefulSet,
+                &Ok(Vec::new()),
+                &Ok(()),
+            )
+            .await;
+
+        assert_eq!(
+            check.result,
+            CheckResult::Unknown,
+            "a 403 must never be read as absence"
+        );
+        assert_eq!(check.reason.as_deref(), Some("lookup_failed"));
+    }
+
+    /// A 404 IS proof, so the happy path must actually verify — otherwise the
+    /// receipt can never be satisfied and every teardown quarantines.
+    #[tokio::test]
+    async fn a_missing_object_verifies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/test-ns/statefulsets/c1-server",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerStatefulSet,
+                &Ok(Vec::new()),
+                &Ok(()),
+            )
+            .await;
+
+        assert_eq!(check.result, CheckResult::Verified);
+        assert!(check.reason.is_none());
+    }
+
+    /// With no datastore reachable, the database and its role are unprovable —
+    /// and a leaked role carries credentials, which is why it is its own
+    /// subject rather than folded into the database check.
+    #[tokio::test]
+    async fn database_and_role_are_unknown_without_a_datastore() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+
+        for subject in [TeardownSubject::Database, TeardownSubject::DatabaseRole] {
+            let check = backend
+                .verify_subject_absent("c1", "test-ns", subject, &Ok(Vec::new()), &Ok(()))
+                .await;
+            assert_eq!(check.result, CheckResult::Unknown, "{subject:?}");
+            assert_eq!(check.reason.as_deref(), Some("datastore_unavailable"));
+        }
+    }
+
+    /// A failed delete poisons every subject. Verifying absence after a
+    /// teardown that did not complete would report "gone" for whatever the
+    /// failed attempt happened not to reach.
+    #[tokio::test]
+    async fn a_failed_delete_makes_every_subject_unknown() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerStatefulSet,
+                &Ok(Vec::new()),
+                &Err(anyhow::anyhow!("delete blew up")),
+            )
+            .await;
+        assert_eq!(check.result, CheckResult::Unknown);
+        assert_eq!(check.reason.as_deref(), Some("delete_failed"));
+    }
+
+    /// If the PVCs could not be listed before deletion, the backing volumes are
+    /// unnameable afterwards — so the volume subject must fail closed rather
+    /// than silently report that nothing needed reclaiming.
+    #[tokio::test]
+    async fn uncapturable_volumes_fail_closed() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::ServerDataVolumes,
+                &Err("pvc_list_failed".to_string()),
+                &Ok(()),
+            )
+            .await;
+        assert_eq!(check.result, CheckResult::Unknown);
+        assert_eq!(check.reason.as_deref(), Some("pvc_list_failed"));
+    }
+
+    #[tokio::test]
+    async fn k3s_advertises_the_verified_teardown_capability() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        assert!(backend.supports_verified_destroy());
     }
 
     fn token_secret_response(name: &str, namespace: &str, token: &[u8]) -> serde_json::Value {
