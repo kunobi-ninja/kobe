@@ -126,15 +126,50 @@ async fn sandbox_exec<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "exec", denied),
     };
 
-    match access::exec_in_sandbox(
-        &scoped,
-        &target,
-        &container,
-        &request.command,
-        SANDBOX_EXEC_TIMEOUT,
-    )
-    .await
-    {
+    // Registered for the duration, so releasing or expiring the lease cancels
+    // the command rather than letting it run on inside a workload that is
+    // being torn down. The guard deregisters on every exit path, including a
+    // panic — a leaked registration would later report cancelling something
+    // that ended long ago.
+    let streams = crate::api::sandbox_streams::registry();
+    if !crate::api::sandbox_streams::may_start_stream(streams, &target.lease_uid).await {
+        return access_denied_with(
+            &identity,
+            &id,
+            "exec",
+            "concurrency_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many concurrent operations for this Sandbox lease",
+        );
+    }
+    let guard = streams.register(&target.lease_uid).await;
+    let revoked = guard.cancelled();
+
+    let result = tokio::select! {
+        result = access::exec_in_sandbox(
+            &scoped,
+            &target,
+            &container,
+            &request.command,
+            SANDBOX_EXEC_TIMEOUT,
+        ) => result,
+        _ = revoked.cancelled() => {
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                operation = "exec",
+                outcome = "revoked",
+                "Sandbox access"
+            );
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access while the command was running",
+                None,
+            );
+        }
+    };
+
+    match result {
         Ok(result) => {
             // The command and its output are the caller's own data and are
             // never audited. Identity, target and outcome are.
@@ -247,6 +282,29 @@ async fn sandbox_logs<B: ClusterBackend>(
 /// The reason code is finer-grained than the caller-facing status on purpose:
 /// an operator needs to tell "expired" from "never placed" when somebody
 /// reports that access stopped working, while the caller must not be able to.
+/// Record and answer a denial that is not a resolver outcome.
+///
+/// Same audit shape as [`access_denied`], for limits enforced after resolution
+/// succeeded — the operator needs those countable by cause too.
+fn access_denied_with(
+    identity: &AuthIdentity,
+    lease: &str,
+    operation: &'static str,
+    reason: &'static str,
+    status: StatusCode,
+    message: &'static str,
+) -> Response {
+    info!(
+        principal = %identity.identity,
+        lease = %lease,
+        operation,
+        outcome = "denied",
+        reason,
+        "Sandbox access"
+    );
+    sandbox_error(status, message, None)
+}
+
 fn access_denied(
     identity: &AuthIdentity,
     lease: &str,

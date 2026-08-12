@@ -259,6 +259,24 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
         });
+
+        // Stream revocation runs on EVERY replica that serves Sandbox
+        // operations, not just the controller leader. A replica can only
+        // cancel connections it is holding itself — the socket lives in one
+        // process — so a leader-elected revoker would leave live streams on
+        // every other replica with nobody watching them.
+        let revoker_client = client.clone();
+        let revoker_ns = namespace.clone();
+        let revoker_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            api::sandbox_streams::run_stream_revoker(
+                revoker_client,
+                &revoker_ns,
+                api::sandbox_streams::registry().clone(),
+                revoker_shutdown,
+            )
+            .await;
+        });
     } else {
         info!("Sandbox placement not started (agentSandbox.mode is not external)");
     }
