@@ -45,6 +45,11 @@ enum Commands {
         #[arg(long)]
         device: bool,
     },
+    /// Sandbox operations: run commands in a leased agent environment.
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
     /// Remove stored credentials. Also revokes the refresh + access
     /// tokens at the IdP (RFC 7009) so a leaked token can't outlive
     /// `kobe logout`.
@@ -127,6 +132,62 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
+    },
+}
+
+/// Sandbox operations.
+///
+/// Separate from cluster leases on purpose: a Sandbox is one agent
+/// environment, not a cluster, and nothing here can produce a kubeconfig or a
+/// credential for the cluster underneath it.
+#[derive(Subcommand)]
+enum SandboxAction {
+    /// Run a command in an existing sandbox and return its exact exit code.
+    ///
+    /// argv is sent as-is — no shell, so no quoting rules of Kobe's own.
+    Exec {
+        /// Sandbox lease id.
+        lease: String,
+        /// Working directory inside the sandbox.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Wall-clock bound for the command (e.g. `30s`, `5m`).
+        #[arg(long)]
+        timeout: Option<String>,
+        /// The command. Everything after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Create a sandbox, run one command in it, and release it.
+    ///
+    /// The release is attempted on every terminal path, and its failure is
+    /// reported separately from the command's result.
+    Run {
+        /// Sandbox pool.
+        pool: String,
+        /// Lease TTL (e.g. `2h`).
+        #[arg(long)]
+        ttl: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        timeout: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Read a bounded tail of the sandbox's output.
+    Logs {
+        lease: String,
+        /// Lines from the end.
+        #[arg(long)]
+        tail: Option<i64>,
+    },
+    /// Cancel a running execution.
+    Cancel {
+        lease: String,
+        /// Execution id, as returned by `exec`.
+        #[arg(long)]
+        execution: String,
     },
 }
 
@@ -242,6 +303,67 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Extend { target: lease, ttl } => {
             commands::extend(lease.as_deref(), &ttl, target, endpoint, output).await
+        }
+        // These return the REMOTE command's exit code, so the process exits
+        // with it rather than with a generic success. `set -e` in a caller's
+        // script depends on exactly this.
+        Commands::Sandbox { action } => {
+            let code = match action {
+                SandboxAction::Exec {
+                    lease,
+                    cwd,
+                    timeout,
+                    command,
+                } => {
+                    commands::sandbox::exec(
+                        &lease,
+                        &command,
+                        cwd.as_deref(),
+                        timeout.as_deref(),
+                        target,
+                        endpoint,
+                        output,
+                    )
+                    .await
+                }
+                SandboxAction::Run {
+                    pool,
+                    ttl,
+                    cwd,
+                    timeout,
+                    command,
+                } => {
+                    commands::sandbox::run(commands::sandbox::RunCommand {
+                        pool: &pool,
+                        ttl: ttl.as_deref(),
+                        argv: &command,
+                        cwd: cwd.as_deref(),
+                        timeout: timeout.as_deref(),
+                        target_override: target,
+                        endpoint_override: endpoint,
+                        output,
+                    })
+                    .await
+                }
+                SandboxAction::Logs { lease, tail } => {
+                    commands::sandbox::logs(&lease, tail, target, endpoint, output)
+                        .await
+                        .map(|()| 0)
+                }
+                SandboxAction::Cancel { lease, execution } => {
+                    commands::sandbox::cancel(&lease, &execution, target, endpoint, output)
+                        .await
+                        .map(|()| 0)
+                }
+            };
+            match code {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(error) => {
+                    eprintln!("kobe: {error:#}");
+                    std::process::exit(commands::sandbox::CLI_FAILURE_EXIT)
+                }
+            }
         }
         Commands::Release { lease_id } => {
             commands::release(lease_id.as_deref(), target, endpoint, output).await

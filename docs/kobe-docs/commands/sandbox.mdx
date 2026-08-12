@@ -1,0 +1,142 @@
+---
+title: Sandbox commands
+description: Run commands inside a leased agent sandbox, from a shell or from an agent.
+---
+
+# Sandbox commands
+
+A **sandbox** is one agent environment leased from a `SandboxPool`. These
+commands run work inside it. None of them produces a kubeconfig, a token, or
+any other credential for the cluster underneath — a sandbox lease is the right
+to run commands in one container, and nothing more.
+
+## `kobe sandbox run`
+
+Create a sandbox, run one command in it, and release it.
+
+```bash
+kobe sandbox run agents --ttl 30m -- /agent analyse ./repo
+```
+
+This is the command to reach for from CI or a script: it owns the whole
+lifecycle, so there is no lease left behind if your job is cancelled.
+
+**The exit code is the remote command's exit code.** `set -e` works:
+
+```bash
+set -e
+kobe sandbox run agents -- /agent test   # non-zero here fails the script
+```
+
+**Cleanup is reported separately from the result.** If the command succeeded
+but the lease could not be released, you are told both — the success is not
+hidden, and the leak is not swallowed:
+
+```json
+{
+  "apiVersion": "kobe.sandbox/v1",
+  "lease": "sbx-7f3a",
+  "execution": "sbxe-91c4",
+  "state": "Succeeded",
+  "exitCode": 0,
+  "stdout": "...",
+  "stderr": "",
+  "cleanup": { "released": false, "error": "HTTP 503" }
+}
+```
+
+A run whose command succeeded but whose lease leaked exits `125` rather than
+`0`, so an unattended caller notices.
+
+## `kobe sandbox exec`
+
+Run a command in a sandbox you already hold.
+
+```bash
+kobe sandbox exec sbx-7f3a -- /agent status
+kobe sandbox exec sbx-7f3a --cwd /work --timeout 5m -- ./build.sh
+```
+
+`argv` is sent **as-is**. There is no shell, so there are no quoting rules of
+Kobe's own to learn — and no way for an argument to become a shell operator:
+
+```bash
+# Runs a program whose name contains a semicolon. It does not run two commands.
+kobe sandbox exec sbx-7f3a -- ./weird;name
+```
+
+If you need a shell, ask for one explicitly — then its quoting is yours to
+reason about:
+
+```bash
+kobe sandbox exec sbx-7f3a -- /bin/sh -lc 'a && b'
+```
+
+## `kobe sandbox logs`
+
+A bounded tail of the sandbox's own output.
+
+```bash
+kobe sandbox logs sbx-7f3a --tail 500
+```
+
+The tail is capped server-side. Asking for more than the cap returns the cap
+rather than an error.
+
+## `kobe sandbox cancel`
+
+```bash
+kobe sandbox cancel sbx-7f3a --execution sbxe-91c4
+```
+
+Reports the state that **actually** applies. An execution that had already
+finished is reported as finished — saying "cancelled" would be a claim you
+might act on.
+
+## For headless agents
+
+Use `--output json`. The fields are versioned by `apiVersion`, which changes
+only on a breaking change:
+
+```bash
+result=$(kobe sandbox run agents --output json -- /agent analyse)
+code=$?
+
+echo "$result" | jq -r '.stdout'
+echo "$result" | jq -r '.exitCode'
+echo "$result" | jq -e '.cleanup.released // true' >/dev/null \
+  || echo "warning: the sandbox lease leaked"
+```
+
+`stdout` and `stderr` are always separate fields. A consumer that cannot tell
+a tool's diagnostics from its output cannot reliably parse either.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| *0–255 from your command* | The remote command ran and exited with this code |
+| `125` | **Kobe** failed — the command may not have run at all |
+
+`125` is the convention `docker run` and `env` already use for "the tool
+failed, not your command", so a script that already handles it needs no new
+knowledge. It is reported when an execution ends without an exit code:
+`Unknown`, `Cancelled`, or `TimedOut`.
+
+### Retries are safe
+
+Every invocation carries an idempotency key. If your client retries after a
+disconnect, the retry finds the original execution rather than starting a
+second one — which matters most for the commands you would least like to run
+twice.
+
+An `Unknown` state means Kobe could not establish what happened: the command
+may have run. It is deliberately **not** reported as a failure, because a
+failure invites an automatic retry of something that may already have had
+effects. Deciding what to do is yours.
+
+## Placement is invisible
+
+A `SandboxPool` may run its sandboxes in Kobe's own cluster or in a cluster
+composed for one lease. Every command above behaves identically either way,
+and nothing exposes which was used.
