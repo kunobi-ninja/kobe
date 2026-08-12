@@ -1854,10 +1854,43 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     let status = instance.status.as_ref()?;
     let binding = status.binding.as_ref()?;
 
+    // An instance that is ALREADY quarantined got there because evidence was
+    // required and missing. It must never fall back to the unverified path,
+    // whatever happens to its lease afterwards — otherwise deleting the
+    // ClusterLease becomes a way to launder unproven capacity back into the
+    // pool, which is a bypass of the whole mechanism rather than an edge case.
+    let already_quarantined = status.phase == ClusterInstancePhase::Quarantined;
+
     // Does the bound lease actually ask for this?
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
-    let lease = leases.get(&binding.lease.name).await.ok()?;
+    let lease = match leases.get(&binding.lease.name).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            if already_quarantined {
+                warn!(
+                    instance = %name,
+                    error = %error,
+                    "quarantined instance's lease is unreadable; holding quarantine rather \
+                     than releasing on the unverified path"
+                );
+                return Some(
+                    quarantine_instance(ctx, instance, name, namespace, "lease_unreadable").await,
+                );
+            }
+            return None;
+        }
+    };
     if lease.spec.cleanup_mode.unwrap_or_default() != CleanupMode::VerifiedDestroy {
+        if already_quarantined {
+            warn!(
+                instance = %name,
+                "quarantined instance's lease no longer requests verified teardown; \
+                 holding quarantine — capacity still has unproven state"
+            );
+            return Some(
+                quarantine_instance(ctx, instance, name, namespace, "mode_downgraded").await,
+            );
+        }
         return None;
     }
 
