@@ -289,6 +289,25 @@ jobs:
           path: /tmp/kind-logs
           if-no-files-found: ignore
 
+      # Dual-placement Sandbox conformance (#76). Runs only on the k3s leg:
+      # child placement REQUIRES a receipt-capable k3s pool, so the other
+      # backends have nothing to compare against and would report a skip that
+      # reads as a pass.
+      #
+      # Skipped LOUDLY when the harness has not published a Sandbox endpoint,
+      # rather than failing the whole e2e run for an environment that predates
+      # the Sandbox pools.
+      - name: Sandbox conformance (management + child)
+        if: matrix.backend == 'k3s'
+        env:
+          KOBE_SANDBOX_E2E: "1"
+        run: |
+          if [ -z "${KOBE_ENDPOINT:-}" ] || [ -z "${KOBE_SANDBOX_POOL_CHILD:-}" ]; then
+            echo "::warning title=Sandbox conformance skipped::no Sandbox endpoint or child pool configured for this environment (#76)"
+            exit 0
+          fi
+          mise exec -- just test-sandbox-conformance
+
       # Always tear down so kind clusters never leak on the persistent runner.
       - name: Tear down the e2e harness
         if: always()

@@ -148,5 +148,13 @@ regex = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The conformance suite drives the public HTTP API, including a blocking
+# release from a `Drop` — a leaked sandbox makes the NEXT scenario queue and
+# fail for an unrelated reason.
+reqwest = { version = "0.12", features = [
+  "json",
+  "rustls-tls",
+  "blocking",
+], default-features = false }
 wiremock = "0.6"
 tempfile = "3"
