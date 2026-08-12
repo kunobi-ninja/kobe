@@ -590,10 +590,20 @@ fn connect_error(status: StatusCode, message: impl Into<String>) -> Response {
 /// server-side and returns ONLY the generic `message` to the client, never the
 /// raw string (which leaks operator namespaces, in-cluster endpoints, and CRD
 /// details to a low-trust caller — possibly before lease-token validation).
-fn connect_infra_error(status: StatusCode, message: &str, err: impl std::fmt::Display) -> Response {
-    warn!(error = %err, "{message}");
+fn connect_infra_error(
+    status: StatusCode,
+    message: &str,
+    err: impl std::fmt::Display,
+    reason: metrics::ConnectErrorReason,
+) -> Response {
+    warn!(error = %err, reason = reason.as_str(), "{message}");
     metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
         .with_label_values(&[metrics::ConnectOutcome::BackendError.as_str()])
+        .inc();
+    // Alongside, never instead: the outcome counter keeps its existing shape so
+    // dashboards and alerts built on it are unaffected (#106).
+    metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+        .with_label_values(&[reason.as_str()])
         .inc();
     connect_error(status, message)
 }
@@ -1607,6 +1617,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to validate lease token",
                         &err,
+                        metrics::ConnectErrorReason::LeaseLookup,
                     );
                 }
             };
@@ -1683,6 +1694,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Failed to extract backend kubeconfig",
                         &err,
+                        metrics::ConnectErrorReason::KubeconfigUnavailable,
                     );
                 }
             };
@@ -1701,6 +1713,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to parse backend kubeconfig",
                         &err,
+                        metrics::ConnectErrorReason::KubeconfigParse,
                     );
                 }
             };
@@ -1741,6 +1754,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to build backend request",
                 &err,
+                metrics::ConnectErrorReason::UpstreamConfig,
             );
         }
     };
@@ -1771,6 +1785,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to build backend TLS config",
                     &err,
+                    metrics::ConnectErrorReason::UpstreamConfig,
                 );
             }
         };
@@ -1788,14 +1803,23 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             protocol = %protocol,
             "Connect proxy tunneling HTTP upgrade (exec/attach/port-forward)"
         );
-        // Upgrade tunnel handed off: count as a successful connect outcome.
-        // Any failure inside the tunnel is its own concern (the request was
-        // accepted and proxied); the outcome counter tracks the proxy's
-        // accept/reject decision, not upstream stream health.
-        metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
-            .with_label_values(&[metrics::ConnectOutcome::Ok.as_str()])
-            .inc();
-        return crate::api::upgrade::tunnel_upgrade(request, upgrade_access, &path_and_query).await;
+        // The outcome is recorded INSIDE tunnel_upgrade, not here.
+        //
+        // This used to count Ok before handing off, reasoning that "any failure
+        // inside the tunnel is its own concern". That holds for failures in an
+        // established tunnel — but the dial, TLS handshake and HTTP/1 handshake
+        // all happen BEFORE any tunnel exists, and each returns 502/504 to the
+        // caller. Counting those as successes made a real outage invisible:
+        // callers saw "Failed to reach leased cluster" while the success rate
+        // stayed flat (#107).
+        return crate::api::upgrade::tunnel_upgrade(
+            request,
+            upgrade_access,
+            &path_and_query,
+            request_id,
+            &lease_id,
+        )
+        .await;
     }
 
     info!(
@@ -1828,6 +1852,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Failed to read request body",
                 &err,
+                metrics::ConnectErrorReason::RequestBody,
             );
         }
     };
@@ -1843,7 +1868,12 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 error = %err,
                 "Connect proxy received unsupported HTTP method"
             );
-            return connect_infra_error(StatusCode::METHOD_NOT_ALLOWED, "Unsupported method", &err);
+            return connect_infra_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Unsupported method",
+                &err,
+                metrics::ConnectErrorReason::UnsupportedMethod,
+            );
         }
     };
 
@@ -1878,6 +1908,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 StatusCode::BAD_GATEWAY,
                 "Failed to reach leased cluster",
                 &err,
+                metrics::ConnectErrorReason::UpgradeDial,
             );
         }
     };
@@ -1918,6 +1949,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     StatusCode::BAD_GATEWAY,
                     "Failed to read leased cluster response",
                     &err,
+                    metrics::ConnectErrorReason::UpstreamResponse,
                 );
             }
         };

@@ -110,12 +110,21 @@ pub(crate) async fn tunnel_upgrade(
     mut req: Request,
     access: BackendUpgradeAccess,
     path_and_query: &str,
+    request_id: &str,
+    lease_id: &str,
 ) -> Response {
     // 0. Reserve a concurrency slot. Fail fast under load.
     let permit = match UPGRADE_SEMAPHORE.try_acquire() {
         Ok(p) => p,
         Err(_) => {
-            warn!("Connect proxy upgrade rejected — concurrency cap reached");
+            warn!(
+                request_id = %request_id,
+                lease_id = %lease_id,
+                "Connect proxy upgrade rejected — concurrency cap reached"
+            );
+            crate::metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+                .with_label_values(&[crate::metrics::ConnectErrorReason::UpgradeCapacity.as_str()])
+                .inc();
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [("retry-after", "5")],
@@ -136,7 +145,13 @@ pub(crate) async fn tunnel_upgrade(
         Ok(parts) => parts,
         Err(err) => {
             warn!(error = %err, server = %access.server, "Connect proxy upgrade: invalid backend server URL");
-            return upgrade_error(StatusCode::BAD_GATEWAY, "Invalid backend server URL");
+            return upgrade_failure(
+                StatusCode::BAD_GATEWAY,
+                "Invalid backend server URL",
+                crate::metrics::ConnectErrorReason::UpstreamConfig,
+                request_id,
+                lease_id,
+            );
         }
     };
 
@@ -154,20 +169,38 @@ pub(crate) async fn tunnel_upgrade(
             .await
             .map_err(|err| {
                 warn!(error = %err, host = %host, port, "Connect proxy upgrade: TCP dial failed");
-                upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster")
+                upgrade_failure(
+                    StatusCode::BAD_GATEWAY,
+                    "Failed to reach leased cluster",
+                    crate::metrics::ConnectErrorReason::UpgradeDial,
+                    request_id,
+                    lease_id,
+                )
             })?;
             tcp.set_nodelay(true).ok();
 
             let connector = TlsConnector::from(access.tls.clone());
             let tls_stream = connector.connect(server_name, tcp).await.map_err(|err| {
                 warn!(error = %err, host = %host, "Connect proxy upgrade: TLS handshake failed");
-                upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster")
+                upgrade_failure(
+                    StatusCode::BAD_GATEWAY,
+                    "Failed to reach leased cluster",
+                    crate::metrics::ConnectErrorReason::UpgradeTls,
+                    request_id,
+                    lease_id,
+                )
             })?;
 
             let io = TokioIo::new(tls_stream);
             hyper::client::conn::http1::handshake(io).await.map_err(|err| {
             warn!(error = %err, host = %host, "Connect proxy upgrade: HTTP/1 handshake failed");
-            upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster")
+            upgrade_failure(
+                StatusCode::BAD_GATEWAY,
+                "Failed to reach leased cluster",
+                crate::metrics::ConnectErrorReason::UpgradeHandshake,
+                request_id,
+                lease_id,
+            )
         })
         };
 
@@ -181,9 +214,12 @@ pub(crate) async fn tunnel_upgrade(
                 timeout_secs = DIAL_TIMEOUT.as_secs(),
                 "Connect proxy upgrade: dial/handshake timed out"
             );
-            return upgrade_error(
+            return upgrade_failure(
                 StatusCode::GATEWAY_TIMEOUT,
                 "Timed out reaching leased cluster",
+                crate::metrics::ConnectErrorReason::UpgradeTimeout,
+                request_id,
+                lease_id,
             );
         }
     };
@@ -206,7 +242,13 @@ pub(crate) async fn tunnel_upgrade(
         Ok(r) => r,
         Err(err) => {
             warn!(error = %err, "Connect proxy upgrade: failed to build upstream request");
-            return upgrade_error(StatusCode::BAD_GATEWAY, "Failed to build backend request");
+            return upgrade_failure(
+                StatusCode::BAD_GATEWAY,
+                "Failed to build backend request",
+                crate::metrics::ConnectErrorReason::UpstreamConfig,
+                request_id,
+                lease_id,
+            );
         }
     };
 
@@ -215,7 +257,13 @@ pub(crate) async fn tunnel_upgrade(
         Ok(r) => r,
         Err(err) => {
             warn!(error = %err, host = %host, "Connect proxy upgrade: send_request failed");
-            return upgrade_error(StatusCode::BAD_GATEWAY, "Failed to reach leased cluster");
+            return upgrade_failure(
+                StatusCode::BAD_GATEWAY,
+                "Failed to reach leased cluster",
+                crate::metrics::ConnectErrorReason::UpgradeHandshake,
+                request_id,
+                lease_id,
+            );
         }
     };
 
@@ -232,9 +280,12 @@ pub(crate) async fn tunnel_upgrade(
         );
         let client_status =
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return upgrade_error(
+        return upgrade_failure(
             client_status,
             "Leased cluster rejected the streaming request",
+            crate::metrics::ConnectErrorReason::UpgradeRejected,
+            request_id,
+            lease_id,
         );
     }
 
@@ -288,16 +339,61 @@ pub(crate) async fn tunnel_upgrade(
         builder = builder.header("sec-websocket-extensions", v);
     }
     match builder.body(Body::empty()) {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            // The last point at which this can still fail. Everything up to
+            // here — dial, TLS, HTTP/1 handshake, the backend's 101 — has
+            // succeeded and the byte bridge is spawned, so THIS is what earns
+            // `outcome="ok"`. The old hand-off counted it before the dial had
+            // even been attempted (#107).
+            crate::metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+                .with_label_values(&[crate::metrics::ConnectOutcome::Ok.as_str()])
+                .inc();
+            resp
+        }
         Err(err) => {
             warn!(error = %err, "Connect proxy upgrade: failed to build 101 response");
-            upgrade_error(StatusCode::BAD_GATEWAY, "Failed to establish stream")
+            upgrade_failure(
+                StatusCode::BAD_GATEWAY,
+                "Failed to establish stream",
+                crate::metrics::ConnectErrorReason::Other,
+                request_id,
+                lease_id,
+            )
         }
     }
 }
 
 /// Generic plain-text error response. We never relay raw upstream bodies on
 /// the upgrade path (redaction policy, matching `connect_error`).
+/// Record an upgrade failure that happened BEFORE any tunnel existed, then
+/// build the response.
+///
+/// These were previously counted as `outcome="ok"` by the caller and logged
+/// without a lease or request id, so a burst of 502s could neither be seen in
+/// the success rate nor traced back to a lease or CI run (#107).
+fn upgrade_failure(
+    status: StatusCode,
+    message: &'static str,
+    reason: crate::metrics::ConnectErrorReason,
+    request_id: &str,
+    lease_id: &str,
+) -> Response {
+    warn!(
+        request_id = %request_id,
+        lease_id = %lease_id,
+        reason = reason.as_str(),
+        status = status.as_u16(),
+        "Connect proxy upgrade failed before the tunnel was established"
+    );
+    crate::metrics::CONNECT_PROXY_REQUEST_OUTCOME_TOTAL
+        .with_label_values(&[crate::metrics::ConnectOutcome::BackendError.as_str()])
+        .inc();
+    crate::metrics::CONNECT_PROXY_ERROR_REASON_TOTAL
+        .with_label_values(&[reason.as_str()])
+        .inc();
+    upgrade_error(status, message)
+}
+
 fn upgrade_error(status: StatusCode, message: &'static str) -> Response {
     (
         status,

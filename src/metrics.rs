@@ -661,6 +661,89 @@ impl ConnectOutcome {
     }
 }
 
+/// Why a connect-proxy request produced `outcome="backend_error"`, or why an
+/// upgrade never established its tunnel.
+///
+/// Closed set, deliberately: this is a metric label, so an unbounded value
+/// (an error string, a host name) would be a cardinality bomb. The raw error
+/// is logged at the call site and never used as a label — the same discipline
+/// `BackendOpErrorReason` already follows.
+///
+/// `backend_error` previously collapsed ~13 unrelated causes into one bucket
+/// (#106): a 405 on an unsupported method, a 413 oversize body, RBAC on the
+/// kubeconfig Secret, TLS construction, and lease lookup all looked identical
+/// from metrics, so a 502 burst could not be attributed without hand-reading
+/// per-lease logs after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectErrorReason {
+    /// HTTP method not supported by the proxy (405).
+    UnsupportedMethod,
+    /// Request body could not be read, or exceeded the cap (413).
+    RequestBody,
+    /// Reading/extracting the kubeconfig from the backend failed — typically
+    /// operator RBAC on the Secret (503).
+    KubeconfigUnavailable,
+    /// Kubeconfig was retrieved but could not be parsed (500).
+    KubeconfigParse,
+    /// Could not build the upstream URL or TLS client config (500).
+    UpstreamConfig,
+    /// Lease lookup/validation against the kube API failed.
+    LeaseLookup,
+    /// Reading the upstream response body failed after headers arrived.
+    UpstreamResponse,
+    /// Upgrade path: TCP dial to the leased cluster failed.
+    UpgradeDial,
+    /// Upgrade path: TLS handshake with the leased cluster failed.
+    UpgradeTls,
+    /// Upgrade path: HTTP/1 handshake failed.
+    UpgradeHandshake,
+    /// Upgrade path: dial/handshake exceeded the dial timeout.
+    UpgradeTimeout,
+    /// Upgrade path: concurrency cap reached before a slot was available.
+    UpgradeCapacity,
+    /// Upgrade path: the leased cluster answered, but not with 101 (it rejected
+    /// the streaming request — 401/403/404 and similar).
+    UpgradeRejected,
+    /// Anything not yet classified.
+    Other,
+}
+
+impl ConnectErrorReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedMethod => "unsupported_method",
+            Self::RequestBody => "request_body",
+            Self::KubeconfigUnavailable => "kubeconfig_unavailable",
+            Self::KubeconfigParse => "kubeconfig_parse",
+            Self::UpstreamConfig => "upstream_config",
+            Self::LeaseLookup => "lease_lookup",
+            Self::UpstreamResponse => "upstream_response",
+            Self::UpgradeDial => "upgrade_dial",
+            Self::UpgradeTls => "upgrade_tls",
+            Self::UpgradeHandshake => "upgrade_handshake",
+            Self::UpgradeTimeout => "upgrade_timeout",
+            Self::UpgradeCapacity => "upgrade_capacity",
+            Self::UpgradeRejected => "upgrade_rejected",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Breakdown of connect-proxy failures by cause.
+///
+/// A SEPARATE counter rather than a new label on
+/// `kobe_connect_proxy_request_outcome_total`, so existing dashboards and
+/// alerts keyed on that metric keep working unchanged while the breakdown
+/// becomes available alongside them.
+pub static CONNECT_PROXY_ERROR_REASON_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_connect_proxy_error_reason_total",
+        "Connect-proxy failures by cause (closed set; see ConnectErrorReason)",
+        &["reason"]
+    )
+    .expect("register kobe_connect_proxy_error_reason_total")
+});
+
 /// Classify a `kube::Error` into a bounded [`BackendOpErrorReason`]. Maps HTTP
 /// status codes (403→Rbac, 404→NotFound, 409→Conflict) and transport failures
 /// (timeout/connect→Timeout/Io) onto the closed set; everything else is
@@ -1649,5 +1732,75 @@ mod tests {
         assert_eq!(ConnectOutcome::PhaseNotBound.as_str(), "phase_not_bound");
         assert_eq!(ConnectOutcome::Expired.as_str(), "expired");
         assert_eq!(ConnectOutcome::BackendError.as_str(), "backend_error");
+    }
+
+    // ── connect-proxy error classification (#106, #107) ────────────────
+
+    /// Every reason must render to a distinct, stable string. A duplicate would
+    /// silently merge two causes back into one bucket — the exact defect #106
+    /// exists to fix.
+    #[test]
+    fn connect_error_reasons_are_distinct() {
+        use std::collections::BTreeSet;
+        let all = [
+            ConnectErrorReason::UnsupportedMethod,
+            ConnectErrorReason::RequestBody,
+            ConnectErrorReason::KubeconfigUnavailable,
+            ConnectErrorReason::KubeconfigParse,
+            ConnectErrorReason::UpstreamConfig,
+            ConnectErrorReason::LeaseLookup,
+            ConnectErrorReason::UpstreamResponse,
+            ConnectErrorReason::UpgradeDial,
+            ConnectErrorReason::UpgradeTls,
+            ConnectErrorReason::UpgradeHandshake,
+            ConnectErrorReason::UpgradeTimeout,
+            ConnectErrorReason::UpgradeCapacity,
+            ConnectErrorReason::UpgradeRejected,
+            ConnectErrorReason::Other,
+        ];
+        let rendered: BTreeSet<&str> = all.iter().map(|r| r.as_str()).collect();
+        assert_eq!(rendered.len(), all.len(), "two reasons share a label");
+    }
+
+    /// Labels are a metric dimension, so they must stay low-cardinality and
+    /// Prometheus-safe: no spaces, no uppercase, no punctuation beyond `_`.
+    #[test]
+    fn connect_error_reason_labels_are_metric_safe() {
+        for r in [
+            ConnectErrorReason::UnsupportedMethod,
+            ConnectErrorReason::UpgradeDial,
+            ConnectErrorReason::UpgradeRejected,
+            ConnectErrorReason::Other,
+        ] {
+            let s = r.as_str();
+            assert!(!s.is_empty());
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "unsafe label: {s}"
+            );
+        }
+    }
+
+    /// The breakdown counter is deliberately SEPARATE from the outcome counter
+    /// so existing dashboards keyed on `kobe_connect_proxy_request_outcome_total`
+    /// keep working. Adding a `reason` label to that metric instead would have
+    /// changed its shape.
+    #[test]
+    fn error_reason_counter_is_separate_from_the_outcome_counter() {
+        let before = CONNECT_PROXY_ERROR_REASON_TOTAL
+            .with_label_values(&[ConnectErrorReason::UpgradeDial.as_str()])
+            .get();
+        CONNECT_PROXY_ERROR_REASON_TOTAL
+            .with_label_values(&[ConnectErrorReason::UpgradeDial.as_str()])
+            .inc();
+        assert_eq!(
+            CONNECT_PROXY_ERROR_REASON_TOTAL
+                .with_label_values(&[ConnectErrorReason::UpgradeDial.as_str()])
+                .get(),
+            before + 1
+        );
+        // The outcome counter still exposes exactly its original label set.
+        assert_eq!(ConnectOutcome::BackendError.as_str(), "backend_error");
+        assert_eq!(ConnectOutcome::Ok.as_str(), "ok");
     }
 }
