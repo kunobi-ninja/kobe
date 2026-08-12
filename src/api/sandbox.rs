@@ -1633,6 +1633,50 @@ fn build_sandbox_lease(
     }
 }
 
+/// Live lease ids carrying one alias, for this caller only.
+///
+/// The label selector is a prefilter, not the authorisation: the requester
+/// hash narrows the list, and each candidate is then re-checked against the
+/// complete principal tuple. A hash collision would otherwise be enough to
+/// reach another tenant's lease, and the hash is over caller-influenced
+/// values.
+///
+/// Terminal leases are excluded. An alias names something a caller can still
+/// use, and a released lease would otherwise shadow the live one they just
+/// created under the same name.
+pub(crate) async fn leases_with_alias(
+    client: &kube::Client,
+    namespace: &str,
+    alias: &str,
+    identity: &AuthIdentity,
+) -> Result<Vec<String>, kube::Error> {
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let params = ListParams::default().labels(&format!(
+        "{REQUESTER_HASH_LABEL}={},{SANDBOX_ALIAS_LABEL}={alias}",
+        principal_hash(identity)
+    ));
+    Ok(leases
+        .list(&params)
+        .await?
+        .into_iter()
+        .filter(|lease| principal_matches(&lease.spec.requester, identity))
+        .filter(|lease| lease.spec.alias.as_deref() == Some(alias))
+        .filter(|lease| {
+            !matches!(
+                lease
+                    .status
+                    .as_ref()
+                    .map(|status| status.phase)
+                    .unwrap_or_default(),
+                SandboxLeasePhase::Released
+                    | SandboxLeasePhase::Expired
+                    | SandboxLeasePhase::Quarantined
+            )
+        })
+        .map(|lease| lease.name_any())
+        .collect())
+}
+
 fn requester_list_params(identity: &AuthIdentity) -> ListParams {
     ListParams::default().labels(&format!(
         "{REQUESTER_HASH_LABEL}={}",

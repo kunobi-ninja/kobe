@@ -109,6 +109,9 @@ pub enum SandboxAccessDenied {
     /// The caller asked for a container or port the pool never declared.
     #[error("{what} is not part of this sandbox")]
     NotDeclared { what: &'static str },
+    /// More than one live lease carries the alias.
+    #[error("more than one sandbox uses this alias")]
+    AmbiguousAlias,
     #[error("sandbox lookup failed")]
     Backend,
 }
@@ -128,6 +131,7 @@ impl SandboxAccessDenied {
             Self::ProvenanceIncomplete => "provenance_incomplete",
             Self::PoolUnresolvable => "pool_unresolvable",
             Self::NotDeclared { .. } => "not_declared",
+            Self::AmbiguousAlias => "ambiguous_alias",
             Self::Backend => "backend_error",
         }
     }
@@ -143,6 +147,9 @@ impl SandboxAccessDenied {
             Self::NotReady { .. } | Self::TargetUnresolved => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
             Self::NotDeclared { .. } => StatusCode::BAD_REQUEST,
+            // 409 rather than 400: the request is well-formed, and the caller
+            // fixes it by changing their leases rather than their command.
+            Self::AmbiguousAlias => StatusCode::CONFLICT,
             Self::ProvenanceIncomplete | Self::PoolUnresolvable | Self::Backend => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -312,6 +319,45 @@ impl SandboxTarget {
     }
 }
 
+/// Whether a string is a lease id rather than an alias.
+///
+/// Lease ids are server-generated and always carry the `sbx-` prefix, so
+/// anything else is an alias. Decided by shape rather than by trying one and
+/// falling back to the other: a fallback would let a caller who names a lease
+/// that has just expired silently reach a *different* lease that happens to
+/// use that name as an alias, and find out from its side effects.
+pub fn looks_like_lease_id(value: &str) -> bool {
+    value.starts_with("sbx-")
+}
+
+/// Resolve a caller's alias to exactly one lease id.
+///
+/// Scoped to the caller, so one tenant's alias can never resolve to another's
+/// lease — aliases are chosen by callers, and two tenants picking `dev` is the
+/// expected case rather than a collision to break arbitrarily.
+///
+/// Ambiguity is **refused**, never resolved by picking the newest. A caller
+/// with two live leases under one alias has a state they need to see; silently
+/// choosing one means their next command lands somewhere they did not expect.
+pub async fn resolve_alias(
+    client: &kube::Client,
+    namespace: &str,
+    alias: &str,
+    identity: &crate::api::auth::AuthIdentity,
+) -> Result<String, SandboxAccessDenied> {
+    let candidates = crate::api::sandbox::leases_with_alias(client, namespace, alias, identity)
+        .await
+        .map_err(|_| SandboxAccessDenied::Backend)?;
+
+    match candidates.len() {
+        1 => Ok(candidates.into_iter().next().expect("length checked")),
+        // Indistinguishable from a lease that does not exist, for the same
+        // reason ownership failures are: the difference is enumerable.
+        0 => Err(SandboxAccessDenied::NotFound),
+        _ => Err(SandboxAccessDenied::AmbiguousAlias),
+    }
+}
+
 /// Resolve one operation, from an authenticated principal to an exact target.
 ///
 /// Ownership is established before anything else is read, and a lease that is
@@ -323,6 +369,16 @@ pub async fn resolve_sandbox_target(
     lease_name: &str,
     identity: &crate::api::auth::AuthIdentity,
 ) -> Result<(SandboxLease, SandboxTarget), SandboxAccessDenied> {
+    // An alias is turned into exactly one id before anything else happens, so
+    // every check below is against a real lease rather than a name that might
+    // mean several things.
+    let resolved = if looks_like_lease_id(lease_name) {
+        lease_name.to_string()
+    } else {
+        resolve_alias(client, namespace, lease_name, identity).await?
+    };
+    let lease_name = resolved.as_str();
+
     let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
     let lease = match leases.get(lease_name).await {
         Ok(lease) => lease,
@@ -1255,6 +1311,156 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "unfenced provenance is refused before anything is looked up"
+        );
+    }
+
+    fn alice() -> crate::api::auth::AuthIdentity {
+        crate::api::auth::AuthIdentity {
+            provider: "oidc".into(),
+            requester_type: "oidc:developer".into(),
+            issuer: "https://issuer.invalid".into(),
+            identity: "alice".into(),
+            policy: crate::api::policy::Policy {
+                allowed_pools: vec![],
+                max_ttl: chrono::Duration::hours(1),
+                max_concurrent_leases: 1,
+                default_priority: 50,
+                max_extensions: 0,
+                sandbox: None,
+            },
+        }
+    }
+
+    fn lease_item(name: &str, identity: &str, alias: &str, phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxLease",
+            "metadata": { "name": name, "namespace": "kobe", "uid": name },
+            "spec": {
+                "poolRef": { "name": "agents", "uid": "p", "generation": 1 },
+                "ttl": "1h",
+                "alias": alias,
+                "requester": {
+                    "provider": "oidc",
+                    "type": "oidc:developer",
+                    "issuer": "https://issuer.invalid",
+                    "identity": identity,
+                },
+            },
+            "status": { "phase": phase },
+        })
+    }
+
+    async fn alias_server(items: Vec<serde_json::Value>) -> (kube::Client, wiremock::MockServer) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "SandboxLeaseList",
+                "metadata": { "resourceVersion": "1" },
+                "items": items,
+            })))
+            .mount(&server)
+            .await;
+        (client, server)
+    }
+
+    /// An alias is never tried as an id, or an id as an alias.
+    ///
+    /// A fallback between the two is the dangerous shape: a caller naming a
+    /// lease that has just expired would silently reach a DIFFERENT lease that
+    /// happens to use that name as an alias.
+    #[test]
+    fn a_lease_id_and_an_alias_are_told_apart_by_shape() {
+        assert!(looks_like_lease_id("sbx-7f3a"));
+        for alias in ["dev", "my-sandbox", "sbx", "SBX-1", "x-sbx-1", ""] {
+            assert!(
+                !looks_like_lease_id(alias),
+                "{alias:?} must be treated as an alias"
+            );
+        }
+    }
+
+    /// Exactly one live lease resolves.
+    #[tokio::test]
+    async fn an_unambiguous_alias_resolves_to_its_lease() {
+        let (client, _server) =
+            alias_server(vec![lease_item("sbx-mine", "alice", "dev", "Ready")]).await;
+        assert_eq!(
+            resolve_alias(&client, "kobe", "dev", &alice())
+                .await
+                .unwrap(),
+            "sbx-mine"
+        );
+    }
+
+    /// Two live leases under one alias are refused, never guessed.
+    ///
+    /// Picking the newest would land a caller's next command somewhere they
+    /// did not expect, and they would find out from its side effects. 409
+    /// rather than 400: the request is well-formed, and the fix is to their
+    /// leases rather than to their command.
+    #[tokio::test]
+    async fn an_ambiguous_alias_is_refused_rather_than_guessed() {
+        let (client, _server) = alias_server(vec![
+            lease_item("sbx-one", "alice", "dev", "Ready"),
+            lease_item("sbx-two", "alice", "dev", "Provisioning"),
+        ])
+        .await;
+
+        let error = resolve_alias(&client, "kobe", "dev", &alice())
+            .await
+            .unwrap_err();
+        assert_eq!(error, SandboxAccessDenied::AmbiguousAlias);
+        assert_eq!(error.http_status(), axum::http::StatusCode::CONFLICT);
+        assert_eq!(error.reason_code(), "ambiguous_alias");
+    }
+
+    /// A released lease does not shadow the live one that replaced it.
+    ///
+    /// Reusing an alias after releasing is the ordinary workflow. If terminal
+    /// leases counted, every second use of an alias would be "ambiguous" — and
+    /// the feature would be unusable exactly when it is most wanted.
+    #[tokio::test]
+    async fn terminal_leases_do_not_shadow_a_live_alias() {
+        for terminal in ["Released", "Expired", "Quarantined"] {
+            let (client, _server) = alias_server(vec![
+                lease_item("sbx-old", "alice", "dev", terminal),
+                lease_item("sbx-new", "alice", "dev", "Ready"),
+            ])
+            .await;
+            assert_eq!(
+                resolve_alias(&client, "kobe", "dev", &alice())
+                    .await
+                    .unwrap(),
+                "sbx-new",
+                "a {terminal} lease must not shadow the live one"
+            );
+        }
+    }
+
+    /// The label prefilter is not the authorisation.
+    ///
+    /// The requester hash narrows the list; each candidate is then re-checked
+    /// against the complete principal tuple. The hash is over caller-
+    /// influenced values, so a collision would otherwise be enough to reach
+    /// another tenant's lease by aliasing it — and the answer is `NotFound`,
+    /// not a conflict, because a conflict would confirm it exists.
+    #[tokio::test]
+    async fn a_lease_that_survives_the_label_filter_is_still_checked() {
+        let (client, _server) =
+            alias_server(vec![lease_item("sbx-theirs", "mallory", "dev", "Ready")]).await;
+        assert_eq!(
+            resolve_alias(&client, "kobe", "dev", &alice())
+                .await
+                .unwrap_err(),
+            SandboxAccessDenied::NotFound,
+            "another principal's lease must not resolve, however it was labelled"
         );
     }
 

@@ -135,6 +135,31 @@ may have run. It is deliberately **not** reported as a failure, because a
 failure invites an automatic retry of something that may already have had
 effects. Deciding what to do is yours.
 
+## Aliases
+
+Any command that takes a lease id also takes an **alias** — the name you gave
+the sandbox when you created it:
+
+```bash
+kobe sandbox exec dev -- /agent status
+```
+
+Aliases are yours. Two people using `dev` never collide: resolution is scoped
+to the caller, so an alias can only ever name one of your own sandboxes.
+
+**Ambiguity is refused, not guessed.** If two of your live sandboxes share an
+alias, the command fails with `409` rather than picking one — a silent choice
+would land your next command somewhere you did not expect, and you would find
+out from its side effects.
+
+Released, expired and quarantined sandboxes do not count, so reusing an alias
+after releasing works the way you would expect.
+
+Anything starting with `sbx-` is treated as a lease id, never an alias. That
+is deliberate: falling back from one to the other would let a request for a
+just-expired lease silently reach a *different* sandbox that happens to use
+that name as an alias.
+
 ## Placement is invisible
 
 A `SandboxPool` may run its sandboxes in Kobe's own cluster or in a cluster
