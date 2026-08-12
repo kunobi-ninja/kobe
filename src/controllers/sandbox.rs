@@ -22,14 +22,20 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams,
+    PropagationPolicy,
+};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
 use kube::{Client, Resource, ResourceExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::api::sandbox::{SANDBOX_ADMISSION_ADMITTED, SANDBOX_ADMISSION_ANNOTATION};
+use crate::api::sandbox::{
+    SANDBOX_ADMISSION_ADMITTED, SANDBOX_ADMISSION_ANNOTATION,
+    SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION,
+};
 use crate::crd::{SandboxLease, SandboxPlacement, SandboxPool};
 use crate::sandbox::{
     AGENT_SANDBOX_API_VERSION, SANDBOX_CLAIM_KIND, SANDBOX_TEMPLATE_KIND, SANDBOX_WARM_POOL_KIND,
@@ -175,6 +181,14 @@ pub async fn reconcile_lease(
     {
         debug!(lease = %name, "not admitted; placement declines");
         return Ok(Action::await_change());
+    }
+
+    // Teardown is evaluated BEFORE the pool is resolved, and deliberately so.
+    // Release must work when the pool was edited or deleted outright — those
+    // are exactly the situations that strand capacity — so it must not sit
+    // behind a fence that a missing pool would fail.
+    if let Some(reason) = release_reason(&lease) {
+        return drive_release(&lease, &ctx, reason).await;
     }
 
     let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
@@ -326,6 +340,324 @@ pub async fn reconcile_lease(
     info!(lease = %name, "Sandbox lease Ready; runtime TTL started");
 
     Ok(Action::requeue(std::time::Duration::from_secs(30)))
+}
+
+/// Why a lease is being torn down, if it is.
+///
+/// Recorded on the lease so an operator reading a `Released` object can tell a
+/// caller who asked from a lease that simply ran out — they mean different
+/// things when someone is reconstructing what happened to a workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReason {
+    /// The caller asked. The API records intent as an annotation and never
+    /// touches status; turning that intent into teardown is this controller's
+    /// job, and until it runs the capacity is still held.
+    Requested,
+    /// The runtime TTL elapsed. The upstream `shutdownTime` backstop removes
+    /// the Sandbox itself, but nothing upstream knows about Kobe's quota
+    /// reservations — an expiry that only fired upstream would leak a slot
+    /// per lease, forever.
+    Expired,
+    /// Teardown was already under way and has not been proven complete.
+    InProgress,
+}
+
+impl ReleaseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "ReleaseRequested",
+            Self::Expired => "TtlElapsed",
+            Self::InProgress => "TeardownInProgress",
+        }
+    }
+
+    /// The terminal phase a verified teardown reaches.
+    ///
+    /// `Released` and `Expired` are both clean, but they are not
+    /// interchangeable: billing, quota reporting and support all care whether
+    /// a caller gave capacity back or had it taken.
+    fn terminal_phase(self) -> crate::crd::SandboxLeasePhase {
+        match self {
+            Self::Expired => crate::crd::SandboxLeasePhase::Expired,
+            _ => crate::crd::SandboxLeasePhase::Released,
+        }
+    }
+}
+
+/// Whether this lease should be torn down rather than placed.
+fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
+    let status = lease.status.clone().unwrap_or_default();
+    match status.phase {
+        // Terminal. Re-running teardown here would be a no-op at best and, if
+        // the name were later reused, would act on somebody else's footprint.
+        crate::crd::SandboxLeasePhase::Released
+        | crate::crd::SandboxLeasePhase::Expired
+        | crate::crd::SandboxLeasePhase::Quarantined => return None,
+        // Already releasing: teardown was interrupted and is not proven done.
+        crate::crd::SandboxLeasePhase::Releasing => return Some(ReleaseReason::InProgress),
+        _ => {}
+    }
+
+    if lease
+        .annotations()
+        .contains_key(SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION)
+    {
+        return Some(ReleaseReason::Requested);
+    }
+
+    // An unparseable expiry is NOT treated as expired. Deleting a live
+    // workload because a timestamp failed to parse is the more damaging
+    // reading of the same uncertainty; the lease stays put and stays visible.
+    let expires_at = status
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+    (chrono::Utc::now() >= expires_at).then_some(ReleaseReason::Expired)
+}
+
+/// Tear one lease down and give its capacity back — but only against proof.
+///
+/// The order is the point. The upstream claim is deleted, its absence is
+/// *verified*, and only then are the quota and alias reservations released.
+/// Releasing reservations first would let the freed slot be handed to the next
+/// caller while the previous Sandbox was still running, which is precisely the
+/// over-subscription the ledger exists to prevent.
+///
+/// Uncertainty quarantines rather than releases. A lease whose teardown cannot
+/// be verified keeps consuming its slot: under-counting capacity is recoverable
+/// by an operator, silently double-booking a Sandbox host is not.
+async fn drive_release(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: ReleaseReason,
+) -> Result<Action, SandboxPlacementError> {
+    use crate::crd::SandboxLeasePhase;
+
+    let name = lease.name_any();
+    let status = lease.status.clone().unwrap_or_default();
+
+    // Make the intent visible in status first. Until the phase moves, capacity
+    // accounting and the API both still read this as a live lease, and a
+    // teardown that crashed midway would look like one too.
+    if status.phase != SandboxLeasePhase::Releasing {
+        let phase = crate::sandbox::transition_sandbox_phase(
+            status.phase,
+            SandboxLeasePhase::Releasing,
+            false,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        patch_lease_status(
+            ctx,
+            &name,
+            &serde_json::json!({ "phase": phase, "message": reason.as_str() }),
+        )
+        .await?;
+        info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
+    }
+
+    let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
+    let claims: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &resource);
+    let claim = claim_name(&name);
+
+    // Foreground propagation: the claim must not report gone while the Sandbox
+    // it owns is still running, because that reported absence is what releases
+    // the caller's quota slot.
+    let delete = DeleteParams {
+        propagation_policy: Some(PropagationPolicy::Foreground),
+        ..Default::default()
+    };
+    match claims.delete(&claim, &delete).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        // Cannot even ask for deletion. Retry — this is not yet evidence of
+        // anything, and quarantining on a transient error would strand
+        // capacity that is fine.
+        Err(error) => {
+            warn!(lease = %name, error = %error, "could not delete upstream claim");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+    }
+
+    // Only a 404 proves absence. A successful DELETE means "accepted", and a
+    // claim mid-foreground-deletion is still very much there.
+    match claim_absence(&claims, &claim).await {
+        ClaimAbsence::Verified => {}
+        // Not gone yet. Foreground deletion takes as long as the Sandbox takes
+        // to stop, and "still deleting" is a normal state, not a fault. The
+        // lease stays in Releasing and keeps holding its slot meanwhile.
+        ClaimAbsence::StillPresent => {
+            debug!(lease = %name, "upstream claim still present; waiting for teardown");
+            return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+        }
+        // We are not permitted to look, and retrying will not grant the
+        // permission. This is durable uncertainty.
+        ClaimAbsence::Unverifiable => {
+            return quarantine_lease(lease, ctx, "claim_absence_unverifiable").await;
+        }
+    }
+
+    // The footprint is gone. Now, and only now, the slot goes back.
+    let uid = lease
+        .uid()
+        .ok_or_else(|| SandboxPlacementError::Invalid(format!("lease {name} has no UID")))?;
+    let reservations: Api<k8s_openapi::api::coordination::v1::Lease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    if let Err(error) =
+        crate::api::sandbox::release_reservations_for_lease(&reservations, &uid).await
+    {
+        // The Sandbox is gone but the slot is still booked. Retry rather than
+        // finish: a lease marked terminal with a live reservation leaks that
+        // slot with nothing left to reconcile it.
+        warn!(lease = %name, error = %error, "could not release admission reservations");
+        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+    }
+
+    let terminal = crate::sandbox::transition_sandbox_phase(
+        SandboxLeasePhase::Releasing,
+        reason.terminal_phase(),
+        true,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    patch_lease_status(
+        ctx,
+        &name,
+        &serde_json::json!({
+            "phase": terminal,
+            "conditions": with_cleanup_condition(
+                lease,
+                crate::crd::SandboxConditionStatus::True,
+                "TeardownVerified",
+                "Upstream SandboxClaim observed absent and reservations released",
+            ),
+        }),
+    )
+    .await?;
+    info!(lease = %name, phase = %terminal, "Sandbox lease teardown verified");
+    Ok(Action::await_change())
+}
+
+/// What one absence check established.
+///
+/// Three outcomes, not two, because "still there" and "cannot tell" call for
+/// opposite responses: the first is a normal step in a deletion that is still
+/// running, the second means the evidence will never arrive. Collapsing them
+/// would either quarantine every healthy teardown or release capacity on the
+/// strength of an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimAbsence {
+    /// Observed absent. The only outcome that releases capacity.
+    Verified,
+    /// Still responding — including mid-deletion, with a `deletionTimestamp`.
+    StillPresent,
+    /// The question could not be answered and retrying will not change that.
+    Unverifiable,
+}
+
+/// Whether the upstream claim is provably gone.
+///
+/// Absence is proven by a 404 and nothing else. Reading "I could not check" as
+/// "it is gone" is how a live Sandbox's capacity gets handed to somebody else.
+async fn claim_absence(claims: &Api<DynamicObject>, claim: &str) -> ClaimAbsence {
+    match claims.get(claim).await {
+        Ok(_) => ClaimAbsence::StillPresent,
+        Err(kube::Error::Api(error)) if error.code == 404 => ClaimAbsence::Verified,
+        // Not permitted to look. Retrying will not grant the permission, so
+        // this is durable uncertainty rather than a transient failure.
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            ClaimAbsence::Unverifiable
+        }
+        // Anything else — a 500, a timeout, a torn connection — may well clear
+        // on its own. Treat it as "not yet" and come back; the lease keeps
+        // holding its capacity in the meantime, so waiting costs correctness
+        // nothing.
+        Err(_) => ClaimAbsence::StillPresent,
+    }
+}
+
+/// Hold a lease whose teardown could not be proven.
+///
+/// `Quarantined` still consumes capacity, on purpose: an operator can see and
+/// reconcile an under-counted pool, but nobody can see a Sandbox that was
+/// quietly double-booked.
+async fn quarantine_lease(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: &str,
+) -> Result<Action, SandboxPlacementError> {
+    let name = lease.name_any();
+    let phase = crate::sandbox::transition_sandbox_phase(
+        lease
+            .status
+            .as_ref()
+            .map(|status| status.phase)
+            .unwrap_or_default(),
+        crate::crd::SandboxLeasePhase::Quarantined,
+        false,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    patch_lease_status(
+        ctx,
+        &name,
+        &serde_json::json!({
+            "phase": phase,
+            "conditions": with_cleanup_condition(
+                lease,
+                crate::crd::SandboxConditionStatus::False,
+                reason,
+                "Teardown could not be verified; capacity is withheld",
+            ),
+        }),
+    )
+    .await?;
+    warn!(lease = %name, reason, "Sandbox lease quarantined; capacity withheld");
+    Ok(Action::requeue(std::time::Duration::from_secs(300)))
+}
+
+const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
+
+/// Build the whole condition list, with `CleanupVerified` upserted into it.
+///
+/// The full list is rebuilt because the status patch is a JSON merge patch,
+/// which REPLACES an array rather than merging it: sending one condition alone
+/// would silently drop every other condition on the lease.
+///
+/// `lastTransitionTime` moves only when the status actually changes, per the
+/// Kubernetes convention — a timestamp that advanced on every requeue would
+/// make a condition that has been stable for an hour look like it just
+/// flipped.
+fn with_cleanup_condition(
+    lease: &SandboxLease,
+    status: crate::crd::SandboxConditionStatus,
+    reason: &str,
+    message: &str,
+) -> Vec<crate::crd::SandboxCondition> {
+    let existing = lease
+        .status
+        .as_ref()
+        .map(|status| status.conditions.clone())
+        .unwrap_or_default();
+    let previous = existing
+        .iter()
+        .find(|condition| condition.condition_type == CLEANUP_VERIFIED_CONDITION);
+    let last_transition_time = match previous {
+        Some(previous) if previous.status == status => previous.last_transition_time.clone(),
+        _ => Some(chrono::Utc::now().to_rfc3339()),
+    };
+
+    let mut conditions: Vec<_> = existing
+        .into_iter()
+        .filter(|condition| condition.condition_type != CLEANUP_VERIFIED_CONDITION)
+        .collect();
+    conditions.push(crate::crd::SandboxCondition {
+        condition_type: CLEANUP_VERIFIED_CONDITION.into(),
+        status,
+        reason: reason.to_string(),
+        message: message.to_string(),
+        observed_generation: lease.metadata.generation,
+        last_transition_time,
+    });
+    conditions
 }
 
 /// The readiness instant already persisted on a Ready lease, if any.
@@ -875,6 +1207,431 @@ mod tests {
                 .is_empty(),
             "placement must decline before it touches the API at all"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Teardown
+    // -----------------------------------------------------------------------
+
+    const RESERVATIONS_PATH: &str = "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases";
+
+    fn releasing_lease(phase: crate::crd::SandboxLeasePhase) -> SandboxLease {
+        let mut lease = admitted_lease();
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        lease.status.as_mut().unwrap().phase = phase;
+        lease
+    }
+
+    fn phase_of(request: &wiremock::Request) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+        body.get("status")?
+            .get("phase")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    async fn recorded_phases(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .filter_map(phase_of)
+            .collect()
+    }
+
+    /// Mount the status PATCH and the reservation list/delete a teardown needs.
+    async fn mount_teardown_scaffolding(server: &MockServer) {
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "SandboxLease",
+                "metadata": { "name": LEASE, "namespace": NS },
+                "spec": admitted_lease().spec,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(RESERVATIONS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "LeaseList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [{
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": {
+                        "name": "sbx-quota-abc-0",
+                        "namespace": NS,
+                        "uid": "reservation-uid-1",
+                    },
+                }],
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "sbx-quota-abc-0", "namespace": NS },
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Capacity comes back only against proof that the Sandbox is gone.
+    ///
+    /// The quota slot is what stops a pool being over-subscribed. Returning it
+    /// while the workload is still running would let the next caller be placed
+    /// onto capacity that is still occupied — so the reservation is released
+    /// only after the claim is observed absent, never merely after a DELETE was
+    /// accepted.
+    #[tokio::test]
+    async fn capacity_returns_only_once_the_claim_is_proven_gone() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await,
+            vec!["Releasing".to_string(), "Released".to_string()],
+            "intent must be visible in status before the terminal write"
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            1,
+            "the quota slot must be handed back"
+        );
+    }
+
+    /// A claim that is still there is "not yet", not "gone" and not "broken".
+    ///
+    /// Foreground deletion takes as long as the Sandbox takes to stop. If that
+    /// window released the quota slot, a pool would be over-subscribed for
+    /// exactly as long as teardown takes — the busiest possible moment. The
+    /// lease stays in Releasing and keeps holding its capacity.
+    #[tokio::test]
+    async fn a_claim_still_being_deleted_holds_its_capacity() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        // Present, with a deletionTimestamp: accepted, not finished.
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION,
+                "kind": SANDBOX_CLAIM_KIND,
+                "metadata": {
+                    "name": "kobe-sbx-1",
+                    "namespace": NS,
+                    "deletionTimestamp": "2026-01-01T00:00:00Z",
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_ne!(
+            action,
+            Action::await_change(),
+            "teardown must be re-checked"
+        );
+
+        assert_eq!(
+            recorded_phases(&server).await,
+            vec!["Releasing".to_string()],
+            "no terminal phase while the Sandbox may still be running"
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            0,
+            "capacity must not be handed back while the claim is still present"
+        );
+    }
+
+    /// Uncertain teardown quarantines; it never releases.
+    ///
+    /// If Kobe is not permitted to look, no amount of retrying produces the
+    /// evidence. Under-counting a pool is something an operator can see and
+    /// fix; a Sandbox quietly double-booked onto released capacity is not.
+    #[tokio::test]
+    async fn an_unverifiable_teardown_quarantines_rather_than_releasing() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 403, "reason": "Forbidden"
+            })))
+            .mount(&server)
+            .await;
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        let phases = recorded_phases(&server).await;
+        assert_eq!(
+            phases.last().map(String::as_str),
+            Some("Quarantined"),
+            "expected quarantine, got {phases:?}"
+        );
+        assert!(
+            !phases
+                .iter()
+                .any(|phase| phase == "Released" || phase == "Expired"),
+            "an unproven teardown must never reach a clean terminal phase"
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            0,
+            "capacity is withheld precisely because teardown is unproven"
+        );
+    }
+
+    /// An elapsed TTL ends as `Expired`, not `Released`.
+    ///
+    /// The upstream shutdown backstop stops the Sandbox, but nothing upstream
+    /// knows about Kobe's quota ledger — without this path every expiry would
+    /// leak a slot. The phases are distinct because giving capacity back and
+    /// having it taken are different events to anyone reading the history.
+    #[tokio::test]
+    async fn an_elapsed_ttl_expires_the_lease_and_frees_its_slot() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await,
+            vec!["Releasing".to_string(), "Expired".to_string()]
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            1
+        );
+    }
+
+    /// A lease that is not being torn down is placed, and one that is, is not.
+    ///
+    /// Terminal leases are excluded outright: re-running teardown against a
+    /// name that may since have been reused would act on somebody else's
+    /// footprint.
+    #[test]
+    fn only_live_leases_are_torn_down_and_only_once() {
+        use crate::crd::SandboxLeasePhase;
+
+        assert_eq!(
+            release_reason(&admitted_lease()),
+            None,
+            "a live lease is placed"
+        );
+
+        assert_eq!(
+            release_reason(&releasing_lease(SandboxLeasePhase::Ready)),
+            Some(ReleaseReason::Requested)
+        );
+        assert_eq!(
+            release_reason(&releasing_lease(SandboxLeasePhase::Releasing)),
+            Some(ReleaseReason::InProgress),
+            "an interrupted teardown resumes"
+        );
+
+        for terminal in [
+            SandboxLeasePhase::Released,
+            SandboxLeasePhase::Expired,
+            SandboxLeasePhase::Quarantined,
+        ] {
+            assert_eq!(
+                release_reason(&releasing_lease(terminal)),
+                None,
+                "{terminal} is terminal and must not be torn down again"
+            );
+        }
+
+        // Quarantine is deliberately terminal here: exiting it is an operator
+        // decision backed by evidence, not something a requeue may do.
+        assert_eq!(
+            ReleaseReason::Expired.terminal_phase(),
+            SandboxLeasePhase::Expired
+        );
+        assert_eq!(
+            ReleaseReason::Requested.terminal_phase(),
+            SandboxLeasePhase::Released
+        );
+    }
+
+    /// An unparseable expiry must not be read as expired.
+    ///
+    /// Both readings are wrong in some sense, but they are not equally wrong:
+    /// treating garbage as "expired" destroys a workload the caller is still
+    /// using, while treating it as "not expired" leaves a visible lease an
+    /// operator can act on.
+    #[test]
+    fn a_malformed_expiry_does_not_destroy_a_live_lease() {
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Ready;
+
+        for value in ["", "not-a-timestamp", "0", "1970-13-45T99:99:99Z"] {
+            lease.status.as_mut().unwrap().expires_at = Some(value.to_string());
+            assert_eq!(release_reason(&lease), None, "must not expire on {value:?}");
+        }
+
+        lease.status.as_mut().unwrap().expires_at =
+            Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        assert_eq!(
+            release_reason(&lease),
+            None,
+            "a future expiry is not expiry"
+        );
+    }
+
+    /// A cleanup condition must not silently drop the others.
+    ///
+    /// Status is written with a JSON merge patch, which REPLACES arrays. A
+    /// patch carrying one condition would erase every other condition on the
+    /// lease — and conditions are exactly what an operator reads to work out
+    /// what happened.
+    #[test]
+    fn writing_the_cleanup_condition_preserves_the_others() {
+        use crate::crd::SandboxConditionStatus;
+
+        let mut lease = admitted_lease();
+        let unrelated = crate::crd::SandboxCondition {
+            condition_type: "Admitted".into(),
+            status: SandboxConditionStatus::True,
+            reason: "QuotaCommitted".into(),
+            message: "reserved".into(),
+            observed_generation: Some(1),
+            last_transition_time: Some("2026-01-01T00:00:00Z".into()),
+        };
+        lease.status.as_mut().unwrap().conditions = vec![unrelated.clone()];
+
+        let conditions = with_cleanup_condition(
+            &lease,
+            SandboxConditionStatus::True,
+            "TeardownVerified",
+            "ok",
+        );
+        assert!(
+            conditions.contains(&unrelated),
+            "unrelated conditions survive"
+        );
+        assert_eq!(conditions.len(), 2);
+
+        // Rewriting an unchanged condition must not restamp its transition
+        // time: a timestamp that moved on every requeue would make a condition
+        // stable for an hour look like it just flipped.
+        lease.status.as_mut().unwrap().conditions = conditions.clone();
+        let again = with_cleanup_condition(
+            &lease,
+            SandboxConditionStatus::True,
+            "TeardownVerified",
+            "ok",
+        );
+        assert_eq!(
+            again.len(),
+            2,
+            "the condition is upserted, never duplicated"
+        );
+        let before = conditions
+            .iter()
+            .find(|c| c.condition_type == CLEANUP_VERIFIED_CONDITION)
+            .unwrap();
+        let after = again
+            .iter()
+            .find(|c| c.condition_type == CLEANUP_VERIFIED_CONDITION)
+            .unwrap();
+        assert_eq!(before.last_transition_time, after.last_transition_time);
+
+        // A real flip does restamp.
+        let flipped = with_cleanup_condition(
+            &lease,
+            SandboxConditionStatus::False,
+            "Unverifiable",
+            "held",
+        );
+        let flipped = flipped
+            .iter()
+            .find(|c| c.condition_type == CLEANUP_VERIFIED_CONDITION)
+            .unwrap();
+        assert_ne!(flipped.last_transition_time, after.last_transition_time);
     }
 
     /// The pinned upstream version must match what #72 validates at startup.

@@ -38,7 +38,7 @@ const SANDBOX_ALIAS_LABEL: &str = "kobe.kunobi.ninja/alias";
 const SANDBOX_POOL_CRD: &str = "sandboxpools.kobe.kunobi.ninja";
 const SANDBOX_LEASE_CRD: &str = "sandboxleases.kobe.kunobi.ninja";
 const SANDBOX_RESERVATION_TYPE_LABEL: &str = "kobe.kunobi.ninja/sandbox-reservation";
-const SANDBOX_RESERVATION_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
+pub(crate) const SANDBOX_RESERVATION_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 const SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
 const SANDBOX_RESERVATION_QUOTA: &str = "quota";
 const SANDBOX_RESERVATION_ALIAS: &str = "alias";
@@ -1168,7 +1168,7 @@ async fn release_admission_reservations(
 /// Used on the cleanup path, where we hold the lease rather than the list of
 /// reservations we created. Selecting on the UID label (not the name) is what
 /// keeps a recreated same-named lease from dropping its predecessor's slots.
-async fn release_reservations_for_lease(
+pub(crate) async fn release_reservations_for_lease(
     reservations: &Api<Lease>,
     lease_uid: &str,
 ) -> Result<(), SandboxLeaseMutationError> {
@@ -1274,7 +1274,7 @@ fn validate_lease_shape(
 }
 
 #[derive(Debug, Error)]
-enum SandboxLeaseMutationError {
+pub(crate) enum SandboxLeaseMutationError {
     #[error("SandboxLease has no UID")]
     MissingUid,
     #[error("SandboxLease has no resourceVersion")]

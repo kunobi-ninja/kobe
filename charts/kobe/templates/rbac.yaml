@@ -104,10 +104,16 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # Leader election
+  # Leader election, and the Sandbox admission ledger.
+  #
+  # `list` and `delete` are what teardown needs: a released lease is found by
+  # its `sandbox-lease-uid` label (a LIST, because the controller holds the
+  # lease and not the reservation names it created), and each reservation is
+  # deleted under a UID precondition. Without both, a lease could be torn
+  # down and still hold its quota slot, with nothing left to reconcile it.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update", "patch"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
   # CRD discovery (Velero detection)
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
