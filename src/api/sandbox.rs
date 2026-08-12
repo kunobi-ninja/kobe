@@ -811,6 +811,84 @@ fn pending_lease_is_abandoned(
     (now - created_at.with_timezone(&chrono::Utc)).num_seconds() >= SANDBOX_PENDING_DEADLINE_SECS
 }
 
+/// Background sweep that reclaims abandoned admission state for every principal.
+///
+/// The create-path sweep only helps a caller who comes back. A principal whose
+/// request died mid-admission and who never calls create again keeps their
+/// quota slot and alias consumed indefinitely — and an operator has no way to
+/// see it, because the lease looks like an ordinary `pending` object that no
+/// controller will ever touch (placement ignores anything not `admitted`).
+///
+/// This runs on the operator, so recovery no longer depends on the victim
+/// retrying. Same fences as the create-path sweep: only leases past the
+/// deadline, deleted under UID + resourceVersion preconditions, releasing only
+/// reservations whose names derive from that lease's own principal.
+///
+/// Deliberately does NOT need the Sandbox placement controller (#73) — it
+/// operates purely on the admission objects this module owns, so it can ship
+/// while placement is still blocked.
+pub async fn run_sandbox_admission_reaper(
+    client: kube::Client,
+    namespace: &str,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let reservations: Api<Lease> = Api::namespaced(client, namespace);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {},
+            _ = shutdown.cancelled() => {
+                info!("Sandbox admission reaper shutting down");
+                return;
+            },
+        }
+
+        let now = chrono::Utc::now();
+        let all = match leases.list(&ListParams::default()).await {
+            Ok(list) => list,
+            Err(error) => {
+                warn!(error = %error, "Sandbox admission reaper could not list leases");
+                continue;
+            }
+        };
+
+        for lease in all.items {
+            if lease
+                .annotations()
+                .get(SANDBOX_ADMISSION_ANNOTATION)
+                .map(String::as_str)
+                != Some(SANDBOX_ADMISSION_PENDING)
+            {
+                continue;
+            }
+            if !pending_lease_is_abandoned(
+                lease
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|timestamp| timestamp.0.to_string())
+                    .as_deref(),
+                now,
+            ) {
+                continue;
+            }
+            match delete_exact_pending_lease(&leases, &reservations, &lease).await {
+                Ok(()) => info!(
+                    lease_id = %lease.name_any(),
+                    "Reaped an abandoned unadmitted Sandbox lease and released its quota"
+                ),
+                Err(error) => warn!(
+                    lease_id = %lease.name_any(),
+                    error = %error,
+                    "Could not reap an abandoned unadmitted Sandbox lease; will retry"
+                ),
+            }
+        }
+    }
+}
+
 /// Release quota and aliases stranded by a request that died mid-admission.
 ///
 /// Reservations are created before the lease is admitted, and they are owned by
@@ -1086,10 +1164,20 @@ async fn acquire_admission_reservations(
             .create(&PostParams::default(), &reservation)
             .await
         {
-            Ok(created) => acquired.push(AdmissionReservation {
-                name: created.name_any(),
-                uid: created.uid().unwrap_or_default(),
-            }),
+            Ok(created) => {
+                // An empty UID would make every later release fail its
+                // precondition with 409, which the release path treats as
+                // "ours is already gone" — silently stranding the slot.
+                // Refuse rather than acquire something we can never release.
+                let Some(uid) = created.uid() else {
+                    rollback_partial_reservations(reservations, &acquired).await;
+                    return Err(AdmissionReservationError::MissingLeaseUid);
+                };
+                acquired.push(AdmissionReservation {
+                    name: created.name_any(),
+                    uid,
+                });
+            }
             Err(kube::Error::Api(error)) if error.code == 409 => {
                 return Err(AdmissionReservationError::AliasTaken);
             }
@@ -1137,9 +1225,15 @@ async fn acquire_admission_reservations(
             .await
         {
             Ok(created) => {
+                // Same reasoning as the alias arm: a reservation we cannot
+                // name by UID is one we can never release.
+                let Some(uid) = created.uid() else {
+                    rollback_partial_reservations(reservations, &acquired).await;
+                    return Err(AdmissionReservationError::MissingLeaseUid);
+                };
                 acquired.push(AdmissionReservation {
                     name: created.name_any(),
-                    uid: created.uid().unwrap_or_default(),
+                    uid,
                 });
                 slot_taken = true;
                 break;
@@ -2334,6 +2428,87 @@ mod tests {
         assert!(
             held.lock().unwrap().contains_key(&contested),
             "the current owner's reservation must survive a stale release"
+        );
+    }
+
+    /// The durable reaper must reclaim a stranded lease belonging to a
+    /// principal who never comes back.
+    ///
+    /// The create-path sweep only helps a caller who retries. This is the case
+    /// it cannot cover: the request died mid-admission and nobody returns, so
+    /// the quota slot and alias stay consumed with no controller willing to
+    /// touch the `pending` lease.
+    ///
+    /// Driving the whole background loop would mean waiting on its interval, so
+    /// this exercises the same decision and the same fenced deletion the loop
+    /// performs per lease.
+    #[tokio::test]
+    async fn the_reaper_reclaims_a_lease_whose_principal_never_returns() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let principal = principal_hash(&identity());
+        let stranded_uid = "sandbox-orphan-uid";
+
+        let held = mount_reservation_api_owned(
+            &server,
+            &[(
+                quota_reservation_name(&principal, 0),
+                stranded_uid.to_string(),
+            )],
+        )
+        .await;
+
+        let abandoned = {
+            let mut object = lease_json("sandbox-orphan", "alice@example.com", "Pending");
+            object["metadata"]["uid"] = serde_json::json!(stranded_uid);
+            object["metadata"]["creationTimestamp"] =
+                serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339());
+            object["metadata"]["annotations"] = serde_json::json!({
+                SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_PENDING
+            });
+            object
+        };
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-orphan",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(abandoned.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-orphan",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Success"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, "test-ns");
+        let lease: SandboxLease = serde_json::from_value(abandoned).unwrap();
+
+        // The reaper's per-lease decision: past the deadline, so reclaim it.
+        assert!(pending_lease_is_abandoned(
+            lease
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|timestamp| timestamp.0.to_string())
+                .as_deref(),
+            chrono::Utc::now()
+        ));
+        delete_exact_pending_lease(&leases, &reservations, &lease)
+            .await
+            .expect("the reaper must be able to reclaim it");
+
+        let remaining = held.lock().unwrap().clone();
+        assert!(
+            remaining.is_empty(),
+            "the stranded principal's quota must be released even though they never retried:              {remaining:?}"
         );
     }
 

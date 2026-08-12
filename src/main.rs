@@ -209,6 +209,25 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    // Start the Sandbox admission reaper. Reservations are created before a
+    // SandboxLease is admitted and are garbage-collected only when that lease
+    // is DELETED — so a request that dies in between leaves a `pending` lease
+    // no controller will ever touch, with its quota slot and alias consumed
+    // forever. Recovery cannot depend on the affected caller retrying, so this
+    // sweeps for every principal. Independent of Sandbox placement (#73): it
+    // only touches admission objects.
+    let sandbox_reaper_client = client.clone();
+    let sandbox_reaper_ns = namespace.clone();
+    let sandbox_reaper_shutdown = shutdown.clone();
+    let sandbox_reaper_handle = tokio::spawn(async move {
+        api::sandbox::run_sandbox_admission_reaper(
+            sandbox_reaper_client,
+            &sandbox_reaper_ns,
+            sandbox_reaper_shutdown,
+        )
+        .await;
+    });
+
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
     // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller
     // creates one claim per `ClusterInstance` (with ownerReference);
@@ -272,6 +291,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("IPAM controller exited unexpectedly"),
                     Err(e) => error!("IPAM controller panicked: {e}"),
+                }
+            }
+            result = sandbox_reaper_handle => {
+                match result {
+                    Ok(()) => warn!("Sandbox admission reaper exited unexpectedly"),
+                    Err(e) => error!("Sandbox admission reaper panicked: {e}"),
                 }
             }
             result = health_handle => {
