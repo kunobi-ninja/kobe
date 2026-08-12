@@ -59,6 +59,21 @@ pub enum SandboxPlacementError {
     Mapping(#[from] crate::sandbox::SandboxMappingError),
     #[error("{0}")]
     Invalid(String),
+    #[error(transparent)]
+    ChildPlacement(#[from] crate::controllers::sandbox_child::ChildPlacementError),
+}
+
+impl SandboxPlacementError {
+    /// Bounded reason code for logs and metrics, so a child composition failure
+    /// is countable by cause rather than only by message.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Kubernetes(_) => "kubernetes",
+            Self::Mapping(_) => "mapping",
+            Self::Invalid(_) => "invalid",
+            Self::ChildPlacement(error) => error.reason_code(),
+        }
+    }
 }
 
 /// Names are derived, never taken from caller input, so one pool's objects can
@@ -106,6 +121,52 @@ async fn apply_upstream(
     .await
 }
 
+/// Apply one pool's `SandboxTemplate` and `SandboxWarmPool` into a cluster.
+///
+/// Shared by management placement and by child composition, so the two cannot
+/// drift into projecting a pool differently — #76 asks for equivalent
+/// semantics across placements, and equivalence built from one code path is
+/// the only kind that stays true.
+///
+/// `owner` is `None` in a child cluster, and that is not an oversight: an owner
+/// reference names an object *in the same cluster*, so a reference to a
+/// management-cluster `SandboxPool` would name nothing there and Kubernetes
+/// garbage collection would delete the template immediately. A child cluster's
+/// objects are bounded by the cluster's own lifetime instead — it is torn down
+/// whole.
+async fn ensure_upstream_pool_objects(
+    client: &Client,
+    namespace: &str,
+    pool_name: &str,
+    spec: &crate::crd::SandboxPoolSpec,
+    owner: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+) -> Result<(), SandboxPlacementError> {
+    let template = build_sandbox_template(&template_name(pool_name), namespace, spec, owner)?;
+    apply_upstream(
+        client,
+        namespace,
+        &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+        &template,
+    )
+    .await?;
+
+    let warm_pool = build_sandbox_warm_pool(
+        &warm_pool_name(pool_name),
+        namespace,
+        &template_name(pool_name),
+        spec.warm_capacity,
+        owner,
+    )?;
+    apply_upstream(
+        client,
+        namespace,
+        &upstream_resource(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
+        &warm_pool,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Reconcile one `SandboxPool` into its controller-owned upstream objects.
 ///
 /// Child-placement pools are skipped entirely: composing a child cluster is
@@ -126,32 +187,13 @@ pub async fn reconcile_pool(
         SandboxPlacementError::Invalid(format!("SandboxPool {name} has no UID to own its objects"))
     })?;
 
-    let template = build_sandbox_template(
-        &template_name(&name),
+    ensure_upstream_pool_objects(
+        &ctx.client,
         &ctx.namespace,
+        &name,
         &pool.spec,
+        // Owner-referenced here, where the parent SandboxPool actually exists.
         Some(&owner),
-    )?;
-    apply_upstream(
-        &ctx.client,
-        &ctx.namespace,
-        &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
-        &template,
-    )
-    .await?;
-
-    let warm_pool = build_sandbox_warm_pool(
-        &warm_pool_name(&name),
-        &ctx.namespace,
-        &template_name(&name),
-        pool.spec.warm_capacity,
-        Some(&owner),
-    )?;
-    apply_upstream(
-        &ctx.client,
-        &ctx.namespace,
-        &upstream_resource(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
-        &warm_pool,
     )
     .await?;
 
@@ -216,24 +258,41 @@ pub async fn reconcile_lease(
         )));
     }
 
-    if !matches!(pool.spec.placement, SandboxPlacement::Management {}) {
-        debug!(lease = %name, "child placement is #74's; declining");
-        return Ok(Action::await_change());
-    }
+    // Where this lease's Sandbox actually runs. Management placement uses the
+    // operator's own cluster; child placement composes an exclusive one, which
+    // may not be ready yet — in which case there is nothing to place into.
+    let target = match &pool.spec.placement {
+        SandboxPlacement::Management {} => Target {
+            client: ctx.client.clone(),
+            namespace: ctx.namespace.clone(),
+            // The parent SandboxPool and SandboxLease live in this cluster, so
+            // upstream objects can be owned by them.
+            owned: true,
+        },
+        SandboxPlacement::ChildCluster { cluster_pool_ref } => {
+            match compose_child_target(&lease, &pool, cluster_pool_ref, &ctx).await? {
+                ChildTarget::Ready(target) => target,
+                ChildTarget::Pending(action) => return Ok(action),
+            }
+        }
+    };
 
     let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to own its claim"))
     })?;
     let claim = build_sandbox_claim(
         &claim_name(&name),
-        &ctx.namespace,
+        &target.namespace,
         &warm_pool_name(&pool.name_any()),
-        Some(&owner),
+        // See `ensure_upstream_pool_objects`: an owner reference names an
+        // object in the SAME cluster, so in a child it would name nothing and
+        // the claim would be garbage-collected on sight.
+        target.owned.then_some(&owner),
     );
 
     let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
     let claims: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &resource);
+        Api::namespaced_with(target.client.clone(), &target.namespace, &resource);
     match claims.create(&PostParams::default(), &claim).await {
         Ok(_) => info!(lease = %name, "created upstream SandboxClaim"),
         // Already placed. One claim per lease is the invariant, and this
@@ -266,8 +325,8 @@ pub async fn reconcile_lease(
     let status = lease.status.clone().unwrap_or_default();
     if !canary_already_passed(&status) {
         let outcome = crate::controllers::sandbox_canary::evaluate_readiness_canary(
-            &ctx.client,
-            &ctx.namespace,
+            &target.client,
+            &target.namespace,
             &claim,
             &pool.spec.template.default_container,
             &pool.spec.readiness.canary,
@@ -505,6 +564,18 @@ async fn drive_release(
         info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
     }
 
+    // A child-placed lease is torn down by destroying its cluster, not by
+    // deleting a claim from here.
+    //
+    // This is not an optimisation. The claim lives in the child cluster, so
+    // deleting it against the management cluster would 404 — and a 404 is
+    // exactly what this path treats as proof of absence. The quota slot would
+    // be handed to the next caller while the previous tenant's Sandbox was
+    // still running in a cluster nobody had touched.
+    if is_child_placed(&status) {
+        return release_child_composition(lease, ctx, reason).await;
+    }
+
     let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
     let claims: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &resource);
@@ -548,6 +619,23 @@ async fn drive_release(
     }
 
     // The footprint is gone. Now, and only now, the slot goes back.
+    finish_release(lease, ctx, reason).await
+}
+
+/// Release the admission reservations and reach the terminal phase.
+///
+/// Only ever called once the footprint has been *proven* absent — by the claim
+/// for management placement, by the child cluster for a composition. Both
+/// placements share this tail so their release semantics cannot drift apart,
+/// which is the equivalence #76 sets out to prove.
+async fn finish_release(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: ReleaseReason,
+) -> Result<Action, SandboxPlacementError> {
+    use crate::crd::SandboxLeasePhase;
+
+    let name = lease.name_any();
     let uid = lease
         .uid()
         .ok_or_else(|| SandboxPlacementError::Invalid(format!("lease {name} has no UID")))?;
@@ -578,13 +666,102 @@ async fn drive_release(
                 lease,
                 crate::crd::SandboxConditionStatus::True,
                 "TeardownVerified",
-                "Upstream SandboxClaim observed absent and reservations released",
+                "Lease-owned footprint observed absent and reservations released",
             ),
         }),
     )
     .await?;
     info!(lease = %name, phase = %terminal, "Sandbox lease teardown verified");
     Ok(Action::await_change())
+}
+
+/// Whether this lease's Sandbox runs in a composed child cluster.
+///
+/// Read from the *resolved* placement recorded on status rather than from the
+/// pool spec, because teardown must remain correct when the pool was since
+/// edited or deleted — the question is where this lease was actually placed,
+/// not where a pool of that name would place a lease today.
+fn is_child_placed(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    matches!(
+        status.placement,
+        Some(crate::crd::ResolvedSandboxPlacement::ChildCluster { .. })
+    )
+}
+
+/// Tear down a child composition by destroying its cluster.
+///
+/// The internal `ClusterLease` was created with `CleanupMode::VerifiedDestroy`,
+/// so releasing it is what puts #80's machinery to work: the cluster's
+/// footprint must be observed gone before its capacity returns to the
+/// `ClusterPool`. Destroying the cluster destroys the Sandbox inside it, which
+/// is why this replaces — rather than accompanies — the claim delete.
+///
+/// The quota slot is released only once the internal lease is observed absent.
+/// Anything less would return capacity while a tenant's cluster was still
+/// running.
+async fn release_child_composition(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: ReleaseReason,
+) -> Result<Action, SandboxPlacementError> {
+    let name = lease.name_any();
+    let status = lease.status.clone().unwrap_or_default();
+
+    // Act on the exact recorded identity. A same-named ClusterLease composed
+    // for a later Sandbox is somebody else's cluster, and deleting it would
+    // destroy a running tenant's work.
+    let Some(recorded) = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_lease.as_ref())
+    else {
+        // Nothing was ever composed — the lease was released before it got a
+        // cluster. There is no footprint to prove absent.
+        debug!(lease = %name, "no child composition recorded; nothing to destroy");
+        return finish_release(lease, ctx, reason).await;
+    };
+
+    let internal: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    match internal.get(&recorded.name).await {
+        Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
+            let delete = DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(recorded.uid.clone()),
+                    resource_version: None,
+                }),
+                ..Default::default()
+            };
+            match internal.delete(&recorded.name, &delete).await {
+                Ok(_) => {}
+                // 404 or 409: ours is not there, which is the goal. Either way
+                // the check below is what decides, not this call.
+                Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {}
+                Err(error) => {
+                    warn!(lease = %name, error = %error, "could not release child cluster lease");
+                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                }
+            }
+            // Destroying a cluster is not instantaneous, and #80 will not let
+            // its capacity return until the footprint is proven gone. Wait.
+            debug!(lease = %name, "child cluster still being destroyed");
+            Ok(Action::requeue(std::time::Duration::from_secs(30)))
+        }
+        // Gone, or replaced by a different object under the same name. Either
+        // way THIS lease's cluster is not there.
+        Ok(_) => finish_release(lease, ctx, reason).await,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            finish_release(lease, ctx, reason).await
+        }
+        // Cannot tell whether the tenant's cluster is still running.
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            quarantine_lease(lease, ctx, "child_absence_unverifiable").await
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "could not check child cluster lease");
+            Ok(Action::requeue(std::time::Duration::from_secs(15)))
+        }
+    }
 }
 
 /// What one absence check established.
@@ -734,6 +911,206 @@ fn with_condition(
     conditions
 }
 
+/// Where one lease's Sandbox is placed.
+struct Target {
+    client: Client,
+    namespace: String,
+    /// Whether upstream objects here may carry an owner reference to their
+    /// Kobe parent. True only in the management cluster, where that parent
+    /// exists — see [`ensure_upstream_pool_objects`].
+    owned: bool,
+}
+
+/// A child cluster is either usable now, or it is not there yet.
+enum ChildTarget {
+    Ready(Target),
+    /// Composition is in progress; the action says when to look again.
+    Pending(Action),
+}
+
+/// Acquire — or resume — the exclusive child cluster this lease runs in.
+///
+/// Every refusal happens before a cluster is allocated. A composition that
+/// cannot be completed is worth nothing to the caller and expensive to
+/// everyone else: an abandoned child cluster is a whole cluster's capacity.
+async fn compose_child_target(
+    lease: &SandboxLease,
+    pool: &SandboxPool,
+    cluster_pool_ref: &str,
+    ctx: &SandboxContext,
+) -> Result<ChildTarget, SandboxPlacementError> {
+    use crate::controllers::sandbox_child as child;
+
+    let name = lease.name_any();
+    let cluster_pools: Api<crate::crd::ClusterPool> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let cluster_pool = cluster_pools.get(cluster_pool_ref).await?;
+
+    // Backend capability first: a pool that cannot prove teardown must never
+    // back an exclusive tenant cluster, and finding that out after allocating
+    // one helps nobody.
+    child::child_pool_is_eligible(&pool.name_any(), &cluster_pool)?;
+
+    let runtime_ttl = crate::pool::parse_duration(&lease.spec.ttl)
+        .and_then(|ttl| ttl.to_std().ok())
+        .ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!("lease {name} has an invalid TTL"))
+        })?;
+    let lifetime = child::child_lifetime_fits(&cluster_pool, pool, runtime_ttl)?;
+
+    // Create-or-adopt, keyed on a derived name, so a restarted controller
+    // resumes the same cluster instead of allocating a second one.
+    let internal_name = child::internal_lease_name(&name);
+    let internal: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let internal_lease = match internal.get(&internal_name).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            let composed = child::build_internal_cluster_lease(lease, cluster_pool_ref, lifetime)
+                .ok_or_else(|| {
+                SandboxPlacementError::Invalid(format!("lease {name} has no UID to own a child"))
+            })?;
+            match internal.create(&PostParams::default(), &composed).await {
+                Ok(created) => {
+                    info!(lease = %name, cluster_lease = %internal_name, "composed child cluster lease");
+                    created
+                }
+                // Lost the race; the winner's object is the one to use.
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    internal.get(&internal_name).await?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    // Adoption is fenced. A same-named object this lease does not own is
+    // somebody else's cluster, and placing a tenant's Sandbox into it would be
+    // the worst possible outcome of a name collision.
+    let owned_by_this_lease = internal_lease
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners
+                .iter()
+                .any(|owner| Some(owner.uid.as_str()) == lease.uid().as_deref())
+        });
+    if !owned_by_this_lease {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "ClusterLease {internal_name} exists but is not owned by SandboxLease {name}"
+        )));
+    }
+
+    let internal_uid = internal_lease
+        .uid()
+        .ok_or_else(|| SandboxPlacementError::Invalid("child lease has no UID".into()))?;
+
+    // Resolve the exact reciprocal binding rather than trusting `clusterName`.
+    // A name alone can be reused; the binding is what pins the instance this
+    // lease was actually given.
+    let binding = match crate::lease_binding::resolve_lease_binding(
+        &ctx.client,
+        &ctx.namespace,
+        &internal_name,
+        &internal_uid,
+        crate::lease_binding::BindingResolveMode::Access,
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        // Still queuing for capacity. Normal, and not an error.
+        Err(error) => {
+            debug!(lease = %name, error = %error, "child cluster not bound yet");
+            return Ok(ChildTarget::Pending(Action::requeue(
+                std::time::Duration::from_secs(15),
+            )));
+        }
+    };
+
+    // Record what was composed before using it. Teardown has to be able to name
+    // the exact instance it must prove absent, and provenance written only
+    // after a successful placement would be missing in precisely the case that
+    // matters — a crash partway through.
+    let provenance = child::child_provenance(
+        &ctx.namespace,
+        &binding.lease,
+        &binding.binding.instance.name,
+        &binding.binding.instance.uid,
+        Some(binding.binding.instance.observed_generation),
+    );
+    patch_lease_status(
+        ctx,
+        &name,
+        &serde_json::json!({
+            "placement": crate::crd::ResolvedSandboxPlacement::ChildCluster {
+                cluster_pool: crate::crd::SandboxObjectReference {
+                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                    kind: "ClusterPool".into(),
+                    namespace: Some(ctx.namespace.clone()),
+                    name: cluster_pool.name_any(),
+                    uid: cluster_pool.uid().unwrap_or_default(),
+                    generation: cluster_pool.metadata.generation,
+                },
+            },
+            "target": provenance,
+        }),
+    )
+    .await?;
+
+    // The kubeconfig is read into memory and never leaves it: not into status,
+    // not into an API response, not into a log line. It is cluster-admin on a
+    // cluster the caller must not be able to reach.
+    let kubeconfig = crate::backend::read_kubeconfig_secret(
+        &ctx.client,
+        &binding.binding.instance.name,
+        &ctx.namespace,
+    )
+    .await
+    // The error is swallowed on purpose: a kubeconfig read failure can carry
+    // the secret's own contents in its context, and this value reaches status.
+    .map_err(|_| child::ChildPlacementError::ChildUnreachable {
+        cluster: binding.binding.instance.name.clone(),
+    })?;
+    let child_client = crate::backend::virtual_client_from_kubeconfig(&kubeconfig)
+        .await
+        .map_err(|_| child::ChildPlacementError::ChildUnreachable {
+            cluster: binding.binding.instance.name.clone(),
+        })?;
+
+    // Kobe validates the child runtime; it does not install it. Installing
+    // cluster-scoped CRDs, RBAC and a webhook with cluster-admin is one of the
+    // effects paused on #72, and a controller must not perform under a
+    // different issue number what it was told to hold.
+    child::validate_child_runtime(&child_client, &binding.binding.instance.name).await?;
+
+    // The pool's template and warm pool have to exist inside the child; nothing
+    // else reconciles them there.
+    ensure_upstream_pool_objects(
+        &child_client,
+        CHILD_SANDBOX_NAMESPACE,
+        &pool.name_any(),
+        &pool.spec,
+        None,
+    )
+    .await?;
+
+    Ok(ChildTarget::Ready(Target {
+        client: child_client,
+        namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
+        owned: false,
+    }))
+}
+
+/// Namespace inside a child cluster that holds its Sandbox objects.
+///
+/// Fixed, and never derived from anything a caller supplies. The child cluster
+/// is exclusive to one lease, so there is nothing to disambiguate — and a
+/// caller-influenced namespace would be a way to reach objects the composition
+/// did not create.
+const CHILD_SANDBOX_NAMESPACE: &str = "kobe-sandbox";
+
 /// The readiness instant already persisted on a Ready lease, if any.
 fn persisted_ready_at(
     status: &crate::crd::SandboxLeaseStatus,
@@ -816,7 +1193,7 @@ fn lease_error_policy(
     error: &SandboxPlacementError,
     _ctx: Arc<SandboxContext>,
 ) -> Action {
-    warn!(error = %error, "SandboxLease placement failed");
+    warn!(error = %error, reason = error.reason_code(), "SandboxLease placement failed");
     Action::requeue(std::time::Duration::from_secs(15))
 }
 
@@ -864,7 +1241,7 @@ pub async fn run_sandbox_controller(client: Client, namespace: &str, shutdown: C
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Upstream object names are DERIVED, never taken from caller input.
@@ -978,7 +1355,7 @@ mod tests {
         }
     }
 
-    fn management_pool(uid: &str, generation: i64) -> SandboxPool {
+    pub(crate) fn management_pool(uid: &str, generation: i64) -> SandboxPool {
         SandboxPool {
             metadata: ObjectMeta {
                 name: Some("agents".into()),
@@ -1025,7 +1402,7 @@ mod tests {
         }
     }
 
-    fn admitted_lease() -> SandboxLease {
+    pub(crate) fn admitted_lease() -> SandboxLease {
         SandboxLease {
             metadata: ObjectMeta {
                 name: Some(LEASE.into()),
@@ -1834,6 +2211,229 @@ mod tests {
             .find(|c| c.condition_type == CLEANUP_VERIFIED_CONDITION)
             .unwrap();
         assert_ne!(flipped.last_transition_time, after.last_transition_time);
+    }
+
+    // -----------------------------------------------------------------------
+    // Child composition
+    // -----------------------------------------------------------------------
+
+    fn child_placed_lease(cluster_lease_uid: &str) -> SandboxLease {
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.placement = Some(crate::crd::ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: crate::crd::SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterPool".into(),
+                namespace: Some(NS.into()),
+                name: "children".into(),
+                uid: "cluster-pool-uid".into(),
+                generation: Some(1),
+            },
+        });
+        status.target = Some(crate::crd::SandboxTargetProvenance {
+            namespace: NS.into(),
+            child_cluster_lease: Some(crate::crd::SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterLease".into(),
+                namespace: Some(NS.into()),
+                name: "kobe-sbx-sbx-1".into(),
+                uid: cluster_lease_uid.into(),
+                generation: Some(1),
+            }),
+            child_cluster_instance: None,
+            sandbox_template: None,
+            sandbox_warm_pool: None,
+            sandbox_claim: None,
+            sandbox: None,
+            pod: None,
+        });
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        lease
+    }
+
+    const CLUSTER_LEASE_PATH: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/kobe-sbx-sbx-1";
+
+    /// A child-placed lease must never be released by a claim delete here.
+    ///
+    /// Its claim lives in the child cluster, so deleting it against the
+    /// management cluster 404s — and a 404 is precisely what this path treats
+    /// as proof of absence. The quota slot would be handed to the next caller
+    /// while the previous tenant's Sandbox was still running in a cluster
+    /// nobody had touched. This is the single most dangerous confusion the two
+    /// placements can have, so it is asserted directly.
+    #[tokio::test]
+    async fn a_child_lease_is_never_released_by_deleting_a_management_claim() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        // The child cluster lease is still there: the tenant's cluster, and
+        // their Sandbox inside it, are still running.
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "kobe-sbx-sbx-1",
+                    "namespace": NS,
+                    "uid": "child-lease-uid",
+                },
+                "spec": { "poolRef": "children", "ttl": "2h",
+                          "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" } },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": { "name": "kobe-sbx-sbx-1", "namespace": NS },
+            })))
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests_to(&server, "DELETE", CLAIM_PATH).await,
+            0,
+            "the claim is in the child cluster; nothing here may stand in for it"
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            0,
+            "capacity must not return while the tenant's cluster is still up"
+        );
+        let phases = recorded_phases(&server).await;
+        assert_eq!(phases, vec!["Releasing".to_string()]);
+    }
+
+    /// Teardown acts on the recorded UID, not the recorded name.
+    ///
+    /// If the composed cluster lease is gone and a DIFFERENT object now holds
+    /// its name, that object belongs to a later Sandbox. Deleting it would
+    /// destroy a running tenant's cluster; treating its presence as "ours is
+    /// still up" would strand this lease forever. Neither: this lease's
+    /// cluster is provably not there, so the release completes.
+    #[tokio::test]
+    async fn a_name_reused_by_a_later_composition_is_not_this_leases_cluster() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": "kobe-sbx-sbx-1",
+                    "namespace": NS,
+                    // Somebody else's composition, under a reused name.
+                    "uid": "a-completely-different-uid",
+                },
+                "spec": { "poolRef": "children", "ttl": "2h",
+                          "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" } },
+            })))
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await,
+            0,
+            "a cluster this lease does not own must never be destroyed"
+        );
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Released"),
+            "this lease's own cluster is provably absent"
+        );
+    }
+
+    /// If Kobe cannot tell whether the tenant's cluster is still running, it
+    /// withholds the capacity rather than guessing.
+    #[tokio::test]
+    async fn an_unreadable_child_cluster_quarantines() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 403, "reason": "Forbidden"
+            })))
+            .mount(&server)
+            .await;
+
+        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            0
+        );
+    }
+
+    /// A lease released before it ever got a cluster has nothing to prove.
+    ///
+    /// Requiring evidence of a footprint that was never created would strand
+    /// the quota slot of every caller who cancelled while queuing — the most
+    /// common cancellation there is.
+    #[tokio::test]
+    async fn a_composition_that_never_happened_releases_cleanly() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        // Placement is recorded, but no cluster was ever composed.
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_lease = None;
+
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Released")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/sbx-quota-abc-0")
+            )
+            .await,
+            1,
+            "the slot it was holding must come back"
+        );
     }
 
     /// The pinned upstream version must match what #72 validates at startup.

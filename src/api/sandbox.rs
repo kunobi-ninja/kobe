@@ -640,8 +640,32 @@ fn sandbox_lease_response(
         ready_at: status.ready_at,
         expires_at: status.expires_at,
         placement: status.placement,
-        target: status.target,
+        target: status.target.map(caller_visible_provenance),
         conditions: status.conditions,
+    }
+}
+
+/// Strip the internal composition from provenance before it reaches a caller.
+///
+/// `SandboxTargetProvenance` is the controller's restart-safe record of exactly
+/// what it built, and for a child-placement lease that includes the internal
+/// `ClusterLease` and `ClusterInstance` Kobe acquired to host the Sandbox.
+///
+/// The caller asked for a Sandbox. The cluster underneath it is Kobe's
+/// implementation of the pool, not a capability they hold — they cannot
+/// connect to it, extend it or release it, and #74 requires that they cannot
+/// *discover* it either. Returning its name and UID would hand them the exact
+/// identifiers every cluster-lease endpoint is keyed on, turning "no
+/// authority" into "no authority, but knows precisely what to ask for".
+///
+/// Stripped at the response boundary rather than never recorded: teardown must
+/// be able to prove that exact instance UID gone, and evidence a controller
+/// cannot see is evidence that does not exist.
+fn caller_visible_provenance(target: SandboxTargetProvenance) -> SandboxTargetProvenance {
+    SandboxTargetProvenance {
+        child_cluster_lease: None,
+        child_cluster_instance: None,
+        ..target
     }
 }
 
@@ -2361,6 +2385,58 @@ mod tests {
                 .iter()
                 .all(|request| request.method.as_str() != "PATCH")
         );
+    }
+
+    /// A caller must not learn which cluster is hosting their Sandbox.
+    ///
+    /// They cannot connect to it, extend it or release it — but returning its
+    /// name and UID would hand them the exact identifiers every cluster-lease
+    /// endpoint is keyed on. "No authority" and "no authority, but knows
+    /// precisely what to ask for" are not the same posture, and #74 requires
+    /// the internal composition be undiscoverable, not merely unusable.
+    #[test]
+    fn the_internal_child_cluster_is_not_discoverable_through_the_sandbox_api() {
+        let reference = |kind: &str, name: &str| crate::crd::SandboxObjectReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: kind.into(),
+            namespace: Some("kobe".into()),
+            name: name.into(),
+            uid: format!("{name}-uid"),
+            generation: Some(1),
+        };
+        let target = SandboxTargetProvenance {
+            namespace: "kobe".into(),
+            child_cluster_lease: Some(reference("ClusterLease", "kobe-sbx-sbx-1")),
+            child_cluster_instance: Some(reference("ClusterInstance", "kobe-abc123")),
+            sandbox_template: Some(reference("SandboxTemplate", "kobe-agents")),
+            sandbox_warm_pool: Some(reference("SandboxWarmPool", "kobe-agents")),
+            sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1")),
+            sandbox: Some(reference("Sandbox", "sbx")),
+            pod: Some(reference("Pod", "sbx-0")),
+        };
+
+        let visible = caller_visible_provenance(target.clone());
+        assert!(visible.child_cluster_lease.is_none());
+        assert!(visible.child_cluster_instance.is_none());
+
+        // Nothing else is stripped: the Sandbox-side objects are the caller's
+        // own, and #81 resolves targets against exactly these.
+        assert_eq!(visible.sandbox_claim, target.sandbox_claim);
+        assert_eq!(visible.pod, target.pod);
+        assert_eq!(visible.namespace, target.namespace);
+
+        // The serialized form is what actually reaches the caller, so assert on
+        // it rather than on the struct alone — a field renamed into the wire
+        // format later would pass a struct-level check and still leak.
+        let json = serde_json::to_string(&visible).unwrap();
+        for secret in [
+            "kobe-sbx-sbx-1",
+            "kobe-abc123",
+            "ClusterLease",
+            "ClusterInstance",
+        ] {
+            assert!(!json.contains(secret), "{secret} leaked into {json}");
+        }
     }
 
     #[tokio::test]
