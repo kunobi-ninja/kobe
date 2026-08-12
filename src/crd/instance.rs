@@ -353,6 +353,20 @@ pub struct ClusterInstanceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_with: Option<ClusterInstanceProvenance>,
 
+    /// Provisioner-assigned resource identities this instance owns — currently
+    /// the PersistentVolumes its data claims are bound to.
+    ///
+    /// Captured once the instance is healthy, NOT at teardown. These names are
+    /// chosen by the provisioner and only knowable after claims bind, so
+    /// capturing them during teardown would let the teardown path define its
+    /// own scope. Recorded early, they become something a later teardown must
+    /// account for rather than something it gets to choose.
+    ///
+    /// Written once and never shrunk: a smaller list would silently narrow what
+    /// a receipt has to prove.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teardown_identities: Vec<String>,
+
     /// Human-readable detail about the instance's current state — *why*
     /// it is in `phase`. Set fresh on every status write by the instance
     /// controller (each construction site supplies a concise phrase like
@@ -504,6 +518,10 @@ mod tests {
             phase: ClusterInstancePhase::Leased,
             provisioned: true,
             bootstrapped: true,
+            // Populated, not empty: this is the round-trip test, and an
+            // identity list that did not survive the wire would silently narrow
+            // what a receipt has to prove.
+            teardown_identities: vec!["pvc-1111".into(), "pvc-2222".into()],
             lease_ref: Some(ResourceRef {
                 name: "lease-abc".into(),
                 uid: None,
@@ -641,6 +659,7 @@ mod tests {
                 "provisioned",
                 "specHash",
                 "stateSince",
+                "teardownIdentities",
             ]
         );
     }

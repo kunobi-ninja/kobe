@@ -260,6 +260,23 @@ impl TeardownReceipt {
         if self.checks.len() != expected.required_subjects.len() {
             return false;
         }
+        // Every recorded identity must appear in some verified check. A receipt
+        // that proved three of four volumes gone would otherwise pass, leaving
+        // the fourth — and the tenant data on it — behind.
+        let proven: Vec<&String> = self
+            .checks
+            .iter()
+            .filter(|check| check.result == CheckResult::Verified)
+            .flat_map(|check| check.verified.iter())
+            .collect();
+        if !expected
+            .recorded_identities
+            .iter()
+            .all(|identity| proven.contains(&identity))
+        {
+            return false;
+        }
+
         expected.required_subjects.iter().all(|subject| {
             let mut matching = self.checks.iter().filter(|check| check.subject == *subject);
             let Some(check) = matching.next() else {
@@ -310,6 +327,14 @@ pub struct TeardownScope<'a> {
     /// Used to derive the expected resource names. Comes from controller-owned
     /// bind-time state like the rest of this scope, never from the receipt.
     pub instance_name: &'a str,
+    /// Provisioner-assigned identities recorded while the instance was healthy
+    /// — the PersistentVolumes its claims were bound to.
+    ///
+    /// These cannot be derived from a name, so they are the one part of the
+    /// footprint a teardown could otherwise quietly omit. Recorded long before
+    /// teardown runs, they are something a receipt must account for rather than
+    /// something it gets to choose.
+    pub recorded_identities: &'a [String],
 }
 
 /// The name a subject's resource must have, where naming is deterministic.
@@ -796,6 +821,7 @@ mod tests {
             instance_spec_digest: "spec-digest",
             required_subjects: required,
             instance_name: "pool-p-0",
+            recorded_identities: &[],
         }
     }
 
@@ -918,6 +944,58 @@ mod tests {
             TeardownOutcome::Verified,
         );
         assert!(!unnamed.permits_release_for(&scope(&required, &refs)));
+    }
+
+    /// Every identity recorded while the instance was healthy must be proven
+    /// absent.
+    ///
+    /// Bound PV names cannot be derived from the instance name, so they are the
+    /// one part of the footprint a teardown could quietly omit — verify three of
+    /// four volumes and the fourth, with the tenant's data on it, survives while
+    /// the receipt reads clean. Recording them at Ready and requiring coverage
+    /// here is what closes that.
+    #[test]
+    fn every_recorded_identity_must_be_proven_absent() {
+        let refs = (lease_ref(), instance_ref(), pool_ref());
+        let required = [TeardownSubject::ServerDataVolumes];
+        let recorded = vec!["pvc-aaa".to_string(), "pvc-bbb".to_string()];
+
+        let volumes_check = |names: Vec<&str>| TeardownCheck {
+            subject: TeardownSubject::ServerDataVolumes,
+            result: CheckResult::Verified,
+            reason: None,
+            verified: names.into_iter().map(String::from).collect(),
+        };
+        let with_recorded = |identities: &'static [String]| TeardownScope {
+            lease: &refs.0,
+            instance: &refs.1,
+            pool: &refs.2,
+            backend_type: "k3s",
+            config_digest: "digest",
+            instance_spec_digest: "spec-digest",
+            required_subjects: &required,
+            instance_name: "pool-p-0",
+            recorded_identities: identities,
+        };
+        // Leaked to satisfy the 'static bound in this helper; test-only.
+        let recorded_static: &'static [String] = Box::leak(recorded.clone().into_boxed_slice());
+
+        // Both volumes proven: releases.
+        let complete = receipt(
+            vec![volumes_check(vec!["pvc-aaa", "pvc-bbb"])],
+            TeardownOutcome::Verified,
+        );
+        assert!(complete.permits_release_for(&with_recorded(recorded_static)));
+
+        // One volume unaccounted for: must not release.
+        let partial = receipt(
+            vec![volumes_check(vec!["pvc-aaa"])],
+            TeardownOutcome::Verified,
+        );
+        assert!(
+            !partial.permits_release_for(&with_recorded(recorded_static)),
+            "a volume recorded at Ready but never proven absent must block release"
+        );
     }
 
     /// Subjects whose names are provisioner-assigned cannot be pre-derived, so

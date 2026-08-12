@@ -624,6 +624,27 @@ pub trait ClusterBackend: Send + Sync {
         async { Err(VerifiedDestroyUnsupported) }
     }
 
+    /// Capture the provisioner-assigned resource identities this instance owns.
+    ///
+    /// Called while the instance is healthy, NOT at teardown. Bound
+    /// PersistentVolume names are chosen by the provisioner and only knowable
+    /// once claims have bound; capturing them at teardown time would let the
+    /// teardown path define its own scope, which is the thing receipts exist to
+    /// prevent. Recorded early, the list is something a later teardown must
+    /// account for rather than something it gets to choose.
+    ///
+    /// Returning an empty list means "this backend has no such identities",
+    /// which is correct for every backend that cannot produce evidence anyway.
+    #[allow(dead_code)]
+    fn capture_teardown_identities(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send {
+        let _ = (name, namespace);
+        async { Ok(Vec::new()) }
+    }
+
     /// Whether this backend can produce teardown evidence at all.
     ///
     /// Checked before binding so a receipt-required lease is refused up front,

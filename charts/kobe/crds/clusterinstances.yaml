@@ -1107,6 +1107,22 @@ spec:
                   timestamp fields above.
                 nullable: true
                 type: string
+              teardownIdentities:
+                description: |-
+                  Provisioner-assigned resource identities this instance owns — currently
+                  the PersistentVolumes its data claims are bound to.
+
+                  Captured once the instance is healthy, NOT at teardown. These names are
+                  chosen by the provisioner and only knowable after claims bind, so
+                  capturing them during teardown would let the teardown path define its
+                  own scope. Recorded early, they become something a later teardown must
+                  account for rather than something it gets to choose.
+
+                  Written once and never shrunk: a smaller list would silently narrow what
+                  a receipt has to prove.
+                items:
+                  type: string
+                type: array
             type: object
         required:
         - spec

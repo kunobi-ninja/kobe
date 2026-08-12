@@ -2343,6 +2343,19 @@ impl ClusterBackend for K3sBackend {
         true
     }
 
+    async fn capture_teardown_identities(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>> {
+        // Same capture the teardown path uses, run early instead. An error is
+        // propagated rather than reported as "no volumes": recording an empty
+        // list on a failed read would understate the footprint permanently.
+        self.capture_bound_volumes(name, namespace)
+            .await
+            .map_err(|reason| anyhow::anyhow!("could not capture bound volumes: {reason}"))
+    }
+
     /// Tear down and then *prove* the footprint is absent.
     ///
     /// The ordering matters and is the whole contract:

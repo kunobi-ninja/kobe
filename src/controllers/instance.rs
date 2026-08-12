@@ -345,6 +345,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 // is preserved (we never want to overwrite it
                                 // from an instance-controller patch).
                                 created_with: None,
+                                teardown_identities: Vec::new(),
                                 message: Some("network allocated; awaiting provisioning".into()),
                                 // Overwritten centrally in patch_instance_status.
                                 conditions: Vec::new(),
@@ -752,6 +753,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Ready => {
+            // Record provisioner-assigned identities while the instance is
+            // healthy. Doing this at teardown would let the teardown path
+            // choose its own scope; recorded here, a later receipt has to
+            // account for what was captured long before it ran.
+            capture_teardown_identities_once(&ctx, &instance, &name, &ns, &status).await;
             let next =
                 evaluate_ready_instance(&ctx, &config, &instance, &name, &ns, &status).await?;
             Ok(next)
@@ -1987,6 +1993,72 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         return Some(Err(error.into()));
     }
     Some(Ok(Action::await_change()))
+}
+
+/// Record the provisioner-assigned identities this instance owns, once.
+///
+/// Best-effort and idempotent: a failed capture leaves the list empty and is
+/// retried on the next reconcile, and a non-empty list is never rewritten —
+/// shrinking it later would silently narrow what a receipt must prove.
+///
+/// Only meaningful for a backend that can produce evidence; everything else
+/// returns an empty list from the default implementation.
+async fn capture_teardown_identities_once<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+    status: &ClusterInstanceStatus,
+) {
+    if !status.teardown_identities.is_empty() {
+        return;
+    }
+    // Only instances whose plan includes a provisioner-assigned footprint have
+    // anything to capture.
+    let wants_volumes = status
+        .created_with
+        .as_ref()
+        .and_then(|created| created.teardown_plan.as_ref())
+        .is_some_and(|plan| plan.contains(&crate::crd::TeardownSubject::ServerDataVolumes));
+    if !wants_volumes {
+        return;
+    }
+    let Some(backend) = resolve_verified_backend(ctx, instance).await else {
+        return;
+    };
+    let identities = match backend.capture_teardown_identities(name, namespace).await {
+        Ok(identities) if !identities.is_empty() => identities,
+        // Empty or failed: retry next reconcile rather than recording a list
+        // that understates the footprint.
+        _ => return,
+    };
+
+    let (Some(uid), Some(resource_version)) = (
+        instance.metadata.uid.as_deref(),
+        instance.resource_version(),
+    ) else {
+        return;
+    };
+    let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status/teardownIdentities", "value": identities }
+    ]));
+    match instances_api
+        .patch_status(name, &PatchParams::default(), &Patch::<()>::Json(patch))
+        .await
+    {
+        Ok(_) => info!(
+            instance = %name,
+            "recorded provisioner-assigned teardown identities"
+        ),
+        Err(error) => debug!(
+            instance = %name,
+            error = %error,
+            "could not record teardown identities; will retry"
+        ),
+    }
 }
 
 /// Resolve the backend through immutable provenance, same fence as
