@@ -173,6 +173,17 @@ pub struct TeardownReceipt {
     pub outcome: TeardownOutcome,
 }
 
+/// Set by a consumer once it has read and acted on a lease's teardown receipt.
+///
+/// Until this is present, a receipt-carrying lease is retained after recycling
+/// rather than deleted — the receipt is the only durable proof its capacity was
+/// destroyed, and it is read precisely when the instance is already gone.
+///
+/// An annotation rather than a timeout: evidence that expires on a clock is
+/// evidence you cannot rely on having when you need it.
+pub const TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION: &str =
+    "kobe.kunobi.ninja/teardown-receipt-acknowledged";
+
 /// Current schema version emitted by this build.
 pub const TEARDOWN_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
