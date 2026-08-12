@@ -317,7 +317,12 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     // Quota and alias admission use atomic, per-principal Kubernetes Lease
     // reservations. Advisory LIST checks above improve error latency, but only
     // these CREATE operations are authoritative across API replicas.
-    let admission_reservations = match acquire_admission_reservations(
+    // The returned handles are intentionally unused past this point: every
+    // cleanup path goes through `delete_exact_pending_lease`, which deletes the
+    // lease under its UID fence FIRST and then releases whatever carries that
+    // lease's UID label. Releasing from this handle directly would free the
+    // quota slot before the lease is provably gone.
+    let _admission_reservations = match acquire_admission_reservations(
         &reservations,
         &created,
         &identity,
@@ -370,19 +375,62 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     };
 
     if let Err(err) = admit_sandbox_lease(&leases, &reservations, &created).await {
-        if matches!(err, SandboxLeaseMutationError::AdmissionNotCommitted) {
-            if let Err(cleanup_err) =
-                release_admission_reservations(&reservations, &admission_reservations).await
-            {
-                error!(error = %cleanup_err, "Failed to release Sandbox admission reservations");
+        match err {
+            // Provably NOT admitted. Remove the lease, which releases its own
+            // reservations afterwards.
+            //
+            // Deliberately does not release reservations first. Doing so would
+            // free the quota slot while the lease might still be live — if the
+            // "not committed" classification were ever wrong, another request
+            // could take that slot against an admitted lease and over-admit.
+            // Deleting the lease under its UID fence is what makes the release
+            // safe, so it has to come first.
+            SandboxLeaseMutationError::AdmissionNotCommitted => {
+                if let Err(cleanup_err) =
+                    delete_exact_pending_lease(&leases, &reservations, &created).await
+                {
+                    error!(error = %cleanup_err, "Failed to remove Sandbox lease after admission failure");
+                }
+                return sandbox_infra_error("Failed to finalize Sandbox lease admission", err);
             }
-            if let Err(cleanup_err) =
-                delete_exact_pending_lease(&leases, &reservations, &created).await
-            {
-                error!(error = %cleanup_err, "Failed to remove Sandbox lease after admission failure");
+            // Anything else means we do NOT know whether admission committed —
+            // a lost response, a transport error, a mutating webhook reshaping
+            // the object. Returning failure on a guess is the worst outcome
+            // available: if the lease actually IS admitted, the caller retries
+            // and ends up with two sandboxes for one intended request.
+            //
+            // So re-read the exact object and report what is true.
+            other => {
+                match leases.get(&lease_id).await {
+                    Ok(current)
+                        if current
+                            .annotations()
+                            .get(SANDBOX_ADMISSION_ANNOTATION)
+                            .map(String::as_str)
+                            == Some(SANDBOX_ADMISSION_ADMITTED) =>
+                    {
+                        warn!(
+                            lease_id = %lease_id,
+                            error = %other,
+                            "admission response was lost but the lease is admitted; \
+                             reporting success rather than inviting a duplicate retry"
+                        );
+                        // Fall through to the success response below.
+                    }
+                    _ => {
+                        if let Err(cleanup_err) =
+                            delete_exact_pending_lease(&leases, &reservations, &created).await
+                        {
+                            error!(error = %cleanup_err, "Failed to remove Sandbox lease after admission failure");
+                        }
+                        return sandbox_infra_error(
+                            "Failed to finalize Sandbox lease admission",
+                            other,
+                        );
+                    }
+                }
             }
         }
-        return sandbox_infra_error("Failed to finalize Sandbox lease admission", err);
     }
 
     info!(
@@ -2537,6 +2585,126 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "the stranded principal's quota must be released even though they never retried:              {remaining:?}"
+        );
+    }
+
+    /// An admission that lands LATE must not be reported as failure.
+    ///
+    /// The race, from the review that found it: the PATCH commits, but the
+    /// response is lost; `admit_sandbox_lease` re-reads and still sees
+    /// `pending` (the write has not surfaced yet); its fenced DELETE then 409s
+    /// against the now-landed patch; so it returns a *Kubernetes* error rather
+    /// than `AdmissionNotCommitted`. The old code returned 503 for that with no
+    /// further checking — while an admitted, placeable lease existed. The
+    /// caller retries and ends up with TWO sandboxes for one request.
+    ///
+    /// Note this is NOT the same as the applied-but-lost case, which
+    /// `admit_sandbox_lease` already resolves internally: with the outer
+    /// re-read disabled, that one still passes. This test fails without it.
+    #[tokio::test]
+    async fn an_admission_that_lands_late_is_not_reported_as_failure() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        mount_reservation_api(&server, &[]).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool_json()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .mount(&server)
+            .await;
+
+        let created_state = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let create_state = Arc::clone(&created_state);
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let mut object: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let name = object["metadata"]["name"].as_str().unwrap().to_string();
+                object["metadata"]["uid"] = serde_json::json!(format!("{name}-uid"));
+                object["metadata"]["resourceVersion"] = serde_json::json!("1");
+                object["metadata"]["creationTimestamp"] = serde_json::json!("2026-08-12T00:00:00Z");
+                *create_state.lock().unwrap() = Some(object.clone());
+                ResponseTemplate::new(201).set_body_json(object)
+            })
+            .mount(&server)
+            .await;
+
+        // The PATCH "fails" from the client's point of view.
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 500
+            })))
+            .mount(&server)
+            .await;
+
+        // First GET (inside admit) still reads `pending`; the second (our outer
+        // re-read) sees the patch has landed as `admitted`.
+        let reads = Arc::new(Mutex::new(0u32));
+        let get_state = Arc::clone(&created_state);
+        let get_reads = Arc::clone(&reads);
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut object = get_state.lock().unwrap().clone().unwrap();
+                let mut seen = get_reads.lock().unwrap();
+                *seen += 1;
+                let admission = if *seen == 1 {
+                    SANDBOX_ADMISSION_PENDING
+                } else {
+                    SANDBOX_ADMISSION_ADMITTED
+                };
+                object["metadata"]["annotations"] =
+                    serde_json::json!({ SANDBOX_ADMISSION_ANNOTATION: admission });
+                ResponseTemplate::new(200).set_body_json(object)
+            })
+            .mount(&server)
+            .await;
+
+        // The fenced DELETE loses to the late-landing patch.
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "Conflict", "code": 409
+            })))
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "the lease is admitted and placeable; a 503 here makes the caller \
+             retry and create a second sandbox"
         );
     }
 
