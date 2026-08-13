@@ -291,7 +291,7 @@ pub async fn reconcile_lease(
     // The deadline starts here, when Kobe accepts responsibility for placing
     // the lease — not at request, which would charge the caller for time spent
     // queuing, and not at readiness, which is what the runtime TTL is for.
-    let status = lease.status.clone().unwrap_or_default();
+    let mut status = lease.status.clone().unwrap_or_default();
     let observed_generation = lease.metadata.generation.unwrap_or_default();
     if status.phase == crate::crd::SandboxLeasePhase::Pending {
         let provisioning_timeout = crate::pool::parse_duration(&pool.spec.provisioning_timeout)
@@ -310,9 +310,11 @@ pub async fn reconcile_lease(
         .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
         patch_lease_status(&ctx, &name, &serde_json::json!(next)).await?;
         info!(lease = %name, "Sandbox lease is provisioning");
-        // Re-read on the next pass rather than acting on a local copy whose
-        // status has just been overwritten server-side.
-        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+        // Carry on in the same pass with the status just written, rather than
+        // requeueing to read back what is already in hand. A lease that had to
+        // wait a whole reconcile between being accepted and being placed would
+        // spend that time doing nothing, and the deadline is already ticking.
+        status = next;
     }
 
     let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
@@ -360,7 +362,9 @@ pub async fn reconcile_lease(
     // tenant workload on every requeue is not a health check — it is a repeated
     // side effect on somebody else's Sandbox — and a controller that restarted
     // between the canary and the Ready write must not run it a second time.
-    let status = lease.status.clone().unwrap_or_default();
+    // NOT a fresh read of `lease.status`: that would shadow the Provisioning
+    // transition written above and hand every step below the stale `Pending`
+    // copy, which is precisely how the missing transition stayed invisible.
     if !canary_already_passed(&status) {
         let outcome = crate::controllers::sandbox_canary::evaluate_readiness_canary(
             &target.client,
@@ -618,7 +622,7 @@ async fn drive_release(
     // exactly what this path treats as proof of absence. The quota slot would
     // be handed to the next caller while the previous tenant's Sandbox was
     // still running in a cluster nobody had touched.
-    if is_child_placed(&status) {
+    if is_child_placed(lease, ctx).await {
         return release_child_composition(lease, ctx, reason).await;
     }
 
@@ -727,11 +731,50 @@ async fn finish_release(
 /// pool spec, because teardown must remain correct when the pool was since
 /// edited or deleted — the question is where this lease was actually placed,
 /// not where a pool of that name would place a lease today.
-fn is_child_placed(status: &crate::crd::SandboxLeaseStatus) -> bool {
-    matches!(
+/// Whether this lease's Sandbox runs in a composed child cluster.
+///
+/// Three sources, in order of directness, because status alone is not enough.
+///
+/// A composition IN FLIGHT has no resolved placement: the internal
+/// `ClusterLease` is created first, and the placement is not recorded until the
+/// binding resolves — which takes as long as a cluster takes to build. A
+/// release landing in that window read the missing placement as "management",
+/// deleted a `SandboxClaim` this cluster never had, took the 404 as proof of
+/// absence and handed the quota slot back, while the child cluster it had
+/// already allocated carried on running.
+///
+/// So the decisive signal is the ARTIFACT: an internal `ClusterLease` under
+/// this lease's derived name, owned by this lease. That exists from the moment
+/// a cluster is allocated, which is exactly when releasing on the management
+/// path becomes wrong — and unlike the pool spec, it survives the pool being
+/// edited or deleted.
+async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
+    let status = lease.status.clone().unwrap_or_default();
+    if matches!(
         status.placement,
         Some(crate::crd::ResolvedSandboxPlacement::ChildCluster { .. })
-    )
+    ) {
+        return true;
+    }
+
+    let internal: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let name = crate::controllers::sandbox_child::internal_lease_name(&lease.name_any());
+    match internal.get(&name).await {
+        // Existence is the whole signal. The name is derived from THIS lease's
+        // name, which is unique in the namespace, so nothing else can produce
+        // it. Re-checking ownership here would only add a way to answer
+        // "management" for a real composition whose owner reference was
+        // stripped — and answering "management" is what releases the slot.
+        // Identity is fenced where it matters, on the recorded UID, before
+        // anything is destroyed.
+        Ok(_) => true,
+        Err(kube::Error::Api(error)) if error.code == 404 => false,
+        // Cannot tell. Take the child path: it waits for evidence, where the
+        // management path would release the quota slot on a 404 that proves
+        // nothing about a cluster this controller cannot currently see.
+        Err(_) => true,
+    }
 }
 
 /// Tear a child composition down, and complete only against its receipt.
@@ -762,16 +805,53 @@ async fn release_child_composition(
     // Act on the exact recorded identity. A same-named ClusterLease composed
     // for a later Sandbox is somebody else's cluster, and releasing it would
     // destroy a running tenant's work.
-    let Some(recorded) = status
+    let internal_api: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let derived = crate::controllers::sandbox_child::internal_lease_name(&name);
+
+    // Provenance is written only once the binding resolves, so a release
+    // landing while the child cluster is still building finds none — and
+    // reading that as "nothing was composed" hands the quota slot back while a
+    // whole cluster carries on running. Absence of a RECORD is not absence of a
+    // CLUSTER, so look for the object under the derived name before concluding
+    // anything.
+    let recorded = match status
         .target
         .as_ref()
         .and_then(|target| target.child_cluster_lease.as_ref())
-    else {
-        // Nothing was ever composed — the lease was released before it got a
-        // cluster. There is no footprint to prove absent.
-        debug!(lease = %name, "no child composition recorded; nothing to destroy");
-        return finish_release(lease, ctx, reason).await;
+    {
+        Some(recorded) => recorded.clone(),
+        None => match internal_api.get(&derived).await {
+            Ok(unrecorded) => {
+                warn!(
+                    lease = %name,
+                    cluster_lease = %derived,
+                    "releasing a child composition that was allocated but never recorded"
+                );
+                crate::crd::SandboxObjectReference {
+                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                    kind: "ClusterLease".into(),
+                    namespace: Some(ctx.namespace.clone()),
+                    name: derived.clone(),
+                    uid: unrecorded.uid().unwrap_or_default(),
+                    generation: unrecorded.metadata.generation,
+                }
+            }
+            // Genuinely nothing composed: no record AND no object. There is no
+            // footprint to prove absent.
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                debug!(lease = %name, "no child composition recorded or allocated");
+                return finish_release(lease, ctx, reason).await;
+            }
+            // Cannot tell whether a cluster is out there. Withhold rather than
+            // release: an under-counted pool is recoverable, a stranded cluster
+            // with its slot already returned is not.
+            Err(_) => {
+                return quarantine_lease(lease, ctx, "child_composition_unverifiable").await;
+            }
+        },
     };
+    let recorded = &recorded;
     let recorded_instance = status
         .target
         .as_ref()
@@ -1899,6 +1979,79 @@ pub(crate) mod tests {
         );
     }
 
+    /// The lease admission actually creates must be able to reach Ready.
+    ///
+    /// REVIEW FINDING (expected to fail). Every other test in this module
+    /// starts from `admitted_lease()`, whose status is hand-written as
+    /// `phase: Provisioning` with a `provisioningDeadline` already set. No
+    /// production code path ever produces that state: `create_sandbox_lease`
+    /// writes `status: None`, and `begin_sandbox_provisioning` — the only
+    /// function that sets `Provisioning` and stamps the deadline — is called
+    /// from nowhere but its own unit test.
+    ///
+    /// So a real lease reaches this reconcile as `Pending` with no deadline,
+    /// `mark_sandbox_ready` refuses it with `MissingProvisioningDeadline`, and
+    /// the lease requeues every 30 seconds forever. It never becomes Ready, so
+    /// no Sandbox operation ever resolves. The fixture is what hides it: it
+    /// asserts the second half of a lifecycle whose first half is missing.
+    #[tokio::test]
+    async fn a_lease_in_the_state_admission_leaves_it_in_can_become_ready() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": [{ "type": "Ready", "status": "True" }]
+                }))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        mount_teardown_scaffolding(&server).await;
+
+        // Exactly what the API writes on create: an admitted lease with no
+        // provisioning state at all. The canary pass is recorded because the
+        // websocket exec cannot be mocked — that is the same shortcut every
+        // other test here takes, and it is not what is under test.
+        let mut lease = lease_past_the_canary();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Pending;
+        status.provisioning_deadline = None;
+        status.observed_generation = None;
+
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert!(
+            recorded_phases(&server)
+                .await
+                .contains(&"Ready".to_string()),
+            "a lease created through the API must be able to reach Ready; \
+             recorded phases were {:?}",
+            recorded_phases(&server).await
+        );
+    }
+
     /// A Sandbox upstream calls Ready is not yet a Sandbox that works.
     ///
     /// Upstream's condition is about the container. A Pod whose agent
@@ -2737,6 +2890,93 @@ pub(crate) mod tests {
             .await,
             1,
             "the slot it was holding must come back"
+        );
+    }
+
+    /// A lease released while its child cluster was still being composed must
+    /// not have its quota returned on a management-cluster 404.
+    ///
+    /// REVIEW FINDING (expected to fail). `compose_child_target` creates the
+    /// internal `ClusterLease` first and only records `placement` +
+    /// `target.childClusterLease` on the *next* reconcile, after
+    /// `resolve_lease_binding` succeeds — which is minutes later, because the
+    /// child cluster has to be provisioned. Between those two writes the lease
+    /// carries no resolved placement.
+    ///
+    /// `drive_release` decides which teardown path to take from
+    /// `status.placement`, so a release landing in that window takes the
+    /// MANAGEMENT path: it deletes a `SandboxClaim` that was never created in
+    /// this cluster, reads the 404 as proof of absence, and calls
+    /// `finish_release`. The quota slot goes back while a whole child cluster
+    /// is still allocated from the `ClusterPool` — the internal `ClusterLease`
+    /// survives, because release marks the SandboxLease terminal rather than
+    /// deleting it, so the owner reference collects nothing for a week.
+    ///
+    /// `a_composition_that_never_happened_releases_cleanly` looks like it
+    /// covers this, but it sets `placement = ChildCluster` with
+    /// `childClusterLease = None` — a state the single combined status patch
+    /// can never produce. The reachable state is the opposite one, and it is
+    /// untested.
+    #[tokio::test]
+    async fn a_composition_in_flight_is_not_released_by_a_management_cluster_404() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        // The child cluster lease exists: composition got as far as allocating
+        // one, and it is still waiting to be bound.
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Pending",
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+        // Nothing was ever placed in the management cluster.
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        // The state a real lease is in while its child cluster provisions: the
+        // internal ClusterLease exists, but no placement has been recorded yet.
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Pending;
+        status.placement = None;
+        status.target = None;
+
+        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+
+        assert!(
+            !recorded_phases(&server)
+                .await
+                .contains(&"Released".to_string()),
+            "a lease holding an unbound child cluster must not reach a clean \
+             terminal phase on a management-cluster 404; phases were {:?}",
+            recorded_phases(&server).await
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0,
+            "the quota slot must not come back while a child cluster is still allocated"
         );
     }
 

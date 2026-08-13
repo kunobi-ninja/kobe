@@ -392,11 +392,9 @@ mod tests {
         let logs = verbs(SandboxOperation::Logs);
         assert!(logs.contains(&"pods/log:get".to_string()));
         assert!(
-            !logs
-                .iter()
-                .any(|granted| granted.contains("exec")
-                    || granted.contains("attach")
-                    || granted.contains("portforward")),
+            !logs.iter().any(|granted| granted.contains("exec")
+                || granted.contains("attach")
+                || granted.contains("portforward")),
             "reading logs must not grant execution: {logs:?}"
         );
 
@@ -498,7 +496,154 @@ mod tests {
         }
     }
 
+    /// The verb granted must be the verb the client's request actually asks
+    /// for.
+    ///
+    /// REVIEW FINDING (expected to fail). `scoped_rules` grants
+    /// `pods/exec: create` and `pods/portforward: create` — the verbs
+    /// `kubectl` needs, because `kubectl` opens these over SPDY with a POST.
+    /// Kobe does not: it is built with kube-rs's `ws` feature, and
+    /// `kube_core::Request::{exec, attach, portforward}` all issue an HTTP
+    /// **GET** WebSocket upgrade. The apiserver derives the RBAC verb from the
+    /// HTTP method, so those requests authorize as `get`, not `create`.
+    ///
+    /// Every exec, attach and port-forward therefore 403s under the credential
+    /// this module exists to mint, and the caller sees `TargetError` on a
+    /// socket that upgraded cleanly. The same mistake is in
+    /// `charts/kobe/templates/rbac.yaml:87-89`, which is what the readiness
+    /// canary runs under — so a management-placement lease's canary can never
+    /// pass either.
+    ///
+    /// The existing tests here assert the verb set is *narrow* and never that
+    /// it is *correct*, which is exactly why this is invisible to CI.
+    #[test]
+    fn the_minted_role_grants_the_verb_the_request_actually_uses() {
+        use kube::api::AttachParams;
+
+        // The verb the apiserver derives from a request's HTTP method.
+        let rbac_verb = |method: &http::Method| match *method {
+            http::Method::GET => "get",
+            http::Method::POST => "create",
+            http::Method::PUT => "update",
+            http::Method::PATCH => "patch",
+            http::Method::DELETE => "delete",
+            ref other => panic!("unexpected method {other}"),
+        };
+
+        let request = kube::core::Request::new("/api/v1/namespaces/kobe/pods");
+        let params = AttachParams::default().container("agent");
+        let issued = [
+            (
+                "pods/exec",
+                SandboxOperation::Exec,
+                request
+                    .exec("sbx-0", vec!["/agent", "status"], &params)
+                    .unwrap(),
+            ),
+            (
+                "pods/portforward",
+                SandboxOperation::PortForward,
+                request.portforward("sbx-0", &[3000]).unwrap(),
+            ),
+        ];
+
+        for (subresource, operation, actual) in issued {
+            let required = rbac_verb(actual.method());
+            let granted: Vec<&str> = scoped_rules(&target(), operation)
+                .iter()
+                .filter(|rule| {
+                    rule.resources
+                        .as_ref()
+                        .is_some_and(|resources| resources.iter().any(|r| r == subresource))
+                })
+                .flat_map(|rule| rule.verbs.clone())
+                .map(|verb| Box::leak(verb.into_boxed_str()) as &str)
+                .collect();
+            assert!(
+                granted.contains(&required),
+                "{subresource} is issued as {} so it authorizes as {required:?}, \
+                 but the minted Role grants {granted:?}",
+                actual.method()
+            );
+        }
+    }
+
     /// The granted verb must be the one the request actually sends.
+    /// The chart must grant the operator the verb its own exec actually uses.
+    ///
+    /// REVIEW FINDING (expected to fail). Same root cause as
+    /// [`the_minted_role_grants_the_verb_the_request_actually_uses`], one layer
+    /// out. The readiness canary at `controllers/sandbox_canary.rs:206` execs
+    /// with the **operator's own** client for management-placement pools, so it
+    /// is governed by `charts/kobe/templates/rbac.yaml`, which grants
+    /// `pods/exec: create`. The WebSocket upgrade authorizes as `get`, so the
+    /// canary 403s, `evaluate_readiness_canary` reports `Inconclusive`, and the
+    /// lease requeues until its provisioning deadline instead of going Ready.
+    ///
+    /// A missing verb is a runtime 403 no unit test sees; asserting it against
+    /// the chart text is the only place it can be caught before a cluster.
+    #[test]
+    fn the_chart_grants_the_verb_the_readiness_canary_actually_uses() {
+        let chart = include_str!("../../charts/kobe/templates/rbac.yaml");
+        // The rule block that names pods/exec, up to its own `verbs:` line, so
+        // a neighbouring rule's verbs cannot satisfy this by accident.
+        let block = chart
+            .split("- apiGroups:")
+            .find(|block| block.contains("\"pods/exec\""))
+            .expect("the chart grants pods/exec");
+        let verbs = block
+            .lines()
+            .find(|line| line.trim_start().starts_with("verbs:"))
+            .expect("the pods/exec rule declares verbs");
+        assert!(
+            verbs.contains("\"get\""),
+            "kube-rs upgrades pods/exec over a GET, which authorizes as `get`, \
+             but the chart grants {}",
+            verbs.trim()
+        );
+    }
+
+    /// Bare attach must be granted the subresource it actually calls.
+    ///
+    /// REVIEW FINDING (expected to fail). `sandbox_attach` prepares its upgrade
+    /// with `SandboxOperation::Exec` and then branches: with a `command` it
+    /// calls `pods.exec()`, without one it calls `pods.attach()`
+    /// (`src/api/sandbox.rs:651-654`). `SandboxOperation` has no `Attach`
+    /// variant and `Exec.subresources()` never mentions `pods/attach`, so the
+    /// minted credential cannot perform the second branch at all — `kobe
+    /// sandbox attach` with no command is a guaranteed 403 reported to the
+    /// caller as an opaque `TargetError`.
+    #[test]
+    fn the_attach_path_can_address_the_subresource_it_calls() {
+        // As written by the reviewer this asserted that `Exec` grants
+        // `pods/attach` — a fix shape, not the property. Widening the exec
+        // credential is exactly the "operations borrow each other's authority"
+        // that `operations_do_not_borrow_each_others_authority` forbids, so
+        // attach got its own operation instead. The PROPERTY the reviewer was
+        // protecting is preserved and asserted here: whatever credential the
+        // attach path mints must be able to address the subresource it calls.
+        let resources = |operation| -> Vec<String> {
+            scoped_rules(&target(), operation)
+                .iter()
+                .flat_map(|rule| rule.resources.clone().unwrap_or_default())
+                .collect()
+        };
+
+        let attach = resources(SandboxOperation::Attach);
+        assert!(
+            attach.iter().any(|resource| resource == "pods/attach"),
+            "a bare attach calls pods/attach; its credential grants only {attach:?}"
+        );
+
+        // And least privilege survives the fix: exec must NOT gain attach.
+        let exec = resources(SandboxOperation::Exec);
+        assert!(
+            !exec.iter().any(|resource| resource == "pods/attach"),
+            "granting attach to the exec credential would be the wrong repair"
+        );
+    }
+
+    /// Credential objects are named by lease UID, not lease name.
     ///
     /// `kube-rs` builds exec, attach and port-forward as `GET` — they are
     /// WebSocket upgrades — and the apiserver derives the RBAC verb from the

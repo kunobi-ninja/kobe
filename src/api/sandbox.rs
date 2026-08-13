@@ -3746,6 +3746,49 @@ mod tests {
         }
     }
 
+    /// The id a caller is handed back must be usable as a lease id.
+    ///
+    /// REVIEW FINDING (expected to fail). `create_sandbox_lease` mints
+    /// `sandbox-{12 hex}`, but `sandbox_access::looks_like_lease_id` decides
+    /// "id or alias" by testing for a `sbx-` prefix. No id this endpoint issues
+    /// carries it, so every operation addressed by id — logs, exec, attach,
+    /// port-forward, executions — is routed through `resolve_alias`, finds no
+    /// lease whose ALIAS is that string, and answers 404.
+    ///
+    /// That is the whole access surface dead for its primary identifier: `kobe
+    /// sandbox run` creates a lease, is handed this id, and then cannot address
+    /// it. Worse, the two are not merely disconnected: because the id falls
+    /// through to alias resolution, a caller's own second lease created with
+    /// `alias = <first lease's id>` silently captures operations aimed at the
+    /// first — exactly the substitution `looks_like_lease_id` is documented to
+    /// prevent.
+    #[tokio::test]
+    async fn the_id_a_caller_is_handed_back_resolves_as_a_lease_id() {
+        let server = MockServer::start().await;
+        mount_create_api(&server, true, false).await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "response: {body}");
+
+        let id = body["id"].as_str().expect("the response carries an id");
+        assert!(
+            crate::api::sandbox_access::looks_like_lease_id(id),
+            "the id this endpoint issues ({id:?}) is not recognised as a lease id, \
+             so every operation addressed by it is resolved as an alias and 404s"
+        );
+    }
+
     #[tokio::test]
     async fn create_uses_server_identity_and_applies_pool_and_policy_ttl() {
         let server = MockServer::start().await;
