@@ -1008,6 +1008,7 @@ mod tests {
                     container: "agent".into(),
                     port: 3000,
                 }],
+                runner_path: None,
             },
             isolation: SandboxIsolation::Gvisor {
                 runtime_class_name: "runsc".into(),

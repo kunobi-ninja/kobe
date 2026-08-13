@@ -149,7 +149,7 @@ build-crdgen:
     cargo run --bin crdgen -- sandboxleases > charts/kobe/crds/sandboxleases.yaml
     cargo run --bin crdgen -- sandboxexecutions > charts/kobe/crds/sandboxexecutions.yaml
 
-# Build Docker images locally (operator + kobe-sync)
+# Build Docker images locally (operator + kobe-sync + runner)
 [group('docker')]
 docker:
     PLATFORM={{ native_platform }} docker buildx bake -f docker-bake.hcl --load
@@ -223,7 +223,7 @@ bump VERSION:
       *)   ah_prerelease=false ;;
     esac
     perl -i -pe "s{^(\s*artifacthub\.io/prerelease:).*}{\$1 \"${ah_prerelease}\"}" charts/kobe/Chart.yaml
-    cargo update -p kobe-operator -p kobectl --precise "{{ VERSION }}" 2>/dev/null || true
+    cargo update -p kobe-operator -p kobectl -p kobe-runner --precise "{{ VERSION }}" 2>/dev/null || true
     ./scripts/check-version-consistency.sh
     echo "Bumped to {{ VERSION }}. Review the diff, commit, then \`just release\`."
 

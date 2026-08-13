@@ -60,6 +60,10 @@ pub struct SandboxTarget {
     pub container: String,
     /// Ports the pool declared. Nothing else is forwardable.
     pub ports: Vec<DeclaredPort>,
+    /// Where `kobe-runner` lives inside the container, if the pool's image
+    /// ships one. `None` means this Sandbox cannot supervise a detached
+    /// command, and the API refuses one rather than approximating it.
+    pub runner_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +287,10 @@ pub fn target_from_provenance(
                 port: port.port,
             })
             .collect(),
+        // Taken from the pool that admitted this lease, never from the caller.
+        // It becomes `argv[0]` of an exec, so a caller who could name it could
+        // run anything in the container under Kobe's own credential.
+        runner_path: pool.spec.template.runner_path.clone(),
     })
 }
 
@@ -634,6 +642,56 @@ pub async fn exec_in_sandbox(
     command: &[String],
     timeout: std::time::Duration,
 ) -> Result<SandboxExecResponse, SandboxAccessDenied> {
+    let raw = exec_capped(
+        client,
+        target,
+        container,
+        command,
+        None,
+        timeout,
+        MAX_EXEC_OUTPUT_BYTES,
+    )
+    .await?;
+
+    Ok(SandboxExecResponse {
+        // Lossy on purpose: a sandboxed command's output is arbitrary bytes,
+        // and refusing to return anything because byte 900k was not UTF-8
+        // would lose the 899k that were.
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
+        success: raw.success,
+        truncated: raw.truncated,
+    })
+}
+
+/// One exec's raw result, before anything decides what it means.
+#[derive(Debug)]
+pub struct RawExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub success: bool,
+    pub truncated: bool,
+}
+
+/// Run one command in the Sandbox, optionally writing to its stdin.
+///
+/// The stdin half exists for the runner contract (#82) and for nothing else: a
+/// tenant's argv is a URL when it travels as exec arguments, and the target
+/// apiserver's audit log records that URL verbatim. Sending the command over
+/// stdin instead keeps it out of a log Kobe does not own and cannot redact.
+///
+/// The input is written and the connection's write half is closed immediately.
+/// The runner reads a single line precisely so it never has to wait for an EOF
+/// that the exec transport may not deliver.
+pub async fn exec_capped(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    command: &[String],
+    stdin: Option<&[u8]>,
+    timeout: std::time::Duration,
+    output_cap: usize,
+) -> Result<RawExecOutput, SandboxAccessDenied> {
     use k8s_openapi::api::core::v1::Pod;
     use kube::api::AttachParams;
     if command.is_empty() || command.iter().any(|argument| argument.is_empty()) {
@@ -653,7 +711,7 @@ pub async fn exec_in_sandbox(
 
     let params = AttachParams::default()
         .container(container)
-        .stdin(false)
+        .stdin(stdin.is_some())
         .stdout(true)
         .stderr(true)
         .tty(false);
@@ -663,14 +721,31 @@ pub async fn exec_in_sandbox(
         .map_err(|_| SandboxAccessDenied::Backend)?
         .map_err(|_| SandboxAccessDenied::Backend)?;
 
+    if let Some(input) = stdin {
+        use tokio::io::AsyncWriteExt;
+        let Some(mut writer) = attached.stdin() else {
+            return Err(SandboxAccessDenied::Backend);
+        };
+        // A failed write is not swallowed: the command on the other end is
+        // waiting for a request it will now never get, and reporting success
+        // here would attribute its silence to the workload.
+        tokio::time::timeout(timeout, async {
+            writer.write_all(input).await?;
+            writer.shutdown().await
+        })
+        .await
+        .map_err(|_| SandboxAccessDenied::Backend)?
+        .map_err(|_| SandboxAccessDenied::Backend)?;
+    }
+
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut truncated = false;
     if let Some(mut stream) = attached.stdout() {
-        truncated |= read_capped(&mut stream, &mut stdout, MAX_EXEC_OUTPUT_BYTES, timeout).await;
+        truncated |= read_capped(&mut stream, &mut stdout, output_cap, timeout).await;
     }
     if let Some(mut stream) = attached.stderr() {
-        truncated |= read_capped(&mut stream, &mut stderr, MAX_EXEC_OUTPUT_BYTES, timeout).await;
+        truncated |= read_capped(&mut stream, &mut stderr, output_cap, timeout).await;
     }
 
     let status = tokio::time::timeout(timeout, attached.take_status().unwrap()).await;
@@ -684,12 +759,9 @@ pub async fn exec_in_sandbox(
         }
     };
 
-    Ok(SandboxExecResponse {
-        // Lossy on purpose: a sandboxed command's output is arbitrary bytes,
-        // and refusing to return anything because byte 900k was not UTF-8
-        // would lose the 899k that were.
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    Ok(RawExecOutput {
+        stdout,
+        stderr,
         success,
         truncated,
     })

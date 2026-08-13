@@ -2681,6 +2681,7 @@ dependencies = [
  "json-patch",
  "jsonwebtoken 9.3.1",
  "k8s-openapi",
+ "kobe-runner",
  "kube",
  "kunobi-auth",
  "kunobi-ha",
@@ -2719,6 +2720,17 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser",
+]
+
+[[package]]
+name = "kobe-runner"
+version = "0.39.1"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -312,6 +312,7 @@ mod tests {
             pod_uid: "pod-uid".into(),
             container: "agent".into(),
             ports: vec![],
+            runner_path: None,
         }
     }
 

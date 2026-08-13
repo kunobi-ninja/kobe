@@ -86,6 +86,10 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
             "/v1/sandbox-leases/{id}/executions/{execution}",
             get(get_sandbox_execution::<B>).delete(cancel_sandbox_execution::<B>),
         )
+        .route(
+            "/v1/sandbox-leases/{id}/executions/{execution}/logs",
+            get(get_sandbox_execution_logs::<B>),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,14 +219,22 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     };
 
     // Detached execution needs a supervisor inside the container that outlives
-    // the connection. Refused explicitly rather than approximated: a "detached"
-    // execution that actually dies with its connection is worse than none,
-    // because a caller builds on the guarantee it appears to offer.
-    if requested.detached {
+    // the connection. Refused explicitly where there is none, rather than
+    // approximated: a "detached" execution that actually dies with its
+    // connection is worse than none, because a caller builds on the guarantee
+    // it appears to offer.
+    //
+    // Checked BEFORE the reservation, so a pool that cannot serve the request
+    // does not leave the caller's idempotency key spent on an execution that
+    // never existed.
+    if requested.detached && target.runner_path.is_none() {
         return sandbox_error(
             StatusCode::NOT_IMPLEMENTED,
-            "Detached execution requires the Sandbox runner contract",
-            Some("Use wait mode; see #82 for the runner contract.".into()),
+            "This Sandbox pool does not provide the Kobe runner",
+            Some(
+                "Detached execution requires a pool whose template sets runnerPath; use wait mode."
+                    .into(),
+            ),
         );
     }
 
@@ -328,6 +340,14 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     let guard = streams.register(&target.lease_uid).await;
     let revoked = guard.cancelled();
 
+    if requested.detached {
+        return start_detached(
+            &state, &identity, &id, &target, &container, &requested, &reserved, &scoped, timeout,
+            revoked,
+        )
+        .await;
+    }
+
     let result = tokio::select! {
         result = access::exec_in_sandbox(&scoped, &target, &container, &requested.argv, timeout) => result,
         _ = revoked.cancelled() => {
@@ -403,6 +423,241 @@ async fn create_sandbox_execution<B: ClusterBackend>(
 /// Default bound when a caller does not choose one.
 const DEFAULT_EXECUTION_TIMEOUT: &str = "60s";
 
+/// Hand one reserved execution to the runner and return without waiting.
+///
+/// The reservation is already `Running` when this is called, so every path out
+/// of here has to leave the record saying something a caller can act on. The
+/// two that matter:
+///
+/// * The runner answered — the execution is supervised, and the caller polls.
+/// * Anything else — `Unknown`. The command may be running perfectly well
+///   inside the container; Kobe simply cannot see it, and `Failed` would tell
+///   the caller their retry is safe when it is not.
+#[allow(clippy::too_many_arguments)]
+async fn start_detached<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    requested: &crate::api::sandbox_executions::ExecutionRequest,
+    reserved: &crate::crd::SandboxExecution,
+    scoped: &kube::Client,
+    timeout: std::time::Duration,
+    revoked: tokio_util::sync::CancellationToken,
+) -> Response {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+    use crate::crd::ExecutionState;
+
+    let Some(runner_path) = target.runner_path.clone() else {
+        // Refused before the reservation; reaching here means the pool changed
+        // underneath this request.
+        executions::record_terminal(
+            &state.client,
+            &state.namespace,
+            reserved,
+            ExecutionState::Unknown,
+            None,
+            "runner_unavailable",
+        )
+        .await;
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "This Sandbox pool stopped providing the Kobe runner",
+            None,
+        );
+    };
+
+    // The execution's own name is the runner's id: derived by Kobe, stable
+    // across retries, and — unlike anything the caller sent — safe to put in an
+    // exec argument that the target apiserver will audit-log verbatim.
+    let request = runner::start_request(
+        &reserved.name_any(),
+        &requested.argv,
+        requested.cwd.as_deref(),
+        timeout,
+    );
+
+    let started = tokio::select! {
+        started = runner::start(scoped, target, container, &runner_path, &request) => started,
+        _ = revoked.cancelled() => {
+            // The lease stopped permitting access mid-start. Whether the runner
+            // received the request is exactly the thing nobody can now say.
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                reserved,
+                ExecutionState::Unknown,
+                None,
+                "lease_revoked",
+            )
+            .await;
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access while the command was starting",
+                None,
+            );
+        }
+    };
+
+    let report = match started {
+        Ok(report) => report,
+        Err(failure) => {
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                reserved,
+                ExecutionState::Unknown,
+                None,
+                failure.reason_code(),
+            )
+            .await;
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                execution = %reserved.name_any(),
+                operation = "execution",
+                outcome = "unknown",
+                reason = failure.reason_code(),
+                "Sandbox access"
+            );
+            return sandbox_error(failure.http_status(), failure.to_string(), None);
+        }
+    };
+
+    let outcome = runner::outcome_from_report(&report);
+    // A start that has already settled is unusual but not impossible — the
+    // runner reports `Unknown` for a supervisor it could not launch — and the
+    // record has to say so rather than leave the caller polling something that
+    // ended before they saw it.
+    if outcome.state.is_terminal() {
+        executions::record_terminal(
+            &state.client,
+            &state.namespace,
+            reserved,
+            outcome.state,
+            outcome.exit_code,
+            &outcome.reason,
+        )
+        .await;
+    }
+
+    let refreshed = executions::refresh(&state.client, &state.namespace, reserved).await;
+    let record = refreshed.as_ref().unwrap_or(reserved);
+    info!(
+        principal = %identity.identity,
+        lease = %id,
+        execution = %reserved.name_any(),
+        operation = "execution",
+        outcome = "detached",
+        state = %outcome.state,
+        "Sandbox access"
+    );
+    // 202: the request was accepted and the work is elsewhere. 200 only once
+    // there is an outcome to report.
+    let status = if outcome.state.is_terminal() {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    (status, Json(execution_response(record, None))).into_response()
+}
+
+/// Ask the runner what a detached execution is doing, and settle it if it is
+/// done.
+///
+/// Returns the record as it now stands. A runner that cannot be reached leaves
+/// the record exactly as it was: a transient failure to poll is not evidence
+/// about the command, and settling on it would turn a blip into a permanent
+/// `Unknown` for a command that finished successfully a second later.
+///
+/// The one exception is a runner that has *no record* of an execution Kobe
+/// reserved. That means the container was replaced under a Pod that kept its
+/// identity, and the outcome is genuinely unrecoverable — so it settles as
+/// `Unknown` now rather than after the verdict deadline.
+async fn reconcile_detached<B: ClusterBackend>(
+    state: &AppState<B>,
+    lease: &SandboxLease,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    record: &crate::crd::SandboxExecution,
+) -> crate::crd::SandboxExecution {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+    use kobe_runner::protocol::RunnerErrorCode;
+
+    let current = record
+        .status
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or_default();
+    if !record.spec.detached || current.is_terminal() {
+        return record.clone();
+    }
+    let Some(runner_path) = target.runner_path.clone() else {
+        return record.clone();
+    };
+
+    let Ok(cluster) = crate::api::sandbox_access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        lease,
+        target,
+    )
+    .await
+    else {
+        return record.clone();
+    };
+    let Ok(scoped) = crate::api::sandbox_credentials::scoped_client(
+        &cluster,
+        target,
+        crate::api::sandbox_credentials::SandboxOperation::Exec,
+    )
+    .await
+    else {
+        return record.clone();
+    };
+
+    let polled = runner::poll(
+        &scoped,
+        target,
+        &target.container,
+        &runner_path,
+        &record.name_any(),
+    )
+    .await;
+
+    let outcome = match polled {
+        Ok(report) => runner::outcome_from_report(&report),
+        Err(runner::RunnerCallFailure::Refused(RunnerErrorCode::NotFound)) => {
+            runner::RunnerOutcome {
+                state: crate::crd::ExecutionState::Unknown,
+                exit_code: None,
+                reason: "runner_forgot_execution".into(),
+            }
+        }
+        // Nothing was learned. The record keeps saying `Running`, and the
+        // verdict deadline remains the backstop it was designed to be.
+        Err(_) => return record.clone(),
+    };
+    if !outcome.state.is_terminal() {
+        return record.clone();
+    }
+
+    executions::record_terminal(
+        &state.client,
+        &state.namespace,
+        record,
+        outcome.state,
+        outcome.exit_code,
+        &outcome.reason,
+    )
+    .await;
+    executions::refresh(&state.client, &state.namespace, record)
+        .await
+        .unwrap_or_else(|| record.clone())
+}
+
 #[tracing::instrument(skip_all, fields(lease = %id))]
 async fn get_sandbox_execution<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -422,7 +677,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
     // Ownership of the LEASE is what authorises reading its executions. An
     // execution name alone must never be enough: they are derived from a caller's
     // own key, so a second caller could otherwise guess one.
-    let (_lease, target) =
+    let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
         {
             Ok(resolved) => resolved,
@@ -438,6 +693,11 @@ async fn get_sandbox_execution<B: ClusterBackend>(
     .await
     {
         Ok(Some(record)) => {
+            // A detached execution is only ever as current as its last poll:
+            // nobody is holding a connection to notice it finish. Asking the
+            // runner here is what makes `GET` an answer rather than an echo of
+            // what Kobe last wrote.
+            let record = reconcile_detached(&state, &lease, &target, &record).await;
             (StatusCode::OK, Json(execution_response(&record, None))).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -445,12 +705,211 @@ async fn get_sandbox_execution<B: ClusterBackend>(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionLogsQuery {
+    /// Where to resume each stream. Separate, because the two streams advance
+    /// independently — one offset for both would re-read whichever stream was
+    /// behind, or skip whichever was ahead.
+    #[serde(default)]
+    stdout_offset: Option<u64>,
+    #[serde(default)]
+    stderr_offset: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionStreamWindow {
+    data: String,
+    /// Where the next read should start. A caller that polls with this value
+    /// sees every byte exactly once, which is what makes a detached
+    /// execution's output reconnectable after a disconnect.
+    next_offset: u64,
+    /// Whether bytes are already waiting past `next_offset`.
+    more: bool,
+    /// Whether the runner dropped output at its retention cap. Unlike `more`,
+    /// this is unrecoverable — and a caller parsing a capped stream as
+    /// complete is how a bound becomes a wrong answer.
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionLogsResponse {
+    id: String,
+    state: String,
+    stdout: ExecutionStreamWindow,
+    stderr: ExecutionStreamWindow,
+}
+
+/// Read a detached execution's retained output.
+///
+/// Only detached executions have any: a wait-mode command's output was returned
+/// in its own response and is not kept. Saying so explicitly beats an empty
+/// body, which a caller would read as "it printed nothing".
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn get_sandbox_execution_logs<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path((id, execution)): Path<(String, String)>,
+    Query(query): Query<ExecutionLogsQuery>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+    use crate::api::sandbox_runner as runner;
+    use kobe_runner::protocol::LogStream;
+
+    if let Err(response) =
+        require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD, SANDBOX_EXECUTION_CRD]).await
+    {
+        return response;
+    }
+    if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let (lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
+        };
+    let record = match crate::api::sandbox_executions::get_owned(
+        &state.client,
+        &state.namespace,
+        &execution,
+        &target.lease_uid,
+    )
+    .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return execution_denied(&identity, &id, &error),
+    };
+
+    if !record.spec.detached {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "This execution's output was returned with its result and is not retained",
+            Some("Only detached executions retain output.".into()),
+        );
+    }
+    let Some(runner_path) = target.runner_path.clone() else {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "This Sandbox pool stopped providing the Kobe runner",
+            None,
+        );
+    };
+
+    // Polled first, so the state reported alongside the output is the one that
+    // was true when the output was read — not the one Kobe last wrote.
+    let record = reconcile_detached(&state, &lease, &target, &record).await;
+
+    let cluster = match access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
+    };
+    let scoped = match crate::api::sandbox_credentials::scoped_client(
+        &cluster,
+        &target,
+        crate::api::sandbox_credentials::SandboxOperation::Exec,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
+    };
+
+    let mut windows = Vec::new();
+    for (stream, offset) in [
+        (LogStream::Stdout, query.stdout_offset.unwrap_or(0)),
+        (LogStream::Stderr, query.stderr_offset.unwrap_or(0)),
+    ] {
+        match runner::read_output(
+            &scoped,
+            &target,
+            &target.container,
+            &runner_path,
+            &record.name_any(),
+            stream,
+            offset,
+        )
+        .await
+        {
+            Ok(chunk) => windows.push(chunk),
+            Err(failure) => {
+                info!(
+                    principal = %identity.identity,
+                    lease = %id,
+                    execution = %record.name_any(),
+                    operation = "execution-logs",
+                    outcome = "denied",
+                    reason = failure.reason_code(),
+                    "Sandbox access"
+                );
+                return sandbox_error(failure.http_status(), failure.to_string(), None);
+            }
+        }
+    }
+
+    let window = |chunk: &kobe_runner::protocol::LogChunk| {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&chunk.data_base64)
+            .unwrap_or_default();
+        ExecutionStreamWindow {
+            // Lossy on purpose: a sandboxed command's output is arbitrary
+            // bytes, and refusing the window because one of them was not UTF-8
+            // would lose all the ones that were.
+            data: String::from_utf8_lossy(&data).into_owned(),
+            next_offset: chunk.next_offset,
+            more: chunk.more,
+            truncated: chunk.truncated,
+        }
+    };
+    // Audited by identity and outcome, never by content: the body is the
+    // workload's own output and can contain anything.
+    info!(
+        principal = %identity.identity,
+        lease = %id,
+        execution = %record.name_any(),
+        pod_uid = %target.pod_uid,
+        operation = "execution-logs",
+        outcome = "allowed",
+        "Sandbox access"
+    );
+    (
+        StatusCode::OK,
+        Json(ExecutionLogsResponse {
+            id: record.name_any(),
+            state: record
+                .status
+                .as_ref()
+                .map(|status| status.state)
+                .unwrap_or_default()
+                .to_string(),
+            stdout: window(&windows[0]),
+            stderr: window(&windows[1]),
+        }),
+    )
+        .into_response()
+}
+
 /// Cancel one execution.
 ///
-/// Cancellation is recorded, not enforced here: without the runner contract
-/// there is no process group to signal. A caller is told what actually
-/// happened — the record moves to `Cancelled` only if the command had not
-/// already settled.
+/// For a detached execution this is a real termination: the runner signals the
+/// process **group**, so a build script that spawned four compilers and exited
+/// does not leave them running on CPU the lease is paying for.
+///
+/// A wait-mode execution has no process group Kobe can reach — its command is
+/// tied to a connection this request is not holding — so cancellation there is
+/// recorded rather than enforced. The record moves to `Cancelled` only if the
+/// command had not already settled.
 #[tracing::instrument(skip_all, fields(lease = %id))]
 async fn cancel_sandbox_execution<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -467,12 +926,18 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
     if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (_lease, target) =
+    let (lease, target) =
         match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
         {
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
+
+    if let Some(response) =
+        cancel_detached(&state, &identity, &id, &lease, &target, &execution).await
+    {
+        return response;
+    }
 
     match crate::api::sandbox_executions::cancel_owned(
         &state.client,
@@ -488,6 +953,136 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => execution_denied(&identity, &id, &error),
     }
+}
+
+/// Terminate a detached execution's process group, if this is one.
+///
+/// `None` means "not a detached execution to cancel" and lets the caller fall
+/// through to the record-only path.
+///
+/// A runner that cannot be reached does **not** settle the record. Recording
+/// `Cancelled` would claim a termination nobody performed, and recording
+/// `Unknown` would close a record whose command is very likely still running —
+/// leaving it `Running` keeps the caller's retry meaningful, and lease teardown
+/// remains the backstop that always ends it.
+async fn cancel_detached<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    lease: &SandboxLease,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    execution: &str,
+) -> Option<Response> {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+
+    let record = executions::get_owned(
+        &state.client,
+        &state.namespace,
+        execution,
+        &target.lease_uid,
+    )
+    .await
+    .ok()
+    .flatten()?;
+    let current = record
+        .status
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or_default();
+    if !record.spec.detached || current.is_terminal() {
+        return None;
+    }
+    let runner_path = target.runner_path.clone()?;
+
+    let cluster = access_or_none(&state.client, &state.namespace, lease, target).await?;
+    let scoped = crate::api::sandbox_credentials::scoped_client(
+        &cluster,
+        target,
+        crate::api::sandbox_credentials::SandboxOperation::Exec,
+    )
+    .await
+    .ok()?;
+
+    match runner::cancel(
+        &scoped,
+        target,
+        &target.container,
+        &runner_path,
+        &record.name_any(),
+    )
+    .await
+    {
+        Ok(report) => {
+            let outcome = runner::outcome_from_report(&report);
+            if !outcome.state.is_terminal() {
+                // The runner answered without settling it. Saying "cancelled"
+                // here would be Kobe's word for something the container did not
+                // confirm.
+                return Some(sandbox_error(
+                    StatusCode::ACCEPTED,
+                    "Cancellation was requested and has not completed yet",
+                    None,
+                ));
+            }
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                &record,
+                outcome.state,
+                outcome.exit_code,
+                &outcome.reason,
+            )
+            .await;
+            let refreshed = executions::refresh(&state.client, &state.namespace, &record).await;
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                execution = %record.name_any(),
+                operation = "execution-cancel",
+                outcome = "allowed",
+                state = %outcome.state,
+                "Sandbox access"
+            );
+            Some(
+                (
+                    StatusCode::OK,
+                    Json(execution_response(
+                        refreshed.as_ref().unwrap_or(&record),
+                        None,
+                    )),
+                )
+                    .into_response(),
+            )
+        }
+        Err(failure) => {
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                execution = %record.name_any(),
+                operation = "execution-cancel",
+                outcome = "denied",
+                reason = failure.reason_code(),
+                "Sandbox access"
+            );
+            Some(sandbox_error(
+                failure.http_status(),
+                failure.to_string(),
+                None,
+            ))
+        }
+    }
+}
+
+async fn access_or_none(
+    client: &kube::Client,
+    namespace: &str,
+    lease: &SandboxLease,
+    target: &crate::api::sandbox_access::SandboxTarget,
+) -> Option<crate::api::sandbox_access::TargetCluster> {
+    crate::api::sandbox_access::resolve_target_cluster(client, namespace, lease, target)
+        .await
+        .ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3019,6 +3614,11 @@ mod tests {
         for (name, plural, kind) in [
             (SANDBOX_POOL_CRD, "sandboxpools", "SandboxPool"),
             (SANDBOX_LEASE_CRD, "sandboxleases", "SandboxLease"),
+            (
+                SANDBOX_EXECUTION_CRD,
+                "sandboxexecutions",
+                "SandboxExecution",
+            ),
         ] {
             Mock::given(method("GET"))
                 .and(path(format!(
@@ -4870,5 +5470,179 @@ mod tests {
                 .iter()
                 .all(|request| request.method.as_str() != "PATCH")
         );
+    }
+    /// A pool with no runner refuses a detached execution, and refuses it
+    /// before the caller's idempotency key is spent.
+    ///
+    /// The order is the point. Reserving first and failing afterwards would
+    /// burn the key on an execution that never existed: the caller's retry —
+    /// with the same key, as retries must — would then get a conflict, or
+    /// worse, the record of a command nobody ever ran.
+    ///
+    /// And it is refused rather than approximated. A "detached" execution that
+    /// actually died with its connection would be worse than none at all,
+    /// because the caller has already built on the guarantee it appeared to
+    /// offer.
+    #[tokio::test]
+    async fn a_pool_without_a_runner_refuses_detached_before_spending_the_key() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        mount_ready_sandbox(&server, pool_json()).await;
+
+        let response = create_sandbox_execution::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path("sbx-own".into()),
+            Json(
+                serde_json::from_value(serde_json::json!({
+                    "command": ["/agent", "run"],
+                    "idempotency_key": "key-1",
+                    "detach": true
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .all(|request| !(request.method.as_str() == "POST"
+                    && request.url.path().contains("/sandboxexecutions"))),
+            "the idempotency key must not be reserved for a request that cannot be served"
+        );
+    }
+
+    /// A wait-mode execution has no retained output, and says so.
+    ///
+    /// Its output was returned in its own response and is not kept anywhere —
+    /// there is no runner holding it. An empty body would read as "the command
+    /// printed nothing", which is a different and wrong answer.
+    #[tokio::test]
+    async fn logs_for_a_wait_mode_execution_are_refused_rather_than_empty() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        mount_ready_sandbox(&server, pool_json_with_runner()).await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/sbxe-.*$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(execution_json(false)))
+            .mount(&server)
+            .await;
+
+        let response = get_sandbox_execution_logs::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path(("sbx-own".into(), "sbxe-1".into())),
+            Query(ExecutionLogsQuery {
+                stdout_offset: None,
+                stderr_offset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .all(|request| !request.url.path().ends_with("/exec")),
+            "nothing may be executed in the Pod to answer a question about a record"
+        );
+    }
+
+    /// Log offsets are per stream, and unknown options are refused.
+    ///
+    /// One offset for both streams would re-read whichever stream was behind
+    /// or skip whichever was ahead — and a silently ignored option means a
+    /// caller believes they set a bound that was never applied.
+    #[test]
+    fn a_log_window_is_addressed_per_stream() {
+        let query: ExecutionLogsQuery =
+            serde_json::from_value(serde_json::json!({ "stdout_offset": 10, "stderr_offset": 20 }))
+                .unwrap();
+        assert_eq!(query.stdout_offset, Some(10));
+        assert_eq!(query.stderr_offset, Some(20));
+
+        for smuggled in ["offset", "tail", "follow", "container", "stream", "limit"] {
+            assert!(
+                serde_json::from_value::<ExecutionLogsQuery>(serde_json::json!({ smuggled: 1 }))
+                    .is_err(),
+                "{smuggled} must be refused, not ignored"
+            );
+        }
+    }
+
+    fn pool_json_with_runner() -> serde_json::Value {
+        let mut pool = pool_json();
+        pool["spec"]["template"]["runnerPath"] = serde_json::json!("/kobe-runner");
+        pool
+    }
+
+    fn execution_json(detached: bool) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxExecution",
+            "metadata": { "name": "sbxe-1", "namespace": "test-ns", "uid": "sbxe-1-uid" },
+            "spec": {
+                "leaseUid": "sbx-own-uid",
+                "podUid": "pod-uid",
+                "idempotencyKey": "key-1",
+                "requestDigest": "d".repeat(64),
+                "timeout": "60s",
+                "detached": detached
+            },
+            "status": { "state": "Running" }
+        })
+    }
+
+    /// A lease that is Ready and fully placed, so execution paths reach their
+    /// own logic instead of stopping at resolution.
+    async fn mount_ready_sandbox(server: &MockServer, pool: serde_json::Value) {
+        // The id must LOOK like a lease id: anything else is resolved as a
+        // caller alias, which is a different code path entirely.
+        let mut lease = lease_json("sbx-own", &identity().identity, "Ready");
+        lease["status"] = serde_json::json!({
+            "phase": "Ready",
+            "observedGeneration": 1,
+            "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            "placement": { "type": "management" },
+            "target": {
+                "namespace": "test-ns",
+                "sandboxClaim": {
+                    "apiVersion": "agents.x-k8s.io/v1alpha1", "kind": "SandboxClaim",
+                    "name": "claim", "uid": "claim-uid"
+                },
+                "sandbox": {
+                    "apiVersion": "agents.x-k8s.io/v1alpha1", "kind": "Sandbox",
+                    "name": "sbx", "uid": "sandbox-uid"
+                },
+                "pod": {
+                    "apiVersion": "v1", "kind": "Pod",
+                    "name": "sbx-0", "uid": "pod-uid"
+                }
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-own",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+            .mount(server)
+            .await;
     }
 }
