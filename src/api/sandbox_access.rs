@@ -321,13 +321,21 @@ impl SandboxTarget {
 
 /// Whether a string is a lease id rather than an alias.
 ///
-/// Lease ids are server-generated and always carry the `sbx-` prefix, so
+/// Lease ids are server-generated and always carry the [`LEASE_ID_PREFIX`], so
 /// anything else is an alias. Decided by shape rather than by trying one and
 /// falling back to the other: a fallback would let a caller who names a lease
 /// that has just expired silently reach a *different* lease that happens to
 /// use that name as an alias, and find out from its side effects.
+///
+/// The prefix is shared with the minting site rather than written twice. It
+/// was written twice, they disagreed — ids are minted `sandbox-…` while this
+/// tested for `sbx-` — and every operation addressed by id fell through to
+/// alias resolution and 404'd. Worse than dead: a caller's second lease could
+/// take the first lease's id as its ALIAS and silently capture operations
+/// aimed at the first, which is exactly the substitution this check exists to
+/// prevent.
 pub fn looks_like_lease_id(value: &str) -> bool {
-    value.starts_with("sbx-")
+    value.starts_with(crate::api::sandbox::LEASE_ID_PREFIX)
 }
 
 /// Resolve a caller's alias to exactly one lease id.
@@ -1370,6 +1378,22 @@ mod tests {
         (client, server)
     }
 
+    /// A minted id must resolve as an id.
+    ///
+    /// These were written at two sites and silently disagreed: ids were minted
+    /// `sandbox-…` while the shape check tested for `sbx-`, so every operation
+    /// addressed by id fell through to alias resolution and 404'd. The check
+    /// now shares the prefix constant, and this asserts the agreement holds
+    /// against a REAL minted id rather than a literal.
+    #[test]
+    fn an_id_the_server_mints_resolves_as_an_id() {
+        let minted = format!("{}1ad3aa5d03bf", crate::api::sandbox::LEASE_ID_PREFIX);
+        assert!(
+            looks_like_lease_id(&minted),
+            "{minted} is a server-minted lease id and must not be treated as an alias"
+        );
+    }
+
     /// An alias is never tried as an id, or an id as an alias.
     ///
     /// A fallback between the two is the dangerous shape: a caller naming a
@@ -1377,8 +1401,15 @@ mod tests {
     /// happens to use that name as an alias.
     #[test]
     fn a_lease_id_and_an_alias_are_told_apart_by_shape() {
-        assert!(looks_like_lease_id("sbx-7f3a"));
-        for alias in ["dev", "my-sandbox", "sbx", "SBX-1", "x-sbx-1", ""] {
+        assert!(looks_like_lease_id("sandbox-7f3a"));
+        for alias in [
+            "dev",
+            "my-sandbox",
+            "sandbox",
+            "SANDBOX-1",
+            "x-sandbox-1",
+            "",
+        ] {
             assert!(
                 !looks_like_lease_id(alias),
                 "{alias:?} must be treated as an alias"

@@ -184,7 +184,7 @@ pub async fn resolve_sandbox_pod(
 pub async fn run_canary(
     client: &Client,
     namespace: &str,
-    pod: &str,
+    pod: &ResolvedSandboxPod,
     container: &str,
     canary: &SandboxExecutionCanary,
 ) -> CanaryOutcome {
@@ -197,13 +197,35 @@ pub async fn run_canary(
     };
 
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+
+    // The identity, not just the name. A Pod recycled between resolution and
+    // here is a different workload, and its exit status says nothing about
+    // this lease's Sandbox.
+    match pods.get(&pod.pod_name).await {
+        Ok(current) if current.uid().as_deref() == Some(pod.pod_uid.as_str()) => {}
+        Ok(_) => {
+            return CanaryOutcome::Inconclusive {
+                reason: "sandbox pod was replaced between resolution and the canary".to_string(),
+            };
+        }
+        Err(error) => {
+            return CanaryOutcome::Inconclusive {
+                reason: format!("could not confirm the sandbox pod: {error}"),
+            };
+        }
+    }
+
     let params = AttachParams::default()
         .container(container)
         .stdin(false)
         .stdout(true)
         .stderr(true);
 
-    let attached = match tokio::time::timeout(timeout, pods.exec(pod, &canary.argv, &params)).await
+    let attached = match tokio::time::timeout(
+        timeout,
+        pods.exec(&pod.pod_name, &canary.argv, &params),
+    )
+    .await
     {
         Ok(Ok(attached)) => attached,
         Ok(Err(error)) => {
@@ -275,7 +297,11 @@ pub async fn evaluate_readiness_canary(
     canary: &SandboxExecutionCanary,
 ) -> CanaryOutcome {
     let pod = match resolve_sandbox_pod(client, namespace, claim).await {
-        Ok(Some(resolved)) => resolved.pod_name,
+        // The UID is resolved here and carried to `run_canary`, which rechecks
+        // it. Executing against the name alone would let a Pod recycled between
+        // resolution and exec answer the canary — and a zero exit from another
+        // tenant's workload would advance THIS lease toward Ready.
+        Ok(Some(resolved)) => resolved,
         Ok(None) => {
             debug!(claim = %claim.name_any(), "sandbox pod not resolvable yet");
             return CanaryOutcome::Inconclusive {
@@ -348,7 +374,13 @@ mod tests {
                 argv: vec!["/agent".into(), "health".into()],
                 timeout: bad.to_string(),
             };
-            let outcome = run_canary(&client, "test-ns", "pod-1", "agent", &canary).await;
+            let pod = ResolvedSandboxPod {
+                sandbox_name: "sbx".into(),
+                sandbox_uid: "sandbox-uid".into(),
+                pod_name: "pod-1".into(),
+                pod_uid: "pod-uid".into(),
+            };
+            let outcome = run_canary(&client, "test-ns", &pod, "agent", &canary).await;
             assert!(
                 matches!(outcome, CanaryOutcome::Inconclusive { .. }),
                 "timeout {bad:?} must not run an unbounded exec, got {outcome:?}"

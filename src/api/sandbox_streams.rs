@@ -96,24 +96,50 @@ impl StreamRegistry {
         Arc::new(Self::default())
     }
 
-    /// Register one stream against its lease UID.
+    /// Register one stream against its lease UID, ignoring the limit.
+    ///
+    /// Test-only on purpose: every production path must go through
+    /// [`register_bounded`], and an unbounded registration in a handler is
+    /// precisely the bug that let durable executions escape the per-lease
+    /// bound.
+    #[cfg(test)]
     pub async fn register(self: &Arc<Self>, lease_uid: &str) -> StreamGuard {
+        self.try_register(lease_uid, usize::MAX)
+            .await
+            .expect("an unbounded registration cannot be refused")
+    }
+
+    /// Register only if the lease is under `limit`, deciding both under ONE
+    /// lock.
+    ///
+    /// Checking capacity and then registering as two steps is a race, not a
+    /// limit: N concurrent upgrades all observe "under the limit" before any of
+    /// them registers, and all N proceed. The count and the insert have to be
+    /// the same critical section or the bound is decorative.
+    pub async fn try_register(
+        self: &Arc<Self>,
+        lease_uid: &str,
+        limit: usize,
+    ) -> Option<StreamGuard> {
         let token = CancellationToken::new();
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.streams
-            .write()
-            .await
-            .entry(lease_uid.to_string())
-            .or_default()
-            .insert(id, token.clone());
-        StreamGuard {
+
+        let mut streams = self.streams.write().await;
+        let held = streams.entry(lease_uid.to_string()).or_default();
+        if held.len() >= limit {
+            return None;
+        }
+        held.insert(id, token.clone());
+        drop(streams);
+
+        Some(StreamGuard {
             registry: self.clone(),
             lease_uid: lease_uid.to_string(),
             id,
             token,
-        }
+        })
     }
 
     async fn deregister(&self, lease_uid: &str, id: u64) {
@@ -143,7 +169,10 @@ impl StreamRegistry {
 
     /// How many streams are currently registered for a lease.
     ///
-    /// Used to enforce per-lease concurrency, and by tests.
+    /// Test-only: enforcing the limit reads the count under the SAME lock that
+    /// inserts, so exposing a standalone count would just invite the
+    /// check-then-act race back.
+    #[cfg(test)]
     pub async fn live_count(&self, lease_uid: &str) -> usize {
         self.streams
             .read()
@@ -166,9 +195,17 @@ impl StreamRegistry {
 /// would need coordination that could fail open.
 pub const MAX_STREAMS_PER_LEASE: usize = 8;
 
-/// Whether one more operation may start for this lease.
-pub async fn may_start_stream(registry: &Arc<StreamRegistry>, lease_uid: &str) -> bool {
-    registry.live_count(lease_uid).await < MAX_STREAMS_PER_LEASE
+/// Register one operation for this lease, or refuse because it is at its limit.
+///
+/// Replaces a separate "may I?" check: asking and then registering is a race
+/// that lets every concurrent request pass a limit none of them has taken yet.
+pub async fn register_bounded(
+    registry: &Arc<StreamRegistry>,
+    lease_uid: &str,
+) -> Option<StreamGuard> {
+    registry
+        .try_register(lease_uid, MAX_STREAMS_PER_LEASE)
+        .await
 }
 
 /// This replica's registry.
@@ -214,24 +251,7 @@ pub async fn run_stream_revoker(
             _ = shutdown.cancelled() => break,
             event = stream.next() => {
                 match event {
-                    Some(Ok(watcher::Event::Apply(lease))) => {
-                        revoke_if_ended(&registry, &lease).await;
-                    }
-                    // A deleted lease has no phase left to read. Everything it
-                    // was serving is over by definition.
-                    Some(Ok(watcher::Event::Delete(lease))) => {
-                        if let Some(uid) = lease.uid() {
-                            let cancelled = registry.revoke(&uid).await;
-                            if cancelled > 0 {
-                                info!(
-                                    lease = %lease.name_any(),
-                                    cancelled,
-                                    "cancelled streams for a deleted Sandbox lease"
-                                );
-                            }
-                        }
-                    }
-                    Some(Ok(_)) => {}
+                    Some(Ok(event)) => handle_watch_event(&registry, event).await,
                     Some(Err(error)) => {
                         // The watch restarts itself; log and keep going. Giving
                         // up here would silently stop revoking.
@@ -243,6 +263,42 @@ pub async fn run_stream_revoker(
         }
     }
     info!("Sandbox stream revoker shut down");
+}
+
+/// Act on one watch event.
+///
+/// Extracted so the EVENT MAPPING is testable, not just the action. Testing
+/// `revoke_if_ended` directly proves nothing about which events reach it —
+/// which is exactly where this went wrong: handling only `Apply` meant a
+/// re-listed lease was silently ignored.
+async fn handle_watch_event(registry: &Arc<StreamRegistry>, event: watcher::Event<SandboxLease>) {
+    match event {
+        // `Apply` AND `InitApply`. A watch that reconnects — after an etcd
+        // compaction, an apiserver restart, a network blip — re-lists every
+        // object as `InitApply`, and a lease that transitioned to Releasing
+        // during the gap arrives ONLY that way. Handling just `Apply` meant
+        // revocation quietly stopped working across a reconnect, while the
+        // revoker went on looking healthy — worse than not having one.
+        watcher::Event::Apply(lease) | watcher::Event::InitApply(lease) => {
+            revoke_if_ended(registry, &lease).await;
+        }
+        // A deleted lease has no phase left to read. Everything it was serving
+        // is over by definition.
+        watcher::Event::Delete(lease) => {
+            if let Some(uid) = lease.uid() {
+                let cancelled = registry.revoke(&uid).await;
+                if cancelled > 0 {
+                    info!(
+                        lease = %lease.name_any(),
+                        cancelled,
+                        "cancelled streams for a deleted Sandbox lease"
+                    );
+                }
+            }
+        }
+        // `Init`/`InitDone` carry no object.
+        watcher::Event::Init | watcher::Event::InitDone => {}
+    }
 }
 
 async fn revoke_if_ended(registry: &Arc<StreamRegistry>, lease: &SandboxLease) {
@@ -376,26 +432,112 @@ mod tests {
         let registry = StreamRegistry::new();
         let mut guards = Vec::new();
         for _ in 0..MAX_STREAMS_PER_LEASE {
-            assert!(may_start_stream(&registry, "lease-a").await);
-            guards.push(registry.register("lease-a").await);
+            guards.push(
+                register_bounded(&registry, "lease-a")
+                    .await
+                    .expect("under the limit"),
+            );
         }
         assert!(
-            !may_start_stream(&registry, "lease-a").await,
+            register_bounded(&registry, "lease-a").await.is_none(),
             "the limit must actually bind"
         );
-        // Another lease is unaffected: the limit is per-lease, not per-replica
-        // in aggregate, so one busy caller cannot lock everybody else out.
-        assert!(may_start_stream(&registry, "lease-b").await);
+        // Another lease is unaffected: the limit is per-lease, so one busy
+        // caller cannot lock everybody else out.
+        assert!(register_bounded(&registry, "lease-b").await.is_some());
 
         // Closing one frees a slot.
         guards.pop();
         for _ in 0..10 {
-            if may_start_stream(&registry, "lease-a").await {
+            if registry.live_count("lease-a").await < MAX_STREAMS_PER_LEASE {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert!(may_start_stream(&registry, "lease-a").await);
+        assert!(register_bounded(&registry, "lease-a").await.is_some());
+    }
+
+    /// The bound holds under concurrency, which is the only case that matters.
+    ///
+    /// Checking capacity and then registering as two steps is a race, not a
+    /// limit: every concurrent request observes "under the limit" before any of
+    /// them has taken a slot, and all of them proceed. This is the test that
+    /// fails if the count and the insert ever stop sharing one critical
+    /// section.
+    #[tokio::test]
+    async fn concurrent_registrations_cannot_overshoot_the_limit() {
+        let registry = StreamRegistry::new();
+        let attempts: Vec<_> = (0..MAX_STREAMS_PER_LEASE * 4)
+            .map(|_| {
+                let registry = registry.clone();
+                tokio::spawn(async move { register_bounded(&registry, "lease-a").await })
+            })
+            .collect();
+
+        let mut admitted = Vec::new();
+        for attempt in attempts {
+            if let Ok(Some(guard)) = attempt.await {
+                admitted.push(guard);
+            }
+        }
+        assert_eq!(
+            admitted.len(),
+            MAX_STREAMS_PER_LEASE,
+            "exactly the limit may be admitted, however many race for it"
+        );
+        assert_eq!(registry.live_count("lease-a").await, MAX_STREAMS_PER_LEASE);
+    }
+
+    /// A watch that reconnects must not silently stop revoking.
+    ///
+    /// After an etcd compaction or an apiserver restart the watcher re-lists
+    /// every object as `InitApply`. A lease that transitioned to Releasing
+    /// during the gap arrives ONLY that way, so handling just `Apply` meant
+    /// revocation quietly stopped working across a reconnect — while the
+    /// revoker went on looking healthy, which is worse than not having one.
+    ///
+    /// Drives the event MAPPING, not `revoke_if_ended`: calling the action
+    /// directly would pass no matter which events actually reach it, which is
+    /// precisely how this was missed the first time.
+    #[tokio::test]
+    async fn a_lease_seen_only_on_resync_still_revokes() {
+        let ended = || {
+            let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+            lease.status.as_mut().unwrap().phase = SandboxLeasePhase::Releasing;
+            lease
+        };
+
+        for event in [
+            watcher::Event::InitApply(ended()),
+            watcher::Event::Apply(ended()),
+            watcher::Event::Delete(ended()),
+        ] {
+            let registry = StreamRegistry::new();
+            let guard = registry.register("lease-uid-1").await;
+            handle_watch_event(&registry, event).await;
+            assert!(
+                guard.cancelled().is_cancelled(),
+                "every event carrying an ended lease must cancel its streams"
+            );
+        }
+
+        // And a LIVE lease is left alone, however it arrives — otherwise the fix
+        // would make every resync tear down healthy sessions, which is a worse
+        // bug than the one it repairs.
+        let ready = || {
+            let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+            lease.status.as_mut().unwrap().phase = SandboxLeasePhase::Ready;
+            lease
+        };
+        for event in [
+            watcher::Event::InitApply(ready()),
+            watcher::Event::Apply(ready()),
+        ] {
+            let registry = StreamRegistry::new();
+            let guard = registry.register("lease-uid-1").await;
+            handle_watch_event(&registry, event).await;
+            assert!(!guard.cancelled().is_cancelled());
+        }
     }
 
     /// A lease that ends cancels its streams; one that is merely updated does

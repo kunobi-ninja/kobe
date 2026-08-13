@@ -277,6 +277,44 @@ pub async fn reconcile_lease(
         }
     };
 
+    // Enter Provisioning before anything is placed.
+    //
+    // This was the missing half of the lifecycle: `mark_sandbox_ready` requires
+    // a persisted `provisioningDeadline` and only accepts `Provisioning ->
+    // Ready`, and NOTHING wrote either — the API creates leases with no status
+    // at all. Every real lease therefore sat in `Pending` forever while the
+    // claim was created and became Ready, because the transition it needed had
+    // no producer. The controller tests did not catch it because their fixture
+    // hand-wrote a `Provisioning` phase and a deadline: a state no production
+    // path could reach.
+    //
+    // The deadline starts here, when Kobe accepts responsibility for placing
+    // the lease — not at request, which would charge the caller for time spent
+    // queuing, and not at readiness, which is what the runtime TTL is for.
+    let status = lease.status.clone().unwrap_or_default();
+    let observed_generation = lease.metadata.generation.unwrap_or_default();
+    if status.phase == crate::crd::SandboxLeasePhase::Pending {
+        let provisioning_timeout = crate::pool::parse_duration(&pool.spec.provisioning_timeout)
+            .ok_or_else(|| {
+                SandboxPlacementError::Invalid(format!(
+                    "SandboxPool {} has an invalid provisioningTimeout",
+                    pool.name_any()
+                ))
+            })?;
+        let next = crate::sandbox::begin_sandbox_provisioning(
+            &status,
+            observed_generation,
+            chrono::Utc::now(),
+            provisioning_timeout,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        patch_lease_status(&ctx, &name, &serde_json::json!(next)).await?;
+        info!(lease = %name, "Sandbox lease is provisioning");
+        // Re-read on the next pass rather than acting on a local copy whose
+        // status has just been overwritten server-side.
+        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+    }
+
     let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to own its claim"))
     })?;
@@ -378,7 +416,6 @@ pub async fn reconcile_lease(
     let runtime_ttl = crate::pool::parse_duration(&lease.spec.ttl).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("lease {name} has an invalid TTL"))
     })?;
-    let observed_generation = lease.metadata.generation.unwrap_or_default();
     // An already-Ready lease reuses its PERSISTED readiness instant. Passing a
     // fresh `now()` on every requeue would make the transition non-idempotent:
     // it would be refused as a changed timestamp forever, and the backstop

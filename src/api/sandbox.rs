@@ -44,6 +44,13 @@ const SANDBOX_LEASE_CRD: &str = "sandboxleases.kobe.kunobi.ninja";
 /// the reservation `create` — which is the failure `require_sandbox_crds`
 /// exists to prevent in the first place.
 const SANDBOX_EXECUTION_CRD: &str = "sandboxexecutions.kobe.kunobi.ninja";
+
+/// Prefix on every server-minted lease id.
+///
+/// Shared with the resolver's shape check rather than written at both sites:
+/// written twice, they disagreed, and every operation addressed by id fell
+/// through to alias resolution and 404'd.
+pub(crate) const LEASE_ID_PREFIX: &str = "sandbox-";
 const SANDBOX_RESERVATION_TYPE_LABEL: &str = "kobe.kunobi.ninja/sandbox-reservation";
 pub(crate) const SANDBOX_RESERVATION_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 const SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
@@ -324,8 +331,37 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         );
     }
 
+    // Durable executions count against the same per-lease bound as every other
+    // operation: each holds a connection to the target cluster, and a caller
+    // submitting them concurrently is consuming the same resource whether the
+    // request is called `exec` or `executions`. Registering unbounded here
+    // meant the limit existed on paper and not in the path most likely to be
+    // driven by a loop.
     let streams = crate::api::sandbox_streams::registry();
-    let guard = streams.register(&target.lease_uid).await;
+    let Some(guard) =
+        crate::api::sandbox_streams::register_bounded(streams, &target.lease_uid).await
+    else {
+        // The reservation already exists and is Running; leaving it that way
+        // would strand it until the verdict deadline. Settle it honestly
+        // instead — nothing was spawned, so it definitely did not run.
+        executions::record_terminal(
+            &state.client,
+            &state.namespace,
+            &reserved,
+            ExecutionState::Cancelled,
+            None,
+            "concurrency_limit",
+        )
+        .await;
+        return access_denied_with(
+            &identity,
+            &id,
+            "execution",
+            "concurrency_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many concurrent operations for this Sandbox lease",
+        );
+    };
     let revoked = guard.cancelled();
 
     let result = tokio::select! {
@@ -512,6 +548,23 @@ struct SandboxPortForwardQuery {
     port: String,
 }
 
+/// Whether the Pod answering to the recorded name is still the recorded Pod.
+///
+/// Kubernetes permits name reuse, so a name that resolved at placement can
+/// point at a different workload by the time a stream opens. Anything that
+/// cannot confirm the identity is treated as a mismatch: "I could not check"
+/// must not open a terminal.
+async fn pod_identity_holds(
+    pods: &kube::Api<k8s_openapi::api::core::v1::Pod>,
+    target: &crate::api::sandbox_access::SandboxTarget,
+) -> bool {
+    use kube::ResourceExt;
+    matches!(
+        pods.get(&target.pod_name).await,
+        Ok(pod) if pod.uid().as_deref() == Some(target.pod_uid.as_str())
+    )
+}
+
 /// Everything an interactive operation needs, resolved before the upgrade.
 ///
 /// Resolution happens *before* the WebSocket handshake completes on purpose:
@@ -521,6 +574,9 @@ struct UpgradeContext {
     target: crate::api::sandbox_access::SandboxTarget,
     container: String,
     scoped: kube::Client,
+    /// The registration claimed before the upgrade. Held here so the slot is
+    /// never released between being taken and the stream starting.
+    guard: crate::api::sandbox_streams::StreamGuard,
 }
 
 async fn prepare_upgrade<B: ClusterBackend>(
@@ -546,14 +602,18 @@ async fn prepare_upgrade<B: ClusterBackend>(
         Ok(container) => container.to_string(),
         Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
     };
-    // Concurrency is checked before the upgrade, so a caller over the limit
-    // gets a status rather than a socket that closes immediately.
-    if !crate::api::sandbox_streams::may_start_stream(
+    // Registered here, not merely checked. Asking "am I under the limit?" and
+    // registering afterwards lets every concurrent upgrade pass a limit none of
+    // them has taken yet. The slot is claimed before the upgrade so a caller
+    // over the limit gets a status rather than a socket that closes at once,
+    // and the guard travels with the context so the claim cannot be dropped in
+    // between.
+    let Some(guard) = crate::api::sandbox_streams::register_bounded(
         crate::api::sandbox_streams::registry(),
         &target.lease_uid,
     )
     .await
-    {
+    else {
         return Err(access_denied_with(
             identity,
             id,
@@ -562,7 +622,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many concurrent operations for this Sandbox lease",
         ));
-    }
+    };
 
     // Both placements go through the same resolution. Child composition
     // changes which cluster the Pod is in; it changes nothing about what the
@@ -588,6 +648,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
         target,
         container,
         scoped,
+        guard,
     })
 }
 
@@ -617,11 +678,20 @@ async fn sandbox_attach<B: ClusterBackend>(
         );
     }
 
+    // The operation is chosen by which subresource this request will actually
+    // call: `pods/exec` with a command, `pods/attach` without. Minting an exec
+    // credential and then calling attach was a guaranteed 403 on a socket that
+    // had already upgraded cleanly.
+    let operation = if query.command.is_some() {
+        SandboxOperation::Exec
+    } else {
+        SandboxOperation::Attach
+    };
     let context = match prepare_upgrade(
         &state,
         &identity,
         &id,
-        SandboxOperation::Exec,
+        operation,
         query.container.as_deref(),
     )
     .await
@@ -632,13 +702,21 @@ async fn sandbox_attach<B: ClusterBackend>(
 
     let principal = identity.identity.clone();
     upgrade.on_upgrade(move |mut socket| async move {
-        let guard = crate::api::sandbox_streams::registry()
-            .register(&context.target.lease_uid)
-            .await;
+        let guard = context.guard;
         let revoked = guard.cancelled();
 
         let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
             kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+
+        // The name resolved at placement; the identity must still match. A Pod
+        // recycled under the same name is a different workload, and attaching a
+        // terminal to it would put a caller's keystrokes into somebody else's
+        // container. Logs and exec already recheck; this path did not.
+        if !pod_identity_holds(&pods, &context.target).await {
+            transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+            return;
+        }
+
         let params = kube::api::AttachParams::default()
             .container(&context.container)
             .stdin(true)
@@ -710,13 +788,19 @@ async fn sandbox_port_forward<B: ClusterBackend>(
 
     let principal = identity.identity.clone();
     upgrade.on_upgrade(move |mut socket| async move {
-        let guard = crate::api::sandbox_streams::registry()
-            .register(&context.target.lease_uid)
-            .await;
+        let guard = context.guard;
         let revoked = guard.cancelled();
 
         let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
             kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+
+        // Same fence as attach: a recycled Pod under the recorded name would
+        // forward the caller's connection into another tenant's workload.
+        if !pod_identity_holds(&pods, &context.target).await {
+            transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+            return;
+        }
+
         let mut forwarder = match pods.portforward(&context.target.pod_name, &[port]).await {
             Ok(forwarder) => forwarder,
             Err(_) => {
@@ -815,7 +899,9 @@ async fn sandbox_exec<B: ClusterBackend>(
     // panic — a leaked registration would later report cancelling something
     // that ended long ago.
     let streams = crate::api::sandbox_streams::registry();
-    if !crate::api::sandbox_streams::may_start_stream(streams, &target.lease_uid).await {
+    let Some(guard) =
+        crate::api::sandbox_streams::register_bounded(streams, &target.lease_uid).await
+    else {
         return access_denied_with(
             &identity,
             &id,
@@ -824,8 +910,7 @@ async fn sandbox_exec<B: ClusterBackend>(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many concurrent operations for this Sandbox lease",
         );
-    }
-    let guard = streams.register(&target.lease_uid).await;
+    };
     let revoked = guard.cancelled();
 
     let result = tokio::select! {
@@ -1278,7 +1363,7 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     reap_abandoned_pending_leases(&leases, &reservations, &identity, chrono::Utc::now()).await;
 
     let lease_id = format!(
-        "sandbox-{}",
+        "{LEASE_ID_PREFIX}{}",
         &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
     );
     let lease = build_sandbox_lease(
