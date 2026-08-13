@@ -5620,7 +5620,7 @@ mod tests {
         let response = create_sandbox_execution::<crate::testutil::MockBackend>(
             State(test_state(&server)),
             identity(),
-            Path("sbx-own".into()),
+            Path("sandbox-own".into()),
             Json(
                 serde_json::from_value(serde_json::json!({
                     "command": ["/agent", "run"],
@@ -5666,7 +5666,7 @@ mod tests {
         let response = get_sandbox_execution_logs::<crate::testutil::MockBackend>(
             State(test_state(&server)),
             identity(),
-            Path(("sbx-own".into(), "sbxe-1".into())),
+            Path(("sandbox-own".into(), "sbxe-1".into())),
             Query(ExecutionLogsQuery {
                 stdout_offset: None,
                 stderr_offset: None,
@@ -5720,7 +5720,7 @@ mod tests {
             "kind": "SandboxExecution",
             "metadata": { "name": "sbxe-1", "namespace": "test-ns", "uid": "sbxe-1-uid" },
             "spec": {
-                "leaseUid": "sbx-own-uid",
+                "leaseUid": "sandbox-own-uid",
                 "podUid": "pod-uid",
                 "idempotencyKey": "key-1",
                 "requestDigest": "d".repeat(64),
@@ -5736,7 +5736,7 @@ mod tests {
     async fn mount_ready_sandbox(server: &MockServer, pool: serde_json::Value) {
         // The id must LOOK like a lease id: anything else is resolved as a
         // caller alias, which is a different code path entirely.
-        let mut lease = lease_json("sbx-own", &identity().identity, "Ready");
+        let mut lease = lease_json("sandbox-own", &identity().identity, "Ready");
         lease["status"] = serde_json::json!({
             "phase": "Ready",
             "observedGeneration": 1,
@@ -5760,7 +5760,7 @@ mod tests {
         });
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-own",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-own",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(lease))
             .mount(server)
