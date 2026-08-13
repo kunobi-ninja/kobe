@@ -280,6 +280,20 @@ pub struct SandboxTemplateSpec {
     #[serde(default)]
     #[schemars(length(max = 64))]
     pub exposed_ports: Vec<SandboxPortSpec>,
+    /// Absolute path to `kobe-runner` inside `defaultContainer`, when the
+    /// administrator's image ships one.
+    ///
+    /// Absent means this pool does not offer detached execution, and the API
+    /// says so rather than approximating it. A detached execution that actually
+    /// dies with its connection is worse than none, because the caller has
+    /// already built on the guarantee it appeared to offer.
+    ///
+    /// A constrained path rather than free text: it becomes `argv[0]` of an
+    /// exec, so anything that could carry an argument, a shell metacharacter or
+    /// a nul is refused by the schema before it can reach one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 255), pattern(r"^/[A-Za-z0-9._/-]*$"))]
+    pub runner_path: Option<String>,
 }
 
 /// One administrator-controlled container in a Sandbox template.
@@ -756,6 +770,7 @@ mod tests {
                     container: "agent".into(),
                     port: 3000,
                 }],
+                runner_path: None,
             },
             isolation: SandboxIsolation::TrustedRunc {},
             readiness: SandboxReadinessRequirements {

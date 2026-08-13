@@ -2,7 +2,7 @@
 # The thin CLI crate `kobectl` (binary `kobe`) is a separate member so it can
 # be published to crates.io with a slim dependency tree. The operator stays the
 # root package (it is the bulk of the code and what the container images build).
-members = ["crates/kobectl"]
+members = ["crates/kobectl", "crates/kobe-runner"]
 resolver = "3"
 
 # Single source of truth for the release version, shared by the operator and the
@@ -145,6 +145,12 @@ http = "1"
 
 libc = "0.2"
 regex = "1"
+
+# The wire contract with the in-container Sandbox runner (#82). A path
+# dependency on the runner crate rather than a second copy of the types: two
+# hand-maintained definitions of a wire format drift, and the drift shows up as
+# a MISREAD reply — a caller told their command succeeded because a field moved.
+kobe-runner = { path = "crates/kobe-runner" }
 
 [dev-dependencies]
 tokio-test = "0.4"

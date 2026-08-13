@@ -23,11 +23,17 @@ WORKDIR /app
 # unique deps aren't compiled here — the operator images never include the CLI.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/kobectl/Cargo.toml crates/kobectl/Cargo.toml
-RUN mkdir -p src crates/kobectl/src && \
+# The runner member is a real dependency of the operator (it owns the wire
+# contract in `src/protocol.rs`), so its manifest AND a lib stub have to exist
+# or the root package cannot resolve during dependency caching.
+COPY crates/kobe-runner/Cargo.toml crates/kobe-runner/Cargo.toml
+RUN mkdir -p src crates/kobectl/src crates/kobe-runner/src && \
     echo "pub fn stub() {}" > src/lib.rs && \
     echo "fn main() {}" > crates/kobectl/src/main.rs && \
+    echo "fn main() {}" > crates/kobe-runner/src/main.rs && \
+    echo "pub fn stub() {}" > crates/kobe-runner/src/lib.rs && \
     cargo build --release --lib 2>/dev/null || true && \
-    rm -rf src crates/kobectl/src
+    rm -rf src crates/kobectl/src crates/kobe-runner/src
 
 # Build the real binaries — clean slate for kobe crates
 FROM deps AS build
