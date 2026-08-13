@@ -1,3 +1,4 @@
+use crate::crd::teardown::TeardownSubject;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -203,6 +204,12 @@ pub enum ClusterInstancePhase {
     Recycling,
     Unhealthy,
     Failed,
+    /// Teardown could not be proven complete. Access stays revoked, finalizers
+    /// and binding provenance are retained, and the unit is never Ready, never
+    /// rebound, and never counted as clean replacement capacity. It may leave
+    /// this phase only when the same exact subject produces a fully verified
+    /// receipt.
+    Quarantined,
 }
 
 /// Network ranges reserved for one ClusterInstance.
@@ -346,6 +353,20 @@ pub struct ClusterInstanceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_with: Option<ClusterInstanceProvenance>,
 
+    /// Provisioner-assigned resource identities this instance owns — currently
+    /// the PersistentVolumes its data claims are bound to.
+    ///
+    /// Captured once the instance is healthy, NOT at teardown. These names are
+    /// chosen by the provisioner and only knowable after claims bind, so
+    /// capturing them during teardown would let the teardown path define its
+    /// own scope. Recorded early, they become something a later teardown must
+    /// account for rather than something it gets to choose.
+    ///
+    /// Written once and never shrunk: a smaller list would silently narrow what
+    /// a receipt has to prove.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teardown_identities: Vec<String>,
+
     /// Human-readable detail about the instance's current state — *why*
     /// it is in `phase`. Set fresh on every status write by the instance
     /// controller (each construction site supplies a concise phrase like
@@ -434,6 +455,21 @@ pub struct ClusterInstanceProvenance {
     /// `"0.17.0"`.
     pub operator_version: String,
 
+    /// Exactly which footprints this instance created, recorded at creation.
+    ///
+    /// This is the trust boundary for verified teardown. A receipt only proves
+    /// what it covers, so the list of subjects it must cover cannot come from
+    /// the receipt, nor from whatever the teardown path happens to look for
+    /// later — an optional resource whose config changed after creation would
+    /// then be quietly dropped from the plan and never verified.
+    ///
+    /// Stamped once alongside the rest of this provenance and never
+    /// overwritten. `None` means the instance predates verified teardown; such
+    /// an instance is ineligible for [`CleanupMode::VerifiedDestroy`] rather
+    /// than being verified against a guessed plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_plan: Option<Vec<TeardownSubject>>,
+
     /// kobe-sync sidecar image used at create time. Recorded for
     /// `Vkobe` backends only (other backends don't run kobe-sync).
     /// Format matches the operator's `KOBE_SYNC_IMAGE` env var, e.g.
@@ -482,6 +518,10 @@ mod tests {
             phase: ClusterInstancePhase::Leased,
             provisioned: true,
             bootstrapped: true,
+            // Populated, not empty: this is the round-trip test, and an
+            // identity list that did not survive the wire would silently narrow
+            // what a receipt has to prove.
+            teardown_identities: vec!["pvc-1111".into(), "pvc-2222".into()],
             lease_ref: Some(ResourceRef {
                 name: "lease-abc".into(),
                 uid: None,
@@ -498,6 +538,7 @@ mod tests {
             }),
             created_with: Some(ClusterInstanceProvenance {
                 operator_version: "0.37.0".into(),
+                teardown_plan: None,
                 kobe_sync_image: Some("zondax/kobe-sync:v0.16.0".into()),
                 backend_type: Some(BackendType::K0s),
                 pool_uid: None,
@@ -618,6 +659,7 @@ mod tests {
                 "provisioned",
                 "specHash",
                 "stateSince",
+                "teardownIdentities",
             ]
         );
     }
@@ -757,6 +799,7 @@ mod tests {
     fn provenance_omits_unknown_components() {
         let p = ClusterInstanceProvenance {
             operator_version: "0.37.0".into(),
+            teardown_plan: None,
             kobe_sync_image: None,
             backend_type: None,
             pool_uid: None,
@@ -796,6 +839,7 @@ mod tests {
         ] {
             let p = ClusterInstanceProvenance {
                 operator_version: "0.37.0".into(),
+                teardown_plan: None,
                 kobe_sync_image: None,
                 backend_type: Some(bt),
                 pool_uid: None,

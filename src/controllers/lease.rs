@@ -15,7 +15,7 @@ use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
     BackendProvenance, BoundInstanceRef, ClusterInstance, ClusterInstancePhase, ClusterLease,
     ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase, ClusterPoolStatus,
-    LeaseBinding, LeasePhase, ResourceRef,
+    LeaseBinding, LeasePhase, ResourceRef, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
 };
 use crate::diagnostics;
 use crate::pool::{PoolState, parse_duration};
@@ -596,6 +596,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             Ok(Action::requeue(std::time::Duration::from_secs(10)))
         }
 
+        // Terminal until the same exact subject produces a verified receipt.
+        // Access is already revoked and the binding/finalizers are deliberately
+        // retained as cleanup handles, so there is nothing to reconcile here.
+        // The transitions INTO this phase, and the retry that can leave it,
+        // belong to the verified-teardown controller work.
+        LeasePhase::Quarantined => Ok(Action::requeue(std::time::Duration::from_secs(300))),
+
         LeasePhase::Recycling => {
             let cluster_gone = if let Some(binding) = &status.binding {
                 let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &ns);
@@ -625,6 +632,27 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             };
 
             if cluster_gone {
+                // A receipt-required lease carries the ONLY durable proof that
+                // its capacity was destroyed, and it is read after the instance
+                // is gone — which is exactly the moment this branch fires. So
+                // deleting the lease here would destroy the evidence at the
+                // instant it becomes relevant, and #74's owning SandboxLease
+                // would have nothing to consume.
+                //
+                // Retain it until a consumer acknowledges. Deliberately not a
+                // timeout: evidence that expires on a clock is evidence you
+                // cannot rely on having.
+                if status.teardown_receipt.is_some()
+                    && !lease
+                        .annotations()
+                        .contains_key(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+                {
+                    debug!(
+                        lease = %name,
+                        "retaining recycled lease: its teardown receipt has not been consumed"
+                    );
+                    return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+                }
                 info!(lease = %name, "Recycling complete, deleting lease CRD");
                 let delete_params = DeleteParams {
                     preconditions: Some(Preconditions {
@@ -837,6 +865,7 @@ async fn finalize_binding<B: ClusterBackend>(
         max_extensions,
         message: None,
         conditions: Vec::new(),
+        teardown_receipt: None,
     };
     new_status.conditions =
         derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());

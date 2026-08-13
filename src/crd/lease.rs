@@ -3,6 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::crd::LeaseBinding;
+use crate::crd::teardown::{CleanupMode, TeardownReceipt};
 
 /// ClusterLease is the internal representation of a cluster lease.
 ///
@@ -34,6 +35,15 @@ pub struct ClusterLeaseSpec {
     /// Higher values are served first.
     #[serde(default = "default_priority")]
     pub priority: u32,
+
+    /// How thoroughly this lease's capacity must be torn down before reuse.
+    ///
+    /// Absent means [`CleanupMode::Standard`], so every existing `ClusterLease`
+    /// keeps its current behaviour. #74's internal leases request
+    /// [`CleanupMode::VerifiedDestroy`]; pools that cannot produce evidence
+    /// reject it at bind time rather than degrading silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_mode: Option<CleanupMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -79,6 +89,14 @@ pub struct ClusterLeaseStatus {
     /// When the lease expires (TTL deadline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+
+    /// Durable proof that this lease's exact capacity was destroyed.
+    ///
+    /// Recorded here rather than on the `ClusterInstance` because it must stay
+    /// queryable *after* the instance object is gone — which is exactly when
+    /// the evidence matters, and when #74's owning `SandboxLease` consumes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_receipt: Option<TeardownReceipt>,
 
     /// Position in the priority queue (0 = not queued, 1 = next).
     #[serde(default)]
@@ -172,6 +190,9 @@ pub enum LeasePhase {
     Expired,
     /// Cluster being deleted and recreated.
     Recycling,
+    /// Teardown could not be proven complete for this lease's exact capacity.
+    /// Terminal until the same subject produces a verified receipt.
+    Quarantined,
 }
 
 impl std::fmt::Display for LeasePhase {
@@ -182,6 +203,7 @@ impl std::fmt::Display for LeasePhase {
             LeasePhase::Released => write!(f, "Released"),
             LeasePhase::Expired => write!(f, "Expired"),
             LeasePhase::Recycling => write!(f, "Recycling"),
+            LeasePhase::Quarantined => write!(f, "Quarantined"),
         }
     }
 }
@@ -235,6 +257,7 @@ mod json_safety_tests {
             cluster_name: Some("pool-x-0".into()),
             bound_at: Some("2026-06-04T00:00:00Z".into()),
             expires_at: Some("2026-06-04T01:00:00Z".into()),
+            teardown_receipt: None,
             ..Default::default()
         };
         let v = serde_json::to_value(&set_status).unwrap();
@@ -522,6 +545,38 @@ mod json_safety_tests {
                 message: "bound".into(),
                 last_transition_time: Some("2026-06-04T00:00:00Z".into()),
             }],
+            // Populated, not None: the receipt is the durable evidence a #74
+            // SandboxLease reads back after its ClusterInstance is gone, so it
+            // has to survive the wire intact.
+            teardown_receipt: Some(crate::crd::TeardownReceipt {
+                schema_version: crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION,
+                attempt_id: "attempt-1".into(),
+                lease: crate::crd::ResourceRef {
+                    name: "lease-x".into(),
+                    uid: Some("lease-uid".into()),
+                },
+                instance: crate::crd::ResourceRef {
+                    name: "pool-x-0".into(),
+                    uid: Some("instance-uid".into()),
+                },
+                pool: crate::crd::ResourceRef {
+                    name: "x".into(),
+                    uid: Some("pool-uid".into()),
+                },
+                backend_type: "k3s".into(),
+                config_digest: "cfg".into(),
+                instance_spec_digest: "spec".into(),
+                started_at: "2026-06-04T02:00:00Z".into(),
+                completed_at: Some("2026-06-04T02:01:00Z".into()),
+                checks: vec![crate::crd::TeardownCheck {
+                    subject: crate::crd::TeardownSubject::ServerStatefulSet,
+                    result: crate::crd::CheckResult::Verified,
+                    reason: None,
+                    verified: Vec::new(),
+                }],
+                retry_count: 0,
+                outcome: crate::crd::TeardownOutcome::Verified,
+            }),
         };
         let once = serde_json::to_value(&original).unwrap();
         let back: ClusterLeaseStatus = serde_json::from_value(once.clone()).unwrap();

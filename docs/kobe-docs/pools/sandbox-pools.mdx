@@ -1,0 +1,84 @@
+---
+title: Sandbox pools
+description: Define bounded, administrator-owned Agent Sandbox templates and placement.
+---
+
+# Sandbox pools
+
+<Callout type="warn">
+  `SandboxPool` and `SandboxLease` are alpha APIs. Kobe admits lease intent, but
+  a lease remains `Pending` until a compatible Agent Sandbox placement
+  controller is enabled.
+</Callout>
+
+Administrators author `SandboxPool` objects. API callers only choose an allowed
+pool, TTL, and optional alias; they cannot provide a Pod spec, namespace,
+RuntimeClass, environment values, mounts, PVCs, or target credentials.
+
+## Example
+
+```yaml
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: SandboxPool
+metadata:
+  name: agent-small
+  namespace: kobe
+spec:
+  warmCapacity: 2
+  defaultTtl: 30m
+  maxTtl: 2h
+  provisioningTimeout: 10m
+  placement:
+    type: management
+  template:
+    defaultContainer: workspace
+    containers:
+      - name: workspace
+        image: ghcr.io/example/agent-sandbox:v1
+        command: ["/usr/local/bin/agent"]
+        args: ["serve"]
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+            ephemeralStorage: 1Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+            ephemeralStorage: 4Gi
+    exposedPorts:
+      - name: http
+        container: workspace
+        port: 8080
+  isolation:
+    tier: gvisor
+    runtimeClassName: gvisor
+  readiness:
+    canary:
+      argv: ["/usr/local/bin/agent", "healthcheck"]
+      timeout: 30s
+```
+
+Every container must declare CPU, memory, and ephemeral-storage requests and
+limits. `defaultContainer` and each exposed port must refer to a declared
+container. Canary `argv` is executed directly, without an implicit shell.
+
+## Placement and isolation
+
+Use `placement.type: management` to place upstream Sandbox objects in Kobe's
+management cluster. To compose a Sandbox with a child cluster from a
+same-namespace `ClusterPool`, use exactly one child placement instead:
+
+```yaml
+placement:
+  type: childCluster
+  clusterPoolRef: ci-sandbox
+```
+
+Isolation tier `trusted-runc` must omit `runtimeClassName`. Hardened tiers
+`gvisor` and `kata` require the exact administrator-selected RuntimeClass name.
+Lease callers cannot override either placement or isolation.
+
+See the [API reference](/docs/api/reference#sandbox-leases) for lease operations
+and [authentication and authorization](/docs/auth/overview) for Sandbox policy
+verbs and limits.

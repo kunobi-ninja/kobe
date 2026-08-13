@@ -45,6 +45,42 @@ pub struct ProfileContext {
 }
 
 #[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    /// Quarantined capacity must never present as leasable. `ClusterState` has
+    /// no Quarantined variant yet, so this pins the interim mapping: whatever it
+    /// maps to, it must not be `Ready` or `Leased`, or unproven capacity would
+    /// be handed to the next caller.
+    #[test]
+    fn quarantined_never_maps_to_usable_capacity() {
+        let state = cluster_state_from_phase(&ClusterInstancePhase::Quarantined);
+        assert_ne!(state, ClusterState::Ready);
+        assert_ne!(state, ClusterState::Leased);
+    }
+
+    /// The reverse mapping must never *produce* Quarantined, because that would
+    /// mean in-memory pool state could invent a quarantine that no teardown
+    /// evidence supports.
+    #[test]
+    fn pool_state_cannot_invent_a_quarantine() {
+        for state in [
+            ClusterState::Creating,
+            ClusterState::Ready,
+            ClusterState::Leased,
+            ClusterState::Unhealthy,
+            ClusterState::Recycling,
+        ] {
+            assert_ne!(
+                cluster_phase_from_state(&state),
+                ClusterInstancePhase::Quarantined,
+                "{state:?} must not round-trip into Quarantined"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod cluster_instance_tests {
     use super::*;
     use std::collections::HashMap;
@@ -1201,6 +1237,11 @@ async fn reconcile_profile(
     pool_size_set("leased", counts.leased);
     pool_size_set("unhealthy", counts.unhealthy);
     pool_size_set("recycling", counts.recycling);
+    // Emitted separately from `unhealthy` so an alert can distinguish capacity
+    // that is churning from capacity that is stuck holding unproven state.
+    // A rising `quarantined` means teardown evidence is failing, which no
+    // other dimension reveals.
+    pool_size_set("quarantined", counts.quarantined);
 
     // Surface hidden CPU over-reservation (issue #189): a pool that sets
     // `resources.limits` with empty `requests` makes the kubelet copy each
@@ -1336,6 +1377,7 @@ async fn reconcile_profile(
         creating: counts.creating,
         recycling: counts.recycling,
         unhealthy: counts.unhealthy,
+        quarantined: counts.quarantined,
         queue_depth,
         golden_backup: existing_golden_backup,
         golden_generation: existing_golden_generation,
@@ -1691,6 +1733,23 @@ async fn ensure_cluster_instance(
         .map_err(|err| anyhow::anyhow!("failed to encode backend provenance: {err}"))?;
     let provenance = crate::crd::ClusterInstanceProvenance {
         operator_version: env!("BUILD_VERSION").to_string(),
+        // Record what this instance is about to create, while we still know.
+        // Recomputing this at teardown would read whatever the pool config says
+        // *then* — so a pool that stopped setting `registryMirrors` after this
+        // instance was built would silently drop that ConfigMap from the plan
+        // and never verify it. Only k3s can be verified, so only k3s gets a
+        // plan; anything else stays `None` and is refused a receipt-required
+        // lease at bind time.
+        teardown_plan: matches!(
+            profile.spec.backend.backend_type,
+            crate::crd::BackendType::K3s
+        )
+        .then(|| {
+            crate::crd::k3s_teardown_plan(
+                &profile.spec.cluster,
+                profile.spec.backend.datastore.is_some(),
+            )
+        }),
         kobe_sync_image: matches!(
             profile.spec.backend.backend_type,
             crate::crd::BackendType::Vkobe
@@ -1910,7 +1969,14 @@ async fn sync_cluster_instance_statuses(client: &Client, namespace: &str, pool_s
         // In particular, an invalid/legacy binding must remain unavailable
         // even if its display-only leaseRef is missing or stale.
         let lease_held = current.lease_ref.is_some() || current.binding.is_some();
-        let phase = if lease_held {
+        // Quarantined is preserved explicitly, not just incidentally. A
+        // quarantined instance keeps its binding as a cleanup handle, so
+        // `lease_held` happens to cover it today — but relying on that would
+        // mean a future change to binding retention silently downgrades
+        // Quarantined to whatever the in-memory pool state says, handing
+        // unproven capacity back to the pool.
+        let quarantined = current.phase == ClusterInstancePhase::Quarantined;
+        let phase = if lease_held || quarantined {
             current.phase.clone()
         } else {
             cluster_phase_from_state(&entry.state)
@@ -2210,6 +2276,10 @@ fn cluster_state_from_phase(phase: &ClusterInstancePhase) -> ClusterState {
         ClusterInstancePhase::Recycling => ClusterState::Recycling,
         ClusterInstancePhase::Unhealthy => ClusterState::Unhealthy,
         ClusterInstancePhase::Failed => ClusterState::Unhealthy,
+        // Quarantined maps to its own state, never to Unhealthy: Unhealthy is
+        // deleted unconditionally by the pool manager, which would destroy the
+        // cleanup handle and let the ordinary recycle path resume.
+        ClusterInstancePhase::Quarantined => ClusterState::Quarantined,
     }
 }
 
@@ -2220,6 +2290,7 @@ fn cluster_phase_from_state(state: &ClusterState) -> ClusterInstancePhase {
         ClusterState::Leased => ClusterInstancePhase::Leased,
         ClusterState::Recycling => ClusterInstancePhase::Recycling,
         ClusterState::Unhealthy => ClusterInstancePhase::Unhealthy,
+        ClusterState::Quarantined => ClusterInstancePhase::Quarantined,
     }
 }
 

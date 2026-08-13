@@ -20,6 +20,10 @@ The kobe HTTP API is served by the operator. All endpoints except `/v1/status`, 
 | `GET` | `/v1/pools` | Required | List available pools |
 | `GET` | `/v1/pools/:name` | Required | Get a specific pool's status |
 | `GET` | `/v1/pools/:name/leases` | Required | List leases for a specific pool |
+| `POST` | `/v1/sandbox-leases` | Required | Create a Sandbox lease from a SandboxPool |
+| `GET` | `/v1/sandbox-leases` | Required | List your Sandbox leases |
+| `GET` | `/v1/sandbox-leases/:id` | Required | Get one Sandbox lease |
+| `DELETE` | `/v1/sandbox-leases/:id` | Required | Request Sandbox release |
 | `GET` | `/v1/status` | Optional | Endpoint status, auth methods, pool summary |
 | `GET` | `/healthz` | None | Liveness probe |
 | `GET` | `/metrics` | None | Prometheus metrics |
@@ -225,6 +229,87 @@ Lists leases currently associated with one pool. This is useful for operational 
   }
 ]
 ```
+
+---
+
+## Sandbox leases
+
+<Callout type="warn">
+  `SandboxPool` and `SandboxLease` are alpha APIs. Admission is available once
+  their CRDs are installed. A lease remains `Pending` until a compatible Agent
+  Sandbox placement controller is enabled.
+</Callout>
+
+Sandbox callers select an administrator-owned `SandboxPool`; they cannot send a
+Pod spec, namespace, RuntimeClass, environment values, mounts, PVCs, or target
+credentials. Responses never contain a management or child-cluster kubeconfig.
+
+### `POST /v1/sandbox-leases`
+
+Creates caller-safe Sandbox intent and returns `202 Accepted`.
+
+```json
+{
+  "pool": "agent-small",
+  "ttl": "30m",
+  "alias": "review-142"
+}
+```
+
+`ttl` defaults to the pool's `defaultTtl` and is capped by both the pool and the
+caller's Sandbox policy. `alias` is optional and must be unique among that
+identity's active Sandbox leases.
+
+```json
+{
+  "id": "sandbox-a1b2c3d4e5f6",
+  "phase": "Pending",
+  "pool": "agent-small",
+  "ttl": "30m",
+  "alias": "review-142"
+}
+```
+
+When a requested TTL is reduced, `effective_ttl` reports the accepted value.
+
+| Status | Meaning |
+|---|---|
+| `400` | Invalid pool name, alias, or TTL |
+| `403` | Missing Sandbox `lease` permission or resource ceiling exceeded |
+| `404` | An allowed SandboxPool does not exist |
+| `409` | Alias is already active |
+| `429` | Sandbox concurrency limit reached |
+| `503` | Pool configuration or Kubernetes admission cannot be verified |
+
+### `GET /v1/sandbox-leases`
+
+Lists only leases owned by the authenticated identity and still permitted by
+its Sandbox pool scope. Requester identity and target credentials are omitted.
+
+### `GET /v1/sandbox-leases/:id`
+
+Returns the typed lifecycle state for an owned lease. A lease belonging to
+another identity returns `404`.
+
+Possible phases are `Pending`, `Provisioning`, `Ready`, `Releasing`, `Released`,
+`Expired`, and `Quarantined`. `Quarantined` means cleanup is uncertain and the
+capacity remains unavailable; it is not a successful terminal state.
+
+When resolved, the response may include non-secret placement and target object
+references with exact Kubernetes UIDs. It never includes bearer tokens or
+kubeconfigs.
+
+### `DELETE /v1/sandbox-leases/:id`
+
+Requires the independent Sandbox `release` verb. For an admitted active lease,
+the API records server-owned release intent and returns `204 No Content`; it
+does not write lifecycle status. The placement controller observes that intent,
+moves the lease to `Releasing`, revokes access, and verifies cleanup.
+
+Repeated release of an already requested, `Releasing`, `Released`, or `Expired`
+lease returns `204 No Content`. A `Quarantined` lease returns `409 Conflict`:
+cleanup is still uncertain, so its capacity remains unavailable rather than
+being reported as released.
 
 ---
 

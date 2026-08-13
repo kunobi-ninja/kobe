@@ -24,6 +24,7 @@ use crate::crd::{
     Addon, BackendType, BootstrapConfig, BootstrapJobSpec, BootstrapRef, ClusterConfig,
     ClusterPool, InterInstanceSpread, PersistenceConfig, ReadinessGate, SpreadStrength,
 };
+use crate::crd::{TeardownCheck, TeardownSubject};
 
 /// Fetch, or create once, the per-cluster PostgreSQL password.
 ///
@@ -550,6 +551,21 @@ pub struct GuestPodCrash {
 /// Implementations handle the actual cluster provisioning. The profile and
 /// claim controllers interact only through this trait, keeping them decoupled
 /// from the underlying technology.
+// Declared ahead of the k3s provider that implements it and the controller
+// that calls it, so nothing constructs or invokes this yet. Same pattern as the
+// `teardown` module in `src/crd`. The alternative — landing the contract and
+// the provider together — is the several-thousand-line PR this split exists to
+// avoid.
+#[allow(dead_code)]
+/// A backend was asked for verified teardown and cannot provide it.
+///
+/// Distinct from an ordinary error: nothing failed, the capability simply does
+/// not exist for this backend. Callers must refuse the lease rather than fall
+/// back to unverified cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("backend does not implement verified teardown")]
+pub struct VerifiedDestroyUnsupported;
+
 pub trait ClusterBackend: Send + Sync {
     /// Create a virtual cluster with the given name and config.
     ///
@@ -581,6 +597,63 @@ pub trait ClusterBackend: Send + Sync {
         name: &str,
         namespace: &str,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Delete a virtual cluster and return **evidence** that its footprint is
+    /// gone, rather than evidence that a DELETE request was accepted.
+    ///
+    /// Deliberately a separate method with a default body instead of a changed
+    /// `delete` signature: the four backends that cannot produce evidence keep
+    /// compiling untouched and refuse honestly, rather than being mechanically
+    /// updated to return a receipt they cannot substantiate. A backend that
+    /// "implements" verified teardown by returning success it did not observe
+    /// is worse than one that says it cannot.
+    ///
+    /// `plan` lists what this instance actually created, so the provider knows
+    /// which subjects it must account for and which never existed. Returning
+    /// [`CheckResult::Unknown`] for anything it cannot observe is correct and
+    /// expected — that quarantines the capacity instead of releasing it.
+    #[allow(dead_code)]
+    fn delete_verified(
+        &self,
+        name: &str,
+        namespace: &str,
+        plan: &[TeardownSubject],
+    ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
+    {
+        let _ = (name, namespace, plan);
+        async { Err(VerifiedDestroyUnsupported) }
+    }
+
+    /// Capture the provisioner-assigned resource identities this instance owns.
+    ///
+    /// Called while the instance is healthy, NOT at teardown. Bound
+    /// PersistentVolume names are chosen by the provisioner and only knowable
+    /// once claims have bound; capturing them at teardown time would let the
+    /// teardown path define its own scope, which is the thing receipts exist to
+    /// prevent. Recorded early, the list is something a later teardown must
+    /// account for rather than something it gets to choose.
+    ///
+    /// Returning an empty list means "this backend has no such identities",
+    /// which is correct for every backend that cannot produce evidence anyway.
+    #[allow(dead_code)]
+    fn capture_teardown_identities(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send {
+        let _ = (name, namespace);
+        async { Ok(Vec::new()) }
+    }
+
+    /// Whether this backend can produce teardown evidence at all.
+    ///
+    /// Checked before binding so a receipt-required lease is refused up front,
+    /// rather than discovering mid-teardown that no evidence is possible and
+    /// stranding the lease in quarantine through no fault of the caller.
+    #[allow(dead_code)]
+    fn supports_verified_destroy(&self) -> bool {
+        false
+    }
 
     /// Check if a virtual cluster's API server is healthy.
     fn check_health(
@@ -1455,6 +1528,31 @@ mod tests {
     use base64::Engine;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A backend that has not implemented verified teardown must REFUSE, not
+    /// quietly succeed.
+    ///
+    /// The default body is the safety property here: adding this capability to
+    /// the trait without one would have forced every backend to be updated by
+    /// hand, and the mechanical update is "return Ok(vec![])" — a backend
+    /// claiming a clean footprint it never looked at. Refusing by default means
+    /// a backend can only claim evidence by actually writing the code.
+    #[tokio::test]
+    async fn a_backend_without_the_capability_refuses_rather_than_claiming_success() {
+        let backend = crate::testutil::MockBackend::new();
+        assert!(
+            !backend.supports_verified_destroy(),
+            "capability must be opt-in"
+        );
+        let outcome = backend
+            .delete_verified("pool-x-0", "test-ns", &[TeardownSubject::ServerStatefulSet])
+            .await;
+        assert_eq!(
+            outcome,
+            Err(VerifiedDestroyUnsupported),
+            "an unimplemented backend must not return an empty (clean-looking) check list"
+        );
+    }
 
     fn kubeconfig_secret_response(
         cluster_name: &str,

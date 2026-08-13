@@ -1,4 +1,5 @@
 use crate::api::auth::AuthIdentity;
+use crate::crd::{SandboxResourceCeiling, SandboxVerb};
 use crate::pool::parse_duration;
 
 /// Authorization policy — what each identity type is allowed to do.
@@ -14,6 +15,19 @@ pub struct Policy {
     pub default_priority: u32,
     /// Maximum number of TTL extensions.
     pub max_extensions: u32,
+    /// Optional kind-specific Sandbox grant. Absence always denies Sandbox and
+    /// preserves the meaning of legacy Cluster-only AccessPolicy objects.
+    pub sandbox: Option<SandboxPolicy>,
+}
+
+/// Runtime form of a validated Sandbox access grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    pub allowed_pools: Vec<String>,
+    pub verbs: Vec<SandboxVerb>,
+    pub max_ttl: chrono::Duration,
+    pub max_concurrent_leases: u32,
+    pub resource_ceiling: SandboxResourceCeiling,
 }
 
 /// Get the authorization policy for a given identity.
@@ -24,7 +38,11 @@ pub fn policy_for(identity: &AuthIdentity) -> Policy {
 
 /// Check if a pool name matches the allowed patterns for an identity.
 pub fn is_pool_allowed(pool: &str, policy: &Policy) -> bool {
-    policy.allowed_pools.iter().any(|pattern| {
+    pool_matches(pool, &policy.allowed_pools)
+}
+
+fn pool_matches(pool: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
         if pattern == "*" {
             return true;
         }
@@ -34,6 +52,27 @@ pub fn is_pool_allowed(pool: &str, policy: &Policy) -> bool {
             pool == pattern
         }
     })
+}
+
+/// Check a Sandbox operation against both its pool scope and independent verb
+/// grant. A missing Sandbox grant fails closed even when Cluster pools allow
+/// the same name or the wildcard `*`.
+pub fn is_sandbox_allowed(pool: &str, verb: SandboxVerb, policy: &Policy) -> bool {
+    policy.sandbox.as_ref().is_some_and(|sandbox| {
+        pool_matches(pool, &sandbox.allowed_pools) && sandbox.verbs.contains(&verb)
+    })
+}
+
+/// Clamp a valid positive runtime TTL to the Sandbox-specific maximum.
+/// Invalid, zero, or negative values return `None` instead of inheriting the
+/// legacy Cluster one-hour fallback.
+pub fn clamp_sandbox_ttl(requested: &str, policy: &Policy) -> Option<chrono::Duration> {
+    let grant = policy.sandbox.as_ref()?;
+    let requested = parse_duration(requested)?;
+    if requested <= chrono::Duration::zero() {
+        return None;
+    }
+    Some(requested.min(grant.max_ttl))
 }
 
 /// Clamp a requested TTL to the policy maximum.
@@ -91,6 +130,7 @@ mod tests {
             max_concurrent_leases: 5,
             default_priority: 100,
             max_extensions: 2,
+            sandbox: None,
         };
 
         assert!(is_pool_allowed("e2e-basic", &ci_policy));
@@ -103,6 +143,7 @@ mod tests {
             max_concurrent_leases: 10,
             default_priority: 100,
             max_extensions: 10,
+            sandbox: None,
         };
 
         assert!(is_pool_allowed("e2e-basic", &admin_policy));
@@ -118,6 +159,7 @@ mod tests {
             max_concurrent_leases: 5,
             default_priority: 100,
             max_extensions: 2,
+            sandbox: None,
         };
 
         // Within limit
@@ -127,6 +169,87 @@ mod tests {
         // Exceeds limit
         let clamped = clamp_ttl("2h", &policy);
         assert_eq!(clamped, chrono::Duration::hours(1));
+    }
+
+    fn policy_with_sandbox() -> Policy {
+        Policy {
+            allowed_pools: vec!["cluster-*".into()],
+            max_ttl: chrono::Duration::hours(8),
+            max_concurrent_leases: 5,
+            default_priority: 100,
+            max_extensions: 2,
+            sandbox: Some(SandboxPolicy {
+                allowed_pools: vec!["agent-*".into()],
+                verbs: vec![SandboxVerb::Lease, SandboxVerb::Release],
+                max_ttl: chrono::Duration::minutes(30),
+                max_concurrent_leases: 3,
+                resource_ceiling: SandboxResourceCeiling {
+                    max_cpu: "2".into(),
+                    max_memory: "4Gi".into(),
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn sandbox_grant_is_kind_pool_and_verb_specific() {
+        let policy = policy_with_sandbox();
+        assert!(is_pool_allowed("cluster-ci", &policy));
+        assert!(!is_sandbox_allowed(
+            "cluster-ci",
+            SandboxVerb::Lease,
+            &policy
+        ));
+        assert!(is_sandbox_allowed("agent-ci", SandboxVerb::Lease, &policy));
+        assert!(!is_sandbox_allowed("agent-ci", SandboxVerb::Exec, &policy));
+
+        let mut legacy = policy;
+        legacy.sandbox = None;
+        assert!(!is_sandbox_allowed("agent-ci", SandboxVerb::Lease, &legacy));
+    }
+
+    #[test]
+    fn sandbox_wildcard_and_every_verb_are_checked_independently() {
+        let mut policy = policy_with_sandbox();
+        let sandbox = policy.sandbox.as_mut().unwrap();
+        sandbox.allowed_pools = vec!["*".into()];
+        sandbox.verbs = vec![
+            SandboxVerb::Lease,
+            SandboxVerb::Exec,
+            SandboxVerb::Logs,
+            SandboxVerb::PortForward,
+            SandboxVerb::Release,
+        ];
+
+        for verb in sandbox.verbs.clone() {
+            assert!(is_sandbox_allowed("any-sandbox-pool", verb, &policy));
+        }
+        policy
+            .sandbox
+            .as_mut()
+            .unwrap()
+            .verbs
+            .retain(|verb| *verb != SandboxVerb::Release);
+        assert!(!is_sandbox_allowed(
+            "any-sandbox-pool",
+            SandboxVerb::Release,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn sandbox_ttl_is_fail_closed_and_uses_kind_specific_limit() {
+        let policy = policy_with_sandbox();
+        assert_eq!(
+            clamp_sandbox_ttl("15m", &policy),
+            Some(chrono::Duration::minutes(15))
+        );
+        assert_eq!(
+            clamp_sandbox_ttl("2h", &policy),
+            Some(chrono::Duration::minutes(30))
+        );
+        assert_eq!(clamp_sandbox_ttl("invalid", &policy), None);
+        assert_eq!(clamp_sandbox_ttl("0s", &policy), None);
     }
 
     #[test]

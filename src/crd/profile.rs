@@ -1496,6 +1496,15 @@ pub struct ClusterPoolStatus {
     #[serde(default)]
     pub recycling: u32,
 
+    /// Members held back because their teardown could not be proven complete.
+    ///
+    /// Separate from `recycling` on purpose: recycling is transient churn that
+    /// resolves itself, while a quarantined member is stuck until the same
+    /// exact subject produces a verified receipt. Reporting them together would
+    /// make a pool bleeding capacity look merely busy.
+    #[serde(default)]
+    pub quarantined: u32,
+
     /// Number of clusters currently unhealthy and being recycled.
     #[serde(default)]
     pub unhealthy: u32,
