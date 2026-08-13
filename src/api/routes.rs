@@ -58,6 +58,11 @@ pub struct AppState<B: ClusterBackend> {
     /// which fans out into dozens of API calls) skip the per-request token
     /// validate + lease GET + kubeconfig Secret read + reqwest client build.
     pub connect_cache: ConnectCache,
+    /// Per-principal admission budget for the Sandbox create path. Shared
+    /// across requests because a limiter rebuilt per request would bound
+    /// nothing; see [`crate::api::sandbox_rate_limit`] for why it is charged
+    /// per attempt rather than per admitted lease.
+    pub sandbox_admission_limiter: crate::api::sandbox_rate_limit::AdmissionRateLimiter,
 }
 
 /// Per-lease connect-proxy context cache. Newtype over a shared, mutex-guarded
@@ -3181,6 +3186,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         (build_router(state), server)
@@ -3205,6 +3211,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         use wiremock::matchers::{method, path};
@@ -3292,6 +3299,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         use wiremock::matchers::{method, path};
@@ -3698,6 +3706,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -3776,6 +3785,7 @@ mod tests {
             factory: Some(factory),
             datastore,
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -3868,6 +3878,7 @@ mod tests {
             factory: Some(factory),
             datastore,
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -3971,6 +3982,7 @@ mod tests {
             factory: Some(factory),
             datastore,
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -4049,6 +4061,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(
@@ -4494,6 +4507,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         };
         (state, server)
     }

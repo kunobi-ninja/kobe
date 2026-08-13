@@ -24,6 +24,7 @@ use tracing::{error, info, warn};
 use super::auth::AuthIdentity;
 use super::policy::{clamp_sandbox_ttl, format_duration, is_sandbox_allowed, policy_for};
 use super::routes::AppState;
+use super::sandbox_rate_limit::RateLimitDecision;
 use crate::backend::ClusterBackend;
 use crate::crd::{
     ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
@@ -1062,12 +1063,57 @@ fn sandbox_infra_error(message: &'static str, err: impl std::fmt::Display) -> Re
     sandbox_error(StatusCode::SERVICE_UNAVAILABLE, message, None)
 }
 
+/// 429 that tells the caller when to come back.
+///
+/// Without `Retry-After` a throttled client has no signal but "no", and the
+/// only strategy left is to poll — which is the load the throttle was raised
+/// against. The value is rounded *up* and floored at one second: advertising a
+/// wait shorter than the real one converts one rejection into two.
+fn sandbox_throttled(error: String, retry_after: std::time::Duration) -> Response {
+    let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+    let mut response = sandbox_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        error,
+        Some(format!("Retry in {seconds}s")),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
+}
+
 #[tracing::instrument(skip_all)]
 async fn create_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Json(request): Json<CreateSandboxLeaseRequest>,
 ) -> Response {
+    // FIRST statement, deliberately. Everything below — the CRD probe, the pool
+    // GET, the lease CREATE, up to `max_concurrent_leases` reservation CREATEs,
+    // and the DELETE that undoes them — is apiserver work this handler performs
+    // *before* it can decide the answer, and it performs all of it just as
+    // eagerly for a request that is going to be refused. So the budget is spent
+    // by the attempt, not by its outcome: a caller looping on 429s pays exactly
+    // like one looping on 202s, and no exit below can skip the charge because
+    // none of them is reachable without passing through here.
+    let principal = principal_hash(&identity);
+    if let RateLimitDecision::Throttled { retry_after } =
+        state.sandbox_admission_limiter.charge(&principal)
+    {
+        crate::metrics::SANDBOX_ADMISSION_RATE_LIMITED_TOTAL.inc();
+        warn!(
+            identity = %identity.identity,
+            retry_after_secs = retry_after.as_secs_f64(),
+            "Sandbox admission throttled for this principal"
+        );
+        return sandbox_throttled(
+            "Sandbox admission rate limit reached for this principal".into(),
+            retry_after,
+        );
+    }
+
     if let Err(response) =
         require_sandbox_crds(&state.client, &[SANDBOX_POOL_CRD, SANDBOX_LEASE_CRD]).await
     {
@@ -2869,6 +2915,7 @@ mod tests {
             factory: None,
             datastore: Default::default(),
             connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
         }
     }
 
@@ -3433,6 +3480,145 @@ mod tests {
             principal_hash(&split_a),
             principal_hash(&split_b),
             "concatenation must be unambiguous across component boundaries"
+        );
+    }
+
+    /// A role change must not move a principal into a fresh quota namespace.
+    ///
+    /// `requester_type` is `"{provider}:{matched rule value}"` — it names the
+    /// AccessPolicy rule that happened to match *this* request, not the caller.
+    /// It moves when an admin reorders or edits rules, when the IdP changes a
+    /// claim, and — decisively — when the same subject presents a token whose
+    /// claims select a different rule. Feeding it into the digest would make
+    /// every one of those a rename of `sbx-quota-{hash}-{slot}` and
+    /// `sbx-alias-{hash}-{alias}`.
+    ///
+    /// A rename is a bypass, not a partition: the old reservations still exist
+    /// and still consume backend resources, but the new selector cannot see
+    /// them, so the caller immediately gets their full `max_concurrent_leases`
+    /// again and can re-take an alias someone is still holding. `principal_hash`
+    /// already documents that hazard for a *code* change, where it is a one-off
+    /// migration; including `requester_type` would make it reachable at runtime,
+    /// repeatedly, by a caller who can influence their own claims.
+    ///
+    /// The exclusion is therefore the safe direction, and this test is what
+    /// stops it being "corrected" later.
+    #[test]
+    fn a_changed_requester_type_keeps_a_principal_in_the_same_quota_namespace() {
+        let base = identity();
+        let mut promoted = base.clone();
+        promoted.requester_type = "oidc:admin".into();
+
+        assert_eq!(
+            principal_hash(&base),
+            principal_hash(&promoted),
+            "a role change must not renumber this principal's quota slots"
+        );
+
+        // The digest is only a prefilter; ownership is decided by
+        // `principal_matches`. The two must agree, or the label selector
+        // narrows a caller out of leases they still own — and then they cannot
+        // release the very lease holding their slot.
+        let lease = build_sandbox_lease(
+            "sandbox-abc",
+            "test-ns",
+            pool_reference(),
+            "1h",
+            None,
+            &base,
+        );
+        assert!(
+            principal_owns_lease(&lease, &promoted),
+            "a caller must keep ownership of their own lease across a role change"
+        );
+    }
+
+    /// A caller whose every attempt fails must still run out of budget.
+    ///
+    /// This is the loop the rate limit exists to close. A principal at their
+    /// concurrency limit is refused — but only after the handler has created a
+    /// `SandboxLease`, contested the reservation ledger, and deleted the lease
+    /// again. That work is done eagerly, before the answer is known, so an
+    /// outcome-sensitive budget (charged on success, or refunded on failure)
+    /// would leave the retry loop free and unbounded: the caller spends none of
+    /// their own quota and saturates the API server every other principal
+    /// shares.
+    ///
+    /// Asserting the limiter's arithmetic would prove nothing here — the
+    /// mistake lives in *where* the handler charges, so the test has to be the
+    /// endpoint. The request count is the assertion that matters: a throttled
+    /// attempt must cost the API server nothing at all.
+    #[tokio::test]
+    async fn a_caller_whose_creates_all_fail_still_runs_out_of_admission_budget() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let principal = principal_hash(&identity());
+        // Both of this principal's slots are held by someone else's lease, so
+        // every attempt below reaches the ledger and is refused there.
+        mount_reservation_api(
+            &server,
+            &[
+                quota_reservation_name(&principal, 0),
+                quota_reservation_name(&principal, 1),
+            ],
+        )
+        .await;
+        mount_create_lease_objects(&server, false, false).await;
+
+        // One state for every attempt: the limiter is shared process state, and
+        // a fresh one per request would bound nothing.
+        let state = test_state(&server);
+        let attempt = || {
+            create_sandbox_lease::<crate::testutil::MockBackend>(
+                State(state.clone()),
+                identity(),
+                Json(CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                }),
+            )
+        };
+
+        let burst = crate::api::sandbox_rate_limit::ADMISSION_BURST as u32;
+        for index in 0..burst {
+            let response = attempt().await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "attempt {index} must be refused by the quota ledger"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "attempt {index} is within the burst and must reach the ledger, not the throttle"
+            );
+        }
+
+        let throttled = attempt().await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            throttled
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+            "the throttled attempt must tell the caller when to come back"
+        );
+
+        let creates = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path().ends_with("/sandboxleases")
+            })
+            .count();
+        assert_eq!(
+            creates as u32, burst,
+            "a throttled attempt must not reach the API server at all"
         );
     }
 

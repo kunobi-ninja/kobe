@@ -278,8 +278,16 @@ When a requested TTL is reduced, `effective_ttl` reports the accepted value.
 | `403` | Missing Sandbox `lease` permission or resource ceiling exceeded |
 | `404` | An allowed SandboxPool does not exist |
 | `409` | Alias is already active |
-| `429` | Sandbox concurrency limit reached |
+| `429` | Sandbox concurrency limit reached, or the per-principal admission rate limit was hit |
 | `503` | Pool configuration or Kubernetes admission cannot be verified |
+
+Admission is rate limited per principal, independently of the concurrency
+limit. The budget is charged per *attempt* — a refused attempt costs the same
+as an accepted one, because refusing one still costs the API server a lease
+create, a contested reservation, and the cleanup that undoes them. A caller
+that has run out of budget gets `429` with a `Retry-After` header, in seconds;
+the concurrency `429` carries no such header. The limit is per API replica, and
+`kobe_sandbox_admission_rate_limited_total` counts every refusal.
 
 ### `GET /v1/sandbox-leases`
 
