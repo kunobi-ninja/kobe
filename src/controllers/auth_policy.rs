@@ -5,6 +5,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::ResourceExt;
 use kube::api::{Api, ListParams};
+use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Config, Event};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -29,7 +30,21 @@ pub async fn run_auth_policy_watcher(
 
     info!("Starting AccessPolicy watcher");
 
-    let watcher = watcher::watcher(policies_api.clone(), Config::default());
+    // `.default_backoff()` is the fix that matters here.
+    //
+    // kube's `watcher()` never terminates — it is a `stream::unfold` whose
+    // closure unconditionally yields `Some`, so the stream is statically
+    // infinite and errors arrive as `Some(Err(_))`. Its own documentation is
+    // explicit that "errors from the underlying watch are propagated, after
+    // which the stream will go into recovery mode on the next poll. You can
+    // apply your own backoff by not polling the stream for a duration after
+    // errors."
+    //
+    // Without that, the `Some(Err(_))` arm below logs and immediately
+    // re-polls, so a persistent failure — the apiserver unreachable, or RBAC
+    // revoked on AccessPolicy — becomes a tight loop hammering the API while
+    // the authenticator serves its last-loaded policies.
+    let watcher = watcher::watcher(policies_api.clone(), Config::default()).default_backoff();
     let mut stream = Box::pin(watcher);
 
     loop {
@@ -48,8 +63,12 @@ pub async fn run_auth_policy_watcher(
                     Some(Err(e)) => {
                         error!("AccessPolicy watcher error: {e}");
                     }
+                    // Unreachable with kube-runtime 3.x, whose watcher stream
+                    // never terminates (watcher.rs:762-768). Kept as a total
+                    // match; `main` also monitors this task's handle and
+                    // triggers a shutdown if it ever returns.
                     None => {
-                        info!("AccessPolicy watcher stream ended");
+                        error!("AccessPolicy watcher stream ended unexpectedly");
                         break;
                     }
                 }
