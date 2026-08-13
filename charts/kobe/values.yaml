@@ -98,6 +98,21 @@ containerSecurityContext:
 #             rather than falling back, so it cannot be switched on by accident.
 agentSandbox:
   mode: disabled
+  # How long a SandboxLease that reached a clean terminal phase (`Released` or
+  # `Expired`) is kept before the record is deleted. Those phases stop
+  # consuming capacity when they are written, so this is not about reclaiming
+  # anything — it bounds the one-object-per-Sandbox-ever-leased growth of etcd,
+  # and it costs the audit record of who held what and whether cleanup was
+  # proven. Set it to however long you would want to be able to answer that
+  # question after the fact.
+  #
+  # `Quarantined` leases are NEVER retired by this sweep, at any window. That
+  # phase is what withholds a slot whose teardown nobody could prove; deleting
+  # it would hand the slot back on no evidence and take the record with it.
+  #
+  # Units are h/m/s (there is no `d`). Values under 1h are clamped to 1h, and
+  # anything unparseable falls back to the default rather than to zero.
+  leaseRetention: 168h
 
 clusterPolicies:
   # Restricts the operator's namespace deletion permission (granted

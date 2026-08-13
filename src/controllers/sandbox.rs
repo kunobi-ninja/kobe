@@ -942,7 +942,13 @@ async fn quarantine_lease(
     Ok(Action::requeue(std::time::Duration::from_secs(300)))
 }
 
-const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
+/// The durable record of when a lease's teardown question was answered.
+///
+/// `pub(crate)` because the retention sweep in `api::sandbox` dates a terminal
+/// lease by this condition. A second copy of the string would be a second thing
+/// to rename, and a sweep matching a condition type nobody writes any more
+/// would simply stop retiring anything, silently.
+pub(crate) const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
 /// Durable record that the pool's canary already ran and passed.
 ///
 /// Durable rather than in-memory because the alternative is running an
