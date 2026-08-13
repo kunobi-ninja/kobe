@@ -6,7 +6,7 @@
 //! or expose upstream Agent Sandbox objects. Placement controllers in #73/#74
 //! own those transitions.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -38,7 +38,7 @@ const SANDBOX_ALIAS_LABEL: &str = "kobe.kunobi.ninja/alias";
 const SANDBOX_POOL_CRD: &str = "sandboxpools.kobe.kunobi.ninja";
 const SANDBOX_LEASE_CRD: &str = "sandboxleases.kobe.kunobi.ninja";
 const SANDBOX_RESERVATION_TYPE_LABEL: &str = "kobe.kunobi.ninja/sandbox-reservation";
-const SANDBOX_RESERVATION_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
+pub(crate) const SANDBOX_RESERVATION_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 const SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
 const SANDBOX_RESERVATION_QUOTA: &str = "quota";
 const SANDBOX_RESERVATION_ALIAS: &str = "alias";
@@ -64,6 +64,929 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
             "/v1/sandbox-leases/{id}",
             get(get_sandbox_lease::<B>).delete(release_sandbox_lease::<B>),
         )
+        .route("/v1/sandbox-leases/{id}/logs", get(sandbox_logs::<B>))
+        .route("/v1/sandbox-leases/{id}/exec", post(sandbox_exec::<B>))
+        .route("/v1/sandbox-leases/{id}/attach", get(sandbox_attach::<B>))
+        .route(
+            "/v1/sandbox-leases/{id}/port-forward",
+            get(sandbox_port_forward::<B>),
+        )
+        .route(
+            "/v1/sandbox-leases/{id}/executions",
+            post(create_sandbox_execution::<B>),
+        )
+        .route(
+            "/v1/sandbox-leases/{id}/executions/{execution}",
+            get(get_sandbox_execution::<B>).delete(cancel_sandbox_execution::<B>),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateExecutionRequest {
+    command: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout: Option<String>,
+    #[serde(default)]
+    container: Option<String>,
+    /// Required. Without it there is no way to tell a retry from a second
+    /// command, and every disconnect becomes a potential duplicate.
+    idempotency_key: String,
+    /// Return once reserved rather than waiting for the result.
+    #[serde(default)]
+    detach: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionResponse {
+    id: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// Present only in wait mode, and kept distinct — a caller that cannot
+    /// separate a tool's diagnostics from its output cannot parse either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
+}
+
+fn execution_response(
+    execution: &crate::crd::SandboxExecution,
+    output: Option<crate::api::sandbox_access::SandboxExecResponse>,
+) -> ExecutionResponse {
+    let status = execution.status.clone().unwrap_or_default();
+    ExecutionResponse {
+        id: execution.name_any(),
+        state: status.state.to_string(),
+        exit_code: status.exit_code,
+        started_at: status.started_at,
+        finished_at: status.finished_at,
+        reason: status.reason,
+        stdout: output.as_ref().map(|output| output.stdout.clone()),
+        stderr: output.as_ref().map(|output| output.stderr.clone()),
+        truncated: output.is_some_and(|output| output.truncated),
+    }
+}
+
+fn execution_denied(
+    identity: &AuthIdentity,
+    lease: &str,
+    error: &crate::api::sandbox_executions::ExecutionRequestError,
+) -> Response {
+    info!(
+        principal = %identity.identity,
+        lease = %lease,
+        operation = "execution",
+        outcome = "denied",
+        reason = error.reason_code(),
+        "Sandbox access"
+    );
+    let status = error.http_status();
+    if status == StatusCode::NOT_FOUND {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    sandbox_error(status, error.to_string(), None)
+}
+
+/// Reserve and run one durable, idempotent command.
+///
+/// The reservation happens BEFORE anything is spawned. Spawning first and
+/// recording afterwards is the obvious implementation, and it is wrong in the
+/// case that matters: a crash between the two leaves no trace that anything
+/// ran, so the retry runs it again.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn create_sandbox_execution<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Json(request): Json<CreateExecutionRequest>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+    use crate::api::sandbox_credentials as credentials;
+    use crate::api::sandbox_executions as executions;
+    use crate::crd::ExecutionState;
+
+    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+        return response;
+    }
+    if !is_valid_k8s_name(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let (lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "execution", denied),
+        };
+    let container = match target.resolve_container(request.container.as_deref()) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return access_denied(&identity, &id, "execution", denied),
+    };
+
+    let requested = executions::ExecutionRequest {
+        argv: request.command,
+        cwd: request.cwd,
+        timeout: request
+            .timeout
+            .unwrap_or_else(|| DEFAULT_EXECUTION_TIMEOUT.to_string()),
+        idempotency_key: request.idempotency_key,
+        detached: request.detach,
+    };
+
+    // Detached execution needs a supervisor inside the container that outlives
+    // the connection. Refused explicitly rather than approximated: a "detached"
+    // execution that actually dies with its connection is worse than none,
+    // because a caller builds on the guarantee it appears to offer.
+    if requested.detached {
+        return sandbox_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Detached execution requires the Sandbox runner contract",
+            Some("Use wait mode; see #82 for the runner contract.".into()),
+        );
+    }
+
+    let reservation = match executions::reserve_execution(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+        &requested,
+    )
+    .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => return execution_denied(&identity, &id, &error),
+    };
+
+    let reserved = match reservation {
+        // Somebody already reserved this exact request. Return what they got,
+        // and spawn nothing — this is the whole point of the key.
+        executions::Reservation::AlreadyExists(existing) => {
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                execution = %existing.name_any(),
+                operation = "execution",
+                outcome = "deduplicated",
+                "Sandbox access"
+            );
+            return (StatusCode::OK, Json(execution_response(&existing, None))).into_response();
+        }
+        executions::Reservation::Reserved(reserved) => reserved,
+    };
+
+    let cluster = match access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => {
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                &reserved,
+                ExecutionState::Unknown,
+                None,
+                denied.reason_code(),
+            )
+            .await;
+            return access_denied(&identity, &id, "execution", denied);
+        }
+    };
+    let scoped =
+        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
+            .await
+        {
+            Ok(client) => client,
+            Err(denied) => {
+                executions::record_terminal(
+                    &state.client,
+                    &state.namespace,
+                    &reserved,
+                    ExecutionState::Unknown,
+                    None,
+                    denied.reason_code(),
+                )
+                .await;
+                return access_denied(&identity, &id, "execution", denied);
+            }
+        };
+
+    let timeout = crate::pool::parse_duration(&requested.timeout)
+        .and_then(|timeout| timeout.to_std().ok())
+        .unwrap_or(SANDBOX_EXEC_TIMEOUT);
+
+    // Belt and braces: a reservation that is not fresh must never spawn, even
+    // though `Reserved` is fresh by construction. The cost of the check is
+    // nothing; the cost of the case it guards is a duplicate `terraform apply`.
+    if !executions::may_spawn(&reserved) {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "This execution has already been started",
+            None,
+        );
+    }
+
+    // Marked Running before the spawn. From here on nothing may spawn this key
+    // again, whatever happens next — including this process disappearing.
+    let running =
+        executions::mark_running(&state.client, &state.namespace, &reserved, timeout).await;
+    if running.is_err() {
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Could not record the execution before starting it",
+            None,
+        );
+    }
+
+    let streams = crate::api::sandbox_streams::registry();
+    let guard = streams.register(&target.lease_uid).await;
+    let revoked = guard.cancelled();
+
+    let result = tokio::select! {
+        result = access::exec_in_sandbox(&scoped, &target, &container, &requested.argv, timeout) => result,
+        _ = revoked.cancelled() => {
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                &reserved,
+                ExecutionState::Cancelled,
+                None,
+                "lease_revoked",
+            )
+            .await;
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access while the command was running",
+                None,
+            );
+        }
+    };
+
+    match result {
+        Ok(output) => {
+            // `success` is what the protocol actually reports; a synthesised
+            // exit code would be indistinguishable from an observed one.
+            let exit_code = if output.success { 0 } else { 1 };
+            let final_state = crate::crd::state_for_exit_code(exit_code);
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                &reserved,
+                final_state,
+                Some(exit_code),
+                "completed",
+            )
+            .await;
+            let refreshed = executions::refresh(&state.client, &state.namespace, &reserved).await;
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                execution = %reserved.name_any(),
+                operation = "execution",
+                outcome = "allowed",
+                state = %final_state,
+                "Sandbox access"
+            );
+            (
+                StatusCode::OK,
+                Json(execution_response(
+                    refreshed.as_ref().unwrap_or(&reserved),
+                    Some(output),
+                )),
+            )
+                .into_response()
+        }
+        Err(denied) => {
+            // The command may well have run; Kobe simply cannot say. `Unknown`
+            // rather than `Failed`, because `Failed` invites a retry of
+            // something that may already have had effects.
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                &reserved,
+                ExecutionState::Unknown,
+                None,
+                denied.reason_code(),
+            )
+            .await;
+            access_denied(&identity, &id, "execution", denied)
+        }
+    }
+}
+
+/// Default bound when a caller does not choose one.
+const DEFAULT_EXECUTION_TIMEOUT: &str = "60s";
+
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn get_sandbox_execution<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path((id, execution)): Path<(String, String)>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+
+    if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Ownership of the LEASE is what authorises reading its executions. An
+    // execution name alone must never be enough: they are derived from a caller's
+    // own key, so a second caller could otherwise guess one.
+    let (_lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "execution", denied),
+        };
+
+    match crate::api::sandbox_executions::get_owned(
+        &state.client,
+        &state.namespace,
+        &execution,
+        &target.lease_uid,
+    )
+    .await
+    {
+        Ok(Some(record)) => {
+            (StatusCode::OK, Json(execution_response(&record, None))).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => execution_denied(&identity, &id, &error),
+    }
+}
+
+/// Cancel one execution.
+///
+/// Cancellation is recorded, not enforced here: without the runner contract
+/// there is no process group to signal. A caller is told what actually
+/// happened — the record moves to `Cancelled` only if the command had not
+/// already settled.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn cancel_sandbox_execution<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path((id, execution)): Path<(String, String)>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+
+    if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (_lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "execution", denied),
+        };
+
+    match crate::api::sandbox_executions::cancel_owned(
+        &state.client,
+        &state.namespace,
+        &execution,
+        &target.lease_uid,
+    )
+    .await
+    {
+        Ok(Some(record)) => {
+            (StatusCode::OK, Json(execution_response(&record, None))).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => execution_denied(&identity, &id, &error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxAttachQuery {
+    /// argv to run. Absent attaches to the container's existing process
+    /// instead of starting a new one.
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    container: Option<String>,
+    /// Allocate a terminal. Off by default: a TTY merges stderr into stdout
+    /// and changes how the workload buffers, so it must be asked for.
+    #[serde(default)]
+    tty: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxPortForwardQuery {
+    /// A pool-declared port name or number. Nothing else resolves.
+    port: String,
+}
+
+/// Everything an interactive operation needs, resolved before the upgrade.
+///
+/// Resolution happens *before* the WebSocket handshake completes on purpose:
+/// a denial has to be an HTTP status the caller's client understands, not a
+/// close frame delivered a moment after a successful-looking upgrade.
+struct UpgradeContext {
+    target: crate::api::sandbox_access::SandboxTarget,
+    container: String,
+    scoped: kube::Client,
+}
+
+async fn prepare_upgrade<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    operation: crate::api::sandbox_credentials::SandboxOperation,
+    requested_container: Option<&str>,
+) -> Result<UpgradeContext, Response> {
+    use crate::api::sandbox_access as access;
+
+    require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await?;
+    if !is_valid_k8s_name(id) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+
+    let (lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, id, identity).await {
+            Ok(resolved) => resolved,
+            Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        };
+    let container = match target.resolve_container(requested_container) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+    };
+    // Concurrency is checked before the upgrade, so a caller over the limit
+    // gets a status rather than a socket that closes immediately.
+    if !crate::api::sandbox_streams::may_start_stream(
+        crate::api::sandbox_streams::registry(),
+        &target.lease_uid,
+    )
+    .await
+    {
+        return Err(access_denied_with(
+            identity,
+            id,
+            operation.as_str(),
+            "concurrency_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many concurrent operations for this Sandbox lease",
+        ));
+    }
+
+    // Both placements go through the same resolution. Child composition
+    // changes which cluster the Pod is in; it changes nothing about what the
+    // caller may do, which is the equivalence #76 sets out to prove.
+    let cluster = match access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+    };
+    let scoped =
+        match crate::api::sandbox_credentials::scoped_client(&cluster, &target, operation).await {
+            Ok(client) => client,
+            Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        };
+
+    Ok(UpgradeContext {
+        target,
+        container,
+        scoped,
+    })
+}
+
+/// Interactive exec or attach over a bounded WebSocket.
+///
+/// The caller's socket never reaches the API server: Kobe terminates it,
+/// opens a separate connection with a credential scoped to one Pod, and copies
+/// bytes. Nothing the caller sends becomes part of a Kubernetes request.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_attach<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Query(query): Query<SandboxAttachQuery>,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> Response {
+    use crate::api::sandbox_credentials::SandboxOperation;
+    use crate::api::sandbox_transport as transport;
+
+    if let Some(command) = query.command.as_ref()
+        && (command.is_empty() || command.iter().any(String::is_empty))
+    {
+        return sandbox_error(
+            StatusCode::BAD_REQUEST,
+            "command must be non-empty argv",
+            None,
+        );
+    }
+
+    let context = match prepare_upgrade(
+        &state,
+        &identity,
+        &id,
+        SandboxOperation::Exec,
+        query.container.as_deref(),
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+
+    let principal = identity.identity.clone();
+    upgrade.on_upgrade(move |mut socket| async move {
+        let guard = crate::api::sandbox_streams::registry()
+            .register(&context.target.lease_uid)
+            .await;
+        let revoked = guard.cancelled();
+
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+        let params = kube::api::AttachParams::default()
+            .container(&context.container)
+            .stdin(true)
+            .stdout(true)
+            // A TTY merges stderr into stdout at the kernel level, so asking
+            // for both is a contradiction rather than a preference.
+            .stderr(!query.tty)
+            .tty(query.tty);
+
+        let attached = match query.command.as_ref() {
+            Some(command) => pods.exec(&context.target.pod_name, command, &params).await,
+            None => pods.attach(&context.target.pod_name, &params).await,
+        };
+        let mut attached = match attached {
+            Ok(attached) => attached,
+            Err(_) => {
+                transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+        };
+
+        let mut limits = transport::StreamLimits::new(
+            transport::IDLE_TIMEOUT,
+            transport::MAX_STREAM_DURATION,
+            transport::MAX_STREAM_BYTES,
+        );
+        let end = transport::pump_attached(&mut socket, &mut attached, &mut limits, revoked).await;
+        attached.abort();
+        transport::close_with(&mut socket, end).await;
+
+        info!(
+            principal = %principal,
+            lease = %id,
+            pod_uid = %context.target.pod_uid,
+            operation = "attach",
+            outcome = "closed",
+            reason = end.code(),
+            caller_fault = end.is_caller_fault(),
+            "Sandbox stream"
+        );
+    })
+}
+
+/// Forward one pool-declared port over a bounded WebSocket.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_port_forward<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Query(query): Query<SandboxPortForwardQuery>,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> Response {
+    use crate::api::sandbox_credentials::SandboxOperation;
+    use crate::api::sandbox_transport as transport;
+
+    let context =
+        match prepare_upgrade(&state, &identity, &id, SandboxOperation::PortForward, None).await {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
+
+    // Only what the pool declared. Without this the forward is a general
+    // tunnel into the Pod's network namespace, reaching a debug listener or a
+    // metrics endpoint the administrator never meant to publish.
+    let port = match context.target.resolve_port(&query.port) {
+        Ok(port) => port,
+        Err(denied) => return access_denied(&identity, &id, "port-forward", denied),
+    };
+
+    let principal = identity.identity.clone();
+    upgrade.on_upgrade(move |mut socket| async move {
+        let guard = crate::api::sandbox_streams::registry()
+            .register(&context.target.lease_uid)
+            .await;
+        let revoked = guard.cancelled();
+
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(context.scoped.clone(), &context.target.namespace);
+        let mut forwarder = match pods.portforward(&context.target.pod_name, &[port]).await {
+            Ok(forwarder) => forwarder,
+            Err(_) => {
+                transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+        };
+        let Some(mut stream) = forwarder.take_stream(port) else {
+            transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+            return;
+        };
+
+        let mut limits = transport::StreamLimits::new(
+            transport::IDLE_TIMEOUT,
+            transport::MAX_STREAM_DURATION,
+            transport::MAX_STREAM_BYTES,
+        );
+        let end = transport::pump_duplex(&mut socket, &mut stream, &mut limits, revoked).await;
+        transport::close_with(&mut socket, end).await;
+
+        info!(
+            principal = %principal,
+            lease = %id,
+            pod_uid = %context.target.pod_uid,
+            operation = "port-forward",
+            port,
+            outcome = "closed",
+            reason = end.code(),
+            caller_fault = end.is_caller_fault(),
+            "Sandbox stream"
+        );
+    })
+}
+
+/// How long one exec may run before it is abandoned.
+///
+/// The caller chooses the command, so they choose how long it takes. Without a
+/// bound, `sleep infinity` holds an API worker permanently — from inside a
+/// sandbox that exists precisely because its occupant is not trusted.
+const SANDBOX_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run one command inside a Sandbox and return its bounded output.
+///
+/// Request/response only: no stdin, no TTY, no shell. Those need a stream
+/// protocol with its own revocation story, which is #83, and a shell would make
+/// quoting the security boundary.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_exec<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Json(request): Json<crate::api::sandbox_access::SandboxExecRequest>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+    use crate::api::sandbox_credentials as credentials;
+
+    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+        return response;
+    }
+    if !is_valid_k8s_name(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let (lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "exec", denied),
+        };
+    let container = match target.resolve_container(request.container.as_deref()) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return access_denied(&identity, &id, "exec", denied),
+    };
+    let cluster = match access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => return access_denied(&identity, &id, "exec", denied),
+    };
+    let scoped =
+        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
+            .await
+        {
+            Ok(client) => client,
+            Err(denied) => return access_denied(&identity, &id, "exec", denied),
+        };
+
+    // Registered for the duration, so releasing or expiring the lease cancels
+    // the command rather than letting it run on inside a workload that is
+    // being torn down. The guard deregisters on every exit path, including a
+    // panic — a leaked registration would later report cancelling something
+    // that ended long ago.
+    let streams = crate::api::sandbox_streams::registry();
+    if !crate::api::sandbox_streams::may_start_stream(streams, &target.lease_uid).await {
+        return access_denied_with(
+            &identity,
+            &id,
+            "exec",
+            "concurrency_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many concurrent operations for this Sandbox lease",
+        );
+    }
+    let guard = streams.register(&target.lease_uid).await;
+    let revoked = guard.cancelled();
+
+    let result = tokio::select! {
+        result = access::exec_in_sandbox(
+            &scoped,
+            &target,
+            &container,
+            &request.command,
+            SANDBOX_EXEC_TIMEOUT,
+        ) => result,
+        _ = revoked.cancelled() => {
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                operation = "exec",
+                outcome = "revoked",
+                "Sandbox access"
+            );
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access while the command was running",
+                None,
+            );
+        }
+    };
+
+    match result {
+        Ok(result) => {
+            // The command and its output are the caller's own data and are
+            // never audited. Identity, target and outcome are.
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                pod_uid = %target.pod_uid,
+                operation = "exec",
+                outcome = "allowed",
+                success = result.success,
+                "Sandbox access"
+            );
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(denied) => access_denied(&identity, &id, "exec", denied),
+    }
+}
+
+/// Read a bounded tail of one Sandbox's output.
+///
+/// The first operation to go through #81's resolver: principal → owned, Ready,
+/// unexpired lease → recorded provenance → the exact Pod and container. It
+/// selects no default at any step, and the denial vocabulary is deliberately
+/// coarse where it faces the caller — an unowned lease answers exactly as an
+/// absent one does.
+///
+/// Management and child placement are not handled separately here. Both
+/// resolve through the same interface; only the client differs, and that is
+/// Kobe's business rather than the caller's.
+#[tracing::instrument(skip_all, fields(lease = %id))]
+async fn sandbox_logs<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Query(query): Query<crate::api::sandbox_access::SandboxLogsQuery>,
+) -> Response {
+    use crate::api::sandbox_access as access;
+
+    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+        return response;
+    }
+    if !is_valid_k8s_name(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let (lease, target) =
+        match access::resolve_sandbox_target(&state.client, &state.namespace, &id, &identity).await
+        {
+            Ok(resolved) => resolved,
+            Err(denied) => return access_denied(&identity, &id, "logs", denied),
+        };
+
+    let container = match target.resolve_container(query.container.as_deref()) {
+        Ok(container) => container.to_string(),
+        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+    };
+
+    // The read runs under a credential that cannot name a second Pod, rather
+    // than under the operator's own authority. The resolver has already denied
+    // everything it should — this is the layer that makes a bug in the request
+    // path a 403 instead of a privilege escalation.
+    let cluster = match access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        &lease,
+        &target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+    };
+    let scoped = match crate::api::sandbox_credentials::scoped_client(
+        &cluster,
+        &target,
+        crate::api::sandbox_credentials::SandboxOperation::Logs,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+    };
+
+    match access::read_sandbox_logs(&scoped, &target, &container, access::clamp_tail(query.tail))
+        .await
+    {
+        Ok(logs) => {
+            // Audited by identity and outcome, never by content: the body is
+            // the workload's own output and can contain anything.
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                pod_uid = %target.pod_uid,
+                operation = "logs",
+                outcome = "allowed",
+                "Sandbox access"
+            );
+            (StatusCode::OK, logs).into_response()
+        }
+        Err(denied) => access_denied(&identity, &id, "logs", denied),
+    }
+}
+
+/// Record and answer one denied Sandbox operation.
+///
+/// The audit line carries the principal, lease, operation and a bounded reason
+/// code — never a credential, a command, or any of the workload's own output.
+/// The reason code is finer-grained than the caller-facing status on purpose:
+/// an operator needs to tell "expired" from "never placed" when somebody
+/// reports that access stopped working, while the caller must not be able to.
+/// Record and answer a denial that is not a resolver outcome.
+///
+/// Same audit shape as [`access_denied`], for limits enforced after resolution
+/// succeeded — the operator needs those countable by cause too.
+fn access_denied_with(
+    identity: &AuthIdentity,
+    lease: &str,
+    operation: &'static str,
+    reason: &'static str,
+    status: StatusCode,
+    message: &'static str,
+) -> Response {
+    info!(
+        principal = %identity.identity,
+        lease = %lease,
+        operation,
+        outcome = "denied",
+        reason,
+        "Sandbox access"
+    );
+    sandbox_error(status, message, None)
+}
+
+fn access_denied(
+    identity: &AuthIdentity,
+    lease: &str,
+    operation: &'static str,
+    denied: crate::api::sandbox_access::SandboxAccessDenied,
+) -> Response {
+    info!(
+        principal = %identity.identity,
+        lease = %lease,
+        operation,
+        outcome = "denied",
+        reason = denied.reason_code(),
+        "Sandbox access"
+    );
+    let status = denied.http_status();
+    if status == StatusCode::NOT_FOUND {
+        // No body: a message would distinguish "not yours" from "not there".
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    sandbox_error(status, denied.to_string(), None)
 }
 
 /// Caller-safe lease intent. Unknown fields are rejected so a caller cannot
@@ -688,8 +1611,32 @@ fn sandbox_lease_response(
         ready_at: status.ready_at,
         expires_at: status.expires_at,
         placement: status.placement,
-        target: status.target,
+        target: status.target.map(caller_visible_provenance),
         conditions: status.conditions,
+    }
+}
+
+/// Strip the internal composition from provenance before it reaches a caller.
+///
+/// `SandboxTargetProvenance` is the controller's restart-safe record of exactly
+/// what it built, and for a child-placement lease that includes the internal
+/// `ClusterLease` and `ClusterInstance` Kobe acquired to host the Sandbox.
+///
+/// The caller asked for a Sandbox. The cluster underneath it is Kobe's
+/// implementation of the pool, not a capability they hold — they cannot
+/// connect to it, extend it or release it, and #74 requires that they cannot
+/// *discover* it either. Returning its name and UID would hand them the exact
+/// identifiers every cluster-lease endpoint is keyed on, turning "no
+/// authority" into "no authority, but knows precisely what to ask for".
+///
+/// Stripped at the response boundary rather than never recorded: teardown must
+/// be able to prove that exact instance UID gone, and evidence a controller
+/// cannot see is evidence that does not exist.
+fn caller_visible_provenance(target: SandboxTargetProvenance) -> SandboxTargetProvenance {
+    SandboxTargetProvenance {
+        child_cluster_lease: None,
+        child_cluster_instance: None,
+        ..target
     }
 }
 
@@ -732,6 +1679,50 @@ fn build_sandbox_lease(
         },
         status: None,
     }
+}
+
+/// Live lease ids carrying one alias, for this caller only.
+///
+/// The label selector is a prefilter, not the authorisation: the requester
+/// hash narrows the list, and each candidate is then re-checked against the
+/// complete principal tuple. A hash collision would otherwise be enough to
+/// reach another tenant's lease, and the hash is over caller-influenced
+/// values.
+///
+/// Terminal leases are excluded. An alias names something a caller can still
+/// use, and a released lease would otherwise shadow the live one they just
+/// created under the same name.
+pub(crate) async fn leases_with_alias(
+    client: &kube::Client,
+    namespace: &str,
+    alias: &str,
+    identity: &AuthIdentity,
+) -> Result<Vec<String>, kube::Error> {
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let params = ListParams::default().labels(&format!(
+        "{REQUESTER_HASH_LABEL}={},{SANDBOX_ALIAS_LABEL}={alias}",
+        principal_hash(identity)
+    ));
+    Ok(leases
+        .list(&params)
+        .await?
+        .into_iter()
+        .filter(|lease| principal_matches(&lease.spec.requester, identity))
+        .filter(|lease| lease.spec.alias.as_deref() == Some(alias))
+        .filter(|lease| {
+            !matches!(
+                lease
+                    .status
+                    .as_ref()
+                    .map(|status| status.phase)
+                    .unwrap_or_default(),
+                SandboxLeasePhase::Released
+                    | SandboxLeasePhase::Expired
+                    | SandboxLeasePhase::Quarantined
+            )
+        })
+        .map(|lease| lease.name_any())
+        .collect())
 }
 
 fn requester_list_params(identity: &AuthIdentity) -> ListParams {
@@ -797,7 +1788,7 @@ fn reservation_name_belongs_to(name: &str, principal: &str) -> bool {
 /// The same digest as [`principal_hash`], over a stored principal rather than a
 /// live authenticated identity. Cleanup runs from the persisted object, not
 /// from a request, so it needs this form.
-fn principal_hash_for(requester: &SandboxPrincipal) -> String {
+pub(crate) fn principal_hash_for(requester: &SandboxPrincipal) -> String {
     let mut hasher = Sha256::new();
     for component in [
         requester.provider.as_bytes(),
@@ -1014,6 +2005,15 @@ async fn reap_abandoned_pending_leases(
     }
 }
 
+/// Whether this principal owns the lease, by the complete identity tuple.
+///
+/// Exposed for #81's resolver so ownership is decided in exactly one place: a
+/// second implementation is a second chance to compare on identity alone and
+/// let one provider's `alice` reach another's.
+pub(crate) fn principal_owns_lease(lease: &SandboxLease, identity: &AuthIdentity) -> bool {
+    principal_matches(&lease.spec.requester, identity)
+}
+
 fn principal_matches(requester: &SandboxPrincipal, identity: &AuthIdentity) -> bool {
     requester.provider == identity.provider
         && requester.issuer == identity.issuer
@@ -1122,7 +2122,7 @@ enum AdmissionReservationError {
 /// a race for a *specific* name. `CREATE` is the atomic primitive: two API
 /// replicas contending for the last slot cannot both succeed, because the
 /// second gets 409 from the API server.
-fn quota_reservation_name(principal: &str, slot: u32) -> String {
+pub(crate) fn quota_reservation_name(principal: &str, slot: u32) -> String {
     format!("sbx-quota-{principal}-{slot}")
 }
 
@@ -1356,7 +2356,7 @@ async fn release_admission_reservations(
 /// Used on the cleanup path, where we hold the lease rather than the list of
 /// reservations we created. Selecting on the UID label (not the name) is what
 /// keeps a recreated same-named lease from dropping its predecessor's slots.
-async fn release_reservations_for_lease(
+pub(crate) async fn release_reservations_for_lease(
     reservations: &Api<Lease>,
     lease: &SandboxLease,
     lease_uid: &str,
@@ -1508,7 +2508,7 @@ fn validate_lease_shape(
 }
 
 #[derive(Debug, Error)]
-enum SandboxLeaseMutationError {
+pub(crate) enum SandboxLeaseMutationError {
     #[error("SandboxLease has no UID")]
     MissingUid,
     #[error("SandboxLease has no resourceVersion")]
@@ -2916,6 +3916,58 @@ mod tests {
                 .iter()
                 .all(|request| request.method.as_str() != "PATCH")
         );
+    }
+
+    /// A caller must not learn which cluster is hosting their Sandbox.
+    ///
+    /// They cannot connect to it, extend it or release it — but returning its
+    /// name and UID would hand them the exact identifiers every cluster-lease
+    /// endpoint is keyed on. "No authority" and "no authority, but knows
+    /// precisely what to ask for" are not the same posture, and #74 requires
+    /// the internal composition be undiscoverable, not merely unusable.
+    #[test]
+    fn the_internal_child_cluster_is_not_discoverable_through_the_sandbox_api() {
+        let reference = |kind: &str, name: &str| crate::crd::SandboxObjectReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: kind.into(),
+            namespace: Some("kobe".into()),
+            name: name.into(),
+            uid: format!("{name}-uid"),
+            generation: Some(1),
+        };
+        let target = SandboxTargetProvenance {
+            namespace: "kobe".into(),
+            child_cluster_lease: Some(reference("ClusterLease", "kobe-sbx-sbx-1")),
+            child_cluster_instance: Some(reference("ClusterInstance", "kobe-abc123")),
+            sandbox_template: Some(reference("SandboxTemplate", "kobe-agents")),
+            sandbox_warm_pool: Some(reference("SandboxWarmPool", "kobe-agents")),
+            sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1")),
+            sandbox: Some(reference("Sandbox", "sbx")),
+            pod: Some(reference("Pod", "sbx-0")),
+        };
+
+        let visible = caller_visible_provenance(target.clone());
+        assert!(visible.child_cluster_lease.is_none());
+        assert!(visible.child_cluster_instance.is_none());
+
+        // Nothing else is stripped: the Sandbox-side objects are the caller's
+        // own, and #81 resolves targets against exactly these.
+        assert_eq!(visible.sandbox_claim, target.sandbox_claim);
+        assert_eq!(visible.pod, target.pod);
+        assert_eq!(visible.namespace, target.namespace);
+
+        // The serialized form is what actually reaches the caller, so assert on
+        // it rather than on the struct alone — a field renamed into the wire
+        // format later would pass a struct-level check and still leak.
+        let json = serde_json::to_string(&visible).unwrap();
+        for secret in [
+            "kobe-sbx-sbx-1",
+            "kobe-abc123",
+            "ClusterLease",
+            "ClusterInstance",
+        ] {
+            assert!(!json.contains(secret), "{secret} leaked into {json}");
+        }
     }
 
     #[tokio::test]

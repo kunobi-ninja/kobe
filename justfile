@@ -103,6 +103,22 @@ test-smoke-pool pool='ci-small' ttl='2m' *args:
 test-smoke-k3s cluster='e2e-kobe' *args:
     @env E2E_CLUSTER={{ cluster }} mise exec -- bun run ./hack/test-e2e-k3s.ts {{ args }}
 
+# Dual-placement Sandbox conformance (#76).
+#
+# One suite, run against BOTH placements — management and child cluster. That
+# is the point: two copies would drift, and the drift would be invisible until
+# somebody's child-placed Sandbox behaved differently from the one they tested.
+#
+# Serial on purpose: these lease real capacity, and a pool sized for a handful
+# of sandboxes queues rather than fails, which reads as a timeout.
+#
+# KOBE_TOKEN_OTHER is REQUIRED. The cross-tenant scenarios are not optional,
+# and a suite that skipped them would report success while proving nothing
+# about the property they exist for.
+[group('test')]
+test-sandbox-conformance:
+    @KOBE_SANDBOX_E2E=1 cargo test --test sandbox_conformance -- --ignored --test-threads=1
+
 # Local e2e environment entrypoint
 [group('dev')]
 e2e *args:

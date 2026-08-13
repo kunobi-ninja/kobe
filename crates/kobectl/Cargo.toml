@@ -24,7 +24,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +35,20 @@ tokio = { version = "1", features = ["full"] }
 # the Windows cross-build, per kache's hard-won note).
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
+# WebSocket client for `sandbox attach` / `sandbox port-forward`. rustls with
+# ring, never default-features — the same constraint as reqwest above, because
+# aws-lc-sys breaks the Windows cross-build.
+tokio-tungstenite = { version = "0.28", features = [
+  "connect",
+  "rustls-tls-webpki-roots",
+], default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# A direct dependency ONLY so the CLI can choose its crypto provider. reqwest
+# selects ring; tokio-tungstenite's rustls feature pulls aws-lc-rs. With two
+# providers compiled in, rustls refuses to pick a default and panics on the
+# first TLS connection — which would break every existing command, not just the
+# new ones. `main` installs ring explicitly, exactly as the operator does.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2"
 # Dual git+version: the git source builds the repo today (and survives until
 # kunobi-auth is published to crates.io); the `version` requirement is what

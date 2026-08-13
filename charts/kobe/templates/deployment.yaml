@@ -68,6 +68,11 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
+            # `managed` is rejected by the operator at startup rather than
+            # here, so the refusal and its reason live in one place and a
+            # direct (non-Helm) deployment cannot route around it.
+            - name: AGENT_SANDBOX_MODE
+              value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
             - name: POOL_SERVICE_ACCOUNT
               value: {{ .Values.poolServiceAccount | default (include "kobe.serviceAccountName" .) | quote }}
             - name: POOL_PUBLISHER_SERVICE_ACCOUNT

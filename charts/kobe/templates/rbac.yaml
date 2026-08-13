@@ -48,10 +48,62 @@ rules:
     resources: ["sandboxpools"]
     verbs: ["get", "list", "watch"]
   # Sandbox callers create lease intent through the HTTP API. Lifecycle
-  # controllers, not admission, own the status subresource.
+  # controllers, not admission, own the status subresource — which needs its
+  # own rule: `/status` is a separate resource to RBAC, so a controller with
+  # `patch` on `sandboxleases` alone still 403s on every phase transition.
   - apiGroups: ["kobe.kunobi.ninja"]
-    resources: ["sandboxleases"]
+    resources: ["sandboxleases", "sandboxleases/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Durable execution records (#82). The reservation is a `create` on a derived
+  # name, which is what makes two concurrent retries of one idempotency key
+  # race for a single object instead of spawning twice.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxexecutions", "sandboxexecutions/status"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Upstream Agent Sandbox objects, created and owned by the placement
+  # controller. Kobe never installs these CRDs (`agentSandbox.mode=external`
+  # means the operator owns the runtime); it only writes the objects it
+  # created, all of which carry a `kobe-` name and an owner reference to their
+  # Kobe parent. `delete` is what makes verified teardown possible: without it
+  # a released lease could never prove its Sandbox was gone, and its capacity
+  # would be withheld forever.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The upstream `Sandbox` object itself, in the CORE Agent Sandbox group.
+  # Read-only: Kobe creates Sandboxes only indirectly, through claims. It is
+  # read to find the Pod behind a claim, via upstream's own `status.selector`.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+  # The readiness canary runs an administrator-declared command inside the
+  # Sandbox. Upstream `Ready` describes the container, not the agent in it —
+  # a crash-looped or wedged agent satisfies it, and believing it starts a
+  # paid runtime TTL on a Sandbox that cannot serve.
+  #
+  # `pods/exec` is a powerful verb, so what bounds it matters: the argv comes
+  # from the `SandboxPool` spec, which only an administrator can write, and a
+  # lease selects a pool and nothing else. No caller input reaches this.
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["create"]
+  # Sandbox log reads (#81). Separate from `pods` above because `pods/log` is
+  # its own resource to RBAC — and worth stating explicitly: this is the verb
+  # that lets the operator return a workload's own output to its lease holder.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Per-lease scoped credentials (#81). Kobe mints a ServiceAccount whose Role
+  # names exactly one Pod, then a short-lived token for it, and reaches the
+  # tenant's Sandbox as THAT identity rather than as itself.
+  #
+  # `serviceaccounts/token` is the mint. It is bounded by RBAC's own escalation
+  # rule: a Role may only be created granting permissions the creator already
+  # holds, so this cannot manufacture authority the operator lacks — it can
+  # only hand out less.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]

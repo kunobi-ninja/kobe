@@ -775,8 +775,12 @@ pub async fn read_kubeconfig_secret(
     Ok(kubeconfig)
 }
 
-/// Build a `kube::Client` targeting a virtual cluster from its kubeconfig YAML.
-pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Client> {
+/// Build a `kube::Config` targeting a virtual cluster from its kubeconfig YAML.
+///
+/// Separated from the client so a caller that must *re-authenticate* against
+/// the same cluster — #81 mints a per-lease token and needs the endpoint and
+/// trust anchors without the admin identity — can do so without re-parsing.
+pub async fn virtual_config_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Config> {
     let kubeconfig = kube::config::Kubeconfig::from_yaml(kubeconfig_yaml)?;
     let mut config = Config::from_custom_kubeconfig(kubeconfig, &Default::default())
         .await
@@ -784,6 +788,12 @@ pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Cli
     // Virtual clusters use self-signed CAs; we trust them because we created them
     // and we're connecting cluster-internal (pod-to-service DNS).
     config.accept_invalid_certs = true;
+    Ok(config)
+}
+
+/// Build a `kube::Client` targeting a virtual cluster from its kubeconfig YAML.
+pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Client> {
+    let config = virtual_config_from_kubeconfig(kubeconfig_yaml).await?;
     Client::try_from(config).context("Failed to create client from kubeconfig")
 }
 
