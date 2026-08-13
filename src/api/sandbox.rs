@@ -2005,6 +2005,300 @@ async fn reap_abandoned_pending_leases(
     }
 }
 
+/// How long a lease that reached a clean terminal phase is kept before the
+/// record itself is retired. Seven days, expressed in the units
+/// [`parse_duration`] understands.
+///
+/// The number is a policy call, and the unit is the part that matters. A
+/// terminal lease is the audit record of who held what, for how long, and
+/// whether cleanup was proven — the thing an operator reads *after* somebody
+/// notices something went wrong. A window measured in hours would routinely
+/// have the evidence gone before the question was asked; one measured in months
+/// grows `etcd` without bound holding records nobody will ever read. A week
+/// spans a weekend plus the working day it takes to notice, which is the
+/// shortest window that still answers the question the record exists to answer.
+const DEFAULT_SANDBOX_LEASE_RETENTION: &str = "168h";
+
+/// Floor on the configured retention window.
+///
+/// Not a guard against an operator wanting a short window — it is a guard
+/// against a mistyped one. `7s` parses perfectly and would delete every
+/// terminal lease almost as fast as it was written, destroying the audit trail
+/// with no error anywhere to explain it. An hour is far below any retention
+/// worth configuring and far above the time it takes to read a record that just
+/// appeared, so clamping here can only ever rescue a typo.
+const MIN_SANDBOX_LEASE_RETENTION_SECS: i64 = 3600;
+
+/// Environment variable carrying the retention window override.
+pub(crate) const ENV_SANDBOX_LEASE_RETENTION: &str = "KOBE_SANDBOX_LEASE_RETENTION";
+
+/// Resolve the terminal-lease retention window from operator configuration.
+///
+/// Takes the configured string rather than reading the environment itself, so
+/// the parsing and clamping rules are assertable without mutating process-wide
+/// state that no two tests can own at the same time.
+///
+/// Every rejection falls back to the default rather than to zero or to
+/// "sweep nothing". Zero would delete records on a typo; disabling the sweep
+/// silently would reintroduce the unbounded growth this exists to stop, and an
+/// operator who mistyped a duration has said nothing about wanting either.
+pub(crate) fn sandbox_lease_retention(configured: Option<&str>) -> chrono::Duration {
+    let default = parse_duration(DEFAULT_SANDBOX_LEASE_RETENTION)
+        .expect("the default Sandbox lease retention window parses");
+    let Some(configured) = configured
+        .map(str::trim)
+        .filter(|configured| !configured.is_empty())
+    else {
+        return default;
+    };
+    // `parse_duration` also refuses anything past a year, which is the same
+    // answer as unparseable here: a value that far out is not a retention
+    // policy, it is a mistake.
+    let Some(parsed) = parse_duration(configured) else {
+        warn!(
+            env = ENV_SANDBOX_LEASE_RETENTION,
+            value = %configured,
+            default = DEFAULT_SANDBOX_LEASE_RETENTION,
+            "Ignoring an unusable Sandbox lease retention window; using the default"
+        );
+        return default;
+    };
+    let floor = chrono::Duration::seconds(MIN_SANDBOX_LEASE_RETENTION_SECS);
+    if parsed < floor {
+        warn!(
+            env = ENV_SANDBOX_LEASE_RETENTION,
+            value = %configured,
+            floor = %format_duration(&floor),
+            "Sandbox lease retention window is below the floor; clamping"
+        );
+        return floor;
+    }
+    parsed
+}
+
+/// When the lease reached a terminal phase, as recorded on the object itself.
+///
+/// `CleanupVerified` is the only durable record of that moment. The phase
+/// carries no timestamp, and `creationTimestamp` dates the lease's birth rather
+/// than its end — sweeping on that would retire a lease that ran for a
+/// fortnight the instant it was released, which is precisely when its record is
+/// most likely to be wanted.
+///
+/// Only the `True` form counts. The `False` form is written by
+/// [`quarantine_lease`](crate::controllers::sandbox) and dates the moment
+/// teardown became *unprovable*, so reading it as a terminal timestamp would
+/// hand the sweep exactly the objects it must never touch.
+fn terminal_lease_recorded_at(status: &crate::crd::SandboxLeaseStatus) -> Option<&str> {
+    status
+        .conditions
+        .iter()
+        .find(|condition| {
+            condition.condition_type == crate::controllers::sandbox::CLEANUP_VERIFIED_CONDITION
+                && condition.status == crate::crd::SandboxConditionStatus::True
+        })
+        .and_then(|condition| condition.last_transition_time.as_deref())
+}
+
+/// Whether a lease's record has outlived its retention window and may be
+/// retired.
+///
+/// Pure so the rules are assertable without a cluster or a clock: `now` and the
+/// window are supplied.
+///
+/// The phase test is an exhaustive `match` with no wildcard arm, deliberately.
+/// A wildcard would let a phase added later be swept — or spared — by whichever
+/// side of the pattern it happened to land on, with nobody forced to decide. As
+/// written, a new phase is a compile error at the one place the decision
+/// belongs.
+fn terminal_lease_is_retired(
+    phase: SandboxLeasePhase,
+    terminal_since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    retention: chrono::Duration,
+) -> bool {
+    match phase {
+        // The clean terminal phases. Cleanup was proven before either was
+        // written, and their reservations were released at that same moment, so
+        // retiring the record cannot release capacity — it only removes a row.
+        SandboxLeasePhase::Released | SandboxLeasePhase::Expired => {}
+        // Quarantined is terminal, and is the one terminal phase that must
+        // never be swept. It still consumes capacity, on purpose: it is what
+        // withholds a slot whose teardown nobody could prove. Deleting the
+        // object would hand that slot back on no evidence at all and take the
+        // record of the unproven teardown with it — the exact double-booking
+        // the quarantine exists to prevent, now with nothing left to show for
+        // it. It leaves only by being cleared to `Released`/`Expired`, after
+        // which the window starts from that transition.
+        SandboxLeasePhase::Quarantined => return false,
+        // Not terminal at all: these leases may still be running.
+        SandboxLeasePhase::Pending
+        | SandboxLeasePhase::Provisioning
+        | SandboxLeasePhase::Ready
+        | SandboxLeasePhase::Releasing => return false,
+    }
+
+    let Some(terminal_since) = terminal_since else {
+        // No proof of when it ended is no proof that it ended long enough ago.
+        // Keeping an undated record costs one row; deleting it may destroy the
+        // audit trail of a lease that ended a minute ago.
+        return false;
+    };
+    let Ok(terminal_since) = chrono::DateTime::parse_from_rfc3339(terminal_since) else {
+        return false;
+    };
+    now - terminal_since.with_timezone(&chrono::Utc) >= retention
+}
+
+/// Retire terminal Sandbox lease records once they are past their retention
+/// window.
+///
+/// `Released` and `Expired` leases stop consuming capacity the moment they are
+/// written, so this is not a capacity reclaim and never was — the objects
+/// simply accumulate, one per Sandbox ever leased, forever. This bounds that at
+/// the cost of the audit record, which is why the window is generous and why
+/// `Quarantined` is excluded outright.
+///
+/// Deleting the lease also collects what it owns: its admission reservations
+/// carry an `ownerReference` to it, and so does the internal `ClusterLease`
+/// holding a child composition's teardown receipt. Both are already settled by
+/// the time a clean terminal phase is written, so the sweep never has to reason
+/// about live capacity — but it does mean the whole evidence chain retires
+/// together, which is the honest description of what the window is buying.
+///
+/// Runs on every replica rather than under leader election. Each delete is
+/// fenced on the exact UID and resourceVersion, so replicas racing on the same
+/// object produce one delete and a 404/409 for the loser, which is the same
+/// outcome as running alone.
+pub async fn run_sandbox_lease_reaper(
+    client: kube::Client,
+    namespace: &str,
+    interval: std::time::Duration,
+    retention: chrono::Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let leases: Api<SandboxLease> = Api::namespaced(client, namespace);
+    info!(
+        retention = %format_duration(&retention),
+        "Starting Sandbox lease retention sweep"
+    );
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        sweep_retired_leases(&leases, retention, chrono::Utc::now()).await;
+    }
+    info!("Sandbox lease retention sweep shut down");
+}
+
+/// One pass of the retention sweep.
+///
+/// Split from the timer loop so a test can run exactly one tick and assert what
+/// it did, rather than racing a sleep.
+async fn sweep_retired_leases(
+    leases: &Api<SandboxLease>,
+    retention: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let listed = match leases.list(&ListParams::default()).await {
+        Ok(listed) => listed,
+        // Best-effort by design: a window this long has no deadline a single
+        // missed tick could threaten.
+        Err(error) => {
+            warn!(error = %error, "Sandbox lease retention sweep failed to list");
+            return;
+        }
+    };
+
+    for lease in listed {
+        let Some(status) = lease.status.as_ref() else {
+            continue;
+        };
+        if !terminal_lease_is_retired(
+            status.phase,
+            terminal_lease_recorded_at(status),
+            now,
+            retention,
+        ) {
+            continue;
+        }
+        match delete_retired_lease(leases, &lease, retention, now).await {
+            Ok(true) => info!(
+                lease_id = %lease.name_any(),
+                phase = %status.phase,
+                "Retired a terminal Sandbox lease past its retention window"
+            ),
+            // Gone already, or no longer eligible on re-read. Both are the
+            // sweep declining to act, not a failure.
+            Ok(false) => {}
+            Err(error) => warn!(
+                lease_id = %lease.name_any(),
+                error = %error,
+                "Could not retire a terminal Sandbox lease"
+            ),
+        }
+    }
+}
+
+/// Delete one retired lease, fenced on the object the decision was made about.
+///
+/// Returns whether this call is what removed it.
+///
+/// The eligibility test is re-run against the *re-read* object, not the listed
+/// one. A lease can be quarantined between the list and the delete — teardown
+/// verification is asynchronous and a controller may reopen the question — and
+/// acting on the stale copy would delete the one kind of record that must never
+/// be deleted. The resourceVersion precondition catches the same race at the
+/// API server; this catches it before the request is even sent, and says why.
+async fn delete_retired_lease(
+    leases: &Api<SandboxLease>,
+    lease: &SandboxLease,
+    retention: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, SandboxLeaseMutationError> {
+    let expected_uid = lease.uid().ok_or(SandboxLeaseMutationError::MissingUid)?;
+    let current = match leases.get(&lease.name_any()).await {
+        Ok(current) => current,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    // A same-named lease created since the list is a different tenant's record
+    // that has not been terminal for a second, let alone a week.
+    if current.uid().as_deref() != Some(expected_uid.as_str()) {
+        return Err(SandboxLeaseMutationError::UidChanged);
+    }
+    let Some(status) = current.status.as_ref() else {
+        return Ok(false);
+    };
+    if !terminal_lease_is_retired(
+        status.phase,
+        terminal_lease_recorded_at(status),
+        now,
+        retention,
+    ) {
+        return Ok(false);
+    }
+
+    let resource_version = current
+        .resource_version()
+        .ok_or(SandboxLeaseMutationError::MissingResourceVersion)?;
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(expected_uid),
+            resource_version: Some(resource_version),
+        }),
+        ..Default::default()
+    };
+    match leases.delete(&current.name_any(), &params).await {
+        Ok(_) => Ok(true),
+        // 404: somebody else retired it. 409: it changed between the re-read
+        // and the delete, so the decision was made about a version that no
+        // longer exists. Neither is an error, and both mean "not by us".
+        Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Whether this principal owns the lease, by the complete identity tuple.
 ///
 /// Exposed for #81's resolver so ownership is decided in exactly one place: a
@@ -3361,6 +3655,325 @@ mod tests {
         // Absent or unparseable evidence of age is not evidence of abandonment.
         assert!(!pending_lease_is_abandoned(None, now));
         assert!(!pending_lease_is_abandoned(Some("not-a-timestamp"), now));
+    }
+
+    /// A lease that reached `phase`, carrying the `CleanupVerified` condition
+    /// the controller writes at that same transition — which is the only thing
+    /// dating the end of the lease.
+    fn terminal_lease_json(
+        name: &str,
+        phase: &str,
+        cleanup: crate::crd::SandboxConditionStatus,
+        terminal_since: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        let mut object = lease_json(name, "alice@example.com", phase);
+        object["status"]["conditions"] = serde_json::json!([{
+            "type": crate::controllers::sandbox::CLEANUP_VERIFIED_CONDITION,
+            "status": cleanup,
+            "reason": "TeardownVerified",
+            "message": "Lease-owned footprint observed absent",
+            "lastTransitionTime": terminal_since.to_rfc3339(),
+        }]);
+        object
+    }
+
+    /// Mount the SandboxLease API for one sweep tick.
+    ///
+    /// `listed` is what LIST returns; `current` is what a subsequent GET on the
+    /// same name returns. They are separate on purpose — the sweep re-reads
+    /// before deleting, and a mock that could not disagree with itself could
+    /// never show that the re-read decides anything.
+    async fn mount_lease_sweep_api(
+        server: &MockServer,
+        listed: &[serde_json::Value],
+        current: &[serde_json::Value],
+    ) {
+        const LEASES: &str = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases";
+        Mock::given(method("GET"))
+            .and(path(LEASES))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(listed.to_vec())),
+            )
+            .mount(server)
+            .await;
+        for object in current {
+            let name = object["metadata"]["name"].as_str().unwrap().to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("{LEASES}/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(object.clone()))
+                .mount(server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(format!("{LEASES}/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Success"
+                })))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// Every lease name the sweep issued a DELETE for.
+    async fn deleted_lease_names(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .filter_map(|request| {
+                request
+                    .url
+                    .path()
+                    .split("/sandboxleases/")
+                    .nth(1)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// `Quarantined` is terminal, and is the one terminal phase the sweep must
+    /// never touch.
+    ///
+    /// If it did, the capacity that phase withholds — withheld precisely
+    /// because nobody could prove the Sandbox was gone — would be handed back
+    /// on no evidence at all, and the record of the unproven teardown would go
+    /// with it. That is the exact double-booking the quarantine exists to
+    /// prevent, now with nothing left to explain where the slot went.
+    ///
+    /// Asserted at the sweep rather than at the predicate: the predicate is
+    /// only where the rule is written, and the sweep is where a DELETE
+    /// actually goes out.
+    ///
+    /// Two quarantined leases, because one is not enough to constrain the
+    /// rule. The `False` cleanup condition is the shape a real quarantine
+    /// carries, and it is spared twice over — by the phase *and* by having no
+    /// verified end date. A test built only from that shape passes even with
+    /// the phase exemption deleted, which is the mutation this is here to
+    /// catch. The second lease carries a `True` condition dated a year back,
+    /// so the phase is the only thing left that can save it.
+    #[tokio::test]
+    async fn quarantined_leases_are_never_swept() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let now = chrono::Utc::now();
+        let long_ago = now - chrono::Duration::days(365);
+
+        let objects = vec![
+            terminal_lease_json(
+                "sandbox-released",
+                "Released",
+                crate::crd::SandboxConditionStatus::True,
+                long_ago,
+            ),
+            terminal_lease_json(
+                "sandbox-quarantined",
+                "Quarantined",
+                crate::crd::SandboxConditionStatus::False,
+                long_ago,
+            ),
+            terminal_lease_json(
+                "sandbox-quarantined-dated",
+                "Quarantined",
+                crate::crd::SandboxConditionStatus::True,
+                long_ago,
+            ),
+        ];
+        mount_lease_sweep_api(&server, &objects, &objects).await;
+
+        let leases: Api<SandboxLease> =
+            Api::namespaced(crate::testutil::mock_k8s_client(&server), "test-ns");
+        sweep_retired_leases(&leases, chrono::Duration::days(7), now).await;
+
+        assert_eq!(
+            deleted_lease_names(&server).await,
+            vec!["sandbox-released".to_string()],
+            "the sweep must retire the clean terminal lease and leave the quarantined one"
+        );
+    }
+
+    /// The sweep decides on the object as it stands when the DELETE is sent,
+    /// not as it stood when it was listed.
+    ///
+    /// Teardown verification is asynchronous, so a lease can be quarantined in
+    /// the gap between the two. Acting on the listed copy would delete the one
+    /// record that must never be deleted, and the resourceVersion precondition
+    /// would not save it: the controller writes status, so the version the
+    /// sweep fences on is the quarantined one.
+    ///
+    /// The re-read object keeps a `True` cleanup condition dated a year back,
+    /// so the phase it was re-read *as* is the only thing that can stop the
+    /// delete — otherwise this would pass without the re-read deciding
+    /// anything.
+    #[tokio::test]
+    async fn a_lease_quarantined_after_the_list_is_left_alone() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let now = chrono::Utc::now();
+        let long_ago = now - chrono::Duration::days(365);
+
+        let listed = terminal_lease_json(
+            "sandbox-reopened",
+            "Released",
+            crate::crd::SandboxConditionStatus::True,
+            long_ago,
+        );
+        let requeried = terminal_lease_json(
+            "sandbox-reopened",
+            "Quarantined",
+            crate::crd::SandboxConditionStatus::True,
+            long_ago,
+        );
+        mount_lease_sweep_api(&server, &[listed], &[requeried]).await;
+
+        let leases: Api<SandboxLease> =
+            Api::namespaced(crate::testutil::mock_k8s_client(&server), "test-ns");
+        sweep_retired_leases(&leases, chrono::Duration::days(7), now).await;
+
+        assert!(
+            deleted_lease_names(&server).await.is_empty(),
+            "a lease quarantined since the list must survive the sweep"
+        );
+    }
+
+    /// The window is the whole promise the retention policy makes, and every
+    /// phase that is not a *clean* terminal one is outside the sweep entirely.
+    ///
+    /// Sweeping a live lease would delete a running Sandbox's record; sweeping
+    /// a fresh terminal one would destroy the audit trail at the moment it is
+    /// most likely to be read — right after whatever went wrong.
+    #[test]
+    fn only_clean_terminal_leases_past_the_window_are_retired() {
+        let now = chrono::Utc::now();
+        let retention = chrono::Duration::days(7);
+        let overdue = (now - retention - chrono::Duration::hours(1)).to_rfc3339();
+        let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let retired =
+            |phase, since: &str| terminal_lease_is_retired(phase, Some(since), now, retention);
+
+        for phase in [SandboxLeasePhase::Released, SandboxLeasePhase::Expired] {
+            assert!(
+                retired(phase, &overdue),
+                "{phase} past the window is retired"
+            );
+            assert!(
+                !retired(phase, &recent),
+                "{phase} inside the window is kept"
+            );
+        }
+
+        // Terminal, and permanently exempt: a quarantine is not made safe to
+        // delete by age. Nothing has proven the teardown in the meantime.
+        assert!(!retired(SandboxLeasePhase::Quarantined, &overdue));
+
+        // Not terminal at all. These leases may still be running, and their
+        // age says nothing about whether they are.
+        for phase in [
+            SandboxLeasePhase::Pending,
+            SandboxLeasePhase::Provisioning,
+            SandboxLeasePhase::Ready,
+            SandboxLeasePhase::Releasing,
+        ] {
+            assert!(!retired(phase, &overdue), "{phase} is not terminal");
+        }
+
+        // Absent or unreadable evidence of when it ended is not evidence that
+        // it ended long enough ago.
+        assert!(!terminal_lease_is_retired(
+            SandboxLeasePhase::Released,
+            None,
+            now,
+            retention
+        ));
+        assert!(!terminal_lease_is_retired(
+            SandboxLeasePhase::Released,
+            Some("not-a-timestamp"),
+            now,
+            retention
+        ));
+    }
+
+    /// A lease is dated by when it *ended*, never by when it was created.
+    ///
+    /// The `False` form of `CleanupVerified` is written when teardown became
+    /// unprovable, so reading it as an end date would date a quarantine — and
+    /// a sweep that trusted `creationTimestamp` instead would retire a lease
+    /// that ran for a fortnight the instant it was released.
+    #[test]
+    fn a_terminal_lease_is_dated_by_its_verified_cleanup() {
+        let ended_at = "2026-08-01T00:00:00+00:00";
+        let with_condition = |status| crate::crd::SandboxLeaseStatus {
+            phase: SandboxLeasePhase::Released,
+            conditions: vec![crate::crd::SandboxCondition {
+                condition_type: crate::controllers::sandbox::CLEANUP_VERIFIED_CONDITION.into(),
+                status,
+                reason: "TeardownVerified".into(),
+                message: String::new(),
+                observed_generation: Some(1),
+                last_transition_time: Some(ended_at.to_string()),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            terminal_lease_recorded_at(&with_condition(crate::crd::SandboxConditionStatus::True)),
+            Some(ended_at)
+        );
+        assert_eq!(
+            terminal_lease_recorded_at(&with_condition(crate::crd::SandboxConditionStatus::False)),
+            None
+        );
+        assert_eq!(
+            terminal_lease_recorded_at(&crate::crd::SandboxLeaseStatus::default()),
+            None
+        );
+    }
+
+    /// A retention setting nobody can act on must not become a short one.
+    ///
+    /// Every rejection here is a value an operator typed. Falling back to zero
+    /// — or honouring `7s` from a dropped `2`, or `1y` from a stray keystroke —
+    /// would delete audit records wholesale on a typo, with a successful
+    /// startup and no error anywhere to say why they went.
+    #[test]
+    fn an_unusable_retention_setting_never_shortens_the_window() {
+        let default = parse_duration(DEFAULT_SANDBOX_LEASE_RETENTION).unwrap();
+        assert_eq!(default, chrono::Duration::days(7));
+
+        // Unset, blank, unparseable, and past the one-year ceiling all mean
+        // "no usable instruction", which is the default and not zero.
+        for unusable in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("7"),
+            Some("7d"),
+            Some("forever"),
+            Some("9000h"),
+        ] {
+            assert_eq!(
+                sandbox_lease_retention(unusable),
+                default,
+                "{unusable:?} must fall back to the default"
+            );
+        }
+
+        // Honoured as written.
+        assert_eq!(
+            sandbox_lease_retention(Some("720h")),
+            chrono::Duration::days(30)
+        );
+        assert_eq!(
+            sandbox_lease_retention(Some(" 24h ")),
+            chrono::Duration::days(1)
+        );
+
+        // Clamped, not honoured: below the floor is a typo, not a policy.
+        let floor = chrono::Duration::seconds(MIN_SANDBOX_LEASE_RETENTION_SECS);
+        assert_eq!(sandbox_lease_retention(Some("7s")), floor);
+        assert_eq!(sandbox_lease_retention(Some("59m")), floor);
+        assert_eq!(sandbox_lease_retention(Some("1h")), floor);
     }
 
     /// Quota is decided by CREATE contention on a per-slot name, not by

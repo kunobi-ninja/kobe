@@ -302,6 +302,32 @@ async fn main() -> anyhow::Result<()> {
             .await;
         });
 
+        // Terminal lease records are retired here. `Released` and `Expired`
+        // stop consuming capacity when they are written, so nothing leaks —
+        // the objects just accumulate, one per Sandbox ever leased, until
+        // etcd carries a row for every Sandbox that ever existed. The window
+        // is measured in days because the record is an audit trail, and the
+        // tick is hourly because nothing on that scale is worth a minute's
+        // list churn against the API server.
+        let lease_reaper_client = client.clone();
+        let lease_reaper_ns = namespace.clone();
+        let lease_reaper_shutdown = shutdown.clone();
+        let lease_retention = api::sandbox::sandbox_lease_retention(
+            std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
+                .ok()
+                .as_deref(),
+        );
+        tokio::spawn(async move {
+            api::sandbox::run_sandbox_lease_reaper(
+                lease_reaper_client,
+                &lease_reaper_ns,
+                std::time::Duration::from_secs(3600),
+                lease_retention,
+                lease_reaper_shutdown,
+            )
+            .await;
+        });
+
         let revoker_client = client.clone();
         let revoker_ns = namespace.clone();
         let revoker_shutdown = shutdown.clone();
