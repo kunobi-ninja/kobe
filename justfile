@@ -147,6 +147,7 @@ build-crdgen:
     cargo run --bin crdgen -- cidrpools > charts/kobe/crds/cidrpools.yaml
     cargo run --bin crdgen -- sandboxpools > charts/kobe/crds/sandboxpools.yaml
     cargo run --bin crdgen -- sandboxleases > charts/kobe/crds/sandboxleases.yaml
+    cargo run --bin crdgen -- sandboxexecutions > charts/kobe/crds/sandboxexecutions.yaml
 
 # Build Docker images locally (operator + kobe-sync)
 [group('docker')]

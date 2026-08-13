@@ -38,6 +38,12 @@ const SANDBOX_POOL_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool";
 const SANDBOX_ALIAS_LABEL: &str = "kobe.kunobi.ninja/alias";
 const SANDBOX_POOL_CRD: &str = "sandboxpools.kobe.kunobi.ninja";
 const SANDBOX_LEASE_CRD: &str = "sandboxleases.kobe.kunobi.ninja";
+/// Executions are a third CRD, and a staged upgrade can have the lease CRD
+/// installed without it. Required explicitly on the execution paths so a
+/// missing CRD is one legible error up front, rather than a 503 raised deep in
+/// the reservation `create` — which is the failure `require_sandbox_crds`
+/// exists to prevent in the first place.
+const SANDBOX_EXECUTION_CRD: &str = "sandboxexecutions.kobe.kunobi.ninja";
 const SANDBOX_RESERVATION_TYPE_LABEL: &str = "kobe.kunobi.ninja/sandbox-reservation";
 pub(crate) const SANDBOX_RESERVATION_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 const SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
@@ -178,7 +184,9 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     use crate::api::sandbox_executions as executions;
     use crate::crd::ExecutionState;
 
-    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+    if let Err(response) =
+        require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD, SANDBOX_EXECUTION_CRD]).await
+    {
         return response;
     }
     if !is_valid_k8s_name(&id) {
@@ -403,6 +411,11 @@ async fn get_sandbox_execution<B: ClusterBackend>(
 ) -> Response {
     use crate::api::sandbox_access as access;
 
+    if let Err(response) =
+        require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD, SANDBOX_EXECUTION_CRD]).await
+    {
+        return response;
+    }
     if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -446,6 +459,11 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
 ) -> Response {
     use crate::api::sandbox_access as access;
 
+    if let Err(response) =
+        require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD, SANDBOX_EXECUTION_CRD]).await
+    {
+        return response;
+    }
     if !is_valid_k8s_name(&id) || !is_valid_k8s_name(&execution) {
         return StatusCode::NOT_FOUND.into_response();
     }
