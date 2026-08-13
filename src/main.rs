@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         factory: Some(factory.clone()),
         datastore: datastore.clone(),
         connect_cache: Default::default(),
+        sandbox_admission_limiter: Default::default(),
     };
 
     let app = build_router(state);
