@@ -115,9 +115,16 @@ test-smoke-k3s cluster='e2e-kobe' *args:
 # KOBE_TOKEN_OTHER is REQUIRED. The cross-tenant scenarios are not optional,
 # and a suite that skipped them would report success while proving nothing
 # about the property they exist for.
+#
+# KOBE_SANDBOX_HARNESS names the command that restarts, breaks and attaches to
+# the target (#138). It defaults to this repo's own harness because that is
+# right whenever the suite runs against the environment `just e2e-up` built;
+# override it when the endpoint lives somewhere else, and remember that the
+# harness needs kubectl access to the cluster serving it — the restart,
+# failure-injection and pty scenarios FAIL rather than skip without one.
 [group('test')]
 test-sandbox-conformance:
-    @KOBE_SANDBOX_E2E=1 cargo test --test sandbox_conformance -- --ignored --test-threads=1
+    @KOBE_SANDBOX_E2E=1 KOBE_SANDBOX_HARNESS="${KOBE_SANDBOX_HARNESS:-bun run ./hack/e2e.ts}" cargo test --test sandbox_conformance -- --ignored --test-threads=1
 
 # Local e2e environment entrypoint
 [group('dev')]

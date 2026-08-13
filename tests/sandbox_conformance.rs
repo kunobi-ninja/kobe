@@ -23,6 +23,27 @@
 //! cannot: that a caller is **unable** to reach the cluster underneath. A test
 //! holding a kubeconfig cannot prove the absence of one.
 //!
+//! # The harness is not the target
+//!
+//! Some properties cannot be provoked through the contract at all. A crash
+//! never causing a duplicate spawn needs a crash; uncertain teardown withholding
+//! capacity needs teardown made uncertain; Ctrl-C reaching the workload needs a
+//! terminal. #138 supplies all three through `hack/e2e.ts`, and this suite
+//! *invokes* them — but it still does not perform them, and it still asserts
+//! only through HTTP.
+//!
+//! That boundary is the point rather than an inconvenience. A suite that could
+//! break its own target could also mask a break it did not intend, and a suite
+//! reaching into the cluster to check its work could pass while the API was
+//! broken. So the disturbance happens in another process, and every assertion
+//! about the result comes back through the same public surface every other
+//! scenario uses.
+//!
+//! `KOBE_SANDBOX_HARNESS` names that command — `bun run ./hack/e2e.ts`. Absent,
+//! the scenarios that need it **fail**, exactly like a missing
+//! `KOBE_TOKEN_OTHER`. #138 says why in one line: a scenario that cannot run
+//! reads as a scenario that passed.
+//!
 //! # Running it
 //!
 //! ```text
@@ -79,8 +100,14 @@ impl Placement {
 /// A failure names the placement, because "the exec scenario failed" is not
 /// actionable when the whole point is that one placement behaves differently
 /// from the other.
+///
+/// Leading attributes are forwarded, so a scenario can carry the doc comment
+/// that says what breaks when it does not hold. Without the passthrough that
+/// reasoning would have to live in an ordinary comment, where `cargo doc` and
+/// a reader jumping to the definition both miss it.
 macro_rules! both_placements {
-    ($name:ident, $body:expr) => {
+    ($(#[$attribute:meta])* $name:ident, $body:expr) => {
+        $(#[$attribute])*
         #[tokio::test]
         #[ignore = "requires a live Kobe endpoint; see the module docs"]
         async fn $name() {
@@ -126,6 +153,79 @@ fn other_token() -> String {
 fn pool_for(placement: Placement) -> String {
     std::env::var(placement.pool_env())
         .unwrap_or_else(|_| panic!("{} is required", placement.pool_env()))
+}
+
+/// The command that disturbs the target.
+///
+/// Absent means **fail**, never skip — the same rule as [`other_token`], for
+/// the same reason. The three properties this unlocks are asserted by
+/// construction today and proven nowhere; a scenario that quietly declined to
+/// run would leave them looking covered.
+fn harness_command() -> Vec<String> {
+    let configured = std::env::var("KOBE_SANDBOX_HARNESS").expect(
+        "KOBE_SANDBOX_HARNESS is required: it names the command that restarts, breaks and \
+         attaches to the target (e.g. `bun run ./hack/e2e.ts`). The restart, failure-injection \
+         and pty scenarios cannot run without it, and a skipped scenario reads as a passing one",
+    );
+    configured
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+}
+
+/// Invoke the harness, failing with everything it printed.
+///
+/// The whole output rather than a status: these subcommands fail for reasons
+/// the suite cannot see — a lease that never reached the stage a restart was
+/// aimed at, a ClusterRole that never granted the verb being revoked — and a
+/// bare exit code would send the reader to the wrong side of the boundary.
+async fn harness(argv: &[&str]) -> anyhow::Result<String> {
+    let command = harness_command();
+    let (program, prefix) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("KOBE_SANDBOX_HARNESS is set but empty"))?;
+
+    let output = tokio::process::Command::new(program)
+        .args(prefix)
+        .args(argv)
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    anyhow::ensure!(
+        output.status.success(),
+        "harness `{} {}` failed ({}):\n{stdout}\n{}",
+        command.join(" "),
+        argv.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(stdout)
+}
+
+/// A value no other run of this suite can produce.
+///
+/// A restart scenario outlives reconciles and retries, so a fixed marker from
+/// an earlier run could still be sitting in the sandbox — and matching it would
+/// pass without anything having happened this time.
+fn nonce(placement: Placement) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{now}", placement.label())
+}
+
+/// The UID a lease recorded for one composed object.
+///
+/// UIDs rather than names throughout, because a same-named replacement is
+/// fresh capacity rather than evidence of continuity — the exact distinction
+/// the operator's own teardown receipts are built on.
+fn provenance_uid(lease: &Value, field: &str) -> anyhow::Result<String> {
+    lease["target"][field]["uid"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("no target.{field}.uid in {lease}"))
 }
 
 struct Api {
@@ -208,6 +308,17 @@ impl LeasedSandbox {
             id,
             released: false,
         })
+    }
+
+    /// The lease as its own holder sees it, right now.
+    async fn status(&self) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+        self.api
+            .json(
+                reqwest::Method::GET,
+                &format!("/v1/sandbox-leases/{}", self.id),
+                None,
+            )
+            .await
     }
 
     async fn wait_ready(&self, within: Duration) -> anyhow::Result<Value> {
@@ -733,6 +844,386 @@ both_placements!(
     }
 );
 
+// ---------------------------------------------------------------------------
+// Harness-driven scenarios (#138)
+//
+// The three rows of #76's matrix that needed the target disturbed rather than
+// merely queried. Each covers a property the design leans on and that nothing
+// proves end to end: a crash never causes a duplicate spawn; uncertain teardown
+// withholds capacity rather than releasing it; Ctrl-C reaches the workload.
+//
+// A restart takes longer than an untouched lease does, so these use wider
+// budgets than the scenarios above. That is not slack — a restart scenario that
+// timed out during the restart would report the operator as broken for having
+// been asked to reboot.
+// ---------------------------------------------------------------------------
+
+both_placements!(
+    /// A restart before readiness resumes the same composition rather than
+    /// starting a second one.
+    ///
+    /// If this does not hold, a crash mid-provision leaves a Sandbox nobody
+    /// owns while the lease builds another — and for child placement the
+    /// orphan is an entire cluster, charged to a pool that has stopped
+    /// counting it.
+    a_restart_before_readiness_resumes_the_same_composition,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+
+        // Aimed at the claim, not at a wall-clock delay. A restart timed by
+        // sleeping lands somewhere different on every run, and a scenario that
+        // sometimes restarts after readiness is not running the same test
+        // twice — which is precisely the class of flake that gets an
+        // idempotency suite switched off.
+        harness(&[
+            "restart-operator",
+            "--wait-for-phase",
+            "claim",
+            "--lease",
+            &sandbox.id,
+            "--timeout",
+            "600",
+        ])
+        .await?;
+
+        let ready = sandbox.wait_ready(Duration::from_secs(600)).await?;
+        let claim = provenance_uid(&ready, "sandboxClaim")?;
+        let pod = provenance_uid(&ready, "pod")?;
+
+        // A second restart, now past readiness. Same objects, and the same
+        // readiness instant: a moved `readyAt` would mean the runtime TTL
+        // restarted along with the operator, quietly handing the caller time
+        // they did not buy — or taking time they did.
+        harness(&[
+            "restart-operator",
+            "--wait-for-phase",
+            "ready",
+            "--lease",
+            &sandbox.id,
+            "--timeout",
+            "600",
+        ])
+        .await?;
+
+        let (_, after) = sandbox.status().await?;
+        anyhow::ensure!(
+            after["phase"] == "Ready",
+            "a restart moved a Ready lease to {}: {after}",
+            after["phase"]
+        );
+        anyhow::ensure!(
+            provenance_uid(&after, "sandboxClaim")? == claim,
+            "the resumed operator composed a second claim: {claim} then {after}"
+        );
+        anyhow::ensure!(
+            provenance_uid(&after, "pod")? == pod,
+            "the resumed operator landed on a different Pod: {pod} then {after}"
+        );
+        anyhow::ensure!(
+            after["readyAt"] == ready["readyAt"],
+            "readyAt moved across a restart ({} then {}); the runtime TTL restarted with the operator",
+            ready["readyAt"],
+            after["readyAt"]
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// A restart between a retry and its original still runs the command once.
+    ///
+    /// The reservation that makes two concurrent retries race for one object
+    /// lives in the cluster, so it must survive the process that wrote it. If
+    /// it does not, a client that retried across a Kobe restart runs its
+    /// command twice — and the commands people least want run twice are exactly
+    /// the ones they wrap in an idempotency key.
+    a_restart_between_a_retry_and_its_original_still_runs_it_once,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let marker = format!("/tmp/kobe-restart-{}", nonce(placement));
+        let script = format!("echo x >> {marker}");
+        let argv = ["/bin/sh", "-c", script.as_str()];
+        let key = "conformance-restart-idempotent";
+
+        let (_, first) = sandbox.exec(&argv, key).await?;
+        harness(&[
+            "restart-operator",
+            "--wait-for-phase",
+            "ready",
+            "--lease",
+            &sandbox.id,
+            "--timeout",
+            "600",
+        ])
+        .await?;
+        let (_, second) = sandbox.exec(&argv, key).await?;
+
+        anyhow::ensure!(
+            first["id"] == second["id"],
+            "a retry across a restart produced a second execution: {first} vs {second}"
+        );
+
+        // The side effect settles it. Two executions sharing an id would still
+        // be one spawn; two spawns sharing an id would not show up in the ids
+        // at all, and this is where they would.
+        let count_script = format!("wc -l < {marker}");
+        let (_, count) = sandbox
+            .exec(
+                &["/bin/sh", "-c", count_script.as_str()],
+                "conformance-restart-count",
+            )
+            .await?;
+        let lines: i64 = count["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(-1);
+        anyhow::ensure!(
+            lines == 1,
+            "the command ran {lines} times across a restart, expected exactly 1"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// A restart during teardown still settles the lease exactly once.
+    ///
+    /// Teardown is where a restart is most expensive to get wrong: a resumed
+    /// operator that forgets it was mid-release either strands the capacity or
+    /// declares it clean without proof. Neither is visible until somebody
+    /// counts a pool that no longer adds up.
+    a_restart_during_teardown_still_settles_the_lease_once,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        // Started BEFORE the release, not after. `Releasing` is a state the
+        // management path can pass through in well under a second, and a
+        // harness asked to wait for it afterwards would be waiting for
+        // something already gone.
+        let id = sandbox.id.clone();
+        let argv = [
+            "restart-operator",
+            "--wait-for-phase",
+            "teardown",
+            "--lease",
+            id.as_str(),
+            "--timeout",
+            "600",
+        ];
+        let (restarted, released) = tokio::join!(harness(&argv), sandbox.release());
+        released?;
+        restarted?;
+
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            let (status, body) = sandbox.status().await?;
+            if status.as_u16() == 404 {
+                return Ok(());
+            }
+            match body["phase"].as_str() {
+                Some("Released" | "Expired") => return Ok(()),
+                // A lease that was already mid-teardown when the operator
+                // restarted has proof available; withholding capacity here
+                // would mean the restart itself destroyed the evidence.
+                Some("Quarantined") => anyhow::bail!(
+                    "a restart during teardown quarantined a lease that had proof: {body}"
+                ),
+                _ => {}
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "a lease restarted mid-teardown never settled: {body}"
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+);
+
+both_placements!(
+    /// An unverifiable teardown withholds capacity instead of releasing it.
+    ///
+    /// The safe direction is the counter-intuitive one. An under-counted pool
+    /// is visible and an administrator can reconcile it; a Sandbox that was
+    /// quietly double-booked is visible to nobody, and the second tenant finds
+    /// out by sharing a workload with the first.
+    ///
+    /// Asserted by construction today: the code path is unit-tested with a
+    /// faked 403. What is not tested is that a real revocation produces one.
+    an_unverifiable_teardown_withholds_capacity_instead_of_releasing_it,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        // Revokes `get` — not `delete`. A revoked delete stalls in `Releasing`
+        // and retries forever, which is a clean failure; only a read the
+        // operator is not permitted to make is DURABLE uncertainty, and
+        // durable uncertainty is what quarantine exists for.
+        harness(&["inject-failure", "--kind", "teardown-unverifiable"]).await?;
+
+        let observed = quarantine_after_release(&mut sandbox).await;
+
+        // Both cleanups run whatever the assertion did. An injection left
+        // behind breaks every scenario after this one, and a quarantined lease
+        // holds a pool slot on purpose and has no exit through the API — the
+        // next scenario would queue behind capacity it cannot see and fail for
+        // a reason it does not assert.
+        let cleared = harness(&["clear-failure", "--kind", "teardown-unverifiable"]).await;
+        let reaped = harness(&["reap-lease", "--lease", &sandbox.id]).await;
+
+        observed?;
+        cleared?;
+        reaped?;
+        anyhow::Ok(())
+    }
+);
+
+both_placements!(
+    /// A keystroke typed on a real terminal reaches the workload.
+    ///
+    /// Framing, key encoding and URL derivation are unit-tested on both sides.
+    /// The round trip is not, and it is the only part a user experiences: an
+    /// attach that connects, renders output and swallows every keystroke
+    /// passes every existing test.
+    a_keystroke_typed_on_a_real_terminal_reaches_the_workload,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let token = nonce(placement);
+        // What is typed and what is expected are deliberately different
+        // strings. A pty echoes input, so an expectation matching the
+        // keystrokes would be satisfied by the terminal alone, without the
+        // workload ever seeing them. Only the shell's own concatenation
+        // produces the joined form.
+        let typed = format!("echo ko\"\"be-typed-{token}\\r");
+        let expected = format!("kobe-typed-{token}");
+
+        // A shell is started rather than attaching to whatever the pool
+        // declared: the pool's process is an administrator's choice and nothing
+        // promises it reads stdin, so attaching to it would make this scenario
+        // a test of that pool's configuration.
+        harness(&[
+            "attach-pty",
+            "--lease",
+            &sandbox.id,
+            "--send",
+            &typed,
+            "--expect",
+            &expected,
+            "--timeout",
+            "120",
+            "--",
+            "/bin/sh",
+        ])
+        .await?;
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// Ctrl-C reaches the workload rather than the client.
+    ///
+    /// Raw mode exists for this one keystroke. If it regressed, `kobe` would
+    /// die and the caller's process would keep running inside a sandbox they
+    /// can no longer see — the failure that costs the most and announces
+    /// itself the least.
+    ctrl_c_reaches_the_workload_rather_than_the_client,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let token = nonce(placement);
+        let marker = format!("echo ko\"\"be-interrupted-{token}\\r");
+        let expected = format!("kobe-interrupted-{token}");
+
+        // Three keystrokes, and only one outcome produces the marker. If
+        // Ctrl-C killed the client, the session is gone and nothing more is
+        // typed. If it never arrived, the shell is still sleeping and the
+        // marker waits behind it. It appears only when the interrupt was
+        // delivered to the process on the other end.
+        harness(&[
+            "attach-pty",
+            "--lease",
+            &sandbox.id,
+            "--send",
+            "sleep 300\\r",
+            "--send",
+            "\\x03",
+            "--send",
+            &marker,
+            "--expect",
+            &expected,
+            // Wider than the default gap between keystrokes, because the
+            // interrupt has to arrive while `sleep` is the foreground process.
+            // Sent too early it lands on the prompt, the shell shrugs, and the
+            // sleep then runs for its full five minutes — a pass turned into a
+            // timeout by a race the assertion never mentions.
+            "--send-delay",
+            "1000",
+            "--timeout",
+            "120",
+            "--",
+            "/bin/sh",
+        ])
+        .await?;
+
+        sandbox.release().await
+    }
+);
+
+/// Release a lease whose teardown cannot be proven, and hold it to quarantine.
+///
+/// Split out because the assertion has to run between the injection and its
+/// cleanup, and inlining it would put the `?` that skips the cleanup in the
+/// middle of the scenario.
+async fn quarantine_after_release(sandbox: &mut LeasedSandbox) -> anyhow::Result<()> {
+    sandbox.release().await?;
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (status, body) = sandbox.status().await?;
+        anyhow::ensure!(
+            status.as_u16() != 404,
+            "a lease whose teardown could not be proven was retired anyway"
+        );
+        match body["phase"].as_str() {
+            Some("Quarantined") => break,
+            // The failure this scenario exists to catch: capacity handed back
+            // on the strength of a teardown nothing confirmed.
+            Some(clean @ ("Released" | "Expired")) => anyhow::bail!(
+                "an unverifiable teardown reported {clean}, releasing capacity it could not prove free: {body}"
+            ),
+            _ => {}
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "an unverifiable teardown never settled either way: {body}"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    // Withheld, not merely marked. A quarantined lease that had dropped out of
+    // the caller's own listing would be holding a slot nobody can account for,
+    // which is the under-counting this phase exists to make visible.
+    let api = Api::as_caller(token());
+    let (_, listed) = api
+        .json(reqwest::Method::GET, "/v1/sandbox-leases", None)
+        .await?;
+    anyhow::ensure!(
+        listed.to_string().contains(&sandbox.id),
+        "a quarantined lease vanished from its holder's listing: {listed}"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod suite_shape {
     use super::*;
@@ -767,8 +1258,13 @@ mod suite_shape {
     #[test]
     fn no_scenario_is_declared_outside_the_dual_placement_macro() {
         let source = include_str!("sandbox_conformance.rs");
+        // Anchored to the start of a line. `"// Scenarios"` alone is also a
+        // substring of any doc comment beginning `/// Scenarios`, and writing
+        // one silently moved this marker forward — the guard then examined an
+        // empty span and reported an under-populated suite. A guard that can be
+        // relocated by prose is not a guard.
         let body = source
-            .split("// Scenarios")
+            .split("\n// Scenarios\n")
             .nth(1)
             .expect("the scenario section is marked");
         let scenarios = body.split("mod suite_shape").next().unwrap_or(body);
@@ -779,8 +1275,10 @@ mod suite_shape {
              which would run it against one placement only"
         );
         assert!(
-            scenarios.matches("both_placements!").count() >= 10,
-            "the #76 matrix expects at least ten dual-placement scenarios"
+            scenarios.matches("both_placements!").count() >= 17,
+            "the #76 matrix expects at least eleven dual-placement scenarios, plus the six \
+             #138 unlocked; a floor rather than an exact count, because the failure being \
+             guarded is deletion, not addition"
         );
     }
 }
