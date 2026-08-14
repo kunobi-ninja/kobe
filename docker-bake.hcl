@@ -35,12 +35,31 @@ variable "LOCAL_CACHE_ROOT" {
   default = ".tmp/buildx-cache"
 }
 
-# Generate tag array: latest, IMAGE_TAG, and rolling semver tags (v0.1.0, v0.1, v0)
+# Generate the tag array. Each tag means exactly ONE thing:
+#
+#   dev        moving; head of main (the `IMAGE_TAG` slot — also how a local
+#              `docker buildx bake` and the e2e harness name their builds)
+#   sha-<7>    immutable; the exact commit that produced the image
+#   latest     newest RELEASE
+#   vX.Y.Z     that release, immutable
+#   vX.Y / vX  newest release in that series
+#
+# `latest` is release-gated on purpose. It used to be emitted unconditionally,
+# which made it a second name for `dev`: every publish moved it, so it tracked
+# whatever last ran (main push, nightly, or a branch dispatch) rather than the
+# newest release. Anyone pulling `latest` expecting a released build silently
+# got main — or worse, an unmerged branch.
+#
+# `IMAGE_TAG` is dropped when empty so a release run publishes ONLY the release
+# tags and leaves `dev` pointing where it was; `dev` advances on the next push
+# to main. Empty is checked rather than assumed because `"${REGISTRY}/${name}:"`
+# is a malformed tag, not an empty string, so `compact` would not remove it.
 function "tags" {
   params = [name]
   result = compact([
-    "${REGISTRY}/${name}:latest",
-    "${REGISTRY}/${name}:${IMAGE_TAG}",
+    notequal(IMAGE_TAG, "") ? "${REGISTRY}/${name}:${IMAGE_TAG}" : "",
+    notequal(BUILD_COMMIT, "unknown") ? "${REGISTRY}/${name}:sha-${substr(BUILD_COMMIT, 0, 7)}" : "",
+    notequal(VERSION, "0.0.0") ? "${REGISTRY}/${name}:latest" : "",
     notequal(VERSION, "0.0.0") ? "${REGISTRY}/${name}:v${VERSION}" : "",
     notequal(VERSION, "0.0.0") ? "${REGISTRY}/${name}:v${split(".", VERSION)[0]}.${split(".", VERSION)[1]}" : "",
     notequal(VERSION, "0.0.0") ? "${REGISTRY}/${name}:v${split(".", VERSION)[0]}" : "",
