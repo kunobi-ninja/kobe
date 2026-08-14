@@ -18,6 +18,7 @@ use crate::crd::{
     LeaseBinding, LeasePhase, ResourceRef, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
 };
 use crate::diagnostics;
+use crate::lease_binding::BindingResolutionError;
 use crate::pool::{PoolState, parse_duration};
 
 /// Shared state for the lease controller.
@@ -525,6 +526,49 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             .await
             {
                 Ok(resolved) => resolved,
+                // A terminal lease that names NOTHING — no binding and no
+                // clusterName — never held capacity: it expired while still
+                // queued. There is nothing to recycle, nothing to quarantine,
+                // and no receipt to preserve, and no amount of retrying will
+                // make a binding appear. Retire it.
+                //
+                // Before #150 this fell into the arm below and requeued every
+                // 30s forever: 75 such leases on int-pro re-reconciled for two
+                // days straight, and every future one joined them permanently.
+                // Access is already revoked here — the connect-token Secret is
+                // deleted above, before this point.
+                //
+                // `clusterName` without a binding is deliberately NOT retired.
+                // That is the legacy pre-UID-fence shape (a controller that
+                // crashed after writing only the name), so an instance may still
+                // exist under that name and this lease is the sole pointer to
+                // it. Same reasoning as `backfill_legacy_binding`: a bare name
+                // is never promoted to authority, and it is not discarded
+                // either.
+                //
+                // Likewise ONLY `binding_missing` is terminal. Every mismatch
+                // code (uid / provenance / reciprocal / malformed / …) means an
+                // instance may exist in an inconsistent state, and lookup
+                // failures are transient. Both still fall through to the arm
+                // below and wait.
+                Err(BindingResolutionError::BindingMissing)
+                    if status.cluster_name.is_none()
+                        && !teardown_receipt_unconsumed(&lease, &status) =>
+                {
+                    info!(
+                        lease = %name,
+                        phase = %phase,
+                        "Retiring terminal lease: no binding was ever recorded"
+                    );
+                    crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+                        .with_label_values(&[
+                            lease.spec.pool_ref.as_str(),
+                            phase.to_string().as_str(),
+                        ])
+                        .inc();
+                    delete_lease_crd(&leases_api, &lease).await;
+                    return Ok(Action::await_change());
+                }
                 Err(err) => {
                     mark_binding_unverified(&leases_api, &lease, err.reason_code()).await?;
                     return Ok(Action::requeue(std::time::Duration::from_secs(30)));
@@ -654,22 +698,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     return Ok(Action::requeue(std::time::Duration::from_secs(300)));
                 }
                 info!(lease = %name, "Recycling complete, deleting lease CRD");
-                let delete_params = DeleteParams {
-                    preconditions: Some(Preconditions {
-                        uid: lease.metadata.uid.clone(),
-                        resource_version: lease.resource_version(),
-                    }),
-                    ..Default::default()
-                };
-                match leases_api.delete(&name, &delete_params).await {
-                    Ok(_) => {}
-                    Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                        // Already deleted, that's fine
-                    }
-                    Err(e) => {
-                        warn!(lease = %name, "Failed to delete recycled lease CRD: {e}");
-                    }
-                }
+                delete_lease_crd(&leases_api, &lease).await;
                 Ok(Action::await_change())
             } else {
                 debug!(lease = %name, "Lease in recycling phase, waiting for cluster cleanup");
@@ -905,11 +934,68 @@ async fn finalize_binding<B: ClusterBackend>(
     Ok(())
 }
 
+/// Message stamped on a lease whose binding could not be verified.
+const BINDING_UNVERIFIED_MESSAGE: &str =
+    "binding unverified; access revoked; recycle/quarantine required";
+
+/// Delete a lease CRD, fenced on the exact object we just read.
+///
+/// The uid + resourceVersion preconditions mean a same-named replacement or a
+/// concurrently-modified lease is never the thing deleted. A 404 is success:
+/// something else already removed it.
+async fn delete_lease_crd(leases_api: &Api<ClusterLease>, lease: &ClusterLease) {
+    let name = lease.name_any();
+    let delete_params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: lease.metadata.uid.clone(),
+            resource_version: lease.resource_version(),
+        }),
+        ..Default::default()
+    };
+    match leases_api.delete(&name, &delete_params).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            // Already deleted, that's fine
+        }
+        Err(e) => {
+            warn!(lease = %name, "Failed to delete lease CRD: {e}");
+        }
+    }
+}
+
+/// True when a terminal lease still owes someone its teardown receipt.
+///
+/// Mirrors the retention rule the Recycling arm applies: a receipt is the only
+/// durable proof that capacity was destroyed, so it outlives the lease until a
+/// consumer acknowledges it.
+fn teardown_receipt_unconsumed(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
+    status.teardown_receipt.is_some()
+        && !lease
+            .annotations()
+            .contains_key(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+}
+
 async fn mark_binding_unverified(
     leases_api: &Api<ClusterLease>,
     lease: &ClusterLease,
     reason: &'static str,
 ) -> Result<(), LeaseError> {
+    // Already stamped: the state is unchanged, so re-sending the identical
+    // message buys nothing and re-warning drowns the signal. This WARN marks a
+    // real safety condition (binding unverified => access revoked), and it is
+    // only legible if it fires on the transition rather than on every requeue.
+    // #150: 75 leases repeating it every 30s made up ~98% of operator WARN/ERROR
+    // output, hiding any genuine occurrence.
+    if lease
+        .status
+        .as_ref()
+        .and_then(|s| s.message.as_deref())
+        .is_some_and(|m| m == BINDING_UNVERIFIED_MESSAGE)
+    {
+        debug!(lease = %lease.name_any(), reason, "Lease binding is still unavailable");
+        return Ok(());
+    }
+
     let uid = lease
         .metadata
         .uid
@@ -921,7 +1007,7 @@ async fn mark_binding_unverified(
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "add", "path": "/status/message", "value": "binding unverified; access revoked; recycle/quarantine required" }
+        { "op": "add", "path": "/status/message", "value": BINDING_UNVERIFIED_MESSAGE }
     ]));
     match leases_api
         .patch_status(
@@ -3012,6 +3098,159 @@ mod tests {
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(30)));
         let calls = ctx.backend.call_count();
         assert_eq!(calls.delete, 0);
+    }
+
+    /// Build an Expired lease that names nothing: no binding, no clusterName.
+    ///
+    /// This is the shape that accumulated on int-pro (#150) — a lease whose TTL
+    /// ran out while it was still sitting in the queue, so it never held
+    /// capacity.
+    fn make_never_bound_expired_lease(name: &str) -> Arc<ClusterLease> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "uid": format!("{name}-uid"),
+                    "resourceVersion": "10"
+                },
+                "spec": {
+                    "poolRef": "test-profile",
+                    "ttl": "1h",
+                    "requester": { "type": "test:admin", "identity": "user@test.com" },
+                    "priority": 50
+                },
+                "status": {
+                    "phase": "Expired",
+                    "queuePosition": 2,
+                    "extensionsCount": 0,
+                    "maxExtensions": 2,
+                    "message": BINDING_UNVERIFIED_MESSAGE
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A lease that expired while still queued must be retired, not retried
+    /// forever.
+    ///
+    /// It never held capacity: no binding was recorded and no clusterName was
+    /// ever written, so there is no instance to recycle and none to quarantine.
+    /// Before #150 this returned `requeue(30s)` unconditionally, so every such
+    /// lease re-reconciled every 30 seconds for as long as the cluster lived —
+    /// 75 of them on int-pro, for two days, emitting ~216k WARN lines/day and
+    /// drowning the genuine `binding_missing` signal this same message carries
+    /// for live leases.
+    ///
+    /// Asserting `await_change()` rather than any requeue duration is the point:
+    /// the object is gone, so there is nothing left to come back to.
+    #[tokio::test]
+    async fn expired_lease_that_never_bound_is_retired_not_retried() {
+        let (ctx, server) = test_lease_context().await;
+        let lease = make_never_bound_expired_lease("never-bound-1");
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/never-bound-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+
+        // The connect-token Secret lookup happens before binding resolution.
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/never-bound-1-connect-token",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        // The lease CRD itself is deleted — this is the assertion that fails
+        // against the pre-#150 code, which only ever patched status.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/never-bound-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
+        assert_eq!(
+            action,
+            Action::await_change(),
+            "a retired lease must not be requeued — the object no longer exists"
+        );
+        assert_eq!(ctx.backend.call_count().delete, 0);
+    }
+
+    /// Retirement must be reachable ONLY when the lease names nothing.
+    ///
+    /// A terminal lease carrying `clusterName` but no binding is the legacy
+    /// pre-UID-fence shape: a controller may have crashed after writing just the
+    /// name, so an instance may still exist under it and this lease is the only
+    /// pointer to it. Deleting it would discard the sole record of capacity that
+    /// might still be running — the same reasoning that stops
+    /// `backfill_legacy_binding` promoting a bare name to authority.
+    ///
+    /// This is the guard on #150's fix: it must not widen into "no binding
+    /// resolved ⇒ delete".
+    #[tokio::test]
+    async fn terminal_lease_naming_a_cluster_is_never_retired() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = make_never_bound_expired_lease("legacy-named-1");
+        {
+            let lease = Arc::make_mut(&mut lease);
+            let status = lease.status.as_mut().expect("fixture has status");
+            status.cluster_name = Some("pool-test-1".to_string());
+            // Not yet stamped, so the mark path does its one write.
+            status.message = None;
+        }
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/legacy-named-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/legacy-named-1-connect-token",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/legacy-named-1/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
+
+        // No DELETE is mounted: if the fix ever widens to cover this case, the
+        // unmatched request fails the test rather than silently passing.
+        let action = reconcile_lease(lease, ctx.clone()).await.unwrap();
+        assert_eq!(
+            action,
+            Action::requeue(std::time::Duration::from_secs(30)),
+            "a lease naming a cluster must keep waiting for a human, not be deleted"
+        );
+        assert_eq!(ctx.backend.call_count().delete, 0);
     }
 
     /// Recycling must survive the generation bump that deletion itself causes.
