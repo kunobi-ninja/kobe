@@ -183,6 +183,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # Asserts what each tag MEANS (latest = newest release, dev = head of
+      # main, sha-<7> = that commit) by resolving `bake --print` under all three
+      # publish shapes. Resolution only — no build, no push — so it is seconds,
+      # and it runs on PRs where `publish` never does: the one place a tagging
+      # regression can still be caught before it reaches the registry.
+      - name: Verify image tag semantics
+        run: ./scripts/test-tag-semantics.sh
+
       - name: Build all images (dry-run, no cache)
         run: docker buildx bake -f docker-bake.hcl --set '*.cache-from='
 
@@ -319,9 +327,20 @@ jobs:
     # push on version-consistency too, so a tag that disagrees with the manifest
     # can't ship images while release-cli + crates are blocked. On push-to-main
     # (where version-consistency is skipped) keep publishing as before.
+    #
+    # The REF gate is load-bearing: this job used to key only off
+    # `event_name != 'pull_request'`, so `workflow_dispatch` on ANY branch
+    # published from that branch. Dispatch is the documented way to exercise
+    # conformance (which never runs on pull_request) before merging a backend
+    # change — so validating a branch silently republished the shared tags from
+    # unmerged code. Validation and publication are now separate concerns:
+    # dispatch a branch to test it, and only main / a release tag ships.
+    # Dispatch on main still publishes, which is the remedy for tags left
+    # pointing somewhere wrong.
     needs: [checks, version-consistency]
     if: >-
       ${{ always() && github.event_name != 'pull_request'
+          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
           && needs.checks.result == 'success'
           && (!startsWith(github.ref, 'refs/tags/v') || needs['version-consistency'].result == 'success') }}
     runs-on: kunobi-runners
@@ -347,6 +366,11 @@ jobs:
       - name: Build and push
         env:
           VERSION: ${{ steps.version.outputs.version || '0.0.0' }}
+          # `dev` means head of main, so only a main build claims it. A release
+          # run sends IMAGE_TAG empty and publishes latest + the semver tags
+          # alone (see the `tags` function in docker-bake.hcl), leaving `dev`
+          # where it was until main next moves.
+          IMAGE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && '' || 'dev' }}
           BUILD_VERSION: ${{ github.ref_name || 'dev' }}
           BUILD_COMMIT: ${{ github.sha }}
         run: docker buildx bake -f docker-bake.hcl push
