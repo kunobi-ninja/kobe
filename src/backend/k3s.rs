@@ -146,6 +146,65 @@ sleep infinity
 /// (https://docs.k3s.io/installation/private-registry)
 const REGISTRIES_YAML_PATH: &str = "/etc/rancher/k3s/registries.yaml";
 
+/// Path every k3s node keeps its cleartext node password at.
+///
+/// k3s hashes this value into a `<nodename>.node-password.k3s` Secret in the
+/// guest's `kube-system` on first registration and re-checks it on every
+/// subsequent one. The path is fixed in k3s (`nodePasswordRoot = "/"` for
+/// non-rootless nodes; see `pkg/agent/config/config.go`) and is NOT under the
+/// data dir — which is exactly what makes #145 possible.
+const NODE_PASSWORD_PATH: &str = "/etc/rancher/node/password";
+
+/// Key under which the per-cluster node password lives in `{cluster}-token`.
+const NODE_PASSWORD_KEY: &str = "node-password";
+
+/// Volume carrying the pinned node password into a k3s pod.
+///
+/// Reuses the cluster's `{name}-token` Secret (already create-once and
+/// preserved across recreation) but projects ONLY the node-password key, so
+/// the token mount at `/var/lib/k3s/token` stays single-purpose.
+fn node_password_volume(name: &str) -> Volume {
+    Volume {
+        name: NODE_PASSWORD_KEY.to_string(),
+        secret: Some(SecretVolumeSource {
+            secret_name: Some(format!("{name}-token")),
+            items: Some(vec![KeyToPath {
+                key: NODE_PASSWORD_KEY.to_string(),
+                path: NODE_PASSWORD_KEY.to_string(),
+                // k3s writes it 0600; match that rather than the 0644 default.
+                mode: Some(0o400),
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Mount that pins `/etc/rancher/node/password` to the cluster's Secret.
+///
+/// LOAD-BEARING (#145). k3s generates this password on first boot and writes it
+/// to a path in the container's overlay rw layer, while the datastore holding
+/// its hash lives on the `data` volume (emptyDir → survives container restarts;
+/// PVC → survives reschedules). A container restart therefore discards the
+/// password but NOT the hash, so the restarted server re-registers its own node
+/// with a fresh random password, k3s reports
+/// `NodePasswordValidationFailed: hash does not match`, and the node never
+/// registers again — one transient restart permanently bricks the cluster.
+/// Sourcing the password from the Secret makes its lifetime that of the
+/// ClusterInstance, so it can never be younger than the datastore.
+///
+/// `read_only` is safe: k3s reads this file when it exists and only writes when
+/// it does not (`ensureNodePassword`).
+fn node_password_mount() -> VolumeMount {
+    VolumeMount {
+        name: NODE_PASSWORD_KEY.to_string(),
+        mount_path: NODE_PASSWORD_PATH.to_string(),
+        sub_path: Some(NODE_PASSWORD_KEY.to_string()),
+        read_only: Some(true),
+        ..Default::default()
+    }
+}
+
 /// True iff the ClusterConfig declares a non-empty registry_mirrors map.
 fn has_registry_mirrors(config: &ClusterConfig) -> bool {
     config
@@ -540,6 +599,18 @@ impl K3sBackend {
         hex::encode(bytes)
     }
 
+    /// Generate a node password in k3s's own format: 16 random bytes, hex.
+    ///
+    /// Matches `ensureNodePassword` in k3s (`pkg/agent/config/config.go`) so a
+    /// pinned password is indistinguishable from one k3s would have rolled
+    /// itself.
+    fn generate_node_password() -> String {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
+        hex::encode(bytes)
+    }
+
     /// Validate that a persisted node-token Secret is usable.
     fn validate_token_secret(secret: &Secret, secret_name: &str) -> Result<()> {
         secret
@@ -551,6 +622,20 @@ impl K3sBackend {
                 format!("Token secret {secret_name} is missing non-empty data.token")
             })?;
         Ok(())
+    }
+
+    /// True iff the Secret already carries a non-empty node password.
+    ///
+    /// Unlike `token`, a missing node password is repairable in place (see
+    /// `ensure_node_password`) — pods mount it via `subPath`, and a subPath
+    /// naming an absent key strands the pod in `ContainerCreating` forever, so
+    /// the key MUST exist before any workload is applied.
+    fn secret_has_node_password(secret: &Secret) -> bool {
+        secret
+            .data
+            .as_ref()
+            .and_then(|data| data.get(NODE_PASSWORD_KEY))
+            .is_some_and(|value| !value.0.is_empty())
     }
 
     /// Standard labels for resources belonging to a cluster.
@@ -589,10 +674,18 @@ impl K3sBackend {
 
     /// Ensure the token Secret for k3s node authentication exists.
     ///
-    /// The Secret is create-once: an existing non-empty `data.token` is never
-    /// patched or replaced because a running server may have persisted its
-    /// original token. Creation uses POST, and a concurrent creator winning the
-    /// race is read back and validated.
+    /// The Secret carries two create-once values:
+    ///   - `token`: the cluster join token. An existing non-empty `data.token`
+    ///     is never patched or replaced because a running server may have
+    ///     persisted its original token.
+    ///   - `node-password`: the per-cluster node password mounted at
+    ///     [`NODE_PASSWORD_PATH`] (see [`node_password_mount`] for why).
+    ///
+    /// Creation uses POST, and a concurrent creator winning the race is read
+    /// back and validated. A Secret predating the node-password key (created by
+    /// an operator older than #145) is repaired in place rather than left
+    /// keyless — pods mount that key via `subPath`, and a subPath naming an
+    /// absent key wedges the pod in `ContainerCreating`.
     async fn create_token_secret(&self, name: &str, namespace: &str) -> Result<()> {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-token");
@@ -601,7 +694,9 @@ impl K3sBackend {
             Ok(existing) => {
                 Self::validate_token_secret(&existing, &secret_name)?;
                 debug!(cluster = name, "Token secret already exists; preserving it");
-                return Ok(());
+                return self
+                    .ensure_node_password(&secrets, &existing, name, &secret_name)
+                    .await;
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
             Err(e) => {
@@ -611,6 +706,7 @@ impl K3sBackend {
         }
 
         let token = Self::generate_token();
+        let node_password = Self::generate_node_password();
         let secret = Secret {
             metadata: ObjectMeta {
                 name: Some(secret_name.clone()),
@@ -621,6 +717,7 @@ impl K3sBackend {
             string_data: Some({
                 let mut data = BTreeMap::new();
                 data.insert("token".to_string(), token);
+                data.insert(NODE_PASSWORD_KEY.to_string(), node_password);
                 data
             }),
             ..Default::default()
@@ -637,6 +734,9 @@ impl K3sBackend {
                     cluster = name,
                     "Concurrent token secret creator won; preserving it"
                 );
+                return self
+                    .ensure_node_password(&secrets, &winner, name, &secret_name)
+                    .await;
             }
             Err(e) => {
                 return Err(e)
@@ -645,6 +745,66 @@ impl K3sBackend {
         }
 
         Ok(())
+    }
+
+    /// Backfill `node-password` into a token Secret that predates it.
+    ///
+    /// No-op when the key is already present — the password must be create-once
+    /// for the same reason the token is: rewriting it would invalidate the hash
+    /// the guest datastore already holds, reproducing #145 by hand.
+    ///
+    /// The merge patch pins `metadata.resourceVersion`, so two operators racing
+    /// to backfill cannot both win and leave a node holding the loser's value:
+    /// the loser gets a 409 and re-reads. A conflict is NOT fatal here — the
+    /// winner's key is equally valid, so we only verify one landed.
+    async fn ensure_node_password(
+        &self,
+        secrets: &Api<Secret>,
+        existing: &Secret,
+        name: &str,
+        secret_name: &str,
+    ) -> Result<()> {
+        if Self::secret_has_node_password(existing) {
+            return Ok(());
+        }
+
+        let resource_version = existing.metadata.resource_version.as_deref();
+        let patch = serde_json::json!({
+            "metadata": { "resourceVersion": resource_version },
+            "stringData": { NODE_PASSWORD_KEY: Self::generate_node_password() },
+        });
+
+        match secrets
+            .patch(secret_name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    cluster = name,
+                    "Backfilled node password into pre-existing token secret"
+                );
+                Ok(())
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                let winner = secrets.get(secret_name).await.with_context(|| {
+                    format!("Failed to re-read token secret {secret_name} after backfill conflict")
+                })?;
+                if Self::secret_has_node_password(&winner) {
+                    debug!(
+                        cluster = name,
+                        "Concurrent node-password backfill won; preserving it"
+                    );
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Token secret {secret_name} still has no {NODE_PASSWORD_KEY} after backfill conflict"
+                    ))
+                }
+            }
+            Err(e) => Err(e).with_context(|| {
+                format!("Failed to backfill {NODE_PASSWORD_KEY} into token secret {secret_name}")
+            }),
+        }
     }
 
     /// Create the ConfigMap containing the kubeconfig publisher script.
@@ -804,6 +964,9 @@ impl K3sBackend {
                 read_only: Some(true),
                 ..Default::default()
             },
+            // Pinned node password (#145) — without it a single container
+            // restart permanently breaks node registration.
+            node_password_mount(),
             VolumeMount {
                 name: "output".to_string(),
                 mount_path: "/output".to_string(),
@@ -998,6 +1161,8 @@ impl K3sBackend {
                 }),
                 ..Default::default()
             },
+            // Pinned node password, projected from the same Secret (#145).
+            node_password_volume(name),
             // Shared output volume (kubeconfig exchange between server and sidecar)
             Volume {
                 name: "output".to_string(),
@@ -1328,6 +1493,10 @@ impl K3sBackend {
                 read_only: Some(true),
                 ..Default::default()
             },
+            // Pinned node password, same rationale as the server (#145). An
+            // agent pod keeps its node name for its whole life, so a restarted
+            // agent container hits the identical hash mismatch.
+            node_password_mount(),
             // k3s data dir on an emptyDir, same rationale as the server (see
             // `build_server_container`): the agent's nested containerd needs a
             // real node filesystem, and its state must survive container
@@ -1409,6 +1578,7 @@ impl K3sBackend {
                 }),
                 ..Default::default()
             },
+            node_password_volume(name),
             // Agents are stateless across pod replacement — emptyDir is
             // always the right backing here (no PVC variant like the server).
             Volume {
@@ -2871,6 +3041,110 @@ mod tests {
         );
     }
 
+    /// Assert a pod spec pins `/etc/rancher/node/password` to the cluster's
+    /// token Secret. Shared by the server and agent cases (#145) — both run a
+    /// kubelet that registers a node, so both brick identically without it.
+    fn assert_node_password_pinned(pod_spec: &PodSpec, container: &Container, cluster: &str) {
+        let mount = container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.mount_path == NODE_PASSWORD_PATH)
+            .unwrap_or_else(|| panic!("{} must mount the node password", container.name));
+        assert_eq!(mount.name, NODE_PASSWORD_KEY);
+        assert_eq!(mount.sub_path.as_deref(), Some(NODE_PASSWORD_KEY));
+        assert_eq!(
+            mount.read_only,
+            Some(true),
+            "k3s only reads an existing password file; nothing may rewrite it"
+        );
+
+        let volume = pod_spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == NODE_PASSWORD_KEY)
+            .expect("pod must carry the node-password volume");
+        let secret = volume.secret.as_ref().unwrap();
+        assert_eq!(
+            secret.secret_name.as_deref(),
+            Some(format!("{cluster}-token").as_str()),
+            "the password rides the create-once token Secret, so it outlives every pod"
+        );
+        let items = secret.items.as_ref().expect("must project a single key");
+        assert_eq!(items.len(), 1, "the token itself must not leak into /etc");
+        assert_eq!(items[0].key, NODE_PASSWORD_KEY);
+        assert_eq!(items[0].path, NODE_PASSWORD_KEY);
+    }
+
+    #[test]
+    fn test_server_pins_node_password_to_token_secret() {
+        let config = base_config();
+        let sts = K3sBackend::build_server_statefulset("my-cluster", "ns", &config, None, 1);
+        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        let server = &pod_spec.containers[0];
+        assert_eq!(server.name, "k3s-server");
+        assert_node_password_pinned(pod_spec, server, "my-cluster");
+    }
+
+    #[test]
+    fn test_agent_pins_node_password_to_token_secret() {
+        let config = base_config();
+        let deploy = K3sBackend::build_agent_deployment("my-cluster", "ns", &config, 2);
+        let pod_spec = deploy
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap();
+        assert_node_password_pinned(pod_spec, &pod_spec.containers[0], "my-cluster");
+    }
+
+    /// The password must NOT ride the data volume: with persistence the data
+    /// volume comes from a claim template, and with an external datastore it is
+    /// an emptyDir the datastore outlives. Only the Secret has a lifetime that
+    /// is never shorter than the datastore's under every combination.
+    #[test]
+    fn test_node_password_survives_persistence_modes() {
+        for persistence in [
+            None,
+            Some(PersistenceConfig {
+                storage_type: Some("dynamic".to_string()),
+                storage_class_name: Some("local-path".to_string()),
+                storage_request_size: Some("20Gi".to_string()),
+            }),
+        ] {
+            let mut config = base_config();
+            config.persistence = persistence;
+            let sts = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
+            let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+            assert_node_password_pinned(pod_spec, &pod_spec.containers[0], "c");
+        }
+    }
+
+    /// The publisher sidecar runs no kubelet and registers no node — it has no
+    /// business holding the node password.
+    #[test]
+    fn test_publisher_sidecar_has_no_node_password() {
+        let config = base_config();
+        let sts = K3sBackend::build_server_statefulset("my-cluster", "ns", &config, None, 1);
+        let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        let sidecar = &pod_spec.containers[1];
+        assert_eq!(sidecar.name, PUBLISHER_CONTAINER);
+        assert!(
+            sidecar
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|m| m.mount_path != NODE_PASSWORD_PATH)
+        );
+    }
+
     #[test]
     fn test_build_service_clusterip() {
         let config = base_config();
@@ -3538,11 +3812,38 @@ mod tests {
         assert!(backend.supports_verified_destroy());
     }
 
+    /// A fully-formed token Secret: join token AND node password, as every
+    /// Secret written since #145 carries.
     fn token_secret_response(name: &str, namespace: &str, token: &[u8]) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
-            "metadata": { "name": name, "namespace": namespace },
+            "metadata": { "name": name, "namespace": namespace, "resourceVersion": "1" },
+            "data": {
+                "token": base64::engine::general_purpose::STANDARD.encode(token),
+                NODE_PASSWORD_KEY: base64::engine::general_purpose::STANDARD
+                    .encode(b"0123456789abcdef0123456789abcdef"),
+            }
+        })
+    }
+
+    /// A token Secret as an operator OLDER than #145 wrote it: join token only,
+    /// no node password. Mounting `NODE_PASSWORD_KEY` via subPath against this
+    /// would wedge the pod, so `create_token_secret` must backfill it.
+    fn legacy_token_secret_response(
+        name: &str,
+        namespace: &str,
+        token: &[u8],
+        resource_version: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "resourceVersion": resource_version,
+            },
             "data": {
                 "token": base64::engine::general_purpose::STANDARD.encode(token)
             }
@@ -3703,6 +4004,185 @@ mod tests {
             .create_token_secret("test-cluster", "test-ns")
             .await
             .unwrap();
+    }
+
+    /// The node password must be minted alongside the token, in k3s's own
+    /// format (16 random bytes, hex) — see `ensureNodePassword` upstream.
+    #[tokio::test]
+    async fn create_token_secret_mints_a_node_password() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let recorder = Arc::clone(&seen);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "test-cluster-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/secrets"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("Secret request must be JSON");
+                *recorder.lock().unwrap() = body["stringData"][NODE_PASSWORD_KEY]
+                    .as_str()
+                    .map(str::to_string);
+                ResponseTemplate::new(201)
+                    .set_body_json(secret_response("test-cluster-token", "test-ns"))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        backend
+            .create_token_secret("test-cluster", "test-ns")
+            .await
+            .unwrap();
+
+        let password = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("created Secret must carry a node password");
+        assert_eq!(
+            password.len(),
+            32,
+            "k3s mints 16 random bytes hex-encoded: {password}"
+        );
+        assert!(
+            password.chars().all(|c| c.is_ascii_hexdigit()),
+            "node password must be hex: {password}"
+        );
+    }
+
+    /// A Secret written before #145 has no node password. Leaving it that way
+    /// would strand every pod in ContainerCreating (subPath on an absent key),
+    /// so it is repaired in place — under a resourceVersion precondition, so a
+    /// racing operator cannot overwrite a value a node may already hold.
+    #[tokio::test]
+    async fn create_token_secret_backfills_node_password_into_legacy_secret() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let patch_body = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let recorder = Arc::clone(&patch_body);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(legacy_token_secret_response(
+                    "test-cluster-token",
+                    "test-ns",
+                    b"legacy-token",
+                    "4242",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                *recorder.lock().unwrap() =
+                    Some(serde_json::from_slice(&request.body).expect("patch body must be JSON"));
+                ResponseTemplate::new(200).set_body_json(token_secret_response(
+                    "test-cluster-token",
+                    "test-ns",
+                    b"legacy-token",
+                ))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        backend
+            .create_token_secret("test-cluster", "test-ns")
+            .await
+            .unwrap();
+
+        let body = patch_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a keyless Secret must be patched");
+        assert_eq!(
+            body["metadata"]["resourceVersion"].as_str(),
+            Some("4242"),
+            "backfill must be guarded by the observed resourceVersion: {body}"
+        );
+        assert_eq!(
+            body["stringData"][NODE_PASSWORD_KEY].as_str().map(str::len),
+            Some(32),
+            "backfill must write a k3s-format node password: {body}"
+        );
+        assert!(
+            body["stringData"]["token"].is_null(),
+            "backfill must never rewrite the join token: {body}"
+        );
+    }
+
+    /// A Secret that already has the key is left strictly alone: rewriting the
+    /// password would invalidate the hash the guest datastore already holds —
+    /// which is precisely the #145 failure, self-inflicted.
+    #[tokio::test]
+    async fn create_token_secret_never_rotates_an_existing_node_password() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/test-cluster-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(token_secret_response(
+                    "test-cluster-token",
+                    "test-ns",
+                    b"existing-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No PATCH mock is mounted: any write at all fails the test.
+
+        backend
+            .create_token_secret("test-cluster", "test-ns")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn secret_has_node_password_rejects_missing_and_empty() {
+        let empty = Secret {
+            data: Some(BTreeMap::from([(
+                NODE_PASSWORD_KEY.to_string(),
+                k8s_openapi::ByteString(Vec::new()),
+            )])),
+            ..Default::default()
+        };
+        assert!(!K3sBackend::secret_has_node_password(&empty));
+        assert!(!K3sBackend::secret_has_node_password(&Secret::default()));
+
+        let present = Secret {
+            data: Some(BTreeMap::from([(
+                NODE_PASSWORD_KEY.to_string(),
+                k8s_openapi::ByteString(b"deadbeef".to_vec()),
+            )])),
+            ..Default::default()
+        };
+        assert!(K3sBackend::secret_has_node_password(&present));
     }
 
     #[test]
