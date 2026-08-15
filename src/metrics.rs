@@ -855,6 +855,22 @@ pub static INSTANCE_STUCK_CREATING_TOTAL: LazyLock<IntCounterVec> = LazyLock::ne
     .unwrap()
 });
 
+/// Terminal leases retired because they carried no binding at all (#150).
+///
+/// A lease that expires while still queued never held capacity, so there is
+/// nothing to recycle and nothing to quarantine — it is simply deleted. This
+/// counter is the signal that the retirement path is firing: before #150 such
+/// leases accumulated forever, each re-reconciling every 30s, so a jump here on
+/// upgrade is the backlog draining rather than anything going wrong.
+pub static LEASES_RETIRED_UNBOUND_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "kobe_leases_retired_unbound_total",
+        "Terminal leases deleted because no binding was ever recorded, by phase",
+        &["profile", "phase"]
+    )
+    .unwrap()
+});
+
 /// Guest-cluster pod OOM-kills observed by the KobeStore health controller.
 /// Keyed by the bounded [`GuestPodRole`] so a server-vs-kine OOM is
 /// distinguishable without per-pod cardinality.
