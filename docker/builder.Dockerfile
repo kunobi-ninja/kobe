@@ -34,6 +34,13 @@ FROM deps AS build
 
 ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
+# Read by build.rs and baked into the binaries, so a running process can state
+# which commit it was built from. Set here in the `build` stage rather than in
+# `deps`: the layer below is invalidated by `COPY . .` on every commit anyway,
+# so a per-commit ENV costs no extra cache — while putting it in `deps` would
+# rebuild every dependency on each commit.
+ARG BUILD_COMMIT=unknown
+ENV BUILD_COMMIT=${BUILD_COMMIT}
 
 COPY . .
 # Operator-side binaries only (the `kobe` CLI lives in the kobectl member and is

@@ -88,6 +88,7 @@ target "builder" {
   cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/builder,mode=max"]
   args = {
     BUILD_VERSION = BUILD_VERSION
+    BUILD_COMMIT  = BUILD_COMMIT
   }
 }
 
