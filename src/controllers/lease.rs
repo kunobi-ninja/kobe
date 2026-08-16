@@ -1540,8 +1540,38 @@ fn instance_matches_binding_subject(instance: &ClusterInstance, binding: &LeaseB
             })
 }
 
+/// True when an API error means "someone else wrote first", not "this request
+/// was wrong".
+///
+/// Every fenced write in this repo is a JSON Patch whose leading `test` ops
+/// assert the uid and resourceVersion we read. The apiserver reports the two
+/// ways that fence can lose differently:
+///
+///   - **409 Conflict** — a failed `Preconditions` check (fenced delete/replace).
+///     Unambiguous: 409 only ever means a concurrent modification.
+///   - **422 Invalid** — a failed `test` op. Shares its status code with genuine
+///     request validation, which is why the code alone is not enough.
+///
+/// A 422 is only treated as a lost race when it carries **no field-level
+/// causes**. A failed `test` op yields the generic "the server rejected our
+/// request due to an error in our request" with `details.causes` empty; a real
+/// validation failure (schema violation, bad field) populates `causes` with the
+/// offending paths. Blanket-matching 422 would swallow that second class
+/// entirely and requeue forever against a request that can never succeed —
+/// the same silent-infinite-retry shape as #150. So when in doubt, this returns
+/// false and the error stays loud.
 pub(crate) fn optimistic_conflict(err: &kube::Error) -> bool {
-    matches!(err, kube::Error::Api(response) if response.code == 409 || response.code == 422)
+    let kube::Error::Api(response) = err else {
+        return false;
+    };
+    match response.code {
+        409 => true,
+        422 => response
+            .details
+            .as_ref()
+            .is_none_or(|details| details.causes.is_empty()),
+        _ => false,
+    }
 }
 
 pub(crate) fn json_patch(value: serde_json::Value) -> json_patch::Patch {
@@ -1904,6 +1934,74 @@ mod tests {
     use crate::testutil::MockBackend;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // -----------------------------------------------------------------------
+    // optimistic_conflict — which API failures mean "someone wrote first"
+    // -----------------------------------------------------------------------
+
+    fn api_error(code: u16, reason: &str, causes: Vec<&str>) -> kube::Error {
+        use kube::core::response::{Status, StatusCause, StatusDetails, StatusSummary};
+        kube::Error::Api(Box::new(Status {
+            status: Some(StatusSummary::Failure),
+            code,
+            message: "boom".to_string(),
+            reason: reason.to_string(),
+            details: Some(StatusDetails {
+                name: String::new(),
+                group: String::new(),
+                kind: String::new(),
+                uid: String::new(),
+                causes: causes
+                    .into_iter()
+                    .map(|field| StatusCause {
+                        field: field.to_string(),
+                        message: "invalid".to_string(),
+                        reason: "FieldValueInvalid".to_string(),
+                    })
+                    .collect(),
+                retry_after_seconds: 0,
+            }),
+            metadata: None,
+        }))
+    }
+
+    /// A failed `Preconditions` check is unambiguous — 409 only ever means a
+    /// concurrent modification.
+    #[test]
+    fn conflict_409_is_a_lost_race() {
+        assert!(optimistic_conflict(&api_error(409, "Conflict", vec![])));
+    }
+
+    /// A failed JSON-Patch `test` op returns 422 with no field-level causes.
+    /// This is the shape observed ~38×/day on int-pro (#153).
+    #[test]
+    fn invalid_422_without_causes_is_a_lost_race() {
+        assert!(optimistic_conflict(&api_error(422, "Invalid", vec![])));
+    }
+
+    /// The one that matters: a 422 carrying field-level causes is a genuinely
+    /// bad request, not a lost race. Retrying it can never succeed, so treating
+    /// it as a conflict would silently requeue forever against a request the
+    /// server will always reject — the failure shape of #150. It must stay
+    /// loud.
+    #[test]
+    fn invalid_422_with_causes_is_a_real_error() {
+        assert!(
+            !optimistic_conflict(&api_error(422, "Invalid", vec!["spec.servers"])),
+            "a validation failure must not be absorbed as a lost race"
+        );
+    }
+
+    /// Unrelated failures are untouched — a 404 or a 500 is not a lost race.
+    #[test]
+    fn other_status_codes_are_not_lost_races() {
+        assert!(!optimistic_conflict(&api_error(404, "NotFound", vec![])));
+        assert!(!optimistic_conflict(&api_error(
+            500,
+            "InternalError",
+            vec![]
+        )));
+    }
 
     // -----------------------------------------------------------------------
     // Helpers

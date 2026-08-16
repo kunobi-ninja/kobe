@@ -175,7 +175,14 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
                     crate::metrics::RECONCILIATIONS_TOTAL
                         .with_label_values(&["instance", "error"])
                         .inc();
-                    error!("Instance reconciliation error: {e:?}");
+                    // `error_policy` already reported this at ERROR, with the
+                    // instance named and the error in its Display form. Logging
+                    // it again here as Debug meant every reconcile failure
+                    // appeared twice in two different shapes, which doubled the
+                    // volume and made counting incidents by eye unreliable
+                    // (#153). Kept at debug for the runtime-level detail the
+                    // Debug form carries; the metric above is the durable count.
+                    debug!("Instance reconciliation error (runtime detail): {e:?}");
                 }
             }
         });
@@ -832,7 +839,15 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         }),
                         ..Default::default()
                     };
-                    instances_api.delete(&name, &delete_params).await?;
+                    // Fenced on uid + resourceVersion, so a concurrent write
+                    // makes this 409. That is the fence working: whoever wrote
+                    // first has already triggered a fresh reconcile, which will
+                    // re-decide the delete against the object as it now is.
+                    tolerate_lost_race(
+                        instances_api.delete(&name, &delete_params).await,
+                        &name,
+                        "fenced_delete",
+                    )?;
                     Ok(Action::await_change())
                 }
                 Err(e) => {
@@ -1047,6 +1062,40 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
     }
 }
 
+/// Absorb a lost optimistic race on a fenced write.
+///
+/// Every write here is fenced on the uid and resourceVersion we read, so losing
+/// the race is the fence doing its job: another writer got there first, its
+/// write already produced a watch event, and the reconcile that event triggers
+/// operates on the newer object. Retrying against the stale read we hold could
+/// only fail the same way.
+///
+/// Before #153 these sites used a bare `?`, which turned that ordinary outcome
+/// into an `InstanceError`, surfaced it through `error_policy` at ERROR, and
+/// requeued. On int-pro that produced ~39 spurious error events a day on a
+/// healthy pool. Sites that already handled it (the phase patch and the fenced
+/// status patch) prove the intended shape; this generalises it.
+///
+/// Genuinely bad requests are NOT absorbed — see `optimistic_conflict`, which
+/// only treats a 422 as a lost race when it carries no field-level causes.
+fn tolerate_lost_race<T>(
+    result: Result<T, kube::Error>,
+    instance: &str,
+    write: &'static str,
+) -> Result<(), kube::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if crate::controllers::lease::optimistic_conflict(&err) => {
+            debug!(
+                instance,
+                write, "fenced write lost the race; a newer reconcile owns this object"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn patch_instance_message_fenced<B: ClusterBackend>(
     ctx: &InstanceContext<B>,
     instance: &ClusterInstance,
@@ -1070,13 +1119,17 @@ async fn patch_instance_message_fenced<B: ClusterBackend>(
         .namespace()
         .unwrap_or_else(|| ctx.namespace.clone());
     let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &namespace);
-    instances
-        .patch_status(
-            &instance.name_any(),
-            &PatchParams::default(),
-            &Patch::<()>::Json(patch),
-        )
-        .await?;
+    tolerate_lost_race(
+        instances
+            .patch_status(
+                &instance.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await,
+        &instance.name_any(),
+        "status_message",
+    )?;
     Ok(())
 }
 
@@ -1111,13 +1164,17 @@ async fn patch_exact_binding_status<B: ClusterBackend>(
         .namespace()
         .unwrap_or_else(|| ctx.namespace.clone());
     let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &namespace);
-    instances
-        .patch_status(
-            &instance.name_any(),
-            &PatchParams::default(),
-            &Patch::<()>::Json(patch),
-        )
-        .await?;
+    tolerate_lost_race(
+        instances
+            .patch_status(
+                &instance.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await,
+        &instance.name_any(),
+        "exact_binding_status",
+    )?;
     Ok(())
 }
 
@@ -2093,13 +2150,17 @@ async fn record_teardown_receipt<B: ClusterBackend>(
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "add", "path": "/status/teardownReceipt", "value": receipt }
     ]));
-    leases
-        .patch_status(
-            &lease.name_any(),
-            &PatchParams::default(),
-            &Patch::<()>::Json(patch),
-        )
-        .await?;
+    tolerate_lost_race(
+        leases
+            .patch_status(
+                &lease.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await,
+        &lease.name_any(),
+        "teardown_receipt",
+    )?;
     Ok(())
 }
 
@@ -2529,14 +2590,17 @@ async fn add_finalizer(
         { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
     ]))
     .expect("finalizer JSON Patch is static");
-    instances_api
-        .patch(
-            &instance.name_any(),
-            &PatchParams::default(),
-            &Patch::<()>::Json(patch),
-        )
-        .await?;
-    Ok(())
+    tolerate_lost_race(
+        instances_api
+            .patch(
+                &instance.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await,
+        &instance.name_any(),
+        "add_finalizer",
+    )
 }
 
 /// Remove `finalizer` from the instance's `metadata.finalizers` list,
@@ -2572,14 +2636,17 @@ async fn remove_finalizer(
         { "op": "add", "path": "/metadata/finalizers", "value": remaining }
     ]))
     .expect("finalizer JSON Patch is static");
-    instances_api
-        .patch(
-            &instance.name_any(),
-            &PatchParams::default(),
-            &Patch::<()>::Json(patch),
-        )
-        .await?;
-    Ok(())
+    tolerate_lost_race(
+        instances_api
+            .patch(
+                &instance.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await,
+        &instance.name_any(),
+        "remove_finalizer",
+    )
 }
 
 /// Stable, machine-readable name for a phase, used as a condition
@@ -2717,11 +2784,13 @@ async fn get_profile(client: &Client, name: &str, namespace: &str) -> Option<Clu
 }
 
 fn error_policy<B: ClusterBackend>(
-    _instance: Arc<ClusterInstance>,
+    instance: Arc<ClusterInstance>,
     error: &InstanceError,
     _ctx: Arc<InstanceContext<B>>,
 ) -> Action {
-    error!("Instance reconciliation error: {error}");
+    // The single ERROR for a failed reconcile. Named, so the object is
+    // identifiable without parsing it back out of a Debug blob.
+    error!(instance = %instance.name_any(), "Instance reconciliation error: {error}");
     Action::requeue(std::time::Duration::from_secs(30))
 }
 
