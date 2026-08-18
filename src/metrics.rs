@@ -38,6 +38,24 @@ use prometheus::{
     register_int_counter_vec, register_int_gauge_vec,
 };
 
+/// Build identity of the running process, as the conventional info-gauge: the
+/// value is always 1 and the labels carry the payload.
+///
+/// Answers "what is actually running right now" without hunting for a startup
+/// log line, which is the question that matters during an incident and the one
+/// that was awkward to answer before: every build from main carries the same
+/// version, and log retention eventually drops the banner. A gauge is always
+/// current, and joins onto other metrics by `version`/`commit` so a behaviour
+/// change can be attributed to a specific build.
+pub static BUILD_INFO: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_build_info",
+        "Build identity of the running operator; value is always 1",
+        &["version", "commit"]
+    )
+    .unwrap()
+});
+
 /// Pool state gauges — set at scrape time from shared pool state.
 ///
 /// Labels: `profile` (e.g. "e2e-basic"), `state` (creating/ready/leased/unhealthy/recycling).

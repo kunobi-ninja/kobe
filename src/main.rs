@@ -44,7 +44,24 @@ async fn main() -> anyhow::Result<()> {
         .with_label_values::<&str>(&[])
         .set(pool::cidr_alloc::ipam_plan().capacity() as i64);
 
-    info!("Starting kobe-operator");
+    // Build identity, stated once per process and exported as a gauge.
+    //
+    // "Starting kobe-operator" already marked a restart, but carried no fields,
+    // so which build produced a given log line could only be inferred by
+    // correlating the ReplicaSet hash in the pod name against rollout history.
+    // Both values are baked by build.rs and already used elsewhere
+    // (`api::routes` serves the version; the profile controller stamps it into
+    // `provenance.operatorVersion`) — they were simply never announced.
+    let build_version = env!("BUILD_VERSION");
+    let build_commit = env!("BUILD_COMMIT");
+    metrics::BUILD_INFO
+        .with_label_values(&[build_version, build_commit])
+        .set(1);
+    info!(
+        version = build_version,
+        commit = build_commit,
+        "Starting kobe-operator"
+    );
 
     let client = Client::try_default().await?;
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
@@ -468,6 +485,53 @@ mod controllers_test_anchor {
 mod diagnostics_test_anchor {
     #[allow(unused_imports)]
     use crate::diagnostics::bundle;
+}
+
+#[cfg(test)]
+mod build_identity_tests {
+    /// The startup path must not be able to panic the operator.
+    ///
+    /// `with_label_values` panics when the slice arity disagrees with the
+    /// metric's label set, and this call runs in the first few lines of `main`
+    /// — before the controllers start and before anything is serving. A
+    /// mismatch introduced by later editing the metric's labels without the
+    /// call site would crash-loop the operator on rollout, which is a far worse
+    /// failure than the missing observability this whole change adds. So
+    /// exercise the exact call, not a paraphrase of it.
+    #[test]
+    fn build_info_gauge_matches_its_call_site() {
+        let version = env!("BUILD_VERSION");
+        let commit = env!("BUILD_COMMIT");
+
+        crate::metrics::BUILD_INFO
+            .with_label_values(&[version, commit])
+            .set(1);
+
+        assert_eq!(
+            crate::metrics::BUILD_INFO
+                .with_label_values(&[version, commit])
+                .get(),
+            1,
+            "build_info must read 1 for the running build's labels"
+        );
+    }
+
+    /// build.rs must always define both values, so `env!` resolves and the
+    /// binary can state its identity. `env!` already fails the compile when a
+    /// variable is absent; this catches the subtler case of build.rs emitting
+    /// an EMPTY value, which compiles fine and yields a metric labelled with
+    /// the empty string.
+    #[test]
+    fn build_identity_is_never_empty() {
+        assert!(
+            !env!("BUILD_VERSION").is_empty(),
+            "build.rs must fall back to CARGO_PKG_VERSION, never an empty version"
+        );
+        assert!(
+            !env!("BUILD_COMMIT").is_empty(),
+            "build.rs must fall back to `unknown`, never an empty commit"
+        );
+    }
 }
 
 #[cfg(test)]
