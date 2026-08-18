@@ -1081,12 +1081,30 @@ async fn reconcile_profile(
         }
     }
 
+    // Computed ONCE per reconcile and threaded to every consumer — the drift
+    // comparison below and both stamp sites. Recomputing it independently at
+    // each site would risk stamped != compared, which recycles every member on
+    // every reconcile forever (bounded only by `maxRecycling`). One value
+    // cannot disagree with itself.
+    //
+    // `None` whenever no factory is configured or the backend has no
+    // fingerprint, which leaves the hash exactly as it was before #149.
+    let render_fingerprint: Option<String> = ctx
+        .factory
+        .as_ref()
+        .and_then(|factory| factory.backend_for(&profile).ok())
+        .and_then(|backend| {
+            use crate::backend::ClusterBackend;
+            backend.render_fingerprint(&profile.spec.cluster)
+        });
+
     let actions = compute_pool_actions(
         &profile,
         &pool_state,
         now,
         &ctx.render_ctx,
         &bootstrap_specs,
+        render_fingerprint.as_deref(),
     );
 
     // Check whether the backend datastore is degraded. When kine/etcd
@@ -1132,6 +1150,7 @@ async fn reconcile_profile(
                     cluster_name,
                     &ctx.render_ctx,
                     &bootstrap_specs,
+                    render_fingerprint.as_deref(),
                 )
                 .await?;
                 pool_state.clusters.insert(
@@ -1145,6 +1164,7 @@ async fn reconcile_profile(
                             &profile,
                             &ctx.render_ctx,
                             &bootstrap_specs,
+                            render_fingerprint.as_deref(),
                         )),
                         // Freshly created — it hasn't had a chance to report a
                         // scheduling block or crashloop yet; build_pool_state
@@ -1699,6 +1719,7 @@ async fn ensure_cluster_instance(
     cluster_name: &str,
     render_ctx: &crate::pool::RenderContext,
     bootstrap_specs: &std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec>,
+    render_fingerprint: Option<&str>,
 ) -> Result<(), ProfileError> {
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/pool".to_string(), profile.name_any());
@@ -1776,6 +1797,7 @@ async fn ensure_cluster_instance(
             profile,
             render_ctx,
             bootstrap_specs,
+            render_fingerprint,
         )),
         created_with: Some(provenance),
         ..Default::default()

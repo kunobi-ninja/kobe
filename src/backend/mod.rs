@@ -329,6 +329,22 @@ impl ClusterBackend for BackendDispatch {
         }
     }
 
+    /// Delegate rather than inherit the trait default.
+    ///
+    /// Every caller holds a `BackendDispatch`, so without this arm the default
+    /// `None` would shadow the concrete implementations and the fingerprint
+    /// would silently never be computed — the drift gap would look fixed while
+    /// behaving exactly as before.
+    fn render_fingerprint(&self, config: &ClusterConfig) -> Option<String> {
+        match self {
+            Self::K3s(b) => b.render_fingerprint(config),
+            Self::K0s(b) => b.render_fingerprint(config),
+            Self::Capi(b) => b.render_fingerprint(config),
+            Self::Vkobe(b) => b.render_fingerprint(config),
+            Self::Vcluster(b) => b.render_fingerprint(config),
+        }
+    }
+
     async fn check_health(&self, name: &str, namespace: &str) -> Result<bool> {
         match self {
             Self::K3s(b) => b.check_health(name, namespace).await,
@@ -653,6 +669,31 @@ pub trait ClusterBackend: Send + Sync {
     #[allow(dead_code)]
     fn supports_verified_destroy(&self) -> bool {
         false
+    }
+
+    /// Fingerprint of the workload this backend WOULD render for `config`,
+    /// or `None` when the backend cannot describe its rendering.
+    ///
+    /// This exists so pool drift detection can see changes that live in
+    /// rendering code rather than in the ClusterPool spec. `profile_spec_hash`
+    /// otherwise hashes only its INPUTS — pool fields, bootstrap content, and
+    /// the vkobe sidecar image — so an operator upgrade that alters the pod
+    /// spec produces a byte-identical hash and no member is ever marked
+    /// drifted. That is #149: v0.39.2 added a node-password volume to every
+    /// k3s server pod (#146) and idle members kept the old, brickable spec
+    /// until someone deleted them by hand.
+    ///
+    /// Implementations MUST render against a fixed placeholder identity, not a
+    /// real instance: per-instance values (names, namespaces, endpoints) would
+    /// otherwise make every member differ from every other and drift forever.
+    /// They MUST also be deterministic for a given `config` — a fingerprint
+    /// that varies between calls churns the whole pool on every reconcile.
+    ///
+    /// `None` keeps a backend's existing behaviour exactly: it contributes
+    /// nothing to the hash, rather than contributing a "None" that would
+    /// itself have to stay stable.
+    fn render_fingerprint(&self, _config: &ClusterConfig) -> Option<String> {
+        None
     }
 
     /// Check if a virtual cluster's API server is healthy.

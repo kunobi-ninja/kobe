@@ -14,16 +14,39 @@ for your pool shape, and what to expect operationally.
 ## When does an upgrade fire?
 
 Any change that flips the pool's `spec_hash` makes existing members
-"drifted" and eligible for recycle. Three sources flow into the hash:
+"drifted" and eligible for recycle. Four sources flow into the hash:
 
 1. **User-visible spec edits** to the `ClusterPool` CR — cluster
    config, addons, bootstrap *names*.
-2. **Operator-level config bumps** — currently just
-   `KOBE_SYNC_IMAGE`, which only affects vkobe-backend pools.
+2. **Operator-level config bumps** — `KOBE_SYNC_IMAGE`, which only
+   affects vkobe-backend pools.
 3. **`BootstrapConfig` content edits** — the install manifest, the
    shell script, anything inside the referenced bootstrap CRs. This
    catches the case where you rev the bootstrap content without
    renaming the bootstrap reference.
+4. **The rendered workload itself** — a digest of the server
+   StatefulSet and agent Deployment the backend would build for this
+   pool. This is what makes an **operator upgrade** visible: a release
+   that changes how pods are rendered flips the hash even though the
+   `ClusterPool` CR is untouched.
+
+Source 4 exists because of a real gap (#149). v0.39.2 added a
+node-password volume to every k3s server pod (#146), but since the pool
+CR was unchanged the hash was byte-identical, no member was ever marked
+drifted, and idle members kept serving the old, brickable spec until
+they were deleted by hand. Sources 1–3 hash the *inputs* to rendering;
+source 4 hashes the *output*.
+
+It is currently implemented for the **k3s** backend. Other backends
+report no fingerprint and behave exactly as before — for them, an
+operator upgrade that changes rendering is still invisible to drift
+detection.
+
+> **Upgrading to the release that introduced source 4 flips every
+> pool's hash once**, because the hash gained an input. Expect a
+> one-time rolling recycle of idle members across all pools, capped by
+> `maxRecycling` and floor-protected by `minReadyDuringUpgrade`, and
+> visible as a `SpecDrift` wave in `kobe_instance_recycles_total`.
 
 To diff actual hashes against the operator's current expectation:
 
