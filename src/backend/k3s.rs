@@ -27,6 +27,7 @@ use kube::Client;
 use kube::api::{
     Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, PropagationPolicy,
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
@@ -145,6 +146,16 @@ sleep infinity
 /// Path k3s reads its container-runtime registry config from on every node.
 /// (https://docs.k3s.io/installation/private-registry)
 const REGISTRIES_YAML_PATH: &str = "/etc/rancher/k3s/registries.yaml";
+
+/// Placeholder identity used only for `render_fingerprint`.
+///
+/// Never names a real object. Its only requirement is stability: change these
+/// and every pool's spec hash changes, triggering a fleet-wide recycle.
+const FINGERPRINT_NAME: &str = "kobe-render-fingerprint";
+const FINGERPRINT_NAMESPACE: &str = "kobe-render-fingerprint";
+/// Stand-in for the real datastore endpoint, whose value rotates and is
+/// per-cluster. Presence is what matters to rendering, not the value.
+const FINGERPRINT_DATASTORE_ENDPOINT: &str = "postgres://kobe-render-fingerprint";
 
 /// Path every k3s node keeps its cleartext node password at.
 ///
@@ -2238,7 +2249,65 @@ impl K3sBackend {
     }
 }
 
+/// Digest the rendered objects that make up a k3s cluster's workload.
+///
+/// Split out from `render_fingerprint` so tests can feed it a deliberately
+/// mutated render and prove the digest actually tracks the pod spec — i.e.
+/// that a change like #146's added node-password volume would be caught.
+///
+/// serde_json over the typed k8s objects is deterministic for a given input:
+/// field order follows the struct definitions and maps are BTreeMaps. A
+/// serialisation failure yields `None` rather than a sentinel digest, so the
+/// hash falls back to exactly its pre-#149 inputs instead of silently
+/// asserting "no drift".
+fn fingerprint_rendered(sts: &StatefulSet, deploy: &Option<Deployment>) -> Option<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(sts).ok()?);
+    hasher.update(serde_json::to_vec(deploy).ok()?);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 impl ClusterBackend for K3sBackend {
+    /// Render the server StatefulSet and agent Deployment this pool would get,
+    /// and digest them. Any change to k3s rendering therefore changes the pool
+    /// spec hash, which is what makes an operator upgrade visible to drift
+    /// detection (#149).
+    ///
+    /// Rendered against a FIXED placeholder identity. The real name, namespace
+    /// and datastore endpoint are per-instance, so hashing them would make
+    /// every member's fingerprint unique and mark the whole pool drifted
+    /// forever. The datastore endpoint in particular carries rotating
+    /// credentials (`POSTGRES_URL`, hot-reloaded), so hashing the live value
+    /// would recycle every pool on each rotation. A placeholder is passed
+    /// rather than `None` so the endpoint-bearing code path is still rendered
+    /// — its presence changes the container args, and that difference is
+    /// exactly the kind of thing this is meant to notice.
+    ///
+    /// Replica counts come from `config` and are already in the input hash;
+    /// they are passed through so the rendered output stays a faithful
+    /// reflection of what `create` would build.
+    fn render_fingerprint(&self, config: &ClusterConfig) -> Option<String> {
+        let sts = Self::build_server_statefulset(
+            FINGERPRINT_NAME,
+            FINGERPRINT_NAMESPACE,
+            config,
+            Some(FINGERPRINT_DATASTORE_ENDPOINT),
+            config.servers.max(1),
+        );
+        let agents = config.agents.unwrap_or(0);
+        let deploy = (agents > 0).then(|| {
+            Self::build_agent_deployment(FINGERPRINT_NAME, FINGERPRINT_NAMESPACE, config, agents)
+        });
+
+        // serde_json over the typed k8s objects: field order follows the
+        // struct definitions and maps are BTreeMaps, so the encoding is
+        // deterministic for a given input. A serialisation failure must not be
+        // reported as "no drift" — it would silently restore the old blind
+        // spot — so it yields None, leaving the hash exactly as it was before
+        // this fingerprint existed.
+        fingerprint_rendered(&sts, &deploy)
+    }
+
     #[tracing::instrument(skip(self, config, addons, _owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
@@ -2636,6 +2705,78 @@ mod tests {
     // =================================================================
     // Pure function tests for resource builders
     // =================================================================
+
+    #[test]
+    fn render_fingerprint_is_deterministic() {
+        // A fingerprint that varies between calls would mark every member
+        // drifted on every reconcile and churn the pool forever, so this is a
+        // correctness requirement rather than a nicety.
+        let config = base_config();
+        let a = K3sBackend::build_server_statefulset("n", "ns", &config, Some("pg"), 1);
+        let b = K3sBackend::build_server_statefulset("n", "ns", &config, Some("pg"), 1);
+        assert_eq!(
+            fingerprint_rendered(&a, &None),
+            fingerprint_rendered(&b, &None),
+            "rendering the same config twice must digest identically"
+        );
+        assert!(fingerprint_rendered(&a, &None).is_some());
+    }
+
+    /// The property #149 is actually about: a change in RENDERING — not in the
+    /// ClusterPool spec — must change the fingerprint.
+    ///
+    /// Modelled on the real case. v0.39.2 (#146) added a `node-password` volume
+    /// to every k3s server pod; the pool spec was untouched, so the old
+    /// input-only hash was byte-identical and idle members kept the brickable
+    /// spec. Removing that volume from an otherwise identical render stands in
+    /// for "the renderer changed", and the digest must notice.
+    #[test]
+    fn render_fingerprint_tracks_the_rendered_pod_spec() {
+        let config = base_config();
+        let rendered = K3sBackend::build_server_statefulset("n", "ns", &config, Some("pg"), 1);
+
+        let mut without_volume = rendered.clone();
+        let volumes = without_volume
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .volumes
+            .as_mut()
+            .expect("server pod renders volumes");
+        let before = volumes.len();
+        volumes.retain(|v| v.name != "node-password");
+        assert_eq!(
+            before - 1,
+            volumes.len(),
+            "fixture must actually drop one volume"
+        );
+
+        assert_ne!(
+            fingerprint_rendered(&rendered, &None),
+            fingerprint_rendered(&without_volume, &None),
+            "a rendering change must flip the fingerprint — this is the #146 blind spot"
+        );
+    }
+
+    /// The agent Deployment is part of the workload, so a pool that renders one
+    /// must not digest the same as a pool that does not.
+    #[test]
+    fn render_fingerprint_covers_the_agent_deployment() {
+        let mut config = base_config();
+        config.agents = Some(2);
+        let sts = K3sBackend::build_server_statefulset("n", "ns", &config, Some("pg"), 1);
+        let deploy = K3sBackend::build_agent_deployment("n", "ns", &config, 2);
+
+        assert_ne!(
+            fingerprint_rendered(&sts, &Some(deploy)),
+            fingerprint_rendered(&sts, &None),
+            "agent Deployment must contribute to the fingerprint"
+        );
+    }
 
     #[test]
     fn test_build_server_statefulset_basic() {

@@ -146,14 +146,50 @@ impl RenderContext {
 /// `compute_pool_actions` recycles unclaimed pool members on the next
 /// reconcile. Leased members keep running; they'll get the fresh hash
 /// when they're released and recycled.
+///
+/// `render_fingerprint` is the backend's digest of the workload it WOULD
+/// render for this pool ([`crate::backend::ClusterBackend::render_fingerprint`]),
+/// or `None` for backends that cannot describe their rendering. It closes
+/// #149: without it the hash sees only its INPUTS, so an operator upgrade that
+/// changes rendering — v0.39.2 adding a node-password volume to every k3s
+/// server pod (#146) — produced an identical hash and left idle members on the
+/// old spec until someone deleted them by hand.
+///
+/// It is ADDITIVE, deliberately. Addons and bootstrap content never appear in
+/// a pod spec (they are applied inside the guest), so replacing the input hash
+/// with the fingerprint would lose drift coverage this pool has today.
+///
+/// The parameter is positional and required rather than defaulted, so a caller
+/// that forgets it fails to compile. A site that stamped the hash without the
+/// fingerprint while another compared it with one would make stamped != compared
+/// on every reconcile — a permanent recycle loop bounded only by `maxRecycling`.
 pub fn profile_spec_hash(
     profile: &ClusterPool,
     render_ctx: &RenderContext,
     bootstrap_specs: &std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec>,
+    render_fingerprint: Option<&str>,
 ) -> SpecHash {
     use crate::crd::BackendType;
+    use sha2::{Digest, Sha256};
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    // A wrapper so the existing `Hash`-based folding below keeps working while
+    // the digest underneath is stable across Rust releases. `DefaultHasher` is
+    // explicitly NOT guaranteed stable between versions, so a toolchain bump
+    // could have silently flipped every pool's hash at once and triggered a
+    // fleet-wide recycle that looked intentional.
+    #[derive(Default)]
+    struct StableHasher(Sha256);
+    impl Hasher for StableHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.update(bytes);
+        }
+        fn finish(&self) -> u64 {
+            let digest = self.0.clone().finalize();
+            u64::from_be_bytes(digest[..8].try_into().expect("sha256 yields 32 bytes"))
+        }
+    }
+    let mut hasher = StableHasher::default();
     // Hash the fields that affect how a cluster is created
     profile.spec.cluster.version.hash(&mut hasher);
     profile.spec.cluster.servers.hash(&mut hasher);
@@ -201,6 +237,15 @@ pub fn profile_spec_hash(
         render_ctx.kobe_sync_image.hash(&mut hasher);
     }
 
+    // What the backend would actually render. `None` contributes nothing, so a
+    // backend without a fingerprint keeps precisely its previous hash inputs
+    // rather than folding in a sentinel that would itself have to stay stable.
+    if let Some(fingerprint) = render_fingerprint {
+        fingerprint.hash(&mut hasher);
+    }
+
+    // Width and shape are load-bearing: `lease_binding` and
+    // `ClusterInstance.status.specHash` document a fixed 16-char hex digest.
     format!("{:016x}", hasher.finish())
 }
 
@@ -531,6 +576,7 @@ pub fn compute_pool_actions(
     now: chrono::DateTime<chrono::Utc>,
     render_ctx: &RenderContext,
     bootstrap_specs: &std::collections::BTreeMap<String, crate::crd::BootstrapConfigSpec>,
+    render_fingerprint: Option<&str>,
 ) -> Vec<PoolAction> {
     let spec = &profile.spec;
     let mut actions = Vec::new();
@@ -581,7 +627,7 @@ pub fn compute_pool_actions(
         0
     };
 
-    let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs);
+    let current_hash = profile_spec_hash(profile, render_ctx, bootstrap_specs, render_fingerprint);
     let counts = count_states(state, Some(&current_hash));
     // Quarantined counts toward the ceiling. Its backend resources still
     // exist — that is the whole point, the cleanup handle is being held — so
@@ -1556,6 +1602,54 @@ mod tests {
 
     // --- Autoscaling: compute_pool_actions ---
 
+    /// The fingerprint must actually reach the hash — otherwise #149's fix is
+    /// wired up but inert.
+    #[test]
+    fn spec_hash_folds_in_the_render_fingerprint() {
+        let profile = make_profile(1, None);
+        let ctx = test_render_ctx();
+        let bs = Default::default();
+
+        let without = profile_spec_hash(&profile, &ctx, &bs, None);
+        let with_a = profile_spec_hash(&profile, &ctx, &bs, Some("render-a"));
+        let with_b = profile_spec_hash(&profile, &ctx, &bs, Some("render-b"));
+
+        assert_ne!(
+            without, with_a,
+            "a pool whose backend reports a fingerprint must not hash the same as one without"
+        );
+        assert_ne!(
+            with_a, with_b,
+            "a changed rendering must change the hash — this is the #146 blind spot"
+        );
+        assert_eq!(
+            with_a,
+            profile_spec_hash(&profile, &ctx, &bs, Some("render-a")),
+            "same inputs must hash identically"
+        );
+    }
+
+    /// Shape is load-bearing: `lease_binding` and `ClusterInstance.status.specHash`
+    /// both document a fixed-width 16-char hex digest. Moving off DefaultHasher
+    /// must not change that contract.
+    #[test]
+    fn spec_hash_is_16_hex_chars() {
+        let profile = make_profile(1, None);
+        for fingerprint in [None, Some("x")] {
+            let h = profile_spec_hash(
+                &profile,
+                &test_render_ctx(),
+                &Default::default(),
+                fingerprint,
+            );
+            assert_eq!(h.len(), 16, "expected 16 chars, got {h:?}");
+            assert!(
+                h.chars().all(|c| c.is_ascii_hexdigit()),
+                "expected hex, got {h:?}"
+            );
+        }
+    }
+
     fn make_profile(
         size: u32,
         scaling: Option<crate::crd::ScalingConfig>,
@@ -1634,6 +1728,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         // Should create up to MAX_BURST (2) clusters
@@ -1682,6 +1777,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert!(
@@ -1724,6 +1820,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert_eq!(
@@ -1761,6 +1858,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert_eq!(
@@ -1803,6 +1901,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert!(
@@ -1852,6 +1951,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert!(
@@ -1887,6 +1987,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert!(
@@ -1914,6 +2015,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert_eq!(
@@ -1953,6 +2055,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert!(actions.is_empty());
@@ -1987,6 +2090,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         let creates: Vec<_> = actions
@@ -2025,6 +2129,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         // At max_clusters=2 with 2 leased, no room to create
@@ -2087,6 +2192,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         // 2 ready, min_ready=1, one idle >30m → delete 1
@@ -2153,6 +2259,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         // Both idle only 5m, threshold is 30m — no deletes
@@ -2181,7 +2288,7 @@ mod tests {
         });
         let stale_hash = format!(
             "{}-stale",
-            profile_spec_hash(&profile, &test_render_ctx(), &Default::default())
+            profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None)
         );
 
         let mut clusters = HashMap::new();
@@ -2225,6 +2332,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         // Only the Ready (unclaimed) cluster should be deleted.
@@ -2254,8 +2362,8 @@ mod tests {
         let new_ctx = RenderContext::with_kobe_sync_image("zondax/kobe-sync:v0.12.3");
         let bs = std::collections::BTreeMap::new();
 
-        let old_hash = profile_spec_hash(&profile, &old_ctx, &bs);
-        let new_hash = profile_spec_hash(&profile, &new_ctx, &bs);
+        let old_hash = profile_spec_hash(&profile, &old_ctx, &bs, None);
+        let new_hash = profile_spec_hash(&profile, &new_ctx, &bs, None);
         assert_ne!(
             old_hash, new_hash,
             "vkobe pool must recompute its spec hash when KOBE_SYNC_IMAGE changes"
@@ -2278,8 +2386,8 @@ mod tests {
         let bs = std::collections::BTreeMap::new();
 
         assert_eq!(
-            profile_spec_hash(&profile, &old_ctx, &bs),
-            profile_spec_hash(&profile, &new_ctx, &bs),
+            profile_spec_hash(&profile, &old_ctx, &bs, None),
+            profile_spec_hash(&profile, &new_ctx, &bs, None),
             "k3s pool spec hash must NOT depend on the kobe-sync sidecar image"
         );
     }
@@ -2340,8 +2448,8 @@ mod tests {
         );
 
         let ctx = test_render_ctx();
-        let h1 = profile_spec_hash(&profile, &ctx, &bs_v1);
-        let h2 = profile_spec_hash(&profile, &ctx, &bs_v2);
+        let h1 = profile_spec_hash(&profile, &ctx, &bs_v1, None);
+        let h2 = profile_spec_hash(&profile, &ctx, &bs_v2, None);
         assert_ne!(
             h1, h2,
             "editing a referenced BootstrapConfig's content must flip the pool hash"
@@ -2370,8 +2478,8 @@ mod tests {
         );
 
         assert_eq!(
-            profile_spec_hash(&profile, &ctx, &Default::default()),
-            profile_spec_hash(&profile, &ctx, &bs_a),
+            profile_spec_hash(&profile, &ctx, &Default::default(), None),
+            profile_spec_hash(&profile, &ctx, &bs_a, None),
             "pool with no bootstraps must not be affected by unrelated entries in the resolved map"
         );
     }
@@ -2414,7 +2522,8 @@ mod tests {
     #[test]
     fn test_no_drift_when_spec_hash_matches() {
         let profile = make_profile(2, None);
-        let current_hash = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let current_hash =
+            profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
 
         let mut clusters = HashMap::new();
         clusters.insert(
@@ -2443,6 +2552,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         let deletes: Vec<_> = actions
@@ -2562,6 +2672,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         assert!(
@@ -2610,6 +2721,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         // The floor legitimately blocks deleting either member right now.
@@ -2735,6 +2847,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let creates: Vec<_> = actions
             .iter()
@@ -2757,6 +2870,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let creates: Vec<_> = actions
             .iter()
@@ -2785,6 +2899,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let creates: Vec<_> = actions
             .iter()
@@ -2810,6 +2925,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let creates: Vec<_> = actions
             .iter()
@@ -3006,6 +3122,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         let deletes: Vec<_> = actions
@@ -3026,7 +3143,7 @@ mod tests {
     #[test]
     fn rolling_drift_holds_recycle_when_floor_would_be_violated() {
         let profile = make_profile_with_upgrade(2, 1, 1, Some(2));
-        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
         let mut clusters = HashMap::new();
         clusters.insert(
             "pool-test-profile-1".into(),
@@ -3046,6 +3163,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3074,7 +3192,7 @@ mod tests {
     #[test]
     fn size_one_pool_with_surge_one_upgrades_with_zero_downtime() {
         let profile = make_profile_with_upgrade(1, 1, 1, None); // floor defaults to size=1
-        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
 
         // T0: 1 drifted Ready, no clean.
         let mut clusters = HashMap::new();
@@ -3091,6 +3209,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         assert_eq!(
             actions_t0
@@ -3124,6 +3243,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes_t1: Vec<_> = actions_t1
             .iter()
@@ -3170,6 +3290,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3220,6 +3341,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3325,6 +3447,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let creates = actions
             .iter()
@@ -3365,6 +3488,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3417,6 +3541,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3439,7 +3564,7 @@ mod tests {
     #[test]
     fn cert_expiring_ready_recycles_like_drift_leased_untouched() {
         let profile = make_profile_with_upgrade(2, 1, 1, Some(0));
-        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
 
         let expiring = ClusterEntry {
             state: ClusterState::Ready,
@@ -3483,6 +3608,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3504,7 +3630,7 @@ mod tests {
     #[test]
     fn soonest_expiring_member_recycles_first_under_cap() {
         let profile = make_profile_with_upgrade(2, 1, 1, Some(0)); // max_recycling=1
-        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
 
         let entry = |horizon: i64, age_secs: i64| ClusterEntry {
             state: ClusterState::Ready,
@@ -3533,6 +3659,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3572,7 +3699,7 @@ mod tests {
             max_surge: 1,
             min_ready_during_upgrade: Some(2),
         });
-        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default());
+        let current = profile_spec_hash(&profile, &test_render_ctx(), &Default::default(), None);
 
         // 3 Ready: 1 drifted + 2 clean. Above min_ready=2 with one
         // long-idle clean cluster — would normally scale-down.
@@ -3609,6 +3736,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         // pool-test-profile-1 (drifted) is a candidate for drift recycle,
         // but neither -2 nor -3 (clean, idle, above min_ready) should
@@ -3658,6 +3786,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3708,6 +3837,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
 
         let deletes: Vec<_> = actions
@@ -3766,6 +3896,7 @@ mod tests {
             chrono::Utc::now(),
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3890,6 +4021,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -3950,6 +4082,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -4026,6 +4159,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -4108,6 +4242,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
@@ -4186,6 +4321,7 @@ mod tests {
             now,
             &test_render_ctx(),
             &Default::default(),
+            None,
         );
         let deletes: Vec<_> = actions
             .iter()
