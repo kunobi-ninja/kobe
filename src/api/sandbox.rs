@@ -315,51 +315,6 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         executions::Reservation::Reserved(reserved) => (reserved, true),
     };
 
-    let cluster = match access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
-        &lease,
-        &target,
-    )
-    .await
-    {
-        Ok(cluster) => cluster,
-        Err(denied) => {
-            if fresh {
-                executions::record_terminal(
-                    &state.client,
-                    &state.namespace,
-                    &reserved,
-                    ExecutionState::Unknown,
-                    None,
-                    denied.reason_code(),
-                )
-                .await;
-            }
-            return access_denied(&identity, &id, "execution", denied);
-        }
-    };
-    let scoped =
-        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
-            .await
-        {
-            Ok(client) => client,
-            Err(denied) => {
-                if fresh {
-                    executions::record_terminal(
-                        &state.client,
-                        &state.namespace,
-                        &reserved,
-                        ExecutionState::Unknown,
-                        None,
-                        denied.reason_code(),
-                    )
-                    .await;
-                }
-                return access_denied(&identity, &id, "execution", denied);
-            }
-        };
-
     // Belt and braces: a reservation that is not fresh must never spawn, even
     // though `Reserved` is fresh by construction. The cost of the check is
     // nothing; the cost of the case it guards is a duplicate `terraform apply`.
@@ -403,6 +358,81 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         }
     };
     let revoked = guard.cancelled();
+
+    // Registration and its exact lease re-read precede target resolution and
+    // TokenRequest. A release event that already passed can therefore never
+    // mint a fresh credential, and an event racing setup cancels the network
+    // wait instead of letting it complete under ended authority.
+    let scoped = match scoped_client_after_registration(
+        &state,
+        &lease,
+        &target,
+        credentials::SandboxOperation::Exec,
+        &revoked,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(ScopedSetupDenied::Access(denied)) => {
+            if fresh {
+                executions::record_terminal(
+                    &state.client,
+                    &state.namespace,
+                    &reserved,
+                    ExecutionState::Unknown,
+                    None,
+                    denied.reason_code(),
+                )
+                .await;
+            }
+            return access_denied(&identity, &id, "execution", denied);
+        }
+        Err(ScopedSetupDenied::Revoked) => {
+            if fresh {
+                executions::record_terminal(
+                    &state.client,
+                    &state.namespace,
+                    &reserved,
+                    ExecutionState::Cancelled,
+                    None,
+                    "lease_revoked_before_credential",
+                )
+                .await;
+            }
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "execution",
+                StreamRegistrationDenied::LeaseEnded,
+            );
+        }
+        Err(
+            failure @ (ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout),
+        ) => {
+            if fresh {
+                let reason = match failure {
+                    ScopedSetupDenied::TargetTimeout => "target_setup_timeout",
+                    ScopedSetupDenied::CredentialTimeout => "credential_setup_timeout",
+                    _ => unreachable!("matched timeout variants above"),
+                };
+                executions::record_terminal(
+                    &state.client,
+                    &state.namespace,
+                    &reserved,
+                    ExecutionState::Unknown,
+                    None,
+                    reason,
+                )
+                .await;
+            }
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "execution",
+                StreamRegistrationDenied::Backend,
+            );
+        }
+    };
 
     if !fresh {
         return resume_wait_with_runner(
@@ -978,9 +1008,9 @@ async fn wait_for_runner(
 /// `Unknown` now rather than after the verdict deadline.
 async fn reconcile_runner<B: ClusterBackend>(
     state: &AppState<B>,
-    lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
     record: &crate::crd::SandboxExecution,
+    scoped: &kube::Client,
 ) -> crate::crd::SandboxExecution {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
@@ -998,28 +1028,8 @@ async fn reconcile_runner<B: ClusterBackend>(
         return record.clone();
     };
 
-    let Ok(cluster) = crate::api::sandbox_access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
-        lease,
-        target,
-    )
-    .await
-    else {
-        return record.clone();
-    };
-    let Ok(scoped) = crate::api::sandbox_credentials::scoped_client(
-        &cluster,
-        target,
-        crate::api::sandbox_credentials::SandboxOperation::Exec,
-    )
-    .await
-    else {
-        return record.clone();
-    };
-
     let polled = runner::poll(
-        &scoped,
+        scoped,
         target,
         &target.container,
         &runner_path,
@@ -1106,8 +1116,70 @@ async fn get_sandbox_execution<B: ClusterBackend>(
             // Current executions are runner-supervised in both modes. Legacy
             // raw wait records are not: polling their id against the runner
             // would turn a valid pre-upgrade Running record into Unknown.
-            let record = if execution_is_runner_managed(&record.spec) {
-                reconcile_runner(&state, &lease, &target, &record).await
+            let record = if execution_is_runner_managed(&record.spec)
+                && !record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.state.is_terminal())
+            {
+                let guard =
+                    match register_live_stream(&state.client, &state.namespace, &lease, &target)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(denied) => {
+                            return stream_registration_denied(&identity, &id, "execution", denied);
+                        }
+                    };
+                let revoked = guard.cancelled();
+                let scoped = match scoped_client_after_registration(
+                    &state,
+                    &lease,
+                    &target,
+                    crate::api::sandbox_credentials::SandboxOperation::Exec,
+                    &revoked,
+                )
+                .await
+                {
+                    Ok(scoped) => scoped,
+                    Err(ScopedSetupDenied::Access(denied)) => {
+                        return access_denied(&identity, &id, "execution", denied);
+                    }
+                    Err(ScopedSetupDenied::Revoked) => {
+                        return stream_registration_denied(
+                            &identity,
+                            &id,
+                            "execution",
+                            StreamRegistrationDenied::LeaseEnded,
+                        );
+                    }
+                    Err(
+                        ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout,
+                    ) => {
+                        return stream_registration_denied(
+                            &identity,
+                            &id,
+                            "execution",
+                            StreamRegistrationDenied::Backend,
+                        );
+                    }
+                };
+                match complete_before_revocation(
+                    &revoked,
+                    reconcile_runner(&state, &target, &record, &scoped),
+                )
+                .await
+                {
+                    Some(record) => record,
+                    None => {
+                        return stream_registration_denied(
+                            &identity,
+                            &id,
+                            "execution",
+                            StreamRegistrationDenied::LeaseEnded,
+                        );
+                    }
+                }
             } else {
                 record
             };
@@ -1235,26 +1307,35 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     };
     let revoked = guard.cancelled();
 
-    let cluster = match access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
+    let scoped = match scoped_client_after_registration(
+        &state,
         &lease,
         &target,
-    )
-    .await
-    {
-        Ok(cluster) => cluster,
-        Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
-    };
-    let scoped = match crate::api::sandbox_credentials::scoped_client(
-        &cluster,
-        &target,
         crate::api::sandbox_credentials::SandboxOperation::Exec,
+        &revoked,
     )
     .await
     {
         Ok(client) => client,
-        Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
+        Err(ScopedSetupDenied::Access(denied)) => {
+            return access_denied(&identity, &id, "execution-logs", denied);
+        }
+        Err(ScopedSetupDenied::Revoked) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "execution-logs",
+                StreamRegistrationDenied::LeaseEnded,
+            );
+        }
+        Err(ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "execution-logs",
+                StreamRegistrationDenied::Backend,
+            );
+        }
     };
 
     // Polled first, so the state reported alongside the output is the one that
@@ -1262,7 +1343,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     // raw records were refused above, so this id is always runner-owned.
     let record = match complete_before_revocation(
         &revoked,
-        reconcile_runner(&state, &lease, &target, &record),
+        reconcile_runner(&state, &target, &record, &scoped),
     )
     .await
     {
@@ -1709,6 +1790,59 @@ enum StreamRegistrationDenied {
     Backend,
 }
 
+#[derive(Debug)]
+enum ScopedSetupDenied {
+    Access(crate::api::sandbox_access::SandboxAccessDenied),
+    Revoked,
+    TargetTimeout,
+    CredentialTimeout,
+}
+
+/// Resolve the target cluster and mint the one-operation credential while the
+/// caller already holds a confirmed stream registration.
+///
+/// Keeping the two network calls behind this helper pins their ordering: no
+/// endpoint may mint a Pod credential before its lease has been re-read and
+/// registered for revocation, and both calls stop if that authority ends.
+async fn scoped_client_after_registration<B: ClusterBackend>(
+    state: &AppState<B>,
+    lease: &SandboxLease,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    operation: crate::api::sandbox_credentials::SandboxOperation,
+    revoked: &tokio_util::sync::CancellationToken,
+) -> Result<kube::Client, ScopedSetupDenied> {
+    use crate::api::sandbox_transport::{StreamEnd, bounded_setup};
+
+    let cluster = match bounded_setup(
+        crate::api::sandbox_access::resolve_target_cluster(
+            &state.client,
+            &state.namespace,
+            lease,
+            target,
+        ),
+        revoked,
+    )
+    .await
+    {
+        Ok(Ok(cluster)) => cluster,
+        Ok(Err(denied)) => return Err(ScopedSetupDenied::Access(denied)),
+        Err(StreamEnd::Revoked) => return Err(ScopedSetupDenied::Revoked),
+        Err(_) => return Err(ScopedSetupDenied::TargetTimeout),
+    };
+
+    match bounded_setup(
+        crate::api::sandbox_credentials::scoped_client(&cluster, target, operation),
+        revoked,
+    )
+    .await
+    {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(denied)) => Err(ScopedSetupDenied::Access(denied)),
+        Err(StreamEnd::Revoked) => Err(ScopedSetupDenied::Revoked),
+        Err(_) => Err(ScopedSetupDenied::CredentialTimeout),
+    }
+}
+
 /// Claim a replica-local stream slot, then re-read the exact lease.
 ///
 /// This helper is shared by interactive, one-shot, and durable execution so
@@ -1786,7 +1920,6 @@ async fn prepare_upgrade<B: ClusterBackend>(
     requested_container: Option<&str>,
 ) -> Result<UpgradeContext, Response> {
     use crate::api::sandbox_access as access;
-    use crate::api::sandbox_transport as transport;
 
     require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await?;
     if !is_valid_k8s_name(id) {
@@ -1816,56 +1949,29 @@ async fn prepare_upgrade<B: ClusterBackend>(
     // Both placements go through the same resolution. Child composition
     // changes which cluster the Pod is in; it changes nothing about what the
     // caller may do, which is the equivalence #76 sets out to prove.
-    let cluster = match transport::bounded_setup(
-        access::resolve_target_cluster(&state.client, &state.namespace, &lease, &target),
-        &revoked,
-    )
-    .await
-    {
-        Ok(Ok(cluster)) => cluster,
-        Ok(Err(denied)) => return Err(access_denied(identity, id, operation.as_str(), denied)),
-        Err(transport::StreamEnd::Revoked) => {
-            return Err(stream_registration_denied(
-                identity,
-                id,
-                operation.as_str(),
-                StreamRegistrationDenied::LeaseEnded,
-            ));
-        }
-        Err(_) => {
-            return Err(stream_registration_denied(
-                identity,
-                id,
-                operation.as_str(),
-                StreamRegistrationDenied::Backend,
-            ));
-        }
-    };
-    let scoped = match transport::bounded_setup(
-        crate::api::sandbox_credentials::scoped_client(&cluster, &target, operation),
-        &revoked,
-    )
-    .await
-    {
-        Ok(Ok(client)) => client,
-        Ok(Err(denied)) => return Err(access_denied(identity, id, operation.as_str(), denied)),
-        Err(transport::StreamEnd::Revoked) => {
-            return Err(stream_registration_denied(
-                identity,
-                id,
-                operation.as_str(),
-                StreamRegistrationDenied::LeaseEnded,
-            ));
-        }
-        Err(_) => {
-            return Err(stream_registration_denied(
-                identity,
-                id,
-                operation.as_str(),
-                StreamRegistrationDenied::Backend,
-            ));
-        }
-    };
+    let scoped =
+        match scoped_client_after_registration(state, &lease, &target, operation, &revoked).await {
+            Ok(client) => client,
+            Err(ScopedSetupDenied::Access(denied)) => {
+                return Err(access_denied(identity, id, operation.as_str(), denied));
+            }
+            Err(ScopedSetupDenied::Revoked) => {
+                return Err(stream_registration_denied(
+                    identity,
+                    id,
+                    operation.as_str(),
+                    StreamRegistrationDenied::LeaseEnded,
+                ));
+            }
+            Err(ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout) => {
+                return Err(stream_registration_denied(
+                    identity,
+                    id,
+                    operation.as_str(),
+                    StreamRegistrationDenied::Backend,
+                ));
+            }
+        };
 
     Ok(UpgradeContext {
         target,
@@ -2131,24 +2237,6 @@ async fn sandbox_exec<B: ClusterBackend>(
         Ok(container) => container.to_string(),
         Err(denied) => return access_denied(&identity, &id, "exec", denied),
     };
-    let cluster = match access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
-        &lease,
-        &target,
-    )
-    .await
-    {
-        Ok(cluster) => cluster,
-        Err(denied) => return access_denied(&identity, &id, "exec", denied),
-    };
-    let scoped =
-        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
-            .await
-        {
-            Ok(client) => client,
-            Err(denied) => return access_denied(&identity, &id, "exec", denied),
-        };
 
     // Registered for the duration, so releasing or expiring the lease cancels
     // the command rather than letting it run on inside a workload that is
@@ -2160,6 +2248,37 @@ async fn sandbox_exec<B: ClusterBackend>(
         Err(denied) => return stream_registration_denied(&identity, &id, "exec", denied),
     };
     let revoked = guard.cancelled();
+
+    let scoped = match scoped_client_after_registration(
+        &state,
+        &lease,
+        &target,
+        credentials::SandboxOperation::Exec,
+        &revoked,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(ScopedSetupDenied::Access(denied)) => {
+            return access_denied(&identity, &id, "exec", denied);
+        }
+        Err(ScopedSetupDenied::Revoked) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "exec",
+                StreamRegistrationDenied::LeaseEnded,
+            );
+        }
+        Err(ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "exec",
+                StreamRegistrationDenied::Backend,
+            );
+        }
+    };
 
     // The fixed endpoint bound is only a ceiling. The exact lease is the
     // authority to execute, so a command may never be granted time beyond its
@@ -2258,36 +2377,70 @@ async fn sandbox_logs<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "logs", denied),
     };
 
+    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+        Ok(guard) => guard,
+        Err(denied) => return stream_registration_denied(&identity, &id, "logs", denied),
+    };
+    let revoked = guard.cancelled();
+
     // The read runs under a credential that cannot name a second Pod, rather
     // than under the operator's own authority. The resolver has already denied
     // everything it should — this is the layer that makes a bug in the request
     // path a 403 instead of a privilege escalation.
-    let cluster = match access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
+    let scoped = match scoped_client_after_registration(
+        &state,
         &lease,
         &target,
-    )
-    .await
-    {
-        Ok(cluster) => cluster,
-        Err(denied) => return access_denied(&identity, &id, "logs", denied),
-    };
-    let scoped = match crate::api::sandbox_credentials::scoped_client(
-        &cluster,
-        &target,
         crate::api::sandbox_credentials::SandboxOperation::Logs,
+        &revoked,
     )
     .await
     {
         Ok(client) => client,
-        Err(denied) => return access_denied(&identity, &id, "logs", denied),
+        Err(ScopedSetupDenied::Access(denied)) => {
+            return access_denied(&identity, &id, "logs", denied);
+        }
+        Err(ScopedSetupDenied::Revoked) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "logs",
+                StreamRegistrationDenied::LeaseEnded,
+            );
+        }
+        Err(ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "logs",
+                StreamRegistrationDenied::Backend,
+            );
+        }
     };
 
-    match access::read_sandbox_logs(&scoped, &target, &container, access::clamp_tail(query.tail))
-        .await
-    {
-        Ok(logs) => {
+    let read = crate::api::sandbox_transport::bounded_setup(
+        access::read_sandbox_logs(&scoped, &target, &container, access::clamp_tail(query.tail)),
+        &revoked,
+    )
+    .await;
+    match read {
+        Err(crate::api::sandbox_transport::StreamEnd::Revoked) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "logs",
+                StreamRegistrationDenied::LeaseEnded,
+            );
+        }
+        Err(_) => {
+            return stream_registration_denied(
+                &identity,
+                &id,
+                "logs",
+                StreamRegistrationDenied::Backend,
+            );
+        }
+        Ok(Ok(logs)) => {
             // Audited by identity and outcome, never by content: the body is
             // the workload's own output and can contain anything.
             info!(
@@ -2300,7 +2453,7 @@ async fn sandbox_logs<B: ClusterBackend>(
             );
             (StatusCode::OK, logs).into_response()
         }
-        Err(denied) => access_denied(&identity, &id, "logs", denied),
+        Ok(Err(denied)) => access_denied(&identity, &id, "logs", denied),
     }
 }
 

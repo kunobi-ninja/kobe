@@ -299,6 +299,29 @@ impl StreamRegistry {
         registrations.len()
     }
 
+    /// Cancel every operation this replica still serves.
+    ///
+    /// Process shutdown is itself a revocation boundary: Axum graceful
+    /// shutdown waits for upgraded sockets, so leaving their tokens live can
+    /// deadlock termination indefinitely. Removing the registrations and
+    /// cancelling them first lets every pump observe shutdown through the same
+    /// path it uses for lease release.
+    pub async fn revoke_all(&self) -> usize {
+        let registrations = {
+            let mut state = self.state.write().await;
+            state.principal_counts.clear();
+            std::mem::take(&mut state.streams)
+        };
+        let mut cancelled = 0;
+        for by_id in registrations.into_values() {
+            cancelled += by_id.len();
+            for registration in by_id.into_values() {
+                registration.token.cancel();
+            }
+        }
+        cancelled
+    }
+
     /// Cancel registrations whose lease UID disappeared from a complete
     /// apiserver relist.
     ///
@@ -554,7 +577,8 @@ pub async fn run_stream_revoker(
             }
         }
     }
-    info!("Sandbox stream revoker shut down");
+    let cancelled = registry.revoke_all().await;
+    info!(cancelled, "Sandbox stream revoker shut down");
 }
 
 /// Only the watcher's `InitDone` marker proves the initial LIST is complete.
@@ -947,6 +971,28 @@ mod tests {
         // Revoking again is a no-op rather than an error: a replica may see the
         // same terminal phase several times.
         assert_eq!(registry.revoke("lease-a").await, 0);
+    }
+
+    /// Graceful process shutdown must not wait forever on sockets whose lease
+    /// would otherwise remain Ready.
+    #[tokio::test]
+    async fn replica_shutdown_revokes_every_local_operation() {
+        let registry = StreamRegistry::new();
+        let alice = principal_identity("alice");
+        let bob = principal_identity("bob");
+        let alice_key = alice.principal_key();
+        let bob_key = bob.principal_key();
+        let first = registry.register("lease-a", &alice).await;
+        let second = registry.register("lease-b", &bob).await;
+
+        assert_eq!(registry.revoke_all().await, 2);
+        assert!(first.cancelled().is_cancelled());
+        assert!(second.cancelled().is_cancelled());
+        assert_eq!(registry.live_count("lease-a").await, 0);
+        assert_eq!(registry.live_count("lease-b").await, 0);
+        assert_eq!(registry.live_principal_count(&alice_key).await, 0);
+        assert_eq!(registry.live_principal_count(&bob_key).await, 0);
+        assert_eq!(registry.revoke_all().await, 0);
     }
 
     /// Registration is keyed by UID, not name.

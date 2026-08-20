@@ -76,11 +76,12 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// separate transport bound at all.
 pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 
-/// Most bytes carried in one direction before the stream is closed.
+/// Most bytes carried across both directions before the stream is closed.
 ///
 /// `yes > /dev/null` is a one-word way to make the operator relay unbounded
 /// traffic from inside a sandbox whose occupant is, by construction, not
-/// trusted.
+/// trusted. Counting both directions also prevents a caller from receiving the
+/// full bound and then sending another full bound back.
 pub const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Longest an upgraded operation may spend opening its exact target stream.
