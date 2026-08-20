@@ -29,6 +29,7 @@ pub const SANDBOX_TEMPLATE_KIND: &str = "SandboxTemplate";
 pub const SANDBOX_WARM_POOL_KIND: &str = "SandboxWarmPool";
 pub const SANDBOX_CLAIM_KIND: &str = "SandboxClaim";
 pub const KOBE_MANAGED_BY: &str = "kobe-operator";
+pub const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 const KOBE_API_VERSION: &str = "kobe.kunobi.ninja/v1alpha1";
 const SANDBOX_API_VERSION: &str = "agents.x-k8s.io/v1beta1";
 const CORE_API_VERSION: &str = "v1";
@@ -146,17 +147,23 @@ pub fn build_sandbox_warm_pool(
 /// The initial claim intentionally omits `shutdownTime`: runtime TTL starts
 /// only after the upstream Sandbox becomes Ready. [`build_sandbox_claim_lifecycle_patch`]
 /// adds the absolute expiry later with a resourceVersion fence.
+///
+/// Every claim also carries the exact outer lease UID. Management
+/// placement has a Kubernetes owner reference as well; child placement cannot
+/// reference an object in another cluster, so these server-controlled labels
+/// are the durable adoption fence there.
 pub fn build_sandbox_claim(
     name: &str,
     namespace: &str,
     warm_pool_name: &str,
-    owner_ref: Option<&OwnerReference>,
+    lease_uid: &str,
+    owner_ref: &OwnerReference,
 ) -> DynamicObject {
-    managed_object(
+    let mut claim = managed_object(
         SANDBOX_CLAIM_KIND,
         name,
         namespace,
-        owner_ref,
+        Some(owner_ref),
         serde_json::json!({
             "spec": {
                 "warmPoolRef": { "name": warm_pool_name },
@@ -165,7 +172,10 @@ pub fn build_sandbox_claim(
                 }
             }
         }),
-    )
+    );
+    let labels = claim.metadata.labels.get_or_insert_default();
+    labels.insert(SANDBOX_LEASE_UID_LABEL.to_string(), lease_uid.to_string());
+    claim
 }
 
 /// Build the post-Ready merge patch that starts upstream expiry. Callers must
@@ -1144,12 +1154,33 @@ mod tests {
         let expires_at = DateTime::parse_from_rfc3339("2026-08-10T12:34:56Z")
             .unwrap()
             .with_timezone(&Utc);
-        let value = serde_json::to_value(build_sandbox_claim("lease-a", "targets", "agents", None))
-            .unwrap();
+        let value = serde_json::to_value(build_sandbox_claim(
+            "claim-a",
+            "targets",
+            "agents",
+            "lease-uid-a",
+            &OwnerReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "SandboxLease".into(),
+                name: "lease-a".into(),
+                uid: "lease-uid-a".into(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            },
+        ))
+        .unwrap();
 
         assert_eq!(value["apiVersion"], AGENT_SANDBOX_API_VERSION);
         assert_eq!(value["kind"], SANDBOX_CLAIM_KIND);
         assert_eq!(value["spec"]["warmPoolRef"]["name"], "agents");
+        assert_eq!(
+            value["metadata"]["labels"][SANDBOX_LEASE_UID_LABEL],
+            "lease-uid-a"
+        );
+        assert_eq!(
+            value["metadata"]["ownerReferences"][0]["uid"],
+            "lease-uid-a"
+        );
         assert!(value["spec"]["lifecycle"].get("shutdownTime").is_none());
         assert_eq!(
             value["spec"]["lifecycle"]["shutdownPolicy"],

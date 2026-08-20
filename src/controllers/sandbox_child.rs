@@ -284,16 +284,20 @@ fn default_internal_priority() -> u32 {
 /// Names alone are not identity. A same-named replacement cluster is fresh
 /// capacity, not evidence that the original was destroyed, and #80's receipts
 /// are checked against these UIDs rather than against a name that may have been
-/// reused in between.
+/// reused in between. Management objects keep their management namespace,
+/// while `target.namespace` is the namespace inside the child cluster; merging
+/// those two authorities would make later upstream provenance look like a
+/// target substitution.
 pub fn child_provenance(
-    namespace: &str,
+    management_namespace: &str,
+    target_namespace: &str,
     lease: &ClusterLease,
     instance_name: &str,
     instance_uid: &str,
     instance_generation: Option<i64>,
 ) -> crate::crd::SandboxTargetProvenance {
     crate::crd::SandboxTargetProvenance {
-        namespace: namespace.to_string(),
+        namespace: target_namespace.to_string(),
         child_cluster_lease: Some(SandboxObjectReference {
             api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
             kind: "ClusterLease".to_string(),
@@ -305,7 +309,7 @@ pub fn child_provenance(
         child_cluster_instance: Some(SandboxObjectReference {
             api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
             kind: "ClusterInstance".to_string(),
-            namespace: Some(namespace.to_string()),
+            namespace: Some(management_namespace.to_string()),
             name: instance_name.to_string(),
             uid: instance_uid.to_string(),
             generation: instance_generation,
@@ -557,14 +561,37 @@ mod tests {
                 .unwrap();
         let mut lease = lease;
         lease.metadata.uid = Some("internal-lease-uid".into());
+        lease.metadata.generation = Some(1);
 
-        let provenance = child_provenance("kobe", &lease, "kobe-abc", "instance-uid", Some(4));
+        let provenance = child_provenance(
+            "test-ns",
+            "kobe-sandbox",
+            &lease,
+            "kobe-abc",
+            "instance-uid",
+            Some(4),
+        );
+
+        assert_eq!(provenance.namespace, "kobe-sandbox");
+        let placement = crate::crd::ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterPool".into(),
+                namespace: Some("test-ns".into()),
+                name: "children".into(),
+                uid: "pool-uid".into(),
+                generation: Some(1),
+            },
+        };
+        crate::sandbox::merge_target_provenance(None, provenance.clone(), &placement, "test-ns")
+            .expect("the child target namespace must be valid for child placement");
 
         let recorded_lease = provenance.child_cluster_lease.unwrap();
         assert_eq!(recorded_lease.uid, "internal-lease-uid");
         assert_eq!(recorded_lease.kind, "ClusterLease");
 
         let instance = provenance.child_cluster_instance.unwrap();
+        assert_eq!(instance.namespace.as_deref(), Some("test-ns"));
         assert_eq!(instance.uid, "instance-uid");
         assert_eq!(instance.generation, Some(4));
         assert!(

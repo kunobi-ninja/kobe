@@ -90,7 +90,8 @@ fn sandbox_resource() -> ApiResource {
 /// is upstream's own label selector for its Pods. Both are followed rather than
 /// guessed from a naming convention: a convention that upstream changes would
 /// silently start selecting the wrong Pod, and the wrong Pod is one belonging
-/// to another tenant.
+/// to another tenant. Each hop must also carry the exact controller owner UID;
+/// status and label fields identify candidates, but never confer authority.
 /// The exact upstream objects behind one claim.
 ///
 /// Identities, not just names: #81 resolves every Sandbox operation through
@@ -109,6 +110,9 @@ pub async fn resolve_sandbox_pod(
     namespace: &str,
     claim: &DynamicObject,
 ) -> Result<Option<ResolvedSandboxPod>, String> {
+    let Some(claim_uid) = claim.uid().filter(|uid| !uid.is_empty()) else {
+        return Ok(None);
+    };
     let Some(sandbox_name) = claim
         .data
         .get("status")
@@ -128,6 +132,21 @@ pub async fn resolve_sandbox_pod(
         Ok(sandbox) => sandbox,
         Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
         Err(error) => return Err(format!("sandbox lookup failed: {error}")),
+    };
+    if !super::sandbox::metadata_is_controlled_by(
+        &sandbox.metadata,
+        crate::sandbox::AGENT_SANDBOX_API_VERSION,
+        crate::sandbox::SANDBOX_CLAIM_KIND,
+        &claim.name_any(),
+        &claim_uid,
+    ) {
+        return Err(format!(
+            "Sandbox {sandbox_name} is not controlled by SandboxClaim {} uid {claim_uid}",
+            claim.name_any()
+        ));
+    }
+    let Some(sandbox_uid) = sandbox.uid().filter(|uid| !uid.is_empty()) else {
+        return Ok(None);
     };
 
     let Some(selector) = sandbox
@@ -163,9 +182,22 @@ pub async fn resolve_sandbox_pod(
         return Err("sandbox selector matched more than one running pod".to_string());
     }
 
+    if !super::sandbox::metadata_is_controlled_by(
+        &pod.metadata,
+        SANDBOX_API_VERSION,
+        SANDBOX_KIND,
+        sandbox_name,
+        &sandbox_uid,
+    ) {
+        return Err(format!(
+            "Pod {} is not controlled by Sandbox {sandbox_name} uid {sandbox_uid}",
+            pod.name_any()
+        ));
+    }
+
     // A Pod with no UID cannot be fenced, and an unfenceable target is one a
     // later same-named Pod could impersonate.
-    let (Some(sandbox_uid), Some(pod_uid)) = (sandbox.uid(), pod.uid()) else {
+    let Some(pod_uid) = pod.uid().filter(|uid| !uid.is_empty()) else {
         return Ok(None);
     };
     Ok(Some(ResolvedSandboxPod {
@@ -321,6 +353,22 @@ mod tests {
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 
+    fn claim_with_sandbox() -> DynamicObject {
+        let mut claim = DynamicObject::new(
+            "kobe-sbx-1",
+            &ApiResource {
+                group: "extensions.agents.x-k8s.io".into(),
+                version: "v1beta1".into(),
+                api_version: crate::sandbox::AGENT_SANDBOX_API_VERSION.into(),
+                kind: crate::sandbox::SANDBOX_CLAIM_KIND.into(),
+                plural: "sandboxclaims".into(),
+            },
+        );
+        claim.metadata.uid = Some("claim-uid".into());
+        claim.data = serde_json::json!({ "status": { "sandbox": { "name": "sbx" } } });
+        claim
+    }
+
     fn status(value: &str, reason: Option<&str>) -> Option<Status> {
         Some(Status {
             status: Some(value.to_string()),
@@ -442,6 +490,152 @@ mod tests {
         );
     }
 
+    /// The documented status/selector chain identifies candidates, while the
+    /// exact controller-owner chain supplies authority.
+    #[tokio::test]
+    async fn exact_claim_sandbox_pod_owner_chain_resolves() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": SANDBOX_API_VERSION,
+                "kind": SANDBOX_KIND,
+                "metadata": {
+                    "name": "sbx", "namespace": "test-ns", "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::sandbox::AGENT_SANDBOX_API_VERSION,
+                        "kind": crate::sandbox::SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1", "uid": "claim-uid", "controller": true,
+                    }],
+                },
+                "status": { "selector": "agents.x-k8s.io/sandbox=sbx" },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList", "metadata": { "resourceVersion": "1" },
+                "items": [{
+                    "metadata": {
+                        "name": "pod-a", "namespace": "test-ns", "uid": "pod-uid",
+                        "ownerReferences": [{
+                            "apiVersion": SANDBOX_API_VERSION,
+                            "kind": SANDBOX_KIND,
+                            "name": "sbx", "uid": "sandbox-uid", "controller": true,
+                        }],
+                    },
+                    "status": { "phase": "Running" },
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            resolve_sandbox_pod(&client, "test-ns", &claim_with_sandbox()).await,
+            Ok(Some(ResolvedSandboxPod {
+                sandbox_name: "sbx".into(),
+                sandbox_uid: "sandbox-uid".into(),
+                pod_name: "pod-a".into(),
+                pod_uid: "pod-uid".into(),
+            }))
+        );
+    }
+
+    /// A status name cannot substitute a Sandbox owned by another Claim.
+    #[tokio::test]
+    async fn foreign_sandbox_owner_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": SANDBOX_API_VERSION, "kind": SANDBOX_KIND,
+                "metadata": {
+                    "name": "sbx", "namespace": "test-ns", "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::sandbox::AGENT_SANDBOX_API_VERSION,
+                        "kind": crate::sandbox::SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1", "uid": "foreign-claim-uid", "controller": true,
+                    }],
+                },
+                "status": { "selector": "agents.x-k8s.io/sandbox=sbx" },
+            })))
+            .mount(&server)
+            .await;
+
+        let error = resolve_sandbox_pod(&client, "test-ns", &claim_with_sandbox())
+            .await
+            .expect_err("a foreign Sandbox must not be resolved");
+        assert!(error.contains("not controlled by SandboxClaim"));
+    }
+
+    /// A matching selector cannot substitute a Pod owned by another Sandbox.
+    #[tokio::test]
+    async fn selector_spoofed_pod_owner_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": SANDBOX_API_VERSION, "kind": SANDBOX_KIND,
+                "metadata": {
+                    "name": "sbx", "namespace": "test-ns", "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::sandbox::AGENT_SANDBOX_API_VERSION,
+                        "kind": crate::sandbox::SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1", "uid": "claim-uid", "controller": true,
+                    }],
+                },
+                "status": { "selector": "agents.x-k8s.io/sandbox=sbx" },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/pods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PodList", "metadata": { "resourceVersion": "1" },
+                "items": [{
+                    "metadata": {
+                        "name": "pod-a", "namespace": "test-ns", "uid": "pod-uid",
+                        "ownerReferences": [{
+                            "apiVersion": SANDBOX_API_VERSION,
+                            "kind": SANDBOX_KIND,
+                            "name": "sbx", "uid": "foreign-sandbox-uid", "controller": true,
+                        }],
+                    },
+                    "status": { "phase": "Running" },
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        let error = resolve_sandbox_pod(&client, "test-ns", &claim_with_sandbox())
+            .await
+            .expect_err("a selector-spoofed Pod must not be resolved");
+        assert!(error.contains("not controlled by Sandbox"));
+    }
+
     /// An ambiguous selector is refused rather than resolved arbitrarily.
     ///
     /// Executing into "whichever Pod came back first" is how a canary ends up
@@ -462,7 +656,18 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": SANDBOX_API_VERSION,
                 "kind": SANDBOX_KIND,
-                "metadata": { "name": "sbx", "namespace": "test-ns" },
+                "metadata": {
+                    "name": "sbx",
+                    "namespace": "test-ns",
+                    "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::sandbox::AGENT_SANDBOX_API_VERSION,
+                        "kind": crate::sandbox::SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1",
+                        "uid": "claim-uid",
+                        "controller": true,
+                    }],
+                },
                 "status": { "selector": "agents.x-k8s.io/sandbox=sbx" },
             })))
             .mount(&server)
@@ -493,6 +698,7 @@ mod tests {
                 plural: "sandboxclaims".into(),
             },
         );
+        claim.metadata.uid = Some("claim-uid".into());
         claim.data = serde_json::json!({ "status": { "sandbox": { "name": "sbx" } } });
 
         assert!(
@@ -524,7 +730,18 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": SANDBOX_API_VERSION,
                 "kind": SANDBOX_KIND,
-                "metadata": { "name": "sbx", "namespace": "test-ns" },
+                "metadata": {
+                    "name": "sbx",
+                    "namespace": "test-ns",
+                    "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::sandbox::AGENT_SANDBOX_API_VERSION,
+                        "kind": crate::sandbox::SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1",
+                        "uid": "claim-uid",
+                        "controller": true,
+                    }],
+                },
                 "status": { "selector": "agents.x-k8s.io/sandbox=sbx" },
             })))
             .mount(&server)
@@ -557,6 +774,7 @@ mod tests {
                 plural: "sandboxclaims".into(),
             },
         );
+        claim.metadata.uid = Some("claim-uid".into());
         claim.data = serde_json::json!({ "status": { "sandbox": { "name": "sbx" } } });
 
         assert_eq!(

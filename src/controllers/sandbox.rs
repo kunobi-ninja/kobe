@@ -22,6 +22,8 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams, Preconditions,
     PropagationPolicy,
@@ -103,22 +105,94 @@ fn upstream_resource(kind: &str, plural: &str) -> ApiResource {
     }
 }
 
-/// Server-side apply, so a drifted upstream object is corrected rather than
-/// duplicated, and two replicas reconciling the same pool converge instead of
-/// fighting.
+/// Create or update one exact controller-owned upstream object.
+///
+/// Ownership is checked before force-SSA and updates carry the observed
+/// resourceVersion. Without both fences, a same-named foreign object or a
+/// delete-and-recreate race could be adopted while correcting ordinary drift.
 async fn apply_upstream(
     client: &Client,
     namespace: &str,
     resource: &ApiResource,
     object: &DynamicObject,
-) -> Result<DynamicObject, kube::Error> {
+    owner: &OwnerReference,
+) -> Result<DynamicObject, SandboxPlacementError> {
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, resource);
-    api.patch(
-        &object.name_any(),
-        &PatchParams::apply(crate::sandbox::KOBE_MANAGED_BY).force(),
-        &Patch::Apply(object),
-    )
-    .await
+    let existing = match api.get(&object.name_any()).await {
+        Ok(existing) => Some(existing),
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            match api.create(&PostParams::default(), object).await {
+                Ok(created) => {
+                    if !metadata_is_controlled_by(
+                        &created.metadata,
+                        &owner.api_version,
+                        &owner.kind,
+                        &owner.name,
+                        &owner.uid,
+                    ) {
+                        return Err(SandboxPlacementError::Invalid(format!(
+                            "created {} {} without the expected owner",
+                            resource.kind,
+                            object.name_any()
+                        )));
+                    }
+                    return Ok(created);
+                }
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    Some(api.get(&object.name_any()).await?)
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let existing = existing.expect("owned object lookup resolves above");
+    if !metadata_is_controlled_by(
+        &existing.metadata,
+        &owner.api_version,
+        &owner.kind,
+        &owner.name,
+        &owner.uid,
+    ) {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "{} {} exists but is not controlled by {} {} uid {}",
+            resource.kind,
+            object.name_any(),
+            owner.kind,
+            owner.name,
+            owner.uid
+        )));
+    }
+    let resource_version = existing.resource_version().ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "{} {} has no resourceVersion",
+            resource.kind,
+            object.name_any()
+        ))
+    })?;
+    let mut desired = object.clone();
+    desired.metadata.resource_version = Some(resource_version);
+    let applied = api
+        .patch(
+            &object.name_any(),
+            &PatchParams::apply(crate::sandbox::KOBE_MANAGED_BY).force(),
+            &Patch::Apply(&desired),
+        )
+        .await?;
+    if !metadata_is_controlled_by(
+        &applied.metadata,
+        &owner.api_version,
+        &owner.kind,
+        &owner.name,
+        &owner.uid,
+    ) {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "{} {} changed owner during reconciliation",
+            resource.kind,
+            object.name_any()
+        )));
+    }
+    Ok(applied)
 }
 
 /// Apply one pool's `SandboxTemplate` and `SandboxWarmPool` into a cluster.
@@ -128,25 +202,23 @@ async fn apply_upstream(
 /// semantics across placements, and equivalence built from one code path is
 /// the only kind that stays true.
 ///
-/// `owner` is `None` in a child cluster, and that is not an oversight: an owner
-/// reference names an object *in the same cluster*, so a reference to a
-/// management-cluster `SandboxPool` would name nothing there and Kubernetes
-/// garbage collection would delete the template immediately. A child cluster's
-/// objects are bounded by the cluster's own lifetime instead — it is torn down
-/// whole.
+/// In management placement `owner` is the exact `SandboxPool`; in a child it is
+/// the exact target `Namespace`. Both are same-cluster controller references,
+/// so no upstream object is ever adopted by name alone.
 async fn ensure_upstream_pool_objects(
     client: &Client,
     namespace: &str,
     pool_name: &str,
     spec: &crate::crd::SandboxPoolSpec,
-    owner: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
-) -> Result<(), SandboxPlacementError> {
-    let template = build_sandbox_template(&template_name(pool_name), namespace, spec, owner)?;
-    apply_upstream(
+    owner: &OwnerReference,
+) -> Result<(DynamicObject, DynamicObject), SandboxPlacementError> {
+    let template = build_sandbox_template(&template_name(pool_name), namespace, spec, Some(owner))?;
+    let template = apply_upstream(
         client,
         namespace,
         &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
         &template,
+        owner,
     )
     .await?;
 
@@ -155,16 +227,17 @@ async fn ensure_upstream_pool_objects(
         namespace,
         &template_name(pool_name),
         spec.warm_capacity,
-        owner,
+        Some(owner),
     )?;
-    apply_upstream(
+    let warm_pool = apply_upstream(
         client,
         namespace,
         &upstream_resource(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
         &warm_pool,
+        owner,
     )
     .await?;
-    Ok(())
+    Ok((template, warm_pool))
 }
 
 /// Reconcile one `SandboxPool` into its controller-owned upstream objects.
@@ -193,7 +266,7 @@ pub async fn reconcile_pool(
         &name,
         &pool.spec,
         // Owner-referenced here, where the parent SandboxPool actually exists.
-        Some(&owner),
+        &owner,
     )
     .await?;
 
@@ -349,6 +422,7 @@ pub async fn reconcile_lease(
             // The parent SandboxPool and SandboxLease live in this cluster, so
             // upstream objects can be owned by them.
             owned: true,
+            claim_owner: None,
         },
         SandboxPlacement::ChildCluster { cluster_pool_ref } => {
             match compose_child_target(&lease, &pool, cluster_pool_ref, &ctx).await? {
@@ -384,17 +458,19 @@ pub async fn reconcile_lease(
         }
     }
 
+    let lease_uid = lease.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to fence its claim"))
+    })?;
     let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to own its claim"))
     })?;
+    let claim_owner = target.claim_owner.as_deref().unwrap_or(&owner);
     let claim = build_sandbox_claim(
         &claim_name(&name),
         &target.namespace,
         &warm_pool_name(&pool.name_any()),
-        // See `ensure_upstream_pool_objects`: an owner reference names an
-        // object in the SAME cluster, so in a child it would name nothing and
-        // the claim would be garbage-collected on sight.
-        target.owned.then_some(&owner),
+        &lease_uid,
+        claim_owner,
     );
 
     let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
@@ -431,53 +507,55 @@ pub async fn reconcile_lease(
             &claim,
         )?;
     }
-    if target.owned {
-        let lease_uid = lease.uid().ok_or_else(|| {
-            SandboxPlacementError::Invalid(format!(
-                "SandboxLease {name} has no UID to fence its claim"
-            ))
-        })?;
-        if !is_controlled_by(
-            &claim,
-            "kobe.kunobi.ninja/v1alpha1",
-            "SandboxLease",
-            &name,
-            &lease_uid,
-        ) {
-            return Err(SandboxPlacementError::Invalid(format!(
-                "SandboxClaim {} is not controlled by SandboxLease {name} uid {lease_uid}",
-                claim.name_any()
-            )));
-        }
-        let mut proposed = status.target.clone().ok_or_else(|| {
-            SandboxPlacementError::Invalid(format!(
-                "lease {name} has no management pool provenance before claim creation"
-            ))
-        })?;
-        proposed.sandbox_claim = Some(target_reference(
-            AGENT_SANDBOX_API_VERSION,
-            SANDBOX_CLAIM_KIND,
-            &target.namespace,
-            &claim,
-        )?);
-        let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
-            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-        let merged = crate::sandbox::merge_target_provenance(
-            status.target.as_ref(),
-            proposed,
-            placement,
-            &ctx.namespace,
-        )
+    if !claim_is_for_lease(&claim, &lease_uid) {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxClaim {} is not labelled for SandboxLease {name} uid {lease_uid}",
+            claim.name_any()
+        )));
+    }
+    if !metadata_is_controlled_by(
+        &claim.metadata,
+        &claim_owner.api_version,
+        &claim_owner.kind,
+        &claim_owner.name,
+        &claim_owner.uid,
+    ) {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxClaim {} is not controlled by the exact target owner {} {} uid {}",
+            claim.name_any(),
+            claim_owner.kind,
+            claim_owner.name,
+            claim_owner.uid
+        )));
+    }
+    let mut proposed = status.target.clone().ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "lease {name} has no target provenance before claim creation"
+        ))
+    })?;
+    proposed.sandbox_claim = Some(target_reference(
+        AGENT_SANDBOX_API_VERSION,
+        SANDBOX_CLAIM_KIND,
+        &target.namespace,
+        &claim,
+    )?);
+    let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
         .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-        if status.target.as_ref() != Some(&merged) {
-            status.target = Some(merged);
-            if patch_lease_status_fenced(&ctx, &lease, &status).await? {
-                debug!(lease = %name, "recorded management claim provenance");
-            } else {
-                debug!(lease = %name, "management claim provenance write lost a status race");
-            }
-            return Ok(Action::await_change());
+    let merged = crate::sandbox::merge_target_provenance(
+        status.target.as_ref(),
+        proposed,
+        placement,
+        &ctx.namespace,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    if status.target.as_ref() != Some(&merged) {
+        status.target = Some(merged);
+        if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+            debug!(lease = %name, "recorded target claim provenance");
+        } else {
+            debug!(lease = %name, "target claim provenance write lost a status race");
         }
+        return Ok(Action::await_change());
     }
     if !upstream_claim_is_ready(&claim) {
         debug!(lease = %name, "claim not Ready yet; TTL clock has not started");
@@ -1587,7 +1665,11 @@ fn is_controlled_by(
     metadata_is_controlled_by(&object.metadata, api_version, kind, name, uid)
 }
 
-fn metadata_is_controlled_by(
+/// Whether metadata carries one exact controller owner reference.
+///
+/// Shared with Sandbox-to-Pod resolution so every adoption boundary uses the
+/// same name+UID+GVK rule.
+pub(super) fn metadata_is_controlled_by(
     metadata: &kube::api::ObjectMeta,
     api_version: &str,
     kind: &str,
@@ -1603,6 +1685,19 @@ fn metadata_is_controlled_by(
                 && owner.controller == Some(true)
         })
     })
+}
+
+/// Cross-cluster ownership fence for an upstream claim.
+///
+/// A child-cluster object cannot carry an owner reference to the outer
+/// management-cluster lease. The controller-owned UID label therefore has to
+/// match before Kobe adopts, observes, or mutates it; the Claim name is checked
+/// separately against its deterministic derived name.
+fn claim_is_for_lease(claim: &DynamicObject, lease_uid: &str) -> bool {
+    let labels = claim.labels();
+    labels
+        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+        .is_some_and(|value| value == lease_uid)
 }
 
 fn target_reference(
@@ -1825,6 +1920,9 @@ struct Target {
     /// Kobe parent. True only in the management cluster, where that parent
     /// exists — see [`ensure_upstream_pool_objects`].
     owned: bool,
+    /// Exact same-cluster controller for child upstream objects. Management
+    /// placement uses the outer lease directly and leaves this empty.
+    claim_owner: Option<Box<OwnerReference>>,
 }
 
 /// A child cluster is either usable now, or it is not there yet.
@@ -1832,6 +1930,85 @@ enum ChildTarget {
     Ready(Target),
     /// Composition is in progress; the action says when to look again.
     Pending(Action),
+}
+
+const CHILD_LEASE_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
+
+/// Create or adopt the fixed target namespace inside one exclusive child.
+///
+/// The outer lease lives in another Kubernetes cluster and cannot be an owner
+/// reference here. Exact lease-UID metadata fences adoption, while the
+/// namespace itself becomes the same-cluster controller owner for every
+/// upstream object Kobe creates below it.
+async fn ensure_child_namespace(
+    client: &Client,
+    lease_name: &str,
+    lease_uid: &str,
+) -> Result<Namespace, SandboxPlacementError> {
+    let namespaces: Api<Namespace> = Api::all(client.clone());
+    let desired = Namespace {
+        metadata: kube::api::ObjectMeta {
+            name: Some(CHILD_SANDBOX_NAMESPACE.to_string()),
+            labels: Some(
+                [
+                    (
+                        "app.kubernetes.io/managed-by".to_string(),
+                        crate::sandbox::KOBE_MANAGED_BY.to_string(),
+                    ),
+                    (
+                        crate::sandbox::SANDBOX_LEASE_UID_LABEL.to_string(),
+                        lease_uid.to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            annotations: Some(
+                [(
+                    CHILD_LEASE_NAME_ANNOTATION.to_string(),
+                    lease_name.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let namespace = match namespaces.get(CHILD_SANDBOX_NAMESPACE).await {
+        Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            match namespaces.create(&PostParams::default(), &desired).await {
+                Ok(created) => created,
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    namespaces.get(CHILD_SANDBOX_NAMESPACE).await?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let labels = namespace.labels();
+    let annotations = namespace.annotations();
+    if namespace.metadata.deletion_timestamp.is_some()
+        || labels
+            .get("app.kubernetes.io/managed-by")
+            .is_none_or(|value| value != crate::sandbox::KOBE_MANAGED_BY)
+        || labels
+            .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+            .is_none_or(|value| value != lease_uid)
+        || annotations
+            .get(CHILD_LEASE_NAME_ANNOTATION)
+            .is_none_or(|value| value != lease_name)
+        || namespace.uid().is_none_or(|uid| uid.is_empty())
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "namespace {CHILD_SANDBOX_NAMESPACE} is not owned by SandboxLease {lease_name} uid {lease_uid}"
+        )));
+    }
+    Ok(namespace)
 }
 
 /// Acquire — or resume — the exclusive child cluster this lease runs in.
@@ -1941,6 +2118,7 @@ async fn compose_child_target(
     // matters — a crash partway through.
     let child_provenance = child::child_provenance(
         &ctx.namespace,
+        CHILD_SANDBOX_NAMESPACE,
         &binding.lease,
         &binding.binding.instance.name,
         &binding.binding.instance.uid,
@@ -2015,21 +2193,68 @@ async fn compose_child_target(
     // different issue number what it was told to hold.
     child::validate_child_runtime(&child_client, &binding.binding.instance.name).await?;
 
+    let target_namespace = ensure_child_namespace(&child_client, &name, &lease_uid).await?;
+    let namespace_owner = target_namespace.controller_owner_ref(&()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "namespace {CHILD_SANDBOX_NAMESPACE} has no UID to own child Sandbox objects"
+        ))
+    })?;
+
     // The pool's template and warm pool have to exist inside the child; nothing
     // else reconciles them there.
-    ensure_upstream_pool_objects(
+    let (template, warm_pool) = ensure_upstream_pool_objects(
         &child_client,
         CHILD_SANDBOX_NAMESPACE,
         &pool.name_any(),
         &pool.spec,
-        None,
+        &namespace_owner,
     )
     .await?;
+
+    // Record the exact child-side pool objects before creating a Claim. A
+    // restart after Claim creation must already know which Template/WarmPool
+    // identities it is authorised to observe and later verify.
+    let status = lease.status.clone().unwrap_or_default();
+    let mut proposed = status.target.clone().ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!("lease {name} has no child composition provenance"))
+    })?;
+    proposed.sandbox_template = Some(target_reference(
+        AGENT_SANDBOX_API_VERSION,
+        SANDBOX_TEMPLATE_KIND,
+        CHILD_SANDBOX_NAMESPACE,
+        &template,
+    )?);
+    proposed.sandbox_warm_pool = Some(target_reference(
+        AGENT_SANDBOX_API_VERSION,
+        SANDBOX_WARM_POOL_KIND,
+        CHILD_SANDBOX_NAMESPACE,
+        &warm_pool,
+    )?);
+    let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    let provenance = crate::sandbox::merge_target_provenance(
+        status.target.as_ref(),
+        proposed,
+        placement,
+        &ctx.namespace,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    if status.target.as_ref() != Some(&provenance) {
+        let mut next = status;
+        next.target = Some(provenance);
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            debug!(lease = %name, "recorded child pool provenance");
+        } else {
+            debug!(lease = %name, "child pool provenance write lost a status race");
+        }
+        return Ok(ChildTarget::Pending(Action::await_change()));
+    }
 
     Ok(ChildTarget::Ready(Target {
         client: child_client,
         namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
         owned: false,
+        claim_owner: Some(Box::new(namespace_owner)),
     }))
 }
 
@@ -2511,6 +2736,9 @@ pub(crate) mod tests {
                 "namespace": NS,
                 "uid": "claim-uid",
                 "resourceVersion": "77",
+                "labels": {
+                    "kobe.kunobi.ninja/sandbox-lease-uid": "lease-uid-1",
+                },
                 "ownerReferences": [{
                     "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                     "kind": "SandboxLease",
@@ -2529,7 +2757,16 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
                 "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
-                "metadata": { "name": "sbx", "namespace": NS, "uid": "sandbox-uid" },
+                "metadata": {
+                    "name": "sbx", "namespace": NS, "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": AGENT_SANDBOX_API_VERSION,
+                        "kind": SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1",
+                        "uid": "claim-uid",
+                        "controller": true,
+                    }],
+                },
                 "status": { "selector": "kobe.test/sandbox=sbx" },
             })))
             .mount(server)
@@ -2543,7 +2780,16 @@ pub(crate) mod tests {
                 "items": [{
                     "apiVersion": "v1",
                     "kind": "Pod",
-                    "metadata": { "name": "sandbox-pod", "namespace": NS, "uid": "pod-uid" },
+                    "metadata": {
+                        "name": "sandbox-pod", "namespace": NS, "uid": "pod-uid",
+                        "ownerReferences": [{
+                            "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                            "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                            "name": "sbx",
+                            "uid": "sandbox-uid",
+                            "controller": true,
+                        }],
+                    },
                     "status": { "phase": "Running" },
                 }],
             })))
@@ -2559,6 +2805,214 @@ pub(crate) mod tests {
             .iter()
             .filter(|request| request.method.as_str() == method && request.url.path() == target)
             .count()
+    }
+
+    /// A child namespace is adopted only when its cross-cluster lease UID
+    /// fence matches; a same-named namespace is not authority.
+    #[tokio::test]
+    async fn child_namespace_is_created_with_exact_lease_identity() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kobe-sandbox"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "kobe-sandbox",
+                    "uid": "namespace-uid",
+                    "labels": {
+                        "app.kubernetes.io/managed-by": crate::sandbox::KOBE_MANAGED_BY,
+                        "kobe.kunobi.ninja/sandbox-lease-uid": "lease-uid",
+                    },
+                    "annotations": {
+                        "kobe.kunobi.ninja/sandbox-lease-name": "lease-name",
+                    },
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let namespace = ensure_child_namespace(&client, "lease-name", "lease-uid")
+            .await
+            .expect("the exact namespace must be created");
+        let owner = namespace
+            .controller_owner_ref(&())
+            .expect("the namespace UID is an owner fence");
+        assert_eq!(owner.kind, "Namespace");
+        assert_eq!(owner.uid, "namespace-uid");
+    }
+
+    /// A same-named namespace from another composition is never patched or
+    /// adopted into this child placement.
+    #[tokio::test]
+    async fn foreign_child_namespace_is_rejected_without_mutation() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kobe-sandbox"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "kobe-sandbox",
+                    "uid": "foreign-namespace-uid",
+                    "labels": {
+                        "app.kubernetes.io/managed-by": crate::sandbox::KOBE_MANAGED_BY,
+                        "kobe.kunobi.ninja/sandbox-lease-uid": "foreign-lease-uid",
+                    },
+                    "annotations": {
+                        "kobe.kunobi.ninja/sandbox-lease-name": "lease-name",
+                    },
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            ensure_child_namespace(&client, "lease-name", "lease-uid").await,
+            Err(SandboxPlacementError::Invalid(_))
+        ));
+        assert_eq!(requests_to(&server, "POST", "/api/v1/namespaces").await, 0);
+        assert_eq!(
+            requests_to(&server, "PATCH", "/api/v1/namespaces/kobe-sandbox").await,
+            0
+        );
+    }
+
+    /// Force-SSA corrects drift only after an exact owner read and carries the
+    /// read resourceVersion as a replacement-race precondition.
+    #[tokio::test]
+    async fn upstream_apply_is_owner_and_resource_version_fenced() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let owner = OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "SandboxPool".into(),
+            name: "agents".into(),
+            uid: POOL_UID.into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let desired = build_sandbox_template(
+            "kobe-agents",
+            NS,
+            &management_pool(POOL_UID, POOL_GENERATION).spec,
+            Some(&owner),
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(TEMPLATE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION,
+                "kind": SANDBOX_TEMPLATE_KIND,
+                "metadata": {
+                    "name": "kobe-agents", "namespace": NS,
+                    "uid": "template-uid", "resourceVersion": "7",
+                    "ownerReferences": [{
+                        "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                        "kind": "SandboxPool", "name": "agents",
+                        "uid": POOL_UID, "controller": true,
+                    }],
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(TEMPLATE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION,
+                "kind": SANDBOX_TEMPLATE_KIND,
+                "metadata": {
+                    "name": "kobe-agents", "namespace": NS,
+                    "uid": "template-uid", "resourceVersion": "8",
+                    "ownerReferences": [{
+                        "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                        "kind": "SandboxPool", "name": "agents",
+                        "uid": POOL_UID, "controller": true,
+                    }],
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        apply_upstream(
+            &client,
+            NS,
+            &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+            &desired,
+            &owner,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap_or_default();
+        let patch: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method.as_str() == "PATCH")
+                .expect("the owned object is updated")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(patch["metadata"]["resourceVersion"], "7");
+    }
+
+    /// A foreign upstream object is rejected before force-SSA can seize its
+    /// fields or owner reference.
+    #[tokio::test]
+    async fn foreign_upstream_object_is_never_force_applied() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let owner = OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "SandboxPool".into(),
+            name: "agents".into(),
+            uid: POOL_UID.into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let desired = build_sandbox_template(
+            "kobe-agents",
+            NS,
+            &management_pool(POOL_UID, POOL_GENERATION).spec,
+            Some(&owner),
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(TEMPLATE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION,
+                "kind": SANDBOX_TEMPLATE_KIND,
+                "metadata": {
+                    "name": "kobe-agents", "namespace": NS,
+                    "uid": "foreign-template-uid", "resourceVersion": "7",
+                    "ownerReferences": [{
+                        "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                        "kind": "SandboxPool", "name": "agents",
+                        "uid": "foreign-pool-uid", "controller": true,
+                    }],
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            apply_upstream(
+                &client,
+                NS,
+                &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+                &desired,
+                &owner,
+            )
+            .await,
+            Err(SandboxPlacementError::Invalid(_))
+        ));
+        assert_eq!(requests_to(&server, "PATCH", TEMPLATE_PATH).await, 0);
     }
 
     fn status_value_of(request: &wiremock::Request) -> Option<serde_json::Value> {
