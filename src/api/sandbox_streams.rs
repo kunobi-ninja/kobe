@@ -13,13 +13,16 @@
 //! the "verified absent" a receipt reports was verified while somebody was
 //! still typing into it.
 //!
-//! # Per-replica, on purpose
+//! # Local cancellation, global admission
 //!
 //! Each API replica registers the streams *it* is serving. A replica cannot
 //! cancel a connection it does not hold — the socket lives in one process — so
 //! revocation has to happen everywhere, driven by each replica's own watch of
 //! the same lease objects. There is no leader here, and there must not be: a
 //! leader that lost its lock would leave live streams nobody was watching.
+//! [`crate::sandbox_access_ledger`] separately serializes admission and drain
+//! across all replicas; the two mechanisms solve different halves of the
+//! invariant and neither substitutes for the other.
 //!
 //! # Cancel first, then tear down
 //!
@@ -86,7 +89,7 @@ impl StreamIdentity {
         })
     }
 
-    fn principal_key(&self) -> String {
+    pub(crate) fn principal_key(&self) -> String {
         crate::api::sandbox::principal_hash_for(&self.spec.requester)
     }
 
@@ -140,6 +143,9 @@ pub struct StreamGuard {
     lease_uid: String,
     id: u64,
     token: CancellationToken,
+    /// Global lease/principal registration. Its Drop removes the API-server
+    /// CAS entries only after the local socket guard itself is released.
+    distributed: Option<crate::sandbox_access_ledger::AccessGuard>,
 }
 
 impl StreamGuard {
@@ -147,6 +153,12 @@ impl StreamGuard {
     /// access, or when this guard is dropped.
     pub fn cancelled(&self) -> CancellationToken {
         self.token.clone()
+    }
+
+    /// Pair this replica-local socket with its global access registration.
+    pub fn with_distributed(mut self, guard: crate::sandbox_access_ledger::AccessGuard) -> Self {
+        self.distributed = Some(guard);
+        self
     }
 }
 
@@ -256,6 +268,7 @@ impl StreamRegistry {
             lease_uid: lease_uid.to_string(),
             id,
             token,
+            distributed: None,
         })
     }
 
@@ -412,25 +425,26 @@ fn decrement_principal_count(state: &mut RegistryState, principal_key: &str) {
     }
 }
 
-/// How many operations one lease may have in flight on this replica.
+/// How many operations one lease may have in flight across all replicas.
 ///
 /// A lease is one Sandbox with one container. Concurrency beyond a handful is
 /// not a caller doing something reasonable faster — it is a caller turning
 /// their lease into a way to occupy the operator's worker pool, and every
 /// in-flight operation holds a connection to the target cluster.
 ///
-/// Per-replica rather than global: the count is of connections *this* process
-/// is holding, which is the resource actually being protected. A global count
-/// would need coordination that could fail open.
+/// The protected API-server access gate enforces the global bound. The local
+/// registry repeats it as defense in depth and to prevent one process from
+/// consuming more sockets while its distributed deregistration is delayed.
 pub const MAX_STREAMS_PER_LEASE: usize = 8;
 
-/// Aggregate operations one authenticated principal may hold on this replica.
+/// Aggregate operations one authenticated principal may hold globally.
 ///
 /// The per-lease limit alone is not a principal limit: a caller with many
 /// leases could multiply it until every target connection and API worker was
 /// occupied. This bound is intentionally larger than the per-lease allowance
 /// so a normal caller can work across several Sandboxes without being able to
-/// grow without limit.
+/// grow without limit. A principal CAS record in the protected ledger enforces
+/// the bound across replicas; the local counter is an additional process cap.
 pub const MAX_STREAMS_PER_PRINCIPAL: usize = 32;
 
 /// Register one operation for this lease, or refuse because it is at its limit.
@@ -455,7 +469,7 @@ pub async fn register_bounded(
 /// Result of atomically claiming a local stream slot and fencing it against
 /// the latest lease object.
 pub enum ConfirmedStreamRegistration {
-    Registered(StreamGuard),
+    Registered(Box<StreamGuard>),
     LimitReached,
     LeaseEnded,
 }
@@ -495,7 +509,7 @@ pub async fn register_confirmed(
     {
         return Ok(ConfirmedStreamRegistration::LeaseEnded);
     }
-    Ok(ConfirmedStreamRegistration::Registered(guard))
+    Ok(ConfirmedStreamRegistration::Registered(Box::new(guard)))
 }
 
 /// This replica's registry.

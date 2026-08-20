@@ -93,7 +93,10 @@ metadata:
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "create", "delete"]
+    # Admission reservations are immutable objects; distributed Sandbox access
+    # gates additionally use UID/resourceVersion-fenced JSON Patch to serialize
+    # entry and teardown close operations across replicas.
+    verbs: ["get", "list", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["resourcequotas"]
     verbs: ["get"]

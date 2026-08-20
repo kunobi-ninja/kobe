@@ -44,6 +44,11 @@ pub struct AppState<B: ClusterBackend> {
     /// writes and a hard object quota without affecting unrelated leader
     /// elections in the control-plane namespace.
     pub sandbox_reservation_namespace: String,
+    /// Exact process identity used by the distributed Sandbox access ledger.
+    /// Present only when Sandbox routes are enabled; downward-API Pod identity
+    /// plus a fresh boot id make crash recovery distinguish a replacement
+    /// process from a still-live replica.
+    pub sandbox_serving_replica: Option<crate::sandbox_access_ledger::ServingReplica>,
     /// Ambient default backend. **Never an authorization or dispatch input.**
     ///
     /// Before #79 the connect proxy fell back to this when pool/backend
@@ -3194,6 +3199,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: None,
             datastore: Default::default(),
@@ -3225,6 +3231,7 @@ mod tests {
             backend: crate::testutil::MockBackend::new(),
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
             factory: None,
             datastore: Default::default(),
@@ -3315,6 +3322,7 @@ mod tests {
             backend: crate::testutil::MockBackend::new(),
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
             factory: None,
             datastore: Default::default(),
@@ -3746,6 +3754,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: None,
             datastore: Default::default(),
@@ -3827,6 +3836,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: Some(factory),
             datastore,
@@ -3922,6 +3932,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: Some(factory),
             datastore,
@@ -4028,6 +4039,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: Some(factory),
             datastore,
@@ -4109,6 +4121,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: None,
             datastore: Default::default(),
@@ -4557,6 +4570,7 @@ mod tests {
             backend,
             namespace: "test-ns".to_string(),
             sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
             authenticator,
             factory: None,
             datastore: Default::default(),

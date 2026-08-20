@@ -256,6 +256,9 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["selfsubjectreviews"]
     verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -341,6 +344,41 @@ spec:
 		`SelfSubjectReview returned ${review.status?.userInfo?.username ?? "<missing>"}`,
 	);
 	info("operator identity confirmed by SelfSubjectReview");
+	for (const verb of ["get", "list", "create", "patch", "delete"]) {
+		result = await runCommand(
+			[
+				"kubectl",
+				"--context",
+				context,
+				`--as=${operatorUsername}`,
+				"create",
+				"-f",
+				"-",
+				"--validate=false",
+				"-o",
+				"json",
+			],
+			{
+				stdin: JSON.stringify({
+					apiVersion: "authorization.k8s.io/v1",
+					kind: "SelfSubjectAccessReview",
+					metadata: {},
+					spec: {
+						resourceAttributes: {
+							group: "coordination.k8s.io",
+							version: "v1",
+							resource: "leases",
+							namespace: ledgerNamespace,
+							verb,
+						},
+					},
+				}),
+			},
+		);
+		const access = JSON.parse(result.stdout);
+		assert(access.status?.allowed === true, `operator lacks Lease ${verb}`);
+	}
+	info("operator access-ledger verbs confirmed by SelfSubjectAccessReview");
 
 	// `kubectlAs` cannot carry stdin; use the generic runner for the mutating
 	// requests so the impersonated identity and exact object body stay visible.
@@ -370,6 +408,65 @@ spec:
 	await createAs(operatorUsername, "operator-slot-0");
 	await createAs(operatorUsername, "operator-slot-1");
 	info("operator reservation CREATE accepted");
+
+	const slot = JSON.parse(
+		(
+			await kubectlAs(operatorUsername, [
+				"get",
+				"lease.coordination.k8s.io",
+				"operator-slot-0",
+				"-n",
+				ledgerNamespace,
+				"-o",
+				"json",
+			])
+		).stdout,
+	);
+	const slotPatch = JSON.stringify([
+		{ op: "test", path: "/metadata/uid", value: slot.metadata.uid },
+		{
+			op: "test",
+			path: "/metadata/resourceVersion",
+			value: slot.metadata.resourceVersion,
+		},
+		{
+			op: "add",
+			path: "/metadata/annotations",
+			value: {
+				"kobe.kunobi.ninja/sandbox-access-state": "open",
+				"kobe.kunobi.ninja/sandbox-access-entries": "{}",
+			},
+		},
+	]);
+	result = await kubectlAs(operatorUsername, [
+		"patch",
+		"lease.coordination.k8s.io",
+		"operator-slot-0",
+		"-n",
+		ledgerNamespace,
+		"--type=json",
+		"-p",
+		slotPatch,
+	]);
+	assert(result.exitCode === 0, "operator UID/resourceVersion PATCH failed");
+	result = await kubectlAs(
+		operatorUsername,
+		[
+			"patch",
+			"lease.coordination.k8s.io",
+			"operator-slot-0",
+			"-n",
+			ledgerNamespace,
+			"--type=json",
+			"-p",
+			slotPatch,
+		],
+		true,
+	);
+	assert(result.exitCode !== 0, "stale access-ledger CAS PATCH succeeded");
+	info(
+		"operator access-ledger PATCH accepted and stale resourceVersion rejected",
+	);
 
 	result = await runCommand(
 		[

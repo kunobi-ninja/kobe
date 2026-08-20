@@ -182,6 +182,11 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["selfsubjectreviews"]
     verbs: ["create"]
+  # Prove the running ServiceAccount can perform every coordination-Lease verb
+  # used by reservation cleanup and distributed Sandbox access CAS.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

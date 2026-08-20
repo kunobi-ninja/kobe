@@ -66,9 +66,10 @@ container. Canary `argv` is executed directly, without an implicit shell.
 
 ## Admission ledger namespace
 
-Sandbox quota slots and aliases are coordination `Lease` objects. When Sandbox
-mode is enabled, the chart creates a dedicated namespace named from the
-immutable Helm release identity (`<release>-sandbox-ledger-<hash>`) with:
+Sandbox quota slots, aliases, and distributed operation gates are coordination
+`Lease` objects. When Sandbox mode is enabled, the chart creates a dedicated
+namespace named from the immutable Helm release identity
+(`<release>-sandbox-ledger-<hash>`) with:
 
 - a `ValidatingAdmissionPolicy` that permits Lease mutations only from the
   exact Kobe operator ServiceAccount;
@@ -80,8 +81,9 @@ immutable Helm release identity (`<release>-sandbox-ledger-<hash>`) with:
 
 The namespace, policy, binding, and quota are retained on Helm uninstall.
 Deleting any of them while a `SandboxLease` is live can free its admission slot
-before teardown is proved. Remove retained ledger resources only after every
-Sandbox lease and reservation has been verified absent. The admission policy
+or erase the proof that all API replicas drained before teardown. Remove
+retained ledger resources only after every Sandbox lease, reservation, and
+operation gate has been verified absent. The admission policy
 requires Kubernetes 1.30 or newer with the `ValidatingAdmissionPolicy` and
 `ResourceQuota` admission plugins enabled. Before serving Sandbox routes, Kobe
 confirms its authenticated ServiceAccount identity and proves both plugins with

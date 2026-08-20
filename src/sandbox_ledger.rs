@@ -9,6 +9,9 @@ use k8s_openapi::api::admissionregistration::v1::{
     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
 };
 use k8s_openapi::api::authentication::v1::SelfSubjectReview;
+use k8s_openapi::api::authorization::v1::{
+    ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+};
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, ResourceQuota};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -98,6 +101,7 @@ async fn validate_once(
         object_limit,
     )?;
     validate_operator_identity(client, operator_username).await?;
+    validate_lease_permissions(client, namespace).await?;
     validate_admission_enforcement(client, namespace).await
 }
 
@@ -117,6 +121,39 @@ async fn validate_operator_identity(
         return Err(SandboxLedgerError::Invalid(
             "operator ServiceAccount identity",
         ));
+    }
+    Ok(())
+}
+
+/// Prove every verb used by admission and distributed access CAS before the
+/// HTTP listener starts. A chart drift that omits `patch` must not produce a
+/// healthy API that fails only when teardown tries to close an access gate.
+async fn validate_lease_permissions(
+    client: &Client,
+    namespace: &str,
+) -> Result<(), SandboxLedgerError> {
+    let reviews: Api<SelfSubjectAccessReview> = Api::all(client.clone());
+    for verb in ["get", "list", "create", "patch", "delete"] {
+        let review = SelfSubjectAccessReview {
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(ResourceAttributes {
+                    group: Some("coordination.k8s.io".into()),
+                    version: Some("v1".into()),
+                    resource: Some("leases".into()),
+                    namespace: Some(namespace.into()),
+                    verb: Some(verb.into()),
+                    ..ResourceAttributes::default()
+                }),
+                ..SelfSubjectAccessReviewSpec::default()
+            },
+            ..SelfSubjectAccessReview::default()
+        };
+        let result = reviews.create(&PostParams::default(), &review).await?;
+        if !result.status.is_some_and(|status| status.allowed) {
+            return Err(SandboxLedgerError::Invalid(
+                "operator coordination-Lease permissions",
+            ));
+        }
     }
     Ok(())
 }

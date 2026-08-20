@@ -58,6 +58,11 @@ pub struct SandboxContext {
     /// It is separate from workload/control-plane objects so a hard ledger
     /// quota cannot starve unrelated controllers or leader election.
     pub reservation_namespace: String,
+    /// Whether the protected distributed access ledger is available.
+    /// Production lifecycle controllers always enable it; focused controller
+    /// unit tests may disable it and exercise the barrier through its own
+    /// API-server CAS suite instead of duplicating every teardown fixture.
+    access_ledger_enabled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1378,6 +1383,41 @@ async fn drive_release(
             debug!(lease = %name, "Releasing checkpoint lost a status race");
         }
         return Ok(Action::await_change());
+    }
+
+    // Close the API-server gate before touching credentials or workload.
+    // Every handler enters this exact gate before it resolves the target or
+    // mints a Pod-bound token, and the close races entry under one
+    // resourceVersion. Empty therefore proves that every replica has dropped
+    // its registered operation; a local watch or a sleep cannot provide that
+    // cross-replica ordering guarantee.
+    if ctx.access_ledger_enabled {
+        match crate::sandbox_access_ledger::close_and_drain(
+            &ctx.client,
+            &ctx.reservation_namespace,
+            lease,
+        )
+        .await
+        {
+            Ok(crate::sandbox_access_ledger::AccessDrain::Drained) => {}
+            Ok(
+                crate::sandbox_access_ledger::AccessDrain::Checkpointed
+                | crate::sandbox_access_ledger::AccessDrain::Waiting,
+            ) => return Ok(Action::requeue(std::time::Duration::from_secs(2))),
+            Err(
+                crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
+                | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
+            ) => return quarantine_lease(lease, ctx, "access_drain_unverifiable").await,
+            Err(crate::sandbox_access_ledger::AccessLedgerError::Kubernetes(kube::Error::Api(
+                response,
+            ))) if response.code == 401 || response.code == 403 => {
+                return quarantine_lease(lease, ctx, "access_drain_forbidden").await;
+            }
+            Err(error) => {
+                warn!(lease = %name, error = %error, "could not prove Sandbox access drained");
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+        }
     }
 
     let child_placed = is_child_placed(lease, ctx).await;
@@ -3014,6 +3054,7 @@ pub async fn run_sandbox_controller(
         client: client.clone(),
         namespace: namespace.to_string(),
         reservation_namespace: reservation_namespace.to_string(),
+        access_ledger_enabled: true,
     });
 
     let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
@@ -3168,6 +3209,7 @@ pub(crate) mod tests {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.to_string(),
             reservation_namespace: NS.to_string(),
+            access_ledger_enabled: false,
         });
         for (path_value, kind, uid) in [
             (TEMPLATE_PATH, SANDBOX_TEMPLATE_KIND, "template-uid"),
@@ -3733,6 +3775,7 @@ pub(crate) mod tests {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.into(),
             reservation_namespace: NS.into(),
+            access_ledger_enabled: false,
         });
 
         let upstream = |kind: &str, uid: &str, resource_version: &str, status| {
@@ -5171,6 +5214,86 @@ pub(crate) mod tests {
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
         }
         lease
+    }
+
+    /// The distributed gate is a durable teardown checkpoint: the pass that
+    /// creates it closed must stop before credentials, Claims, or reservations
+    /// are touched. The next pass is the first one allowed to observe it empty.
+    #[tokio::test]
+    async fn release_checkpoints_a_closed_access_gate_before_teardown() {
+        use sha2::{Digest, Sha256};
+
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let lease_uid = lease.uid().unwrap();
+        let gate = format!(
+            "kobe-access-g-{}",
+            &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
+        );
+        let gate_path = format!("{RESERVATIONS_PATH}/{gate}");
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESERVATIONS_PATH))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": gate,
+                    "namespace": NS,
+                    "uid": "access-gate-uid",
+                    "resourceVersion": "1",
+                    "labels": {
+                        "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                        "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
+                        "kobe.kunobi.ninja/sandbox-lease-uid": lease_uid,
+                    },
+                    "annotations": {
+                        "kobe.kunobi.ninja/sandbox-access-state": "closed",
+                        "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                    },
+                },
+                "spec": {},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        let post = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "POST")
+            .expect("closed gate checkpoint");
+        let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(
+            body["metadata"]["annotations"]["kobe.kunobi.ninja/sandbox-access-state"],
+            "closed"
+        );
+        assert_eq!(
+            body["metadata"]["annotations"]["kobe.kunobi.ninja/sandbox-access-entries"],
+            "{}"
+        );
     }
 
     /// Run the destructive half only after the durable Releasing checkpoint

@@ -8,6 +8,7 @@ mod metrics;
 pub mod pki;
 mod pool;
 mod sandbox;
+mod sandbox_access_ledger;
 mod sandbox_ledger;
 mod sandbox_runtime;
 mod telemetry;
@@ -180,6 +181,22 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("KOBE_SSH_NAMESPACE").unwrap_or_else(|_| "kobe-system".to_string());
     let authenticator = Arc::new(JwtAuthenticator::new(ssh_namespace));
 
+    let sandbox_serving_replica =
+        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+            let replica = crate::sandbox_access_ledger::ServingReplica {
+                namespace: pod_namespace.clone(),
+                pod_name: std::env::var("POD_NAME")
+                    .map_err(|_| anyhow::anyhow!("POD_NAME is required when Sandbox is enabled"))?,
+                pod_uid: std::env::var("POD_UID")
+                    .map_err(|_| anyhow::anyhow!("POD_UID is required when Sandbox is enabled"))?,
+                boot_id: uuid::Uuid::new_v4().to_string(),
+            };
+            replica.validate()?;
+            Some(replica)
+        } else {
+            None
+        };
+
     // Stream revocation is a per-replica API responsibility, not a leader
     // controller. Start it before this process can serve Sandbox routes and
     // before leader acquisition can block indefinitely. The handle remains
@@ -208,6 +225,14 @@ async fn main() -> anyhow::Result<()> {
                 &shutdown,
             )
             .await?;
+            crate::sandbox_access_ledger::recover_replica(
+                &client,
+                &sandbox_reservation_namespace,
+                sandbox_serving_replica
+                    .as_ref()
+                    .expect("external Sandbox mode has replica identity"),
+            )
+            .await?;
             Some(handle)
         } else {
             None
@@ -219,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
         authenticator: authenticator.clone(),
         namespace: namespace.clone(),
         sandbox_reservation_namespace: sandbox_reservation_namespace.clone(),
+        sandbox_serving_replica: sandbox_serving_replica.clone(),
         backend: backend.clone(),
         factory: Some(factory.clone()),
         datastore: datastore.clone(),
@@ -385,6 +411,25 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    let access_ledger_reaper_handle =
+        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+            let access_client = client.clone();
+            let access_sandbox_ns = namespace.clone();
+            let access_ledger_ns = sandbox_reservation_namespace.clone();
+            let access_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                crate::sandbox_access_ledger::run_reaper(
+                    access_client,
+                    access_sandbox_ns,
+                    access_ledger_ns,
+                    access_shutdown,
+                )
+                .await;
+            }))
+        } else {
+            None
+        };
+
     // Start Sandbox placement, but ONLY when a validated runtime is present.
     // Spawning it in `disabled` mode would have it watch CRDs that may not
     // exist and log errors forever; spawning it without the #72 validation
@@ -524,6 +569,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("Sandbox admission reaper exited unexpectedly"),
                     Err(e) => error!("Sandbox admission reaper panicked: {e}"),
+                }
+            }
+            result = await_optional_critical_task(access_ledger_reaper_handle) => {
+                match result {
+                    Ok(()) => warn!("Sandbox access-ledger reaper exited unexpectedly"),
+                    Err(e) => error!("Sandbox access-ledger reaper panicked: {e}"),
                 }
             }
             result = health_handle => {

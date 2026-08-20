@@ -99,7 +99,9 @@ containerSecurityContext:
 agentSandbox:
   mode: disabled
   # Aggregate object ceiling across every caller. This namespace contains only
-  # admission tokens, so the quota cannot starve unrelated leader elections.
+  # admission tokens plus distributed operation gates/principal ledgers, so
+  # the quota cannot starve unrelated leader elections. Each live Sandbox can
+  # add one gate and each principal with active operations one ledger.
   reservationObjectLimit: 4096
   # How long a SandboxLease that reached a clean terminal phase (`Released` or
   # `Expired`) is kept before the record is deleted. Those phases stop

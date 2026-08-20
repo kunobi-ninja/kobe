@@ -332,7 +332,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // request is called `exec` or `executions`. Registering unbounded here
     // meant the limit existed on paper and not in the path most likely to be
     // driven by a loop.
-    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target).await {
         Ok(guard) => guard,
         Err(denied) => {
             if fresh {
@@ -1122,15 +1122,12 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                     .as_ref()
                     .is_some_and(|status| status.state.is_terminal())
             {
-                let guard =
-                    match register_live_stream(&state.client, &state.namespace, &lease, &target)
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(denied) => {
-                            return stream_registration_denied(&identity, &id, "execution", denied);
-                        }
-                    };
+                let guard = match register_live_stream(&state, &lease, &target).await {
+                    Ok(guard) => guard,
+                    Err(denied) => {
+                        return stream_registration_denied(&identity, &id, "execution", denied);
+                    }
+                };
                 let revoked = guard.cancelled();
                 let scoped = match scoped_client_after_registration(
                     &state,
@@ -1299,7 +1296,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     // Output reads are live operations too. Holding a guard ensures release,
     // expiry, or quarantine interrupts every runner call below rather than
     // allowing a second stream read under authority that has ended.
-    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target).await {
         Ok(guard) => guard,
         Err(denied) => {
             return stream_registration_denied(&identity, &id, "execution-logs", denied);
@@ -1517,7 +1514,23 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
 
-    match cancel_runner(&state, &identity, &id, &lease, &target, &execution).await {
+    // Cancellation reaches the same Pod and runner as execution/log reads, so
+    // it must enter the same distributed gate. Otherwise it could resolve a
+    // Ready lease, race a release that observes an empty gate, and mint a new
+    // credential while teardown is already removing the target.
+    let guard = match register_live_stream(&state, &lease, &target).await {
+        Ok(guard) => guard,
+        Err(denied) => {
+            return stream_registration_denied(&identity, &id, "execution-cancel", denied);
+        }
+    };
+    let revoked = guard.cancelled();
+
+    match cancel_runner(
+        &state, &identity, &id, &lease, &target, &execution, &revoked,
+    )
+    .await
+    {
         RunnerCancellation::NotRunnerManaged => {}
         RunnerCancellation::Handled(response) => return response,
     }
@@ -1572,6 +1585,7 @@ async fn cancel_runner<B: ClusterBackend>(
     lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
     execution: &str,
+    revoked: &tokio_util::sync::CancellationToken,
 ) -> RunnerCancellation {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
@@ -1623,33 +1637,17 @@ async fn cancel_runner<B: ClusterBackend>(
         ));
     };
 
-    let cluster = match crate::api::sandbox_access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
+    let scoped = match scoped_client_after_registration(
+        state,
         lease,
         target,
-    )
-    .await
-    {
-        Ok(cluster) => cluster,
-        Err(denied) => {
-            return RunnerCancellation::Handled(access_denied(
-                identity,
-                id,
-                "execution-cancel",
-                denied,
-            ));
-        }
-    };
-    let scoped = match crate::api::sandbox_credentials::scoped_client(
-        &cluster,
-        target,
         crate::api::sandbox_credentials::SandboxOperation::Exec,
+        revoked,
     )
     .await
     {
         Ok(scoped) => scoped,
-        Err(denied) => {
+        Err(ScopedSetupDenied::Access(denied)) => {
             return RunnerCancellation::Handled(access_denied(
                 identity,
                 id,
@@ -1657,18 +1655,43 @@ async fn cancel_runner<B: ClusterBackend>(
                 denied,
             ));
         }
+        Err(ScopedSetupDenied::Revoked) => {
+            return RunnerCancellation::Handled(stream_registration_denied(
+                identity,
+                id,
+                "execution-cancel",
+                StreamRegistrationDenied::LeaseEnded,
+            ));
+        }
+        Err(ScopedSetupDenied::TargetTimeout | ScopedSetupDenied::CredentialTimeout) => {
+            return RunnerCancellation::Handled(stream_registration_denied(
+                identity,
+                id,
+                "execution-cancel",
+                StreamRegistrationDenied::Backend,
+            ));
+        }
     };
 
-    match runner::cancel(
-        &scoped,
-        target,
-        &target.container,
-        &runner_path,
-        &record.name_any(),
+    let cancelled = complete_before_revocation(
+        revoked,
+        runner::cancel(
+            &scoped,
+            target,
+            &target.container,
+            &runner_path,
+            &record.name_any(),
+        ),
     )
-    .await
-    {
-        Ok(report) => {
+    .await;
+    match cancelled {
+        None => RunnerCancellation::Handled(stream_registration_denied(
+            identity,
+            id,
+            "execution-cancel",
+            StreamRegistrationDenied::LeaseEnded,
+        )),
+        Some(Ok(report)) => {
             let outcome = runner::outcome_from_report(&report);
             if !outcome.state.is_terminal() {
                 // The runner answered without settling it. Saying "cancelled"
@@ -1711,7 +1734,7 @@ async fn cancel_runner<B: ClusterBackend>(
                     .into_response(),
             )
         }
-        Err(failure) => {
+        Some(Err(failure)) => {
             info!(
                 principal = %identity.identity,
                 lease = %id,
@@ -1847,15 +1870,43 @@ async fn scoped_client_after_registration<B: ClusterBackend>(
 ///
 /// This helper is shared by interactive, one-shot, and durable execution so
 /// none can register after its deletion/release watch event already passed.
-async fn register_live_stream(
-    client: &kube::Client,
-    namespace: &str,
+async fn register_live_stream<B: ClusterBackend>(
+    state: &AppState<B>,
     lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
 ) -> Result<crate::api::sandbox_streams::StreamGuard, StreamRegistrationDenied> {
-    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let identity = crate::api::sandbox_streams::StreamIdentity::from_ready_lease(lease)
         .ok_or(StreamRegistrationDenied::LeaseEnded)?;
+    let distributed = if let Some(replica) = state.sandbox_serving_replica.as_ref() {
+        match crate::sandbox_access_ledger::acquire(
+            &state.client,
+            &state.sandbox_reservation_namespace,
+            &lease.name_any(),
+            &target.lease_uid,
+            &identity.principal_key(),
+            replica,
+        )
+        .await
+        {
+            Ok(crate::sandbox_access_ledger::AccessAcquire::Acquired(guard)) => Some(*guard),
+            Ok(crate::sandbox_access_ledger::AccessAcquire::LeaseClosed) => {
+                return Err(StreamRegistrationDenied::LeaseEnded);
+            }
+            Ok(crate::sandbox_access_ledger::AccessAcquire::LimitReached) => {
+                return Err(StreamRegistrationDenied::LimitReached);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, lease = %lease.name_any(), "could not acquire distributed Sandbox access slot");
+                return Err(StreamRegistrationDenied::Backend);
+            }
+        }
+    } else {
+        #[cfg(not(test))]
+        return Err(StreamRegistrationDenied::Backend);
+        #[cfg(test)]
+        None
+    };
     match crate::api::sandbox_streams::register_confirmed(
         crate::api::sandbox_streams::registry(),
         &leases,
@@ -1866,7 +1917,10 @@ async fn register_live_stream(
     .await
     {
         Ok(crate::api::sandbox_streams::ConfirmedStreamRegistration::Registered(guard)) => {
-            Ok(guard)
+            Ok(match distributed {
+                Some(distributed) => (*guard).with_distributed(distributed),
+                None => *guard,
+            })
         }
         Ok(crate::api::sandbox_streams::ConfirmedStreamRegistration::LimitReached) => {
             Err(StreamRegistrationDenied::LimitReached)
@@ -1941,7 +1995,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
     // over the limit gets a status rather than a socket that closes at once,
     // and the guard travels with the context so the claim cannot be dropped in
     // between.
-    let guard = register_live_stream(&state.client, &state.namespace, &lease, &target)
+    let guard = register_live_stream(state, &lease, &target)
         .await
         .map_err(|denied| stream_registration_denied(identity, id, operation.as_str(), denied))?;
     let revoked = guard.cancelled();
@@ -2243,7 +2297,7 @@ async fn sandbox_exec<B: ClusterBackend>(
     // being torn down. The guard deregisters on every exit path, including a
     // panic — a leaked registration would later report cancelling something
     // that ended long ago.
-    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target).await {
         Ok(guard) => guard,
         Err(denied) => return stream_registration_denied(&identity, &id, "exec", denied),
     };
@@ -2377,7 +2431,7 @@ async fn sandbox_logs<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "logs", denied),
     };
 
-    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+    let guard = match register_live_stream(&state, &lease, &target).await {
         Ok(guard) => guard,
         Err(denied) => return stream_registration_denied(&identity, &id, "logs", denied),
     };
@@ -5045,6 +5099,7 @@ mod tests {
             )),
             namespace: "test-ns".into(),
             sandbox_reservation_namespace: TEST_LEDGER_NAMESPACE.into(),
+            sandbox_serving_replica: None,
             backend: crate::testutil::MockBackend::new(),
             factory: None,
             datastore: Default::default(),

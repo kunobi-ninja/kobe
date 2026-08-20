@@ -186,6 +186,12 @@ upstream stream, and those count against your lease's concurrency limit — a
 browser opening six sockets would exhaust it, and the failures would look like
 the sandbox misbehaving.
 
+Kobe admits at most eight simultaneous operations for one Sandbox and 32 for
+one authenticated principal, counted across all API replicas. A refused
+operation returns `429`; releasing the Sandbox closes the distributed gate and
+waits for every admitted operation to drain before credentials or workload are
+removed.
+
 ## Aliases
 
 Any command that takes a lease id also takes an **alias** — the name you gave
