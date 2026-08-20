@@ -200,7 +200,9 @@ jobs:
     timeout-minutes: 15
     env:
       SANDBOX_CONTRACT_CLUSTER: sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}
-      KUBECONFIG: ${{ runner.temp }}/sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+      # The `runner` context is unavailable while GitHub evaluates job-level
+      # env. The run/attempt pair still makes this host path unique.
+      KUBECONFIG: /tmp/sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
     steps:
       - uses: actions/checkout@v7
 
