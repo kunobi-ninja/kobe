@@ -628,6 +628,7 @@ pub fn merge_target_provenance(
         )?,
         sandbox: merge_reference("sandbox", &existing.sandbox, proposed.sandbox)?,
         pod: merge_reference("pod", &existing.pod, proposed.pod)?,
+        service: merge_reference("service", &existing.service, proposed.service)?,
     })
 }
 
@@ -725,6 +726,14 @@ fn validate_target_provenance(
             &provenance.pod,
             CORE_API_VERSION,
             "Pod",
+            Some(provenance.namespace.as_str()),
+            false,
+        ),
+        (
+            "service",
+            &provenance.service,
+            CORE_API_VERSION,
+            "Service",
             Some(provenance.namespace.as_str()),
             false,
         ),
@@ -1104,6 +1113,7 @@ mod tests {
             sandbox_claim: claim,
             sandbox: None,
             pod: None,
+            service: None,
         }
     }
 
@@ -1402,6 +1412,26 @@ mod tests {
         assert_eq!(
             merge_target_provenance(Some(&enriched), cleared, &placement, "kobe"),
             Err(SandboxProvenanceError::ReferenceCleared("sandboxClaim"))
+        );
+
+        let mut with_service = enriched.clone();
+        with_service.service = Some(SandboxObjectReference {
+            api_version: CORE_API_VERSION.into(),
+            kind: "Service".into(),
+            namespace: Some("targets".into()),
+            name: "sandbox-service".into(),
+            uid: "service-uid".into(),
+            generation: None,
+        });
+        assert_eq!(
+            merge_target_provenance(Some(&enriched), with_service.clone(), &placement, "kobe"),
+            Ok(with_service.clone())
+        );
+        let mut reused_service = with_service.clone();
+        reused_service.service.as_mut().unwrap().uid = "replacement-service-uid".into();
+        assert_eq!(
+            merge_target_provenance(Some(&with_service), reused_service, &placement, "kobe"),
+            Err(SandboxProvenanceError::ReferenceChanged("service"))
         );
 
         let mut moved = enriched.clone();

@@ -444,6 +444,40 @@ spec:
                     - name
                     - uid
                     type: object
+                  service:
+                    description: |-
+                      Exact headless Service created by Agent Sandbox when the pool exposes
+                      ports. Teardown uses this UID rather than assuming Claim disappearance
+                      proves every nested dependent is gone.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
                 required:
                 - namespace
                 type: object

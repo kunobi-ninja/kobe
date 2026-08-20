@@ -657,8 +657,10 @@ pub async fn reconcile_lease(
     // a name reused between placement and access would send a caller's exec
     // into somebody else's Pod. Recorded here, where the objects have just
     // been observed, rather than looked up again at access time.
-    if target.owned && !management_provenance_is_complete(&status) {
-        let provenance = match observed_provenance(&target, &claim, &status).await {
+    let service_required = !pool.spec.template.exposed_ports.is_empty();
+    if target.owned && !management_provenance_is_complete(&status, service_required) {
+        let provenance = match observed_provenance(&target, &claim, &status, service_required).await
+        {
             Ok(Some(provenance)) => provenance,
             Ok(None) => {
                 debug!(lease = %name, "management Sandbox target provenance not ready");
@@ -683,7 +685,8 @@ pub async fn reconcile_lease(
         }
         return Ok(Action::await_change());
     } else if !target.owned {
-        let provenance = match observed_provenance(&target, &claim, &status).await {
+        let provenance = match observed_provenance(&target, &claim, &status, service_required).await
+        {
             Ok(Some(provenance)) => provenance,
             Ok(None) => {
                 debug!(lease = %name, "child Sandbox target provenance not ready");
@@ -711,7 +714,9 @@ pub async fn reconcile_lease(
         }
     }
 
-    if target.owned && !management_provenance_is_complete(&status) {
+    if (target.owned && !management_provenance_is_complete(&status, service_required))
+        || !workload_provenance_is_complete(&status, service_required)
+    {
         return Ok(Action::requeue(std::time::Duration::from_secs(10)));
     }
 
@@ -1139,6 +1144,7 @@ async fn drive_release(
                 sandbox_claim: None,
                 sandbox: None,
                 pod: None,
+                service: None,
             });
         if target.namespace != ctx.namespace {
             return quarantine_lease(lease, ctx, "claim_namespace_changed").await;
@@ -2005,20 +2011,35 @@ async fn observed_management_pool_provenance(
             sandbox_claim: None,
             sandbox: None,
             pod: None,
+            service: None,
         });
     proposed.sandbox_template = Some(observed.remove(0));
     proposed.sandbox_warm_pool = Some(observed.remove(0));
     Ok(Some(proposed))
 }
 
-fn management_provenance_is_complete(status: &crate::crd::SandboxLeaseStatus) -> bool {
+/// A workload can advance only after every object the selected pool can create
+/// has an exact persisted identity. Pools without exposed ports legitimately
+/// have no Service; pools with ports must never infer one later by name.
+fn workload_provenance_is_complete(
+    status: &crate::crd::SandboxLeaseStatus,
+    service_required: bool,
+) -> bool {
     status.target.as_ref().is_some_and(|target| {
-        target.sandbox_template.is_some()
-            && target.sandbox_warm_pool.is_some()
-            && target.sandbox_claim.is_some()
+        target.sandbox_claim.is_some()
             && target.sandbox.is_some()
             && target.pod.is_some()
+            && (!service_required || target.service.is_some())
     })
+}
+
+fn management_provenance_is_complete(
+    status: &crate::crd::SandboxLeaseStatus,
+    service_required: bool,
+) -> bool {
+    status.target.as_ref().is_some_and(|target| {
+        target.sandbox_template.is_some() && target.sandbox_warm_pool.is_some()
+    }) && workload_provenance_is_complete(status, service_required)
 }
 
 /// Build the full target provenance for a placed, ready lease.
@@ -2036,6 +2057,7 @@ async fn observed_provenance(
     target: &Target,
     claim: &DynamicObject,
     status: &crate::crd::SandboxLeaseStatus,
+    service_required: bool,
 ) -> Result<Option<crate::crd::SandboxTargetProvenance>, String> {
     let Some(claim_uid) = claim.uid().filter(|uid| !uid.is_empty()) else {
         return Ok(None);
@@ -2049,6 +2071,9 @@ async fn observed_provenance(
     let Some(resolved) = resolved else {
         return Ok(None);
     };
+    if service_required && resolved.service_uid.is_none() {
+        return Ok(None);
+    }
 
     let existing = status.target.clone();
     let reference =
@@ -2093,6 +2118,11 @@ async fn observed_provenance(
             &resolved.pod_name,
             &resolved.pod_uid,
         )),
+        service: resolved
+            .service_name
+            .as_deref()
+            .zip(resolved.service_uid.as_deref())
+            .map(|(name, uid)| reference("v1", "Service", name, uid)),
     }))
 }
 
@@ -2761,6 +2791,7 @@ pub(crate) mod tests {
         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxwarmpools/kobe-agents";
     const SANDBOX_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx";
     const PODS_PATH: &str = "/api/v1/namespaces/test-ns/pods";
+    const SERVICE_PATH: &str = "/api/v1/namespaces/test-ns/services/sandbox-service";
     const LEASE_STATUS_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1/status";
     const LEASE_PATH: &str =
@@ -2947,6 +2978,7 @@ pub(crate) mod tests {
                         "sandbox-uid",
                     )),
                     pod: Some(reference("v1", "Pod", "sandbox-pod", "pod-uid")),
+                    service: Some(reference("v1", "Service", "sandbox-service", "service-uid")),
                 }),
                 ..Default::default()
             }),
@@ -3013,7 +3045,28 @@ pub(crate) mod tests {
                         "controller": true,
                     }],
                 },
-                "status": { "selector": "kobe.test/sandbox=sbx" },
+                "status": {
+                    "selector": "kobe.test/sandbox=sbx",
+                    "service": "sandbox-service",
+                },
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVICE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "sandbox-service", "namespace": NS, "uid": "service-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                        "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                        "name": "sbx",
+                        "uid": "sandbox-uid",
+                        "controller": true,
+                    }],
+                },
             })))
             .mount(server)
             .await;
@@ -3900,6 +3953,7 @@ pub(crate) mod tests {
         let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
         target.sandbox = None;
         target.pod = None;
+        target.service = None;
 
         let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
         assert_eq!(action, Action::await_change());
@@ -3915,6 +3969,28 @@ pub(crate) mod tests {
         assert_ne!(status["phase"], "Ready");
         assert_eq!(status["target"]["sandbox"]["uid"], "sandbox-uid");
         assert_eq!(status["target"]["pod"]["uid"], "pod-uid");
+        assert_eq!(status["target"]["service"]["uid"], "service-uid");
+    }
+
+    /// Exposed ports create a Service, so Ready must checkpoint that exact UID.
+    #[test]
+    fn exposed_ports_require_service_provenance_before_ready() {
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.target.as_mut().unwrap().service = None;
+
+        assert!(workload_provenance_is_complete(status, false));
+        assert!(!workload_provenance_is_complete(status, true));
+
+        status.target.as_mut().unwrap().service = Some(crate::crd::SandboxObjectReference {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            namespace: Some(NS.into()),
+            name: "sandbox-service".into(),
+            uid: "service-uid".into(),
+            generation: None,
+        });
+        assert!(workload_provenance_is_complete(status, true));
     }
 
     /// An unadmitted lease is not placed, and the check costs no API call.
@@ -5770,6 +5846,7 @@ pub(crate) mod tests {
             sandbox_claim: None,
             sandbox: None,
             pod: None,
+            service: None,
         });
         lease.metadata.annotations.as_mut().unwrap().insert(
             SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),

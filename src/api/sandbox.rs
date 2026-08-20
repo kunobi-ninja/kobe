@@ -6577,6 +6577,7 @@ mod tests {
             sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1")),
             sandbox: Some(reference("Sandbox", "sbx")),
             pod: Some(reference("Pod", "sbx-0")),
+            service: Some(reference("Service", "sbx")),
         };
 
         let visible = caller_visible_provenance(target.clone());
@@ -6587,6 +6588,7 @@ mod tests {
         // own, and #81 resolves targets against exactly these.
         assert_eq!(visible.sandbox_claim, target.sandbox_claim);
         assert_eq!(visible.pod, target.pod);
+        assert_eq!(visible.service, target.service);
         assert_eq!(visible.namespace, target.namespace);
 
         // The serialized form is what actually reaches the caller, so assert on

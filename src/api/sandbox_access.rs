@@ -842,6 +842,7 @@ mod tests {
             sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1", "claim-uid")),
             sandbox: Some(reference("Sandbox", "sbx", "sandbox-uid")),
             pod: Some(reference("Pod", "sbx-0", "pod-uid")),
+            service: None,
         });
         lease
     }

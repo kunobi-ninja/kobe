@@ -323,6 +323,7 @@ pub fn child_provenance(
         sandbox_claim: None,
         sandbox: None,
         pod: None,
+        service: None,
     }
 }
 

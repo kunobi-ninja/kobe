@@ -693,6 +693,11 @@ pub struct SandboxTargetProvenance {
     pub sandbox: Option<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod: Option<SandboxObjectReference>,
+    /// Exact headless Service created by Agent Sandbox when the pool exposes
+    /// ports. Teardown uses this UID rather than assuming Claim disappearance
+    /// proves every nested dependent is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<SandboxObjectReference>,
 }
 
 /// Kubernetes-style condition with the generation from which it was derived.

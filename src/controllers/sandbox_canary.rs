@@ -29,7 +29,7 @@
 //! provisioning deadline already bounds how long that may continue, so an
 //! unrunnable canary ends as an expiry rather than as a lease that hangs.
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, ApiResource, AttachParams, DynamicObject, ListParams};
 use kube::{Client, ResourceExt};
 use tracing::{debug, warn};
@@ -86,23 +86,26 @@ fn sandbox_resource() -> ApiResource {
 /// Resolve the Pod backing one claim, following only documented upstream
 /// fields.
 ///
-/// `claim.status.sandbox.name` names the Sandbox, and `sandbox.status.selector`
-/// is upstream's own label selector for its Pods. Both are followed rather than
-/// guessed from a naming convention: a convention that upstream changes would
-/// silently start selecting the wrong Pod, and the wrong Pod is one belonging
-/// to another tenant. Each hop must also carry the exact controller owner UID;
+/// `claim.status.sandbox.name` names the Sandbox, `sandbox.status.selector`
+/// selects its Pod, and `sandbox.status.service` names its optional Service.
+/// These upstream fields are followed rather than guessed from conventions.
+/// Each discovered object must also carry the exact controller-owner UID;
 /// status and label fields identify candidates, but never confer authority.
-/// The exact upstream objects behind one claim.
 ///
 /// Identities, not just names: #81 resolves every Sandbox operation through
 /// these UIDs, and a name that was reused between placement and access would
 /// otherwise route a caller's exec into somebody else's Pod.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSandboxPod {
+    /// Sandbox identity controlled by the exact Claim UID.
     pub sandbox_name: String,
     pub sandbox_uid: String,
+    /// Running Pod identity controlled by the exact Sandbox UID.
     pub pod_name: String,
     pub pod_uid: String,
+    /// Optional Service identity controlled by the exact Sandbox UID.
+    pub service_name: Option<String>,
+    pub service_uid: Option<String>,
 }
 
 pub async fn resolve_sandbox_pod(
@@ -147,6 +150,38 @@ pub async fn resolve_sandbox_pod(
     }
     let Some(sandbox_uid) = sandbox.uid().filter(|uid| !uid.is_empty()) else {
         return Ok(None);
+    };
+
+    let service_identity = if let Some(service_name) = sandbox
+        .data
+        .get("status")
+        .and_then(|status| status.get("service"))
+        .and_then(|service| service.as_str())
+        .filter(|service| !service.is_empty())
+    {
+        let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+        let service = match services.get(service_name).await {
+            Ok(service) => service,
+            Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
+            Err(error) => return Err(format!("service lookup failed: {error}")),
+        };
+        if !super::sandbox::metadata_is_controlled_by(
+            &service.metadata,
+            SANDBOX_API_VERSION,
+            SANDBOX_KIND,
+            sandbox_name,
+            &sandbox_uid,
+        ) {
+            return Err(format!(
+                "Service {service_name} is not controlled by Sandbox {sandbox_name} uid {sandbox_uid}"
+            ));
+        }
+        let Some(service_uid) = service.uid().filter(|uid| !uid.is_empty()) else {
+            return Ok(None);
+        };
+        (Some(service.name_any()), Some(service_uid))
+    } else {
+        (None, None)
     };
 
     let Some(selector) = sandbox
@@ -205,6 +240,8 @@ pub async fn resolve_sandbox_pod(
         sandbox_uid,
         pod_name: pod.name_any(),
         pod_uid,
+        service_name: service_identity.0,
+        service_uid: service_identity.1,
     }))
 }
 
@@ -427,6 +464,8 @@ mod tests {
                 sandbox_uid: "sandbox-uid".into(),
                 pod_name: "pod-1".into(),
                 pod_uid: "pod-uid".into(),
+                service_name: None,
+                service_uid: None,
             };
             let outcome = run_canary(&client, "test-ns", &pod, "agent", &canary).await;
             assert!(
@@ -516,7 +555,25 @@ mod tests {
                         "name": "kobe-sbx-1", "uid": "claim-uid", "controller": true,
                     }],
                 },
-                "status": { "selector": "agents.x-k8s.io/sandbox=sbx" },
+                "status": {
+                    "selector": "agents.x-k8s.io/sandbox=sbx",
+                    "service": "sandbox-service",
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/services/sandbox-service"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {
+                    "name": "sandbox-service", "namespace": "test-ns", "uid": "service-uid",
+                    "ownerReferences": [{
+                        "apiVersion": SANDBOX_API_VERSION,
+                        "kind": SANDBOX_KIND,
+                        "name": "sbx", "uid": "sandbox-uid", "controller": true,
+                    }],
+                },
             })))
             .mount(&server)
             .await;
@@ -546,6 +603,8 @@ mod tests {
                 sandbox_uid: "sandbox-uid".into(),
                 pod_name: "pod-a".into(),
                 pod_uid: "pod-uid".into(),
+                service_name: Some("sandbox-service".into()),
+                service_uid: Some("service-uid".into()),
             }))
         );
     }
@@ -582,6 +641,68 @@ mod tests {
             .await
             .expect_err("a foreign Sandbox must not be resolved");
         assert!(error.contains("not controlled by SandboxClaim"));
+    }
+
+    /// A Service named by Sandbox status is accepted only when its exact
+    /// controller owner is the resolved Sandbox UID.
+    #[tokio::test]
+    async fn foreign_service_owner_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": SANDBOX_API_VERSION, "kind": SANDBOX_KIND,
+                "metadata": {
+                    "name": "sbx", "namespace": "test-ns", "uid": "sandbox-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::sandbox::AGENT_SANDBOX_API_VERSION,
+                        "kind": crate::sandbox::SANDBOX_CLAIM_KIND,
+                        "name": "kobe-sbx-1", "uid": "claim-uid", "controller": true,
+                    }],
+                },
+                "status": {
+                    "selector": "agents.x-k8s.io/sandbox=sbx",
+                    "service": "sandbox-service",
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/services/sandbox-service"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {
+                    "name": "sandbox-service", "namespace": "test-ns", "uid": "service-uid",
+                    "ownerReferences": [{
+                        "apiVersion": SANDBOX_API_VERSION,
+                        "kind": SANDBOX_KIND,
+                        "name": "sbx", "uid": "foreign-sandbox-uid", "controller": true,
+                    }],
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let error = resolve_sandbox_pod(&client, "test-ns", &claim_with_sandbox())
+            .await
+            .expect_err("a foreign Service must not be resolved");
+        assert!(error.contains("Service sandbox-service is not controlled by Sandbox"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .all(|request| request.url.path() != "/api/v1/namespaces/test-ns/pods"),
+            "foreign Service provenance must fail before Pod selection"
+        );
     }
 
     /// A matching selector cannot substitute a Pod owned by another Sandbox.
