@@ -206,6 +206,18 @@ spec:
                 format: date-time
                 nullable: true
                 type: string
+              releaseCause:
+                description: |-
+                  Immutable reason the lease first entered `Releasing`. Persisted in the
+                  same status write as that phase so retries, later release requests, and
+                  controller restarts cannot change the terminal accounting outcome.
+                enum:
+                - Requested
+                - RuntimeTtl
+                - ProvisioningDeadline
+                - null
+                nullable: true
+                type: string
               target:
                 description: |-
                   Restart-safe, non-secret target provenance. Fields are filled monotonically:
@@ -438,8 +450,15 @@ spec:
             type: object
         required:
         - spec
-        title: SandboxLease
+        title: SandboxLeaseValidated
         type: object
+        x-kubernetes-validations:
+        - message: status.releaseCause is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.releaseCause) || (has(self.status) && self.status != null && has(self.status.releaseCause) && self.status.releaseCause == oldSelf.status.releaseCause)'
+        - message: status FootprintAbsent proof is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True'') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
+        - message: FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause
+          rule: '!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != ''FootprintAbsent'' || (c.status == ''True'' && has(self.status.releaseCause) && self.status.phase in [''Releasing'', ''Released'', ''Expired'']))'
     served: true
     storage: true
     subresources:

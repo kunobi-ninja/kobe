@@ -296,6 +296,49 @@ pub async fn reconcile_lease(
         }
     }
 
+    // Start the setup clock before either placement can wait. Management may
+    // wait for its upstream Template/WarmPool and child placement may wait for
+    // a whole cluster to bind; both are provisioning work and must be covered
+    // by the administrator's `provisioningTimeout`.
+    let mut status = lease.status.clone().unwrap_or_default();
+    let observed_generation = lease.metadata.generation.unwrap_or_default();
+    if status.phase == crate::crd::SandboxLeasePhase::Pending {
+        let accepted_at = lease
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .and_then(|timestamp| {
+                chrono::DateTime::parse_from_rfc3339(&timestamp.0.to_string())
+                    .ok()
+                    .map(|parsed| parsed.with_timezone(&chrono::Utc))
+            })
+            .ok_or_else(|| {
+                SandboxPlacementError::Invalid(format!(
+                    "SandboxLease {name} has no API-server creation timestamp"
+                ))
+            })?;
+        let provisioning_timeout = crate::pool::parse_duration(&pool.spec.provisioning_timeout)
+            .ok_or_else(|| {
+                SandboxPlacementError::Invalid(format!(
+                    "SandboxPool {} has an invalid provisioningTimeout",
+                    pool.name_any()
+                ))
+            })?;
+        let next = crate::sandbox::begin_sandbox_provisioning(
+            &status,
+            observed_generation,
+            accepted_at,
+            provisioning_timeout,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        if patch_lease_status_fenced(&ctx, &lease, &next).await? {
+            info!(lease = %name, "Sandbox lease is provisioning");
+        } else {
+            debug!(lease = %name, "Provisioning checkpoint lost a status race");
+        }
+        return Ok(Action::await_change());
+    }
+
     // Where this lease's Sandbox actually runs. Management placement uses the
     // operator's own cluster; child placement composes an exclusive one, which
     // may not be ready yet — in which case there is nothing to place into.
@@ -314,23 +357,6 @@ pub async fn reconcile_lease(
             }
         }
     };
-
-    // Enter Provisioning before anything is placed.
-    //
-    // This was the missing half of the lifecycle: `mark_sandbox_ready` requires
-    // a persisted `provisioningDeadline` and only accepts `Provisioning ->
-    // Ready`, and NOTHING wrote either — the API creates leases with no status
-    // at all. Every real lease therefore sat in `Pending` forever while the
-    // claim was created and became Ready, because the transition it needed had
-    // no producer. The controller tests did not catch it because their fixture
-    // hand-wrote a `Provisioning` phase and a deadline: a state no production
-    // path could reach.
-    //
-    // The deadline starts here, when Kobe accepts responsibility for placing
-    // the lease — not at request, which would charge the caller for time spent
-    // queuing, and not at readiness, which is what the runtime TTL is for.
-    let mut status = lease.status.clone().unwrap_or_default();
-    let observed_generation = lease.metadata.generation.unwrap_or_default();
 
     if target.owned {
         let Some(proposed) = observed_management_pool_provenance(&ctx, &pool, &status).await?
@@ -356,33 +382,6 @@ pub async fn reconcile_lease(
             }
             return Ok(Action::await_change());
         }
-    }
-
-    if status.phase == crate::crd::SandboxLeasePhase::Pending {
-        let provisioning_timeout = crate::pool::parse_duration(&pool.spec.provisioning_timeout)
-            .ok_or_else(|| {
-                SandboxPlacementError::Invalid(format!(
-                    "SandboxPool {} has an invalid provisioningTimeout",
-                    pool.name_any()
-                ))
-            })?;
-        let next = crate::sandbox::begin_sandbox_provisioning(
-            &status,
-            observed_generation,
-            chrono::Utc::now(),
-            provisioning_timeout,
-        )
-        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-        if patch_lease_status_fenced(&ctx, &lease, &next).await? {
-            info!(lease = %name, "Sandbox lease is provisioning");
-        } else {
-            debug!(lease = %name, "Provisioning checkpoint lost a status race");
-        }
-        // Every durable checkpoint ends this pass. A real apiserver increments
-        // resourceVersion on the write, so continuing with `lease` would make
-        // every later optimistic patch stale even though in-memory `next` is
-        // current in every other respect.
-        return Ok(Action::await_change());
     }
 
     let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
@@ -567,10 +566,33 @@ pub async fn reconcile_lease(
             debug!(lease = %name, "management target provenance write lost a status race");
         }
         return Ok(Action::await_change());
-    } else if !target.owned
-        && let Ok(Some(provenance)) = observed_provenance(&target, &claim, &status).await
-    {
-        patch_lease_status(&ctx, &name, &serde_json::json!({ "target": provenance })).await?;
+    } else if !target.owned {
+        let provenance = match observed_provenance(&target, &claim, &status).await {
+            Ok(Some(provenance)) => provenance,
+            Ok(None) => {
+                debug!(lease = %name, "child Sandbox target provenance not ready");
+                return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+            }
+            Err(error) => return Err(SandboxPlacementError::Invalid(error)),
+        };
+        let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        let merged = crate::sandbox::merge_target_provenance(
+            status.target.as_ref(),
+            provenance,
+            placement,
+            &ctx.namespace,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        if status.target.as_ref() != Some(&merged) {
+            status.target = Some(merged);
+            if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+                debug!(lease = %name, "recorded child Sandbox and Pod provenance");
+            } else {
+                debug!(lease = %name, "child target provenance write lost a status race");
+            }
+            return Ok(Action::await_change());
+        }
     }
 
     if target.owned && !management_provenance_is_complete(&status) {
@@ -604,26 +626,10 @@ pub async fn reconcile_lease(
         // move the lease to Releasing rather than requeue forever.
         Err(crate::sandbox::SandboxLifecycleError::ProvisioningDeadlineElapsed) => {
             warn!(lease = %name, "provisioning deadline elapsed; releasing");
-            stamp_upstream_shutdown(
-                &claims,
-                &claim_name(&name),
-                &resource_version,
-                chrono::Utc::now(),
-            )
-            .await?;
-            let phase = crate::sandbox::transition_sandbox_phase(
-                status.phase,
-                crate::crd::SandboxLeasePhase::Releasing,
-                false,
-            )
-            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-            patch_lease_status(
-                &ctx,
-                &name,
-                &serde_json::json!({ "phase": phase, "message": "provisioning deadline elapsed" }),
-            )
-            .await?;
-            return Ok(Action::await_change());
+            // Checkpoint phase + cause first. A stale reconcile must not stamp
+            // or tear down anything before it proves it can still update this
+            // exact SandboxLease UID/resourceVersion.
+            return drive_release(&lease, &ctx, ReleaseReason::ProvisioningDeadline).await;
         }
         Err(error) => {
             debug!(lease = %name, error = %error, "readiness transition declined");
@@ -659,13 +665,9 @@ pub async fn reconcile_lease(
 
     // Only now is the lease Ready: the Sandbox exists, and its shutdown is
     // bounded even if this controller never runs again.
-    if target.owned {
-        if !patch_lease_status_fenced(&ctx, &lease, &next_status).await? {
-            debug!(lease = %name, "Ready write lost a status race");
-            return Ok(Action::await_change());
-        }
-    } else {
-        patch_lease_status(&ctx, &name, &serde_json::json!(next_status)).await?;
+    if !patch_lease_status_fenced(&ctx, &lease, &next_status).await? {
+        debug!(lease = %name, "Ready write lost a status race");
+        return Ok(Action::await_change());
     }
     info!(lease = %name, "Sandbox lease Ready; runtime TTL started");
 
@@ -685,19 +687,41 @@ enum ReleaseReason {
     Requested,
     /// The runtime TTL elapsed. The upstream `shutdownTime` backstop removes
     /// the Sandbox itself, but nothing upstream knows about Kobe's quota
-    /// reservations — an expiry that only fired upstream would leak a slot
-    /// per lease, forever.
-    Expired,
-    /// Teardown was already under way and has not been proven complete.
-    InProgress,
+    /// reservations — an expiry that only fired upstream would leak a slot.
+    RuntimeTtl,
+    /// Setup did not finish within the pool's provisioning bound.
+    ProvisioningDeadline,
+    /// Legacy or corrupt Releasing state without the atomic cause checkpoint.
+    /// This is quarantined before any destructive action.
+    MissingCause,
 }
 
 impl ReleaseReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::Requested => "ReleaseRequested",
-            Self::Expired => "TtlElapsed",
-            Self::InProgress => "TeardownInProgress",
+            Self::RuntimeTtl => "RuntimeTtlElapsed",
+            Self::ProvisioningDeadline => "ProvisioningDeadlineElapsed",
+            Self::MissingCause => "ReleaseCauseMissing",
+        }
+    }
+
+    fn persisted_cause(self) -> Option<crate::crd::SandboxReleaseCause> {
+        match self {
+            Self::Requested => Some(crate::crd::SandboxReleaseCause::Requested),
+            Self::RuntimeTtl => Some(crate::crd::SandboxReleaseCause::RuntimeTtl),
+            Self::ProvisioningDeadline => {
+                Some(crate::crd::SandboxReleaseCause::ProvisioningDeadline)
+            }
+            Self::MissingCause => None,
+        }
+    }
+
+    fn from_persisted(cause: crate::crd::SandboxReleaseCause) -> Self {
+        match cause {
+            crate::crd::SandboxReleaseCause::Requested => Self::Requested,
+            crate::crd::SandboxReleaseCause::RuntimeTtl => Self::RuntimeTtl,
+            crate::crd::SandboxReleaseCause::ProvisioningDeadline => Self::ProvisioningDeadline,
         }
     }
 
@@ -708,8 +732,9 @@ impl ReleaseReason {
     /// a caller gave capacity back or had it taken.
     fn terminal_phase(self) -> crate::crd::SandboxLeasePhase {
         match self {
-            Self::Expired => crate::crd::SandboxLeasePhase::Expired,
-            _ => crate::crd::SandboxLeasePhase::Released,
+            Self::RuntimeTtl | Self::ProvisioningDeadline => crate::crd::SandboxLeasePhase::Expired,
+            Self::Requested => crate::crd::SandboxLeasePhase::Released,
+            Self::MissingCause => unreachable!("missing release cause must quarantine"),
         }
     }
 }
@@ -726,36 +751,76 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
         _ => {}
     }
 
-    if lease
-        .annotations()
-        .contains_key(SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION)
-    {
-        return Some(ReleaseReason::Requested);
+    // Once written, the first cause wins forever. In particular, a late DELETE
+    // cannot turn an expiry already in Releasing into a caller-requested
+    // release and change its terminal accounting outcome.
+    if let Some(cause) = status.release_cause {
+        return Some(ReleaseReason::from_persisted(cause));
     }
 
     let now = chrono::Utc::now();
     // An unparseable deadline is NOT treated as elapsed. Deleting a live
     // workload because a timestamp failed to parse is the more damaging
     // reading of the same uncertainty; the lease stays put and stays visible.
-    let runtime_elapsed = status
-        .expires_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| now >= deadline);
-    let provisioning_elapsed = status.ready_at.is_none()
-        && status
-            .provisioning_deadline
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|deadline| now >= deadline);
-    if runtime_elapsed || provisioning_elapsed {
-        return Some(ReleaseReason::Expired);
+    let runtime_deadline = status
+        .ready_at
+        .is_some()
+        .then(|| {
+            status
+                .expires_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .filter(|deadline| now >= *deadline)
+        })
+        .flatten();
+    let provisioning_deadline = status
+        .ready_at
+        .is_none()
+        .then(|| {
+            status
+                .provisioning_deadline
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .filter(|deadline| now >= *deadline)
+        })
+        .flatten();
+    let expiry = match (runtime_deadline, provisioning_deadline) {
+        (Some(runtime), Some(provisioning)) if runtime <= provisioning => {
+            Some((runtime, ReleaseReason::RuntimeTtl))
+        }
+        (Some(_), Some(provisioning)) => Some((provisioning, ReleaseReason::ProvisioningDeadline)),
+        (Some(runtime), None) => Some((runtime, ReleaseReason::RuntimeTtl)),
+        (None, Some(provisioning)) => Some((provisioning, ReleaseReason::ProvisioningDeadline)),
+        (None, None) => None,
+    };
+
+    if let Some(requested) = lease
+        .annotations()
+        .get(SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION)
+    {
+        let requested_at = chrono::DateTime::parse_from_rfc3339(requested).ok();
+        // The annotation is server-owned. If its timestamp is corrupt, honour
+        // a provably earlier elapsed deadline; otherwise preserve the request
+        // rather than keeping a caller's workload alive on malformed metadata.
+        if expiry.as_ref().is_none_or(|(deadline, _)| {
+            requested_at.is_some_and(|requested| requested <= *deadline)
+        }) {
+            return Some(ReleaseReason::Requested);
+        }
+        if let Some((_, reason)) = expiry {
+            return Some(reason);
+        }
+    }
+
+    if let Some((_, reason)) = expiry {
+        return Some(reason);
     }
 
     // Already releasing without a surviving request/deadline signal: teardown
     // was interrupted and is not proven done. The two durable signals above
     // preserve the original terminal outcome across the phase checkpoint.
-    (status.phase == crate::crd::SandboxLeasePhase::Releasing).then_some(ReleaseReason::InProgress)
+    (status.phase == crate::crd::SandboxLeasePhase::Releasing)
+        .then_some(ReleaseReason::MissingCause)
 }
 
 /// Tear one lease down and give its capacity back — but only against proof.
@@ -779,10 +844,28 @@ async fn drive_release(
     let name = lease.name_any();
     let status = lease.status.clone().unwrap_or_default();
 
+    // New controllers always persist phase and cause atomically. A legacy or
+    // corrupt Releasing object without any surviving durable signal cannot be
+    // assigned a clean outcome safely, so hold its capacity for operator
+    // review instead of inventing "Requested".
+    if reason == ReleaseReason::MissingCause && status.release_cause.is_none() {
+        return quarantine_lease(lease, ctx, "release_cause_missing").await;
+    }
+
     // Make the intent visible in status first. Until the phase moves, capacity
     // accounting and the API both still read this as a live lease, and a
     // teardown that crashed midway would look like one too.
-    if status.phase != SandboxLeasePhase::Releasing {
+    let proposed_cause = reason.persisted_cause();
+    if let (Some(current), Some(proposed)) = (status.release_cause, proposed_cause)
+        && current != proposed
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxLease {name} releaseCause is immutable ({current:?} cannot become {proposed:?})"
+        )));
+    }
+    if status.phase != SandboxLeasePhase::Releasing
+        || (status.release_cause.is_none() && proposed_cause.is_some())
+    {
         let phase = crate::sandbox::transition_sandbox_phase(
             status.phase,
             SandboxLeasePhase::Releasing,
@@ -791,12 +874,20 @@ async fn drive_release(
         .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
         let mut next = status.clone();
         next.phase = phase;
+        next.release_cause = proposed_cause;
         if patch_lease_status_fenced(ctx, lease, &next).await? {
             info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
         } else {
             debug!(lease = %name, "Releasing checkpoint lost a status race");
         }
         return Ok(Action::await_change());
+    }
+
+    // Footprint absence is a durable linearization point. Once it wins its
+    // fenced race against quarantine, every retry skips external teardown
+    // checks and completes only the idempotent reservation/terminal tail.
+    if footprint_absence_proven(&status) {
+        return finish_release(lease, ctx, reason).await;
     }
 
     // A child-placed lease is torn down by destroying its cluster, not by
@@ -959,6 +1050,29 @@ async fn finish_release(
     use crate::crd::SandboxLeasePhase;
 
     let name = lease.name_any();
+    let status = lease.status.clone().unwrap_or_default();
+
+    // Prove the lease-owned footprint absent in status before freeing quota.
+    // This checkpoint and Quarantined compete on the same UID/resourceVersion:
+    // whichever wins determines whether capacity may ever be returned.
+    if !footprint_absence_proven(&status) {
+        let mut next = status.clone();
+        next.conditions = with_condition_for_status(
+            &status,
+            lease.metadata.generation,
+            FOOTPRINT_ABSENT_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "FootprintObservedAbsent",
+            "Lease-owned Sandbox footprint was verified absent",
+        );
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            info!(lease = %name, "Sandbox footprint absence checkpointed");
+        } else {
+            debug!(lease = %name, "footprint absence checkpoint lost a status race");
+        }
+        return Ok(Action::await_change());
+    }
+
     let uid = lease
         .uid()
         .ok_or_else(|| SandboxPlacementError::Invalid(format!("lease {name} has no UID")))?;
@@ -980,30 +1094,22 @@ async fn finish_release(
         true,
     )
     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-    patch_lease_status(
-        ctx,
-        &name,
-        &serde_json::json!({
-            "phase": terminal,
-            "conditions": with_cleanup_condition(
-                lease,
-                crate::crd::SandboxConditionStatus::True,
-                "TeardownVerified",
-                "Lease-owned footprint observed absent and reservations released",
-            ),
-        }),
-    )
-    .await?;
+    let mut next = status;
+    next.phase = terminal;
+    next.conditions = with_cleanup_condition(
+        lease,
+        crate::crd::SandboxConditionStatus::True,
+        "TeardownVerified",
+        "Lease-owned footprint observed absent and reservations released",
+    );
+    if !patch_lease_status_fenced(ctx, lease, &next).await? {
+        debug!(lease = %name, "terminal teardown checkpoint lost a status race");
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    }
     info!(lease = %name, phase = %terminal, "Sandbox lease teardown verified");
     Ok(Action::await_change())
 }
 
-/// Whether this lease's Sandbox runs in a composed child cluster.
-///
-/// Read from the *resolved* placement recorded on status rather than from the
-/// pool spec, because teardown must remain correct when the pool was since
-/// edited or deleted — the question is where this lease was actually placed,
-/// not where a pool of that name would place a lease today.
 /// Whether this lease's Sandbox runs in a composed child cluster.
 ///
 /// Three sources, in order of directness, because status alone is not enough.
@@ -1033,13 +1139,10 @@ async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let name = crate::controllers::sandbox_child::internal_lease_name(&lease.name_any());
     match internal.get(&name).await {
-        // Existence is the whole signal. The name is derived from THIS lease's
-        // name, which is unique in the namespace, so nothing else can produce
-        // it. Re-checking ownership here would only add a way to answer
-        // "management" for a real composition whose owner reference was
-        // stripped — and answering "management" is what releases the slot.
-        // Identity is fenced where it matters, on the recorded UID, before
-        // anything is destroyed.
+        // Existence selects the conservative child path. Exact owner identity
+        // is checked there before recovery or mutation; a foreign same-named
+        // object therefore quarantines instead of being mistaken for either a
+        // management Sandbox or this lease's composition.
         Ok(_) => true,
         Err(kube::Error::Api(error)) if error.code == 404 => false,
         // Cannot tell. Take the child path: it waits for evidence, where the
@@ -1095,6 +1198,24 @@ async fn release_child_composition(
         Some(recorded) => recorded.clone(),
         None => match internal_api.get(&derived).await {
             Ok(unrecorded) => {
+                let lease_uid = lease.uid().ok_or_else(|| {
+                    SandboxPlacementError::Invalid(format!(
+                        "SandboxLease {name} has no UID to recover child provenance"
+                    ))
+                })?;
+                if !metadata_is_controlled_by(
+                    &unrecorded.metadata,
+                    "kobe.kunobi.ninja/v1alpha1",
+                    "SandboxLease",
+                    &name,
+                    &lease_uid,
+                ) {
+                    return quarantine_lease(lease, ctx, "child_composition_identity_unverifiable")
+                        .await;
+                }
+                let Some(unrecorded_uid) = unrecorded.uid().filter(|uid| !uid.is_empty()) else {
+                    return quarantine_lease(lease, ctx, "child_composition_uid_missing").await;
+                };
                 warn!(
                     lease = %name,
                     cluster_lease = %derived,
@@ -1105,7 +1226,7 @@ async fn release_child_composition(
                     kind: "ClusterLease".into(),
                     namespace: Some(ctx.namespace.clone()),
                     name: derived.clone(),
-                    uid: unrecorded.uid().unwrap_or_default(),
+                    uid: unrecorded_uid,
                     generation: unrecorded.metadata.generation,
                 }
             }
@@ -1133,6 +1254,20 @@ async fn release_child_composition(
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match internal.get(&recorded.name).await {
         Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
+            let lease_uid = lease.uid().ok_or_else(|| {
+                SandboxPlacementError::Invalid(format!(
+                    "SandboxLease {name} has no UID to verify child ownership"
+                ))
+            })?;
+            if !metadata_is_controlled_by(
+                &current.metadata,
+                "kobe.kunobi.ninja/v1alpha1",
+                "SandboxLease",
+                &name,
+                &lease_uid,
+            ) {
+                return quarantine_lease(lease, ctx, "child_composition_owner_changed").await;
+            }
             let child_status = current.status.clone().unwrap_or_default();
 
             // #80 could not prove the cluster's own teardown. Nothing this
@@ -1311,30 +1446,28 @@ async fn quarantine_lease(
     reason: &str,
 ) -> Result<Action, SandboxPlacementError> {
     let name = lease.name_any();
+    let mut next = lease.status.clone().unwrap_or_default();
+    if footprint_absence_proven(&next) {
+        warn!(lease = %name, reason, "refusing to quarantine after footprint absence was proven");
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    }
     let phase = crate::sandbox::transition_sandbox_phase(
-        lease
-            .status
-            .as_ref()
-            .map(|status| status.phase)
-            .unwrap_or_default(),
+        next.phase,
         crate::crd::SandboxLeasePhase::Quarantined,
         false,
     )
     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-    patch_lease_status(
-        ctx,
-        &name,
-        &serde_json::json!({
-            "phase": phase,
-            "conditions": with_cleanup_condition(
-                lease,
-                crate::crd::SandboxConditionStatus::False,
-                reason,
-                "Teardown could not be verified; capacity is withheld",
-            ),
-        }),
-    )
-    .await?;
+    next.phase = phase;
+    next.conditions = with_cleanup_condition(
+        lease,
+        crate::crd::SandboxConditionStatus::False,
+        reason,
+        "Teardown could not be verified; capacity is withheld",
+    );
+    if !patch_lease_status_fenced(ctx, lease, &next).await? {
+        debug!(lease = %name, "quarantine checkpoint lost a status race");
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    }
     warn!(lease = %name, reason, "Sandbox lease quarantined; capacity withheld");
     Ok(Action::requeue(std::time::Duration::from_secs(300)))
 }
@@ -1346,6 +1479,8 @@ async fn quarantine_lease(
 /// to rename, and a sweep matching a condition type nobody writes any more
 /// would simply stop retiring anything, silently.
 pub(crate) const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
+/// Durable latch proving the lease-owned workload is gone before quota moves.
+const FOOTPRINT_ABSENT_CONDITION: &str = "FootprintAbsent";
 /// Durable record that the pool's canary already ran and passed.
 ///
 /// Durable rather than in-memory because the alternative is running an
@@ -1361,6 +1496,13 @@ fn canary_already_passed(status: &crate::crd::SandboxLeaseStatus) -> bool {
     })
 }
 
+fn footprint_absence_proven(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.condition_type == FOOTPRINT_ABSENT_CONDITION
+            && condition.status == crate::crd::SandboxConditionStatus::True
+    })
+}
+
 fn with_cleanup_condition(
     lease: &SandboxLease,
     status: crate::crd::SandboxConditionStatus,
@@ -1372,9 +1514,9 @@ fn with_cleanup_condition(
 
 /// Build the whole condition list, with one condition upserted into it.
 ///
-/// The full list is rebuilt because the status patch is a JSON merge patch,
-/// which REPLACES an array rather than merging it: sending one condition alone
-/// would silently drop every other condition on the lease.
+/// The full list is rebuilt because lifecycle checkpoints replace the complete
+/// status value: sending one condition alone would silently drop every other
+/// condition on the lease.
 ///
 /// `lastTransitionTime` moves only when the status actually changes, per the
 /// Kubernetes convention — a timestamp that advanced on every requeue would
@@ -1442,19 +1584,25 @@ fn is_controlled_by(
     name: &str,
     uid: &str,
 ) -> bool {
-    object
-        .metadata
-        .owner_references
-        .as_ref()
-        .is_some_and(|owners| {
-            owners.iter().any(|owner| {
-                owner.api_version == api_version
-                    && owner.kind == kind
-                    && owner.name == name
-                    && owner.uid == uid
-                    && owner.controller == Some(true)
-            })
+    metadata_is_controlled_by(&object.metadata, api_version, kind, name, uid)
+}
+
+fn metadata_is_controlled_by(
+    metadata: &kube::api::ObjectMeta,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+    uid: &str,
+) -> bool {
+    metadata.owner_references.as_ref().is_some_and(|owners| {
+        owners.iter().any(|owner| {
+            owner.api_version == api_version
+                && owner.kind == kind
+                && owner.name == name
+                && owner.uid == uid
+                && owner.controller == Some(true)
         })
+    })
 }
 
 fn target_reference(
@@ -1746,16 +1894,16 @@ async fn compose_child_target(
     // Adoption is fenced. A same-named object this lease does not own is
     // somebody else's cluster, and placing a tenant's Sandbox into it would be
     // the worst possible outcome of a name collision.
-    let owned_by_this_lease = internal_lease
-        .metadata
-        .owner_references
-        .as_ref()
-        .is_some_and(|owners| {
-            owners
-                .iter()
-                .any(|owner| Some(owner.uid.as_str()) == lease.uid().as_deref())
-        });
-    if !owned_by_this_lease {
+    let lease_uid = lease.uid().ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to own a child"))
+    })?;
+    if !metadata_is_controlled_by(
+        &internal_lease.metadata,
+        "kobe.kunobi.ninja/v1alpha1",
+        "SandboxLease",
+        &name,
+        &lease_uid,
+    ) {
         return Err(SandboxPlacementError::Invalid(format!(
             "ClusterLease {internal_name} exists but is not owned by SandboxLease {name}"
         )));
@@ -1791,31 +1939,55 @@ async fn compose_child_target(
     // the exact instance it must prove absent, and provenance written only
     // after a successful placement would be missing in precisely the case that
     // matters — a crash partway through.
-    let provenance = child::child_provenance(
+    let child_provenance = child::child_provenance(
         &ctx.namespace,
         &binding.lease,
         &binding.binding.instance.name,
         &binding.binding.instance.uid,
         Some(binding.binding.instance.observed_generation),
     );
-    patch_lease_status(
-        ctx,
-        &name,
-        &serde_json::json!({
-            "placement": crate::crd::ResolvedSandboxPlacement::ChildCluster {
-                cluster_pool: crate::crd::SandboxObjectReference {
-                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-                    kind: "ClusterPool".into(),
-                    namespace: Some(ctx.namespace.clone()),
-                    name: cluster_pool.name_any(),
-                    uid: cluster_pool.uid().unwrap_or_default(),
-                    generation: cluster_pool.metadata.generation,
-                },
+    let status = lease.status.clone().unwrap_or_default();
+    let placement = crate::sandbox::record_placement_once(
+        status.placement.as_ref(),
+        crate::crd::ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: crate::crd::SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterPool".into(),
+                namespace: Some(ctx.namespace.clone()),
+                name: cluster_pool.name_any(),
+                uid: cluster_pool.uid().unwrap_or_default(),
+                generation: cluster_pool.metadata.generation,
             },
-            "target": provenance,
-        }),
+        },
+        &ctx.namespace,
     )
-    .await?;
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    let mut proposed = status
+        .target
+        .clone()
+        .unwrap_or_else(|| child_provenance.clone());
+    proposed.namespace = child_provenance.namespace;
+    proposed.child_cluster_lease = child_provenance.child_cluster_lease;
+    proposed.child_cluster_instance = child_provenance.child_cluster_instance;
+    let provenance = crate::sandbox::merge_target_provenance(
+        status.target.as_ref(),
+        proposed,
+        &placement,
+        &ctx.namespace,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    if status.placement.as_ref() != Some(&placement) || status.target.as_ref() != Some(&provenance)
+    {
+        let mut next = status;
+        next.placement = Some(placement);
+        next.target = Some(provenance);
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            debug!(lease = %name, "recorded child composition provenance");
+        } else {
+            debug!(lease = %name, "child composition provenance write lost a status race");
+        }
+        return Ok(ChildTarget::Pending(Action::await_change()));
+    }
 
     // The kubeconfig is read into memory and never leaves it: not into status,
     // not into an API response, not into a log line. It is cluster-admin on a
@@ -1898,22 +2070,6 @@ async fn stamp_upstream_shutdown(
     let patch = crate::sandbox::build_sandbox_claim_lifecycle_patch(resource_version, at)?;
     claims
         .patch(claim, &PatchParams::default(), &Patch::Merge(&patch))
-        .await?;
-    Ok(())
-}
-
-async fn patch_lease_status(
-    ctx: &SandboxContext,
-    lease: &str,
-    status: &serde_json::Value,
-) -> Result<(), SandboxPlacementError> {
-    let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
-    leases
-        .patch_status(
-            lease,
-            &PatchParams::apply(crate::sandbox::KOBE_MANAGED_BY),
-            &Patch::Merge(&serde_json::json!({ "status": status })),
-        )
         .await?;
     Ok(())
 }
@@ -2233,6 +2389,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn admitted_lease() -> SandboxLease {
+        let created_at = chrono::Utc::now();
         let reference = |api_version: &str, kind: &str, name: &str, uid: &str| {
             crate::crd::SandboxObjectReference {
                 api_version: api_version.into(),
@@ -2250,6 +2407,10 @@ pub(crate) mod tests {
                 uid: Some("lease-uid-1".into()),
                 resource_version: Some("lease-rv-1".into()),
                 generation: Some(1),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_millisecond(created_at.timestamp_millis())
+                        .unwrap(),
+                )),
                 annotations: Some(
                     [(
                         SANDBOX_ADMISSION_ANNOTATION.to_string(),
@@ -2279,7 +2440,11 @@ pub(crate) mod tests {
                 phase: crate::crd::SandboxLeasePhase::Provisioning,
                 observed_generation: Some(1),
                 provisioning_deadline: Some(
-                    (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+                    crate::sandbox::sandbox_provisioning_deadline(
+                        created_at,
+                        chrono::Duration::minutes(10),
+                    )
+                    .unwrap(),
                 ),
                 placement: Some(crate::crd::ResolvedSandboxPlacement::Management {}),
                 target: Some(crate::crd::SandboxTargetProvenance {
@@ -2745,6 +2910,141 @@ pub(crate) mod tests {
         assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 1);
     }
 
+    /// Missing upstream pool objects are part of provisioning, not a queue
+    /// outside its clock. The deadline is durable before the first Template
+    /// lookup and can expire without those objects ever appearing.
+    #[tokio::test]
+    async fn missing_management_pool_objects_are_bounded_by_provisioning_deadline() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(TEMPLATE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Pending;
+        status.observed_generation = None;
+        status.provisioning_deadline = None;
+        status.target = None;
+
+        let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "GET", TEMPLATE_PATH).await, 0);
+        advance_lease_to_latest_status(&mut lease, &server, "lease-rv-2").await;
+        assert_eq!(
+            lease.status.as_ref().unwrap().phase,
+            crate::crd::SandboxLeasePhase::Provisioning
+        );
+        assert!(
+            lease
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning_deadline
+                .is_some()
+        );
+
+        let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(requests_to(&server, "GET", TEMPLATE_PATH).await, 1);
+
+        lease.status.as_mut().unwrap().provisioning_deadline =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        lease.metadata.resource_version = Some("lease-rv-3".into());
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "GET", TEMPLATE_PATH).await, 1);
+        let status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("Releasing checkpoint");
+        assert_eq!(status["phase"], "Releasing");
+        assert_eq!(status["releaseCause"], "ProvisioningDeadline");
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+    }
+
+    /// Child-cluster allocation cannot sit outside the provisioning bound. A
+    /// Pending child lease checkpoints its deadline before even reading the
+    /// ClusterPool, and an elapsed checkpoint releases without composing.
+    #[tokio::test]
+    async fn child_binding_wait_is_bounded_before_composition() {
+        const CHILD_POOL_PATH: &str =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool";
+        let (ctx, server) = test_context().await;
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.placement = serde_json::from_value(serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "child-pool"
+        }))
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Pending;
+        status.observed_generation = None;
+        status.provisioning_deadline = None;
+        status.placement = None;
+        status.target = None;
+
+        let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "GET", CHILD_POOL_PATH).await, 0);
+        advance_lease_to_latest_status(&mut lease, &server, "lease-rv-2").await;
+        lease.status.as_mut().unwrap().provisioning_deadline =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "GET", CHILD_POOL_PATH).await, 0);
+        let status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("child expiry checkpoint");
+        assert_eq!(status["releaseCause"], "ProvisioningDeadline");
+    }
+
     /// An unready claim is still an allocated identity. Record it before the
     /// normal readiness requeue so restart-safe cleanup can address the exact
     /// object rather than a derived name.
@@ -3030,8 +3330,8 @@ pub(crate) mod tests {
 
         for (resource_version, checkpoint) in [
             ("lease-rv-2", "placement"),
-            ("lease-rv-3", "pool provenance"),
-            ("lease-rv-4", "Provisioning"),
+            ("lease-rv-3", "Provisioning"),
+            ("lease-rv-4", "pool provenance"),
             ("lease-rv-5", "claim provenance"),
         ] {
             let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
@@ -3229,7 +3529,11 @@ pub(crate) mod tests {
             SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),
             chrono::Utc::now().to_rfc3339(),
         );
-        lease.status.as_mut().unwrap().phase = phase;
+        let status = lease.status.as_mut().unwrap();
+        status.phase = phase;
+        if phase == crate::crd::SandboxLeasePhase::Releasing {
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        }
         lease
     }
 
@@ -3238,18 +3542,49 @@ pub(crate) mod tests {
     async fn reconcile_release_after_checkpoint(
         mut lease: SandboxLease,
         ctx: Arc<SandboxContext>,
+        server: &MockServer,
     ) -> Action {
-        if lease.status.as_ref().unwrap().phase != crate::crd::SandboxLeasePhase::Releasing {
+        for pass in 0..4 {
+            let before = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .count();
             let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
                 .await
-                .expect("Releasing checkpoint");
-            assert_eq!(action, Action::await_change());
-            lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Releasing;
-            lease.metadata.resource_version = Some("lease-rv-after-releasing".into());
+                .expect("release checkpoint");
+            if action != Action::await_change() {
+                return action;
+            }
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .filter_map(status_value_of)
+                .collect();
+            let Some(latest) = statuses.get(before).cloned() else {
+                return action;
+            };
+            lease.status = Some(serde_json::from_value(latest).expect("typed release checkpoint"));
+            lease.metadata.resource_version = Some(format!("lease-rv-after-release-{pass}"));
+            if matches!(
+                lease.status.as_ref().unwrap().phase,
+                crate::crd::SandboxLeasePhase::Released
+                    | crate::crd::SandboxLeasePhase::Expired
+                    | crate::crd::SandboxLeasePhase::Quarantined
+            ) {
+                return action;
+            }
         }
-        reconcile_lease(Arc::new(lease), ctx)
-            .await
-            .expect("release after checkpoint")
+        panic!("release did not settle within four durable checkpoints")
     }
 
     async fn advance_lease_to_latest_status(
@@ -3330,6 +3665,29 @@ pub(crate) mod tests {
             .await;
     }
 
+    /// Let one status writer win, then make every stale writer lose its
+    /// UID/resourceVersion fence. Both proof and quarantine tests use the same
+    /// apiserver ordering so the only variable is which state is submitted
+    /// first.
+    async fn mount_one_winning_status_patch(server: &MockServer) {
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .up_to_n_times(1)
+            .expect(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "Conflict"
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
     /// A crash can land after CREATE but before the claim UID checkpoint. The
     /// release path first recovers the exact lease-owned identity and ends the
     /// pass; it never deletes an object known only by a derived name.
@@ -3378,6 +3736,476 @@ pub(crate) mod tests {
         assert_eq!(recovered["target"]["sandboxClaim"]["uid"], "claim-uid");
     }
 
+    /// A derived name is not provenance. If the object at that name is not
+    /// controlled by this exact lease UID, recovery quarantines without
+    /// deleting it or returning quota.
+    #[tokio::test]
+    async fn teardown_never_recovers_a_foreign_claim() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut foreign = claim_json(serde_json::json!({}));
+        foreign["metadata"]["ownerReferences"][0]["uid"] = "another-lease-uid".into();
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
+            .mount(&server)
+            .await;
+
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+    }
+
+    /// A successful DELETE is only an acknowledgement. If the same name is
+    /// already occupied by another UID when absence is checked, teardown is
+    /// unproven and the reservation remains held.
+    #[tokio::test]
+    async fn teardown_rejects_a_same_named_claim_replacement() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        let mut replacement = claim_json(serde_json::json!({}));
+        replacement["metadata"]["uid"] = "replacement-claim-uid".into();
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replacement))
+            .mount(&server)
+            .await;
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 1);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+    }
+
+    /// A legacy/corrupt Releasing object without the atomic cause checkpoint
+    /// cannot be given a clean terminal outcome. It quarantines without
+    /// touching either the claim or quota reservations.
+    #[tokio::test]
+    async fn a_releasing_lease_without_cause_fails_closed() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Releasing;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("quarantine status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/uid"
+                && operation["value"] == "lease-uid-1"
+        }));
+        assert_eq!(status_value_of(&request).unwrap()["phase"], "Quarantined");
+    }
+
+    /// After footprint proof and idempotent reservation release, a stale
+    /// terminal writer must lose on UID/resourceVersion rather than mutate a
+    /// same-named replacement lease.
+    #[tokio::test]
+    async fn terminal_status_conflict_cannot_write_through_name_reuse() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "Conflict"
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease.status.as_mut().unwrap().conditions = with_condition(
+            &lease,
+            FOOTPRINT_ABSENT_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "FootprintObservedAbsent",
+            "recorded by an earlier reconcile",
+        );
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            1,
+            "reservation cleanup remains safely idempotent"
+        );
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("terminal status attempt");
+        let operations: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "lease-rv-1"
+        }));
+        assert_eq!(
+            status_value_of(&patch).unwrap()["releaseCause"],
+            "Requested"
+        );
+    }
+
+    /// Quarantine has the same identity fence as a clean terminal write and
+    /// never frees reservations when that fence loses a race.
+    #[tokio::test]
+    async fn quarantine_status_conflict_cannot_write_through_name_reuse() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "Conflict"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "Conflict"
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("quarantine status attempt");
+        assert_eq!(status_value_of(&patch).unwrap()["phase"], "Quarantined");
+    }
+
+    /// Footprint proof and quarantine are mutually exclusive durable outcomes.
+    /// If proof wins the shared resourceVersion first, a stale quarantine may
+    /// not overwrite it and quota remains untouched until a fresh reconcile
+    /// observes that proof.
+    #[tokio::test]
+    async fn footprint_proof_wins_the_race_without_releasing_quota_in_that_pass() {
+        let (ctx, server) = test_context().await;
+        mount_one_winning_status_patch(&server).await;
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+
+        let proof = finish_release(&lease, &ctx, ReleaseReason::Requested)
+            .await
+            .unwrap();
+        assert_eq!(proof, Action::await_change());
+        let stale_quarantine = quarantine_lease(&lease, &ctx, "stale_uncertainty")
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_quarantine,
+            Action::requeue(std::time::Duration::from_secs(5))
+        );
+
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            statuses[0]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| {
+                    condition["type"] == FOOTPRINT_ABSENT_CONDITION && condition["status"] == "True"
+                })
+        );
+        assert_eq!(statuses[1]["phase"], "Quarantined");
+        assert_eq!(requests_to(&server, "GET", RESERVATIONS_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+    }
+
+    /// The opposite ordering fails closed too. A quarantine that wins first
+    /// keeps the reservation; a stale proof writer cannot free quota because a
+    /// proof checkpoint never performs reservation cleanup itself.
+    #[tokio::test]
+    async fn quarantine_wins_the_race_without_releasing_quota() {
+        let (ctx, server) = test_context().await;
+        mount_one_winning_status_patch(&server).await;
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+
+        let quarantine = quarantine_lease(&lease, &ctx, "absence_unverifiable")
+            .await
+            .unwrap();
+        assert_eq!(
+            quarantine,
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+        let stale_proof = finish_release(&lease, &ctx, ReleaseReason::Requested)
+            .await
+            .unwrap();
+        assert_eq!(stale_proof, Action::await_change());
+
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0]["phase"], "Quarantined");
+        assert!(
+            statuses[1]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| {
+                    condition["type"] == FOOTPRINT_ABSENT_CONDITION && condition["status"] == "True"
+                })
+        );
+        assert_eq!(requests_to(&server, "GET", RESERVATIONS_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+    }
+
+    /// `FootprintAbsent` is the restart boundary. Once present, reconciliation
+    /// must skip both placement-specific teardown paths and run only the
+    /// idempotent reservation/terminal tail.
+    #[tokio::test]
+    async fn restart_from_footprint_proof_skips_claim_and_child_teardown() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut lease = child_placed_lease("child-lease-uid");
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        }
+        lease.status.as_mut().unwrap().conditions = with_condition(
+            &lease,
+            FOOTPRINT_ABSENT_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "FootprintObservedAbsent",
+            "persisted before controller restart",
+        );
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0
+        );
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            1
+        );
+        let terminal = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("terminal status");
+        assert_eq!(terminal["phase"], "Released");
+        assert!(
+            terminal["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| {
+                    condition["type"] == FOOTPRINT_ABSENT_CONDITION && condition["status"] == "True"
+                })
+        );
+    }
+
+    /// A reservation API outage occurs after workload absence is durable. The
+    /// proof must survive the failed tail so a retry neither rechecks nor
+    /// re-destroys the external footprint.
+    #[tokio::test]
+    async fn reservation_failure_retains_footprint_proof_for_retry() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(RESERVATIONS_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 500, "reason": "InternalError"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        }
+        lease.status.as_mut().unwrap().conditions = with_condition(
+            &lease,
+            FOOTPRINT_ABSENT_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "FootprintObservedAbsent",
+            "persisted before reservation cleanup",
+        );
+
+        let first = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(first, Action::requeue(std::time::Duration::from_secs(15)));
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert!(footprint_absence_proven(lease.status.as_ref().unwrap()));
+
+        let retry = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(retry, Action::await_change());
+        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            1
+        );
+        let terminal = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("terminal status after retry");
+        assert!(
+            terminal["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| {
+                    condition["type"] == FOOTPRINT_ABSENT_CONDITION && condition["status"] == "True"
+                })
+        );
+    }
+
     /// Capacity comes back only against proof that the Sandbox is gone.
     ///
     /// The quota slot is what stops a pool being over-subscribed. Returning it
@@ -3405,12 +4233,16 @@ pub(crate) mod tests {
             .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
-        reconcile_release_after_checkpoint(lease, ctx).await;
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
 
         assert_eq!(
             recorded_phases(&server).await,
-            vec!["Releasing".to_string(), "Released".to_string()],
-            "intent must be visible in status before the terminal write"
+            vec![
+                "Releasing".to_string(),
+                "Releasing".to_string(),
+                "Released".to_string()
+            ],
+            "intent and footprint proof must be durable before the terminal write"
         );
         let delete = server
             .received_requests()
@@ -3468,7 +4300,7 @@ pub(crate) mod tests {
             .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
-        let action = reconcile_release_after_checkpoint(lease, ctx).await;
+        let action = reconcile_release_after_checkpoint(lease, ctx, &server).await;
         assert_ne!(
             action,
             Action::await_change(),
@@ -3517,7 +4349,7 @@ pub(crate) mod tests {
             .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
-        reconcile_release_after_checkpoint(lease, ctx).await;
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
 
         let phases = recorded_phases(&server).await;
         assert_eq!(
@@ -3571,13 +4403,18 @@ pub(crate) mod tests {
         let mut lease = admitted_lease();
         let status = lease.status.as_mut().unwrap();
         status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.ready_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
         status.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
 
-        reconcile_release_after_checkpoint(lease, ctx).await;
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
 
         assert_eq!(
             recorded_phases(&server).await,
-            vec!["Releasing".to_string(), "Expired".to_string()]
+            vec![
+                "Releasing".to_string(),
+                "Releasing".to_string(),
+                "Expired".to_string()
+            ]
         );
         assert_eq!(
             requests_to(
@@ -3618,8 +4455,8 @@ pub(crate) mod tests {
         interrupted.status.as_mut().unwrap().phase = SandboxLeasePhase::Releasing;
         assert_eq!(
             release_reason(&interrupted),
-            Some(ReleaseReason::InProgress),
-            "an interrupted teardown without another durable cause still resumes"
+            Some(ReleaseReason::MissingCause),
+            "an interrupted teardown without a durable cause fails closed"
         );
 
         for terminal in [
@@ -3637,13 +4474,95 @@ pub(crate) mod tests {
         // Quarantine is deliberately terminal here: exiting it is an operator
         // decision backed by evidence, not something a requeue may do.
         assert_eq!(
-            ReleaseReason::Expired.terminal_phase(),
+            ReleaseReason::RuntimeTtl.terminal_phase(),
             SandboxLeasePhase::Expired
         );
         assert_eq!(
             ReleaseReason::Requested.terminal_phase(),
             SandboxLeasePhase::Released
         );
+    }
+
+    /// The earliest durable teardown signal owns the outcome, and the cause
+    /// remains immutable once checkpointed.
+    #[test]
+    fn release_cause_orders_requests_and_deadlines_chronologically() {
+        let deadline = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let before = deadline - chrono::Duration::seconds(1);
+        let after = deadline + chrono::Duration::seconds(1);
+
+        let runtime = |requested_at: chrono::DateTime<chrono::Utc>| {
+            let mut lease = admitted_lease();
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Ready;
+            status.ready_at = Some((deadline - chrono::Duration::hours(1)).to_rfc3339());
+            status.expires_at = Some(deadline.to_rfc3339());
+            lease.metadata.annotations.as_mut().unwrap().insert(
+                SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.into(),
+                requested_at.to_rfc3339(),
+            );
+            lease
+        };
+        assert_eq!(
+            release_reason(&runtime(before)),
+            Some(ReleaseReason::Requested)
+        );
+        assert_eq!(
+            release_reason(&runtime(deadline)),
+            Some(ReleaseReason::Requested)
+        );
+        assert_eq!(
+            release_reason(&runtime(after)),
+            Some(ReleaseReason::RuntimeTtl)
+        );
+
+        let mut provisioning = admitted_lease();
+        provisioning.status.as_mut().unwrap().provisioning_deadline = Some(deadline.to_rfc3339());
+        provisioning.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.into(),
+            after.to_rfc3339(),
+        );
+        assert_eq!(
+            release_reason(&provisioning),
+            Some(ReleaseReason::ProvisioningDeadline)
+        );
+
+        // Persisted first cause beats every later signal.
+        provisioning.status.as_mut().unwrap().release_cause =
+            Some(crate::crd::SandboxReleaseCause::ProvisioningDeadline);
+        provisioning.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.into(),
+            before.to_rfc3339(),
+        );
+        assert_eq!(
+            release_reason(&provisioning),
+            Some(ReleaseReason::ProvisioningDeadline)
+        );
+
+        // A stale expiresAt cannot start the runtime clock without Ready proof.
+        let mut not_ready = admitted_lease();
+        not_ready.status.as_mut().unwrap().expires_at = Some(deadline.to_rfc3339());
+        assert_eq!(release_reason(&not_ready), None);
+    }
+
+    /// Corrupt server-owned request time never beats a known elapsed deadline,
+    /// but still represents immediate release intent when no clock elapsed.
+    #[test]
+    fn malformed_release_request_time_fails_closed_on_cause_ordering() {
+        let mut expired = admitted_lease();
+        let status = expired.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.ready_at = Some((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339());
+        status.expires_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+        expired.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.into(),
+            "not-a-timestamp".into(),
+        );
+        assert_eq!(release_reason(&expired), Some(ReleaseReason::RuntimeTtl));
+
+        expired.status.as_mut().unwrap().ready_at = None;
+        expired.status.as_mut().unwrap().expires_at = None;
+        assert_eq!(release_reason(&expired), Some(ReleaseReason::Requested));
     }
 
     /// An unparseable expiry must not be read as expired.
@@ -3655,7 +4574,9 @@ pub(crate) mod tests {
     #[test]
     fn a_malformed_expiry_does_not_destroy_a_live_lease() {
         let mut lease = admitted_lease();
-        lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Ready;
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.ready_at = Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
 
         for value in ["", "not-a-timestamp", "0", "1970-13-45T99:99:99Z"] {
             lease.status.as_mut().unwrap().expires_at = Some(value.to_string());
@@ -3671,12 +4592,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// Provisioning also remains live when its deadline is malformed or still
+    /// in the future; uncertainty must never be interpreted as permission to
+    /// destroy a workload.
+    #[test]
+    fn a_malformed_or_future_provisioning_deadline_does_not_release() {
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Provisioning;
+
+        for value in ["", "not-a-timestamp", "0", "1970-13-45T99:99:99Z"] {
+            lease.status.as_mut().unwrap().provisioning_deadline = Some(value.to_string());
+            assert_eq!(release_reason(&lease), None, "must not expire on {value:?}");
+        }
+
+        lease.status.as_mut().unwrap().provisioning_deadline =
+            Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        assert_eq!(release_reason(&lease), None);
+    }
+
     /// A cleanup condition must not silently drop the others.
     ///
-    /// Status is written with a JSON merge patch, which REPLACES arrays. A
-    /// patch carrying one condition would erase every other condition on the
-    /// lease — and conditions are exactly what an operator reads to work out
-    /// what happened.
+    /// Lifecycle checkpoints replace the complete status value. A status
+    /// carrying one condition would erase every other condition on the lease —
+    /// and conditions are exactly what an operator reads to work out what
+    /// happened.
     #[test]
     fn writing_the_cleanup_condition_preserves_the_others() {
         use crate::crd::SandboxConditionStatus;
@@ -3823,6 +4762,13 @@ pub(crate) mod tests {
                 "namespace": NS,
                 "uid": uid,
                 "resourceVersion": "42",
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "SandboxLease",
+                    "name": LEASE,
+                    "uid": "lease-uid-1",
+                    "controller": true,
+                }],
             },
             "spec": {
                 "poolRef": "children",
@@ -3881,7 +4827,8 @@ pub(crate) mod tests {
             .await;
         mount_child_release_patch(&server).await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
+            .await;
 
         assert_eq!(
             requests_to(&server, "DELETE", CLAIM_PATH).await,
@@ -3933,7 +4880,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
+            .await;
 
         assert_eq!(
             requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await,
@@ -3962,6 +4910,66 @@ pub(crate) mod tests {
         );
     }
 
+    /// Recovery of an uncheckpointed child allocation is allowed only from an
+    /// exact controller owner reference. A foreign owner and a recreated
+    /// same-named SandboxLease are both somebody else's cluster.
+    #[tokio::test]
+    async fn unrecorded_child_with_foreign_or_recreated_owner_quarantines() {
+        for (case, owner_name, owner_uid) in [
+            ("foreign owner", "another-sandbox", "another-lease-uid"),
+            ("same-name replacement", LEASE, "replacement-lease-uid"),
+        ] {
+            let (ctx, server) = test_context().await;
+            mount_teardown_scaffolding(&server).await;
+            let mut child = child_cluster_lease("child-lease-uid", "Bound", None);
+            child["metadata"]["ownerReferences"][0]["name"] = serde_json::json!(owner_name);
+            child["metadata"]["ownerReferences"][0]["uid"] = serde_json::json!(owner_uid);
+            Mock::given(method("GET"))
+                .and(path(CLUSTER_LEASE_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(child))
+                .mount(&server)
+                .await;
+
+            let mut lease = child_placed_lease("child-lease-uid");
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+            status.target.as_mut().unwrap().child_cluster_lease = None;
+
+            let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+            assert_eq!(
+                action,
+                Action::requeue(std::time::Duration::from_secs(300)),
+                "{case}"
+            );
+            assert_eq!(
+                requests_to(&server, "GET", CLUSTER_LEASE_PATH).await,
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+                0,
+                "{case}: a foreign child must not be released"
+            );
+            assert_eq!(
+                requests_to(
+                    &server,
+                    "DELETE",
+                    &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+                )
+                .await,
+                0,
+                "{case}: uncertain ownership must retain quota"
+            );
+            assert_eq!(
+                recorded_phases(&server).await.last().map(String::as_str),
+                Some("Quarantined"),
+                "{case}"
+            );
+        }
+    }
+
     /// If Kobe cannot tell whether the tenant's cluster is still running, it
     /// withholds the capacity rather than guessing.
     #[tokio::test]
@@ -3976,7 +4984,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
+            .await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -4014,7 +5023,7 @@ pub(crate) mod tests {
             .unwrap()
             .child_cluster_lease = None;
 
-        reconcile_release_after_checkpoint(lease, ctx).await;
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -4097,7 +5106,7 @@ pub(crate) mod tests {
         status.placement = None;
         status.target = None;
 
-        reconcile_release_after_checkpoint(lease, ctx).await;
+        reconcile_release_after_checkpoint(lease, ctx, &server).await;
 
         assert!(
             !recorded_phases(&server)
@@ -4140,7 +5149,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
+            .await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -4181,7 +5191,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
+            .await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -4215,7 +5226,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
+            .await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),

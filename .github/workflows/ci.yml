@@ -189,6 +189,49 @@ jobs:
             }
           done
 
+  # Real API-server contract for the SandboxLease status protocol. Unit tests
+  # pin the JSON Patch and CEL text; this job proves Kubernetes actually
+  # accepts the intended writes and rejects stale identity/version writers and
+  # release-cause mutation. It installs only the CRD into kind: no Kobe image,
+  # Helm release or external Agent Sandbox runtime is involved.
+  sandbox-apiserver-contract:
+    name: Sandbox API-server Contract
+    runs-on: kunobi-runners
+    timeout-minutes: 15
+    env:
+      SANDBOX_CONTRACT_CLUSTER: sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: ${{ runner.temp }}/sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up pinned contract-test tools
+        uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+
+      - name: Install bun, kind and kubectl
+        run: mise install bun kind kubectl
+
+      - name: Create kind and install the SandboxLease CRD
+        run: |
+          mise exec -- kind create cluster --name "$SANDBOX_CONTRACT_CLUSTER" --wait 120s
+          CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
+          mise exec -- kubectl --context "$CONTEXT" apply -f charts/kobe/crds/sandboxleases.yaml
+          mise exec -- kubectl --context "$CONTEXT" wait \
+            --for=condition=Established \
+            crd/sandboxleases.kobe.kunobi.ninja \
+            --timeout=60s
+
+      - name: Verify SandboxLease CEL and status fences
+        run: |
+          export KOBE_SANDBOX_APISERVER_CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
+          mise exec -- bun run ./hack/test-sandbox-apiserver.ts
+
+      - name: Tear down contract cluster
+        if: always()
+        run: mise exec -- kind delete cluster --name "$SANDBOX_CONTRACT_CLUSTER" || true
+
   docker-dry-run:
     if: github.event_name == 'pull_request'
     needs: checks

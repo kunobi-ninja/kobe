@@ -457,6 +457,12 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
     shortname = "sl",
     status = "SandboxLeaseStatus",
     namespaced,
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.releaseCause) || (has(self.status) && self.status != null && has(self.status.releaseCause) && self.status.releaseCause == oldSelf.status.releaseCause)")
+        .message("status.releaseCause is immutable once recorded"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))")
+        .message("status FootprintAbsent proof is immutable once recorded"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != 'FootprintAbsent' || (c.status == 'True' && has(self.status.releaseCause) && self.status.phase in ['Releasing', 'Released', 'Expired']))")
+        .message("FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -543,6 +549,11 @@ pub struct SandboxLeaseStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
     pub expires_at: Option<String>,
+    /// Immutable reason the lease first entered `Releasing`. Persisted in the
+    /// same status write as that phase so retries, later release requests, and
+    /// controller restarts cannot change the terminal accounting outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_cause: Option<SandboxReleaseCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<ResolvedSandboxPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,6 +578,15 @@ pub enum SandboxLeasePhase {
     Released,
     Expired,
     Quarantined,
+}
+
+/// Durable cause of Sandbox teardown. Runtime and provisioning expiry both end
+/// in `Expired`, but remain distinct for operator diagnostics and billing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum SandboxReleaseCause {
+    Requested,
+    RuntimeTtl,
+    ProvisioningDeadline,
 }
 
 impl std::fmt::Display for SandboxLeasePhase {
@@ -950,5 +970,42 @@ mod tests {
             lease["spec"]["versions"][0]["subresources"]["status"],
             serde_json::json!({})
         );
+    }
+
+    /// The first teardown cause is a durable accounting fact. Its wire values
+    /// are public, and Kubernetes must reject both changing and removing it.
+    #[test]
+    fn release_cause_schema_is_exact_and_write_once() {
+        let mut status = SandboxLeaseStatus::default();
+        let absent = serde_json::to_value(&status).unwrap();
+        assert!(absent.get("releaseCause").is_none());
+
+        status.release_cause = Some(SandboxReleaseCause::RuntimeTtl);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["releaseCause"],
+            "RuntimeTtl"
+        );
+
+        let lease = serde_json::to_value(SandboxLease::crd()).unwrap();
+        let root_schema = &lease["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let status_schema = &root_schema["properties"]["status"];
+        assert_eq!(
+            status_schema["properties"]["releaseCause"]["enum"],
+            serde_json::json!(["Requested", "RuntimeTtl", "ProvisioningDeadline", null])
+        );
+        assert!(status_schema.get("x-kubernetes-validations").is_none());
+        let validations = root_schema["x-kubernetes-validations"].as_array().unwrap();
+        for rule in [
+            "!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.releaseCause) || (has(self.status) && self.status != null && has(self.status.releaseCause) && self.status.releaseCause == oldSelf.status.releaseCause)",
+            "!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))",
+            "!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != 'FootprintAbsent' || (c.status == 'True' && has(self.status.releaseCause) && self.status.phase in ['Releasing', 'Released', 'Expired']))",
+        ] {
+            assert!(
+                validations
+                    .iter()
+                    .any(|validation| validation["rule"] == rule),
+                "missing root validation: {rule}"
+            );
+        }
     }
 }

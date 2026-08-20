@@ -28,7 +28,8 @@ use super::sandbox_rate_limit::RateLimitDecision;
 use crate::backend::ClusterBackend;
 use crate::crd::{
     ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
-    SandboxPool, SandboxPoolReference, SandboxPrincipal, SandboxTargetProvenance, SandboxVerb,
+    SandboxPool, SandboxPoolReference, SandboxPrincipal, SandboxReleaseCause,
+    SandboxTargetProvenance, SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use crate::sandbox::{aggregate_resource_limits, resource_ceiling_allows};
@@ -1720,6 +1721,8 @@ struct SandboxLeaseResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    release_cause: Option<SandboxReleaseCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     placement: Option<ResolvedSandboxPlacement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<SandboxTargetProvenance>,
@@ -1896,16 +1899,15 @@ async fn create_sandbox_lease<B: ClusterBackend>(
             None,
         );
     };
-    if parse_duration(&pool.spec.provisioning_timeout)
+    let Some(provisioning_timeout) = parse_duration(&pool.spec.provisioning_timeout)
         .filter(|duration| *duration > chrono::Duration::zero())
-        .is_none()
-    {
+    else {
         return sandbox_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "SandboxPool provisioning timeout is invalid",
             None,
         );
-    }
+    };
     let Some(pool_max_ttl) =
         parse_duration(&pool.spec.max_ttl).filter(|duration| *duration > chrono::Duration::zero())
     else {
@@ -1980,6 +1982,52 @@ async fn create_sandbox_lease<B: ClusterBackend>(
         }
         return sandbox_infra_error("Sandbox lease create response failed validation", err);
     }
+
+    // Admission snapshots the absolute setup bound before reserving quota or
+    // exposing `admitted`. The API-server creation timestamp is authoritative:
+    // using a process clock here, or `now()` later in the controller, would
+    // erase queue/controller downtime from the bound.
+    let provisioning_deadline = match created
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .and_then(|timestamp| {
+            chrono::DateTime::parse_from_rfc3339(&timestamp.0.to_string())
+                .ok()
+                .map(|parsed| parsed.with_timezone(&chrono::Utc))
+        })
+        .ok_or(SandboxLeaseMutationError::MissingCreationTimestamp)
+        .and_then(|accepted_at| {
+            crate::sandbox::sandbox_provisioning_deadline(accepted_at, provisioning_timeout)
+                .map_err(SandboxLeaseMutationError::Lifecycle)
+        }) {
+        Ok(deadline) => deadline,
+        Err(err) => {
+            if let Err(cleanup_err) =
+                delete_exact_pending_lease(&leases, &reservations, &created).await
+            {
+                error!(error = %cleanup_err, "Failed to remove Sandbox lease without a provisioning deadline");
+            }
+            return sandbox_infra_error("Failed to bound Sandbox lease provisioning", err);
+        }
+    };
+    let created = match persist_pending_provisioning_deadline(
+        &leases,
+        &created,
+        &provisioning_deadline,
+    )
+    .await
+    {
+        Ok(created) => created,
+        Err(err) => {
+            if let Err(cleanup_err) =
+                delete_exact_pending_lease(&leases, &reservations, &created).await
+            {
+                error!(error = %cleanup_err, "Failed to remove Sandbox lease after deadline checkpoint failure");
+            }
+            return sandbox_infra_error("Failed to checkpoint Sandbox provisioning deadline", err);
+        }
+    };
 
     // Quota and alias admission use atomic, per-principal Kubernetes Lease
     // reservations. Advisory LIST checks above improve error latency, but only
@@ -2070,11 +2118,8 @@ async fn create_sandbox_lease<B: ClusterBackend>(
             other => {
                 match leases.get(&lease_id).await {
                     Ok(current)
-                        if current
-                            .annotations()
-                            .get(SANDBOX_ADMISSION_ANNOTATION)
-                            .map(String::as_str)
-                            == Some(SANDBOX_ADMISSION_ADMITTED) =>
+                        if validate_lease_shape(&created, &current, SANDBOX_ADMISSION_ADMITTED)
+                            .is_ok() =>
                     {
                         warn!(
                             lease_id = %lease_id,
@@ -2117,9 +2162,10 @@ async fn create_sandbox_lease<B: ClusterBackend>(
             effective_ttl: was_clamped.then_some(effective_ttl),
             alias: request.alias,
             observed_generation: None,
-            provisioning_deadline: None,
+            provisioning_deadline: Some(provisioning_deadline),
             ready_at: None,
             expires_at: None,
+            release_cause: None,
             placement: None,
             target: None,
             conditions: Vec::new(),
@@ -2354,6 +2400,7 @@ fn sandbox_lease_response(
         provisioning_deadline: status.provisioning_deadline,
         ready_at: status.ready_at,
         expires_at: status.expires_at,
+        release_cause: status.release_cause,
         placement: status.placement,
         target: status.target.map(caller_visible_provenance),
         conditions: status.conditions,
@@ -3075,6 +3122,70 @@ fn sandbox_pool_reference(pool: &SandboxPool) -> Result<SandboxPoolReference, St
     })
 }
 
+/// Persist the admission-time setup bound before quota can be committed.
+///
+/// The UID/resourceVersion tests make the checkpoint belong to the exact
+/// object returned by CREATE. A lost response is resolved by re-reading that
+/// object and accepting only the exact deadline; no reservation exists yet, so
+/// every failure remains safely removable as an unadmitted lease.
+async fn persist_pending_provisioning_deadline(
+    leases: &Api<SandboxLease>,
+    lease: &SandboxLease,
+    deadline: &str,
+) -> Result<SandboxLease, SandboxLeaseMutationError> {
+    let uid = lease.uid().ok_or(SandboxLeaseMutationError::MissingUid)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or(SandboxLeaseMutationError::MissingResourceVersion)?;
+    let mut status = lease.status.clone().unwrap_or_default();
+    if status.phase != SandboxLeasePhase::Pending {
+        return Err(SandboxLeaseMutationError::UnexpectedAdmissionState);
+    }
+    status.provisioning_deadline = Some(deadline.to_string());
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(stamped) => {
+            validate_lease_shape(lease, &stamped, SANDBOX_ADMISSION_PENDING)?;
+            require_provisioning_deadline(&stamped, deadline)?;
+            Ok(stamped)
+        }
+        Err(_patch_error) => {
+            let current = leases.get(&lease.name_any()).await?;
+            validate_lease_shape(lease, &current, SANDBOX_ADMISSION_PENDING)?;
+            require_provisioning_deadline(&current, deadline)?;
+            Ok(current)
+        }
+    }
+}
+
+fn require_provisioning_deadline(
+    lease: &SandboxLease,
+    expected: &str,
+) -> Result<(), SandboxLeaseMutationError> {
+    if lease
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning_deadline.as_deref())
+        == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err(SandboxLeaseMutationError::ProvisioningDeadlineNotCommitted)
+    }
+}
+
 async fn admit_sandbox_lease(
     leases: &Api<SandboxLease>,
     reservations: &Api<Lease>,
@@ -3534,6 +3645,13 @@ fn validate_lease_shape(
             return Err(SandboxLeaseMutationError::LeaseShapeChanged);
         }
     }
+    if let Some(expected_deadline) = expected
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning_deadline.as_deref())
+    {
+        require_provisioning_deadline(actual, expected_deadline)?;
+    }
     if actual
         .annotations()
         .get(SANDBOX_ADMISSION_ANNOTATION)
@@ -3551,6 +3669,10 @@ pub(crate) enum SandboxLeaseMutationError {
     MissingUid,
     #[error("SandboxLease has no resourceVersion")]
     MissingResourceVersion,
+    #[error("SandboxLease has no API-server creation timestamp")]
+    MissingCreationTimestamp,
+    #[error("SandboxLease provisioning deadline checkpoint did not commit")]
+    ProvisioningDeadlineNotCommitted,
     #[error("SandboxLease identity or server-owned admission fields changed")]
     LeaseShapeChanged,
     #[error("SandboxLease UID changed")]
@@ -3559,6 +3681,8 @@ pub(crate) enum SandboxLeaseMutationError {
     UnexpectedAdmissionState,
     #[error("SandboxLease admission patch did not commit; the pending object was removed")]
     AdmissionNotCommitted,
+    #[error(transparent)]
+    Lifecycle(#[from] crate::sandbox::SandboxLifecycleError),
     #[error(transparent)]
     Kubernetes(#[from] kube::Error),
 }
@@ -4029,6 +4153,32 @@ mod tests {
             .mount(server)
             .await;
 
+        let status_patch_state = Arc::clone(&lease_state);
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+/status$",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("status JSON Patch");
+                let status = operations
+                    .as_array()
+                    .and_then(|operations| {
+                        operations.iter().find_map(|operation| {
+                            (operation["op"] == "add" && operation["path"] == "/status")
+                                .then(|| operation["value"].clone())
+                        })
+                    })
+                    .expect("deadline status operation");
+                let mut guard = status_patch_state.lock().unwrap();
+                let object = guard.as_mut().expect("created lease");
+                object["status"] = status;
+                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(200).set_body_json(object.clone())
+            })
+            .mount(server)
+            .await;
+
         let patch_state = Arc::clone(&lease_state);
         Mock::given(method("PATCH"))
             .and(path_regex(
@@ -4039,7 +4189,7 @@ mod tests {
                 let object = guard.as_mut().expect("created lease");
                 object["metadata"]["annotations"][SANDBOX_ADMISSION_ANNOTATION] =
                     serde_json::json!(SANDBOX_ADMISSION_ADMITTED);
-                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                object["metadata"]["resourceVersion"] = serde_json::json!("3");
                 if ambiguous_admit_response {
                     ResponseTemplate::new(500).set_body_json(serde_json::json!({
                         "apiVersion": "v1",
@@ -4139,10 +4289,16 @@ mod tests {
             &identity(),
         );
         lease.status = Some(SandboxLeaseStatus::default());
-        let json = serde_json::to_string(&sandbox_lease_response(lease, None)).unwrap();
+        let json = serde_json::to_string(&sandbox_lease_response(lease.clone(), None)).unwrap();
         assert!(!json.contains("alice@example.com"));
         assert!(!json.to_ascii_lowercase().contains("token"));
         assert!(!json.to_ascii_lowercase().contains("kubeconfig"));
+        assert!(!json.contains("release_cause"));
+
+        lease.status.as_mut().unwrap().release_cause =
+            Some(SandboxReleaseCause::ProvisioningDeadline);
+        let json = serde_json::to_value(sandbox_lease_response(lease, None)).unwrap();
+        assert_eq!(json["release_cause"], "ProvisioningDeadline");
     }
 
     // NOTE: `quota_race_resolution_is_deterministic` lived here and is gone.
@@ -4410,16 +4566,49 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED, "response: {body}");
         assert_eq!(body["ttl"], "2h");
         assert_eq!(body["effective_ttl"], "2h");
+        assert_eq!(body["provisioning_deadline"], "2026-08-10T00:10:00Z");
         assert!(body.get("kubeconfig").is_none());
         assert!(body.get("token").is_none());
 
         let requests = server.received_requests().await.unwrap();
-        let create = requests
+        let create_index = requests
             .iter()
-            .find(|request| {
+            .position(|request| {
                 request.method.as_str() == "POST" && request.url.path().ends_with("/sandboxleases")
             })
             .expect("SandboxLease create request");
+        let deadline_index = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "PATCH"
+                    && request.url.path().contains("/sandboxleases/sandbox-")
+                    && request.url.path().ends_with("/status")
+            })
+            .expect("provisioning deadline status patch");
+        let reservation_index = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path()
+                        == "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases"
+            })
+            .expect("admission reservation create");
+        let admission_index = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "PATCH"
+                    && request.url.path().contains("/sandboxleases/sandbox-")
+                    && !request.url.path().ends_with("/status")
+            })
+            .expect("admission metadata patch");
+        assert!(
+            create_index < deadline_index
+                && deadline_index < reservation_index
+                && reservation_index < admission_index,
+            "the durable deadline must precede quota reservation and admission"
+        );
+
+        let create = &requests[create_index];
         let object: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
         assert_eq!(object["spec"]["requester"]["identity"], "alice@example.com");
         assert_eq!(object["spec"]["requester"]["provider"], "developer-oidc");
@@ -4427,6 +4616,23 @@ mod tests {
         assert_eq!(object["spec"]["ttl"], "2h");
         assert!(object["spec"].get("namespace").is_none());
         assert!(object["spec"].get("runtimeClassName").is_none());
+
+        let operations: serde_json::Value =
+            serde_json::from_slice(&requests[deadline_index].body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test" && operation["path"] == "/metadata/uid"
+        }));
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "1"
+        }));
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status"
+                && operation["value"]["phase"] == "Pending"
+                && operation["value"]["provisioningDeadline"] == "2026-08-10T00:10:00Z"
+        }));
     }
 
     #[tokio::test]
@@ -4445,6 +4651,196 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
+    /// Admission must not consume quota until the API-server creation time has
+    /// been converted into a durable provisioning deadline.
+    #[tokio::test]
+    async fn create_without_a_server_timestamp_never_reserves_quota() {
+        let server = MockServer::start().await;
+        let state = mount_create_api(&server, true, false).await;
+        let create_state = Arc::clone(&state);
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let mut object: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let name = object["metadata"]["name"].as_str().unwrap().to_string();
+                object["metadata"]["uid"] = serde_json::json!(format!("{name}-uid"));
+                object["metadata"]["resourceVersion"] = serde_json::json!("1");
+                *create_state.lock().unwrap() = Some(object.clone());
+                ResponseTemplate::new(201).set_body_json(object)
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method.as_str() != "POST"
+                || request.url.path() != "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases"
+        }));
+        assert!(requests.iter().any(|request| {
+            request.method.as_str() == "DELETE"
+                && request.url.path().contains("/sandboxleases/sandbox-")
+        }));
+    }
+
+    /// A failed or unprovable status checkpoint is still before the admission
+    /// commit point, so it removes the exact pending lease without reservations.
+    #[tokio::test]
+    async fn an_unproven_deadline_checkpoint_never_reserves_quota() {
+        let server = MockServer::start().await;
+        mount_create_api(&server, true, false).await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+/status$",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 500
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method.as_str() != "POST"
+                || request.url.path() != "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases"
+        }));
+        assert!(requests.iter().any(|request| {
+            request.method.as_str() == "DELETE"
+                && request.url.path().contains("/sandboxleases/sandbox-")
+        }));
+    }
+
+    /// A lost status response is recoverable only when a re-read proves the
+    /// exact deadline was committed to the exact created object.
+    #[tokio::test]
+    async fn create_recovers_an_exact_lost_deadline_checkpoint() {
+        let server = MockServer::start().await;
+        let state = mount_create_api(&server, true, false).await;
+        let deadline_state = Arc::clone(&state);
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+/status$",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let status = operations
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|operation| operation["path"] == "/status")
+                    .unwrap()["value"]
+                    .clone();
+                let mut guard = deadline_state.lock().unwrap();
+                let object = guard.as_mut().unwrap();
+                object["status"] = status;
+                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 500
+                }))
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
+    /// An admitted re-read with a mutated deadline cannot be reported as a
+    /// successful create, because retrying against that unbounded object would
+    /// hide a contract violation behind a 202.
+    #[tokio::test]
+    async fn a_lost_admission_response_requires_the_exact_deadline() {
+        let server = MockServer::start().await;
+        let state = mount_create_api(&server, true, false).await;
+        let admission_state = Arc::clone(&state);
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut guard = admission_state.lock().unwrap();
+                let object = guard.as_mut().unwrap();
+                object["metadata"]["annotations"][SANDBOX_ADMISSION_ANNOTATION] =
+                    serde_json::json!(SANDBOX_ADMISSION_ADMITTED);
+                object["metadata"]["resourceVersion"] = serde_json::json!("3");
+                object["status"]["provisioningDeadline"] =
+                    serde_json::json!("2099-01-01T00:00:00Z");
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure", "code": 500
+                }))
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             server
                 .received_requests()
@@ -5183,6 +5579,32 @@ mod tests {
                 object["metadata"]["creationTimestamp"] = serde_json::json!("2026-08-12T00:00:00Z");
                 *create_state.lock().unwrap() = Some(object.clone());
                 ResponseTemplate::new(201).set_body_json(object)
+            })
+            .mount(&server)
+            .await;
+
+        let deadline_state = Arc::clone(&created_state);
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+/status$",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("deadline JSON Patch");
+                let status = operations
+                    .as_array()
+                    .and_then(|operations| {
+                        operations.iter().find_map(|operation| {
+                            (operation["op"] == "add" && operation["path"] == "/status")
+                                .then(|| operation["value"].clone())
+                        })
+                    })
+                    .expect("deadline status operation");
+                let mut guard = deadline_state.lock().unwrap();
+                let object = guard.as_mut().expect("created lease");
+                object["status"] = status;
+                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(200).set_body_json(object.clone())
             })
             .mount(&server)
             .await;

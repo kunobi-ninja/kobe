@@ -303,6 +303,10 @@ impl LeasedSandbox {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("no lease id in {body}"))?
             .to_string();
+        anyhow::ensure!(
+            body["provisioning_deadline"].as_str().is_some(),
+            "accepted lease has no provisioning_deadline: {body}"
+        );
         Ok(Self {
             api,
             id,
@@ -413,7 +417,15 @@ both_placements!(
         // The same typed status either way. A field present for one placement and
         // absent for the other is a caller-visible difference, which is exactly
         // what this suite exists to catch.
-        for required in ["id", "phase", "pool", "ttl", "readyAt", "expiresAt"] {
+        for required in [
+            "id",
+            "phase",
+            "pool",
+            "ttl",
+            "provisioning_deadline",
+            "ready_at",
+            "expires_at",
+        ] {
             anyhow::ensure!(
                 ready.get(required).is_some(),
                 "{required} missing from a Ready lease: {ready}"
@@ -447,14 +459,14 @@ both_placements!(
         let ready = sandbox.wait_ready(Duration::from_secs(300)).await?;
 
         let ready_at = chrono::DateTime::parse_from_rfc3339(
-            ready["readyAt"]
+            ready["ready_at"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("no readyAt"))?,
+                .ok_or_else(|| anyhow::anyhow!("no ready_at"))?,
         )?;
         let expires_at = chrono::DateTime::parse_from_rfc3339(
-            ready["expiresAt"]
+            ready["expires_at"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("no expiresAt"))?,
+                .ok_or_else(|| anyhow::anyhow!("no expires_at"))?,
         )?;
 
         // The expiry is the TTL measured from READINESS. If it were measured from
@@ -826,7 +838,16 @@ both_placements!(
                 return Ok(());
             }
             match body["phase"].as_str() {
-                Some("Released" | "Expired") => return Ok(()),
+                Some("Released") => {
+                    anyhow::ensure!(
+                        body["release_cause"] == "Requested",
+                        "an immediately released sandbox recorded the wrong cause: {body}"
+                    );
+                    return Ok(());
+                }
+                Some("Expired") => anyhow::bail!(
+                    "an immediate caller-requested release was reported as expiry: {body}"
+                ),
                 // Uncertain teardown holds capacity on purpose, but a lease
                 // cancelled before it ever ran should have nothing to be uncertain
                 // about.
@@ -891,7 +912,7 @@ both_placements!(
         let pod = provenance_uid(&ready, "pod")?;
 
         // A second restart, now past readiness. Same objects, and the same
-        // readiness instant: a moved `readyAt` would mean the runtime TTL
+        // readiness instant: a moved `ready_at` would mean the runtime TTL
         // restarted along with the operator, quietly handing the caller time
         // they did not buy — or taking time they did.
         harness(&[
@@ -920,10 +941,10 @@ both_placements!(
             "the resumed operator landed on a different Pod: {pod} then {after}"
         );
         anyhow::ensure!(
-            after["readyAt"] == ready["readyAt"],
-            "readyAt moved across a restart ({} then {}); the runtime TTL restarted with the operator",
-            ready["readyAt"],
-            after["readyAt"]
+            after["ready_at"] == ready["ready_at"],
+            "ready_at moved across a restart ({} then {}); the runtime TTL restarted with the operator",
+            ready["ready_at"],
+            after["ready_at"]
         );
 
         sandbox.release().await
@@ -1028,7 +1049,16 @@ both_placements!(
                 return Ok(());
             }
             match body["phase"].as_str() {
-                Some("Released" | "Expired") => return Ok(()),
+                Some("Released") => {
+                    anyhow::ensure!(
+                        body["release_cause"] == "Requested",
+                        "a release resumed after restart recorded the wrong cause: {body}"
+                    );
+                    return Ok(());
+                }
+                Some("Expired") => anyhow::bail!(
+                    "a caller-requested release became expiry after restart: {body}"
+                ),
                 // A lease that was already mid-teardown when the operator
                 // restarted has proof available; withholding capacity here
                 // would mean the restart itself destroyed the evidence.
@@ -1195,7 +1225,13 @@ async fn quarantine_after_release(sandbox: &mut LeasedSandbox) -> anyhow::Result
             "a lease whose teardown could not be proven was retired anyway"
         );
         match body["phase"].as_str() {
-            Some("Quarantined") => break,
+            Some("Quarantined") => {
+                anyhow::ensure!(
+                    body["release_cause"] == "Requested",
+                    "a quarantined caller-requested release lost or changed its cause: {body}"
+                );
+                break;
+            }
             // The failure this scenario exists to catch: capacity handed back
             // on the strength of a teardown nothing confirmed.
             Some(clean @ ("Released" | "Expired")) => anyhow::bail!(

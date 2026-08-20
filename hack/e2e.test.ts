@@ -60,19 +60,35 @@ test("an unknown failure kind is refused rather than defaulted", () => {
 
 test("every stage is backed by a signal the operator actually writes", () => {
   // Guards the mistake the stage list exists to avoid: a stage nobody reaches
-  // reads as covered while the restart it names never happens. `provisioning`
-  // is the concrete case — no production path writes that phase.
-  expect(Object.keys(LEASE_STAGES)).not.toContain("provisioning");
+  // reads as covered while the restart it names never happens. Management
+  // placement records bootstrap provenance; child placement has no equivalent
+  // outer-lease marker, so the shared stage registry cannot expose bootstrap.
+  expect(Object.keys(LEASE_STAGES)).toContain("provisioning");
   expect(Object.keys(LEASE_STAGES)).not.toContain("bootstrap");
 });
 
 test("a stage is reached by its own marker and by nothing else", () => {
   const bound = { status: { target: { namespace: "kobe-system", childClusterLease: { uid: "u" } } } };
+  const deadline = "2026-08-20T12:00:00Z";
 
   expect(leaseStageReached("provenance", bound)).toBe(true);
   expect(leaseStageReached("bind", bound)).toBe(true);
   expect(leaseStageReached("claim", bound)).toBe(false);
   expect(leaseStageReached("ready", bound)).toBe(false);
+  expect(leaseStageReached("provisioning", { status: { phase: "Provisioning" } })).toBe(false);
+  expect(leaseStageReached("provisioning", { status: { provisioningDeadline: deadline } })).toBe(false);
+  expect(
+    leaseStageReached("provisioning", {
+      status: { phase: "Provisioning", provisioningDeadline: deadline },
+    }),
+  ).toBe(true);
+  expect(leaseStageReached("teardown", { status: { phase: "Releasing" } })).toBe(false);
+  expect(leaseStageReached("teardown", { status: { releaseCause: "Requested" } })).toBe(false);
+  expect(
+    leaseStageReached("teardown", {
+      status: { phase: "Releasing", releaseCause: "Requested" },
+    }),
+  ).toBe(true);
 });
 
 test("an unknown stage fails loudly instead of never matching", () => {

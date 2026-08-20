@@ -267,11 +267,15 @@ identity's active Sandbox leases.
   "phase": "Pending",
   "pool": "agent-small",
   "ttl": "30m",
-  "alias": "review-142"
+  "alias": "review-142",
+  "provisioning_deadline": "2026-08-20T12:10:00Z"
 }
 ```
 
 When a requested TTL is reduced, `effective_ttl` reports the accepted value.
+`provisioning_deadline` is anchored to the API-server creation time and already
+includes queueing or controller downtime; retrying reconciliation never resets
+it.
 
 | Status | Meaning |
 |---|---|
@@ -303,6 +307,13 @@ another identity returns `404`.
 Possible phases are `Pending`, `Provisioning`, `Ready`, `Releasing`, `Released`,
 `Expired`, and `Quarantined`. `Quarantined` means cleanup is uncertain and the
 capacity remains unavailable; it is not a successful terminal state.
+
+When teardown starts, `release_cause` is recorded once as `Requested`,
+`RuntimeTtl`, or `ProvisioningDeadline`. The first cause is immutable: a later
+release request cannot turn an already-expired lease into a caller-requested
+`Released` outcome. After cleanup is verified, both automatic causes finish as
+`Expired` and `Requested` finishes as `Released`; unverifiable cleanup finishes
+as `Quarantined` without returning capacity.
 
 When resolved, the response may include non-secret placement and target object
 references with exact Kubernetes UIDs. It never includes bearer tokens or

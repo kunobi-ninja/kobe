@@ -810,6 +810,25 @@ pub enum SandboxProvenanceError {
     UnexpectedChildReference,
 }
 
+/// Compute the absolute setup bound from the API-server creation timestamp.
+///
+/// Admission and reconciliation share this helper so neither can reset the
+/// clock after queueing, controller downtime, or a missing pool.
+pub fn sandbox_provisioning_deadline(
+    accepted_at: DateTime<Utc>,
+    provisioning_timeout: chrono::Duration,
+) -> Result<String, SandboxLifecycleError> {
+    if provisioning_timeout <= chrono::Duration::zero() {
+        return Err(SandboxLifecycleError::InvalidDuration(
+            "provisioning timeout",
+        ));
+    }
+    let deadline = accepted_at
+        .checked_add_signed(provisioning_timeout)
+        .ok_or(SandboxLifecycleError::TimestampOverflow)?;
+    Ok(deadline.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+}
+
 /// Start bounded provisioning from the lease creation timestamp. Retrying with
 /// the same inputs is idempotent; changing an already-persisted deadline fails.
 pub fn begin_sandbox_provisioning(
@@ -818,15 +837,17 @@ pub fn begin_sandbox_provisioning(
     accepted_at: DateTime<Utc>,
     provisioning_timeout: chrono::Duration,
 ) -> Result<SandboxLeaseStatus, SandboxLifecycleError> {
-    if provisioning_timeout <= chrono::Duration::zero() {
-        return Err(SandboxLifecycleError::InvalidDuration(
-            "provisioning timeout",
+    let deadline = sandbox_provisioning_deadline(accepted_at, provisioning_timeout)?;
+
+    if status
+        .provisioning_deadline
+        .as_deref()
+        .is_some_and(|persisted| persisted != deadline)
+    {
+        return Err(SandboxLifecycleError::PersistedTimestampChanged(
+            "provisioningDeadline",
         ));
     }
-    let deadline = accepted_at
-        .checked_add_signed(provisioning_timeout)
-        .ok_or(SandboxLifecycleError::TimestampOverflow)?
-        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
     if status.phase == SandboxLeasePhase::Provisioning {
         if status.provisioning_deadline.as_deref() == Some(deadline.as_str())
@@ -1386,6 +1407,24 @@ mod tests {
         );
         assert!(provisioning.ready_at.is_none());
         assert!(provisioning.expires_at.is_none());
+
+        let mut stamped = SandboxLeaseStatus {
+            provisioning_deadline: Some("2026-08-10T10:10:00Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            begin_sandbox_provisioning(&stamped, 2, accepted_at, chrono::Duration::minutes(10),)
+                .unwrap()
+                .provisioning_deadline,
+            stamped.provisioning_deadline
+        );
+        stamped.provisioning_deadline = Some("2026-08-10T10:11:00Z".into());
+        assert_eq!(
+            begin_sandbox_provisioning(&stamped, 2, accepted_at, chrono::Duration::minutes(10),),
+            Err(SandboxLifecycleError::PersistedTimestampChanged(
+                "provisioningDeadline"
+            ))
+        );
 
         let ready =
             mark_sandbox_ready(&provisioning, 2, ready_at, chrono::Duration::hours(1)).unwrap();

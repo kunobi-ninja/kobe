@@ -1489,7 +1489,9 @@ type SandboxLeaseObject = {
   };
   status?: {
     phase?: string;
+    provisioningDeadline?: string;
     readyAt?: string;
+    releaseCause?: string;
     target?: {
       namespace?: string;
       childClusterLease?: { uid?: string };
@@ -1516,28 +1518,26 @@ function conditionIsTrue(lease: SandboxLeaseObject, type: string): boolean {
 
 /// The points a restart can be aimed at.
 ///
-/// Every one of these is a signal the operator ALREADY writes and never
-/// unwrites — `child_provenance` is explicit that provenance is monotonic, a
-/// reference only ever added. That matters more than it looks: a stage defined
-/// by something that can flip back would let `restart-operator` fire twice, or
-/// fire after the moment it was aiming at, and the scenario would be testing a
-/// different restart than the one it named.
+/// Every one of these is a signal the operator writes. Identity markers are
+/// monotonic; transient phase windows are paired with their durable checkpoint
+/// so a default or partially-written status cannot satisfy the stage.
 ///
-/// Two stages #76 asks for are deliberately ABSENT:
+/// One stage #76 asks for is deliberately ABSENT:
 ///
-/// - `provisioning`, because nothing in production writes that phase. The only
-///   caller of `begin_sandbox_provisioning` is a unit test, so a real lease
-///   never passes through it and a harness waiting for it would hang until the
-///   timeout and report a restart that never happened.
-/// - `bootstrap`, because the upstream `SandboxTemplate`/`SandboxWarmPool`
-///   references on `status.target` are only ever copied from themselves — no
-///   code path populates them. Offering a stage backed by a marker nobody
-///   writes is worse than not offering it: the scenario reads as covered.
+/// - `bootstrap`: management placement checkpoints `SandboxTemplate` or
+///   `SandboxWarmPool` provenance, but child placement exposes no equivalent
+///   outer-lease marker. This stage registry is shared by both placements, so
+///   a placement-neutral bootstrap stage would hang for child leases.
 export const LEASE_STAGES: Record<string, LeaseStage> = {
   admitted: {
     describe: "the HTTP API has admitted the lease and the controller may act",
     reached: (lease) =>
       lease.metadata?.annotations?.["kobe.kunobi.ninja/sandbox-admission"] === "admitted",
+  },
+  provisioning: {
+    describe: "provisioning has begun and its absolute deadline is checkpointed",
+    reached: (lease) =>
+      lease.status?.phase === "Provisioning" && Boolean(lease.status?.provisioningDeadline),
   },
   provenance: {
     describe: "the first provenance write has landed",
@@ -1568,8 +1568,9 @@ export const LEASE_STAGES: Record<string, LeaseStage> = {
     reached: (lease) => lease.status?.phase === "Ready",
   },
   teardown: {
-    describe: "release has begun",
-    reached: (lease) => lease.status?.phase === "Releasing",
+    describe: "release has begun and its cause is checkpointed",
+    reached: (lease) =>
+      lease.status?.phase === "Releasing" && Boolean(lease.status?.releaseCause),
   },
   quarantined: {
     describe: "teardown could not be proven and capacity is withheld",
