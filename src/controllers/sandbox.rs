@@ -110,6 +110,49 @@ fn claim_name(lease: &str) -> String {
     format!("kobe-{lease}")
 }
 
+/// Absolute deadline stored on an inert management Claim. The Claim name stays
+/// occupied beyond the outer lease's audit-retention window, so a delayed
+/// create from an older reconcile cannot resurrect workload after teardown.
+pub(crate) const SANDBOX_CLAIM_TOMBSTONE_RETAIN_UNTIL_ANNOTATION: &str =
+    "kobe.kunobi.ninja/tombstone-retain-until";
+
+/// Original workload Claim UID when release had to create a replacement
+/// tombstone after the workload Claim was already absent.
+pub(crate) const SANDBOX_CLAIM_TOMBSTONE_PRIOR_UID_LABEL: &str =
+    "kobe.kunobi.ninja/prior-sandbox-claim-uid";
+
+/// The final authorization read and the Claim POST share this deadline. A
+/// release fence only has to drain this bounded interval before absence can be
+/// considered stable; a timed-out POST is always recovered by exact GET.
+pub(crate) const SANDBOX_CLAIM_CREATE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Extra time beyond the bounded create interval before a tombstone can be
+/// reaped. This absorbs watch/API scheduling jitter without weakening the
+/// lease-retention guarantee.
+const SANDBOX_CLAIM_TOMBSTONE_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Result of making the deterministic management Claim name an inert durable
+/// release fence.
+#[derive(Debug)]
+pub(super) enum ManagementClaimTombstone {
+    /// Exact tombstone identity was just persisted; reconcile from the fresh
+    /// status object before proving anything absent.
+    Checkpointed,
+    /// The exact recorded Claim exists, is expired with `Retain`, and has a
+    /// future reaping deadline.
+    Ready {
+        claim: DynamicObject,
+        tombstone_ref: crate::crd::SandboxObjectReference,
+        prior_claim_uid: Option<String>,
+    },
+    /// A normal converging or optimistic-race state.
+    Retry(std::time::Duration),
+    /// Durable identity uncertainty. The caller must quarantine while cleanup
+    /// proof is still mutable, or record a durable post-proof failure.
+    Quarantine(&'static str),
+}
+
 /// The upstream API resources this controller writes.
 ///
 /// Built by hand rather than discovered: the version is pinned so an
@@ -1371,6 +1414,361 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
     // preserve the original terminal outcome across the phase checkpoint.
     (status.phase == crate::crd::SandboxLeasePhase::Releasing)
         .then_some(ReleaseReason::MissingCause)
+}
+
+fn claim_reference_has_expected_shape(
+    reference: &crate::crd::SandboxObjectReference,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    reference.api_version == AGENT_SANDBOX_API_VERSION
+        && reference.kind == SANDBOX_CLAIM_KIND
+        && reference.namespace.as_deref() == Some(namespace)
+        && reference.name == name
+        && !reference.uid.is_empty()
+}
+
+fn exact_legacy_claim_owner(lease: &SandboxLease, claim: &DynamicObject) -> bool {
+    let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+        return false;
+    };
+    claim
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners.len() == 1
+                && owners[0].api_version == SandboxLease::api_version(&()).as_ref()
+                && owners[0].kind == SandboxLease::kind(&()).as_ref()
+                && owners[0].name == lease.name_any()
+                && owners[0].uid == lease_uid
+                && owners[0].controller == Some(true)
+        })
+}
+
+fn claim_matches_release_shape(
+    claim: &DynamicObject,
+    lease_uid: &str,
+    expected_warm_pool: &str,
+) -> bool {
+    claim_is_for_lease(claim, lease_uid)
+        && claim
+            .data
+            .pointer("/spec/warmPoolRef/name")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_warm_pool)
+}
+
+fn claim_is_expired_retain_tombstone(
+    claim: &DynamicObject,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let retain = claim
+        .data
+        .pointer("/spec/lifecycle/shutdownPolicy")
+        .and_then(serde_json::Value::as_str)
+        == Some("Retain");
+    let expired = claim
+        .data
+        .pointer("/spec/lifecycle/shutdownTime")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|shutdown| shutdown.with_timezone(&chrono::Utc) <= now);
+    let retained = claim
+        .annotations()
+        .get(SANDBOX_CLAIM_TOMBSTONE_RETAIN_UNTIL_ANNOTATION)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|until| until.with_timezone(&chrono::Utc) > now);
+    retain && expired && retained
+}
+
+fn new_claim_tombstone_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
+    let retention = crate::api::sandbox::sandbox_lease_retention(configured.as_deref());
+    let create_window = chrono::Duration::from_std(SANDBOX_CLAIM_CREATE_TIMEOUT)
+        .expect("the fixed Claim create timeout fits chrono");
+    now + retention + create_window + SANDBOX_CLAIM_TOMBSTONE_MARGIN
+}
+
+fn build_management_claim_tombstone(
+    lease: &SandboxLease,
+    namespace: &str,
+    prior_claim_uid: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<DynamicObject, SandboxPlacementError> {
+    let lease_uid = lease.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxLease {} has no UID to fence its release tombstone",
+            lease.name_any()
+        ))
+    })?;
+    let mut claim = build_sandbox_claim(
+        &claim_name(&lease.name_any()),
+        namespace,
+        &warm_pool_name(&lease.spec.pool_ref.name),
+        &lease_uid,
+        None,
+    );
+    claim.data["spec"]["lifecycle"] = serde_json::json!({
+        "shutdownTime": now.to_rfc3339(),
+        "shutdownPolicy": "Retain"
+    });
+    claim.metadata.annotations.get_or_insert_default().insert(
+        SANDBOX_CLAIM_TOMBSTONE_RETAIN_UNTIL_ANNOTATION.to_string(),
+        new_claim_tombstone_deadline(now).to_rfc3339(),
+    );
+    if let Some(prior_claim_uid) = prior_claim_uid {
+        claim.metadata.labels.get_or_insert_default().insert(
+            SANDBOX_CLAIM_TOMBSTONE_PRIOR_UID_LABEL.to_string(),
+            prior_claim_uid.to_string(),
+        );
+    }
+    Ok(claim)
+}
+
+async fn patch_management_claim_tombstone(
+    claims: &Api<DynamicObject>,
+    claim: &DynamicObject,
+    prior_claim_uid: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, SandboxPlacementError> {
+    let Some(uid) = claim.uid().filter(|uid| !uid.is_empty()) else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxClaim {} has no UID for its tombstone fence",
+            claim.name_any()
+        )));
+    };
+    let Some(resource_version) = claim.resource_version() else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxClaim {} has no resourceVersion for its tombstone fence",
+            claim.name_any()
+        )));
+    };
+    let mut annotations = claim.metadata.annotations.clone().unwrap_or_default();
+    annotations.insert(
+        SANDBOX_CLAIM_TOMBSTONE_RETAIN_UNTIL_ANNOTATION.to_string(),
+        new_claim_tombstone_deadline(now).to_rfc3339(),
+    );
+    let mut labels = claim.metadata.labels.clone().unwrap_or_default();
+    if let Some(prior_claim_uid) = prior_claim_uid {
+        labels.insert(
+            SANDBOX_CLAIM_TOMBSTONE_PRIOR_UID_LABEL.to_string(),
+            prior_claim_uid.to_string(),
+        );
+    }
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/metadata/annotations", "value": annotations },
+        { "op": "add", "path": "/metadata/labels", "value": labels },
+        { "op": "add", "path": "/spec/lifecycle", "value": {
+            "shutdownTime": now.to_rfc3339(),
+            "shutdownPolicy": "Retain"
+        }}
+    ]));
+    match claims
+        .patch(
+            &claim.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_exact_legacy_claim_owner(
+    claims: &Api<DynamicObject>,
+    claim: &DynamicObject,
+) -> Result<bool, SandboxPlacementError> {
+    let Some(uid) = claim.uid().filter(|uid| !uid.is_empty()) else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxClaim {} has no UID for ownerRef migration",
+            claim.name_any()
+        )));
+    };
+    let Some(resource_version) = claim.resource_version() else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxClaim {} has no resourceVersion for ownerRef migration",
+            claim.name_any()
+        )));
+    };
+    let owners = claim.metadata.owner_references.clone().unwrap_or_default();
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/metadata/ownerReferences", "value": owners },
+        { "op": "replace", "path": "/metadata/ownerReferences", "value": [] }
+    ]));
+    match claims
+        .patch(
+            &claim.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Occupy the deterministic management Claim name with an exact inert object.
+///
+/// `target.sandboxClaim` remains the immutable identity of the workload Claim.
+/// If that Claim is already 404, this helper creates a same-named expired
+/// `Retain` Claim and checkpoints its different UID in
+/// `status.sandboxClaimTombstone`. A late active POST then loses with 409. If
+/// the active POST won first, its exact lease label and immutable request shape
+/// let release convert that object into the tombstone instead.
+pub(super) async fn ensure_management_claim_tombstone(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    claims: &Api<DynamicObject>,
+) -> Result<ManagementClaimTombstone, SandboxPlacementError> {
+    let status = lease.status.clone().unwrap_or_default();
+    let name = claim_name(&lease.name_any());
+    let lease_uid = lease.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxLease {} has no UID to fence management cleanup",
+            lease.name_any()
+        ))
+    })?;
+    let prior = status
+        .target
+        .as_ref()
+        .and_then(|target| target.sandbox_claim.as_ref());
+    if prior.is_some_and(|reference| {
+        !claim_reference_has_expected_shape(reference, &ctx.namespace, &name)
+    }) {
+        return Ok(ManagementClaimTombstone::Quarantine(
+            "claim_provenance_invalid",
+        ));
+    }
+    let recorded = status.sandbox_claim_tombstone.as_ref();
+    if recorded.is_some_and(|reference| {
+        !claim_reference_has_expected_shape(reference, &ctx.namespace, &name)
+    }) {
+        return Ok(ManagementClaimTombstone::Quarantine(
+            "claim_tombstone_provenance_invalid",
+        ));
+    }
+
+    let observed = match claims.get(&name).await {
+        Ok(observed) => observed,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            if recorded.is_some() {
+                return Ok(ManagementClaimTombstone::Quarantine(
+                    "claim_tombstone_missing",
+                ));
+            }
+            let now = chrono::Utc::now();
+            let tombstone = build_management_claim_tombstone(
+                lease,
+                &ctx.namespace,
+                prior.map(|reference| reference.uid.as_str()),
+                now,
+            )?;
+            return match tokio::time::timeout(
+                SANDBOX_CLAIM_CREATE_TIMEOUT,
+                claims.create(&PostParams::default(), &tombstone),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(ManagementClaimTombstone::Retry(
+                    std::time::Duration::from_secs(1),
+                )),
+                Ok(Err(kube::Error::Api(error))) if error.code == 409 => Ok(
+                    ManagementClaimTombstone::Retry(std::time::Duration::from_secs(1)),
+                ),
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => Ok(ManagementClaimTombstone::Retry(
+                    std::time::Duration::from_secs(10),
+                )),
+            };
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return Ok(ManagementClaimTombstone::Quarantine(
+                "claim_tombstone_unverifiable",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    if observed.metadata.deletion_timestamp.is_some() {
+        return Ok(ManagementClaimTombstone::Quarantine(
+            "claim_tombstone_deleting",
+        ));
+    }
+    if !claim_matches_release_shape(
+        &observed,
+        &lease_uid,
+        &warm_pool_name(&lease.spec.pool_ref.name),
+    ) {
+        return Ok(ManagementClaimTombstone::Quarantine(
+            "claim_tombstone_identity_unverifiable",
+        ));
+    }
+    if let Some(recorded) = recorded
+        && observed.uid().as_deref() != Some(recorded.uid.as_str())
+    {
+        return Ok(ManagementClaimTombstone::Quarantine(
+            "claim_tombstone_identity_changed",
+        ));
+    }
+
+    if !metadata_has_no_owner_references(&observed.metadata) {
+        if !exact_legacy_claim_owner(lease, &observed) {
+            return Ok(ManagementClaimTombstone::Quarantine(
+                "claim_ownerref_legacy_unverifiable",
+            ));
+        }
+        if remove_exact_legacy_claim_owner(claims, &observed).await? {
+            info!(lease = %lease.name_any(), claim = %name, "removed exact legacy Claim ownerRef");
+        }
+        return Ok(ManagementClaimTombstone::Retry(
+            std::time::Duration::from_secs(1),
+        ));
+    }
+
+    let reference = target_reference(
+        AGENT_SANDBOX_API_VERSION,
+        SANDBOX_CLAIM_KIND,
+        &ctx.namespace,
+        &observed,
+    )?;
+    if recorded.is_none() {
+        let mut next = status;
+        next.sandbox_claim_tombstone = Some(reference);
+        let _ = patch_lease_status_fenced(ctx, lease, &next).await?;
+        return Ok(ManagementClaimTombstone::Checkpointed);
+    }
+
+    let now = chrono::Utc::now();
+    if !claim_is_expired_retain_tombstone(&observed, now) {
+        let _ = patch_management_claim_tombstone(
+            claims,
+            &observed,
+            prior.map(|reference| reference.uid.as_str()),
+            now,
+        )
+        .await?;
+        return Ok(ManagementClaimTombstone::Retry(
+            std::time::Duration::from_secs(1),
+        ));
+    }
+
+    Ok(ManagementClaimTombstone::Ready {
+        claim: observed,
+        tombstone_ref: recorded.expect("checked above").clone(),
+        prior_claim_uid: prior.map(|reference| reference.uid.clone()),
+    })
 }
 
 /// Tear one lease down and give its capacity back — but only against proof.

@@ -218,6 +218,42 @@ spec:
                 - null
                 nullable: true
                 type: string
+              sandboxClaimTombstone:
+                description: |-
+                  Exact management-cluster `SandboxClaim` retained as an inert release
+                  tombstone. This is separate from [`SandboxTargetProvenance::sandbox_claim`]:
+                  the original workload Claim may already be gone, while its same-named
+                  replacement has a different UID that must be checkpointed before it can
+                  fence delayed creates.
+                nullable: true
+                properties:
+                  apiVersion:
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  kind:
+                    minLength: 1
+                    type: string
+                  name:
+                    minLength: 1
+                    type: string
+                  namespace:
+                    minLength: 1
+                    nullable: true
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                - uid
+                type: object
               target:
                 description: |-
                   Restart-safe, non-secret target provenance. Fields are filled monotonically:

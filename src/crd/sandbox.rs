@@ -572,6 +572,13 @@ pub struct SandboxLeaseStatus {
     pub placement: Option<ResolvedSandboxPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<SandboxTargetProvenance>,
+    /// Exact management-cluster `SandboxClaim` retained as an inert release
+    /// tombstone. This is separate from [`SandboxTargetProvenance::sandbox_claim`]:
+    /// the original workload Claim may already be gone, while its same-named
+    /// replacement has a different UID that must be checkpointed before it can
+    /// fence delayed creates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_claim_tombstone: Option<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         extend("x-kubernetes-list-type" = "map"),
