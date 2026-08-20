@@ -30,6 +30,12 @@ pub const SANDBOX_WARM_POOL_KIND: &str = "SandboxWarmPool";
 pub const SANDBOX_CLAIM_KIND: &str = "SandboxClaim";
 pub const KOBE_MANAGED_BY: &str = "kobe-operator";
 pub const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
+/// Keeps a [`SandboxLease`](crate::crd::SandboxLease) present until Kobe has
+/// durably proved its complete footprint absent and released its reservations.
+///
+/// Admission stamps this on the initial CREATE, eliminating the controller
+/// race where a direct Kubernetes DELETE could otherwise bypass cleanup.
+pub const SANDBOX_LEASE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-cleanup";
 const KOBE_API_VERSION: &str = "kobe.kunobi.ninja/v1alpha1";
 const SANDBOX_API_VERSION: &str = "agents.x-k8s.io/v1beta1";
 const CORE_API_VERSION: &str = "v1";
@@ -966,8 +972,10 @@ pub fn transition_sandbox_phase(
             | (SandboxLeasePhase::Releasing, SandboxLeasePhase::Released)
             | (SandboxLeasePhase::Releasing, SandboxLeasePhase::Expired)
             | (SandboxLeasePhase::Releasing, SandboxLeasePhase::Quarantined)
-            | (SandboxLeasePhase::Quarantined, SandboxLeasePhase::Released)
-            | (SandboxLeasePhase::Quarantined, SandboxLeasePhase::Expired)
+            // Quarantine is a retryable evidence hold, not an operator-only
+            // tomb. A retry may resume teardown, but quota still cannot move
+            // until the ordinary cleanup proof gate succeeds.
+            | (SandboxLeasePhase::Quarantined, SandboxLeasePhase::Releasing)
     );
     if allowed {
         Ok(next)
@@ -1475,7 +1483,18 @@ mod tests {
                 SandboxLeasePhase::Released,
                 true,
             ),
-            Ok(SandboxLeasePhase::Released)
+            Err(SandboxLifecycleError::InvalidTransition {
+                current: SandboxLeasePhase::Quarantined,
+                next: SandboxLeasePhase::Released,
+            })
+        );
+        assert_eq!(
+            transition_sandbox_phase(
+                SandboxLeasePhase::Quarantined,
+                SandboxLeasePhase::Releasing,
+                false,
+            ),
+            Ok(SandboxLeasePhase::Releasing)
         );
     }
 }

@@ -278,9 +278,9 @@ pub async fn reconcile_pool(
 ///
 /// Creation is `create`-then-tolerate-409 rather than apply: exactly one claim
 /// per lease is the invariant, and a create that loses the race has already
-/// been satisfied by whoever won it. Terminal leases are inert: once cleanup
-/// has reached `Released`, `Expired`, or `Quarantined`, reconciliation must not
-/// resolve a pool or recreate any part of the workload.
+/// been satisfied by whoever won it. Terminal leases never resolve a pool or
+/// recreate workload; clean terminal leases only remove Kobe's cleanup
+/// finalizer after both teardown proof checkpoints are durable.
 pub async fn reconcile_lease(
     lease: Arc<SandboxLease>,
     ctx: Arc<SandboxContext>,
@@ -300,15 +300,53 @@ pub async fn reconcile_lease(
         return Ok(Action::await_change());
     }
 
-    if matches!(
-        lease.status.as_ref().map(|status| status.phase),
-        Some(
-            crate::crd::SandboxLeasePhase::Released
-                | crate::crd::SandboxLeasePhase::Expired
-                | crate::crd::SandboxLeasePhase::Quarantined
-        )
-    ) {
-        debug!(lease = %name, "terminal Sandbox lease is inert");
+    let status = lease.status.clone().unwrap_or_default();
+    match status.phase {
+        crate::crd::SandboxLeasePhase::Released | crate::crd::SandboxLeasePhase::Expired => {
+            if sandbox_finalizer_present(&lease) {
+                if footprint_absence_proven(&status) && cleanup_verified(&status) {
+                    if patch_sandbox_finalizer(&ctx, &lease, false).await? {
+                        info!(lease = %name, "removed Sandbox cleanup finalizer after verified teardown");
+                    } else {
+                        debug!(lease = %name, "cleanup finalizer removal lost an object race");
+                    }
+                    return Ok(Action::await_change());
+                }
+                warn!(lease = %name, "clean terminal Sandbox lease lacks durable teardown proof; retaining finalizer");
+                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+            }
+            debug!(lease = %name, "clean terminal Sandbox lease is inert");
+            return Ok(Action::await_change());
+        }
+        crate::crd::SandboxLeasePhase::Quarantined => {
+            // Quarantine keeps the finalizer and quota, then periodically
+            // retries the exact evidence path below. A repaired permission or
+            // backend may make proof available later; only that proof can move
+            // it to a clean terminal phase.
+            if status.release_cause.is_none() {
+                warn!(lease = %name, "quarantined Sandbox lease has no durable release cause; retaining finalizer and capacity");
+                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+            }
+            debug!(lease = %name, "retrying quarantined Sandbox teardown evidence");
+        }
+        _ => {}
+    }
+
+    // Admission creates the finalizer before reservations commit. Backfill a
+    // legacy admitted object before touching its pool or footprint, fenced so
+    // a stale reconcile cannot modify a same-named replacement. Kubernetes
+    // forbids adding a finalizer after deletion has begun; such a legacy object
+    // therefore fails closed instead of pretending it can be protected.
+    if !sandbox_finalizer_present(&lease) {
+        if lease.metadata.deletion_timestamp.is_some() {
+            warn!(lease = %name, "deleting admitted Sandbox lease is missing cleanup finalizer");
+            return Ok(Action::await_change());
+        }
+        if patch_sandbox_finalizer(&ctx, &lease, true).await? {
+            info!(lease = %name, "backfilled Sandbox cleanup finalizer");
+        } else {
+            debug!(lease = %name, "cleanup finalizer backfill lost an object race");
+        }
         return Ok(Action::await_change());
     }
 
@@ -823,9 +861,12 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
     match status.phase {
         // Terminal. Re-running teardown here would be a no-op at best and, if
         // the name were later reused, would act on somebody else's footprint.
-        crate::crd::SandboxLeasePhase::Released
-        | crate::crd::SandboxLeasePhase::Expired
-        | crate::crd::SandboxLeasePhase::Quarantined => return None,
+        crate::crd::SandboxLeasePhase::Released | crate::crd::SandboxLeasePhase::Expired => {
+            return None;
+        }
+        crate::crd::SandboxLeasePhase::Quarantined => {
+            return status.release_cause.map(ReleaseReason::from_persisted);
+        }
         _ => {}
     }
 
@@ -872,14 +913,32 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
         (None, None) => None,
     };
 
-    if let Some(requested) = lease
+    let annotated_request = lease
         .annotations()
         .get(SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION)
-    {
-        let requested_at = chrono::DateTime::parse_from_rfc3339(requested).ok();
+        .map(String::as_str);
+    let annotation_time = annotated_request
+        .and_then(|requested| chrono::DateTime::parse_from_rfc3339(requested).ok())
+        .map(|requested| requested.with_timezone(&chrono::Utc));
+    let deletion_time = lease
+        .metadata
+        .deletion_timestamp
+        .as_ref()
+        .and_then(|timestamp| {
+            chrono::DateTime::parse_from_rfc3339(&timestamp.0.to_string())
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        });
+    let requested_at = match (annotation_time, deletion_time) {
+        (Some(annotation), Some(deletion)) => Some(annotation.min(deletion)),
+        (Some(annotation), None) => Some(annotation),
+        (None, Some(deletion)) => Some(deletion),
+        (None, None) => None,
+    };
+    if annotated_request.is_some() || lease.metadata.deletion_timestamp.is_some() {
         // The annotation is server-owned. If its timestamp is corrupt, honour
-        // a provably earlier elapsed deadline; otherwise preserve the request
-        // rather than keeping a caller's workload alive on malformed metadata.
+        // a provably earlier elapsed deadline. deletionTimestamp is also
+        // apiserver-owned and revokes a direct kubectl DELETE immediately.
         if expiry.as_ref().is_none_or(|(deadline, _)| {
             requested_at.is_some_and(|requested| requested <= *deadline)
         }) {
@@ -961,9 +1020,48 @@ async fn drive_release(
         return Ok(Action::await_change());
     }
 
+    let child_placed = is_child_placed(lease, ctx).await;
+
+    // Scoped identities are externally usable capabilities. Remove and prove
+    // them absent before deleting the management Claim, including when an old
+    // controller already checkpointed footprint absence. A lease without Pod
+    // provenance could never mint one, so there is nothing to clean.
+    if !child_placed
+        && let Some(target) = status.target.as_ref()
+        && let Some(pod) = target.pod.as_ref()
+    {
+        let lease_uid = lease.uid().ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxLease {name} has no UID to clean scoped identities"
+            ))
+        })?;
+        if target.namespace != ctx.namespace || pod.name.is_empty() || pod.uid.is_empty() {
+            return quarantine_lease(lease, ctx, "credential_provenance_invalid").await;
+        }
+        match crate::api::sandbox_credentials::cleanup_scoped_identities(
+            &ctx.client,
+            &target.namespace,
+            &lease_uid,
+            &pod.name,
+            &pod.uid,
+        )
+        .await
+        {
+            crate::api::sandbox_credentials::CredentialCleanupOutcome::Clean => {}
+            crate::api::sandbox_credentials::CredentialCleanupOutcome::Retry => {
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+            crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
+                return quarantine_lease(lease, ctx, "credential_cleanup_unverifiable").await;
+            }
+        }
+    }
+
     // Footprint absence is a durable linearization point. Once it wins its
-    // fenced race against quarantine, every retry skips external teardown
-    // checks and completes only the idempotent reservation/terminal tail.
+    // fenced race against quarantine, every retry skips workload teardown and
+    // completes only the idempotent reservation/terminal tail. Management
+    // credentials were intentionally handled above because older proof
+    // checkpoints did not include them.
     if footprint_absence_proven(&status) {
         return finish_release(lease, ctx, reason).await;
     }
@@ -976,7 +1074,7 @@ async fn drive_release(
     // exactly what this path treats as proof of absence. The quota slot would
     // be handed to the next caller while the previous tenant's Sandbox was
     // still running in a cluster nobody had touched.
-    if is_child_placed(lease, ctx).await {
+    if child_placed {
         return release_child_composition(lease, ctx, reason).await;
     }
 
@@ -1368,6 +1466,82 @@ async fn release_child_composition(
                 None => {}
             }
 
+            // When the child API is still reachable, revoke every scoped
+            // identity before asking the internal lease to destroy the
+            // cluster. If it is unreachable, VerifiedDestroy remains the
+            // fail-closed fallback: only the exact backend receipt can prove
+            // that the inaccessible credentials disappeared with the cluster.
+            if !matches!(
+                child_status.phase,
+                crate::crd::LeasePhase::Released
+                    | crate::crd::LeasePhase::Expired
+                    | crate::crd::LeasePhase::Recycling
+            ) && let Some(target) = status.target.as_ref()
+                && let Some(pod) = target.pod.as_ref()
+            {
+                let lease_uid = lease.uid().ok_or_else(|| {
+                    SandboxPlacementError::Invalid(format!(
+                        "SandboxLease {name} has no UID to clean child scoped identities"
+                    ))
+                })?;
+                let Some(expected_instance) = recorded_instance else {
+                    return quarantine_lease(lease, ctx, "child_credential_target_unverifiable")
+                        .await;
+                };
+                let Some(binding) = child_status.binding.as_ref() else {
+                    return quarantine_lease(lease, ctx, "child_credential_target_unverifiable")
+                        .await;
+                };
+                if binding.instance.name != expected_instance.name
+                    || binding.instance.uid != expected_instance.uid
+                    || target.namespace != CHILD_SANDBOX_NAMESPACE
+                    || pod.name.is_empty()
+                    || pod.uid.is_empty()
+                {
+                    return quarantine_lease(lease, ctx, "child_credential_target_unverifiable")
+                        .await;
+                }
+
+                let child_client = match crate::backend::read_kubeconfig_secret(
+                    &ctx.client,
+                    &expected_instance.name,
+                    &ctx.namespace,
+                )
+                .await
+                {
+                    Ok(kubeconfig) => crate::backend::virtual_client_from_kubeconfig(&kubeconfig)
+                        .await
+                        .ok(),
+                    Err(_) => None,
+                };
+                if let Some(child_client) = child_client {
+                    match crate::api::sandbox_credentials::cleanup_scoped_identities(
+                        &child_client,
+                        &target.namespace,
+                        &lease_uid,
+                        &pod.name,
+                        &pod.uid,
+                    )
+                    .await
+                    {
+                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Clean => {}
+                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Retry => {
+                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                        }
+                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
+                            return quarantine_lease(
+                                lease,
+                                ctx,
+                                "child_credential_cleanup_unverifiable",
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    warn!(lease = %name, "child API unavailable during credential cleanup; relying on exact destroy receipt");
+                }
+            }
+
             // No receipt yet. Ask for release if nobody has, then wait —
             // destroying a cluster and proving it gone both take time.
             if !matches!(
@@ -1577,6 +1751,16 @@ fn canary_already_passed(status: &crate::crd::SandboxLeaseStatus) -> bool {
 fn footprint_absence_proven(status: &crate::crd::SandboxLeaseStatus) -> bool {
     status.conditions.iter().any(|condition| {
         condition.condition_type == FOOTPRINT_ABSENT_CONDITION
+            && condition.status == crate::crd::SandboxConditionStatus::True
+    })
+}
+
+/// Whether teardown and reservation cleanup both reached their durable
+/// success checkpoint. A terminal phase alone is not enough to remove the
+/// finalizer: old or corrupted objects may claim a clean phase without proof.
+fn cleanup_verified(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.condition_type == CLEANUP_VERIFIED_CONDITION
             && condition.status == crate::crd::SandboxConditionStatus::True
     })
 }
@@ -2338,6 +2522,65 @@ async fn patch_lease_status_fenced(
     }
 }
 
+/// Add or remove only Kobe's Sandbox cleanup finalizer under exact UID/RV
+/// tests. Replacing the complete finalizer list preserves other controllers'
+/// entries while preventing a stale reconcile from touching a replacement.
+async fn patch_sandbox_finalizer(
+    ctx: &SandboxContext,
+    lease: &SandboxLease,
+    present: bool,
+) -> Result<bool, SandboxPlacementError> {
+    let mut finalizers = lease.metadata.finalizers.clone().unwrap_or_default();
+    let had_finalizer = finalizers
+        .iter()
+        .any(|finalizer| finalizer == crate::sandbox::SANDBOX_LEASE_FINALIZER);
+    if had_finalizer == present {
+        return Ok(true);
+    }
+    if present {
+        finalizers.push(crate::sandbox::SANDBOX_LEASE_FINALIZER.to_string());
+    } else {
+        finalizers.retain(|finalizer| finalizer != crate::sandbox::SANDBOX_LEASE_FINALIZER);
+    }
+    let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxLease {} has no UID or resourceVersion to fence finalizer",
+            lease.name_any()
+        )));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+    ]));
+    let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    match leases
+        .patch(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(false),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sandbox_finalizer_present(lease: &SandboxLease) -> bool {
+    lease
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|finalizer| finalizer == crate::sandbox::SANDBOX_LEASE_FINALIZER)
+        })
+}
+
 /// Whether the upstream claim reports a Ready condition.
 ///
 /// Pure and defensive: an unparseable or absent status is NOT ready. Treating
@@ -2520,6 +2763,8 @@ pub(crate) mod tests {
     const PODS_PATH: &str = "/api/v1/namespaces/test-ns/pods";
     const LEASE_STATUS_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1/status";
+    const LEASE_PATH: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1";
 
     async fn test_context() -> (Arc<SandboxContext>, MockServer) {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2644,6 +2889,7 @@ pub(crate) mod tests {
                     .into_iter()
                     .collect(),
                 ),
+                finalizers: Some(vec![crate::sandbox::SANDBOX_LEASE_FINALIZER.to_string()]),
                 ..Default::default()
             },
             spec: SandboxLeaseSpec {
@@ -3702,9 +3948,9 @@ pub(crate) mod tests {
     }
 
     /// Terminal leases never recreate capacity after teardown has finished or
-    /// become unverifiable. This guard belongs at the reconcile boundary: the
-    /// release classifier intentionally returns no new release reason for a
-    /// terminal phase, which must mean "stop", never "resume placement".
+    /// become unverifiable. A terminal object still carrying Kobe's finalizer
+    /// is periodically revisited for proof/operator recovery, but it must never
+    /// fall through into placement.
     #[tokio::test]
     async fn terminal_leases_never_recreate_capacity() {
         let (ctx, server) = test_context().await;
@@ -3718,7 +3964,11 @@ pub(crate) mod tests {
             lease.status.as_mut().unwrap().phase = phase;
 
             let action = reconcile_lease(Arc::new(lease), ctx.clone()).await.unwrap();
-            assert_eq!(action, Action::await_change(), "terminal phase {phase}");
+            assert_eq!(
+                action,
+                Action::requeue(std::time::Duration::from_secs(300)),
+                "terminal phase {phase}"
+            );
         }
 
         assert!(
@@ -3962,6 +4212,254 @@ pub(crate) mod tests {
     // Teardown
     // -----------------------------------------------------------------------
 
+    /// Only a clean terminal checkpoint permits Kobe's finalizer to leave,
+    /// and another controller's finalizer is preserved byte-for-byte.
+    #[tokio::test]
+    async fn verified_terminal_removes_only_the_sandbox_finalizer() {
+        let (ctx, server) = test_context().await;
+        let mut lease = admitted_lease();
+        let mut status = lease.status.clone().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Released;
+        status.conditions = with_condition_for_status(
+            &status,
+            lease.metadata.generation,
+            FOOTPRINT_ABSENT_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "FootprintObservedAbsent",
+            "gone",
+        );
+        status.conditions = with_condition_for_status(
+            &status,
+            lease.metadata.generation,
+            CLEANUP_VERIFIED_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "TeardownVerified",
+            "clean",
+        );
+        lease.status = Some(status);
+        lease.metadata.finalizers = Some(vec![
+            "another.example/finalizer".into(),
+            crate::sandbox::SANDBOX_LEASE_FINALIZER.into(),
+        ]);
+
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH" && request.url.path() == LEASE_PATH)
+            .expect("finalizer patch");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": "lease-uid-1" },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": "lease-rv-1" },
+                { "op": "add", "path": "/metadata/finalizers", "value": ["another.example/finalizer"] }
+            ])
+        );
+    }
+
+    /// Quarantine is uncertainty, not cleanup proof. It must keep Kobe's
+    /// finalizer even when Kubernetes deletion is already waiting on it.
+    #[tokio::test]
+    async fn quarantined_lease_retains_its_cleanup_finalizer() {
+        let (ctx, server) = test_context().await;
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Quarantined;
+        lease.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_millisecond(
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .unwrap(),
+            ));
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(requests_to(&server, "PATCH", LEASE_PATH).await, 0);
+    }
+
+    /// Quarantine is a durable evidence hold, not a permanent lifecycle tomb.
+    /// Once the same exact footprint becomes provably clean, a retry must pass
+    /// through Releasing again, return quota, reach the original cause's clean
+    /// terminal phase, and only then remove Kobe's finalizer.
+    #[tokio::test]
+    async fn remediated_quarantine_releases_only_after_fresh_proof() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Quarantined);
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .unwrap(),
+            Action::await_change(),
+            "the retry first re-enters Releasing under the lease fence"
+        );
+        assert_eq!(recorded_phases(&server).await, vec!["Releasing"]);
+        advance_lease_to_latest_status(&mut lease, &server, "lease-rv-releasing").await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .unwrap(),
+            Action::await_change(),
+            "fresh footprint absence is a second durable checkpoint"
+        );
+        advance_lease_to_latest_status(&mut lease, &server, "lease-rv-proof").await;
+        assert!(footprint_absence_proven(lease.status.as_ref().unwrap()));
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0,
+            "proof and quota release cannot happen in the same pass"
+        );
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .unwrap(),
+            Action::await_change()
+        );
+        advance_lease_to_latest_status(&mut lease, &server, "lease-rv-terminal").await;
+        assert_eq!(
+            lease.status.as_ref().unwrap().phase,
+            crate::crd::SandboxLeasePhase::Released
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            1
+        );
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(requests_to(&server, "PATCH", LEASE_PATH).await, 1);
+    }
+
+    /// Legacy admitted objects are fenced with the cleanup finalizer before
+    /// the controller reads a pool or creates any upstream object.
+    #[tokio::test]
+    async fn a_missing_cleanup_finalizer_is_backfilled_before_placement() {
+        let (ctx, server) = test_context().await;
+        let mut lease = admitted_lease();
+        lease.metadata.finalizers = Some(vec!["another.example/finalizer".into()]);
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(requests_to(&server, "GET", POOL_PATH).await, 0);
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH" && request.url.path() == LEASE_PATH)
+            .expect("finalizer patch");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body[2]["value"],
+            serde_json::json!([
+                "another.example/finalizer",
+                crate::sandbox::SANDBOX_LEASE_FINALIZER
+            ])
+        );
+    }
+
+    /// deletionTimestamp is itself a server-owned release request. The
+    /// Releasing+cause checkpoint must precede every teardown side effect.
+    #[tokio::test]
+    async fn direct_delete_checkpoints_requested_release_without_an_annotation() {
+        let (ctx, server) = test_context().await;
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Ready;
+        status.ready_at = Some(chrono::Utc::now().to_rfc3339());
+        status.expires_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        lease.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_millisecond(
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .unwrap(),
+            ));
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("Releasing checkpoint");
+        let status = status_value_of(&request).unwrap();
+        assert_eq!(status["phase"], "Releasing");
+        assert_eq!(status["releaseCause"], "Requested");
+    }
+
     const RESERVATIONS_PATH: &str = "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases";
 
     /// A reservation name the hardened release path will accept.
@@ -3985,7 +4483,10 @@ pub(crate) mod tests {
         );
         let status = lease.status.as_mut().unwrap();
         status.phase = phase;
-        if phase == crate::crd::SandboxLeasePhase::Releasing {
+        if matches!(
+            phase,
+            crate::crd::SandboxLeasePhase::Releasing | crate::crd::SandboxLeasePhase::Quarantined
+        ) {
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
         }
         lease
@@ -4708,6 +5209,32 @@ pub(crate) mod tests {
         let delete_options: serde_json::Value =
             serde_json::from_slice(&delete.body).expect("DeleteOptions body");
         assert_eq!(delete_options["preconditions"]["uid"], "claim-uid");
+        let requests = server.received_requests().await.unwrap_or_default();
+        let claim_delete = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "DELETE" && request.url.path() == CLAIM_PATH
+            })
+            .unwrap();
+        let credential_checks: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                request.method.as_str() == "GET"
+                    && (request.url.path().contains("/rolebindings/")
+                        || request.url.path().contains("/roles/")
+                        || request.url.path().contains("/serviceaccounts/"))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            credential_checks
+                .iter()
+                .filter(|credential_check| **credential_check < claim_delete)
+                .count(),
+            12,
+            "all four operations x three identity objects must be proven absent before Claim deletion"
+        );
         assert_eq!(
             requests_to(
                 &server,
@@ -4717,6 +5244,48 @@ pub(crate) mod tests {
             .await,
             1,
             "the quota slot must be handed back"
+        );
+    }
+
+    /// RBAC uncertainty stops before Claim deletion and quota release. A 403
+    /// is not evidence that an identity is absent, so the finalizer must retain
+    /// the whole lease for operator inspection.
+    #[tokio::test]
+    async fn unverifiable_scoped_identity_quarantines_before_claim_delete() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let first_name = crate::api::sandbox_credentials::credential_name(
+            "lease-uid-1",
+            crate::api::sandbox_credentials::SandboxOperation::Logs,
+        );
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/{NS}/rolebindings/{first_name}"
+            )))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 403, "reason": "Forbidden"
+            })))
+            .mount(&server)
+            .await;
+
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
         );
     }
 
@@ -4913,11 +5482,7 @@ pub(crate) mod tests {
             "an interrupted teardown without a durable cause fails closed"
         );
 
-        for terminal in [
-            SandboxLeasePhase::Released,
-            SandboxLeasePhase::Expired,
-            SandboxLeasePhase::Quarantined,
-        ] {
+        for terminal in [SandboxLeasePhase::Released, SandboxLeasePhase::Expired] {
             assert_eq!(
                 release_reason(&releasing_lease(terminal)),
                 None,
@@ -4925,8 +5490,12 @@ pub(crate) mod tests {
             );
         }
 
-        // Quarantine is deliberately terminal here: exiting it is an operator
-        // decision backed by evidence, not something a requeue may do.
+        assert_eq!(
+            release_reason(&releasing_lease(SandboxLeasePhase::Quarantined)),
+            Some(ReleaseReason::Requested),
+            "quarantine retries the immutable release cause without changing its outcome"
+        );
+
         assert_eq!(
             ReleaseReason::RuntimeTtl.terminal_phase(),
             SandboxLeasePhase::Expired
@@ -4968,6 +5537,30 @@ pub(crate) mod tests {
         assert_eq!(
             release_reason(&runtime(after)),
             Some(ReleaseReason::RuntimeTtl)
+        );
+
+        let deleting = |deleted_at: chrono::DateTime<chrono::Utc>| {
+            let mut lease = admitted_lease();
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Ready;
+            status.ready_at = Some((deadline - chrono::Duration::hours(1)).to_rfc3339());
+            status.expires_at = Some(deadline.to_rfc3339());
+            lease.metadata.deletion_timestamp =
+                Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_millisecond(deleted_at.timestamp_millis())
+                        .unwrap(),
+                ));
+            lease
+        };
+        assert_eq!(
+            release_reason(&deleting(before)),
+            Some(ReleaseReason::Requested),
+            "a direct delete before expiry owns the terminal outcome"
+        );
+        assert_eq!(
+            release_reason(&deleting(after)),
+            Some(ReleaseReason::RuntimeTtl),
+            "a delete after expiry cannot rewrite automatic expiry"
         );
 
         let mut provisioning = admitted_lease();

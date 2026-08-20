@@ -33,10 +33,12 @@
 //! CRD, a response, an event or a log is a token somebody can replay after the
 //! lease it belonged to is gone.
 
-use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
+use k8s_openapi::api::authentication::v1::{BoundObjectReference, TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
-use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::Resource;
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions};
 
 use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget};
 
@@ -47,6 +49,15 @@ use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget};
 /// are already authenticated — Kubernetes does not re-check mid-connection —
 /// which is why #83's revocation cancels streams rather than relying on expiry.
 pub const TOKEN_LIFETIME_SECONDS: i64 = 600;
+
+/// Maximum API-server clock skew accepted on the actual token expiry.
+///
+/// The requested lifetime remains ten minutes. These five seconds only keep a
+/// slightly-ahead API-server clock from making an otherwise correctly bounded
+/// response unusable; they are not added to the TokenRequest itself.
+const TOKEN_EXPIRATION_SKEW_SECONDS: i64 = 5;
+
+const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 
 /// What a credential is being minted for.
 ///
@@ -64,6 +75,8 @@ pub enum SandboxOperation {
 }
 
 impl SandboxOperation {
+    const ALL: [Self; 4] = [Self::Logs, Self::Exec, Self::Attach, Self::PortForward];
+
     /// The exact Pod subresources this operation needs.
     ///
     /// The verb comes from the HTTP METHOD the client actually sends, not from
@@ -96,6 +109,41 @@ impl SandboxOperation {
             Self::Attach => "attach",
             Self::PortForward => "port-forward",
         }
+    }
+}
+
+/// Result of removing every short-lived identity for one Sandbox Pod.
+///
+/// `Clean` means every deterministic object was observed absent. `Retry`
+/// means a transient response prevented that proof. `Quarantine` means Kobe
+/// was forbidden from checking, or the deterministic name now identifies an
+/// object whose provenance cannot be proven; callers must retain capacity and
+/// require operator inspection rather than deleting by label or name alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum CredentialCleanupOutcome {
+    Clean,
+    Retry,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CredentialResourceKind {
+    RoleBinding,
+    Role,
+    ServiceAccount,
+}
+
+fn pod_owner_reference(pod_name: &str, pod_uid: &str) -> OwnerReference {
+    OwnerReference {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        name: pod_name.to_string(),
+        uid: pod_uid.to_string(),
+        // The Pod's real controller remains the Sandbox runtime. These
+        // credentials are dependants, never competing controllers.
+        controller: Some(false),
+        block_owner_deletion: Some(true),
     }
 }
 
@@ -139,24 +187,11 @@ pub fn scoped_rules(target: &SandboxTarget, operation: SandboxOperation) -> Vec<
         .collect()
 }
 
-/// Create — or converge — the ServiceAccount, Role and RoleBinding for a lease.
-///
-/// Server-side applied so a repeated operation converges instead of failing on
-/// conflict, and so a drifted Role is corrected rather than trusted. Drift
-/// matters here more than usual: a Role edited to drop its `resourceNames` is
-/// a namespace-wide grant that looks, by name, exactly like the scoped one.
-async fn ensure_scoped_identity(
-    client: &kube::Client,
-    target: &SandboxTarget,
-    operation: SandboxOperation,
-) -> Result<String, SandboxAccessDenied> {
-    let name = credential_name(&target.lease_uid, operation);
-    let namespace = &target.namespace;
-    let params = PatchParams::apply(crate::sandbox::KOBE_MANAGED_BY).force();
-
-    let metadata = || ObjectMeta {
-        name: Some(name.clone()),
-        namespace: Some(namespace.clone()),
+fn credential_metadata(name: &str, target: &SandboxTarget) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name.to_string()),
+        namespace: Some(target.namespace.clone()),
+        owner_references: Some(vec![pod_owner_reference(&target.pod_name, &target.pod_uid)]),
         labels: Some(
             [
                 (
@@ -164,7 +199,7 @@ async fn ensure_scoped_identity(
                     crate::sandbox::KOBE_MANAGED_BY.to_string(),
                 ),
                 (
-                    "kobe.kunobi.ninja/sandbox-lease-uid".to_string(),
+                    SANDBOX_LEASE_UID_LABEL.to_string(),
                     target.lease_uid.clone(),
                 ),
             ]
@@ -172,61 +207,255 @@ async fn ensure_scoped_identity(
             .collect(),
         ),
         ..Default::default()
+    }
+}
+
+/// Prove that an object at the deterministic name belongs to this exact lease
+/// and Pod before Kobe is allowed to converge it.
+///
+/// A name is deliberately not treated as ownership. The singular, exact Pod
+/// owner reference and the exact lease-UID label are independent provenance
+/// checks, while UID/resourceVersion fence the later JSON Patch against a
+/// same-name replacement.
+fn owned_credential_fence<K: Resource>(
+    object: &K,
+    name: &str,
+    target: &SandboxTarget,
+) -> Result<(String, String), ()> {
+    let metadata = object.meta();
+    let expected_owner = pod_owner_reference(&target.pod_name, &target.pod_uid);
+    if metadata.name.as_deref() != Some(name)
+        || metadata.namespace.as_deref() != Some(target.namespace.as_str())
+        || metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_LEASE_UID_LABEL))
+            .map(String::as_str)
+            != Some(target.lease_uid.as_str())
+        || metadata.owner_references.as_deref() != Some(std::slice::from_ref(&expected_owner))
+    {
+        return Err(());
+    }
+
+    let uid = metadata
+        .uid
+        .as_ref()
+        .filter(|uid| !uid.is_empty())
+        .cloned()
+        .ok_or(())?;
+    let resource_version = metadata
+        .resource_version
+        .as_ref()
+        .filter(|version| !version.is_empty())
+        .cloned()
+        .ok_or(())?;
+    Ok((uid, resource_version))
+}
+
+fn managed_label_matches<K: Resource>(object: &K) -> bool {
+    object
+        .meta()
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+        .map(String::as_str)
+        == Some(crate::sandbox::KOBE_MANAGED_BY)
+}
+
+/// Create a missing credential object, or converge only an object whose exact
+/// lease and Pod provenance was proved by a pre-read.
+///
+/// JSON Patch `test` operations make that proof atomic with the repair. If the
+/// object is replaced or its provenance changes after GET, Kubernetes rejects
+/// the patch rather than letting Kobe adopt the replacement.
+async fn ensure_owned_credential<K, F>(
+    api: &Api<K>,
+    name: &str,
+    target: &SandboxTarget,
+    desired: &K,
+    shape_matches: F,
+    mut convergence_operations: Vec<serde_json::Value>,
+) -> Result<(), SandboxAccessDenied>
+where
+    K: Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug
+        + Resource<DynamicType = ()>,
+    F: Fn(&K) -> bool,
+{
+    let observed = match api.get(name).await {
+        Ok(observed) => observed,
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            match api.create(&PostParams::default(), desired).await {
+                Ok(created) => {
+                    owned_credential_fence(&created, name, target)
+                        .map_err(|()| SandboxAccessDenied::Backend)?;
+                    if managed_label_matches(&created) && shape_matches(&created) {
+                        return Ok(());
+                    }
+                    return Err(SandboxAccessDenied::Backend);
+                }
+                // A concurrent creator won. Re-read it and apply the same
+                // ownership proof; never turn the conflict into adoption.
+                Err(kube::Error::Api(response)) if response.code == 409 => api
+                    .get(name)
+                    .await
+                    .map_err(|_| SandboxAccessDenied::Backend)?,
+                Err(_) => return Err(SandboxAccessDenied::Backend),
+            }
+        }
+        Err(_) => return Err(SandboxAccessDenied::Backend),
     };
 
-    let accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
-    accounts
-        .patch(
-            &name,
-            &params,
-            &Patch::Apply(&ServiceAccount {
-                metadata: metadata(),
-                // No automounted token: nothing runs as this account. It exists
-                // only to be the subject of a TokenRequest.
-                automount_service_account_token: Some(false),
-                ..Default::default()
-            }),
-        )
+    let (uid, resource_version) = owned_credential_fence(&observed, name, target)
+        .map_err(|()| SandboxAccessDenied::Backend)?;
+    if managed_label_matches(&observed) && shape_matches(&observed) {
+        return Ok(());
+    }
+
+    let expected_owner = pod_owner_reference(&target.pod_name, &target.pod_uid);
+    let mut operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": resource_version,
+        }),
+        serde_json::json!({
+            "op": "test",
+            "path": "/metadata/labels/kobe.kunobi.ninja~1sandbox-lease-uid",
+            "value": target.lease_uid,
+        }),
+        serde_json::json!({
+            "op": "test",
+            "path": "/metadata/ownerReferences",
+            "value": [expected_owner],
+        }),
+        serde_json::json!({
+            "op": "add",
+            "path": "/metadata/labels/app.kubernetes.io~1managed-by",
+            "value": crate::sandbox::KOBE_MANAGED_BY,
+        }),
+    ];
+    operations.append(&mut convergence_operations);
+    let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(operations));
+    let converged = api
+        .patch(name, &PatchParams::default(), &Patch::Json::<()>(patch))
         .await
         .map_err(|_| SandboxAccessDenied::Backend)?;
+
+    owned_credential_fence(&converged, name, target).map_err(|()| SandboxAccessDenied::Backend)?;
+    if managed_label_matches(&converged) && shape_matches(&converged) {
+        Ok(())
+    } else {
+        Err(SandboxAccessDenied::Backend)
+    }
+}
+
+/// Create — or safely converge — the ServiceAccount, Role and RoleBinding.
+///
+/// Missing objects are created atomically. Existing objects are changed only
+/// after exact lease/Pod provenance is proved, so a foreign same-name object
+/// is rejected rather than force-adopted. Owned drift is still corrected: a
+/// Role edited to drop `resourceNames` is a namespace-wide grant and must never
+/// be trusted merely because its name looks scoped.
+async fn ensure_scoped_identity(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    operation: SandboxOperation,
+) -> Result<String, SandboxAccessDenied> {
+    let name = credential_name(&target.lease_uid, operation);
+    let namespace = &target.namespace;
+
+    let accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    let account = ServiceAccount {
+        metadata: credential_metadata(&name, target),
+        // No automounted token: nothing runs as this account. It exists only
+        // to be the subject of a TokenRequest.
+        automount_service_account_token: Some(false),
+        ..Default::default()
+    };
+    ensure_owned_credential(
+        &accounts,
+        &name,
+        target,
+        &account,
+        |observed| observed.automount_service_account_token == Some(false),
+        vec![serde_json::json!({
+            "op": "add",
+            "path": "/automountServiceAccountToken",
+            "value": false,
+        })],
+    )
+    .await?;
 
     let roles: Api<Role> = Api::namespaced(client.clone(), namespace);
-    roles
-        .patch(
-            &name,
-            &params,
-            &Patch::Apply(&Role {
-                metadata: metadata(),
-                rules: Some(scoped_rules(target, operation)),
-            }),
-        )
-        .await
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+    let rules = scoped_rules(target, operation);
+    let role = Role {
+        metadata: credential_metadata(&name, target),
+        rules: Some(rules.clone()),
+    };
+    ensure_owned_credential(
+        &roles,
+        &name,
+        target,
+        &role,
+        |observed| observed.rules.as_deref() == Some(rules.as_slice()),
+        vec![serde_json::json!({ "op": "add", "path": "/rules", "value": rules })],
+    )
+    .await?;
 
     let bindings: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
-    bindings
-        .patch(
-            &name,
-            &params,
-            &Patch::Apply(&RoleBinding {
-                metadata: metadata(),
-                role_ref: RoleRef {
-                    api_group: "rbac.authorization.k8s.io".to_string(),
-                    kind: "Role".to_string(),
-                    name: name.clone(),
-                },
-                subjects: Some(vec![Subject {
-                    kind: "ServiceAccount".to_string(),
-                    name: name.clone(),
-                    namespace: Some(namespace.clone()),
-                    api_group: None,
-                }]),
-            }),
-        )
-        .await
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+    let role_ref = RoleRef {
+        api_group: "rbac.authorization.k8s.io".to_string(),
+        kind: "Role".to_string(),
+        name: name.clone(),
+    };
+    let subjects = vec![Subject {
+        kind: "ServiceAccount".to_string(),
+        name: name.clone(),
+        namespace: Some(namespace.clone()),
+        api_group: None,
+    }];
+    let binding = RoleBinding {
+        metadata: credential_metadata(&name, target),
+        role_ref: role_ref.clone(),
+        subjects: Some(subjects.clone()),
+    };
+    ensure_owned_credential(
+        &bindings,
+        &name,
+        target,
+        &binding,
+        |observed| {
+            observed.role_ref == role_ref
+                && observed.subjects.as_deref() == Some(subjects.as_slice())
+        },
+        vec![
+            serde_json::json!({ "op": "add", "path": "/roleRef", "value": role_ref }),
+            serde_json::json!({ "op": "add", "path": "/subjects", "value": subjects }),
+        ],
+    )
+    .await?;
 
     Ok(name)
+}
+
+/// Validate the API server's actual expiry, independently of what was asked
+/// for in the TokenRequest.
+fn token_expiration_is_acceptable(
+    expiration_timestamp: &str,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Ok(expiration) = chrono::DateTime::parse_from_rfc3339(expiration_timestamp) else {
+        return false;
+    };
+    let expiration = expiration.with_timezone(&chrono::Utc);
+    let latest_allowed = requested_at
+        + chrono::Duration::seconds(TOKEN_LIFETIME_SECONDS + TOKEN_EXPIRATION_SKEW_SECONDS);
+    expiration > received_at && expiration <= latest_allowed
 }
 
 /// Mint a short-lived token for one operation against one Pod.
@@ -253,7 +482,15 @@ pub async fn mint_scoped_token(
             // server, which is the only thing it should ever authenticate to.
             audiences: vec![],
             expiration_seconds: Some(TOKEN_LIFETIME_SECONDS),
-            bound_object_ref: None,
+            // The API server invalidates this credential when this exact Pod
+            // identity disappears. Binding by UID prevents a same-named Pod
+            // replacement from inheriting an already-issued token.
+            bound_object_ref: Some(BoundObjectReference {
+                api_version: Some("v1".to_string()),
+                kind: Some("Pod".to_string()),
+                name: Some(target.pod_name.clone()),
+                uid: Some(target.pod_uid.clone()),
+            }),
         },
         status: None,
     };
@@ -263,16 +500,196 @@ pub async fn mint_scoped_token(
         pod = %target.pod_name,
         "minting scoped Sandbox credential"
     );
+    let requested_at = chrono::Utc::now();
     let issued = accounts
         .create_token_request(&name, &PostParams::default(), &request)
         .await
         .map_err(|_| SandboxAccessDenied::Backend)?;
+    let received_at = chrono::Utc::now();
+    let status = issued.status.ok_or(SandboxAccessDenied::Backend)?;
+    // Kubernetes parses the wire value into `Time`; parsing its canonical RFC
+    // 3339 representation here also keeps the temporal comparison in one clock
+    // type instead of relying on ordering across time-library versions.
+    if status.token.is_empty()
+        || !token_expiration_is_acceptable(
+            &status.expiration_timestamp.0.to_string(),
+            requested_at,
+            received_at,
+        )
+    {
+        return Err(SandboxAccessDenied::Backend);
+    }
 
-    issued
-        .status
-        .map(|status| status.token)
-        .filter(|token| !token.is_empty())
-        .ok_or(SandboxAccessDenied::Backend)
+    Ok(status.token)
+}
+
+fn observed_credential_uid<K: Resource>(
+    object: &K,
+    name: &str,
+    namespace: &str,
+    lease_uid: &str,
+    pod_name: &str,
+    pod_uid: &str,
+) -> Result<String, ()> {
+    let metadata = object.meta();
+    let expected_owner = pod_owner_reference(pod_name, pod_uid);
+    if metadata.name.as_deref() != Some(name)
+        || metadata.namespace.as_deref() != Some(namespace)
+        || metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_LEASE_UID_LABEL))
+            .map(String::as_str)
+            != Some(lease_uid)
+        || metadata.owner_references.as_deref() != Some(std::slice::from_ref(&expected_owner))
+    {
+        return Err(());
+    }
+
+    metadata
+        .uid
+        .as_ref()
+        .filter(|uid| !uid.is_empty())
+        .cloned()
+        .ok_or(())
+}
+
+fn inaccessible_or_replaced(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if matches!(response.code, 401 | 403 | 409))
+}
+
+/// Remove one exact credential object and prove its deterministic name absent.
+///
+/// The label only participates in provenance validation; it is never a delete
+/// selector. Deletion is by the deterministic name and the UID read from that
+/// exact object, and a successful DELETE is followed by another GET because
+/// acceptance is not proof that asynchronous deletion has completed.
+async fn cleanup_credential_object<K>(
+    api: &Api<K>,
+    name: &str,
+    namespace: &str,
+    lease_uid: &str,
+    pod_name: &str,
+    pod_uid: &str,
+) -> CredentialCleanupOutcome
+where
+    K: Clone + serde::de::DeserializeOwned + std::fmt::Debug + Resource,
+{
+    let observed = match api.get(name).await {
+        Ok(observed) => observed,
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            return CredentialCleanupOutcome::Clean;
+        }
+        Err(error) if inaccessible_or_replaced(&error) => {
+            return CredentialCleanupOutcome::Quarantine;
+        }
+        Err(_) => return CredentialCleanupOutcome::Retry,
+    };
+    let observed_uid =
+        match observed_credential_uid(&observed, name, namespace, lease_uid, pod_name, pod_uid) {
+            Ok(uid) => uid,
+            Err(()) => return CredentialCleanupOutcome::Quarantine,
+        };
+
+    let delete = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(observed_uid.clone()),
+            resource_version: None,
+        }),
+        ..DeleteParams::default()
+    };
+    match api.delete(name, &delete).await {
+        Ok(_) => {}
+        // A concurrent garbage collection can win between GET and DELETE.
+        // Re-read below so even that race ends on an observed 404.
+        Err(kube::Error::Api(response)) if response.code == 404 => {}
+        Err(error) if inaccessible_or_replaced(&error) => {
+            return CredentialCleanupOutcome::Quarantine;
+        }
+        Err(_) => return CredentialCleanupOutcome::Retry,
+    }
+
+    match api.get(name).await {
+        Err(kube::Error::Api(response)) if response.code == 404 => CredentialCleanupOutcome::Clean,
+        Err(error) if inaccessible_or_replaced(&error) => CredentialCleanupOutcome::Quarantine,
+        Err(_) => CredentialCleanupOutcome::Retry,
+        Ok(current) => {
+            match observed_credential_uid(&current, name, namespace, lease_uid, pod_name, pod_uid) {
+                Ok(current_uid) if current_uid == observed_uid => CredentialCleanupOutcome::Retry,
+                // The name was replaced, or its provenance changed, between the
+                // fenced delete and the proof read. It must never be deleted as if
+                // it were the object Kobe just observed.
+                Ok(_) | Err(()) => CredentialCleanupOutcome::Quarantine,
+            }
+        }
+    }
+}
+
+/// Delete all operation credentials for one exact recorded Sandbox Pod.
+///
+/// RoleBindings are proven absent before any Role is touched, and every Role
+/// is proven absent before any ServiceAccount is touched. Stopping on the
+/// first non-clean outcome preserves that order across retries. A caller may
+/// release the lease's cleanup gate only for [`CredentialCleanupOutcome::Clean`].
+pub(crate) async fn cleanup_scoped_identities(
+    client: &kube::Client,
+    namespace: &str,
+    lease_uid: &str,
+    pod_name: &str,
+    pod_uid: &str,
+) -> CredentialCleanupOutcome {
+    if namespace.is_empty() || lease_uid.is_empty() || pod_name.is_empty() || pod_uid.is_empty() {
+        return CredentialCleanupOutcome::Quarantine;
+    }
+
+    let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
+    let roles: Api<Role> = Api::namespaced(client.clone(), namespace);
+    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+
+    for resource_kind in [
+        CredentialResourceKind::RoleBinding,
+        CredentialResourceKind::Role,
+        CredentialResourceKind::ServiceAccount,
+    ] {
+        for operation in SandboxOperation::ALL {
+            let name = credential_name(lease_uid, operation);
+            let outcome = match resource_kind {
+                CredentialResourceKind::RoleBinding => {
+                    cleanup_credential_object(
+                        &role_bindings,
+                        &name,
+                        namespace,
+                        lease_uid,
+                        pod_name,
+                        pod_uid,
+                    )
+                    .await
+                }
+                CredentialResourceKind::Role => {
+                    cleanup_credential_object(
+                        &roles, &name, namespace, lease_uid, pod_name, pod_uid,
+                    )
+                    .await
+                }
+                CredentialResourceKind::ServiceAccount => {
+                    cleanup_credential_object(
+                        &service_accounts,
+                        &name,
+                        namespace,
+                        lease_uid,
+                        pod_name,
+                        pod_uid,
+                    )
+                    .await
+                }
+            };
+            if outcome != CredentialCleanupOutcome::Clean {
+                return outcome;
+            }
+        }
+    }
+
+    CredentialCleanupOutcome::Clean
 }
 
 /// The operator's own cluster configuration, resolved once.
@@ -323,6 +740,214 @@ pub async fn scoped_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{Value, json};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn mock_client(server: &MockServer) -> kube::Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::testutil::mock_k8s_client(server)
+    }
+
+    fn k8s_error(code: u16) -> ResponseTemplate {
+        let reason = match code {
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "NotFound",
+            409 => "Conflict",
+            _ => "InternalError",
+        };
+        ResponseTemplate::new(code).set_body_json(json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": reason,
+            "reason": reason,
+            "code": code,
+        }))
+    }
+
+    fn credential_object(
+        kind: &str,
+        name: &str,
+        uid: &str,
+        owner_name: &str,
+        owner_uid: &str,
+    ) -> Value {
+        let api_version = if kind == "ServiceAccount" {
+            "v1"
+        } else {
+            "rbac.authorization.k8s.io/v1"
+        };
+        let mut object = json!({
+            "apiVersion": api_version,
+            "kind": kind,
+            "metadata": {
+                "name": name,
+                "namespace": "kobe",
+                "uid": uid,
+                "labels": { (SANDBOX_LEASE_UID_LABEL): "lease-uid-1" },
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": owner_name,
+                    "uid": owner_uid,
+                    "controller": false,
+                    "blockOwnerDeletion": true,
+                }],
+            },
+        });
+        match kind {
+            "RoleBinding" => {
+                object["roleRef"] = json!({
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": name,
+                });
+            }
+            "Role" => object["rules"] = json!([]),
+            "ServiceAccount" => {}
+            _ => panic!("unsupported test credential kind"),
+        }
+        object
+    }
+
+    fn expected_identity_object(
+        kind: &str,
+        name: &str,
+        uid: &str,
+        target: &SandboxTarget,
+        operation: SandboxOperation,
+    ) -> Value {
+        let mut object = credential_object(
+            kind,
+            name,
+            uid,
+            target.pod_name.as_str(),
+            target.pod_uid.as_str(),
+        );
+        object["metadata"]["resourceVersion"] = json!(format!("rv-{uid}"));
+        object["metadata"]["labels"]["app.kubernetes.io/managed-by"] =
+            json!(crate::sandbox::KOBE_MANAGED_BY);
+        match kind {
+            "ServiceAccount" => object["automountServiceAccountToken"] = json!(false),
+            "Role" => object["rules"] = json!(scoped_rules(target, operation)),
+            "RoleBinding" => {
+                object["subjects"] = json!([{
+                    "kind": "ServiceAccount",
+                    "name": name,
+                    "namespace": target.namespace,
+                }]);
+            }
+            _ => panic!("unsupported test credential kind"),
+        }
+        object
+    }
+
+    async fn mount_missing_identity_creation(
+        server: &MockServer,
+        target: &SandboxTarget,
+        operation: SandboxOperation,
+    ) {
+        let name = credential_name(&target.lease_uid, operation);
+        for (collection_path, kind, uid) in [
+            (
+                "/api/v1/namespaces/kobe/serviceaccounts",
+                "ServiceAccount",
+                "service-account-uid",
+            ),
+            (
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/roles",
+                "Role",
+                "role-uid",
+            ),
+            (
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/rolebindings",
+                "RoleBinding",
+                "role-binding-uid",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("{collection_path}/{name}")))
+                .respond_with(k8s_error(404))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(collection_path))
+                .respond_with(
+                    ResponseTemplate::new(201).set_body_json(expected_identity_object(
+                        kind, &name, uid, target, operation,
+                    )),
+                )
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[derive(Clone)]
+    struct FirstObjectThen {
+        calls: Arc<AtomicUsize>,
+        first: Value,
+        later: Value,
+    }
+
+    impl Respond for FirstObjectThen {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            let body = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                &self.first
+            } else {
+                &self.later
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DeletingCredentialApi {
+        deleted: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl Respond for DeletingCredentialApi {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let request_path = request.url.path().to_string();
+            if request.method.as_str() == "DELETE" {
+                self.deleted.lock().unwrap().insert(request_path);
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Success",
+                    "code": 200,
+                }));
+            }
+            if self.deleted.lock().unwrap().contains(&request_path) {
+                return k8s_error(404);
+            }
+
+            let name = request_path.rsplit('/').next().unwrap();
+            let kind = if request_path.contains("/rolebindings/") {
+                "RoleBinding"
+            } else if request_path.contains("/roles/") {
+                "Role"
+            } else if request_path.contains("/serviceaccounts/") {
+                "ServiceAccount"
+            } else {
+                panic!("unexpected credential API path {request_path}");
+            };
+            ResponseTemplate::new(200).set_body_json(credential_object(
+                kind,
+                name,
+                &format!("uid-{name}"),
+                "sbx-0",
+                "pod-uid",
+            ))
+        }
+    }
 
     fn target() -> SandboxTarget {
         SandboxTarget {
@@ -338,6 +963,558 @@ mod tests {
             ports: vec![],
             runner_path: None,
         }
+    }
+
+    /// Applied identities and the issued token are tied to one exact Pod UID.
+    ///
+    /// The owner reference makes Kubernetes reap the RBAC footprint with the
+    /// Pod, while the bound object reference makes an issued token invalid as
+    /// soon as that exact Pod identity disappears.
+    #[tokio::test]
+    async fn identity_bodies_and_token_request_are_bound_to_the_exact_pod() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let target = target();
+        let name = credential_name(&target.lease_uid, SandboxOperation::Exec);
+        let service_account_path = format!("/api/v1/namespaces/kobe/serviceaccounts/{name}");
+        mount_missing_identity_creation(&server, &target, SandboxOperation::Exec).await;
+
+        let token_path = format!("{service_account_path}/token");
+        let valid_expiry = (chrono::Utc::now()
+            + chrono::Duration::seconds(TOKEN_LIFETIME_SECONDS - 1))
+        .to_rfc3339();
+        Mock::given(method("POST"))
+            .and(path(token_path))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenRequest",
+                "metadata": { "name": name, "namespace": "kobe" },
+                "spec": {
+                    "audiences": [],
+                    "expirationSeconds": TOKEN_LIFETIME_SECONDS,
+                    "boundObjectRef": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": target.pod_name,
+                        "uid": target.pod_uid,
+                    },
+                },
+                "status": {
+                    "expirationTimestamp": valid_expiry,
+                    "token": "opaque-test-token",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            mint_scoped_token(&client, &target, SandboxOperation::Exec).await,
+            Ok("opaque-test-token".to_string())
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let expected_owner = json!([{
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "name": "sbx-0",
+            "uid": "pod-uid",
+            "controller": false,
+            "blockOwnerDeletion": true,
+        }]);
+        let creates: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && !request.url.path().ends_with("/token")
+            })
+            .collect();
+        assert_eq!(creates.len(), 3);
+        for request in creates {
+            let body: Value = request.body_json().unwrap();
+            assert_eq!(body["metadata"]["ownerReferences"], expected_owner);
+            assert_eq!(
+                body["metadata"]["labels"][SANDBOX_LEASE_UID_LABEL],
+                "lease-uid-1"
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "PATCH"),
+            "creating missing identities must not require force-adoption"
+        );
+
+        let token_request = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("/token"))
+            .expect("TokenRequest was issued");
+        let body: Value = token_request.body_json().unwrap();
+        assert_eq!(
+            body["spec"]["boundObjectRef"],
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "name": "sbx-0",
+                "uid": "pod-uid",
+            })
+        );
+    }
+
+    /// The API server chooses the actual expiry, so the response — not merely
+    /// our requested `expirationSeconds` — is the authority Kobe must bound.
+    #[tokio::test]
+    async fn a_token_with_an_excessive_actual_expiry_is_rejected() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let target = target();
+        let name = credential_name(&target.lease_uid, SandboxOperation::Exec);
+        let service_account_path = format!("/api/v1/namespaces/kobe/serviceaccounts/{name}");
+        mount_missing_identity_creation(&server, &target, SandboxOperation::Exec).await;
+
+        let excessive_expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        Mock::given(method("POST"))
+            .and(path(format!("{service_account_path}/token")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenRequest",
+                "metadata": { "name": name, "namespace": "kobe" },
+                "spec": {
+                    "audiences": [],
+                    "expirationSeconds": TOKEN_LIFETIME_SECONDS,
+                    "boundObjectRef": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": target.pod_name,
+                        "uid": target.pod_uid,
+                    },
+                },
+                "status": {
+                    "expirationTimestamp": excessive_expiry,
+                    "token": "overlong-token",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            mint_scoped_token(&client, &target, SandboxOperation::Exec).await,
+            Err(SandboxAccessDenied::Backend)
+        );
+    }
+
+    /// A deterministic name is not ownership. A foreign object at that name
+    /// must be rejected before server-side apply can adopt or mutate it.
+    #[tokio::test]
+    async fn a_foreign_same_named_identity_is_rejected_without_patch() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let target = target();
+        let name = credential_name(&target.lease_uid, SandboxOperation::Exec);
+        let service_account_path = format!("/api/v1/namespaces/kobe/serviceaccounts/{name}");
+        Mock::given(method("GET"))
+            .and(path(&service_account_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(credential_object(
+                "ServiceAccount",
+                &name,
+                "foreign-service-account-uid",
+                "somebody-elses-pod",
+                "foreign-pod-uid",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            mint_scoped_token(&client, &target, SandboxOperation::Exec).await,
+            Err(SandboxAccessDenied::Backend)
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(requests[0].url.path(), service_account_path);
+    }
+
+    #[tokio::test]
+    async fn a_same_named_identity_with_the_wrong_lease_label_is_rejected_without_patch() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let target = target();
+        let name = credential_name(&target.lease_uid, SandboxOperation::Exec);
+        let service_account_path = format!("/api/v1/namespaces/kobe/serviceaccounts/{name}");
+        let mut foreign = credential_object(
+            "ServiceAccount",
+            &name,
+            "foreign-service-account-uid",
+            &target.pod_name,
+            &target.pod_uid,
+        );
+        foreign["metadata"]["labels"][SANDBOX_LEASE_UID_LABEL] = json!("another-lease-uid");
+        Mock::given(method("GET"))
+            .and(path(&service_account_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            mint_scoped_token(&client, &target, SandboxOperation::Exec).await,
+            Err(SandboxAccessDenied::Backend)
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(requests[0].url.path(), service_account_path);
+    }
+
+    /// Owned drift is repaired, but only through a patch fenced to the UID,
+    /// resourceVersion, lease label and singular Pod owner read just before it.
+    #[tokio::test]
+    async fn owned_role_drift_is_converged_with_atomic_provenance_fences() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let target = target();
+        let operation = SandboxOperation::Exec;
+        let name = credential_name(&target.lease_uid, operation);
+        let service_account_path = format!("/api/v1/namespaces/kobe/serviceaccounts/{name}");
+        let role_path = format!("/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/roles/{name}");
+        let role_binding_path =
+            format!("/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/rolebindings/{name}");
+
+        Mock::given(method("GET"))
+            .and(path(&service_account_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(expected_identity_object(
+                    "ServiceAccount",
+                    &name,
+                    "service-account-uid",
+                    &target,
+                    operation,
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut drifted_role =
+            expected_identity_object("Role", &name, "role-uid", &target, operation);
+        drifted_role["rules"] = json!([{
+            "apiGroups": [""],
+            "resources": ["pods/exec"],
+            "verbs": ["get"],
+        }]);
+        let expected_role = expected_identity_object("Role", &name, "role-uid", &target, operation);
+        Mock::given(method("GET"))
+            .and(path(&role_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(drifted_role))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&role_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(expected_role))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(&role_binding_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(expected_identity_object(
+                    "RoleBinding",
+                    &name,
+                    "role-binding-uid",
+                    &target,
+                    operation,
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let valid_expiry = (chrono::Utc::now()
+            + chrono::Duration::seconds(TOKEN_LIFETIME_SECONDS - 1))
+        .to_rfc3339();
+        Mock::given(method("POST"))
+            .and(path(format!("{service_account_path}/token")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenRequest",
+                "metadata": { "name": name, "namespace": "kobe" },
+                "spec": {
+                    "audiences": [],
+                    "expirationSeconds": TOKEN_LIFETIME_SECONDS,
+                    "boundObjectRef": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": target.pod_name,
+                        "uid": target.pod_uid,
+                    },
+                },
+                "status": {
+                    "expirationTimestamp": valid_expiry,
+                    "token": "opaque-test-token",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            mint_scoped_token(&client, &target, operation).await,
+            Ok("opaque-test-token".to_string())
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let patches: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].url.path(), role_path);
+        let body: Value = patches[0].body_json().unwrap();
+        let operations = body.as_array().expect("JSON Patch operation array");
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/uid"
+                && operation["value"] == "role-uid"
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "rv-role-uid"
+        }));
+        let rules = operations
+            .iter()
+            .find(|operation| operation["path"] == "/rules")
+            .expect("Role rules convergence operation");
+        assert_eq!(rules["value"], json!(scoped_rules(&target, operation)));
+    }
+
+    /// Cleanup removes grants before their identities and proves every name
+    /// absent. A second run observes only 404s and remains clean.
+    #[tokio::test]
+    async fn cleanup_is_ordered_uid_fenced_and_idempotent_on_404() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let responder = DeletingCredentialApi::default();
+        for request_method in ["GET", "DELETE"] {
+            Mock::given(method(request_method))
+                .respond_with(responder.clone())
+                .mount(&server)
+                .await;
+        }
+
+        assert_eq!(
+            cleanup_scoped_identities(&client, "kobe", "lease-uid-1", "sbx-0", "pod-uid").await,
+            CredentialCleanupOutcome::Clean
+        );
+        assert_eq!(
+            cleanup_scoped_identities(&client, "kobe", "lease-uid-1", "sbx-0", "pod-uid").await,
+            CredentialCleanupOutcome::Clean
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let mut expected_first_run = Vec::new();
+        for resource_path in [
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/rolebindings",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/roles",
+            "/api/v1/namespaces/kobe/serviceaccounts",
+        ] {
+            for operation in SandboxOperation::ALL {
+                let object_path = format!(
+                    "{resource_path}/{}",
+                    credential_name("lease-uid-1", operation)
+                );
+                expected_first_run.extend([
+                    ("GET".to_string(), object_path.clone()),
+                    ("DELETE".to_string(), object_path.clone()),
+                    ("GET".to_string(), object_path),
+                ]);
+            }
+        }
+        let first_run: Vec<_> = requests[..expected_first_run.len()]
+            .iter()
+            .map(|request| {
+                (
+                    request.method.as_str().to_string(),
+                    request.url.path().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(first_run, expected_first_run);
+
+        for request in requests
+            .iter()
+            .take(expected_first_run.len())
+            .filter(|request| request.method.as_str() == "DELETE")
+        {
+            assert!(
+                !request
+                    .url
+                    .query_pairs()
+                    .any(|(key, _)| key == "labelSelector"),
+                "credential cleanup must never turn the lease label into a delete selector"
+            );
+            let name = request.url.path().rsplit('/').next().unwrap();
+            let body: Value = request.body_json().unwrap();
+            assert_eq!(body["preconditions"]["uid"], format!("uid-{name}"));
+        }
+
+        let second_run = &requests[expected_first_run.len()..];
+        assert_eq!(second_run.len(), SandboxOperation::ALL.len() * 3);
+        assert!(
+            second_run
+                .iter()
+                .all(|request| request.method.as_str() == "GET"),
+            "already-absent credentials require no delete"
+        );
+    }
+
+    /// Authorization failures make absence unverifiable and therefore require
+    /// quarantine; a transient server failure instead remains retryable.
+    #[tokio::test]
+    async fn cleanup_distinguishes_retry_from_unauthorized_or_forbidden() {
+        for code in [401, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(k8s_error(code))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                cleanup_scoped_identities(
+                    &mock_client(&server),
+                    "kobe",
+                    "lease-uid-1",
+                    "sbx-0",
+                    "pod-uid"
+                )
+                .await,
+                CredentialCleanupOutcome::Quarantine,
+                "HTTP {code} must not be mistaken for absence"
+            );
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(k8s_error(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            cleanup_scoped_identities(
+                &mock_client(&server),
+                "kobe",
+                "lease-uid-1",
+                "sbx-0",
+                "pod-uid"
+            )
+            .await,
+            CredentialCleanupOutcome::Retry
+        );
+    }
+
+    /// A deterministic name is not authority. Foreign provenance or a UID
+    /// replacement is quarantined and never followed by a delete of the new
+    /// object.
+    #[tokio::test]
+    async fn cleanup_quarantines_foreign_owner_and_name_reuse() {
+        let name = credential_name("lease-uid-1", SandboxOperation::Logs);
+        let role_binding_path =
+            format!("/apis/rbac.authorization.k8s.io/v1/namespaces/kobe/rolebindings/{name}");
+
+        let foreign_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(&role_binding_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(credential_object(
+                "RoleBinding",
+                &name,
+                "foreign-object-uid",
+                "somebody-elses-pod",
+                "foreign-pod-uid",
+            )))
+            .expect(1)
+            .mount(&foreign_server)
+            .await;
+        assert_eq!(
+            cleanup_scoped_identities(
+                &mock_client(&foreign_server),
+                "kobe",
+                "lease-uid-1",
+                "sbx-0",
+                "pod-uid"
+            )
+            .await,
+            CredentialCleanupOutcome::Quarantine
+        );
+        assert!(
+            foreign_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() == "GET"),
+            "a foreign owner must never be deleted"
+        );
+
+        let replacement_server = MockServer::start().await;
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path(&role_binding_path))
+            .respond_with(FirstObjectThen {
+                calls: get_calls,
+                first: credential_object(
+                    "RoleBinding",
+                    &name,
+                    "old-object-uid",
+                    "sbx-0",
+                    "pod-uid",
+                ),
+                later: credential_object(
+                    "RoleBinding",
+                    &name,
+                    "replacement-object-uid",
+                    "sbx-0",
+                    "pod-uid",
+                ),
+            })
+            .expect(2)
+            .mount(&replacement_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(&role_binding_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(credential_object(
+                "RoleBinding",
+                &name,
+                "old-object-uid",
+                "sbx-0",
+                "pod-uid",
+            )))
+            .expect(1)
+            .mount(&replacement_server)
+            .await;
+        assert_eq!(
+            cleanup_scoped_identities(
+                &mock_client(&replacement_server),
+                "kobe",
+                "lease-uid-1",
+                "sbx-0",
+                "pod-uid"
+            )
+            .await,
+            CredentialCleanupOutcome::Quarantine
+        );
+        let requests = replacement_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GET", "DELETE", "GET"]
+        );
+        let delete: Value = requests[1].body_json().unwrap();
+        assert_eq!(delete["preconditions"]["uid"], "old-object-uid");
     }
 
     /// A credential must never be able to name a second Pod.

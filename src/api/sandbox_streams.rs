@@ -33,7 +33,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -208,6 +208,55 @@ pub async fn register_bounded(
         .await
 }
 
+/// Result of atomically claiming a local stream slot and fencing it against
+/// the latest lease object.
+pub enum ConfirmedStreamRegistration {
+    Registered(StreamGuard),
+    LimitReached,
+    LeaseEnded,
+}
+
+/// Register first, then strongly re-read the exact lease before starting work.
+///
+/// The order closes both sides of the watch race: a deletion event observed
+/// before registration is reflected by the GET, while an event after
+/// registration cancels the guard already stored in this replica's registry.
+/// UID, Ready phase, and deletionTimestamp are checked together so a
+/// same-named replacement or direct Kubernetes DELETE cannot open a stream.
+pub async fn register_confirmed(
+    registry: &Arc<StreamRegistry>,
+    leases: &Api<SandboxLease>,
+    lease_name: &str,
+    expected_uid: &str,
+) -> Result<ConfirmedStreamRegistration, kube::Error> {
+    let Some(guard) = register_bounded(registry, expected_uid).await else {
+        return Ok(ConfirmedStreamRegistration::LimitReached);
+    };
+    let current = match leases.get(lease_name).await {
+        Ok(current) => current,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok(ConfirmedStreamRegistration::LeaseEnded);
+        }
+        Err(error) => return Err(error),
+    };
+    let current_uid = current.uid();
+    let status = current.status.as_ref();
+    let phase = status.map(|status| status.phase).unwrap_or_default();
+    let before_expiry = status
+        .and_then(|status| status.expires_at.as_deref())
+        .and_then(|expires_at| chrono::DateTime::parse_from_rfc3339(expires_at).ok())
+        .is_some_and(|expires_at| chrono::Utc::now() < expires_at);
+    if current_uid.as_deref() != Some(expected_uid)
+        || !phase_permits_open_streams(phase)
+        || !before_expiry
+        || current.metadata.deletion_timestamp.is_some()
+        || guard.cancelled().is_cancelled()
+    {
+        return Ok(ConfirmedStreamRegistration::LeaseEnded);
+    }
+    Ok(ConfirmedStreamRegistration::Registered(guard))
+}
+
 /// This replica's registry.
 ///
 /// A process global because "per-replica" *is* per-process: the sockets live
@@ -239,30 +288,84 @@ pub async fn run_stream_revoker(
     client: Client,
     namespace: &str,
     registry: Arc<StreamRegistry>,
+    initial_sync: oneshot::Sender<Result<(), String>>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let leases: Api<SandboxLease> = Api::namespaced(client, namespace);
     let stream = watcher(leases, watcher::Config::default());
     futures::pin_mut!(stream);
+    let mut initial_sync = Some(initial_sync);
 
     info!("Starting Sandbox stream revoker");
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                fail_initial_sync(&mut initial_sync, "shutdown requested before initial lease sync");
+                break;
+            },
             event = stream.next() => {
                 match event {
-                    Some(Ok(event)) => handle_watch_event(&registry, event).await,
+                    Some(Ok(event)) => {
+                        let initial_list_complete = event_completes_initial_sync(&event);
+                        handle_watch_event(&registry, event).await;
+                        if initial_list_complete {
+                            complete_initial_sync(&mut initial_sync);
+                        }
+                    }
                     Some(Err(error)) => {
+                        if initial_sync.is_some() {
+                            fail_initial_sync(
+                                &mut initial_sync,
+                                format!("initial Sandbox lease watch failed: {error}"),
+                            );
+                            break;
+                        }
                         // The watch restarts itself; log and keep going. Giving
                         // up here would silently stop revoking.
                         warn!(error = %error, "Sandbox lease watch error");
                     }
-                    None => break,
+                    None => {
+                        fail_initial_sync(
+                            &mut initial_sync,
+                            "Sandbox lease watch ended before initial sync",
+                        );
+                        break;
+                    }
                 }
             }
         }
     }
     info!("Sandbox stream revoker shut down");
+}
+
+/// Only the watcher's `InitDone` marker proves the initial LIST is complete.
+fn event_completes_initial_sync(event: &watcher::Event<SandboxLease>) -> bool {
+    matches!(event, watcher::Event::InitDone)
+}
+
+/// Open the per-replica startup barrier after the watch's initial LIST has
+/// been fully consumed.
+///
+/// `InitApply` is not sufficient: a lease omitted later in the same LIST can
+/// still determine whether a stream must be revoked. Only `InitDone` proves
+/// the replica has a complete baseline before it starts serving Sandbox
+/// operations.
+fn complete_initial_sync(initial_sync: &mut Option<oneshot::Sender<Result<(), String>>>) {
+    if let Some(initial_sync) = initial_sync.take() {
+        let _ = initial_sync.send(Ok(()));
+    }
+}
+
+/// Fail the unopened startup barrier. Errors after `InitDone` are ordinary
+/// restartable watch errors and therefore leave the already-open barrier
+/// untouched.
+fn fail_initial_sync(
+    initial_sync: &mut Option<oneshot::Sender<Result<(), String>>>,
+    reason: impl Into<String>,
+) {
+    if let Some(initial_sync) = initial_sync.take() {
+        let _ = initial_sync.send(Err(reason.into()));
+    }
 }
 
 /// Act on one watch event.
@@ -310,7 +413,11 @@ async fn revoke_if_ended(registry: &Arc<StreamRegistry>, lease: &SandboxLease) {
         .as_ref()
         .map(|status| status.phase)
         .unwrap_or_default();
-    if phase_permits_open_streams(phase) {
+    // A direct Kubernetes DELETE publishes deletionTimestamp before the
+    // lifecycle controller can checkpoint Releasing. Treat it as ended now,
+    // or an upgraded connection can survive into finalizer cleanup.
+    let deleting = lease.metadata.deletion_timestamp.is_some();
+    if phase_permits_open_streams(phase) && !deleting {
         return;
     }
     let cancelled = registry.revoke(&uid).await;
@@ -318,17 +425,67 @@ async fn revoke_if_ended(registry: &Arc<StreamRegistry>, lease: &SandboxLease) {
         info!(
             lease = %lease.name_any(),
             phase = %phase,
+            deleting,
             cancelled,
             "cancelled streams for a Sandbox lease that stopped permitting access"
         );
     } else {
-        debug!(lease = %lease.name_any(), phase = %phase, "no streams to cancel here");
+        debug!(lease = %lease.name_any(), phase = %phase, deleting, "no streams to cancel here");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ready_lease_for_stream() -> SandboxLease {
+        let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = SandboxLeasePhase::Ready;
+        status.ready_at = Some(chrono::Utc::now().to_rfc3339());
+        status.expires_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        lease
+    }
+
+    async fn lease_api(server: &MockServer) -> Api<SandboxLease> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Api::namespaced(crate::testutil::mock_k8s_client(server), "test-ns")
+    }
+
+    /// The API must remain closed through Init and every InitApply; only the
+    /// terminal marker establishes a complete revocation baseline.
+    #[tokio::test]
+    async fn initial_sync_barrier_opens_only_after_init_done() {
+        assert!(!event_completes_initial_sync(&watcher::Event::Init));
+        assert!(!event_completes_initial_sync(&watcher::Event::InitApply(
+            ready_lease_for_stream()
+        )));
+        assert!(event_completes_initial_sync(&watcher::Event::InitDone));
+
+        let (sender, receiver) = oneshot::channel();
+        let mut sender = Some(sender);
+        complete_initial_sync(&mut sender);
+
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert!(sender.is_none(), "the barrier must be one-shot");
+    }
+
+    /// An initial LIST/watch error must be observable by startup instead of
+    /// leaving an API replica serving without a complete revocation baseline.
+    #[tokio::test]
+    async fn initial_sync_failure_is_reported_fail_closed() {
+        let (sender, receiver) = oneshot::channel();
+        let mut sender = Some(sender);
+        fail_initial_sync(&mut sender, "initial list failed");
+
+        assert_eq!(
+            receiver.await.unwrap(),
+            Err("initial list failed".to_string())
+        );
+        assert!(sender.is_none(), "the barrier must be one-shot");
+    }
 
     /// Every phase but Ready closes streams.
     ///
@@ -352,6 +509,79 @@ mod tests {
                 "{phase} must close streams"
             );
         }
+    }
+
+    /// If deletion was observed before registration, no guard existed for the
+    /// watcher to cancel. The post-registration GET is therefore mandatory.
+    #[tokio::test]
+    async fn post_registration_get_catches_an_already_missed_delete_event() {
+        let server = MockServer::start().await;
+        let mut lease = ready_lease_for_stream();
+        lease.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_millisecond(
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .unwrap(),
+            ));
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = StreamRegistry::new();
+
+        assert!(matches!(
+            register_confirmed(&registry, &lease_api(&server).await, "sbx-1", "lease-uid-1")
+                .await
+                .unwrap(),
+            ConfirmedStreamRegistration::LeaseEnded
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(registry.live_count("lease-uid-1").await, 0);
+    }
+
+    /// Once the guard exists, an event racing the exact GET cancels it. Even a
+    /// still-Ready GET response cannot resurrect that registration.
+    #[tokio::test]
+    async fn watch_event_after_registration_wins_the_confirmation_race() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(ready_lease_for_stream()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = StreamRegistry::new();
+        let api = lease_api(&server).await;
+        let task_registry = registry.clone();
+        let task = tokio::spawn(async move {
+            register_confirmed(&task_registry, &api, "sbx-1", "lease-uid-1").await
+        });
+
+        for _ in 0..100 {
+            if registry.live_count("lease-uid-1").await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(registry.live_count("lease-uid-1").await, 1);
+        assert_eq!(registry.revoke("lease-uid-1").await, 1);
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            ConfirmedStreamRegistration::LeaseEnded
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(registry.live_count("lease-uid-1").await, 0);
     }
 
     #[tokio::test]
@@ -561,6 +791,27 @@ mod tests {
 
         lease.status.as_mut().unwrap().phase = SandboxLeasePhase::Releasing;
         revoke_if_ended(&registry, &lease).await;
+        assert!(guard.cancelled().is_cancelled());
+    }
+
+    /// A direct Kubernetes DELETE must revoke on the Apply carrying
+    /// deletionTimestamp, without waiting for Releasing to be persisted.
+    #[tokio::test]
+    async fn deletion_timestamp_revokes_a_ready_lease_immediately() {
+        let registry = StreamRegistry::new();
+        let guard = registry.register("lease-uid-1").await;
+
+        let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+        lease.status.as_mut().unwrap().phase = SandboxLeasePhase::Ready;
+        lease.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_millisecond(
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .unwrap(),
+            ));
+        handle_watch_event(&registry, watcher::Event::Apply(lease)).await;
+
         assert!(guard.cancelled().is_cancelled());
     }
 

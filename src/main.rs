@@ -121,6 +121,39 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("KOBE_SSH_NAMESPACE").unwrap_or_else(|_| "kobe-system".to_string());
     let authenticator = Arc::new(JwtAuthenticator::new(ssh_namespace));
 
+    // Stream revocation is a per-replica API responsibility, not a leader
+    // controller. Start it before this process can serve Sandbox routes and
+    // before leader acquisition can block indefinitely. The handle remains
+    // supervised below: silently losing the watch would leave upgraded exec,
+    // attach, and port-forward connections alive after their lease ends.
+    let mut stream_revoker_handle =
+        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+            let revoker_client = client.clone();
+            let revoker_ns = namespace.clone();
+            let revoker_shutdown = shutdown.clone();
+            let (revoker_ready_tx, revoker_ready_rx) = tokio::sync::oneshot::channel();
+            let mut handle = tokio::spawn(async move {
+                api::sandbox_streams::run_stream_revoker(
+                    revoker_client,
+                    &revoker_ns,
+                    api::sandbox_streams::registry().clone(),
+                    revoker_ready_tx,
+                    revoker_shutdown,
+                )
+                .await;
+            });
+            await_critical_task_readiness(
+                revoker_ready_rx,
+                &mut handle,
+                "Sandbox stream revoker",
+                &shutdown,
+            )
+            .await?;
+            Some(handle)
+        } else {
+            None
+        };
+
     // ── Start HTTP server immediately (all replicas serve API + health) ──
     let state = AppState {
         client: client.clone(),
@@ -169,7 +202,17 @@ async fn main() -> anyhow::Result<()> {
     let leader_election =
         kunobi_ha::leader::LeaderElection::builder(client.clone(), &namespace, "kobe-operator")
             .build();
-    let leader_guard = leader_election.acquire().await?;
+    let leader_guard = if let Some(revoker_handle) = stream_revoker_handle.as_mut() {
+        acquire_while_critical_task_runs(
+            async move { Ok(leader_election.acquire().await?) },
+            revoker_handle,
+            "Sandbox stream revoker",
+            &shutdown,
+        )
+        .await?
+    } else {
+        leader_election.acquire().await?
+    };
 
     // Live-set ConfigMap reconciler (writes kobe-system/kobe-live-instances).
     // Leader-only; consumed by the kobe-host-reaper DaemonSet to decide
@@ -285,83 +328,69 @@ async fn main() -> anyhow::Result<()> {
     // Spawning it in `disabled` mode would have it watch CRDs that may not
     // exist and log errors forever; spawning it without the #72 validation
     // would let it write objects an incompatible runtime cannot reconcile.
-    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
-        let sandbox_client = client.clone();
-        let sandbox_ns = namespace.clone();
-        let sandbox_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            controllers::sandbox::run_sandbox_controller(
-                sandbox_client,
-                &sandbox_ns,
-                sandbox_shutdown,
-            )
-            .await;
-        });
+    let sandbox_controller_handle =
+        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+            let sandbox_client = client.clone();
+            let sandbox_ns = namespace.clone();
+            let sandbox_shutdown = shutdown.clone();
+            let handle = tokio::spawn(async move {
+                controllers::sandbox::run_sandbox_controller(
+                    sandbox_client,
+                    &sandbox_ns,
+                    sandbox_shutdown,
+                )
+                .await;
+            });
 
-        // Stream revocation runs on EVERY replica that serves Sandbox
-        // operations, not just the controller leader. A replica can only
-        // cancel connections it is holding itself — the socket lives in one
-        // process — so a leader-elected revoker would leave live streams on
-        // every other replica with nobody watching them.
-        // Executions left Running by a process that disappeared are settled
-        // here. The reserve-then-spawn order buys "never a duplicate spawn"
-        // and pays for it with records nobody is left to finish; this is what
-        // turns those into an honest `Unknown` rather than a poll that never
-        // ends.
-        let execution_reaper_client = client.clone();
-        let execution_reaper_ns = namespace.clone();
-        let execution_reaper_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            api::sandbox_executions::run_execution_reaper(
-                execution_reaper_client,
-                &execution_reaper_ns,
-                std::time::Duration::from_secs(60),
-                execution_reaper_shutdown,
-            )
-            .await;
-        });
+            // Executions left Running by a process that disappeared are settled
+            // here. The reserve-then-spawn order buys "never a duplicate spawn"
+            // and pays for it with records nobody is left to finish; this is what
+            // turns those into an honest `Unknown` rather than a poll that never
+            // ends.
+            let execution_reaper_client = client.clone();
+            let execution_reaper_ns = namespace.clone();
+            let execution_reaper_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                api::sandbox_executions::run_execution_reaper(
+                    execution_reaper_client,
+                    &execution_reaper_ns,
+                    std::time::Duration::from_secs(60),
+                    execution_reaper_shutdown,
+                )
+                .await;
+            });
 
-        // Terminal lease records are retired here. `Released` and `Expired`
-        // stop consuming capacity when they are written, so nothing leaks —
-        // the objects just accumulate, one per Sandbox ever leased, until
-        // etcd carries a row for every Sandbox that ever existed. The window
-        // is measured in days because the record is an audit trail, and the
-        // tick is hourly because nothing on that scale is worth a minute's
-        // list churn against the API server.
-        let lease_reaper_client = client.clone();
-        let lease_reaper_ns = namespace.clone();
-        let lease_reaper_shutdown = shutdown.clone();
-        let lease_retention = api::sandbox::sandbox_lease_retention(
-            std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
-                .ok()
-                .as_deref(),
-        );
-        tokio::spawn(async move {
-            api::sandbox::run_sandbox_lease_reaper(
-                lease_reaper_client,
-                &lease_reaper_ns,
-                std::time::Duration::from_secs(3600),
-                lease_retention,
-                lease_reaper_shutdown,
-            )
-            .await;
-        });
+            // Terminal lease records are retired here. `Released` and `Expired`
+            // stop consuming capacity when they are written, so nothing leaks —
+            // the objects just accumulate, one per Sandbox ever leased, until
+            // etcd carries a row for every Sandbox that ever existed. The window
+            // is measured in days because the record is an audit trail, and the
+            // tick is hourly because nothing on that scale is worth a minute's
+            // list churn against the API server.
+            let lease_reaper_client = client.clone();
+            let lease_reaper_ns = namespace.clone();
+            let lease_reaper_shutdown = shutdown.clone();
+            let lease_retention = api::sandbox::sandbox_lease_retention(
+                std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
+                    .ok()
+                    .as_deref(),
+            );
+            tokio::spawn(async move {
+                api::sandbox::run_sandbox_lease_reaper(
+                    lease_reaper_client,
+                    &lease_reaper_ns,
+                    std::time::Duration::from_secs(3600),
+                    lease_retention,
+                    lease_reaper_shutdown,
+                )
+                .await;
+            });
 
-        let revoker_client = client.clone();
-        let revoker_ns = namespace.clone();
-        let revoker_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            api::sandbox_streams::run_stream_revoker(
-                revoker_client,
-                &revoker_ns,
-                api::sandbox_streams::registry().clone(),
-                revoker_shutdown,
-            )
-            .await;
-        });
-    } else {
-        info!("Sandbox placement not started (agentSandbox.mode is not external)");
-    }
+            Some(handle)
+        } else {
+            info!("Sandbox placement not started (agentSandbox.mode is not external)");
+            None
+        };
 
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
     // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller
@@ -446,6 +475,18 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => error!("Live-set controller panicked: {e}"),
                 }
             }
+            result = await_optional_critical_task(stream_revoker_handle) => {
+                match result {
+                    Ok(()) => warn!("Sandbox stream revoker exited unexpectedly"),
+                    Err(e) => error!("Sandbox stream revoker panicked: {e}"),
+                }
+            }
+            result = await_optional_critical_task(sandbox_controller_handle) => {
+                match result {
+                    Ok(()) => warn!("Sandbox placement controller exited unexpectedly"),
+                    Err(e) => error!("Sandbox placement controller panicked: {e}"),
+                }
+            }
         }
         error!("Controller died, initiating shutdown");
         controller_shutdown.cancel();
@@ -461,6 +502,81 @@ async fn main() -> anyhow::Result<()> {
 
     telemetry::shutdown(_otel_provider);
     Ok(())
+}
+
+/// Acquire leadership while proving a pre-leader critical task stays alive.
+///
+/// Every replica can wait indefinitely for the leader Lease, so merely keeping
+/// a task's [`tokio::task::JoinHandle`] for the post-election monitor is not
+/// enough. If that task exits while acquisition is pending, cancel the shared
+/// shutdown token and fail startup instead of leaving a degraded API replica
+/// serving forever.
+async fn acquire_while_critical_task_runs<T>(
+    acquire: impl std::future::Future<Output = anyhow::Result<T>>,
+    critical_task: &mut tokio::task::JoinHandle<()>,
+    task_name: &'static str,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<T> {
+    tokio::pin!(acquire);
+    tokio::select! {
+        result = &mut acquire => result,
+        result = &mut *critical_task => {
+            shutdown.cancel();
+            match result {
+                Ok(()) => anyhow::bail!("{task_name} exited unexpectedly before leadership was acquired"),
+                Err(error) => anyhow::bail!("{task_name} failed before leadership was acquired: {error}"),
+            }
+        }
+    }
+}
+
+/// Wait until a critical per-replica task has established its startup safety
+/// invariant, while treating an early return or panic as a startup failure.
+///
+/// For the Sandbox stream revoker this barrier is the watcher's `InitDone`:
+/// the HTTP listener is not created until the initial lease LIST has been
+/// completely consumed, so no replica can accept a Sandbox operation with an
+/// incomplete revocation baseline.
+async fn await_critical_task_readiness(
+    readiness: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    critical_task: &mut tokio::task::JoinHandle<()>,
+    task_name: &'static str,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        readiness = readiness => match readiness {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => {
+                shutdown.cancel();
+                anyhow::bail!("{task_name} failed initial synchronization: {reason}")
+            }
+            Err(error) => {
+                shutdown.cancel();
+                anyhow::bail!("{task_name} dropped its initial synchronization barrier: {error}")
+            }
+        },
+        result = &mut *critical_task => {
+            shutdown.cancel();
+            match result {
+                Ok(()) => anyhow::bail!("{task_name} exited before initial synchronization"),
+                Err(error) => anyhow::bail!("{task_name} failed before initial synchronization: {error}"),
+            }
+        }
+    }
+}
+
+/// Await a mode-dependent critical task without waking when it is disabled.
+///
+/// This lets the single fatal-task monitor supervise Sandbox tasks in
+/// `external` mode while retaining the same select topology in `disabled`
+/// mode, where no Sandbox task exists.
+async fn await_optional_critical_task(
+    handle: Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match handle {
+        Some(handle) => handle.await,
+        None => std::future::pending::<Result<(), tokio::task::JoinError>>().await,
+    }
 }
 
 /// Wait for required CRDs to be established, retrying with backoff.
@@ -575,6 +691,7 @@ async fn shutdown_signal(
         _ = ctrl_c => info!("Received Ctrl+C, shutting down"),
         _ = terminate => info!("Received SIGTERM, shutting down"),
         _ = leader_lost => info!("Lost leader lease, shutting down"),
+        _ = shutdown.cancelled() => error!("Critical background task exited, shutting down"),
     }
 
     // Cooperative step-down so the next replica picks up the Lease quickly
@@ -603,6 +720,144 @@ mod controllers_test_anchor {
 mod diagnostics_test_anchor {
     #[allow(unused_imports)]
     use crate::diagnostics::bundle;
+}
+
+#[cfg(test)]
+mod critical_task_supervision_tests {
+    use super::{
+        acquire_while_critical_task_runs, await_critical_task_readiness,
+        await_optional_critical_task,
+    };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// A follower must fail closed if its per-replica revoker exits while
+    /// leader acquisition is still pending.
+    #[tokio::test]
+    async fn critical_task_exit_before_leadership_cancels_shutdown() {
+        let shutdown = CancellationToken::new();
+        let mut critical_task = tokio::spawn(async {});
+
+        let result = acquire_while_critical_task_runs(
+            std::future::pending::<anyhow::Result<()>>(),
+            &mut critical_task,
+            "test revoker",
+            &shutdown,
+        )
+        .await;
+
+        assert!(
+            result
+                .expect_err("a dead critical task must fail leader acquisition")
+                .to_string()
+                .contains("exited unexpectedly before leadership was acquired")
+        );
+        assert!(
+            shutdown.is_cancelled(),
+            "critical task exit must wake process shutdown"
+        );
+    }
+
+    /// A panic is the same availability and safety failure as a clean early
+    /// return: neither may leave a follower serving Sandbox routes unwatched.
+    #[tokio::test]
+    async fn critical_task_panic_before_leadership_cancels_shutdown() {
+        let shutdown = CancellationToken::new();
+        let mut critical_task = tokio::spawn(async { panic!("revoker panic") });
+
+        let result = acquire_while_critical_task_runs(
+            std::future::pending::<anyhow::Result<()>>(),
+            &mut critical_task,
+            "test revoker",
+            &shutdown,
+        )
+        .await;
+
+        assert!(
+            result
+                .expect_err("a panicked critical task must fail leader acquisition")
+                .to_string()
+                .contains("failed before leadership was acquired")
+        );
+        assert!(shutdown.is_cancelled());
+    }
+
+    /// Successful election transfers the still-live task to the normal fatal
+    /// monitor instead of consuming or cancelling it.
+    #[tokio::test]
+    async fn leadership_keeps_critical_task_live_for_post_election_monitoring() {
+        let shutdown = CancellationToken::new();
+        let mut critical_task = tokio::spawn(std::future::pending::<()>());
+
+        let leader = acquire_while_critical_task_runs(
+            async { Ok::<_, anyhow::Error>("leader") },
+            &mut critical_task,
+            "test revoker",
+            &shutdown,
+        )
+        .await
+        .expect("leadership should win while the critical task is healthy");
+
+        assert_eq!(leader, "leader");
+        assert!(!shutdown.is_cancelled());
+        assert!(!critical_task.is_finished());
+        critical_task.abort();
+        let _ = critical_task.await;
+    }
+
+    /// Startup may proceed only after the critical task explicitly opens its
+    /// initial-sync barrier, and the task must remain available to monitor.
+    #[tokio::test]
+    async fn readiness_barrier_keeps_critical_task_live_for_monitoring() {
+        let shutdown = CancellationToken::new();
+        let mut critical_task = tokio::spawn(std::future::pending::<()>());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        ready_tx.send(Ok(())).unwrap();
+
+        await_critical_task_readiness(ready_rx, &mut critical_task, "test revoker", &shutdown)
+            .await
+            .expect("an explicit InitDone signal should open startup");
+
+        assert!(!shutdown.is_cancelled());
+        assert!(!critical_task.is_finished());
+        critical_task.abort();
+        let _ = critical_task.await;
+    }
+
+    /// Initial LIST/watch failure must prevent the HTTP startup path and wake
+    /// process shutdown.
+    #[tokio::test]
+    async fn readiness_failure_cancels_shutdown() {
+        let shutdown = CancellationToken::new();
+        let mut critical_task = tokio::spawn(std::future::pending::<()>());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        ready_tx
+            .send(Err("initial list failed".to_string()))
+            .unwrap();
+
+        let error =
+            await_critical_task_readiness(ready_rx, &mut critical_task, "test revoker", &shutdown)
+                .await
+                .expect_err("startup must fail closed without an initial lease baseline");
+
+        assert!(error.to_string().contains("initial list failed"));
+        assert!(shutdown.is_cancelled());
+        critical_task.abort();
+        let _ = critical_task.await;
+    }
+
+    /// Disabled mode contributes no synthetic completion to the fatal-task
+    /// select; other controllers remain the only possible wakeups.
+    #[tokio::test]
+    async fn absent_optional_critical_task_never_wakes_monitor() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            await_optional_critical_task(None),
+        )
+        .await;
+
+        assert!(result.is_err(), "an absent task must stay pending");
+    }
 }
 
 #[cfg(test)]

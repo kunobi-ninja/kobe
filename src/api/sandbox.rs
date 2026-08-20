@@ -32,7 +32,7 @@ use crate::crd::{
     SandboxTargetProvenance, SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
-use crate::sandbox::{aggregate_resource_limits, resource_ceiling_allows};
+use crate::sandbox::{SANDBOX_LEASE_FINALIZER, aggregate_resource_limits, resource_ceiling_allows};
 
 const REQUESTER_HASH_LABEL: &str = "kobe.kunobi.ninja/requester-hash";
 const SANDBOX_POOL_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool";
@@ -350,30 +350,28 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // request is called `exec` or `executions`. Registering unbounded here
     // meant the limit existed on paper and not in the path most likely to be
     // driven by a loop.
-    let streams = crate::api::sandbox_streams::registry();
-    let Some(guard) =
-        crate::api::sandbox_streams::register_bounded(streams, &target.lease_uid).await
-    else {
-        // The reservation already exists and is Running; leaving it that way
-        // would strand it until the verdict deadline. Settle it honestly
-        // instead — nothing was spawned, so it definitely did not run.
-        executions::record_terminal(
-            &state.client,
-            &state.namespace,
-            &reserved,
-            ExecutionState::Cancelled,
-            None,
-            "concurrency_limit",
-        )
-        .await;
-        return access_denied_with(
-            &identity,
-            &id,
-            "execution",
-            "concurrency_limit",
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many concurrent operations for this Sandbox lease",
-        );
+    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+        Ok(guard) => guard,
+        Err(denied) => {
+            // The reservation already exists and is Running; leaving it that
+            // way would strand it until the verdict deadline. Nothing spawned,
+            // so Cancelled is exact even when revalidation itself failed.
+            let reason = match denied {
+                StreamRegistrationDenied::LimitReached => "concurrency_limit",
+                StreamRegistrationDenied::LeaseEnded => "lease_ended",
+                StreamRegistrationDenied::Backend => "lease_revalidation_failed",
+            };
+            executions::record_terminal(
+                &state.client,
+                &state.namespace,
+                &reserved,
+                ExecutionState::Cancelled,
+                None,
+                reason,
+            )
+            .await;
+            return stream_registration_denied(&identity, &id, "execution", denied);
+        }
     };
     let revoked = guard.cancelled();
 
@@ -970,10 +968,9 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
 
-    if let Some(response) =
-        cancel_detached(&state, &identity, &id, &lease, &target, &execution).await
-    {
-        return response;
+    match cancel_detached(&state, &identity, &id, &lease, &target, &execution).await {
+        DetachedCancellation::NotDetached => {}
+        DetachedCancellation::Handled(response) => return response,
     }
 
     match crate::api::sandbox_executions::cancel_owned(
@@ -994,14 +991,21 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
 
 /// Terminate a detached execution's process group, if this is one.
 ///
-/// `None` means "not a detached execution to cancel" and lets the caller fall
-/// through to the record-only path.
+/// Only [`DetachedCancellation::NotDetached`] lets the caller fall through to
+/// the record-only path. Once a record says `detached`, every missing runner,
+/// target, credential or backend response is an unconfirmed termination and
+/// must keep the record Running rather than pretending it was cancelled.
 ///
 /// A runner that cannot be reached does **not** settle the record. Recording
 /// `Cancelled` would claim a termination nobody performed, and recording
 /// `Unknown` would close a record whose command is very likely still running —
 /// leaving it `Running` keeps the caller's retry meaningful, and lease teardown
 /// remains the backstop that always ends it.
+enum DetachedCancellation {
+    NotDetached,
+    Handled(Response),
+}
+
 async fn cancel_detached<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
@@ -1009,37 +1013,85 @@ async fn cancel_detached<B: ClusterBackend>(
     lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
     execution: &str,
-) -> Option<Response> {
+) -> DetachedCancellation {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
 
-    let record = executions::get_owned(
+    let record = match executions::get_owned(
         &state.client,
         &state.namespace,
         execution,
         &target.lease_uid,
     )
     .await
-    .ok()
-    .flatten()?;
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return DetachedCancellation::Handled(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(error) => {
+            return DetachedCancellation::Handled(execution_denied(identity, id, &error));
+        }
+    };
     let current = record
         .status
         .as_ref()
         .map(|status| status.state)
         .unwrap_or_default();
-    if !record.spec.detached || current.is_terminal() {
-        return None;
+    if !record.spec.detached {
+        return DetachedCancellation::NotDetached;
     }
-    let runner_path = target.runner_path.clone()?;
+    if current.is_terminal() {
+        return DetachedCancellation::Handled(
+            (StatusCode::OK, Json(execution_response(&record, None))).into_response(),
+        );
+    }
+    let Some(runner_path) = target.runner_path.clone() else {
+        return DetachedCancellation::Handled(access_denied_with(
+            identity,
+            id,
+            "execution-cancel",
+            "runner_missing",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Detached execution termination could not be confirmed",
+        ));
+    };
 
-    let cluster = access_or_none(&state.client, &state.namespace, lease, target).await?;
-    let scoped = crate::api::sandbox_credentials::scoped_client(
+    let cluster = match crate::api::sandbox_access::resolve_target_cluster(
+        &state.client,
+        &state.namespace,
+        lease,
+        target,
+    )
+    .await
+    {
+        Ok(cluster) => cluster,
+        Err(denied) => {
+            return DetachedCancellation::Handled(access_denied(
+                identity,
+                id,
+                "execution-cancel",
+                denied,
+            ));
+        }
+    };
+    let scoped = match crate::api::sandbox_credentials::scoped_client(
         &cluster,
         target,
         crate::api::sandbox_credentials::SandboxOperation::Exec,
     )
     .await
-    .ok()?;
+    {
+        Ok(scoped) => scoped,
+        Err(denied) => {
+            return DetachedCancellation::Handled(access_denied(
+                identity,
+                id,
+                "execution-cancel",
+                denied,
+            ));
+        }
+    };
 
     match runner::cancel(
         &scoped,
@@ -1056,7 +1108,7 @@ async fn cancel_detached<B: ClusterBackend>(
                 // The runner answered without settling it. Saying "cancelled"
                 // here would be Kobe's word for something the container did not
                 // confirm.
-                return Some(sandbox_error(
+                return DetachedCancellation::Handled(sandbox_error(
                     StatusCode::ACCEPTED,
                     "Cancellation was requested and has not completed yet",
                     None,
@@ -1081,7 +1133,7 @@ async fn cancel_detached<B: ClusterBackend>(
                 state = %outcome.state,
                 "Sandbox access"
             );
-            Some(
+            DetachedCancellation::Handled(
                 (
                     StatusCode::OK,
                     Json(execution_response(
@@ -1102,24 +1154,13 @@ async fn cancel_detached<B: ClusterBackend>(
                 reason = failure.reason_code(),
                 "Sandbox access"
             );
-            Some(sandbox_error(
+            DetachedCancellation::Handled(sandbox_error(
                 failure.http_status(),
                 failure.to_string(),
                 None,
             ))
         }
     }
-}
-
-async fn access_or_none(
-    client: &kube::Client,
-    namespace: &str,
-    lease: &SandboxLease,
-    target: &crate::api::sandbox_access::SandboxTarget,
-) -> Option<crate::api::sandbox_access::TargetCluster> {
-    crate::api::sandbox_access::resolve_target_cluster(client, namespace, lease, target)
-        .await
-        .ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1175,6 +1216,79 @@ struct UpgradeContext {
     guard: crate::api::sandbox_streams::StreamGuard,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StreamRegistrationDenied {
+    LimitReached,
+    LeaseEnded,
+    Backend,
+}
+
+/// Claim a replica-local stream slot, then re-read the exact lease.
+///
+/// This helper is shared by interactive, one-shot, and durable execution so
+/// none can register after its deletion/release watch event already passed.
+async fn register_live_stream(
+    client: &kube::Client,
+    namespace: &str,
+    lease: &SandboxLease,
+    target: &crate::api::sandbox_access::SandboxTarget,
+) -> Result<crate::api::sandbox_streams::StreamGuard, StreamRegistrationDenied> {
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    match crate::api::sandbox_streams::register_confirmed(
+        crate::api::sandbox_streams::registry(),
+        &leases,
+        &lease.name_any(),
+        &target.lease_uid,
+    )
+    .await
+    {
+        Ok(crate::api::sandbox_streams::ConfirmedStreamRegistration::Registered(guard)) => {
+            Ok(guard)
+        }
+        Ok(crate::api::sandbox_streams::ConfirmedStreamRegistration::LimitReached) => {
+            Err(StreamRegistrationDenied::LimitReached)
+        }
+        Ok(crate::api::sandbox_streams::ConfirmedStreamRegistration::LeaseEnded) => {
+            Err(StreamRegistrationDenied::LeaseEnded)
+        }
+        Err(_) => Err(StreamRegistrationDenied::Backend),
+    }
+}
+
+fn stream_registration_denied(
+    identity: &AuthIdentity,
+    id: &str,
+    operation: &'static str,
+    denied: StreamRegistrationDenied,
+) -> Response {
+    match denied {
+        StreamRegistrationDenied::LimitReached => access_denied_with(
+            identity,
+            id,
+            operation,
+            "concurrency_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many concurrent operations for this Sandbox lease",
+        ),
+        StreamRegistrationDenied::LeaseEnded => access_denied_with(
+            identity,
+            id,
+            operation,
+            "lease_ended",
+            StatusCode::CONFLICT,
+            "Sandbox lease stopped permitting access",
+        ),
+        StreamRegistrationDenied::Backend => access_denied_with(
+            identity,
+            id,
+            operation,
+            "backend_error",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sandbox lease could not be revalidated",
+        ),
+    }
+}
+
 async fn prepare_upgrade<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
@@ -1204,21 +1318,9 @@ async fn prepare_upgrade<B: ClusterBackend>(
     // over the limit gets a status rather than a socket that closes at once,
     // and the guard travels with the context so the claim cannot be dropped in
     // between.
-    let Some(guard) = crate::api::sandbox_streams::register_bounded(
-        crate::api::sandbox_streams::registry(),
-        &target.lease_uid,
-    )
-    .await
-    else {
-        return Err(access_denied_with(
-            identity,
-            id,
-            operation.as_str(),
-            "concurrency_limit",
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many concurrent operations for this Sandbox lease",
-        ));
-    };
+    let guard = register_live_stream(&state.client, &state.namespace, &lease, &target)
+        .await
+        .map_err(|denied| stream_registration_denied(identity, id, operation.as_str(), denied))?;
 
     // Both placements go through the same resolution. Child composition
     // changes which cluster the Pod is in; it changes nothing about what the
@@ -1494,18 +1596,9 @@ async fn sandbox_exec<B: ClusterBackend>(
     // being torn down. The guard deregisters on every exit path, including a
     // panic — a leaked registration would later report cancelling something
     // that ended long ago.
-    let streams = crate::api::sandbox_streams::registry();
-    let Some(guard) =
-        crate::api::sandbox_streams::register_bounded(streams, &target.lease_uid).await
-    else {
-        return access_denied_with(
-            &identity,
-            &id,
-            "exec",
-            "concurrency_limit",
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many concurrent operations for this Sandbox lease",
-        );
+    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+        Ok(guard) => guard,
+        Err(denied) => return stream_registration_denied(&identity, &id, "exec", denied),
     };
     let revoked = guard.cancelled();
 
@@ -2038,6 +2131,7 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     // lease's UID label. Releasing from this handle directly would free the
     // quota slot before the lease is provably gone.
     let _admission_reservations = match acquire_admission_reservations(
+        &leases,
         &reservations,
         &created,
         &identity,
@@ -2455,6 +2549,11 @@ fn build_sandbox_lease(
             namespace: Some(namespace.into()),
             labels: Some(labels),
             annotations: Some(annotations),
+            // The finalizer belongs on the admission CREATE, before the
+            // provisioning deadline, reservations, or `admitted` marker. A
+            // controller-added finalizer would leave a deletion race in that
+            // interval where the durable lease could disappear first.
+            finalizers: Some(vec![SANDBOX_LEASE_FINALIZER.to_string()]),
             ..Default::default()
         },
         spec: SandboxLeaseSpec {
@@ -3263,6 +3362,8 @@ enum AdmissionReservationError {
     AliasTaken,
     #[error("SandboxLease has no UID to fence its reservations against")]
     MissingLeaseUid,
+    #[error("Sandbox reservation DELETE was accepted but object absence was not confirmed")]
+    DeletionNotConfirmed,
     #[error(transparent)]
     Kubernetes(#[from] kube::Error),
 }
@@ -3284,9 +3385,12 @@ fn alias_reservation_name(principal: &str, alias: &str) -> String {
 
 /// Build a coordination `Lease` used purely as a compare-and-swap token.
 ///
-/// The owner reference is the crash-safety net: if the `SandboxLease` is
-/// deleted by any path we did not anticipate, Kubernetes garbage-collects the
-/// reservations with it, so a slot cannot leak and permanently consume quota.
+/// Reservations deliberately have no owner reference to the `SandboxLease`.
+/// A foreground delete may garbage-collect dependants before Kobe has proved
+/// the tenant footprint absent; letting GC remove these capacity tokens would
+/// admit a replacement while the old Sandbox could still be running. The
+/// pending-admission reaper and verified release path perform exact UID-fenced
+/// cleanup instead.
 fn build_admission_reservation(
     name: String,
     reservation_type: &str,
@@ -3318,16 +3422,6 @@ fn build_admission_reservation(
             namespace: lease.namespace(),
             labels: Some(labels),
             annotations: Some(annotations),
-            owner_references: Some(vec![
-                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                    api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
-                    kind: "SandboxLease".to_string(),
-                    name: lease.name_any(),
-                    uid: lease_uid,
-                    controller: Some(false),
-                    block_owner_deletion: Some(false),
-                },
-            ]),
             ..Default::default()
         },
         // The token carries no lease semantics; existence *is* the claim.
@@ -3346,6 +3440,7 @@ fn build_admission_reservation(
 /// conflict, so failing on it before consuming a quota slot avoids a pointless
 /// acquire-then-release round trip against the shared quota namespace.
 async fn acquire_admission_reservations(
+    leases: &Api<SandboxLease>,
     reservations: &Api<Lease>,
     lease: &SandboxLease,
     identity: &AuthIdentity,
@@ -3372,7 +3467,7 @@ async fn acquire_admission_reservations(
                 // "ours is already gone" — silently stranding the slot.
                 // Refuse rather than acquire something we can never release.
                 let Some(uid) = created.uid() else {
-                    rollback_partial_reservations(reservations, &acquired).await;
+                    rollback_partial_reservations(leases, reservations, lease).await;
                     return Err(AdmissionReservationError::MissingLeaseUid);
                 };
                 acquired.push(AdmissionReservation {
@@ -3400,7 +3495,7 @@ async fn acquire_admission_reservations(
         .await
     {
         Ok(existing) if existing.items.len() as u32 >= max_concurrent_leases => {
-            rollback_partial_reservations(reservations, &acquired).await;
+            rollback_partial_reservations(leases, reservations, lease).await;
             return Err(AdmissionReservationError::QuotaExhausted);
         }
         Ok(_) => {}
@@ -3430,7 +3525,7 @@ async fn acquire_admission_reservations(
                 // Same reasoning as the alias arm: a reservation we cannot
                 // name by UID is one we can never release.
                 let Some(uid) = created.uid() else {
-                    rollback_partial_reservations(reservations, &acquired).await;
+                    rollback_partial_reservations(leases, reservations, lease).await;
                     return Err(AdmissionReservationError::MissingLeaseUid);
                 };
                 acquired.push(AdmissionReservation {
@@ -3443,16 +3538,14 @@ async fn acquire_admission_reservations(
             // This slot belongs to another live lease; try the next one.
             Err(kube::Error::Api(error)) if error.code == 409 => continue,
             Err(error) => {
-                // Never leave a partially-acquired alias behind: it would block
-                // the caller's own retry with a spurious 409.
-                rollback_partial_reservations(reservations, &acquired).await;
+                rollback_partial_reservations(leases, reservations, lease).await;
                 return Err(error.into());
             }
         }
     }
 
     if !slot_taken {
-        rollback_partial_reservations(reservations, &acquired).await;
+        rollback_partial_reservations(leases, reservations, lease).await;
         return Err(AdmissionReservationError::QuotaExhausted);
     }
 
@@ -3461,16 +3554,17 @@ async fn acquire_admission_reservations(
 
 /// Best-effort unwind of reservations taken earlier in a failed acquire.
 ///
-/// Deliberately swallows errors: the caller is already returning a failure, and
-/// the owner reference guarantees Kubernetes reaps anything left behind when
-/// the pending lease is removed. Losing the original error to a cleanup error
-/// would be strictly worse for the caller.
+/// The durable lease is deleted and confirmed absent before any slot is freed.
+/// This is intentionally the same cleanup path the caller will retry: directly
+/// deleting a partially acquired reservation first would create a quota hole
+/// if admission raced with the acquire failure.
 async fn rollback_partial_reservations(
+    leases: &Api<SandboxLease>,
     reservations: &Api<Lease>,
-    acquired: &[AdmissionReservation],
+    lease: &SandboxLease,
 ) {
-    if let Err(error) = release_admission_reservations(reservations, acquired).await {
-        error!(error = %error, "Failed to roll back partial Sandbox admission reservations");
+    if let Err(error) = delete_exact_pending_lease(leases, reservations, lease).await {
+        error!(error = %error, "Failed to remove pending Sandbox lease after partial reservation acquire");
     }
 }
 
@@ -3491,9 +3585,18 @@ async fn release_admission_reservations(
         };
         match reservations.delete(&reservation.name, &params).await {
             Ok(_) => {}
-            // 404: already gone. 409: the name now holds someone else's
-            // reservation. Both mean "ours is not there", which is the goal.
+            // 404: already gone. 409: either the name now holds somebody
+            // else's reservation or the precondition raced; the exact GET
+            // below distinguishes those outcomes.
             Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {}
+            Err(error) => return Err(error.into()),
+        }
+        match reservations.get(&reservation.name).await {
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Ok(current) if current.uid().as_deref() != Some(reservation.uid.as_str()) => {
+                // Our exact object is gone. A replacement must survive.
+            }
+            Ok(_) => return Err(AdmissionReservationError::DeletionNotConfirmed),
             Err(error) => return Err(error.into()),
         }
     }
@@ -3548,10 +3651,9 @@ pub(crate) async fn release_reservations_for_lease(
     if let Err(error) = release_admission_reservations(reservations, &held).await {
         return match error {
             AdmissionReservationError::Kubernetes(error) => Err(error.into()),
-            // The other variants cannot arise from a release.
             other => {
                 error!(error = %other, "Unexpected Sandbox reservation release failure");
-                Ok(())
+                Err(SandboxLeaseMutationError::ReservationDeletionNotConfirmed)
             }
         };
     }
@@ -3560,27 +3662,85 @@ pub(crate) async fn release_reservations_for_lease(
 
 /// Remove a still-unadmitted lease and free whatever it reserved.
 ///
-/// Reservations are released *after* the lease is gone. Doing it in the other
-/// order would briefly leave an admitted-looking lease with no quota slot,
-/// which a concurrent request could then double-book.
+/// Cleanup is deliberately three checkpoints: remove only Kobe's finalizer,
+/// issue an exact UID/resourceVersion-fenced DELETE, and prove a subsequent
+/// GET is 404. Reservations are released only after that absence proof. An
+/// accepted DELETE is not proof when a foreign finalizer can keep the lease
+/// present, and freeing quota in that state could over-admit.
 async fn delete_exact_pending_lease(
     leases: &Api<SandboxLease>,
     reservations: &Api<Lease>,
     lease: &SandboxLease,
 ) -> Result<(), SandboxLeaseMutationError> {
     let expected_uid = lease.uid().ok_or(SandboxLeaseMutationError::MissingUid)?;
-    let current = match leases.get(&lease.name_any()).await {
+    let mut current = match leases.get(&lease.name_any()).await {
         Ok(current) => current,
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            // The lease is already gone; its reservations may not be.
+            // This GET is the required absence proof. The lease is already
+            // gone, but reservations may still be awaiting explicit cleanup.
             return release_reservations_for_lease(reservations, lease, &expected_uid).await;
         }
         Err(error) => return Err(error.into()),
     };
-    validate_lease_shape(lease, &current, SANDBOX_ADMISSION_PENDING)?;
     if current.uid().as_deref() != Some(expected_uid.as_str()) {
         return Err(SandboxLeaseMutationError::UidChanged);
     }
+
+    // A previous attempt may have committed finalizer removal and lost its
+    // response. Accept exactly that one shape change so a retry can finish the
+    // DELETE; every foreign finalizer must otherwise be preserved byte-for-byte.
+    let expected_without_finalizer = without_sandbox_cleanup_finalizer(lease);
+    if validate_lease_shape_unadmitted(lease, &current).is_err() {
+        validate_lease_shape_unadmitted(&expected_without_finalizer, &current)?;
+    }
+
+    if normalized_finalizers(&current)
+        .iter()
+        .any(|finalizer| finalizer == SANDBOX_LEASE_FINALIZER)
+    {
+        let resource_version = current
+            .resource_version()
+            .ok_or(SandboxLeaseMutationError::MissingResourceVersion)?;
+        let expected_after_patch = without_sandbox_cleanup_finalizer(&current);
+        let patch = crate::controllers::lease::json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": expected_uid.clone() },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            {
+                "op": "add",
+                "path": "/metadata/finalizers",
+                "value": normalized_finalizers(&expected_after_patch)
+            }
+        ]));
+        current = match leases
+            .patch(
+                &current.name_any(),
+                &PatchParams::default(),
+                &Patch::Json::<()>(patch),
+            )
+            .await
+        {
+            Ok(patched) => {
+                validate_lease_shape_unadmitted(&expected_after_patch, &patched)?;
+                patched
+            }
+            Err(patch_error) => {
+                // JSON Patch may have committed before its response was lost.
+                // Only the exact post-removal object lets cleanup continue.
+                match leases.get(&current.name_any()).await {
+                    Ok(reread) => {
+                        validate_lease_shape_unadmitted(&expected_after_patch, &reread)?;
+                        reread
+                    }
+                    Err(kube::Error::Api(error)) if error.code == 404 => {
+                        return release_reservations_for_lease(reservations, lease, &expected_uid)
+                            .await;
+                    }
+                    Err(_) => return Err(patch_error.into()),
+                }
+            }
+        };
+    }
+
     let resource_version = current
         .resource_version()
         .ok_or(SandboxLeaseMutationError::MissingResourceVersion)?;
@@ -3591,8 +3751,34 @@ async fn delete_exact_pending_lease(
         }),
         ..Default::default()
     };
-    leases.delete(&current.name_any(), &params).await?;
-    release_reservations_for_lease(reservations, lease, &expected_uid).await
+    let delete_result = leases.delete(&current.name_any(), &params).await;
+
+    // DELETE success only means deletion was accepted. A foreign finalizer can
+    // keep this exact lease present, so an explicit 404 is the release fence.
+    match leases.get(&current.name_any()).await {
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            release_reservations_for_lease(reservations, lease, &expected_uid).await
+        }
+        Ok(remaining) if remaining.uid().as_deref() != Some(expected_uid.as_str()) => {
+            Err(SandboxLeaseMutationError::UidChanged)
+        }
+        Ok(_) => match delete_result {
+            Err(error) => Err(error.into()),
+            Ok(_) => Err(SandboxLeaseMutationError::DeletionNotConfirmed),
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn without_sandbox_cleanup_finalizer(lease: &SandboxLease) -> SandboxLease {
+    let mut lease = lease.clone();
+    let remaining: Vec<String> = normalized_finalizers(&lease)
+        .iter()
+        .filter(|finalizer| finalizer.as_str() != SANDBOX_LEASE_FINALIZER)
+        .cloned()
+        .collect();
+    lease.metadata.finalizers = (!remaining.is_empty()).then_some(remaining);
+    lease
 }
 
 /// Validate everything `validate_lease_shape` does, except that the admission
@@ -3626,6 +3812,7 @@ fn validate_lease_shape(
     if actual.name_any() != expected.name_any()
         || actual.namespace() != expected.namespace()
         || actual.spec != expected.spec
+        || normalized_finalizers(actual) != normalized_finalizers(expected)
     {
         return Err(SandboxLeaseMutationError::LeaseShapeChanged);
     }
@@ -3663,6 +3850,10 @@ fn validate_lease_shape(
     Ok(())
 }
 
+fn normalized_finalizers(lease: &SandboxLease) -> &[String] {
+    lease.metadata.finalizers.as_deref().unwrap_or_default()
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SandboxLeaseMutationError {
     #[error("SandboxLease has no UID")]
@@ -3681,6 +3872,10 @@ pub(crate) enum SandboxLeaseMutationError {
     UnexpectedAdmissionState,
     #[error("SandboxLease admission patch did not commit; the pending object was removed")]
     AdmissionNotCommitted,
+    #[error("SandboxLease DELETE was accepted but object absence was not confirmed")]
+    DeletionNotConfirmed,
+    #[error("Sandbox reservation DELETE was accepted but object absence was not confirmed")]
+    ReservationDeletionNotConfirmed,
     #[error(transparent)]
     Lifecycle(#[from] crate::sandbox::SandboxLifecycleError),
     #[error(transparent)]
@@ -4184,9 +4379,23 @@ mod tests {
             .and(path_regex(
                 r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
             ))
-            .respond_with(move |_: &wiremock::Request| {
+            .respond_with(move |request: &wiremock::Request| {
                 let mut guard = patch_state.lock().unwrap();
                 let object = guard.as_mut().expect("created lease");
+                let patch: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if let Some(operations) = patch.as_array() {
+                    let finalizers = operations
+                        .iter()
+                        .find_map(|operation| {
+                            (operation["op"] == "add"
+                                && operation["path"] == "/metadata/finalizers")
+                                .then(|| operation["value"].clone())
+                        })
+                        .expect("cleanup finalizer operation");
+                    object["metadata"]["finalizers"] = finalizers;
+                    object["metadata"]["resourceVersion"] = serde_json::json!("3");
+                    return ResponseTemplate::new(200).set_body_json(object.clone());
+                }
                 object["metadata"]["annotations"][SANDBOX_ADMISSION_ANNOTATION] =
                     serde_json::json!(SANDBOX_ADMISSION_ADMITTED);
                 object["metadata"]["resourceVersion"] = serde_json::json!("3");
@@ -4257,6 +4466,11 @@ mod tests {
         assert_eq!(lease.spec.requester.identity, identity.identity);
         assert_eq!(lease.spec.alias.as_deref(), Some("review"));
         assert!(lease.status.is_none());
+        assert_eq!(
+            normalized_finalizers(&lease),
+            [SANDBOX_LEASE_FINALIZER],
+            "cleanup fencing must exist on the initial object, not arrive later from a controller"
+        );
         let json = serde_json::to_string(&lease).unwrap();
         for forbidden in ["kubeconfig", "bearer", "token", "credentials", "podSpec"] {
             assert!(
@@ -4265,6 +4479,33 @@ mod tests {
                     .contains(&forbidden.to_ascii_lowercase())
             );
         }
+    }
+
+    #[test]
+    fn admission_rejects_any_cleanup_finalizer_drift() {
+        let expected = build_sandbox_lease(
+            "sandbox-abc",
+            "kobe",
+            pool_reference(),
+            "30m",
+            None,
+            &identity(),
+        );
+        let mut actual = expected.clone();
+        actual.metadata.uid = Some("lease-uid".into());
+        actual.metadata.resource_version = Some("1".into());
+        assert!(validate_lease_shape(&expected, &actual, SANDBOX_ADMISSION_PENDING).is_ok());
+
+        actual
+            .metadata
+            .finalizers
+            .as_mut()
+            .unwrap()
+            .push("foreign.example/cleanup".into());
+        assert!(matches!(
+            validate_lease_shape(&expected, &actual, SANDBOX_ADMISSION_PENDING),
+            Err(SandboxLeaseMutationError::LeaseShapeChanged)
+        ));
     }
 
     #[test]
@@ -4614,6 +4855,10 @@ mod tests {
         assert_eq!(object["spec"]["requester"]["provider"], "developer-oidc");
         assert_eq!(object["spec"]["poolRef"]["uid"], "pool-uid");
         assert_eq!(object["spec"]["ttl"], "2h");
+        assert_eq!(
+            object["metadata"]["finalizers"],
+            serde_json::json!([SANDBOX_LEASE_FINALIZER])
+        );
         assert!(object["spec"].get("namespace").is_none());
         assert!(object["spec"].get("runtimeClassName").is_none());
 
@@ -4638,7 +4883,7 @@ mod tests {
     #[tokio::test]
     async fn create_treats_applied_but_lost_admission_response_as_success() {
         let server = MockServer::start().await;
-        mount_create_api(&server, true, true).await;
+        let state = mount_create_api(&server, true, true).await;
 
         let response = create_sandbox_lease::<crate::testutil::MockBackend>(
             State(test_state(&server)),
@@ -4651,6 +4896,11 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state.lock().unwrap().as_ref().unwrap()["metadata"]["finalizers"],
+            serde_json::json!([SANDBOX_LEASE_FINALIZER]),
+            "a lost admission response must not weaken the cleanup fence"
+        );
         assert!(
             server
                 .received_requests()
@@ -4918,20 +5168,34 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let abandoned_state = Arc::new(Mutex::new(Some(abandoned.clone())));
+        let get_abandoned_state = Arc::clone(&abandoned_state);
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-stranded",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(abandoned))
+            .respond_with(move |_: &wiremock::Request| {
+                match get_abandoned_state.lock().unwrap().clone() {
+                    Some(object) => ResponseTemplate::new(200).set_body_json(object),
+                    None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "reason": "NotFound", "code": 404
+                    })),
+                }
+            })
             .mount(&server)
             .await;
+        let delete_abandoned_state = Arc::clone(&abandoned_state);
         Mock::given(method("DELETE"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-stranded",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "v1", "kind": "Status", "status": "Success"
-            })))
+            .respond_with(move |_: &wiremock::Request| {
+                *delete_abandoned_state.lock().unwrap() = None;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Success"
+                }))
+            })
             .mount(&server)
             .await;
         mount_create_lease_only(&server).await;
@@ -5449,6 +5713,51 @@ mod tests {
         );
     }
 
+    /// An accepted reservation DELETE is not absence proof: a foreign
+    /// finalizer may keep the exact UID alive and still consuming its slot.
+    #[tokio::test]
+    async fn reservation_delete_acceptance_never_masquerades_as_absence() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let name = quota_reservation_name(&principal_hash(&identity()), 0);
+        let path_value = format!("/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{name}");
+        let still_present = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": name.clone(),
+                "namespace": "test-ns",
+                "uid": "reservation-uid",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2026-08-20T00:00:00Z",
+                "finalizers": ["foreign.example/hold"]
+            }
+        });
+        Mock::given(method("DELETE"))
+            .and(path(path_value.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(still_present.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(path_value))
+            .respond_with(ResponseTemplate::new(200).set_body_json(still_present))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let reservations: Api<Lease> =
+            Api::namespaced(crate::testutil::mock_k8s_client(&server), "test-ns");
+        let held = AdmissionReservation {
+            name,
+            uid: "reservation-uid".into(),
+        };
+        assert!(matches!(
+            release_admission_reservations(&reservations, &[held]).await,
+            Err(AdmissionReservationError::DeletionNotConfirmed)
+        ));
+    }
+
     /// The durable reaper must reclaim a stranded lease belonging to a
     /// principal who never comes back.
     ///
@@ -5487,20 +5796,34 @@ mod tests {
             });
             object
         };
+        let abandoned_state = Arc::new(Mutex::new(Some(abandoned.clone())));
+        let get_abandoned_state = Arc::clone(&abandoned_state);
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-orphan",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(abandoned.clone()))
+            .respond_with(move |_: &wiremock::Request| {
+                match get_abandoned_state.lock().unwrap().clone() {
+                    Some(object) => ResponseTemplate::new(200).set_body_json(object),
+                    None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "reason": "NotFound", "code": 404
+                    })),
+                }
+            })
             .mount(&server)
             .await;
+        let delete_abandoned_state = Arc::clone(&abandoned_state);
         Mock::given(method("DELETE"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-orphan",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "v1", "kind": "Status", "status": "Success"
-            })))
+            .respond_with(move |_: &wiremock::Request| {
+                *delete_abandoned_state.lock().unwrap() = None;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Success"
+                }))
+            })
             .mount(&server)
             .await;
 
@@ -5528,6 +5851,322 @@ mod tests {
             remaining.is_empty(),
             "the stranded principal's quota must be released even though they never retried:              {remaining:?}"
         );
+    }
+
+    /// Both mutating calls can commit and lose their responses. Cleanup must
+    /// recover from the exact re-read, but quota still cannot move until the
+    /// post-DELETE GET proves 404.
+    #[tokio::test]
+    async fn pending_cleanup_recovers_lost_responses_and_releases_only_after_404() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let principal = principal_hash(&identity());
+        let lease_uid = "sandbox-fenced-uid";
+        let held = mount_reservation_api_owned(
+            &server,
+            &[(quota_reservation_name(&principal, 0), lease_uid.into())],
+        )
+        .await;
+
+        let mut object = lease_json("sandbox-fenced", "alice@example.com", "Pending");
+        object["metadata"]["uid"] = serde_json::json!(lease_uid);
+        object["metadata"]["annotations"] = serde_json::json!({
+            SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_PENDING
+        });
+        object["metadata"]["finalizers"] = serde_json::json!([SANDBOX_LEASE_FINALIZER]);
+        let state = Arc::new(Mutex::new(Some(object.clone())));
+
+        let get_state = Arc::clone(&state);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-fenced",
+            ))
+            .respond_with(
+                move |_: &wiremock::Request| match get_state.lock().unwrap().clone() {
+                    Some(object) => ResponseTemplate::new(200).set_body_json(object),
+                    None => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "reason": "NotFound", "code": 404
+                    })),
+                },
+            )
+            .mount(&server)
+            .await;
+
+        let patch_state = Arc::clone(&state);
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-fenced",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let finalizers = operations
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|operation| operation["path"] == "/metadata/finalizers")
+                    .unwrap()["value"]
+                    .clone();
+                let mut guard = patch_state.lock().unwrap();
+                let object = guard.as_mut().unwrap();
+                object["metadata"]["finalizers"] = finalizers;
+                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                    "reason": "InternalError", "code": 500
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let delete_state = Arc::clone(&state);
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-fenced",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                *delete_state.lock().unwrap() = None;
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                    "reason": "InternalError", "code": 500
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, "test-ns");
+        let lease: SandboxLease = serde_json::from_value(object).unwrap();
+        delete_exact_pending_lease(&leases, &reservations, &lease)
+            .await
+            .expect("exact 404 proof makes both lost responses recoverable");
+        assert!(held.lock().unwrap().is_empty());
+
+        let requests = server.received_requests().await.unwrap();
+        let finalizer_patch = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH"
+                    && request
+                        .url
+                        .path()
+                        .ends_with("/sandboxleases/sandbox-fenced")
+            })
+            .unwrap();
+        let operations: serde_json::Value = serde_json::from_slice(&finalizer_patch.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/uid"
+                && operation["value"] == lease_uid
+        }));
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "1"
+        }));
+        let sandbox_delete = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "DELETE"
+                    && request
+                        .url
+                        .path()
+                        .ends_with("/sandboxleases/sandbox-fenced")
+            })
+            .unwrap();
+        let delete_options: serde_json::Value =
+            serde_json::from_slice(&requests[sandbox_delete].body).unwrap();
+        assert_eq!(delete_options["preconditions"]["uid"], lease_uid);
+        assert_eq!(delete_options["preconditions"]["resourceVersion"], "2");
+        let absence_get = requests
+            .iter()
+            .enumerate()
+            .skip(sandbox_delete + 1)
+            .find(|(_, request)| {
+                request.method.as_str() == "GET"
+                    && request
+                        .url
+                        .path()
+                        .ends_with("/sandboxleases/sandbox-fenced")
+            })
+            .map(|(index, _)| index)
+            .unwrap();
+        let reservation_delete = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "DELETE"
+                    && request.url.path().contains("coordination.k8s.io")
+            })
+            .unwrap();
+        assert!(sandbox_delete < absence_get && absence_get < reservation_delete);
+    }
+
+    /// Kobe may remove only its own finalizer. If a foreign controller still
+    /// holds the object, DELETE acceptance is not absence and quota stays held.
+    #[tokio::test]
+    async fn pending_cleanup_preserves_foreign_finalizers_and_quota() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let principal = principal_hash(&identity());
+        let lease_uid = "sandbox-foreign-uid";
+        let held = mount_reservation_api_owned(
+            &server,
+            &[(quota_reservation_name(&principal, 0), lease_uid.into())],
+        )
+        .await;
+
+        let mut object = lease_json("sandbox-foreign", "alice@example.com", "Pending");
+        object["metadata"]["uid"] = serde_json::json!(lease_uid);
+        object["metadata"]["annotations"] = serde_json::json!({
+            SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_PENDING
+        });
+        object["metadata"]["finalizers"] =
+            serde_json::json!(["foreign.example/cleanup", SANDBOX_LEASE_FINALIZER]);
+        let state = Arc::new(Mutex::new(object.clone()));
+
+        let get_state = Arc::clone(&state);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-foreign",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(get_state.lock().unwrap().clone())
+            })
+            .mount(&server)
+            .await;
+
+        let patch_state = Arc::clone(&state);
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-foreign",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let finalizers = operations
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|operation| operation["path"] == "/metadata/finalizers")
+                    .unwrap()["value"]
+                    .clone();
+                let mut object = patch_state.lock().unwrap();
+                object["metadata"]["finalizers"] = finalizers;
+                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(200).set_body_json(object.clone())
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-foreign",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Success", "code": 200
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, "test-ns");
+        let lease: SandboxLease = serde_json::from_value(object).unwrap();
+        assert!(matches!(
+            delete_exact_pending_lease(&leases, &reservations, &lease).await,
+            Err(SandboxLeaseMutationError::DeletionNotConfirmed)
+        ));
+        assert_eq!(
+            state.lock().unwrap()["metadata"]["finalizers"],
+            serde_json::json!(["foreign.example/cleanup"])
+        );
+        assert_eq!(held.lock().unwrap().len(), 1);
+    }
+
+    /// A same-named replacement is not the 404 proof for the deleted UID. Its
+    /// presence must stop explicit reservation release even though selectors
+    /// and UID preconditions would otherwise make that release look harmless.
+    #[tokio::test]
+    async fn pending_cleanup_does_not_release_on_name_reuse() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let principal = principal_hash(&identity());
+        let lease_uid = "sandbox-old-uid";
+        let held = mount_reservation_api_owned(
+            &server,
+            &[(quota_reservation_name(&principal, 0), lease_uid.into())],
+        )
+        .await;
+
+        let mut object = lease_json("sandbox-reused", "alice@example.com", "Pending");
+        object["metadata"]["uid"] = serde_json::json!(lease_uid);
+        object["metadata"]["annotations"] = serde_json::json!({
+            SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_PENDING
+        });
+        object["metadata"]["finalizers"] = serde_json::json!([SANDBOX_LEASE_FINALIZER]);
+        let state = Arc::new(Mutex::new(object.clone()));
+
+        let get_state = Arc::clone(&state);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-reused",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(get_state.lock().unwrap().clone())
+            })
+            .mount(&server)
+            .await;
+
+        let patch_state = Arc::clone(&state);
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-reused",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let finalizers = operations
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|operation| operation["path"] == "/metadata/finalizers")
+                    .unwrap()["value"]
+                    .clone();
+                let mut object = patch_state.lock().unwrap();
+                object["metadata"]["finalizers"] = finalizers;
+                object["metadata"]["resourceVersion"] = serde_json::json!("2");
+                ResponseTemplate::new(200).set_body_json(object.clone())
+            })
+            .mount(&server)
+            .await;
+
+        let delete_state = Arc::clone(&state);
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-reused",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut replacement = delete_state.lock().unwrap().clone();
+                replacement["metadata"]["uid"] = serde_json::json!("sandbox-replacement-uid");
+                replacement["metadata"]["resourceVersion"] = serde_json::json!("1");
+                replacement["metadata"]["finalizers"] =
+                    serde_json::json!([SANDBOX_LEASE_FINALIZER]);
+                *delete_state.lock().unwrap() = replacement;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Success", "code": 200
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, "test-ns");
+        let lease: SandboxLease = serde_json::from_value(object).unwrap();
+        assert!(matches!(
+            delete_exact_pending_lease(&leases, &reservations, &lease).await,
+            Err(SandboxLeaseMutationError::UidChanged)
+        ));
+        assert_eq!(held.lock().unwrap().len(), 1);
     }
 
     /// An admission that lands LATE must not be reported as failure.
@@ -5813,6 +6452,32 @@ mod tests {
         assert_ne!(
             quota_reservation_name(&alice, 0),
             quota_reservation_name(&bob, 0)
+        );
+    }
+
+    /// Kubernetes GC must not release capacity ahead of Kobe's teardown proof
+    /// when somebody foreground-deletes the owning SandboxLease.
+    #[test]
+    fn admission_reservations_are_not_garbage_collected_with_the_sandbox_lease() {
+        let lease: SandboxLease =
+            serde_json::from_value(lease_json("sandbox-owned", "alice@example.com", "Pending"))
+                .unwrap();
+        let principal = principal_hash(&identity());
+        let reservation = build_admission_reservation(
+            quota_reservation_name(&principal, 0),
+            SANDBOX_RESERVATION_QUOTA,
+            &lease,
+            &principal,
+        )
+        .unwrap();
+
+        assert!(reservation.metadata.owner_references.is_none());
+        assert_eq!(
+            reservation
+                .labels()
+                .get(SANDBOX_RESERVATION_LEASE_UID_LABEL)
+                .map(String::as_str),
+            Some("sandbox-owned-uid")
         );
     }
 
@@ -6106,6 +6771,44 @@ mod tests {
                 .iter()
                 .all(|request| !request.url.path().ends_with("/exec")),
             "nothing may be executed in the Pod to answer a question about a record"
+        );
+    }
+
+    /// A detached record may fall back to record-only cancellation only when
+    /// it was actually wait-mode. Missing runner provenance is uncertainty
+    /// about a live process, so it must remain Running and retryable.
+    #[tokio::test]
+    async fn detached_cancel_without_runner_never_records_a_fake_cancellation() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        mount_ready_sandbox(&server, pool_json()).await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/sbxe-.*$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(execution_json(true)))
+            .mount(&server)
+            .await;
+
+        let response = cancel_sandbox_execution::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Path(("sandbox-own".into(), "sbxe-1".into())),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .all(|request| {
+                    !(request.method.as_str() == "PATCH"
+                        && request.url.path().contains("/sandboxexecutions/"))
+                }),
+            "an unconfirmed detached process must remain Running"
         );
     }
 

@@ -211,6 +211,14 @@ pub fn target_from_provenance(
     pool: &SandboxPool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<SandboxTarget, SandboxAccessDenied> {
+    // A direct Kubernetes DELETE sets deletionTimestamp before the lifecycle
+    // controller can checkpoint Releasing. Deny immediately: otherwise a
+    // caller can open a fresh exec/attach stream in that gap and race cleanup.
+    if lease.metadata.deletion_timestamp.is_some() {
+        return Err(SandboxAccessDenied::NotReady {
+            phase: "Deleting".into(),
+        });
+    }
     let status = lease
         .status
         .as_ref()
@@ -887,6 +895,27 @@ mod tests {
         assert_eq!(
             target_from_provenance(&expired, &pool(), now()).unwrap_err(),
             SandboxAccessDenied::Expired
+        );
+    }
+
+    /// Kubernetes deletion intent revokes before the controller phase catches
+    /// up, so no new stream can open while finalizer cleanup is starting.
+    #[test]
+    fn a_deleting_ready_lease_denies_access_immediately() {
+        let mut lease = ready_lease();
+        lease.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_millisecond(
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .unwrap(),
+            ));
+
+        assert_eq!(
+            target_from_provenance(&lease, &pool(), now()).unwrap_err(),
+            SandboxAccessDenied::NotReady {
+                phase: "Deleting".into()
+            }
         );
     }
 
