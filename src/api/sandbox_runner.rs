@@ -117,6 +117,14 @@ pub struct RunnerOutcome {
     pub reason: String,
 }
 
+/// Bounded output captured by the runner for one completed wait-mode command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub truncated: bool,
+}
+
 /// Translate a report into the record a caller reads.
 ///
 /// This is the function that decides what a caller will do next, so every arm
@@ -369,6 +377,90 @@ pub async fn read_output(
         Reply::Logs { chunk } => Ok(*chunk),
         _ => Err(RunnerCallFailure::Unreadable),
     }
+}
+
+/// Read both retained streams to the API response cap.
+///
+/// Streams are fetched concurrently and by monotonically advancing offsets.
+/// A broken runner that repeats an offset is refused rather than allowed to
+/// spin forever, and output beyond Kobe's response cap is reported as
+/// truncated even if the runner retained more on disk.
+pub async fn read_wait_output(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    runner_path: &str,
+    id: &str,
+) -> Result<RunnerOutput, RunnerCallFailure> {
+    let stdout = read_stream_to_cap(
+        client,
+        target,
+        container,
+        runner_path,
+        id,
+        LogStream::Stdout,
+    );
+    let stderr = read_stream_to_cap(
+        client,
+        target,
+        container,
+        runner_path,
+        id,
+        LogStream::Stderr,
+    );
+    let (stdout, stderr) = tokio::join!(stdout, stderr);
+    let (stdout, stdout_truncated) = stdout?;
+    let (stderr, stderr_truncated) = stderr?;
+    Ok(RunnerOutput {
+        stdout,
+        stderr,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+async fn read_stream_to_cap(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    runner_path: &str,
+    id: &str,
+    stream: LogStream,
+) -> Result<(Vec<u8>, bool), RunnerCallFailure> {
+    use base64::Engine;
+
+    let mut offset = 0;
+    let mut output = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = read_output(client, target, container, runner_path, id, stream, offset).await?;
+        if chunk.offset != offset || chunk.next_offset < chunk.offset {
+            return Err(RunnerCallFailure::Unreadable);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&chunk.data_base64)
+            .map_err(|_| RunnerCallFailure::Unreadable)?;
+        if chunk.next_offset != chunk.offset.saturating_add(bytes.len() as u64) {
+            return Err(RunnerCallFailure::Unreadable);
+        }
+
+        let remaining =
+            crate::api::sandbox_access::MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len());
+        let kept = bytes.len().min(remaining);
+        output.extend_from_slice(&bytes[..kept]);
+        truncated |= chunk.truncated || kept < bytes.len();
+        if output.len() == crate::api::sandbox_access::MAX_EXEC_OUTPUT_BYTES {
+            truncated |= chunk.more;
+            break;
+        }
+        if !chunk.more {
+            break;
+        }
+        if chunk.next_offset == offset {
+            return Err(RunnerCallFailure::Unreadable);
+        }
+        offset = chunk.next_offset;
+    }
+    Ok((output, truncated))
 }
 
 /// One exec against the runner.

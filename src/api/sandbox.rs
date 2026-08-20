@@ -101,7 +101,7 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateExecutionRequest {
     command: Vec<String>,
     #[serde(default)]
@@ -119,6 +119,7 @@ struct CreateExecutionRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecutionResponse {
     id: String,
     state: String,
@@ -226,24 +227,30 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         detached: request.detach,
     };
 
-    // Detached execution needs a supervisor inside the container that outlives
-    // the connection. Refused explicitly where there is none, rather than
-    // approximated: a "detached" execution that actually dies with its
-    // connection is worse than none, because a caller builds on the guarantee
-    // it appears to offer.
+    // The runner is the execution contract, not just a detached-mode helper.
+    // Raw Kubernetes exec cannot apply `cwd` without a shell, cannot supervise
+    // a process group, and does not always expose an exact exit code. Falling
+    // back would silently weaken the same API depending on pool image.
     //
     // Checked BEFORE the reservation, so a pool that cannot serve the request
     // does not leave the caller's idempotency key spent on an execution that
     // never existed.
-    if requested.detached && target.runner_path.is_none() {
+    if target.runner_path.is_none() {
         return sandbox_error(
             StatusCode::NOT_IMPLEMENTED,
             "This Sandbox pool does not provide the Kobe runner",
-            Some(
-                "Detached execution requires a pool whose template sets runnerPath; use wait mode."
-                    .into(),
-            ),
+            Some("Durable execution requires a pool whose template sets runnerPath.".into()),
         );
+    }
+    if let Err(error) = executions::validate_request(&requested) {
+        return execution_denied(&identity, &id, &error);
+    }
+    let requested_timeout = crate::pool::parse_duration(&requested.timeout)
+        .and_then(|timeout| timeout.to_std().ok())
+        .expect("validated execution timeout must parse");
+    if let Err(error) = executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now())
+    {
+        return execution_denied(&identity, &id, &error);
     }
 
     let reservation = match executions::reserve_execution(
@@ -317,10 +324,6 @@ async fn create_sandbox_execution<B: ClusterBackend>(
             }
         };
 
-    let timeout = crate::pool::parse_duration(&requested.timeout)
-        .and_then(|timeout| timeout.to_std().ok())
-        .unwrap_or(SANDBOX_EXEC_TIMEOUT);
-
     // Belt and braces: a reservation that is not fresh must never spawn, even
     // though `Reserved` is fresh by construction. The cost of the check is
     // nothing; the cost of the case it guards is a duplicate `terraform apply`.
@@ -328,18 +331,6 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         return sandbox_error(
             StatusCode::CONFLICT,
             "This execution has already been started",
-            None,
-        );
-    }
-
-    // Marked Running before the spawn. From here on nothing may spawn this key
-    // again, whatever happens next — including this process disappearing.
-    let running =
-        executions::mark_running(&state.client, &state.namespace, &reserved, timeout).await;
-    if running.is_err() {
-        return sandbox_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Could not record the execution before starting it",
             None,
         );
     }
@@ -353,9 +344,8 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
         Ok(guard) => guard,
         Err(denied) => {
-            // The reservation already exists and is Running; leaving it that
-            // way would strand it until the verdict deadline. Nothing spawned,
-            // so Cancelled is exact even when revalidation itself failed.
+            // Nothing spawned, so cancellation is exact even when the final
+            // lease revalidation itself failed.
             let reason = match denied {
                 StreamRegistrationDenied::LimitReached => "concurrency_limit",
                 StreamRegistrationDenied::LeaseEnded => "lease_ended",
@@ -375,101 +365,63 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     };
     let revoked = guard.cancelled();
 
-    if requested.detached {
-        return start_detached(
-            &state, &identity, &id, &target, &container, &requested, &reserved, &scoped, timeout,
-            revoked,
-        )
-        .await;
-    }
-
-    let result = tokio::select! {
-        result = access::exec_in_sandbox(&scoped, &target, &container, &requested.argv, timeout) => result,
-        _ = revoked.cancelled() => {
+    // Recompute after credential creation and stream registration. Authority
+    // can expire while those network calls run; using the earlier remainder
+    // would grant the runner time the lease no longer owns.
+    let timeout = match executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now())
+    {
+        Ok(timeout) => timeout,
+        Err(error) => {
             executions::record_terminal(
                 &state.client,
                 &state.namespace,
                 &reserved,
-                ExecutionState::Cancelled,
+                ExecutionState::TimedOut,
                 None,
-                "lease_revoked",
+                "lease_ttl_exhausted",
             )
             .await;
-            return sandbox_error(
-                StatusCode::GONE,
-                "Sandbox lease stopped permitting access while the command was running",
-                None,
-            );
+            return execution_denied(&identity, &id, &error);
         }
     };
 
-    match result {
-        Ok(output) => {
-            // `success` is what the protocol actually reports; a synthesised
-            // exit code would be indistinguishable from an observed one.
-            let exit_code = if output.success { 0 } else { 1 };
-            let final_state = crate::crd::state_for_exit_code(exit_code);
-            executions::record_terminal(
-                &state.client,
-                &state.namespace,
-                &reserved,
-                final_state,
-                Some(exit_code),
-                "completed",
-            )
-            .await;
-            let refreshed = executions::refresh(&state.client, &state.namespace, &reserved).await;
-            info!(
-                principal = %identity.identity,
-                lease = %id,
-                execution = %reserved.name_any(),
-                operation = "execution",
-                outcome = "allowed",
-                state = %final_state,
-                "Sandbox access"
-            );
-            (
-                StatusCode::OK,
-                Json(execution_response(
-                    refreshed.as_ref().unwrap_or(&reserved),
-                    Some(output),
-                )),
-            )
-                .into_response()
-        }
-        Err(denied) => {
-            // The command may well have run; Kobe simply cannot say. `Unknown`
-            // rather than `Failed`, because `Failed` invites a retry of
-            // something that may already have had effects.
-            executions::record_terminal(
-                &state.client,
-                &state.namespace,
-                &reserved,
-                ExecutionState::Unknown,
-                None,
-                denied.reason_code(),
-            )
-            .await;
-            access_denied(&identity, &id, "execution", denied)
-        }
+    // Marked Running before the runner sees the request. From here on nothing
+    // may spawn this key again, including after this process disappears.
+    if executions::mark_running(&state.client, &state.namespace, &reserved, timeout)
+        .await
+        .is_err()
+    {
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Could not record the execution before starting it",
+            None,
+        );
     }
+
+    run_with_runner(
+        &state, &identity, &id, &target, &container, &requested, &reserved, &scoped, timeout,
+        revoked,
+    )
+    .await
 }
 
 /// Default bound when a caller does not choose one.
 const DEFAULT_EXECUTION_TIMEOUT: &str = "60s";
 
-/// Hand one reserved execution to the runner and return without waiting.
+/// Hand one reserved execution to the runner, then either return its durable
+/// handle or wait for the same supervised process.
 ///
-/// The reservation is already `Running` when this is called, so every path out
-/// of here has to leave the record saying something a caller can act on. The
-/// two that matter:
+/// Wait mode deliberately uses the same runner as detached mode. A raw exec
+/// cannot implement `cwd` without a shell, cannot guarantee process-group
+/// cancellation, and does not always expose an exact exit code. One supervisor
+/// contract keeps those semantics identical; only the response timing differs.
 ///
 /// * The runner answered — the execution is supervised, and the caller polls.
 /// * Anything else — `Unknown`. The command may be running perfectly well
 ///   inside the container; Kobe simply cannot see it, and `Failed` would tell
 ///   the caller their retry is safe when it is not.
 #[allow(clippy::too_many_arguments)]
-async fn start_detached<B: ClusterBackend>(
+async fn run_with_runner<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
     id: &str,
@@ -561,11 +513,121 @@ async fn start_detached<B: ClusterBackend>(
         }
     };
 
+    if requested.detached {
+        return runner_started_response(state, identity, id, reserved, &report).await;
+    }
+
+    let report = match wait_for_runner(
+        scoped,
+        target,
+        container,
+        &runner_path,
+        &reserved.name_any(),
+        report,
+        revoked,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(WaitRunnerFailure::Poll(failure)) => {
+            // Start was acknowledged, so the command may still be running.
+            // Keep `Running`: a later GET can reconcile it, whereas settling
+            // Unknown here would discard a recoverable outcome.
+            return sandbox_error(failure.http_status(), failure.to_string(), None);
+        }
+        Err(WaitRunnerFailure::Revoked(Ok(report))) => {
+            let outcome = runner::outcome_from_report(&report);
+            if outcome.state.is_terminal() {
+                executions::record_terminal(
+                    &state.client,
+                    &state.namespace,
+                    reserved,
+                    outcome.state,
+                    outcome.exit_code,
+                    &outcome.reason,
+                )
+                .await;
+            }
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access; runner cancellation was requested",
+                None,
+            );
+        }
+        Err(WaitRunnerFailure::Revoked(Err(failure))) => {
+            // No terminal claim: teardown remains responsible for proving the
+            // process group is gone.
+            return sandbox_error(
+                failure.http_status(),
+                "Sandbox lease ended and runner termination could not be confirmed",
+                None,
+            );
+        }
+    };
+
     let outcome = runner::outcome_from_report(&report);
-    // A start that has already settled is unusual but not impossible — the
-    // runner reports `Unknown` for a supervisor it could not launch — and the
-    // record has to say so rather than leave the caller polling something that
-    // ended before they saw it.
+    executions::record_terminal(
+        &state.client,
+        &state.namespace,
+        reserved,
+        outcome.state,
+        outcome.exit_code,
+        &outcome.reason,
+    )
+    .await;
+
+    let output = match runner::read_wait_output(
+        scoped,
+        target,
+        container,
+        &runner_path,
+        &reserved.name_any(),
+    )
+    .await
+    {
+        Ok(output) => crate::api::sandbox_access::SandboxExecResponse {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            success: outcome.state == ExecutionState::Succeeded,
+            exit_code: outcome.exit_code,
+            truncated: output.truncated,
+        },
+        Err(failure) => {
+            // The outcome is durable and exact; output retrieval is a separate
+            // transport failure and must not rewrite it to Unknown.
+            return sandbox_error(failure.http_status(), failure.to_string(), None);
+        }
+    };
+    let refreshed = executions::refresh(&state.client, &state.namespace, reserved).await;
+    let record = refreshed.as_ref().unwrap_or(reserved);
+    info!(
+        principal = %identity.identity,
+        lease = %id,
+        execution = %reserved.name_any(),
+        operation = "execution",
+        outcome = "allowed",
+        state = %outcome.state,
+        exit_code = ?outcome.exit_code,
+        "Sandbox access"
+    );
+    (
+        StatusCode::OK,
+        Json(execution_response(record, Some(output))),
+    )
+        .into_response()
+}
+
+async fn runner_started_response<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    reserved: &crate::crd::SandboxExecution,
+    report: &kobe_runner::protocol::ExecutionReport,
+) -> Response {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+
+    let outcome = runner::outcome_from_report(report);
     if outcome.state.is_terminal() {
         executions::record_terminal(
             &state.client,
@@ -577,7 +639,6 @@ async fn start_detached<B: ClusterBackend>(
         )
         .await;
     }
-
     let refreshed = executions::refresh(&state.client, &state.namespace, reserved).await;
     let record = refreshed.as_ref().unwrap_or(reserved);
     info!(
@@ -589,8 +650,6 @@ async fn start_detached<B: ClusterBackend>(
         state = %outcome.state,
         "Sandbox access"
     );
-    // 202: the request was accepted and the work is elsewhere. 200 only once
-    // there is an outcome to report.
     let status = if outcome.state.is_terminal() {
         StatusCode::OK
     } else {
@@ -599,7 +658,56 @@ async fn start_detached<B: ClusterBackend>(
     (status, Json(execution_response(record, None))).into_response()
 }
 
-/// Ask the runner what a detached execution is doing, and settle it if it is
+enum WaitRunnerFailure {
+    Poll(crate::api::sandbox_runner::RunnerCallFailure),
+    Revoked(
+        Result<
+            kobe_runner::protocol::ExecutionReport,
+            crate::api::sandbox_runner::RunnerCallFailure,
+        >,
+    ),
+}
+
+/// Wait for the runner without ever respawning the reserved command.
+///
+/// Lease revocation races every poll and invokes the runner's process-group
+/// cancellation. A polling failure leaves the durable record Running so a
+/// later GET can recover the answer; it never invents a terminal outcome.
+async fn wait_for_runner(
+    scoped: &kube::Client,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    runner_path: &str,
+    execution: &str,
+    mut report: kobe_runner::protocol::ExecutionReport,
+    revoked: tokio_util::sync::CancellationToken,
+) -> Result<kobe_runner::protocol::ExecutionReport, WaitRunnerFailure> {
+    use crate::api::sandbox_runner as runner;
+
+    while !report.state.is_terminal() {
+        tokio::select! {
+            _ = revoked.cancelled() => {
+                return Err(WaitRunnerFailure::Revoked(
+                    runner::cancel(scoped, target, container, runner_path, execution).await,
+                ));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        report = tokio::select! {
+            polled = runner::poll(scoped, target, container, runner_path, execution) => {
+                polled.map_err(WaitRunnerFailure::Poll)?
+            }
+            _ = revoked.cancelled() => {
+                return Err(WaitRunnerFailure::Revoked(
+                    runner::cancel(scoped, target, container, runner_path, execution).await,
+                ));
+            }
+        };
+    }
+    Ok(report)
+}
+
+/// Ask the runner what a supervised execution is doing, and settle it if it is
 /// done.
 ///
 /// Returns the record as it now stands. A runner that cannot be reached leaves
@@ -611,7 +719,7 @@ async fn start_detached<B: ClusterBackend>(
 /// reserved. That means the container was replaced under a Pod that kept its
 /// identity, and the outcome is genuinely unrecoverable — so it settles as
 /// `Unknown` now rather than after the verdict deadline.
-async fn reconcile_detached<B: ClusterBackend>(
+async fn reconcile_runner<B: ClusterBackend>(
     state: &AppState<B>,
     lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
@@ -626,7 +734,7 @@ async fn reconcile_detached<B: ClusterBackend>(
         .as_ref()
         .map(|status| status.state)
         .unwrap_or_default();
-    if !record.spec.detached || current.is_terminal() {
+    if current.is_terminal() {
         return record.clone();
     }
     let Some(runner_path) = target.runner_path.clone() else {
@@ -728,11 +836,10 @@ async fn get_sandbox_execution<B: ClusterBackend>(
     .await
     {
         Ok(Some(record)) => {
-            // A detached execution is only ever as current as its last poll:
-            // nobody is holding a connection to notice it finish. Asking the
-            // runner here is what makes `GET` an answer rather than an echo of
-            // what Kobe last wrote.
-            let record = reconcile_detached(&state, &lease, &target, &record).await;
+            // Every durable execution is runner-supervised. A wait client may
+            // disconnect before Kobe persists the outcome, so GET reconciles
+            // both modes rather than echoing a stale Running record.
+            let record = reconcile_runner(&state, &lease, &target, &record).await;
             (StatusCode::OK, Json(execution_response(&record, None))).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -741,7 +848,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExecutionLogsQuery {
     /// Where to resume each stream. Separate, because the two streams advance
     /// independently — one offset for both would re-read whichever stream was
@@ -753,6 +860,7 @@ struct ExecutionLogsQuery {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecutionStreamWindow {
     data: String,
     /// Where the next read should start. A caller that polls with this value
@@ -768,6 +876,7 @@ struct ExecutionStreamWindow {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecutionLogsResponse {
     id: String,
     state: String,
@@ -775,11 +884,11 @@ struct ExecutionLogsResponse {
     stderr: ExecutionStreamWindow,
 }
 
-/// Read a detached execution's retained output.
+/// Read one runner-supervised execution's retained output.
 ///
-/// Only detached executions have any: a wait-mode command's output was returned
-/// in its own response and is not kept. Saying so explicitly beats an empty
-/// body, which a caller would read as "it printed nothing".
+/// Wait mode returns these bytes inline, but they remain addressable so a
+/// client disconnected after completion can recover them without rerunning the
+/// command. Detached mode uses the same offset contract for tailing.
 #[tracing::instrument(skip_all, fields(lease = %id))]
 async fn get_sandbox_execution_logs<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -819,13 +928,6 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         Err(error) => return execution_denied(&identity, &id, &error),
     };
 
-    if !record.spec.detached {
-        return sandbox_error(
-            StatusCode::CONFLICT,
-            "This execution's output was returned with its result and is not retained",
-            Some("Only detached executions retain output.".into()),
-        );
-    }
     let Some(runner_path) = target.runner_path.clone() else {
         return sandbox_error(
             StatusCode::CONFLICT,
@@ -836,7 +938,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
 
     // Polled first, so the state reported alongside the output is the one that
     // was true when the output was read — not the one Kobe last wrote.
-    let record = reconcile_detached(&state, &lease, &target, &record).await;
+    let record = reconcile_runner(&state, &lease, &target, &record).await;
 
     let cluster = match access::resolve_target_cluster(
         &state.client,
@@ -937,14 +1039,12 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
 
 /// Cancel one execution.
 ///
-/// For a detached execution this is a real termination: the runner signals the
+/// For every runner-supervised execution this is a real termination: the runner signals the
 /// process **group**, so a build script that spawned four compilers and exited
 /// does not leave them running on CPU the lease is paying for.
 ///
-/// A wait-mode execution has no process group Kobe can reach — its command is
-/// tied to a connection this request is not holding — so cancellation there is
-/// recorded rather than enforced. The record moves to `Cancelled` only if the
-/// command had not already settled.
+/// The record-only fallback exists solely for pre-runner wait-mode records. New
+/// wait and detached requests both take the supervised path.
 #[tracing::instrument(skip_all, fields(lease = %id))]
 async fn cancel_sandbox_execution<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -968,9 +1068,9 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
 
-    match cancel_detached(&state, &identity, &id, &lease, &target, &execution).await {
-        DetachedCancellation::NotDetached => {}
-        DetachedCancellation::Handled(response) => return response,
+    match cancel_runner(&state, &identity, &id, &lease, &target, &execution).await {
+        RunnerCancellation::NotRunnerManaged => {}
+        RunnerCancellation::Handled(response) => return response,
     }
 
     match crate::api::sandbox_executions::cancel_owned(
@@ -989,31 +1089,31 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
     }
 }
 
-/// Terminate a detached execution's process group, if this is one.
+/// Terminate a runner-supervised execution's process group, if this is one.
 ///
-/// Only [`DetachedCancellation::NotDetached`] lets the caller fall through to
-/// the record-only path. Once a record says `detached`, every missing runner,
-/// target, credential or backend response is an unconfirmed termination and
-/// must keep the record Running rather than pretending it was cancelled.
+/// Only [`RunnerCancellation::NotRunnerManaged`] lets a legacy wait-mode record
+/// fall through to record-only cancellation. Every new execution requires the
+/// runner, so missing runner/target/credential proof keeps it Running rather
+/// than pretending its process group stopped.
 ///
 /// A runner that cannot be reached does **not** settle the record. Recording
 /// `Cancelled` would claim a termination nobody performed, and recording
 /// `Unknown` would close a record whose command is very likely still running —
 /// leaving it `Running` keeps the caller's retry meaningful, and lease teardown
 /// remains the backstop that always ends it.
-enum DetachedCancellation {
-    NotDetached,
+enum RunnerCancellation {
+    NotRunnerManaged,
     Handled(Response),
 }
 
-async fn cancel_detached<B: ClusterBackend>(
+async fn cancel_runner<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
     id: &str,
     lease: &SandboxLease,
     target: &crate::api::sandbox_access::SandboxTarget,
     execution: &str,
-) -> DetachedCancellation {
+) -> RunnerCancellation {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
 
@@ -1027,10 +1127,10 @@ async fn cancel_detached<B: ClusterBackend>(
     {
         Ok(Some(record)) => record,
         Ok(None) => {
-            return DetachedCancellation::Handled(StatusCode::NOT_FOUND.into_response());
+            return RunnerCancellation::Handled(StatusCode::NOT_FOUND.into_response());
         }
         Err(error) => {
-            return DetachedCancellation::Handled(execution_denied(identity, id, &error));
+            return RunnerCancellation::Handled(execution_denied(identity, id, &error));
         }
     };
     let current = record
@@ -1038,16 +1138,16 @@ async fn cancel_detached<B: ClusterBackend>(
         .as_ref()
         .map(|status| status.state)
         .unwrap_or_default();
-    if !record.spec.detached {
-        return DetachedCancellation::NotDetached;
-    }
     if current.is_terminal() {
-        return DetachedCancellation::Handled(
+        return RunnerCancellation::Handled(
             (StatusCode::OK, Json(execution_response(&record, None))).into_response(),
         );
     }
     let Some(runner_path) = target.runner_path.clone() else {
-        return DetachedCancellation::Handled(access_denied_with(
+        if !record.spec.detached {
+            return RunnerCancellation::NotRunnerManaged;
+        }
+        return RunnerCancellation::Handled(access_denied_with(
             identity,
             id,
             "execution-cancel",
@@ -1067,7 +1167,7 @@ async fn cancel_detached<B: ClusterBackend>(
     {
         Ok(cluster) => cluster,
         Err(denied) => {
-            return DetachedCancellation::Handled(access_denied(
+            return RunnerCancellation::Handled(access_denied(
                 identity,
                 id,
                 "execution-cancel",
@@ -1084,7 +1184,7 @@ async fn cancel_detached<B: ClusterBackend>(
     {
         Ok(scoped) => scoped,
         Err(denied) => {
-            return DetachedCancellation::Handled(access_denied(
+            return RunnerCancellation::Handled(access_denied(
                 identity,
                 id,
                 "execution-cancel",
@@ -1108,7 +1208,7 @@ async fn cancel_detached<B: ClusterBackend>(
                 // The runner answered without settling it. Saying "cancelled"
                 // here would be Kobe's word for something the container did not
                 // confirm.
-                return DetachedCancellation::Handled(sandbox_error(
+                return RunnerCancellation::Handled(sandbox_error(
                     StatusCode::ACCEPTED,
                     "Cancellation was requested and has not completed yet",
                     None,
@@ -1133,7 +1233,7 @@ async fn cancel_detached<B: ClusterBackend>(
                 state = %outcome.state,
                 "Sandbox access"
             );
-            DetachedCancellation::Handled(
+            RunnerCancellation::Handled(
                 (
                     StatusCode::OK,
                     Json(execution_response(
@@ -1154,7 +1254,7 @@ async fn cancel_detached<B: ClusterBackend>(
                 reason = failure.reason_code(),
                 "Sandbox access"
             );
-            DetachedCancellation::Handled(sandbox_error(
+            RunnerCancellation::Handled(sandbox_error(
                 failure.http_status(),
                 failure.to_string(),
                 None,
@@ -1554,6 +1654,7 @@ async fn sandbox_exec<B: ClusterBackend>(
 ) -> Response {
     use crate::api::sandbox_access as access;
     use crate::api::sandbox_credentials as credentials;
+    use crate::api::sandbox_executions as executions;
 
     if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
         return response;
@@ -1602,13 +1703,28 @@ async fn sandbox_exec<B: ClusterBackend>(
     };
     let revoked = guard.cancelled();
 
+    // The fixed endpoint bound is only a ceiling. The exact lease is the
+    // authority to execute, so a command may never be granted time beyond its
+    // remaining TTL. Compute this immediately before opening the exec stream;
+    // credential setup and stream registration may have consumed part of it.
+    let timeout =
+        match executions::effective_timeout(SANDBOX_EXEC_TIMEOUT, &lease, chrono::Utc::now()) {
+            Ok(timeout) => timeout,
+            Err(executions::ExecutionRequestError::Denied(denied)) => {
+                return access_denied(&identity, &id, "exec", denied);
+            }
+            Err(error) => {
+                return sandbox_error(error.http_status(), error.to_string(), None);
+            }
+        };
+
     let result = tokio::select! {
         result = access::exec_in_sandbox(
             &scoped,
             &target,
             &container,
             &request.command,
-            SANDBOX_EXEC_TIMEOUT,
+            timeout,
         ) => result,
         _ = revoked.cancelled() => {
             info!(
@@ -6772,7 +6888,7 @@ mod tests {
                 .all(|request| request.method.as_str() != "PATCH")
         );
     }
-    /// A pool with no runner refuses a detached execution, and refuses it
+    /// A pool with no runner refuses every durable execution, and refuses it
     /// before the caller's idempotency key is spent.
     ///
     /// The order is the point. Reserving first and failing afterwards would
@@ -6780,51 +6896,53 @@ mod tests {
     /// with the same key, as retries must — would then get a conflict, or
     /// worse, the record of a command nobody ever ran.
     ///
-    /// And it is refused rather than approximated. A "detached" execution that
-    /// actually died with its connection would be worse than none at all,
-    /// because the caller has already built on the guarantee it appeared to
-    /// offer.
+    /// And it is refused rather than approximated. Raw exec cannot implement
+    /// wait-mode `cwd`, exact exit status and process-group cancellation; mode
+    /// must not silently select a weaker contract.
     #[tokio::test]
-    async fn a_pool_without_a_runner_refuses_detached_before_spending_the_key() {
-        let server = MockServer::start().await;
-        mount_sandbox_crds(&server).await;
-        mount_ready_sandbox(&server, pool_json()).await;
+    async fn a_pool_without_a_runner_refuses_all_modes_before_spending_the_key() {
+        for detached in [false, true] {
+            let server = MockServer::start().await;
+            mount_sandbox_crds(&server).await;
+            mount_ready_sandbox(&server, pool_json()).await;
 
-        let response = create_sandbox_execution::<crate::testutil::MockBackend>(
-            State(test_state(&server)),
-            identity(),
-            Path("sandbox-own".into()),
-            Json(
-                serde_json::from_value(serde_json::json!({
-                    "command": ["/agent", "run"],
-                    "idempotency_key": "key-1",
-                    "detach": true
-                }))
-                .unwrap(),
-            ),
-        )
-        .await;
+            let response = create_sandbox_execution::<crate::testutil::MockBackend>(
+                State(test_state(&server)),
+                identity(),
+                Path("sandbox-own".into()),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "command": ["/agent", "run"],
+                        "cwd": "/workspace",
+                        "idempotencyKey": "key-1",
+                        "detach": detached
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await;
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .all(|request| !(request.method.as_str() == "POST"
-                    && request.url.path().contains("/sandboxexecutions"))),
-            "the idempotency key must not be reserved for a request that cannot be served"
-        );
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .all(|request| !(request.method.as_str() == "POST"
+                        && request.url.path().contains("/sandboxexecutions"))),
+                "the idempotency key must not be reserved for a request that cannot be served"
+            );
+        }
     }
 
-    /// A wait-mode execution has no retained output, and says so.
+    /// Wait-mode output remains runner-addressable after its inline response.
     ///
-    /// Its output was returned in its own response and is not kept anywhere —
-    /// there is no runner holding it. An empty body would read as "the command
-    /// printed nothing", which is a different and wrong answer.
+    /// A disconnect can happen after the command settles but before the client
+    /// receives the body. Refusing logs solely because `detached=false` would
+    /// make that exact output unrecoverable and force a dangerous retry.
     #[tokio::test]
-    async fn logs_for_a_wait_mode_execution_are_refused_rather_than_empty() {
+    async fn logs_for_a_wait_mode_execution_are_not_rejected_by_mode() {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
         mount_ready_sandbox(&server, pool_json_with_runner()).await;
@@ -6847,16 +6965,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .all(|request| !request.url.path().ends_with("/exec")),
-            "nothing may be executed in the Pod to answer a question about a record"
-        );
+        // The mock does not provide scoped credentials, so the request stops
+        // later at that boundary. What must not return is the old mode-only
+        // conflict before runner access is even attempted.
+        assert_ne!(response.status(), StatusCode::CONFLICT);
     }
 
     /// A detached record may fall back to record-only cancellation only when
@@ -6905,7 +7017,7 @@ mod tests {
     #[test]
     fn a_log_window_is_addressed_per_stream() {
         let query: ExecutionLogsQuery =
-            serde_json::from_value(serde_json::json!({ "stdout_offset": 10, "stderr_offset": 20 }))
+            serde_json::from_value(serde_json::json!({ "stdoutOffset": 10, "stderrOffset": 20 }))
                 .unwrap();
         assert_eq!(query.stdout_offset, Some(10));
         assert_eq!(query.stderr_offset, Some(20));
@@ -6919,6 +7031,45 @@ mod tests {
         }
     }
 
+    /// The CLI and conformance clients consume camelCase. A server response
+    /// that emitted `exit_code` would silently deserialize as `None` in the CLI
+    /// and replace the real remote result with Kobe's transport-failure code.
+    #[test]
+    fn the_execution_wire_contract_uses_stable_camel_case_fields() {
+        let request: CreateExecutionRequest = serde_json::from_value(serde_json::json!({
+            "command": ["/agent", "run"],
+            "cwd": "/workspace",
+            "timeout": "60s",
+            "idempotencyKey": "key-1",
+            "detach": false
+        }))
+        .unwrap();
+        assert_eq!(request.idempotency_key, "key-1");
+        assert!(
+            serde_json::from_value::<CreateExecutionRequest>(serde_json::json!({
+                "command": ["/agent"],
+                "idempotency_key": "key-1"
+            }))
+            .is_err(),
+            "snake_case must not become an undocumented second wire shape"
+        );
+
+        let response = serde_json::to_value(ExecutionResponse {
+            id: "sbxe-1".into(),
+            state: "Failed".into(),
+            exit_code: Some(42),
+            started_at: None,
+            finished_at: None,
+            reason: Some("completed".into()),
+            stdout: Some("out".into()),
+            stderr: Some("err".into()),
+            truncated: false,
+        })
+        .unwrap();
+        assert_eq!(response["exitCode"], 42);
+        assert!(response.get("exit_code").is_none());
+    }
+
     fn pool_json_with_runner() -> serde_json::Value {
         let mut pool = pool_json();
         pool["spec"]["template"]["runnerPath"] = serde_json::json!("/kobe-runner");
@@ -6929,7 +7080,10 @@ mod tests {
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "SandboxExecution",
-            "metadata": { "name": "sbxe-1", "namespace": "test-ns", "uid": "sbxe-1-uid" },
+            "metadata": {
+                "name": "sbxe-1", "namespace": "test-ns",
+                "uid": "sbxe-1-uid", "resourceVersion": "1"
+            },
             "spec": {
                 "leaseUid": "sandbox-own-uid",
                 "podUid": "pod-uid",

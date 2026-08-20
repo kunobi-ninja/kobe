@@ -258,7 +258,7 @@ pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
 /// different command wearing the first one's name, and returning the first
 /// one's result would be a wrong answer rather than a cached one.
 #[allow(dead_code)]
-pub fn request_digest(argv: &[String], cwd: Option<&str>, timeout: &str) -> String {
+pub fn request_digest(argv: &[String], cwd: Option<&str>, timeout: &str, detached: bool) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -280,6 +280,10 @@ pub fn request_digest(argv: &[String], cwd: Option<&str>, timeout: &str) -> Stri
     }
     hasher.update((timeout.len() as u64).to_be_bytes());
     hasher.update(timeout.as_bytes());
+    // Wait and detached mode have different lifecycle semantics. Treating
+    // them as one request could return a wait-mode record to a caller that
+    // asked for a reconnectable execution, or vice versa.
+    hasher.update([u8::from(detached)]);
     format!("{:x}", hasher.finalize())
 }
 
@@ -476,39 +480,53 @@ mod tests {
     /// under a key whose first use they already got a result for.
     #[test]
     fn the_request_digest_cannot_be_made_to_collide() {
-        let base = request_digest(&["/agent".into(), "run".into()], None, "60s");
+        let base = request_digest(&["/agent".into(), "run".into()], None, "60s", false);
 
         assert_eq!(
             base,
-            request_digest(&["/agent".into(), "run".into()], None, "60s"),
+            request_digest(&["/agent".into(), "run".into()], None, "60s", false),
             "the same request must digest identically"
         );
 
         // Argument boundaries.
-        assert_ne!(base, request_digest(&["/agentrun".into()], None, "60s"));
         assert_ne!(
-            request_digest(&["a".into(), "bc".into()], None, "60s"),
-            request_digest(&["ab".into(), "c".into()], None, "60s")
+            base,
+            request_digest(&["/agentrun".into()], None, "60s", false)
+        );
+        assert_ne!(
+            request_digest(&["a".into(), "bc".into()], None, "60s", false),
+            request_digest(&["ab".into(), "c".into()], None, "60s", false)
         );
         // Order.
         assert_ne!(
             base,
-            request_digest(&["run".into(), "/agent".into()], None, "60s")
+            request_digest(&["run".into(), "/agent".into()], None, "60s", false)
         );
         // Working directory, including present-but-empty versus absent.
         assert_ne!(
             base,
-            request_digest(&["/agent".into(), "run".into()], Some("/work"), "60s")
+            request_digest(
+                &["/agent".into(), "run".into()],
+                Some("/work"),
+                "60s",
+                false
+            )
         );
         assert_ne!(
             base,
-            request_digest(&["/agent".into(), "run".into()], Some(""), "60s")
+            request_digest(&["/agent".into(), "run".into()], Some(""), "60s", false)
         );
         // Timeout: the same command with a different bound is a different
         // request, because its outcome can differ.
         assert_ne!(
             base,
-            request_digest(&["/agent".into(), "run".into()], None, "600s")
+            request_digest(&["/agent".into(), "run".into()], None, "600s", false)
+        );
+        // Lifecycle mode is part of the request. Returning a wait-mode result
+        // for a detached retry would silently remove its reconnectability.
+        assert_ne!(
+            base,
+            request_digest(&["/agent".into(), "run".into()], None, "60s", true)
         );
 
         assert_eq!(base.len(), 64);

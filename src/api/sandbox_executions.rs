@@ -108,6 +108,42 @@ pub const MAX_IDEMPOTENCY_KEY: usize = 253;
 /// outcome than refusing the request.
 pub const MAX_EXECUTION_TIMEOUT: chrono::Duration = chrono::Duration::hours(1);
 
+/// Clamp one execution to the time its exact lease still owns.
+///
+/// Runner timeouts are whole seconds and are rounded up so a caller's
+/// fractional timeout is not shortened. Lease time is rounded down instead:
+/// granting the runner a partial second past `expiresAt` would let the command
+/// outlive the authority that started it. Less than one full second remaining
+/// is therefore already expired for a new execution.
+pub fn effective_timeout(
+    requested: std::time::Duration,
+    lease: &SandboxLease,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<std::time::Duration, ExecutionRequestError> {
+    let expires_at = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.expires_at.as_deref())
+        .and_then(|expires_at| chrono::DateTime::parse_from_rfc3339(expires_at).ok())
+        .ok_or(ExecutionRequestError::Denied(SandboxAccessDenied::Expired))?;
+    let remaining_millis = expires_at
+        .signed_duration_since(now)
+        .num_milliseconds()
+        .max(0) as u64;
+    let remaining_seconds = remaining_millis / 1_000;
+    if remaining_seconds == 0 {
+        return Err(ExecutionRequestError::Denied(SandboxAccessDenied::Expired));
+    }
+
+    let requested_seconds = requested
+        .as_secs()
+        .saturating_add(u64::from(requested.subsec_nanos() > 0))
+        .max(1);
+    Ok(std::time::Duration::from_secs(
+        requested_seconds.min(remaining_seconds),
+    ))
+}
+
 /// Validate a request before anything is reserved.
 ///
 /// Every check here is one that would otherwise become a partially-reserved
@@ -166,7 +202,12 @@ pub async fn reserve_execution(
 ) -> Result<Reservation, ExecutionRequestError> {
     validate_request(request)?;
 
-    let digest = request_digest(&request.argv, request.cwd.as_deref(), &request.timeout);
+    let digest = request_digest(
+        &request.argv,
+        request.cwd.as_deref(),
+        &request.timeout,
+        request.detached,
+    );
     let name = execution_name(&target.lease_uid, &request.idempotency_key);
     let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
 
@@ -282,17 +323,16 @@ pub async fn mark_running(
         started,
         chrono::Duration::from_std(timeout).unwrap_or(VERDICT_GRACE),
     );
-    patch_status(
-        client,
-        namespace,
-        &execution.name_any(),
-        serde_json::json!({
-            "state": ExecutionState::Running,
-            "startedAt": started.to_rfc3339(),
-            "verdictDeadline": deadline.to_rfc3339(),
-        }),
-    )
+    mutate_status(client, namespace, execution, |status| {
+        crate::crd::transition_execution(status.state, ExecutionState::Running, None)
+            .map_err(|_| ExecutionRequestError::Backend)?;
+        status.state = ExecutionState::Running;
+        status.started_at = Some(started.to_rfc3339());
+        status.verdict_deadline = Some(deadline.to_rfc3339());
+        Ok(())
+    })
     .await
+    .map(|_| ())
 }
 
 /// Record a settled outcome.
@@ -309,15 +349,18 @@ pub async fn record_terminal(
     exit_code: Option<i32>,
     reason: &str,
 ) {
-    let mut status = serde_json::json!({
-        "state": state,
-        "finishedAt": chrono::Utc::now().to_rfc3339(),
-        "reason": reason,
-    });
-    if let Some(exit_code) = exit_code {
-        status["exitCode"] = serde_json::json!(exit_code);
-    }
-    if let Err(error) = patch_status(client, namespace, &execution.name_any(), status).await {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = mutate_status(client, namespace, execution, |status| {
+        crate::crd::transition_execution(status.state, state, exit_code)
+            .map_err(|_| ExecutionRequestError::Backend)?;
+        status.state = state;
+        status.finished_at = Some(finished_at);
+        status.exit_code = exit_code;
+        status.reason = Some(reason.to_string());
+        Ok(())
+    })
+    .await
+    {
         tracing::warn!(
             execution = %execution.name_any(),
             error = %error,
@@ -326,22 +369,62 @@ pub async fn record_terminal(
     }
 }
 
-async fn patch_status(
+/// Mutate one execution status under exact object identity and version.
+///
+/// The strong GET establishes the current state and resourceVersion. The JSON
+/// Patch then tests both UID and resourceVersion before replacing status, so a
+/// same-name successor or a concurrent terminal writer can never be
+/// overwritten by a stale request.
+async fn mutate_status<F>(
     client: &kube::Client,
     namespace: &str,
-    name: &str,
-    status: serde_json::Value,
-) -> Result<(), ExecutionRequestError> {
+    expected: &SandboxExecution,
+    mutate: F,
+) -> Result<SandboxExecution, ExecutionRequestError>
+where
+    F: FnOnce(&mut crate::crd::SandboxExecutionStatus) -> Result<(), ExecutionRequestError>,
+{
     let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
+    let expected_uid = expected.uid().ok_or(ExecutionRequestError::Backend)?;
+    let live = executions
+        .get(&expected.name_any())
+        .await
+        .map_err(|_| ExecutionRequestError::Backend)?;
+    if live.uid().as_deref() != Some(expected_uid.as_str()) {
+        return Err(ExecutionRequestError::Backend);
+    }
+    let resource_version = live
+        .resource_version()
+        .ok_or(ExecutionRequestError::Backend)?;
+    let mut status = live.status.clone().unwrap_or_default();
+    mutate(&mut status)?;
+    let patch = fenced_status_patch(&expected_uid, &resource_version, &status)?;
+
     executions
         .patch_status(
-            name,
-            &kube::api::PatchParams::apply(crate::sandbox::KOBE_MANAGED_BY),
-            &kube::api::Patch::Merge(&serde_json::json!({ "status": status })),
+            &expected.name_any(),
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Json::<()>(patch),
         )
         .await
-        .map(|_| ())
         .map_err(|_| ExecutionRequestError::Backend)
+}
+
+fn fenced_status_patch(
+    uid: &str,
+    resource_version: &str,
+    status: &crate::crd::SandboxExecutionStatus,
+) -> Result<json_patch::Patch, ExecutionRequestError> {
+    serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        {
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": resource_version
+        },
+        { "op": "add", "path": "/status", "value": status }
+    ]))
+    .map_err(|_| ExecutionRequestError::Backend)
 }
 
 /// Re-read one execution after its outcome was recorded.
@@ -665,5 +748,75 @@ mod tests {
 
         assert!(deadline > started + timeout);
         assert_eq!(deadline, started + timeout + VERDICT_GRACE);
+    }
+
+    /// An execution's wall-clock bound is never longer than the lease that
+    /// authorises it, even when the caller asks for the global maximum.
+    #[test]
+    fn an_execution_timeout_never_outlives_its_lease() {
+        let now = chrono::Utc::now();
+        let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+        lease.status.as_mut().unwrap().expires_at = Some(
+            (now + chrono::Duration::seconds(17) + chrono::Duration::milliseconds(900))
+                .to_rfc3339(),
+        );
+
+        assert_eq!(
+            effective_timeout(std::time::Duration::from_secs(3_600), &lease, now).unwrap(),
+            std::time::Duration::from_secs(17),
+            "lease time is rounded down, never granted past expiresAt"
+        );
+        assert_eq!(
+            effective_timeout(std::time::Duration::from_millis(1_500), &lease, now).unwrap(),
+            std::time::Duration::from_secs(2),
+            "the caller timeout keeps the runner's existing round-up semantics"
+        );
+
+        lease.status.as_mut().unwrap().expires_at =
+            Some((now + chrono::Duration::milliseconds(999)).to_rfc3339());
+        assert!(matches!(
+            effective_timeout(std::time::Duration::from_secs(1), &lease, now),
+            Err(ExecutionRequestError::Denied(SandboxAccessDenied::Expired))
+        ));
+
+        lease.status.as_mut().unwrap().expires_at = Some("not-a-time".into());
+        assert!(matches!(
+            effective_timeout(std::time::Duration::from_secs(1), &lease, now),
+            Err(ExecutionRequestError::Denied(SandboxAccessDenied::Expired))
+        ));
+    }
+
+    /// Status writes are conditional on both immutable identity and the exact
+    /// version that was read. A same-name replacement or concurrent terminal
+    /// writer therefore makes the patch fail instead of being overwritten.
+    #[test]
+    fn every_execution_status_patch_is_uid_and_resource_version_fenced() {
+        let status = crate::crd::SandboxExecutionStatus {
+            state: ExecutionState::Running,
+            ..Default::default()
+        };
+        let patch = fenced_status_patch("execution-uid", "42", &status).unwrap();
+        let value = serde_json::to_value(patch).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "op": "test",
+                    "path": "/metadata/uid",
+                    "value": "execution-uid"
+                },
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": "42"
+                },
+                {
+                    "op": "add",
+                    "path": "/status",
+                    "value": { "state": "Running" }
+                }
+            ])
+        );
     }
 }

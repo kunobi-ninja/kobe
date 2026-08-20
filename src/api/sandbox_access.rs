@@ -61,8 +61,9 @@ pub struct SandboxTarget {
     /// Ports the pool declared. Nothing else is forwardable.
     pub ports: Vec<DeclaredPort>,
     /// Where `kobe-runner` lives inside the container, if the pool's image
-    /// ships one. `None` means this Sandbox cannot supervise a detached
-    /// command, and the API refuses one rather than approximating it.
+    /// ships one. `None` means this Sandbox cannot provide the durable
+    /// execution contract — including exact exit status and `cwd` — and that
+    /// API refuses one rather than approximating it with a raw exec stream.
     pub runner_path: Option<String>,
 }
 
@@ -633,6 +634,7 @@ pub struct SandboxExecRequest {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SandboxExecResponse {
     pub stdout: String,
     pub stderr: String,
@@ -640,6 +642,10 @@ pub struct SandboxExecResponse {
     /// available over this protocol, and inventing one would be worse than
     /// reporting what is actually known.
     pub success: bool,
+    /// Exact remote exit status when Kubernetes reported one. `None` means the
+    /// transport did not establish an outcome; it is never synthesised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     /// Whether output was cut off at the cap. Reported rather than silently
     /// truncated: a caller parsing partial output as complete is how a
     /// truncation becomes a wrong answer instead of an obvious one.
@@ -676,6 +682,7 @@ pub async fn exec_in_sandbox(
         stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&raw.stderr).into_owned(),
         success: raw.success,
+        exit_code: raw.exit_code,
         truncated: raw.truncated,
     })
 }
@@ -686,6 +693,7 @@ pub struct RawExecOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub success: bool,
+    pub exit_code: Option<i32>,
     pub truncated: bool,
 }
 
@@ -754,33 +762,101 @@ pub async fn exec_capped(
         .map_err(|_| SandboxAccessDenied::Backend)?;
     }
 
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut truncated = false;
-    if let Some(mut stream) = attached.stdout() {
-        truncated |= read_capped(&mut stream, &mut stdout, output_cap, timeout).await;
-    }
-    if let Some(mut stream) = attached.stderr() {
-        truncated |= read_capped(&mut stream, &mut stderr, output_cap, timeout).await;
-    }
+    let stdout_stream = attached.stdout();
+    let stderr_stream = attached.stderr();
+    let status = attached.take_status().ok_or(SandboxAccessDenied::Backend)?;
 
-    let status = tokio::time::timeout(timeout, attached.take_status().unwrap()).await;
-    let success = match status {
-        Ok(Some(status)) => status.status.as_deref() == Some("Success"),
-        // Wedged or unreported. Not a success: the caller must not read
-        // "we could not tell" as "it worked".
-        _ => {
+    // Drain both bounded pipes while waiting for status. Reading stdout to EOF
+    // before touching stderr deadlocks when the command fills stderr's pipe
+    // while Kobe is blocked on stdout (and vice versa).
+    let ((stdout, stderr, stdout_truncated, stderr_truncated), status) = tokio::join!(
+        drain_capped_pair(stdout_stream, stderr_stream, output_cap, timeout),
+        tokio::time::timeout(timeout, status),
+    );
+    let status = match status {
+        Ok(status) => status,
+        Err(_) => {
             attached.abort();
-            false
+            None
         }
     };
+    let exit_code = exact_exec_exit_code(status.as_ref());
+    let success = exit_code == Some(0);
 
     Ok(RawExecOutput {
         stdout,
         stderr,
         success,
-        truncated,
+        exit_code,
+        truncated: stdout_truncated || stderr_truncated,
     })
+}
+
+/// Drain stdout and stderr concurrently under independent per-stream caps.
+///
+/// The remote process can block while writing either pipe. Progress on one
+/// must therefore never depend on the other reaching EOF first.
+async fn drain_capped_pair<Stdout, Stderr>(
+    stdout: Option<Stdout>,
+    stderr: Option<Stderr>,
+    cap: usize,
+    timeout: std::time::Duration,
+) -> (Vec<u8>, Vec<u8>, bool, bool)
+where
+    Stdout: tokio::io::AsyncRead + Unpin,
+    Stderr: tokio::io::AsyncRead + Unpin,
+{
+    let stdout_read = async {
+        let mut output = Vec::new();
+        let truncated = match stdout {
+            Some(mut stream) => read_capped(&mut stream, &mut output, cap, timeout).await,
+            None => false,
+        };
+        (output, truncated)
+    };
+    let stderr_read = async {
+        let mut output = Vec::new();
+        let truncated = match stderr {
+            Some(mut stream) => read_capped(&mut stream, &mut output, cap, timeout).await,
+            None => false,
+        };
+        (output, truncated)
+    };
+    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) =
+        tokio::join!(stdout_read, stderr_read);
+    (stdout, stderr, stdout_truncated, stderr_truncated)
+}
+
+/// Extract only an exit status Kubernetes actually observed.
+///
+/// Success is exactly zero. A non-zero remote exit is encoded as an
+/// `ExitCode` status cause. Any malformed, missing, or unfamiliar status stays
+/// `None`; mapping it to `1` would turn a transport uncertainty into a claim
+/// about what the process returned.
+fn exact_exec_exit_code(
+    status: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+) -> Option<i32> {
+    let status = status?;
+    if status.status.as_deref() == Some("Success") {
+        return Some(0);
+    }
+    if status.status.as_deref() != Some("Failure")
+        || status.reason.as_deref() != Some("NonZeroExitCode")
+    {
+        return None;
+    }
+    status
+        .details
+        .as_ref()?
+        .causes
+        .as_ref()?
+        .iter()
+        .find(|cause| cause.reason.as_deref() == Some("ExitCode"))?
+        .message
+        .as_deref()?
+        .parse::<i32>()
+        .ok()
+        .filter(|code| (1..=255).contains(code))
 }
 
 /// Read at most `cap` bytes, reporting whether more was waiting.
@@ -1259,6 +1335,107 @@ mod tests {
             .await
         );
         assert_eq!(into.len(), MAX_EXEC_OUTPUT_BYTES);
+    }
+
+    /// Neither output pipe may wait for the other one to close first.
+    ///
+    /// The writer deliberately fills stderr before touching stdout. A serial
+    /// stdout-first reader deadlocks here; the production concurrent drain
+    /// lets stderr make room and eventually receives both streams exactly.
+    #[tokio::test]
+    async fn stdout_and_stderr_are_drained_without_cross_stream_deadlock() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut stdout_writer, stdout_reader) = tokio::io::duplex(8);
+        let (mut stderr_writer, stderr_reader) = tokio::io::duplex(8);
+        let writer = tokio::spawn(async move {
+            stderr_writer.write_all(&[b'e'; 32]).await.unwrap();
+            drop(stderr_writer);
+            stdout_writer.write_all(&[b'o'; 32]).await.unwrap();
+        });
+
+        let (stdout, stderr, stdout_truncated, stderr_truncated) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            drain_capped_pair(
+                Some(stdout_reader),
+                Some(stderr_reader),
+                64,
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("a concurrent drain must not deadlock");
+        writer.await.unwrap();
+
+        assert_eq!(stdout, [b'o'; 32]);
+        assert_eq!(stderr, [b'e'; 32]);
+        assert!(!stdout_truncated);
+        assert!(!stderr_truncated);
+    }
+
+    /// Kubernetes reports the exact non-zero code in a structured cause.
+    /// Missing or malformed causes remain unknown instead of becoming a
+    /// synthesised `1` that the process may never have returned.
+    #[test]
+    fn an_exec_exit_code_is_exact_or_absent() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, StatusCause, StatusDetails};
+
+        let success = Status {
+            status: Some("Success".into()),
+            ..Default::default()
+        };
+        assert_eq!(exact_exec_exit_code(Some(&success)), Some(0));
+
+        let failed = Status {
+            status: Some("Failure".into()),
+            reason: Some("NonZeroExitCode".into()),
+            details: Some(StatusDetails {
+                causes: Some(vec![StatusCause {
+                    reason: Some("ExitCode".into()),
+                    message: Some("42".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(exact_exec_exit_code(Some(&failed)), Some(42));
+
+        let mut impossible = failed.clone();
+        impossible
+            .details
+            .as_mut()
+            .unwrap()
+            .causes
+            .as_mut()
+            .unwrap()[0]
+            .message = Some("-1".into());
+        assert_eq!(exact_exec_exit_code(Some(&impossible)), None);
+        impossible
+            .details
+            .as_mut()
+            .unwrap()
+            .causes
+            .as_mut()
+            .unwrap()[0]
+            .message = Some("256".into());
+        assert_eq!(exact_exec_exit_code(Some(&impossible)), None);
+
+        for unknown in [
+            None,
+            Some(&Status {
+                status: Some("Failure".into()),
+                reason: Some("NonZeroExitCode".into()),
+                ..Default::default()
+            }),
+            Some(&Status {
+                status: Some("Failure".into()),
+                reason: Some("TransportError".into()),
+                ..Default::default()
+            }),
+        ] {
+            assert_eq!(exact_exec_exit_code(unknown), None);
+        }
     }
 
     fn child_lease_with(cluster_lease_uid: &str, instance_uid: &str) -> SandboxLease {

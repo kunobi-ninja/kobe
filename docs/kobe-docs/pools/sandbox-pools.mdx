@@ -64,13 +64,13 @@ Every container must declare CPU, memory, and ephemeral-storage requests and
 limits. `defaultContainer` and each exposed port must refer to a declared
 container. Canary `argv` is executed directly, without an implicit shell.
 
-## Detached execution
+## Durable execution
 
-A detached execution keeps running after the caller disconnects, which a
-Kubernetes exec cannot do on its own: everything an exec starts dies with the
-connection. Supervising it requires a process inside the container, so a pool
-offers detached execution only if its image ships `kobe-runner` and the template
-says where:
+Kobe uses the same supervisor for wait-mode and detached commands. A raw
+Kubernetes exec cannot apply a working directory without a shell, cannot always
+recover the exact exit code, and dies with its connection. A pool therefore
+offers the durable execution API only if its image ships `kobe-runner` and the
+template says where:
 
 ```yaml
 template:
@@ -88,14 +88,13 @@ It is a static binary with no dependencies on the base image, and it runs as
 whatever user the container already uses — it needs no privileges beyond
 starting a process and writing under `/var/run`.
 
-Without `runnerPath`, `POST /v1/sandbox-leases/{id}/executions` with
-`"detach": true` returns `501 Not Implemented`. That is deliberate: a detached
-execution that actually died with its connection would be worse than none,
-because callers build on the guarantee it appears to offer. Wait-mode
-executions are unaffected and need no runner.
+Without `runnerPath`, `POST /v1/sandbox-leases/{id}/executions` returns
+`501 Not Implemented` in both modes. That is deliberate: selecting wait mode
+must not silently remove working-directory, exact-exit-code, process-group
+cancellation, or reconnectability guarantees.
 
-Output from a detached execution is retained inside the container until the
-Sandbox is torn down, bounded per stream, and read back through
+Output from every durable execution is retained inside the container until the
+Sandbox is torn down, bounded per stream, and can be read back through
 `GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Cancelling one
 terminates its whole process group, not only the process Kobe started.
 

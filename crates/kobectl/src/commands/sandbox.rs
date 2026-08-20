@@ -139,6 +139,7 @@ pub fn new_idempotency_key() -> String {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecRequestBody<'a> {
     command: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -669,6 +670,25 @@ mod tests {
         assert_eq!(keys.len(), 100, "keys must not repeat across invocations");
         assert!(keys.iter().all(|key| key.starts_with("kobe-cli-")));
         assert!(keys.iter().all(|key| key.len() <= 253));
+    }
+
+    /// The CLI sends the same canonical field names the server and conformance
+    /// contract accept. A snake_case idempotency key would be rejected before
+    /// the durable reservation that makes retries safe.
+    #[test]
+    fn execution_requests_use_the_canonical_wire_shape() {
+        let argv = vec!["/agent".to_string(), "run".to_string()];
+        let body = serde_json::to_value(ExecRequestBody {
+            command: &argv,
+            cwd: Some("/workspace"),
+            timeout: Some("60s"),
+            idempotency_key: "key-1",
+        })
+        .unwrap();
+
+        assert_eq!(body["idempotencyKey"], "key-1");
+        assert!(body.get("idempotency_key").is_none());
+        assert_eq!(body["cwd"], "/workspace");
     }
 
     /// Machine output is versioned and keeps the streams apart.
