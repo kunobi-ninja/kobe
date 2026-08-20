@@ -59,6 +59,38 @@ const DEMO_VKOBE_VERSION = "1.35";
 const LOCAL_TARGET = "e2e";
 const LOCAL_ENDPOINT = "http://127.0.0.1:8080";
 const LOCAL_NODE_PORT = 30080;
+// Where an injected failure's ORIGINAL state is parked until `clear-failure`.
+// On disk rather than in memory because the two halves are separate process
+// invocations: a conformance scenario injects, asserts, and clears from three
+// different `bun run` calls, and an in-memory capture would be gone by the
+// second one.
+const FAILURE_DIR = `${process.cwd()}/.tmp/e2e-failures`;
+// Coordination Lease the operator's leader election holds (src/main.rs).
+// Restarting is only half of "restart": the HTTP server answers from any
+// replica, but the reconcilers run solely in whichever replica owns this.
+const OPERATOR_LEADER_LEASE = "kobe-operator";
+// Label the admission ledger stamps on a lease's quota/alias reservations
+// (SANDBOX_RESERVATION_LEASE_UID_LABEL in src/api/sandbox.rs). `reap-lease`
+// needs it because a quarantined lease's reservations outlive the lease.
+const SANDBOX_LEASE_UID_LABEL = "kobe.kunobi.ninja/sandbox-lease-uid";
+// Label every backend stamps on the resources of one child cluster
+// (`cluster_labels` in src/backend/k3s.rs and its k0s/vkobe siblings). It is
+// how `inject-failure --kind=child-api-unreachable` finds the Service in front
+// of a child API server without knowing which backend built it.
+const CHILD_CLUSTER_LABEL = "kobe.kunobi.ninja/cluster";
+// Sentinel selector a severed Service is given. Nothing carries this label, so
+// the Service resolves to zero endpoints and the child API stops answering —
+// while every object behind it stays exactly where it was.
+const UNREACHABLE_SELECTOR = { "kobe.kunobi.ninja/e2e-unreachable": "true" };
+// The two reads whose 403 the operator treats as DURABLE uncertainty rather
+// than a transient error: `claim_absence()` and the child-receipt lookup in
+// src/controllers/sandbox.rs. Revoking `get` on exactly these is what makes a
+// teardown unverifiable — and therefore what makes quarantine reachable —
+// without breaking anything else the operator does.
+const UNVERIFIABLE_TEARDOWN_REVOCATIONS: ReadonlyArray<RevocationTarget> = [
+  { apiGroup: "extensions.agents.x-k8s.io", resource: "sandboxclaims", verb: "get" },
+  { apiGroup: "kobe.kunobi.ninja", resource: "clusterleases", verb: "get" },
+];
 const REQUIRED_MISE_TOOLS = ["bun", "helm", "kind", "kubectl"];
 const FINGERPRINT_INPUTS = [
   "Cargo.toml",
@@ -72,8 +104,43 @@ const FINGERPRINT_INPUTS = [
   "src",
 ];
 
+/// Everything this script can be asked to do.
+///
+/// `up`/`down` own the environment. The rest exist because #76's matrix needs
+/// the target *disturbed* — restarted mid-phase, deliberately broken, driven
+/// through a real terminal — and the conformance suite deliberately cannot do
+/// any of that: a suite able to break its own target could also mask a break it
+/// did not intend.
+const COMMANDS = [
+  "up",
+  "down",
+  "restart-operator",
+  "inject-failure",
+  "clear-failure",
+  "reap-lease",
+  "attach-pty",
+] as const;
+
+type Command = (typeof COMMANDS)[number];
+
+/// Ways the target can be deliberately broken.
+///
+/// `teardown-unverifiable` is the one #76 turns on; the other two are the
+/// primitives it is built from, exposed separately because a scenario that
+/// needs a different verb should not have to add a new kind.
+const FAILURE_KINDS = ["teardown-unverifiable", "rbac-revoke", "child-api-unreachable"] as const;
+
+type FailureKind = (typeof FAILURE_KINDS)[number];
+
+/// One verb, on one resource, in one API group.
+type RevocationTarget = {
+  apiGroup: string;
+  resource: string;
+  verb: string;
+};
+
 type Args = {
-  command: "up" | "down";
+  command: Command;
   cluster: string;
   namespace: string;
   release: string;
@@ -82,6 +149,34 @@ type Args = {
   /// known. Only used to decide which guest images are worth pre-loading —
   /// every pool is still applied regardless.
   backend?: string;
+  /// kubectl context to drive. Defaults to the kind context for `--cluster`,
+  /// which is what `up` creates; overridable so the same subcommands work
+  /// against a CI cluster that kind did not build.
+  kubeContext?: string;
+  /// Kobe HTTP endpoint used to confirm the operator is serving again.
+  endpoint: string;
+  /// SandboxLease to observe, restart at, or reap.
+  lease?: string;
+  /// Stage that lease must reach before the disturbance is applied.
+  waitForStage?: string;
+  timeoutSeconds: number;
+  failure: FailureKind;
+  revocation: Partial<RevocationTarget>;
+  /// ClusterInstance whose child API is to be severed.
+  instance?: string;
+  /// The `kobe` binary the pty harness drives. A path, not a shell string:
+  /// it is passed to the pty as argv[0] and never re-parsed.
+  kobeBin: string;
+  /// Keystroke payloads, in order. Escapes are decoded by `decodeKeystrokes`.
+  send: string[];
+  sendDelayMs: number;
+  settleMs: number;
+  /// Substring the attached session must produce for the run to pass.
+  expect?: string;
+  /// Exit code `kobe sandbox attach` must terminate with.
+  expectExit?: number;
+  /// Argv handed to `kobe sandbox attach ... -- <argv>`, after a bare `--`.
+  attachArgv: string[];
 };
 
 type E2eState = {
@@ -243,6 +338,14 @@ function canReuseExistingEnvironment(args: Args, fingerprint: string): boolean {
   );
 }
 
+function isCommand(token: string | undefined): token is Command {
+  return COMMANDS.includes(token as Command);
+}
+
+function isFailureKind(token: string): token is FailureKind {
+  return FAILURE_KINDS.includes(token as FailureKind);
+}
+
 export function parseArgs(argv: string[]): Args {
   const args = {
     command: "up" as const,
@@ -250,18 +353,38 @@ export function parseArgs(argv: string[]): Args {
     namespace: DEFAULT_NAMESPACE,
     release: DEFAULT_RELEASE,
     imageTag: DEFAULT_IMAGE_TAG,
+    endpoint: LOCAL_ENDPOINT,
+    timeoutSeconds: 300,
+    failure: "teardown-unverifiable" as const,
+    revocation: {},
+    kobeBin: process.env.KOBE_BIN ?? "kobe",
+    send: [],
+    // Long enough for the attach WebSocket to be established and the CLI to
+    // have entered raw mode. Keystrokes written before that are typed into a
+    // pty nobody is reading yet and are simply lost — which reads exactly like
+    // "the keystroke never reached the workload", the failure this harness
+    // exists to detect. Better to spend two seconds than to report it falsely.
+    sendDelayMs: 300,
+    settleMs: 2000,
+    attachArgv: [],
   } as Args;
 
   const [maybeCommand, ...rest] = argv;
-  const tokens = maybeCommand === "up" || maybeCommand === "down" ? rest : argv;
-  if (maybeCommand === "down") {
-    args.command = "down";
+  const tokens = isCommand(maybeCommand) ? rest : argv;
+  if (isCommand(maybeCommand)) {
+    args.command = maybeCommand;
   }
 
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
     const next = tokens[i + 1];
 
+    // Everything after a bare `--` belongs to the attached session, not to
+    // this script. Parsing it here would eat the workload's own flags.
+    if (token === "--") {
+      args.attachArgv = tokens.slice(i + 1);
+      break;
+    }
     if (token === "--cluster" && next) {
       args.cluster = next;
       i += 1;
@@ -287,6 +410,93 @@ export function parseArgs(argv: string[]): Args {
       i += 1;
       continue;
     }
+    if (token === "--kube-context" && next) {
+      args.kubeContext = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--endpoint" && next) {
+      args.endpoint = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--lease" && next) {
+      args.lease = next;
+      i += 1;
+      continue;
+    }
+    // `--after-phase` is what #138 wrote; `--wait-for-phase` is what it means.
+    // Both accepted so a recipe copied from the issue still runs.
+    if ((token === "--wait-for-phase" || token === "--after-phase") && next) {
+      args.waitForStage = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--timeout" && next) {
+      args.timeoutSeconds = parsePositiveInt(next, "--timeout");
+      i += 1;
+      continue;
+    }
+    if (token === "--kind" && next) {
+      if (!isFailureKind(next)) {
+        throw new Error(`unknown failure kind '${next}' (expected one of: ${FAILURE_KINDS.join(", ")})`);
+      }
+      args.failure = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--api-group" && next !== undefined) {
+      // Deliberately not `&& next`: the core API group is the empty string,
+      // and rejecting it would make every core-resource revocation impossible.
+      args.revocation.apiGroup = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--resource" && next) {
+      args.revocation.resource = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--verb" && next) {
+      args.revocation.verb = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--instance" && next) {
+      args.instance = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--kobe" && next) {
+      args.kobeBin = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--send" && next !== undefined) {
+      args.send.push(next);
+      i += 1;
+      continue;
+    }
+    if (token === "--send-delay" && next) {
+      args.sendDelayMs = parsePositiveInt(next, "--send-delay");
+      i += 1;
+      continue;
+    }
+    if (token === "--settle" && next) {
+      args.settleMs = parsePositiveInt(next, "--settle");
+      i += 1;
+      continue;
+    }
+    if (token === "--expect" && next !== undefined) {
+      args.expect = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--expect-exit" && next) {
+      args.expectExit = parsePositiveInt(next, "--expect-exit", { allowZero: true });
+      i += 1;
+      continue;
+    }
     if (token === "--help" || token === "-h") {
       printHelpAndExit();
     }
@@ -295,12 +505,43 @@ export function parseArgs(argv: string[]): Args {
   return args;
 }
 
+function parsePositiveInt(value: string, name: string, options?: { allowZero?: boolean }): number {
+  const parsed = Number.parseInt(value, 10);
+  const floor = options?.allowZero ? 0 : 1;
+  if (!Number.isFinite(parsed) || parsed < floor) {
+    throw new Error(`${name} must be an integer >= ${floor}, got '${value}'`);
+  }
+  return parsed;
+}
+
 function printHelpAndExit(): never {
   info("Usage:");
   info(
     "  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG] [--backend NAME]",
   );
   info("  bun run ./hack/e2e.ts down [--cluster NAME]");
+  info("");
+  info("Conformance harness (#138) — disturbs the target so #76's matrix can be run.");
+  info("All of these accept [--cluster NAME] [--namespace NS] [--release NAME]");
+  info("[--kube-context CTX] [--timeout SECONDS].");
+  info("");
+  info("  bun run ./hack/e2e.ts restart-operator [--wait-for-phase STAGE] [--lease ID] [--endpoint URL]");
+  info("      Restart the operator and wait until it is BOTH serving and leading again.");
+  info(`      Stages: ${Object.keys(LEASE_STAGES).join(", ")}`);
+  info("");
+  info("  bun run ./hack/e2e.ts inject-failure [--kind KIND] [--api-group G --resource R --verb V] [--instance NAME|--lease ID]");
+  info("  bun run ./hack/e2e.ts clear-failure  [--kind KIND]");
+  info(`      Kinds: ${FAILURE_KINDS.join(", ")} (default: teardown-unverifiable)`);
+  info("      rbac-revoke needs --api-group/--resource/--verb;");
+  info("      child-api-unreachable needs --instance, or --lease to resolve one from the CR.");
+  info("");
+  info("  bun run ./hack/e2e.ts reap-lease --lease ID");
+  info("      Delete a SandboxLease and its admission reservations. Quarantine has no API exit;");
+  info("      without this a quarantine scenario withholds capacity from every scenario after it.");
+  info("");
+  info("  bun run ./hack/e2e.ts attach-pty --lease ID [--send KEYS]... [--expect TEXT] [--expect-exit N]");
+  info("                                   [--kobe PATH] [--settle MS] [--send-delay MS] [-- ARGV...]");
+  info("      Drive `kobe sandbox attach` through a real pty. --send accepts \\r \\n \\t \\e \\xNN.");
   process.exit(0);
 }
 
@@ -1226,16 +1467,909 @@ async function down(args: Args): Promise<void> {
   clearStateFiles();
 }
 
+// ---------------------------------------------------------------------------
+// Conformance harness (#138)
+//
+// Three capabilities the dual-placement suite (tests/sandbox_conformance.rs)
+// cannot have and must not have. The suite asserts only through the public
+// HTTP API, because a suite that could reach around the API could pass while
+// the API was broken — and one that could break its own target could mask a
+// break it did not intend. So the disturbance lives here, on the other side of
+// a process boundary, and the suite still asserts nothing but the contract.
+// ---------------------------------------------------------------------------
+
+/// The shape of a `SandboxLease` this harness reads. Deliberately partial:
+/// naming only the fields that are waited on means a CRD field added later
+/// cannot silently change what a stage means.
+type SandboxLeaseObject = {
+  metadata?: {
+    name?: string;
+    uid?: string;
+    annotations?: Record<string, string>;
+  };
+  status?: {
+    phase?: string;
+    readyAt?: string;
+    target?: {
+      namespace?: string;
+      childClusterLease?: { uid?: string };
+      childClusterInstance?: { name?: string; uid?: string };
+      sandboxClaim?: { uid?: string };
+      sandbox?: { uid?: string };
+      pod?: { uid?: string };
+    };
+    conditions?: Array<{ type?: string; status?: string; reason?: string }>;
+  };
+};
+
+type LeaseStage = {
+  /// What the operator has finished doing, in the words of #76's matrix.
+  readonly describe: string;
+  readonly reached: (lease: SandboxLeaseObject) => boolean;
+};
+
+function conditionIsTrue(lease: SandboxLeaseObject, type: string): boolean {
+  return (lease.status?.conditions ?? []).some(
+    (condition) => condition.type === type && condition.status === "True",
+  );
+}
+
+/// The points a restart can be aimed at.
+///
+/// Every one of these is a signal the operator ALREADY writes and never
+/// unwrites — `child_provenance` is explicit that provenance is monotonic, a
+/// reference only ever added. That matters more than it looks: a stage defined
+/// by something that can flip back would let `restart-operator` fire twice, or
+/// fire after the moment it was aiming at, and the scenario would be testing a
+/// different restart than the one it named.
+///
+/// Two stages #76 asks for are deliberately ABSENT:
+///
+/// - `provisioning`, because nothing in production writes that phase. The only
+///   caller of `begin_sandbox_provisioning` is a unit test, so a real lease
+///   never passes through it and a harness waiting for it would hang until the
+///   timeout and report a restart that never happened.
+/// - `bootstrap`, because the upstream `SandboxTemplate`/`SandboxWarmPool`
+///   references on `status.target` are only ever copied from themselves — no
+///   code path populates them. Offering a stage backed by a marker nobody
+///   writes is worse than not offering it: the scenario reads as covered.
+export const LEASE_STAGES: Record<string, LeaseStage> = {
+  admitted: {
+    describe: "the HTTP API has admitted the lease and the controller may act",
+    reached: (lease) =>
+      lease.metadata?.annotations?.["kobe.kunobi.ninja/sandbox-admission"] === "admitted",
+  },
+  provenance: {
+    describe: "the first provenance write has landed",
+    reached: (lease) => Boolean(lease.status?.target?.namespace),
+  },
+  bind: {
+    describe: "the internal ClusterLease for a child-placed Sandbox is bound and recorded",
+    reached: (lease) => Boolean(lease.status?.target?.childClusterLease?.uid),
+  },
+  instance: {
+    describe: "the child ClusterInstance is recorded by UID",
+    reached: (lease) => Boolean(lease.status?.target?.childClusterInstance?.uid),
+  },
+  claim: {
+    describe: "the upstream SandboxClaim exists and is recorded by UID",
+    reached: (lease) => Boolean(lease.status?.target?.sandboxClaim?.uid),
+  },
+  access: {
+    describe: "the Pod a per-lease scoped credential can name is recorded",
+    reached: (lease) => Boolean(lease.status?.target?.pod?.uid),
+  },
+  canary: {
+    describe: "the readiness canary has run inside the Sandbox and passed",
+    reached: (lease) => conditionIsTrue(lease, "ReadinessCanary"),
+  },
+  ready: {
+    describe: "the lease is Ready and its runtime TTL has started",
+    reached: (lease) => lease.status?.phase === "Ready",
+  },
+  teardown: {
+    describe: "release has begun",
+    reached: (lease) => lease.status?.phase === "Releasing",
+  },
+  quarantined: {
+    describe: "teardown could not be proven and capacity is withheld",
+    reached: (lease) => lease.status?.phase === "Quarantined",
+  },
+  settled: {
+    describe: "the lease reached a clean terminal state",
+    reached: (lease) => lease.status?.phase === "Released" || lease.status?.phase === "Expired",
+  },
+};
+
+export function leaseStageReached(stage: string, lease: SandboxLeaseObject): boolean {
+  const definition = LEASE_STAGES[stage];
+  if (!definition) {
+    throw new Error(`unknown stage '${stage}' (expected one of: ${Object.keys(LEASE_STAGES).join(", ")})`);
+  }
+  return definition.reached(lease);
+}
+
+function contextFor(args: Args): string {
+  return args.kubeContext ?? kubeContext(args.cluster);
+}
+
+async function kubectl(
+  args: Args,
+  argv: string[],
+  options?: { allowFailure?: boolean; step?: string; stream?: boolean },
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const bin = await resolveTool("kubectl");
+  return runCommand([bin, "--context", contextFor(args), ...argv], options);
+}
+
+async function kubectlJson<T>(args: Args, argv: string[], options?: { step?: string }): Promise<T> {
+  const { stdout } = await kubectl(args, [...argv, "-o", "json"], options);
+  return JSON.parse(stdout) as T;
+}
+
+/// Read one SandboxLease, or `null` while it does not exist yet.
+///
+/// Absence is not an error here: `restart-operator --wait-for-phase` is
+/// routinely started in parallel with the lease's own creation, and treating
+/// the gap as a failure would make the harness lose a race it is meant to win.
+async function readSandboxLease(args: Args, lease: string): Promise<SandboxLeaseObject | null> {
+  const { stdout, exitCode } = await kubectl(
+    args,
+    ["get", "sandboxleases.kobe.kunobi.ninja", "-n", args.namespace, lease, "-o", "json"],
+    { allowFailure: true },
+  );
+  if (exitCode !== 0) return null;
+  return JSON.parse(stdout) as SandboxLeaseObject;
+}
+
+async function waitForLeaseStage(args: Args, lease: string, stage: string): Promise<void> {
+  const definition = LEASE_STAGES[stage];
+  if (!definition) {
+    throw new Error(`unknown stage '${stage}' (expected one of: ${Object.keys(LEASE_STAGES).join(", ")})`);
+  }
+
+  step(`Waiting for sandbox lease '${lease}' to reach '${stage}' (${definition.describe})`);
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let lastPhase = "<absent>";
+  for (;;) {
+    const observed = await readSandboxLease(args, lease);
+    if (observed && definition.reached(observed)) {
+      info(`  - reached '${stage}' (phase=${observed.status?.phase ?? "<none>"})`);
+      return;
+    }
+    lastPhase = observed?.status?.phase ?? "<absent>";
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `sandbox lease '${lease}' never reached '${stage}' within ${args.timeoutSeconds}s (last phase: ${lastPhase})`,
+      );
+    }
+    await Bun.sleep(1000);
+  }
+}
+
+/// Resolve the operator Deployment by selector rather than by name.
+///
+/// Its name is the Helm template `kobe.fullname`, which is `kobe` for a release
+/// called `kobe` and `<release>-kobe` for anything else. Hardcoding either
+/// would, against the other, restart nothing at all — and `kubectl rollout
+/// restart` on a name that does not exist is the kind of failure that reads as
+/// "the restart had no effect" rather than as a broken harness.
+async function operatorDeployment(args: Args): Promise<string> {
+  const { stdout } = await kubectl(args, [
+    "get",
+    "deployment",
+    "-n",
+    args.namespace,
+    "-l",
+    `app.kubernetes.io/name=kobe,app.kubernetes.io/instance=${args.release}`,
+    "-o",
+    "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
+  ]);
+  const names = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (names.length !== 1) {
+    throw new Error(
+      `expected exactly one operator Deployment in '${args.namespace}' for release '${args.release}', found: ${names.join(", ") || "none"}`,
+    );
+  }
+  return names[0];
+}
+
+type CoordinationLease = { spec?: { holderIdentity?: string; renewTime?: string } };
+
+async function leaderRenewTime(args: Args): Promise<string | undefined> {
+  const { stdout, exitCode } = await kubectl(
+    args,
+    ["get", "lease.coordination.k8s.io", "-n", args.namespace, OPERATOR_LEADER_LEASE, "-o", "json"],
+    { allowFailure: true },
+  );
+  if (exitCode !== 0) return undefined;
+  return (JSON.parse(stdout) as CoordinationLease).spec?.renewTime;
+}
+
+/// Wait until the operator answers `/readyz`.
+///
+/// Necessary but NOT sufficient — see `waitForFreshLeader`.
+async function waitForEndpointServing(args: Args): Promise<void> {
+  step(`Waiting for ${args.endpoint}/readyz`);
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let lastError = "no attempt made";
+  for (;;) {
+    try {
+      const response = await fetch(`${args.endpoint}/readyz`);
+      if (response.ok) {
+        info("  - serving");
+        return;
+      }
+      lastError = `HTTP ${response.status}: ${(await response.text()).trim()}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`operator did not serve /readyz within ${args.timeoutSeconds}s (${lastError})`);
+    }
+    await Bun.sleep(1000);
+  }
+}
+
+/// Wait until a NEW process is renewing the leader Lease.
+///
+/// `kubectl rollout status` returning and `/readyz` answering both only prove
+/// the HTTP server is up, and the HTTP server is up in every replica. The
+/// reconcilers — the thing a restart scenario is actually about — run solely in
+/// whichever replica holds this Lease, and it is acquired after the server
+/// starts. Acting on the sooner signal would drive a cluster whose controllers
+/// are not running yet, and the scenario would blame the operator for a race
+/// the harness created.
+///
+/// Freshness is judged by `renewTime` advancing rather than by matching
+/// `holderIdentity` against a pod name: the identity format belongs to the
+/// leader-election library, and a harness that asserted its shape would break
+/// on a dependency bump for no reason.
+async function waitForFreshLeader(args: Args, before: string | undefined): Promise<void> {
+  step("Waiting for a fresh leader to renew the operator Lease");
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  for (;;) {
+    const now = await leaderRenewTime(args);
+    if (now && now !== before) {
+      info(`  - leading again (renewTime=${now})`);
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `no replica took the '${OPERATOR_LEADER_LEASE}' Lease within ${args.timeoutSeconds}s (renewTime still ${before ?? "<absent>"})`,
+      );
+    }
+    await Bun.sleep(1000);
+  }
+}
+
+async function restartOperator(args: Args): Promise<void> {
+  if (args.waitForStage) {
+    if (!args.lease) {
+      throw new Error("--wait-for-phase needs --lease: a stage is a property of one lease, not of the cluster");
+    }
+    await waitForLeaseStage(args, args.lease, args.waitForStage);
+  }
+
+  const deployment = await operatorDeployment(args);
+  // Captured BEFORE the restart: the comparison in `waitForFreshLeader` is
+  // against this exact value, and reading it afterwards would compare the new
+  // leader with itself and return immediately.
+  const renewedBefore = await leaderRenewTime(args);
+
+  step(`Restarting deployment '${deployment}' in namespace '${args.namespace}'`);
+  await kubectl(args, ["rollout", "restart", `deployment/${deployment}`, "-n", args.namespace], {
+    step: `failed to restart deployment '${deployment}'`,
+  });
+  await kubectl(
+    args,
+    [
+      "rollout",
+      "status",
+      `deployment/${deployment}`,
+      "-n",
+      args.namespace,
+      `--timeout=${args.timeoutSeconds}s`,
+    ],
+    { step: `deployment '${deployment}' did not roll out`, stream: true },
+  );
+
+  await waitForEndpointServing(args);
+  await waitForFreshLeader(args, renewedBefore);
+  step("Operator is serving and leading again");
+}
+
+// ---------------------------------------------------------------------------
+// Failure injection
+// ---------------------------------------------------------------------------
+
+type PolicyRule = {
+  apiGroups?: string[];
+  resources?: string[];
+  verbs?: string[];
+  resourceNames?: string[];
+};
+
+type FailureState = {
+  kind: FailureKind;
+  capturedAt: string;
+  clusterRole?: { name: string; rules: PolicyRule[] };
+  services?: Array<{ namespace: string; name: string; selector: Record<string, string> | null }>;
+};
+
+function failureStatePath(kind: FailureKind): string {
+  return `${FAILURE_DIR}/${kind}.json`;
+}
+
+/// Remove one verb from one resource in one API group, leaving every other
+/// grant in the ClusterRole byte-identical.
+///
+/// RBAC has no deny, so the only way to take a permission away is to narrow the
+/// rule that grants it — and a rule usually grants several resources at once.
+/// Narrowing the whole rule would revoke the verb from its siblings too, and
+/// the scenario would then be testing a much larger breakage than it named. So
+/// a matching rule is SPLIT: the siblings keep everything they had, and the
+/// target resource gets its own rule minus the one verb.
+///
+/// A wildcard rule is refused rather than edited. `*` cannot be narrowed by
+/// subtraction — the split would leave the wildcard rule still granting the
+/// verb, and the injection would silently do nothing at all.
+export function revokeVerb(
+  rules: PolicyRule[],
+  target: RevocationTarget,
+): { rules: PolicyRule[]; revoked: number } {
+  let revoked = 0;
+  const next: PolicyRule[] = [];
+
+  for (const rule of rules) {
+    const groups = rule.apiGroups ?? [];
+    const resources = rule.resources ?? [];
+    const verbs = rule.verbs ?? [];
+
+    const grants =
+      (groups.includes("*") || groups.includes(target.apiGroup)) &&
+      (resources.includes("*") || resources.includes(target.resource)) &&
+      (verbs.includes("*") || verbs.includes(target.verb));
+    if (!grants) {
+      next.push(rule);
+      continue;
+    }
+
+    const named =
+      groups.includes(target.apiGroup) && resources.includes(target.resource) && verbs.includes(target.verb);
+    if (!named) {
+      throw new Error(
+        `cannot revoke ${target.apiGroup || "core"}/${target.resource}:${target.verb}: rule ${JSON.stringify(rule)} grants it through a wildcard, which subtraction cannot narrow`,
+      );
+    }
+
+    revoked += 1;
+    const otherGroups = groups.filter((group) => group !== target.apiGroup);
+    if (otherGroups.length > 0) {
+      next.push({ ...rule, apiGroups: otherGroups });
+    }
+    const otherResources = resources.filter((resource) => resource !== target.resource);
+    if (otherResources.length > 0) {
+      next.push({ ...rule, apiGroups: [target.apiGroup], resources: otherResources });
+    }
+    const remainingVerbs = verbs.filter((verb) => verb !== target.verb);
+    if (remainingVerbs.length > 0) {
+      next.push({
+        ...rule,
+        apiGroups: [target.apiGroup],
+        resources: [target.resource],
+        verbs: remainingVerbs,
+      });
+    }
+  }
+
+  return { rules: next, revoked };
+}
+
+function loadFailureState(kind: FailureKind): FailureState | null {
+  const path = failureStatePath(kind);
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, "utf8")) as FailureState;
+}
+
+async function saveFailureState(state: FailureState): Promise<void> {
+  await runCommand(["mkdir", "-p", FAILURE_DIR], { step: "failed to create the failure state directory" });
+  await Bun.write(failureStatePath(state.kind), JSON.stringify(state, null, 2));
+}
+
+/// Refuse to inject a failure that is already injected.
+///
+/// The second capture would record the ALREADY BROKEN state as the original,
+/// and `clear-failure` would then faithfully restore the breakage — leaving a
+/// cluster that looks repaired and is not. Every scenario after it would fail
+/// for a reason that has nothing to do with what it asserts.
+function refuseDoubleInjection(kind: FailureKind): void {
+  const existing = loadFailureState(kind);
+  if (existing) {
+    throw new Error(
+      `failure '${kind}' is already injected (captured ${existing.capturedAt}); run 'clear-failure --kind ${kind}' first`,
+    );
+  }
+}
+
+function revocationsFor(args: Args): RevocationTarget[] {
+  if (args.failure === "teardown-unverifiable") {
+    return [...UNVERIFIABLE_TEARDOWN_REVOCATIONS];
+  }
+  const { apiGroup, resource, verb } = args.revocation;
+  if (apiGroup === undefined || !resource || !verb) {
+    throw new Error("--kind rbac-revoke needs --api-group, --resource and --verb");
+  }
+  return [{ apiGroup, resource, verb }];
+}
+
+async function injectRbacRevocation(args: Args): Promise<void> {
+  // Resolved before anything is read or written: an incomplete request should
+  // say so, not fail three calls later with a message about a Deployment.
+  const targets = revocationsFor(args);
+  refuseDoubleInjection(args.failure);
+  // Same name as the Deployment: both render from `kobe.fullname`. Resolving
+  // the Deployment first means a release named anything at all still finds its
+  // own ClusterRole rather than a same-labelled one from another release.
+  const name = await operatorDeployment(args);
+  const role = await kubectlJson<{ rules: PolicyRule[] }>(args, ["get", "clusterrole", name], {
+    step: `failed to read ClusterRole '${name}'`,
+  });
+  const original = role.rules;
+
+  let rules = original;
+  for (const target of targets) {
+    const result = revokeVerb(rules, target);
+    if (result.revoked === 0) {
+      throw new Error(
+        `ClusterRole '${name}' never granted ${target.apiGroup || "core"}/${target.resource}:${target.verb}, so revoking it would prove nothing`,
+      );
+    }
+    info(`  - revoking ${target.apiGroup || "core"}/${target.resource}:${target.verb} (${result.revoked} rule(s))`);
+    rules = result.rules;
+  }
+
+  await saveFailureState({
+    kind: args.failure,
+    capturedAt: new Date().toISOString(),
+    clusterRole: { name, rules: original },
+  });
+  await kubectl(args, ["patch", "clusterrole", name, "--type=merge", "-p", JSON.stringify({ rules })], {
+    step: `failed to narrow ClusterRole '${name}'`,
+  });
+  step(`Injected '${args.failure}' into ClusterRole '${name}'`);
+}
+
+type ServiceList = {
+  items: Array<{
+    metadata: { name: string; namespace: string };
+    spec?: { selector?: Record<string, string> };
+  }>;
+};
+
+/// Make a child cluster's API server unreachable without destroying it.
+///
+/// The Service in front of it keeps existing; only its selector is swapped for
+/// one nothing carries, so it resolves to zero endpoints. Deleting the
+/// StatefulSet instead would have made teardown succeed for the WRONG reason —
+/// the property under test is what the operator does when it cannot REACH a
+/// cluster that is still there, which is the case where releasing capacity
+/// would be a double-booking rather than a cleanup.
+async function injectChildApiUnreachable(args: Args): Promise<void> {
+  // `--lease` rather than `--instance` is the form a conformance scenario can
+  // actually use: the API strips `childClusterInstance` from what a caller may
+  // read, on purpose, so the suite never learns the name. The harness reads it
+  // from the CR instead — which is the whole reason the harness exists.
+  refuseDoubleInjection(args.failure);
+  const instance = args.instance ?? (await childInstanceOf(args));
+
+  const found = await kubectlJson<ServiceList>(args, [
+    "get",
+    "service",
+    "--all-namespaces",
+    "-l",
+    `${CHILD_CLUSTER_LABEL}=${instance}`,
+  ]);
+  if (found.items.length === 0) {
+    throw new Error(
+      `no Service carries ${CHILD_CLUSTER_LABEL}=${instance}; the instance may not exist, or its backend (vcluster installs an upstream Helm chart) may not stamp the label`,
+    );
+  }
+
+  const captured = found.items.map((service) => ({
+    namespace: service.metadata.namespace,
+    name: service.metadata.name,
+    selector: service.spec?.selector ?? null,
+  }));
+  await saveFailureState({
+    kind: args.failure,
+    capturedAt: new Date().toISOString(),
+    services: captured,
+  });
+
+  for (const service of captured) {
+    info(`  - severing ${service.namespace}/${service.name} (instance ${instance})`);
+    await kubectl(
+      args,
+      [
+        "patch",
+        "service",
+        service.name,
+        "-n",
+        service.namespace,
+        "--type=merge",
+        "-p",
+        JSON.stringify({ spec: { selector: UNREACHABLE_SELECTOR } }),
+      ],
+      { step: `failed to sever Service '${service.namespace}/${service.name}'` },
+    );
+  }
+  step(`Injected '${args.failure}' for ClusterInstance '${instance}'`);
+}
+
+/// Resolve the child cluster behind a lease, by reading the CR.
+async function childInstanceOf(args: Args): Promise<string> {
+  if (!args.lease) {
+    throw new Error("--kind child-api-unreachable needs --instance <ClusterInstance> or --lease <id>");
+  }
+  const lease = await readSandboxLease(args, args.lease);
+  if (!lease) {
+    throw new Error(`sandbox lease '${args.lease}' does not exist`);
+  }
+  const instance = lease.status?.target?.childClusterInstance?.name;
+  if (!instance) {
+    throw new Error(
+      `sandbox lease '${args.lease}' records no child ClusterInstance; a management-placed lease has no child API to sever`,
+    );
+  }
+  return instance;
+}
+
+async function injectFailure(args: Args): Promise<void> {
+  if (args.failure === "child-api-unreachable") {
+    await injectChildApiUnreachable(args);
+    return;
+  }
+  await injectRbacRevocation(args);
+}
+
+async function clearFailure(args: Args): Promise<void> {
+  const state = loadFailureState(args.failure);
+  if (!state) {
+    // Not an error. `clear-failure` is what a scenario runs on its way out,
+    // including on the path where the injection itself failed — making that
+    // path noisy would bury the real failure under a second one.
+    info(`no '${args.failure}' failure is injected`);
+    return;
+  }
+
+  if (state.clusterRole) {
+    step(`Restoring ClusterRole '${state.clusterRole.name}'`);
+    await kubectl(
+      args,
+      [
+        "patch",
+        "clusterrole",
+        state.clusterRole.name,
+        "--type=merge",
+        "-p",
+        JSON.stringify({ rules: state.clusterRole.rules }),
+      ],
+      { step: `failed to restore ClusterRole '${state.clusterRole.name}'` },
+    );
+  }
+
+  for (const service of state.services ?? []) {
+    step(`Restoring Service '${service.namespace}/${service.name}'`);
+    await kubectl(
+      args,
+      [
+        "patch",
+        "service",
+        service.name,
+        "-n",
+        service.namespace,
+        "--type=merge",
+        "-p",
+        JSON.stringify({ spec: { selector: service.selector } }),
+      ],
+      { step: `failed to restore Service '${service.namespace}/${service.name}'` },
+    );
+  }
+
+  // Removed LAST. A state file deleted before the restore landed would leave a
+  // broken cluster that no longer knows it is broken.
+  rmSync(failureStatePath(args.failure), { force: true });
+  step(`Cleared '${args.failure}'`);
+}
+
+/// Delete a SandboxLease and the admission reservations it still holds.
+///
+/// Quarantine is deliberately terminal and deliberately keeps consuming
+/// capacity: an operator can reconcile an under-counted pool, but nobody can
+/// see a Sandbox that was quietly double-booked. That is the right product
+/// behaviour and the wrong test behaviour — a scenario that proves quarantine
+/// happens would otherwise withhold a slot from every scenario after it, and
+/// they would fail by queueing, for a reason none of them assert.
+///
+/// So the exit exists here, in the harness, and nowhere in the API. That is the
+/// point: the "operator intervention" quarantine requires is exactly what this
+/// is, performed against the cluster rather than through the contract.
+async function reapLease(args: Args): Promise<void> {
+  if (!args.lease) {
+    throw new Error("reap-lease needs --lease <id>");
+  }
+  const lease = await readSandboxLease(args, args.lease);
+  if (!lease) {
+    info(`sandbox lease '${args.lease}' does not exist`);
+    return;
+  }
+
+  const uid = lease.metadata?.uid;
+  if (uid) {
+    step(`Deleting admission reservations for lease uid ${uid}`);
+    await kubectl(
+      args,
+      [
+        "delete",
+        "lease.coordination.k8s.io",
+        "-n",
+        args.namespace,
+        "-l",
+        `${SANDBOX_LEASE_UID_LABEL}=${uid}`,
+        "--ignore-not-found",
+      ],
+      { step: "failed to delete admission reservations" },
+    );
+  }
+
+  step(`Deleting sandbox lease '${args.lease}'`);
+  await kubectl(
+    args,
+    [
+      "delete",
+      "sandboxleases.kobe.kunobi.ninja",
+      "-n",
+      args.namespace,
+      args.lease,
+      "--ignore-not-found",
+      `--timeout=${args.timeoutSeconds}s`,
+    ],
+    { step: `failed to delete sandbox lease '${args.lease}'` },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// pty harness
+// ---------------------------------------------------------------------------
+
+/// Decode a `--send` payload into the bytes a keyboard would have produced.
+///
+/// Control characters have to be expressible on a command line, and the ones
+/// that matter most are precisely the ones that cannot be typed into an
+/// argument: `\r` ends a line and `\x03` is the Ctrl-C whose arrival at the
+/// workload is the property being tested.
+export function decodeKeystrokes(spec: string): Uint8Array {
+  const bytes: number[] = [];
+  for (let i = 0; i < spec.length; i += 1) {
+    if (spec[i] !== "\\") {
+      bytes.push(...new TextEncoder().encode(spec[i]));
+      continue;
+    }
+    const escape = spec[i + 1];
+    i += 1;
+    switch (escape) {
+      case "r":
+        bytes.push(0x0d);
+        break;
+      case "n":
+        bytes.push(0x0a);
+        break;
+      case "t":
+        bytes.push(0x09);
+        break;
+      case "e":
+        bytes.push(0x1b);
+        break;
+      case "0":
+        bytes.push(0x00);
+        break;
+      case "\\":
+        bytes.push(0x5c);
+        break;
+      case "x": {
+        const hex = spec.slice(i + 1, i + 3);
+        if (!/^[0-9a-fA-F]{2}$/.test(hex)) {
+          throw new Error(`\\x must be followed by two hex digits, got '${hex}'`);
+        }
+        bytes.push(Number.parseInt(hex, 16));
+        i += 2;
+        break;
+      }
+      default:
+        throw new Error(`unknown escape '\\${escape ?? ""}' in --send payload`);
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+/// Run argv on a pty, forward this process's stdin to it, and exit with its
+/// status. `sys.argv[1:]` because `-c` occupies `sys.argv[0]`.
+const PTY_SPAWN = "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))";
+
+/// Wrap a command so it runs with a controlling terminal.
+///
+/// A pty is not a convenience here, it is the only option. `kobe sandbox attach`
+/// reads keys through crossterm's event stream, which uses stdin only when
+/// `isatty(0)` and otherwise opens `/dev/tty` — so a pipe on stdin is not read
+/// at all, and in CI, where there is no controlling terminal to fall back to,
+/// the stream errors out. Feeding keystrokes to attach therefore REQUIRES a
+/// real terminal on the other end, which is exactly why this could not be
+/// tested before.
+///
+/// `python3 -c 'pty.spawn(...)'` rather than `script(1)`, which is the obvious
+/// choice and does not work: BSD `script` calls `tcgetattr` on ITS stdin to
+/// clone the terminal settings, and a harness necessarily feeds keystrokes
+/// through a pipe, so it dies with `tcgetattr/ioctl: Operation not supported on
+/// socket` before the command starts. util-linux's `script` tolerates it, so
+/// the harness would work in CI and fail on every maintainer's laptop —
+/// and it would fail by producing no output, which is indistinguishable from
+/// the keystroke-delivery bug this exists to detect. `pty.spawn` handles a
+/// non-tty stdin explicitly and identically on both.
+///
+/// Python rather than a pty binding because this repo has no JavaScript
+/// dependencies at all, and adding one would put a node_modules tree in the
+/// path of every e2e run.
+export function ptyCommand(python: string, argv: string[]): string[] {
+  return [python, "-c", PTY_SPAWN, ...argv];
+}
+
+/// Locate a Python that can allocate the pty, or say so plainly.
+///
+/// Named explicitly rather than falling back to `script`: two allocators with
+/// different behaviour would make a failure mean two different things.
+async function resolvePython(): Promise<string> {
+  for (const candidate of [process.env.PYTHON ?? "python3", "python"]) {
+    const { exitCode } = await runCommand([candidate, "-c", "import pty"], { allowFailure: true });
+    if (exitCode === 0) return candidate;
+  }
+  throw new Error(
+    "attach-pty needs a python3 with the stdlib `pty` module to allocate a terminal; set PYTHON to one",
+  );
+}
+
+async function attachPty(args: Args): Promise<void> {
+  if (!args.lease) {
+    throw new Error("attach-pty needs --lease <id>");
+  }
+  if (!args.expect && args.expectExit === undefined) {
+    throw new Error("attach-pty needs --expect and/or --expect-exit: a session with no assertion proves nothing");
+  }
+
+  const attach = [
+    args.kobeBin,
+    "sandbox",
+    "attach",
+    args.lease,
+    ...(args.attachArgv.length > 0 ? ["--", ...args.attachArgv] : []),
+  ];
+  const cmd = ptyCommand(await resolvePython(), attach);
+  step(`Attaching through a pty: ${attach.join(" ")}`);
+
+  const proc = Bun.spawn({
+    cmd,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: process.cwd(),
+    // A terminal type the remote shell can render into. Without one it falls
+    // back to `dumb`, where a prompt may never be drawn — and a harness waiting
+    // on output would then time out with nothing to show for it.
+    env: { ...process.env, TERM: process.env.TERM ?? "xterm-256color" },
+  });
+
+  let transcript = "";
+  const decoder = new TextDecoder();
+  const drain = async (stream: ReadableStream<Uint8Array>): Promise<void> => {
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      transcript += decoder.decode(value, { stream: true });
+    }
+  };
+  const pumped = Promise.all([drain(proc.stdout), drain(proc.stderr)]);
+
+  const writer = proc.stdin;
+  await Bun.sleep(args.settleMs);
+  for (const payload of args.send) {
+    writer.write(decodeKeystrokes(payload));
+    await writer.flush();
+    await Bun.sleep(args.sendDelayMs);
+  }
+
+  let matched = args.expect === undefined;
+  if (args.expect !== undefined) {
+    const deadline = Date.now() + args.timeoutSeconds * 1000;
+    while (Date.now() < deadline) {
+      if (transcript.includes(args.expect)) {
+        matched = true;
+        break;
+      }
+      await Bun.sleep(200);
+    }
+  }
+
+  if (args.expectExit === undefined) {
+    // Nothing asserts how the session ends, so end it. Leaving it attached
+    // would hold one of the lease's eight concurrent streams until the idle
+    // timeout, and the next scenario would be refused with a 429 it never asked
+    // about.
+    //
+    // stdin is closed first: that collapses the pty, which hangs up `kobe` the
+    // way a closed terminal window would. `kill` alone reaches `script`, and a
+    // `kobe` reparented away from it would keep the stream open exactly as if
+    // nothing had been cleaned up.
+    writer.end();
+  }
+  // Bounded either way. An attach that never exits would otherwise hang here
+  // long past the timeout the caller asked for, and CI would kill the run with
+  // no transcript at all — the one artefact that says what went wrong.
+  //
+  // A cleared timer rather than a bare sleep: an un-cleared one keeps the event
+  // loop alive, and every successful run would then take the full timeout.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), args.timeoutSeconds * 1000);
+  });
+  const outcome = await Promise.race([proc.exited, expired]);
+  clearTimeout(timer);
+  if (outcome === "timeout") {
+    proc.kill();
+  }
+  const exitCode = outcome === "timeout" ? await proc.exited : outcome;
+  await pumped;
+
+  info("--- session transcript ---");
+  info(transcript.trimEnd());
+  info("--- end transcript ---");
+
+  if (!matched) {
+    throw new Error(`the attached session never produced ${JSON.stringify(args.expect)} within ${args.timeoutSeconds}s`);
+  }
+  if (args.expectExit !== undefined && exitCode !== args.expectExit) {
+    throw new Error(`kobe sandbox attach exited ${exitCode}, expected ${args.expectExit}`);
+  }
+  step("Attached session satisfied every assertion");
+}
+
 async function main() {
   try {
     const args = parseArgs(Bun.argv.slice(2));
 
-    if (args.command === "up") {
-      await up(args);
-      return;
+    switch (args.command) {
+      case "up":
+        await up(args);
+        return;
+      case "down":
+        await down(args);
+        return;
+      case "restart-operator":
+        await restartOperator(args);
+        return;
+      case "inject-failure":
+        await injectFailure(args);
+        return;
+      case "clear-failure":
+        await clearFailure(args);
+        return;
+      case "reap-lease":
+        await reapLease(args);
+        return;
+      case "attach-pty":
+        await attachPty(args);
+        return;
     }
-
-    await down(args);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     fail(message);

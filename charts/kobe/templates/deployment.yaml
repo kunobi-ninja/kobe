@@ -68,6 +68,17 @@ spec:
               value: {{ .Values.logLevel | quote }}
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
+            # `managed` is rejected by the operator at startup rather than
+            # here, so the refusal and its reason live in one place and a
+            # direct (non-Helm) deployment cannot route around it.
+            - name: AGENT_SANDBOX_MODE
+              value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
+            # Retention window for terminal SandboxLease records. Always set,
+            # including in `disabled` mode, so switching the mode on does not
+            # also silently change the retention policy from whatever the
+            # operator wrote here to the built-in default.
+            - name: KOBE_SANDBOX_LEASE_RETENTION
+              value: {{ .Values.agentSandbox.leaseRetention | default "168h" | quote }}
             - name: POOL_SERVICE_ACCOUNT
               value: {{ .Values.poolServiceAccount | default (include "kobe.serviceAccountName" .) | quote }}
             - name: POOL_PUBLISHER_SERVICE_ACCOUNT

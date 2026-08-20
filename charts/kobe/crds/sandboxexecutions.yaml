@@ -1,0 +1,135 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxexecutions.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: SandboxExecution
+    plural: sandboxexecutions
+    shortNames:
+    - sbxe
+    singular: sandboxexecution
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .status.exitCode
+      name: Exit
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SandboxExecutionSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              One command's durable record.
+
+              Owner-referenced to its `SandboxLease`, so it cannot outlive the lease it
+              belongs to: #82 requires history to end with the Sandbox, and an execution
+              record that survived would describe a workload nobody can inspect.
+            properties:
+              detached:
+                default: false
+                description: Whether the caller waited for the result.
+                type: boolean
+              idempotencyKey:
+                description: Caller-supplied key. Two requests with this key are the same request.
+                maxLength: 253
+                minLength: 1
+                type: string
+              leaseUid:
+                description: |-
+                  The lease this ran under, by UID. An execution never outlives its exact
+                  lease: a same-named successor is a different Sandbox, and answering its
+                  caller with this record would describe somebody else's command.
+                minLength: 1
+                type: string
+              podUid:
+                description: |-
+                  The Pod it ran in, by UID. Recorded so a replaced Pod invalidates the
+                  record rather than silently re-pointing it.
+                minLength: 1
+                type: string
+              requestDigest:
+                description: |-
+                  SHA-256 over the canonical request. Never the request itself: a command
+                  line routinely carries secrets, and object status is readable by anyone
+                  with `get`, replicated to every etcd member, and included in backups.
+                maxLength: 64
+                minLength: 64
+                type: string
+              timeout:
+                description: Wall-clock bound the runner enforces.
+                minLength: 1
+                type: string
+            required:
+            - idempotencyKey
+            - leaseUid
+            - podUid
+            - requestDigest
+            - timeout
+            type: object
+          status:
+            nullable: true
+            properties:
+              exitCode:
+                description: |-
+                  The remote process's exact exit code. Absent unless the command actually
+                  ran to completion — a synthesised zero would be indistinguishable from
+                  a real success.
+                format: int32
+                nullable: true
+                type: integer
+              finishedAt:
+                format: date-time
+                nullable: true
+                type: string
+              reason:
+                description: |-
+                  Bounded reason code. Never a raw backend message, and never any part of
+                  the command's own output.
+                maxLength: 64
+                nullable: true
+                type: string
+              startedAt:
+                format: date-time
+                nullable: true
+                type: string
+              state:
+                default: Queued
+                description: Where an execution is.
+                enum:
+                - Running
+                - Succeeded
+                - Queued
+                - Failed
+                - Cancelled
+                - TimedOut
+                - Unknown
+                type: string
+              verdictDeadline:
+                description: |-
+                  Deadline after which a still-`Running` execution becomes `Unknown`.
+
+                  Persisted rather than derived, so a restarted controller reaches the
+                  same verdict as the one that started it.
+                format: date-time
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: SandboxExecution
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

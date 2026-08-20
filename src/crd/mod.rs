@@ -3,6 +3,7 @@ pub mod bootstrap_config;
 pub mod cidr;
 #[allow(dead_code)]
 pub mod datastore;
+pub mod execution;
 pub mod instance;
 pub mod lease;
 pub mod profile;
@@ -19,6 +20,7 @@ pub use bootstrap_config::*;
 pub use cidr::*;
 #[allow(unused_imports)]
 pub use datastore::*;
+pub use execution::*;
 pub use instance::*;
 pub use lease::*;
 pub use profile::*;

@@ -47,6 +47,10 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::SandboxLease::crd()).unwrap()
         ),
+        "sandboxexecutions" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::SandboxExecution::crd()).unwrap()
+        ),
         _ => {
             print!(
                 "{}",
@@ -96,6 +100,11 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::SandboxLease::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::SandboxExecution::crd()).unwrap()
             );
         }
     }

@@ -235,10 +235,20 @@ impl TeardownReceipt {
         {
             return false;
         }
-        // A reference without a UID cannot fence anything: two `None` UIDs
+        // A reference without a UID cannot fence anything: two absent UIDs
         // compare equal, so a same-named replacement would satisfy the match
         // that is supposed to exclude it.
-        if self.lease.uid.is_none() || self.instance.uid.is_none() || self.pool.uid.is_none() {
+        //
+        // EMPTY counts as absent. `Some("")` is not a UID, and checking only
+        // for `None` left the exact hole this paragraph describes: two empty
+        // strings compare equal just as happily as two `None`s.
+        let fenced = |reference: &ResourceRef| {
+            reference
+                .uid
+                .as_deref()
+                .is_some_and(|uid| !uid.trim().is_empty())
+        };
+        if !fenced(&self.lease) || !fenced(&self.instance) || !fenced(&self.pool) {
             return false;
         }
         // Identity, not just shape: a valid receipt for a *different* subject

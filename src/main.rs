@@ -8,6 +8,7 @@ mod metrics;
 pub mod pki;
 mod pool;
 mod sandbox;
+mod sandbox_runtime;
 mod telemetry;
 mod velero;
 
@@ -63,7 +64,40 @@ async fn main() -> anyhow::Result<()> {
         "Starting kobe-operator"
     );
 
+    // Refuse an unimplemented or unrecognised Agent Sandbox mode at STARTUP.
+    // Deferring it to the first Sandbox request would leave a cluster running
+    // that looks healthy and fails only when someone tries to use it.
+    let agent_sandbox_mode = match sandbox_runtime::mode_from_env() {
+        Ok(mode) => {
+            info!(?mode, "Agent Sandbox runtime mode");
+            mode
+        }
+        Err(err) => {
+            error!(reason = err.reason_code(), "{err}");
+            std::process::exit(1);
+        }
+    };
+
     let client = Client::try_default().await?;
+
+    // In `external` mode the runtime is the operator's to install, so verify it
+    // is actually there and compatible before anything depends on it. Refused
+    // at startup rather than per-request: a cluster that looks healthy and only
+    // fails when someone tries to use Sandbox is the worse failure.
+    //
+    // Deliberately no create/delete canary — writing a real SandboxClaim is one
+    // of the effects paused on #72. Presence and version are a weaker signal
+    // than a canary, and that limit is stated rather than hidden.
+    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+        match sandbox_runtime::validate_external_runtime(&client).await {
+            Ok(()) => info!("Agent Sandbox runtime validated (external, operator-installed)"),
+            Err(err) => {
+                error!(reason = err.reason_code(), "{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
     let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
 
@@ -96,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         factory: Some(factory.clone()),
         datastore: datastore.clone(),
         connect_cache: Default::default(),
+        sandbox_admission_limiter: Default::default(),
     };
 
     let app = build_router(state);
@@ -244,6 +279,88 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     });
+
+    // Start Sandbox placement, but ONLY when a validated runtime is present.
+    // Spawning it in `disabled` mode would have it watch CRDs that may not
+    // exist and log errors forever; spawning it without the #72 validation
+    // would let it write objects an incompatible runtime cannot reconcile.
+    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+        let sandbox_client = client.clone();
+        let sandbox_ns = namespace.clone();
+        let sandbox_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            controllers::sandbox::run_sandbox_controller(
+                sandbox_client,
+                &sandbox_ns,
+                sandbox_shutdown,
+            )
+            .await;
+        });
+
+        // Stream revocation runs on EVERY replica that serves Sandbox
+        // operations, not just the controller leader. A replica can only
+        // cancel connections it is holding itself — the socket lives in one
+        // process — so a leader-elected revoker would leave live streams on
+        // every other replica with nobody watching them.
+        // Executions left Running by a process that disappeared are settled
+        // here. The reserve-then-spawn order buys "never a duplicate spawn"
+        // and pays for it with records nobody is left to finish; this is what
+        // turns those into an honest `Unknown` rather than a poll that never
+        // ends.
+        let execution_reaper_client = client.clone();
+        let execution_reaper_ns = namespace.clone();
+        let execution_reaper_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            api::sandbox_executions::run_execution_reaper(
+                execution_reaper_client,
+                &execution_reaper_ns,
+                std::time::Duration::from_secs(60),
+                execution_reaper_shutdown,
+            )
+            .await;
+        });
+
+        // Terminal lease records are retired here. `Released` and `Expired`
+        // stop consuming capacity when they are written, so nothing leaks —
+        // the objects just accumulate, one per Sandbox ever leased, until
+        // etcd carries a row for every Sandbox that ever existed. The window
+        // is measured in days because the record is an audit trail, and the
+        // tick is hourly because nothing on that scale is worth a minute's
+        // list churn against the API server.
+        let lease_reaper_client = client.clone();
+        let lease_reaper_ns = namespace.clone();
+        let lease_reaper_shutdown = shutdown.clone();
+        let lease_retention = api::sandbox::sandbox_lease_retention(
+            std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
+                .ok()
+                .as_deref(),
+        );
+        tokio::spawn(async move {
+            api::sandbox::run_sandbox_lease_reaper(
+                lease_reaper_client,
+                &lease_reaper_ns,
+                std::time::Duration::from_secs(3600),
+                lease_retention,
+                lease_reaper_shutdown,
+            )
+            .await;
+        });
+
+        let revoker_client = client.clone();
+        let revoker_ns = namespace.clone();
+        let revoker_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            api::sandbox_streams::run_stream_revoker(
+                revoker_client,
+                &revoker_ns,
+                api::sandbox_streams::registry().clone(),
+                revoker_shutdown,
+            )
+            .await;
+        });
+    } else {
+        info!("Sandbox placement not started (agentSandbox.mode is not external)");
+    }
 
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
     // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller

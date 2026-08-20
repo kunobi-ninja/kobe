@@ -78,6 +78,42 @@ containerSecurityContext:
 # Cluster-side defense-in-depth policies. These are opt-in because they
 # require Kubernetes features that may not be available in every cluster
 # (ValidatingAdmissionPolicy is GA in K8s 1.30+).
+# Upstream Agent Sandbox runtime (kubernetes-sigs/agent-sandbox).
+#
+# Kobe consumes SandboxTemplate / SandboxWarmPool / SandboxClaim from that
+# project. This selects how the runtime gets there.
+#
+#   disabled  (default) Sandbox features are off. Nothing is validated and no
+#             Sandbox API is served, so an upgrade never starts depending on a
+#             runtime you have not installed.
+#
+#   external  You install and own the runtime; kobe validates that the required
+#             APIs are present and version-compatible, and owns nothing.
+#
+#   managed   NOT IMPLEMENTED. It would install and RETAIN cluster-scoped CRDs,
+#             RBAC and a webhook across uninstall — Helm never deletes anything
+#             from a chart's crds/ directory, so those become permanent on any
+#             cluster that installs once. Pending approval on
+#             kunobi-ninja/kobe#72. Selecting it fails with an explicit error
+#             rather than falling back, so it cannot be switched on by accident.
+agentSandbox:
+  mode: disabled
+  # How long a SandboxLease that reached a clean terminal phase (`Released` or
+  # `Expired`) is kept before the record is deleted. Those phases stop
+  # consuming capacity when they are written, so this is not about reclaiming
+  # anything — it bounds the one-object-per-Sandbox-ever-leased growth of etcd,
+  # and it costs the audit record of who held what and whether cleanup was
+  # proven. Set it to however long you would want to be able to answer that
+  # question after the fact.
+  #
+  # `Quarantined` leases are NEVER retired by this sweep, at any window. That
+  # phase is what withholds a slot whose teardown nobody could prove; deleting
+  # it would hand the slot back on no evidence and take the record with it.
+  #
+  # Units are h/m/s (there is no `d`). Values under 1h are clamped to 1h, and
+  # anything unparseable falls back to the default rather than to zero.
+  leaseRetention: 168h
+
 clusterPolicies:
   # Restricts the operator's namespace deletion permission (granted
   # broadly by the ClusterRole, since RBAC cannot pattern-match names)

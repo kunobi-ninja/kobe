@@ -70,11 +70,11 @@ function "tags" {
 # Groups
 # =============================================================================
 group "default" {
-  targets = ["operator", "kobe-sync"]
+  targets = ["operator", "kobe-sync", "runner"]
 }
 
 group "push" {
-  targets = ["operator-push", "kobe-sync-push"]
+  targets = ["operator-push", "kobe-sync-push", "runner-push"]
 }
 
 # =============================================================================
@@ -151,4 +151,32 @@ target "kobe-sync-push" {
   inherits = ["kobe-sync"]
   output   = ["type=registry"]
   # cache-to = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache,mode=max"]
+}
+
+# =============================================================================
+# kobe-runner image
+#
+# Deliberately NOT built from the shared `builder` context. The runner ships
+# inside an administrator's Sandbox image, so it is compiled statically against
+# musl with only its own (tiny) dependency tree — reusing the operator's
+# builder would both waste the whole kube/aws/sqlx compile and let the thing
+# that runs next to a tenant's workload inherit an operator dependency.
+# =============================================================================
+target "runner" {
+  dockerfile = "docker/runner.Dockerfile"
+  context    = "."
+  platforms  = [PLATFORM]
+  tags       = tags("kobe-runner")
+  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/runner"]
+  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/runner,mode=max"]
+  args = {
+    BUILD_VERSION = BUILD_VERSION
+    BUILD_COMMIT  = BUILD_COMMIT
+    BUILD_DATE    = BUILD_DATE
+  }
+}
+
+target "runner-push" {
+  inherits = ["runner"]
+  output   = ["type=registry"]
 }

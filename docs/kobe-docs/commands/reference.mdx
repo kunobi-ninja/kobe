@@ -11,6 +11,12 @@ description: All kobe CLI commands with flags and examples.
 |---|---|
 | `kobe status` | Show endpoint status, auth methods, and pool summary |
 | `kobe version` | Show CLI and endpoint versions |
+| `kobe sandbox run` | Create a sandbox, run one command, release it ([details](/commands/sandbox)) |
+| `kobe sandbox exec` | Run a command in a sandbox you already hold |
+| `kobe sandbox logs` | Read a bounded tail of a sandbox's output |
+| `kobe sandbox cancel` | Cancel a running execution |
+| `kobe sandbox attach` | Open an interactive session in a sandbox |
+| `kobe sandbox port-forward` | Forward a declared sandbox port to a local one |
 | `kobe login` | Authenticate with the kobe service |
 | `kobe logout` | Remove stored credentials |
 | `kobe lease <pool>` | Lease a cluster from a pool |

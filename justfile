@@ -103,6 +103,29 @@ test-smoke-pool pool='ci-small' ttl='2m' *args:
 test-smoke-k3s cluster='e2e-kobe' *args:
     @env E2E_CLUSTER={{ cluster }} mise exec -- bun run ./hack/test-e2e-k3s.ts {{ args }}
 
+# Dual-placement Sandbox conformance (#76).
+#
+# One suite, run against BOTH placements — management and child cluster. That
+# is the point: two copies would drift, and the drift would be invisible until
+# somebody's child-placed Sandbox behaved differently from the one they tested.
+#
+# Serial on purpose: these lease real capacity, and a pool sized for a handful
+# of sandboxes queues rather than fails, which reads as a timeout.
+#
+# KOBE_TOKEN_OTHER is REQUIRED. The cross-tenant scenarios are not optional,
+# and a suite that skipped them would report success while proving nothing
+# about the property they exist for.
+#
+# KOBE_SANDBOX_HARNESS names the command that restarts, breaks and attaches to
+# the target (#138). It defaults to this repo's own harness because that is
+# right whenever the suite runs against the environment `just e2e-up` built;
+# override it when the endpoint lives somewhere else, and remember that the
+# harness needs kubectl access to the cluster serving it — the restart,
+# failure-injection and pty scenarios FAIL rather than skip without one.
+[group('test')]
+test-sandbox-conformance:
+    @KOBE_SANDBOX_E2E=1 KOBE_SANDBOX_HARNESS="${KOBE_SANDBOX_HARNESS:-bun run ./hack/e2e.ts}" cargo test --test sandbox_conformance -- --ignored --test-threads=1
+
 # Local e2e environment entrypoint
 [group('dev')]
 e2e *args:
@@ -131,8 +154,9 @@ build-crdgen:
     cargo run --bin crdgen -- cidrpools > charts/kobe/crds/cidrpools.yaml
     cargo run --bin crdgen -- sandboxpools > charts/kobe/crds/sandboxpools.yaml
     cargo run --bin crdgen -- sandboxleases > charts/kobe/crds/sandboxleases.yaml
+    cargo run --bin crdgen -- sandboxexecutions > charts/kobe/crds/sandboxexecutions.yaml
 
-# Build Docker images locally (operator + kobe-sync)
+# Build Docker images locally (operator + kobe-sync + runner)
 [group('docker')]
 docker:
     PLATFORM={{ native_platform }} docker buildx bake -f docker-bake.hcl --load
@@ -206,7 +230,7 @@ bump VERSION:
       *)   ah_prerelease=false ;;
     esac
     perl -i -pe "s{^(\s*artifacthub\.io/prerelease:).*}{\$1 \"${ah_prerelease}\"}" charts/kobe/Chart.yaml
-    cargo update -p kobe-operator -p kobectl --precise "{{ VERSION }}" 2>/dev/null || true
+    cargo update -p kobe-operator -p kobectl -p kobe-runner --precise "{{ VERSION }}" 2>/dev/null || true
     ./scripts/check-version-consistency.sh
     echo "Bumped to {{ VERSION }}. Review the diff, commit, then \`just release\`."
 
