@@ -9,9 +9,11 @@
 //! # What a caller cannot reach
 //!
 //! Callers select a `SandboxPool` and nothing else. Every upstream object here
-//! is built from the administrator-owned pool spec, named by the controller,
-//! and owner-referenced to its Kobe parent. There is no path from lease intent
-//! to a Pod spec, a RuntimeClass, a namespace, or a host mount.
+//! is built from the administrator-owned pool spec and named by the controller.
+//! Pool objects use same-cluster ownership; a management `SandboxClaim` instead
+//! carries the exact lease UID and is deleted explicitly under the outer
+//! finalizer, so garbage collection cannot bypass teardown proof. There is no
+//! path from lease intent to a Pod spec, RuntimeClass, namespace, or host mount.
 //!
 //! # Admission is a precondition, not a formality
 //!
@@ -830,8 +832,9 @@ pub async fn reconcile_lease(
         SandboxPlacement::Management {} => Target {
             client: ctx.client.clone(),
             namespace: ctx.namespace.clone(),
-            // The parent SandboxPool and SandboxLease live in this cluster, so
-            // upstream objects can be owned by them.
+            // Pool objects are owned by the SandboxPool. The Claim is not
+            // owned by the SandboxLease: it must survive GC until explicit
+            // teardown proof is durable.
             owned: true,
             claim_owner: None,
         },
@@ -872,10 +875,7 @@ pub async fn reconcile_lease(
     let lease_uid = lease.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to fence its claim"))
     })?;
-    let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
-        SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to own its claim"))
-    })?;
-    let claim_owner = target.claim_owner.as_deref().unwrap_or(&owner);
+    let claim_owner = target.claim_owner.as_deref();
     let claim = build_sandbox_claim(
         &claim_name(&name),
         &target.namespace,
@@ -948,20 +948,31 @@ pub async fn reconcile_lease(
             claim.name_any()
         )));
     }
-    if !metadata_is_controlled_by(
-        &claim.metadata,
-        &claim_owner.api_version,
-        &claim_owner.kind,
-        &claim_owner.name,
-        &claim_owner.uid,
-    ) {
-        return Err(SandboxPlacementError::Invalid(format!(
-            "SandboxClaim {} is not controlled by the exact target owner {} {} uid {}",
-            claim.name_any(),
-            claim_owner.kind,
-            claim_owner.name,
-            claim_owner.uid
-        )));
+    match claim_owner {
+        Some(owner)
+            if !metadata_is_controlled_by(
+                &claim.metadata,
+                &owner.api_version,
+                &owner.kind,
+                &owner.name,
+                &owner.uid,
+            ) =>
+        {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "SandboxClaim {} is not controlled by the exact target owner {} {} uid {}",
+                claim.name_any(),
+                owner.kind,
+                owner.name,
+                owner.uid
+            )));
+        }
+        None if !metadata_has_no_owner_references(&claim.metadata) => {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "management SandboxClaim {} unexpectedly has ownerReferences; refusing GC-dependent adoption",
+                claim.name_any()
+            )));
+        }
+        _ => {}
     }
     let mut proposed = status.target.clone().ok_or_else(|| {
         SandboxPlacementError::Invalid(format!(
@@ -1529,6 +1540,9 @@ async fn drive_release(
     // credentials were intentionally handled above because older proof
     // checkpoints did not include them.
     if footprint_absence_proven(&status) {
+        if child_placed {
+            return finish_child_release_after_proof(lease, ctx, reason).await;
+        }
         return finish_release(lease, ctx, reason).await;
     }
 
@@ -1555,8 +1569,9 @@ async fn drive_release(
         .cloned();
 
     // Older objects and create-before-checkpoint crashes may have a live claim
-    // but no recorded UID. Recover only an object controlled by this exact
-    // lease, persist its identity, and end the pass before deleting anything.
+    // but no recorded UID. Recover only an object carrying this exact lease
+    // UID and no GC owner, persist its identity, and end the pass before
+    // deleting anything.
     let recorded_claim = if let Some(recorded) = recorded_claim {
         recorded
     } else {
@@ -1578,13 +1593,9 @@ async fn drive_release(
                 "SandboxLease {name} has no UID to recover claim provenance"
             ))
         })?;
-        if !is_controlled_by(
-            &observed,
-            "kobe.kunobi.ninja/v1alpha1",
-            "SandboxLease",
-            &name,
-            &lease_uid,
-        ) {
+        if !claim_is_for_lease(&observed, &lease_uid)
+            || !metadata_has_no_owner_references(&observed.metadata)
+        {
             return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
         }
         let reference = target_reference(
@@ -1766,10 +1777,11 @@ async fn finish_release(
 /// already allocated carried on running.
 ///
 /// So the decisive signal is the ARTIFACT: an internal `ClusterLease` under
-/// this lease's derived name, owned by this lease. That exists from the moment
-/// a cluster is allocated, which is exactly when releasing on the management
-/// path becomes wrong — and unlike the pool spec, it survives the pool being
-/// edited or deleted.
+/// this lease's derived name. Exact label/UID validation happens before any
+/// mutation; even a foreign same-named object selects the conservative child
+/// path and is quarantined there instead of letting a management 404 release
+/// capacity. The artifact exists from the moment a cluster is allocated and,
+/// unlike the pool spec, survives the pool being edited or deleted.
 async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
     let status = lease.status.clone().unwrap_or_default();
     match status.placement {
@@ -1782,7 +1794,7 @@ async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let name = crate::controllers::sandbox_child::internal_lease_name(&lease.name_any());
     match internal.get(&name).await {
-        // Existence selects the conservative child path. Exact owner identity
+        // Existence selects the conservative child path. Exact durable identity
         // is checked there before recovery or mutation; a foreign same-named
         // object therefore quarantines instead of being mistaken for either a
         // management Sandbox or this lease's composition.
@@ -1804,10 +1816,12 @@ async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
 /// Destroying the cluster destroys the Sandbox inside it, which is why this
 /// replaces — rather than accompanies — the claim delete.
 ///
-/// The internal lease is **released, never deleted**. Deleting the object would
-/// destroy the receipt along with it, at exactly the moment the evidence
-/// matters; it is collected later by its owner reference, once the Sandbox
-/// lease itself goes.
+/// The internal lease is first **released, not deleted**, because deletion
+/// would destroy the receipt at exactly the moment the evidence matters. Once
+/// that receipt has been consumed into the outer lease's durable
+/// `FootprintAbsent` checkpoint, [`finish_child_release_after_proof`] deletes
+/// the exact internal lease explicitly and verifies its 404 before the outer
+/// finalizer can be removed.
 ///
 /// The quota slot returns only once a receipt proves the exact recorded
 /// instance gone. The disappearance of a name is not evidence — a same-named
@@ -1827,12 +1841,10 @@ async fn release_child_composition(
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let derived = crate::controllers::sandbox_child::internal_lease_name(&name);
 
-    // Provenance is written only once the binding resolves, so a release
-    // landing while the child cluster is still building finds none — and
-    // reading that as "nothing was composed" hands the quota slot back while a
-    // whole cluster carries on running. Absence of a RECORD is not absence of a
-    // CLUSTER, so look for the object under the derived name before concluding
-    // anything.
+    // Older objects may have been created before their identity checkpoint. A
+    // release landing in that window must recover and persist the exact UID
+    // before it requests teardown; absence of a RECORD is not absence of a
+    // CLUSTER.
     let recorded = match status
         .target
         .as_ref()
@@ -1841,17 +1853,9 @@ async fn release_child_composition(
         Some(recorded) => recorded.clone(),
         None => match internal_api.get(&derived).await {
             Ok(unrecorded) => {
-                let lease_uid = lease.uid().ok_or_else(|| {
-                    SandboxPlacementError::Invalid(format!(
-                        "SandboxLease {name} has no UID to recover child provenance"
-                    ))
-                })?;
-                if !metadata_is_controlled_by(
-                    &unrecorded.metadata,
-                    "kobe.kunobi.ninja/v1alpha1",
-                    "SandboxLease",
-                    &name,
-                    &lease_uid,
+                if !crate::controllers::sandbox_child::internal_lease_is_for_sandbox(
+                    &unrecorded,
+                    lease,
                 ) {
                     return quarantine_lease(lease, ctx, "child_composition_identity_unverifiable")
                         .await;
@@ -1859,19 +1863,47 @@ async fn release_child_composition(
                 let Some(unrecorded_uid) = unrecorded.uid().filter(|uid| !uid.is_empty()) else {
                     return quarantine_lease(lease, ctx, "child_composition_uid_missing").await;
                 };
+                let Some(unrecorded_generation) = unrecorded.metadata.generation else {
+                    return quarantine_lease(lease, ctx, "child_composition_generation_missing")
+                        .await;
+                };
                 warn!(
                     lease = %name,
                     cluster_lease = %derived,
                     "releasing a child composition that was allocated but never recorded"
                 );
-                crate::crd::SandboxObjectReference {
+                let reference = crate::crd::SandboxObjectReference {
                     api_version: "kobe.kunobi.ninja/v1alpha1".into(),
                     kind: "ClusterLease".into(),
                     namespace: Some(ctx.namespace.clone()),
                     name: derived.clone(),
                     uid: unrecorded_uid,
-                    generation: unrecorded.metadata.generation,
+                    generation: Some(unrecorded_generation),
+                };
+                let mut next = status.clone();
+                let target =
+                    next.target
+                        .get_or_insert_with(|| crate::crd::SandboxTargetProvenance {
+                            namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
+                            child_cluster_lease: None,
+                            child_cluster_instance: None,
+                            sandbox_template: None,
+                            sandbox_warm_pool: None,
+                            sandbox_claim: None,
+                            sandbox: None,
+                            pod: None,
+                            service: None,
+                        });
+                if target.namespace != CHILD_SANDBOX_NAMESPACE {
+                    return quarantine_lease(lease, ctx, "child_target_namespace_changed").await;
                 }
+                target.child_cluster_lease = Some(reference);
+                if patch_lease_status_fenced(ctx, lease, &next).await? {
+                    info!(lease = %name, "recovered child lease provenance before teardown");
+                } else {
+                    debug!(lease = %name, "child lease recovery checkpoint lost a status race");
+                }
+                return Ok(Action::await_change());
             }
             // Genuinely nothing composed: no record AND no object. There is no
             // footprint to prove absent.
@@ -1888,6 +1920,15 @@ async fn release_child_composition(
         },
     };
     let recorded = &recorded;
+    if recorded.api_version != "kobe.kunobi.ninja/v1alpha1"
+        || recorded.kind != "ClusterLease"
+        || recorded.namespace.as_deref() != Some(ctx.namespace.as_str())
+        || recorded.name != derived
+        || recorded.uid.is_empty()
+        || recorded.generation.is_none()
+    {
+        return quarantine_lease(lease, ctx, "child_composition_provenance_invalid").await;
+    }
     let recorded_instance = status
         .target
         .as_ref()
@@ -1896,22 +1937,53 @@ async fn release_child_composition(
     let internal: Api<crate::crd::ClusterLease> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     match internal.get(&recorded.name).await {
-        Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
-            let lease_uid = lease.uid().ok_or_else(|| {
-                SandboxPlacementError::Invalid(format!(
-                    "SandboxLease {name} has no UID to verify child ownership"
-                ))
-            })?;
-            if !metadata_is_controlled_by(
-                &current.metadata,
-                "kobe.kunobi.ninja/v1alpha1",
-                "SandboxLease",
-                &name,
-                &lease_uid,
-            ) {
-                return quarantine_lease(lease, ctx, "child_composition_owner_changed").await;
+        Ok(current)
+            if current.uid().as_deref() == Some(recorded.uid.as_str())
+                && current.metadata.generation == recorded.generation =>
+        {
+            if !crate::controllers::sandbox_child::internal_lease_is_for_sandbox(&current, lease) {
+                return quarantine_lease(lease, ctx, "child_composition_identity_changed").await;
             }
             let child_status = current.status.clone().unwrap_or_default();
+
+            // Binding may win after the internal-handle checkpoint but before
+            // the next outer reconcile. Recover that exact instance into the
+            // outer status before asking for release, otherwise the eventual
+            // receipt would have no durable UID to match and safe cleanup
+            // would strand in quarantine after an ordinary controller crash.
+            if recorded_instance.is_none()
+                && let Some(binding) = child_status.binding.as_ref()
+            {
+                if binding.lease.name != recorded.name
+                    || binding.lease.uid.as_deref() != Some(recorded.uid.as_str())
+                    || binding.instance.name.is_empty()
+                    || binding.instance.uid.is_empty()
+                {
+                    return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable")
+                        .await;
+                }
+                let mut next = status.clone();
+                let Some(target) = next.target.as_mut() else {
+                    return quarantine_lease(lease, ctx, "child_target_provenance_missing").await;
+                };
+                if target.namespace != CHILD_SANDBOX_NAMESPACE {
+                    return quarantine_lease(lease, ctx, "child_target_namespace_changed").await;
+                }
+                target.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
+                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                    kind: "ClusterInstance".into(),
+                    namespace: Some(ctx.namespace.clone()),
+                    name: binding.instance.name.clone(),
+                    uid: binding.instance.uid.clone(),
+                    generation: Some(binding.instance.observed_generation),
+                });
+                if patch_lease_status_fenced(ctx, lease, &next).await? {
+                    info!(lease = %name, "recovered child instance provenance before teardown");
+                } else {
+                    debug!(lease = %name, "child instance recovery checkpoint lost a status race");
+                }
+                return Ok(Action::await_change());
+            }
 
             // #80 could not prove the cluster's own teardown. Nothing this
             // controller can do makes that evidence appear.
@@ -2036,6 +2108,117 @@ async fn release_child_composition(
         }
         Err(error) => {
             warn!(lease = %name, error = %error, "could not check child cluster lease");
+            Ok(Action::requeue(std::time::Duration::from_secs(15)))
+        }
+    }
+}
+
+/// Remove the receipt-bearing internal lease after its evidence is durable.
+///
+/// The outer `FootprintAbsent=True` checkpoint is the linearization point: a
+/// crash before it leaves the receipt available for recovery; a crash after it
+/// may safely recover from the internal lease's 404. The delete is UID-fenced
+/// and its absence is re-read, so a same-named replacement is never deleted or
+/// mistaken for successful cleanup.
+async fn finish_child_release_after_proof(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: ReleaseReason,
+) -> Result<Action, SandboxPlacementError> {
+    let name = lease.name_any();
+    let status = lease.status.clone().unwrap_or_default();
+    debug_assert!(footprint_absence_proven(&status));
+
+    let derived = crate::controllers::sandbox_child::internal_lease_name(&name);
+    let internal: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let Some(recorded) = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_lease.as_ref())
+    else {
+        return match internal.get(&derived).await {
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                finish_release(lease, ctx, reason).await
+            }
+            Ok(_) => quarantine_lease(lease, ctx, "child_handle_provenance_missing").await,
+            Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                quarantine_lease(lease, ctx, "child_handle_absence_unverifiable").await
+            }
+            Err(error) => {
+                warn!(lease = %name, error = %error, "could not check unrecorded child handle");
+                Ok(Action::requeue(std::time::Duration::from_secs(15)))
+            }
+        };
+    };
+
+    if recorded.api_version != "kobe.kunobi.ninja/v1alpha1"
+        || recorded.kind != "ClusterLease"
+        || recorded.namespace.as_deref() != Some(ctx.namespace.as_str())
+        || recorded.name != derived
+        || recorded.uid.is_empty()
+        || recorded.generation.is_none()
+    {
+        return quarantine_lease(lease, ctx, "child_handle_provenance_invalid").await;
+    }
+
+    let current = match internal.get(&recorded.name).await {
+        Ok(current) => current,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return finish_release(lease, ctx, reason).await;
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return quarantine_lease(lease, ctx, "child_handle_absence_unverifiable").await;
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "could not read verified child handle");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+    };
+    if current.uid().as_deref() != Some(recorded.uid.as_str())
+        || current.metadata.generation != recorded.generation
+        || !crate::controllers::sandbox_child::internal_lease_is_for_sandbox(&current, lease)
+    {
+        return quarantine_lease(lease, ctx, "child_handle_identity_changed").await;
+    }
+
+    let delete = DeleteParams {
+        propagation_policy: Some(PropagationPolicy::Foreground),
+        preconditions: Some(Preconditions {
+            uid: Some(recorded.uid.clone()),
+            resource_version: None,
+        }),
+        ..Default::default()
+    };
+    match internal.delete(&recorded.name, &delete).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            return quarantine_lease(lease, ctx, "child_handle_uid_precondition_failed").await;
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return quarantine_lease(lease, ctx, "child_handle_delete_forbidden").await;
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "could not delete verified child handle");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+    }
+
+    match internal.get(&recorded.name).await {
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            finish_release(lease, ctx, reason).await
+        }
+        Ok(current) if current.uid().as_deref() == Some(recorded.uid.as_str()) => {
+            debug!(lease = %name, "verified child handle is still deleting");
+            Ok(Action::requeue(std::time::Duration::from_secs(10)))
+        }
+        Ok(_) => quarantine_lease(lease, ctx, "child_handle_replaced_during_delete").await,
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            quarantine_lease(lease, ctx, "child_handle_absence_unverifiable").await
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "could not verify child handle absence");
             Ok(Action::requeue(std::time::Duration::from_secs(15)))
         }
     }
@@ -2358,17 +2541,31 @@ pub(super) fn metadata_is_controlled_by(
     })
 }
 
-/// Cross-cluster ownership fence for an upstream claim.
+/// Whether metadata has no garbage-collection dependency at all.
 ///
-/// A child-cluster object cannot carry an owner reference to the outer
-/// management-cluster lease. The controller-owned UID label therefore has to
-/// match before Kobe adopts, observes, or mutates it; the Claim name is checked
-/// separately against its deterministic derived name.
+/// Management claims and internal child leases are cleaned explicitly under
+/// the outer lease finalizer. Accepting even a non-controller owner reference
+/// would let Kubernetes delete them independently and turn a 404 into false
+/// teardown evidence.
+fn metadata_has_no_owner_references(metadata: &kube::api::ObjectMeta) -> bool {
+    metadata.owner_references.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Exact outer-lease identity fence for an upstream claim.
+///
+/// Management claims intentionally have no owner reference, while a
+/// child-cluster object cannot carry a reference to the outer management
+/// cluster. The controller-owned UID label therefore has to match before Kobe
+/// adopts, observes, or mutates either; the Claim name is checked separately
+/// against its deterministic derived name.
 fn claim_is_for_lease(claim: &DynamicObject, lease_uid: &str) -> bool {
     let labels = claim.labels();
     labels
         .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
         .is_some_and(|value| value == lease_uid)
+        && labels
+            .get("app.kubernetes.io/managed-by")
+            .is_some_and(|value| value == crate::sandbox::KOBE_MANAGED_BY)
 }
 
 fn target_reference(
@@ -2611,12 +2808,12 @@ async fn observed_provenance(
 struct Target {
     client: Client,
     namespace: String,
-    /// Whether upstream objects here may carry an owner reference to their
-    /// Kobe parent. True only in the management cluster, where that parent
-    /// exists — see [`ensure_upstream_pool_objects`].
+    /// Whether this is the management target. Its pool objects use the
+    /// SandboxPool owner, while child pool objects use the remote Namespace.
+    /// Claims are handled separately by `claim_owner`.
     owned: bool,
-    /// Exact same-cluster controller for child upstream objects. Management
-    /// placement uses the outer lease directly and leaves this empty.
+    /// Exact same-cluster controller for a child Claim. Management leaves this
+    /// empty so its Claim survives GC until explicit teardown proof.
     claim_owner: Option<Box<OwnerReference>>,
 }
 
@@ -2750,8 +2947,18 @@ async fn compose_child_target(
     let internal_name = child::internal_lease_name(&name);
     let internal: Api<crate::crd::ClusterLease> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let recorded_internal = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.as_ref())
+        .and_then(|target| target.child_cluster_lease.as_ref());
     let internal_lease = match internal.get(&internal_name).await {
         Ok(existing) => existing,
+        Err(kube::Error::Api(error)) if error.code == 404 && recorded_internal.is_some() => {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "recorded ClusterLease {internal_name} is absent; refusing to allocate a same-named replacement"
+            )));
+        }
         Err(kube::Error::Api(error)) if error.code == 404 => {
             let composed = child::build_internal_cluster_lease(lease, cluster_pool_ref, lifetime)
                 .ok_or_else(|| {
@@ -2772,27 +2979,93 @@ async fn compose_child_target(
         Err(error) => return Err(error.into()),
     };
 
-    // Adoption is fenced. A same-named object this lease does not own is
+    // Adoption is fenced. A same-named object without this exact durable
+    // identity is
     // somebody else's cluster, and placing a tenant's Sandbox into it would be
     // the worst possible outcome of a name collision.
     let lease_uid = lease.uid().ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("SandboxLease {name} has no UID to own a child"))
     })?;
-    if !metadata_is_controlled_by(
-        &internal_lease.metadata,
-        "kobe.kunobi.ninja/v1alpha1",
-        "SandboxLease",
-        &name,
-        &lease_uid,
+    if !child::internal_lease_matches_composition(
+        &internal_lease,
+        lease,
+        cluster_pool_ref,
+        lifetime,
     ) {
         return Err(SandboxPlacementError::Invalid(format!(
-            "ClusterLease {internal_name} exists but is not owned by SandboxLease {name}"
+            "ClusterLease {internal_name} exists but does not match SandboxLease {name} uid {lease_uid}"
         )));
     }
 
     let internal_uid = internal_lease
         .uid()
         .ok_or_else(|| SandboxPlacementError::Invalid("child lease has no UID".into()))?;
+    let internal_generation = internal_lease.metadata.generation.ok_or_else(|| {
+        SandboxPlacementError::Invalid("child lease has no generation to fence".into())
+    })?;
+
+    // Persist the exact internal lease identity before waiting for a binding.
+    // Cluster provisioning can take minutes; a release or controller crash in
+    // that interval must still have a UID-fenced handle it can explicitly
+    // release without relying on garbage collection.
+    let status = lease.status.clone().unwrap_or_default();
+    let placement = crate::sandbox::record_placement_once(
+        status.placement.as_ref(),
+        crate::crd::ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: crate::crd::SandboxObjectReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterPool".into(),
+                namespace: Some(ctx.namespace.clone()),
+                name: cluster_pool.name_any(),
+                uid: cluster_pool.uid().unwrap_or_default(),
+                generation: cluster_pool.metadata.generation,
+            },
+        },
+        &ctx.namespace,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    let mut proposed = status
+        .target
+        .clone()
+        .unwrap_or(crate::crd::SandboxTargetProvenance {
+            namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
+            child_cluster_lease: None,
+            child_cluster_instance: None,
+            sandbox_template: None,
+            sandbox_warm_pool: None,
+            sandbox_claim: None,
+            sandbox: None,
+            pod: None,
+            service: None,
+        });
+    proposed.namespace = CHILD_SANDBOX_NAMESPACE.to_string();
+    proposed.child_cluster_lease = Some(crate::crd::SandboxObjectReference {
+        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+        kind: "ClusterLease".into(),
+        namespace: Some(ctx.namespace.clone()),
+        name: internal_name.clone(),
+        uid: internal_uid.clone(),
+        generation: Some(internal_generation),
+    });
+    let provenance = crate::sandbox::merge_target_provenance(
+        status.target.as_ref(),
+        proposed,
+        &placement,
+        &ctx.namespace,
+    )
+    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    if status.placement.as_ref() != Some(&placement) || status.target.as_ref() != Some(&provenance)
+    {
+        let mut next = status;
+        next.placement = Some(placement);
+        next.target = Some(provenance);
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            debug!(lease = %name, "recorded internal child lease before binding");
+        } else {
+            debug!(lease = %name, "internal child lease checkpoint lost a status race");
+        }
+        return Ok(ChildTarget::Pending(Action::await_change()));
+    }
 
     // Resolve the exact reciprocal binding rather than trusting `clusterName`.
     // A name alone can be reused; the binding is what pins the instance this
@@ -2829,21 +3102,8 @@ async fn compose_child_target(
         Some(binding.binding.instance.observed_generation),
     );
     let status = lease.status.clone().unwrap_or_default();
-    let placement = crate::sandbox::record_placement_once(
-        status.placement.as_ref(),
-        crate::crd::ResolvedSandboxPlacement::ChildCluster {
-            cluster_pool: crate::crd::SandboxObjectReference {
-                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-                kind: "ClusterPool".into(),
-                namespace: Some(ctx.namespace.clone()),
-                name: cluster_pool.name_any(),
-                uid: cluster_pool.uid().unwrap_or_default(),
-                generation: cluster_pool.metadata.generation,
-            },
-        },
-        &ctx.namespace,
-    )
-    .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
     let mut proposed = status
         .target
         .clone()
@@ -2854,14 +3114,12 @@ async fn compose_child_target(
     let provenance = crate::sandbox::merge_target_provenance(
         status.target.as_ref(),
         proposed,
-        &placement,
+        placement,
         &ctx.namespace,
     )
     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-    if status.placement.as_ref() != Some(&placement) || status.target.as_ref() != Some(&provenance)
-    {
+    if status.target.as_ref() != Some(&provenance) {
         let mut next = status;
-        next.placement = Some(placement);
         next.target = Some(provenance);
         if patch_lease_status_fenced(ctx, lease, &next).await? {
             debug!(lease = %name, "recorded child composition provenance");
@@ -3589,15 +3847,9 @@ pub(crate) mod tests {
                 "uid": "claim-uid",
                 "resourceVersion": "77",
                 "labels": {
+                    "app.kubernetes.io/managed-by": crate::sandbox::KOBE_MANAGED_BY,
                     "kobe.kunobi.ninja/sandbox-lease-uid": "lease-uid-1",
                 },
-                "ownerReferences": [{
-                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                    "kind": "SandboxLease",
-                    "name": LEASE,
-                    "uid": "lease-uid-1",
-                    "controller": true,
-                }],
             },
             "status": status,
         })
@@ -4433,6 +4685,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// Without a resolved placement, even a foreign same-named child handle
+    /// selects the conservative child path. Its label is rejected there; it
+    /// must never let a management Claim 404 release capacity.
+    #[tokio::test]
+    async fn unresolved_foreign_child_artifact_fails_closed() {
+        let (ctx, server) = test_context().await;
+        let mut foreign = child_cluster_lease("foreign-child-uid", "Pending", None);
+        foreign["metadata"]["labels"][crate::sandbox::SANDBOX_LEASE_UID_LABEL] =
+            "foreign-outer-uid".into();
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().placement = None;
+        lease.status.as_mut().unwrap().target = None;
+        assert!(is_child_placed(&lease, &ctx).await);
+    }
+
     /// Pool object identities are checkpointed before a claim can refer to
     /// them. This prevents a same-named foreign WarmPool from becoming the
     /// source of tenant workloads.
@@ -4643,6 +4916,114 @@ pub(crate) mod tests {
         assert_eq!(status["releaseCause"], "ProvisioningDeadline");
     }
 
+    /// Child allocation persists the exact handle before binding can block.
+    /// The handle itself has no ownerRef, so the outer finalizer—not GC—owns
+    /// the receipt lifecycle.
+    #[tokio::test]
+    async fn child_handle_identity_is_checkpointed_before_binding() {
+        const CHILD_POOL_PATH: &str =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool";
+        const CLUSTER_LEASES_PATH: &str =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases";
+        let (ctx, server) = test_context().await;
+        let cluster_pool: crate::crd::ClusterPool = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "metadata": {
+                "name": "child-pool",
+                "namespace": NS,
+                "uid": "child-pool-uid",
+                "generation": 1,
+            },
+            "spec": {
+                "ttl": "8h",
+                "backend": { "type": "k3s" },
+                "cluster": { "version": "v1.32.0" },
+            },
+        }))
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(CHILD_POOL_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&cluster_pool))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.placement = serde_json::from_value(serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "child-pool"
+        }))
+        .unwrap();
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().placement = None;
+        lease.status.as_mut().unwrap().target = None;
+        let lifetime = crate::controllers::sandbox_child::required_child_lifetime(
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(3600),
+            crate::controllers::sandbox_child::CHILD_DRAIN_GRACE,
+        );
+        let mut created = crate::controllers::sandbox_child::build_internal_cluster_lease(
+            &lease,
+            "child-pool",
+            lifetime,
+        )
+        .unwrap();
+        created.metadata.uid = Some("child-lease-uid".into());
+        created.metadata.generation = Some(1);
+        created.metadata.resource_version = Some("child-rv-1".into());
+        Mock::given(method("POST"))
+            .and(path(CLUSTER_LEASES_PATH))
+            .respond_with(ResponseTemplate::new(201).set_body_json(&created))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+
+        let outcome = compose_child_target(&lease, &pool, "child-pool", &ctx)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ChildTarget::Pending(action) if action == Action::await_change())
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let create: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == CLUSTER_LEASES_PATH
+                })
+                .expect("internal lease create")
+                .body,
+        )
+        .unwrap();
+        assert!(create["metadata"].get("ownerReferences").is_none());
+        assert_eq!(
+            create["metadata"]["labels"][crate::sandbox::SANDBOX_LEASE_UID_LABEL],
+            "lease-uid-1"
+        );
+        let checkpoint = requests
+            .iter()
+            .filter_map(status_value_of)
+            .next_back()
+            .expect("pre-binding identity checkpoint");
+        assert_eq!(checkpoint["placement"]["type"], "childCluster");
+        assert_eq!(
+            checkpoint["target"]["childClusterLease"]["uid"],
+            "child-lease-uid"
+        );
+    }
+
     /// An unready claim is still an allocated identity. Record it before the
     /// normal readiness requeue so restart-safe cleanup can address the exact
     /// object rather than a derived name.
@@ -4698,6 +5079,25 @@ pub(crate) mod tests {
         assert_eq!(
             statuses.last().expect("claim provenance status")["target"]["sandboxClaim"]["uid"],
             "claim-uid"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let created: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == CLAIMS_PATH
+                })
+                .expect("management claim create attempt")
+                .body,
+        )
+        .unwrap();
+        assert!(
+            created["metadata"].get("ownerReferences").is_none(),
+            "management claim cleanup must be explicit under the outer finalizer"
+        );
+        assert_eq!(
+            created["metadata"]["labels"][crate::sandbox::SANDBOX_LEASE_UID_LABEL],
+            "lease-uid-1"
         );
     }
 
@@ -5837,15 +6237,16 @@ pub(crate) mod tests {
         assert_eq!(recovered["target"]["sandboxClaim"]["uid"], "claim-uid");
     }
 
-    /// A derived name is not provenance. If the object at that name is not
-    /// controlled by this exact lease UID, recovery quarantines without
-    /// deleting it or returning quota.
+    /// A derived name is not provenance. If the object at that name lacks this
+    /// exact lease UID label, recovery quarantines without deleting it or
+    /// returning quota.
     #[tokio::test]
     async fn teardown_never_recovers_a_foreign_claim() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
         let mut foreign = claim_json(serde_json::json!({}));
-        foreign["metadata"]["ownerReferences"][0]["uid"] = "another-lease-uid".into();
+        foreign["metadata"]["labels"][crate::sandbox::SANDBOX_LEASE_UID_LABEL] =
+            "another-lease-uid".into();
         Mock::given(method("GET"))
             .and(path(CLAIM_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(foreign))
@@ -5874,6 +6275,43 @@ pub(crate) mod tests {
             .await,
             0
         );
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+    }
+
+    /// Even an exact UID label cannot make a management claim safe when it is
+    /// still a GC dependent. Recovery refuses the legacy/foreign ownerRef
+    /// shape before any delete or quota release.
+    #[tokio::test]
+    async fn teardown_rejects_a_gc_dependent_management_claim() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut dependent = claim_json(serde_json::json!({}));
+        dependent["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxLease",
+            "name": LEASE,
+            "uid": "lease-uid-1",
+            "controller": true,
+        }]);
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(dependent))
+            .mount(&server)
+            .await;
+
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
         assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
     }
 
@@ -6176,12 +6614,13 @@ pub(crate) mod tests {
     }
 
     /// `FootprintAbsent` is the restart boundary. Once present, reconciliation
-    /// must skip both placement-specific teardown paths and run only the
-    /// idempotent reservation/terminal tail.
+    /// skips workload teardown but still removes the receipt-bearing internal
+    /// handle explicitly before the reservation/terminal tail.
     #[tokio::test]
     async fn restart_from_footprint_proof_skips_claim_and_child_teardown() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
+        mount_child_handle_cleanup(&server, 1, None).await;
         let mut lease = child_placed_lease("child-lease-uid");
         {
             let status = lease.status.as_mut().unwrap();
@@ -6198,11 +6637,12 @@ pub(crate) mod tests {
 
         let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
         assert_eq!(action, Action::await_change());
-        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 2);
         assert_eq!(
             requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
             0
         );
+        assert_eq!(requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await, 1);
         assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
         assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
         assert_eq!(
@@ -6232,6 +6672,18 @@ pub(crate) mod tests {
                     condition["type"] == FOOTPRINT_ABSENT_CONDITION && condition["status"] == "True"
                 })
         );
+        let delete = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                request.method.as_str() == "DELETE" && request.url.path() == CLUSTER_LEASE_PATH
+            })
+            .expect("verified child handle delete");
+        let options: serde_json::Value = serde_json::from_slice(&delete.body).unwrap();
+        assert_eq!(options["preconditions"]["uid"], "child-lease-uid");
+        assert_eq!(options["propagationPolicy"], "Foreground");
     }
 
     /// A reservation API outage occurs after workload absence is durable. The
@@ -6241,6 +6693,7 @@ pub(crate) mod tests {
     async fn reservation_failure_retains_footprint_proof_for_retry() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
+        mount_child_handle_cleanup(&server, 1, None).await;
         Mock::given(method("GET"))
             .and(path(RESERVATIONS_PATH))
             .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
@@ -6271,13 +6724,15 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(first, Action::requeue(std::time::Duration::from_secs(15)));
         assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
-        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 2);
+        assert_eq!(requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await, 1);
         assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
         assert!(footprint_absence_proven(lease.status.as_ref().unwrap()));
 
         let retry = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
         assert_eq!(retry, Action::await_change());
-        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLUSTER_LEASE_PATH).await, 3);
+        assert_eq!(requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await, 1);
         assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
         assert_eq!(
             requests_to(
@@ -6894,7 +7349,7 @@ pub(crate) mod tests {
             },
         });
         status.target = Some(crate::crd::SandboxTargetProvenance {
-            namespace: NS.into(),
+            namespace: CHILD_SANDBOX_NAMESPACE.into(),
             child_cluster_lease: Some(crate::crd::SandboxObjectReference {
                 api_version: "kobe.kunobi.ninja/v1alpha1".into(),
                 kind: "ClusterLease".into(),
@@ -6955,22 +7410,59 @@ pub(crate) mod tests {
                 "name": "kobe-sbx-sbx-1",
                 "namespace": NS,
                 "uid": uid,
+                "generation": 1,
                 "resourceVersion": "42",
-                "ownerReferences": [{
-                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                    "kind": "SandboxLease",
-                    "name": LEASE,
-                    "uid": "lease-uid-1",
-                    "controller": true,
-                }],
+                "labels": {
+                    "app.kubernetes.io/managed-by": crate::sandbox::KOBE_MANAGED_BY,
+                    "kobe.kunobi.ninja/sandbox-lease-uid": "lease-uid-1",
+                },
             },
             "spec": {
                 "poolRef": "children",
                 "ttl": "2h",
                 "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" },
+                "cleanupMode": "VerifiedDestroy",
             },
             "status": status,
         })
+    }
+
+    /// Model an internal lease that remains readable for `visible_reads`, then
+    /// disappears after the UID-fenced foreground delete.
+    async fn mount_child_handle_cleanup(
+        server: &MockServer,
+        visible_reads: u64,
+        receipt: Option<serde_json::Value>,
+    ) {
+        let visible = child_cluster_lease("child-lease-uid", "Released", receipt);
+        serde_json::from_value::<crate::crd::ClusterLease>(visible.clone())
+            .expect("child cleanup fixture must deserialize");
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(visible))
+            .up_to_n_times(visible_reads)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .with_priority(10)
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Released",
+                    None,
+                )),
+            )
+            .mount(server)
+            .await;
     }
 
     /// A receipt about the exact instance recorded at composition time.
@@ -7104,20 +7596,29 @@ pub(crate) mod tests {
         );
     }
 
-    /// Recovery of an uncheckpointed child allocation is allowed only from an
-    /// exact controller owner reference. A foreign owner and a recreated
-    /// same-named SandboxLease are both somebody else's cluster.
+    /// Recovery of an uncheckpointed child allocation requires the exact UID
+    /// label and an ownerRef-free handle. A recreated same-named SandboxLease
+    /// and a GC-dependent legacy object both fail closed.
     #[tokio::test]
-    async fn unrecorded_child_with_foreign_or_recreated_owner_quarantines() {
-        for (case, owner_name, owner_uid) in [
-            ("foreign owner", "another-sandbox", "another-lease-uid"),
-            ("same-name replacement", LEASE, "replacement-lease-uid"),
+    async fn unrecorded_child_with_foreign_identity_quarantines() {
+        for (case, label_uid, gc_owned) in [
+            ("same-name replacement", "replacement-lease-uid", false),
+            ("legacy GC dependent", "lease-uid-1", true),
         ] {
             let (ctx, server) = test_context().await;
             mount_teardown_scaffolding(&server).await;
             let mut child = child_cluster_lease("child-lease-uid", "Bound", None);
-            child["metadata"]["ownerReferences"][0]["name"] = serde_json::json!(owner_name);
-            child["metadata"]["ownerReferences"][0]["uid"] = serde_json::json!(owner_uid);
+            child["metadata"]["labels"][crate::sandbox::SANDBOX_LEASE_UID_LABEL] =
+                serde_json::json!(label_uid);
+            if gc_owned {
+                child["metadata"]["ownerReferences"] = serde_json::json!([{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "SandboxLease",
+                    "name": LEASE,
+                    "uid": "lease-uid-1",
+                    "controller": true,
+                }]);
+            }
             Mock::given(method("GET"))
                 .and(path(CLUSTER_LEASE_PATH))
                 .respond_with(ResponseTemplate::new(200).set_body_json(child))
@@ -7162,6 +7663,71 @@ pub(crate) mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A binding that wins between the handle checkpoint and release is
+    /// persisted before teardown, giving the later receipt an exact instance
+    /// UID to prove rather than forcing a permanent quarantine after restart.
+    #[tokio::test]
+    async fn teardown_recovers_child_instance_before_requesting_release() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let binding = crate::crd::LeaseBinding {
+            binding_id: "binding-child".into(),
+            lease: crate::crd::ResourceRef {
+                name: "kobe-sbx-sbx-1".into(),
+                uid: Some("child-lease-uid".into()),
+            },
+            instance: crate::crd::BoundInstanceRef {
+                name: "kobe-abc123".into(),
+                uid: "child-instance-uid".into(),
+                observed_generation: 2,
+            },
+            pool: crate::crd::ResourceRef {
+                name: "children".into(),
+                uid: Some("cluster-pool-uid".into()),
+            },
+            backend: crate::crd::BackendProvenance::from_config(
+                &crate::crd::BackendConfig::default(),
+            )
+            .unwrap(),
+            instance_spec_digest: "instance-spec-digest".into(),
+        };
+        let mut child = child_cluster_lease("child-lease-uid", "Bound", None);
+        child["status"]["binding"] = serde_json::to_value(binding).unwrap();
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(child))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status.target.as_mut().unwrap().namespace = CHILD_SANDBOX_NAMESPACE.into();
+        status.target.as_mut().unwrap().child_cluster_instance = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0,
+            "release waits for the outer identity checkpoint"
+        );
+        assert_eq!(requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await, 0);
+        let checkpoint = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("child instance checkpoint");
+        assert_eq!(
+            checkpoint["target"]["childClusterInstance"]["uid"],
+            "child-instance-uid"
+        );
     }
 
     /// If Kobe cannot tell whether the tenant's cluster is still running, it
@@ -7238,27 +7804,11 @@ pub(crate) mod tests {
     /// A lease released while its child cluster was still being composed must
     /// not have its quota returned on a management-cluster 404.
     ///
-    /// REVIEW FINDING (expected to fail). `compose_child_target` creates the
-    /// internal `ClusterLease` first and only records `placement` +
-    /// `target.childClusterLease` on the *next* reconcile, after
-    /// `resolve_lease_binding` succeeds — which is minutes later, because the
-    /// child cluster has to be provisioned. Between those two writes the lease
-    /// carries no resolved placement.
-    ///
-    /// `drive_release` decides which teardown path to take from
-    /// `status.placement`, so a release landing in that window takes the
-    /// MANAGEMENT path: it deletes a `SandboxClaim` that was never created in
-    /// this cluster, reads the 404 as proof of absence, and calls
-    /// `finish_release`. The quota slot goes back while a whole child cluster
-    /// is still allocated from the `ClusterPool` — the internal `ClusterLease`
-    /// survives, because release marks the SandboxLease terminal rather than
-    /// deleting it, so the owner reference collects nothing for a week.
-    ///
-    /// `a_composition_that_never_happened_releases_cleanly` looks like it
-    /// covers this, but it sets `placement = ChildCluster` with
-    /// `childClusterLease = None` — a state the single combined status patch
-    /// can never produce. The reachable state is the opposite one, and it is
-    /// untested.
+    /// The normal create path now checkpoints placement plus exact internal
+    /// UID before waiting for a binding. This fixture retains the older
+    /// crash-window state to prove recovery from the UID label is also safe:
+    /// it checkpoints the handle before requesting release and never treats a
+    /// management-cluster Claim 404 as child teardown evidence.
     #[tokio::test]
     async fn a_composition_in_flight_is_not_released_by_a_management_cluster_404() {
         let (ctx, server) = test_context().await;
@@ -7331,17 +7881,12 @@ pub(crate) mod tests {
     async fn a_verified_receipt_for_the_recorded_instance_completes_the_release() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        Mock::given(method("GET"))
-            .and(path(CLUSTER_LEASE_PATH))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
-                    "child-lease-uid",
-                    "Released",
-                    Some(verified_receipt("kobe-abc123", "child-instance-uid")),
-                )),
-            )
-            .mount(&server)
-            .await;
+        mount_child_handle_cleanup(
+            &server,
+            2,
+            Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+        )
+        .await;
 
         reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
             .await;
@@ -7358,6 +7903,11 @@ pub(crate) mod tests {
             )
             .await,
             1
+        );
+        assert_eq!(
+            requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await,
+            1,
+            "the receipt handle is removed only after its proof is durable"
         );
     }
 

@@ -243,22 +243,23 @@ pub fn build_sandbox_warm_pool(
 /// only after the upstream Sandbox becomes Ready. [`build_sandbox_claim_lifecycle_patch`]
 /// adds the absolute expiry later with a resourceVersion fence.
 ///
-/// Every claim also carries the exact outer lease UID. Management
-/// placement has a Kubernetes owner reference as well; child placement cannot
-/// reference an object in another cluster, so these server-controlled labels
-/// are the durable adoption fence there.
+/// Every claim also carries the exact outer lease UID. Management placement
+/// deliberately has no owner reference: garbage collection must not remove the
+/// claim before the outer lease finalizer has verified teardown. Child claims
+/// may be owned by their same-cluster target Namespace, so deleting that
+/// exclusive Namespace still collects its upstream footprint.
 pub fn build_sandbox_claim(
     name: &str,
     namespace: &str,
     warm_pool_name: &str,
     lease_uid: &str,
-    owner_ref: &OwnerReference,
+    owner_ref: Option<&OwnerReference>,
 ) -> DynamicObject {
     let mut claim = managed_object(
         SANDBOX_CLAIM_KIND,
         name,
         namespace,
-        Some(owner_ref),
+        owner_ref,
         serde_json::json!({
             "spec": {
                 "warmPoolRef": { "name": warm_pool_name },
@@ -1416,14 +1417,7 @@ mod tests {
             "targets",
             "agents",
             "lease-uid-a",
-            &OwnerReference {
-                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-                kind: "SandboxLease".into(),
-                name: "lease-a".into(),
-                uid: "lease-uid-a".into(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            },
+            None,
         ))
         .unwrap();
 
@@ -1434,9 +1428,9 @@ mod tests {
             value["metadata"]["labels"][SANDBOX_LEASE_UID_LABEL],
             "lease-uid-a"
         );
-        assert_eq!(
-            value["metadata"]["ownerReferences"][0]["uid"],
-            "lease-uid-a"
+        assert!(
+            value["metadata"].get("ownerReferences").is_none(),
+            "a management claim must survive outer-lease GC until explicit proof"
         );
         assert!(value["spec"]["lifecycle"].get("shutdownTime").is_none());
         assert_eq!(
@@ -1464,6 +1458,34 @@ mod tests {
         ] {
             assert!(value["spec"].get(forbidden).is_none(), "found {forbidden}");
         }
+    }
+
+    /// A child claim may remain owned by its same-cluster Namespace. That
+    /// owner cannot race deletion of the outer management-cluster lease.
+    #[test]
+    fn child_claim_can_be_owned_by_its_remote_namespace() {
+        let owner = OwnerReference {
+            api_version: "v1".into(),
+            kind: "Namespace".into(),
+            name: "kobe-sandbox".into(),
+            uid: "namespace-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let value = serde_json::to_value(build_sandbox_claim(
+            "claim-a",
+            "targets",
+            "agents",
+            "lease-uid-a",
+            Some(&owner),
+        ))
+        .unwrap();
+
+        assert_eq!(value["metadata"]["ownerReferences"][0]["kind"], "Namespace");
+        assert_eq!(
+            value["metadata"]["ownerReferences"][0]["uid"],
+            "namespace-uid"
+        );
     }
 
     #[test]

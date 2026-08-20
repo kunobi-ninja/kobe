@@ -22,8 +22,10 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+use kube::Resource;
 use kube::api::ObjectMeta;
-use kube::{Client, Resource, ResourceExt};
+use kube::{Client, ResourceExt};
 
 use crate::crd::{
     CleanupMode, ClusterLease, ClusterLeaseSpec, ClusterPool, Requester, SandboxLease,
@@ -208,9 +210,14 @@ fn parse_std_duration(value: &str) -> Option<Duration> {
 ///
 /// Three properties matter and each is deliberate:
 ///
-/// * **Owner-referenced to the `SandboxLease`.** Cancelling or deleting the
-///   outer lease garbage-collects the internal one, so a composition abandoned
-///   halfway cannot strand a whole cluster.
+/// * **Not owner-referenced to the `SandboxLease`.** Kubernetes garbage
+///   collection must not erase the lease or its teardown receipt before the
+///   outer finalizer consumes that proof. The exact outer UID label plus the
+///   deterministic name form the restart-safe pre-status recovery fence.
+///   Normal deletion is covered by the outer finalizer and explicit cleanup.
+///   A generic orphan reaper is intentionally not inferred from a missing
+///   outer object: after manual finalizer stripping it would have no durable
+///   place to retain the destroy receipt or decide quota ownership safely.
 /// * **`CleanupMode::VerifiedDestroy`.** A pool that cannot honour it rejects
 ///   the lease at bind time rather than degrading to "we issued the deletes and
 ///   assumed they worked" — which for an exclusive tenant cluster is exactly
@@ -223,17 +230,22 @@ pub fn build_internal_cluster_lease(
     cluster_pool_ref: &str,
     lifetime: Duration,
 ) -> Option<ClusterLease> {
-    let owner = sandbox_lease.controller_owner_ref(&())?;
+    let sandbox_uid = sandbox_lease.uid().filter(|uid| !uid.is_empty())?;
     Some(ClusterLease {
         metadata: ObjectMeta {
             name: Some(internal_lease_name(&sandbox_lease.name_any())),
             namespace: sandbox_lease.namespace(),
-            owner_references: Some(vec![owner]),
             labels: Some(
-                [(
-                    "app.kubernetes.io/managed-by".to_string(),
-                    crate::sandbox::KOBE_MANAGED_BY.to_string(),
-                )]
+                [
+                    (
+                        "app.kubernetes.io/managed-by".to_string(),
+                        crate::sandbox::KOBE_MANAGED_BY.to_string(),
+                    ),
+                    (
+                        crate::sandbox::SANDBOX_LEASE_UID_LABEL.to_string(),
+                        sandbox_uid,
+                    ),
+                ]
                 .into_iter()
                 .collect(),
             ),
@@ -248,6 +260,54 @@ pub fn build_internal_cluster_lease(
         },
         status: None,
     })
+}
+
+/// Whether an internal lease carries the exact durable identity of one outer
+/// Sandbox lease.
+///
+/// This intentionally rejects legacy owner references. Even a correct-looking
+/// reference would reintroduce the GC race this identity scheme avoids. A
+/// same-named object with a missing or different UID label is foreign and must
+/// never be released, observed as placement, or adopted.
+pub fn internal_lease_is_for_sandbox(
+    internal: &ClusterLease,
+    sandbox_lease: &SandboxLease,
+) -> bool {
+    let Some(sandbox_uid) = sandbox_lease.uid().filter(|uid| !uid.is_empty()) else {
+        return false;
+    };
+    internal.name_any() == internal_lease_name(&sandbox_lease.name_any())
+        && internal.namespace() == sandbox_lease.namespace()
+        && internal
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+        && internal
+            .labels()
+            .get("app.kubernetes.io/managed-by")
+            .is_some_and(|value| value == crate::sandbox::KOBE_MANAGED_BY)
+        && internal
+            .labels()
+            .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+            .is_some_and(|value| value == &sandbox_uid)
+        && internal.spec.requester.requester_type == "kobe:sandbox-composition"
+        && internal.spec.requester.identity == "kobe-operator"
+        && internal.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+}
+
+/// Placement additionally requires the immutable request shape this controller
+/// intended. Identity alone authorises recovery; it does not authorise silently
+/// changing pools or shortening the child lifetime after a create race.
+pub fn internal_lease_matches_composition(
+    internal: &ClusterLease,
+    sandbox_lease: &SandboxLease,
+    cluster_pool_ref: &str,
+    lifetime: Duration,
+) -> bool {
+    internal_lease_is_for_sandbox(internal, sandbox_lease)
+        && internal.spec.pool_ref == cluster_pool_ref
+        && internal.spec.ttl == format!("{}s", lifetime.as_secs())
 }
 
 /// The identity Kobe uses for its own compositions.
@@ -497,14 +557,13 @@ mod tests {
         ));
     }
 
-    /// The internal lease is Kobe's, and dies with the Sandbox lease.
+    /// The internal lease is Kobe's and survives until explicit proof cleanup.
     ///
-    /// The owner reference is what makes "cancelling a pending outer lease
-    /// releases any partial internal allocation" true without a compensating
-    /// code path — and a compensating path is exactly what fails to run when
-    /// the controller is the thing that crashed.
+    /// It must not be a GC dependent: foreground deletion could otherwise
+    /// erase the receipt before the outer finalizer consumes it. Restart-safe
+    /// recovery uses the exact lease UID label and deterministic name.
     #[test]
-    fn the_internal_lease_is_owned_by_the_sandbox_lease_and_never_by_the_caller() {
+    fn the_internal_lease_has_durable_identity_without_an_owner_reference() {
         let sandbox_lease = sandbox_lease();
         let lease =
             build_internal_cluster_lease(&sandbox_lease, "children", Duration::from_secs(5100))
@@ -516,10 +575,12 @@ mod tests {
             "an internal lease must never be mistakable for a tenant one"
         );
 
-        let owner = &lease.metadata.owner_references.as_ref().unwrap()[0];
-        assert_eq!(owner.kind, "SandboxLease");
-        assert_eq!(owner.uid, "lease-uid-1");
-        assert_eq!(owner.controller, Some(true));
+        assert!(lease.metadata.owner_references.is_none());
+        assert_eq!(
+            lease.labels().get(crate::sandbox::SANDBOX_LEASE_UID_LABEL),
+            Some(&"lease-uid-1".to_string())
+        );
+        assert!(internal_lease_is_for_sandbox(&lease, &sandbox_lease));
 
         // Verified destroy is requested explicitly. A pool that cannot honour
         // it rejects at bind time instead of quietly downgrading.
@@ -533,10 +594,11 @@ mod tests {
         assert_eq!(lease.spec.ttl, "5100s");
     }
 
-    /// A Sandbox lease with no UID cannot own anything, so nothing is composed.
+    /// A Sandbox lease with no UID cannot identify anything, so nothing is composed.
     ///
-    /// Allocating a cluster with no owner reference is how an abandoned
-    /// composition strands one: nothing would ever collect it.
+    /// The exact UID label is what lets restart and release recover a handle
+    /// before its status checkpoint. Without it, a derived name alone could
+    /// adopt or destroy somebody else's cluster.
     #[test]
     fn a_lease_without_a_uid_composes_nothing() {
         let mut sandbox_lease = sandbox_lease();
@@ -545,6 +607,29 @@ mod tests {
             build_internal_cluster_lease(&sandbox_lease, "children", Duration::from_secs(60))
                 .is_none()
         );
+    }
+
+    /// A derived name never permits adoption without the exact UID label, and
+    /// reintroducing an owner reference is rejected as the same GC hazard.
+    #[test]
+    fn same_named_or_gc_owned_internal_leases_are_foreign() {
+        let sandbox_lease = sandbox_lease();
+        let exact =
+            build_internal_cluster_lease(&sandbox_lease, "children", Duration::from_secs(60))
+                .unwrap();
+
+        let mut wrong_uid = exact.clone();
+        wrong_uid.metadata.labels.as_mut().unwrap().insert(
+            crate::sandbox::SANDBOX_LEASE_UID_LABEL.into(),
+            "replacement-lease-uid".into(),
+        );
+        assert!(!internal_lease_is_for_sandbox(&wrong_uid, &sandbox_lease));
+
+        let mut gc_owned = exact;
+        gc_owned.metadata.owner_references = sandbox_lease
+            .controller_owner_ref(&())
+            .map(|owner| vec![owner]);
+        assert!(!internal_lease_is_for_sandbox(&gc_owned, &sandbox_lease));
     }
 
     /// Provenance is recorded by UID, because a name is not identity.
