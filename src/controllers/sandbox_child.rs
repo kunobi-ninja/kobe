@@ -41,6 +41,34 @@ use crate::crd::{
 /// clean completion.
 pub const CHILD_DRAIN_GRACE: Duration = Duration::from_secs(15 * 60);
 
+/// Keeps the deterministic internal-handle name occupied after proof is ACKed.
+///
+/// A controller from before the allocation-fence protocol may still have a
+/// create request in flight. Deleting the handle to 404 before the outer
+/// lease's retention window ends would let that stale request recreate an
+/// allocation after `FootprintAbsent=True`. The Sandbox tombstone reaper is
+/// the only code allowed to remove this finalizer.
+pub const CHILD_HANDLE_RETENTION_FINALIZER: &str =
+    "kobe.kunobi.ninja/sandbox-child-handle-retention";
+pub const CHILD_HANDLE_TOMBSTONE_LABEL: &str = "kobe.kunobi.ninja/sandbox-child-handle-tombstone";
+pub const CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION: &str =
+    "kobe.kunobi.ninja/child-handle-retain-until";
+pub const CHILD_HANDLE_OUTER_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
+pub const CHILD_HANDLE_STALE_REJECTED_ANNOTATION: &str =
+    "kobe.kunobi.ninja/stale-sandbox-composition-rejected";
+
+/// Retain the handle at least as long as the outer audit record, plus the
+/// bounded create window and scheduling margin used by the release fence.
+pub fn child_handle_retention_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let configured = std::env::var(crate::api::sandbox::ENV_SANDBOX_LEASE_RETENTION).ok();
+    now + crate::api::sandbox::sandbox_lease_retention(configured.as_deref())
+        + chrono::Duration::from_std(crate::controllers::sandbox::SANDBOX_CLAIM_CREATE_TIMEOUT)
+            .expect("fixed create timeout fits chrono")
+        + chrono::Duration::minutes(5)
+}
+
 /// Why a child composition cannot proceed.
 ///
 /// A closed, non-secret vocabulary: these values reach status, events and
@@ -244,10 +272,26 @@ pub fn build_internal_cluster_lease(
                         crate::sandbox::SANDBOX_LEASE_UID_LABEL.to_string(),
                         sandbox_uid,
                     ),
+                    (CHILD_HANDLE_TOMBSTONE_LABEL.to_string(), "true".into()),
                 ]
                 .into_iter()
                 .collect(),
             ),
+            annotations: Some(
+                [
+                    (
+                        CHILD_HANDLE_OUTER_NAME_ANNOTATION.to_string(),
+                        sandbox_lease.name_any(),
+                    ),
+                    (
+                        CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.to_string(),
+                        child_handle_retention_deadline(chrono::Utc::now()).to_rfc3339(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            finalizers: Some(vec![CHILD_HANDLE_RETENTION_FINALIZER.to_string()]),
             ..Default::default()
         },
         spec: ClusterLeaseSpec {

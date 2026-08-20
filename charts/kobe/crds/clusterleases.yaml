@@ -491,6 +491,15 @@ spec:
                 - schemaVersion
                 - startedAt
                 type: object
+              unboundReleaseVerifiedAt:
+                description: |-
+                  API-server-observed proof that a terminal lease never acquired a
+                  binding or even a display `clusterName`. `VerifiedDestroy` leases keep
+                  this proof-bearing handle until their composing Sandbox acknowledges it;
+                  otherwise the handle's 404 would erase the only evidence that there was
+                  no child cluster to destroy.
+                nullable: true
+                type: string
             type: object
         required:
         - spec

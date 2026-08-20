@@ -93,6 +93,52 @@ spec:
           status:
             nullable: true
             properties:
+              allocationFence:
+                description: |-
+                  Exact management-cluster coordination `Lease` that closes allocation
+                  before teardown begins. Create paths must observe its absence inside a
+                  bounded final authorization window; release drains that window before
+                  it may checkpoint footprint absence.
+                nullable: true
+                properties:
+                  apiVersion:
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  kind:
+                    minLength: 1
+                    type: string
+                  name:
+                    minLength: 1
+                    type: string
+                  namespace:
+                    minLength: 1
+                    nullable: true
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                - uid
+                type: object
+              claimCleanupFence:
+                description: |-
+                  Protocol checkpoint written before any management `SandboxClaim` POST.
+                  `FinalizerV1` means every subsequently created Claim carries Kobe's
+                  cleanup finalizer from birth, so an unrecorded Claim cannot disappear
+                  before teardown either checkpoints its UID or proves the name absent.
+                enum:
+                - FinalizerV1
+                - null
+                nullable: true
+                type: string
               conditions:
                 items:
                   description: Kubernetes-style condition with the generation from which it was derived.

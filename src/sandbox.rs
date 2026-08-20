@@ -36,6 +36,10 @@ pub const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
 /// different namespace during recovery would let a damaged parent select a
 /// teardown path the controller never created.
 pub const CHILD_SANDBOX_NAMESPACE: &str = "kobe-sandbox";
+/// Holds a management `SandboxClaim` through the create-response/status-write
+/// gap. Release removes it only while atomically converting a live Claim into
+/// an inert tombstone, or the retained tombstone reaper removes it later.
+pub const SANDBOX_CLAIM_CLEANUP_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-claim-cleanup";
 /// Keeps a [`SandboxLease`](crate::crd::SandboxLease) present until Kobe has
 /// durably proved its complete footprint absent and released its reservations.
 ///
@@ -239,9 +243,14 @@ pub fn build_sandbox_warm_pool(
 
 /// Render one lease as a v1beta1 SandboxClaim.
 ///
-/// The initial claim intentionally omits `shutdownTime`: runtime TTL starts
-/// only after the upstream Sandbox becomes Ready. [`build_sandbox_claim_lifecycle_patch`]
-/// adds the absolute expiry later with a resourceVersion fence.
+/// The initial claim carries the already-persisted provisioning deadline as a
+/// shutdown backstop. Runtime TTL still starts only after the upstream Sandbox
+/// becomes Ready: [`build_sandbox_claim_lifecycle_patch`] then replaces this
+/// provisional bound with `readyAt + ttl` under a resourceVersion fence.
+///
+/// Putting the first bound in the POST body matters for cancellation safety. A
+/// request whose apiserver commit is delayed past outer-lease retention is
+/// already expired when it finally lands; it cannot create an unbounded orphan.
 ///
 /// Every claim also carries the exact outer lease UID. Management placement
 /// deliberately has no owner reference: garbage collection must not remove the
@@ -253,6 +262,8 @@ pub fn build_sandbox_claim(
     namespace: &str,
     warm_pool_name: &str,
     lease_uid: &str,
+    provisioning_deadline: DateTime<Utc>,
+    hold_for_explicit_cleanup: bool,
     owner_ref: Option<&OwnerReference>,
 ) -> DynamicObject {
     let mut claim = managed_object(
@@ -264,6 +275,8 @@ pub fn build_sandbox_claim(
             "spec": {
                 "warmPoolRef": { "name": warm_pool_name },
                 "lifecycle": {
+                    "shutdownTime": provisioning_deadline
+                        .to_rfc3339_opts(SecondsFormat::AutoSi, true),
                     "shutdownPolicy": "DeleteForeground"
                 }
             }
@@ -271,6 +284,9 @@ pub fn build_sandbox_claim(
     );
     let labels = claim.metadata.labels.get_or_insert_default();
     labels.insert(SANDBOX_LEASE_UID_LABEL.to_string(), lease_uid.to_string());
+    if hold_for_explicit_cleanup {
+        claim.metadata.finalizers = Some(vec![SANDBOX_CLAIM_CLEANUP_FINALIZER.to_string()]);
+    }
     claim
 }
 
@@ -1408,7 +1424,10 @@ mod tests {
     }
 
     #[test]
-    fn claim_projection_starts_ttl_only_after_ready() {
+    fn claim_projection_bounds_provisioning_then_starts_runtime_ttl_at_ready() {
+        let provisioning_deadline = DateTime::parse_from_rfc3339("2026-08-10T10:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let expires_at = DateTime::parse_from_rfc3339("2026-08-10T12:34:56Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -1417,6 +1436,8 @@ mod tests {
             "targets",
             "agents",
             "lease-uid-a",
+            provisioning_deadline,
+            true,
             None,
         ))
         .unwrap();
@@ -1432,7 +1453,15 @@ mod tests {
             value["metadata"].get("ownerReferences").is_none(),
             "a management claim must survive outer-lease GC until explicit proof"
         );
-        assert!(value["spec"]["lifecycle"].get("shutdownTime").is_none());
+        assert_eq!(
+            value["metadata"]["finalizers"],
+            serde_json::json!([SANDBOX_CLAIM_CLEANUP_FINALIZER]),
+            "a management claim must not disappear before its UID checkpoint"
+        );
+        assert_eq!(
+            value["spec"]["lifecycle"]["shutdownTime"],
+            "2026-08-10T10:10:00Z"
+        );
         assert_eq!(
             value["spec"]["lifecycle"]["shutdownPolicy"],
             "DeleteForeground"
@@ -1477,6 +1506,10 @@ mod tests {
             "targets",
             "agents",
             "lease-uid-a",
+            DateTime::parse_from_rfc3339("2026-08-10T10:10:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            false,
             Some(&owner),
         ))
         .unwrap();
@@ -1485,6 +1518,10 @@ mod tests {
         assert_eq!(
             value["metadata"]["ownerReferences"][0]["uid"],
             "namespace-uid"
+        );
+        assert!(
+            value["metadata"].get("finalizers").is_none(),
+            "the remote Namespace already owns child-Claim cleanup"
         );
     }
 

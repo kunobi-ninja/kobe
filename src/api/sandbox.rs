@@ -5120,10 +5120,12 @@ fn terminal_lease_is_retired(
 /// the cost of the audit record, which is why the window is generous and why
 /// `Quarantined` is excluded outright.
 ///
-/// Admission reservations and child teardown evidence are intentionally not
-/// garbage-collected through this object: their verified cleanup happens before
-/// a clean terminal phase is written. This sweep therefore retires only the
-/// public audit record and never acts as a capacity or footprint cleanup path.
+/// Before a clean terminal phase is written, reconciliation has explicitly
+/// verified the management footprint absent or consumed the exact child
+/// teardown proof, then released every admission reservation. Claim, allocation
+/// fence, and child-handle tombstones are not GC dependents of this record. A
+/// sweep always considers them before the outer record, and their own reaper
+/// still requires the exact outer UID to be absent on a later pass.
 ///
 /// Runs on every replica rather than under leader election. Each delete is
 /// fenced on the exact UID and resourceVersion, so replicas racing on the same
@@ -5136,7 +5138,7 @@ pub async fn run_sandbox_lease_reaper(
     retention: chrono::Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let leases: Api<SandboxLease> = Api::namespaced(client, namespace);
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
     info!(
         retention = %format_duration(&retention),
         "Starting Sandbox lease retention sweep"
@@ -5146,7 +5148,10 @@ pub async fn run_sandbox_lease_reaper(
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
         }
-        sweep_retired_leases(&leases, retention, chrono::Utc::now()).await;
+        let now = chrono::Utc::now();
+        crate::controllers::sandbox::sweep_sandbox_allocation_tombstones(&client, namespace, now)
+            .await;
+        sweep_retired_leases(&leases, retention, now).await;
     }
     info!("Sandbox lease retention sweep shut down");
 }

@@ -572,6 +572,12 @@ pub struct SandboxLeaseStatus {
     pub placement: Option<ResolvedSandboxPlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<SandboxTargetProvenance>,
+    /// Protocol checkpoint written before any management `SandboxClaim` POST.
+    /// `FinalizerV1` means every subsequently created Claim carries Kobe's
+    /// cleanup finalizer from birth, so an unrecorded Claim cannot disappear
+    /// before teardown either checkpoints its UID or proves the name absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_cleanup_fence: Option<SandboxClaimCleanupFence>,
     /// Exact management-cluster `SandboxClaim` retained as an inert release
     /// tombstone. This is separate from [`SandboxTargetProvenance::sandbox_claim`]:
     /// the original workload Claim may already be gone, while its same-named
@@ -591,6 +597,12 @@ pub struct SandboxLeaseStatus {
         extend("x-kubernetes-list-map-keys" = ["type"])
     )]
     pub conditions: Vec<SandboxCondition>,
+}
+
+/// Durable management-Claim deletion fence understood by this controller.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum SandboxClaimCleanupFence {
+    FinalizerV1,
 }
 
 /// Stable public phases. `Released` and `Expired` are clean terminal states;
