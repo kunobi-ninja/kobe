@@ -1598,4 +1598,48 @@ mod tests {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
     }
+
+    /// A token policy whose Secret could not be read must be skipped entirely,
+    /// not registered with an empty credential.
+    ///
+    /// `load_token_secrets` omits the entry on any Secret read failure — RBAC,
+    /// a missing `token` key, a transient API error — so the policy still
+    /// reaches `update_policies` without its token. The `continue` above is the
+    /// SOLE defence: kunobi-auth will happily register an empty static token,
+    /// compares it with a constant-time equality that returns true for
+    /// `("", "")`, and checks static tokens before anything else. An
+    /// `Authorization: Bearer ` header strips to `""`, so without that guard an
+    /// empty bearer authenticates as the provider.
+    #[tokio::test]
+    async fn a_token_policy_whose_secret_is_missing_authenticates_nobody() {
+        for secrets in [
+            HashMap::new(),
+            HashMap::from([("local-token-secret".to_string(), String::new())]),
+        ] {
+            let auth = JwtAuthenticator::new("test".to_string());
+            let policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "AccessPolicy",
+                "metadata": { "name": "local-token" },
+                "spec": {
+                    "auth": { "token": { "secretRef": "local-token-secret" } },
+                    "rules": [{
+                        "pools": ["*"],
+                        "maxTtl": "1h",
+                        "maxConcurrentLeases": 10
+                    }]
+                }
+            }))
+            .unwrap();
+
+            auth.update_policies(vec![policy], secrets).await;
+
+            for candidate in ["", "e2e-dev-token", "anything"] {
+                assert!(
+                    auth.validate(candidate).await.is_err(),
+                    "credential {candidate:?} authenticated against a policy with no token"
+                );
+            }
+        }
+    }
 }
