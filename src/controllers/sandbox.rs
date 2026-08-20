@@ -694,6 +694,37 @@ pub async fn reconcile_lease(
         return drive_release(&lease, &ctx, reason).await;
     }
 
+    // `admitted` is only the arbitration winner; it is not sufficient workload
+    // authority on its own. The same atomic patch must also have persisted the
+    // exact pre-created gate name+UID, and that object must still be the
+    // canonical open gate. A lost/mutated admission response can otherwise
+    // leave a caller holding a durable lease whose controller creates a
+    // workload that teardown can never drain safely.
+    if ctx.access_ledger_enabled {
+        match crate::sandbox_access_ledger::verify_open_admitted_gate(
+            &ctx.client,
+            &ctx.reservation_namespace,
+            &lease,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(
+                crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
+                | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
+            ) => return quarantine_lease(&lease, &ctx, "access_gate_unverifiable").await,
+            Err(crate::sandbox_access_ledger::AccessLedgerError::Kubernetes(kube::Error::Api(
+                response,
+            ))) if response.code == 401 || response.code == 403 => {
+                return quarantine_lease(&lease, &ctx, "access_gate_forbidden").await;
+            }
+            Err(error) => {
+                warn!(lease = %name, error = %error, "could not verify admitted Sandbox access gate");
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+        }
+    }
+
     let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let pool = pools.get(&lease.spec.pool_ref.name).await?;
 
@@ -3541,6 +3572,64 @@ pub(crate) mod tests {
             .iter()
             .filter(|request| request.method.as_str() == method && request.url.path() == target)
             .count()
+    }
+
+    /// `admitted` without the exact persisted gate is a durable record, not
+    /// workload authority. The controller must quarantine it before even
+    /// resolving the pool, so no Claim or other footprint can be created.
+    #[tokio::test]
+    async fn missing_admitted_gate_quarantines_before_any_footprint_request() {
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(Arc::new(admitted_lease()), ctx)
+            .await
+            .unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let quarantine = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("durable quarantine checkpoint");
+        let status = status_value_of(quarantine).unwrap();
+        assert_eq!(status["phase"], "Quarantined");
+        assert!(
+            status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|condition| {
+                    condition["reason"] == "access_gate_unverifiable"
+                        && condition["status"] == "False"
+                })
+        );
+
+        for forbidden in [
+            POOL_PATH,
+            CLAIMS_PATH,
+            CLAIM_PATH,
+            TEMPLATE_PATH,
+            WARM_POOL_PATH,
+            SANDBOX_PATH,
+            PODS_PATH,
+            SERVICE_PATH,
+        ] {
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.path() != forbidden),
+                "gate failure must happen before touching {forbidden}"
+            );
+        }
     }
 
     /// A child namespace is adopted only when its cross-cluster lease UID

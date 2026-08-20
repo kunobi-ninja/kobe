@@ -16,7 +16,7 @@
 //! window in which a late handler can mint a credential after cleanup starts,
 //! and teardown never needs to CREATE a gate while the ledger quota is full.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
@@ -113,6 +113,8 @@ pub enum AccessLedgerError {
     Kubernetes(#[from] kube::Error),
     #[error(transparent)]
     Serialization(#[from] serde_json::Error),
+    #[error("Sandbox access ledger mutation task failed: {0}")]
+    MutationTask(#[source] tokio::task::JoinError),
 }
 
 /// Result of globally reserving one operation.
@@ -148,6 +150,11 @@ struct AccessClient {
 pub struct AccessGuard {
     access: Arc<AccessClient>,
     registration: ReleaseRegistration,
+    /// An acquisition PATCH remains owned after the request future is
+    /// cancelled. Drop waits for its ambiguous outcome before cleanup, so a
+    /// late commit cannot recreate the exact entry after cleanup observed it
+    /// absent.
+    pending_write: Option<tokio::task::JoinHandle<Result<Lease, kube::Error>>>,
 }
 
 #[derive(Clone)]
@@ -178,10 +185,29 @@ impl Drop for AccessGuard {
     fn drop(&mut self) {
         let access = self.access.clone();
         let registration = self.registration.clone();
-        if registration.gate_uid.is_none() && registration.principal_uid.is_none() {
+        let pending_write = self.pending_write.take();
+        if pending_write.is_none()
+            && registration.gate_uid.is_none()
+            && registration.principal_uid.is_none()
+        {
             return;
         }
         tokio::spawn(async move {
+            if let Some(pending_write) = pending_write {
+                match pending_write.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => warn!(
+                        %error,
+                        operation = %registration.operation_id,
+                        "ambiguous Sandbox access acquisition PATCH completed with an error before cleanup"
+                    ),
+                    Err(error) => warn!(
+                        %error,
+                        operation = %registration.operation_id,
+                        "ambiguous Sandbox access acquisition PATCH task failed before cleanup"
+                    ),
+                }
+            }
             loop {
                 match release_exact(&access, &registration).await {
                     Ok(()) => return,
@@ -348,7 +374,7 @@ pub async fn prepare_open_gate(
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
     let (gate, _) =
         get_or_create_open_gate(&api, ledger_namespace, &sandbox_name, &sandbox_uid).await?;
-    validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
+    validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
     if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN) {
         return Err(AccessLedgerError::Invalid("lease gate state"));
     }
@@ -395,6 +421,45 @@ pub fn persisted_gate_reference(
     Ok(reference)
 }
 
+/// Prove an admitted lease still owns the exact open gate recorded at admission.
+///
+/// Placement calls this before creating any Sandbox footprint. The admission
+/// marker alone is insufficient: a committed patch whose response was mutated
+/// or whose gate annotation was stripped must retain its durable handle without
+/// becoming workload authority. Exact name, object UID, full object shape, open
+/// state, and typed entries are all required.
+pub async fn verify_open_admitted_gate(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+) -> Result<(), AccessLedgerError> {
+    let sandbox_name = lease.name_any();
+    let sandbox_uid = lease
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    let expected = persisted_gate_reference(lease)?;
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    let gate = match api.get(&expected.name).await {
+        Ok(gate) => gate,
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            return Err(AccessLedgerError::Invalid("missing admitted lease gate"));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
+    if lease_uid(&gate)? != expected.uid {
+        return Err(AccessLedgerError::Invalid("persisted access gate UID"));
+    }
+    if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN) {
+        return Err(AccessLedgerError::Invalid(
+            "admitted lease gate is not open",
+        ));
+    }
+    parse_entries::<GateEntry>(&gate)?;
+    Ok(())
+}
+
 /// Remove an empty pre-admission gate after the exact parent is proven absent.
 ///
 /// The caller owns the parent-404 fence. This helper never treats a DELETE
@@ -416,7 +481,10 @@ pub async fn remove_pre_admission_gate(
         Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
+    let ledger_namespace = api
+        .namespace()
+        .ok_or(AccessLedgerError::Invalid("ledger namespace"))?;
+    validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
     if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN)
         || !parse_entries::<GateEntry>(&gate)?.is_empty()
     {
@@ -446,18 +514,43 @@ pub async fn remove_pre_admission_gate(
 
 fn validate_gate(
     gate: &Lease,
+    expected_namespace: &str,
     expected_lease_name: &str,
     expected_lease_uid: &str,
 ) -> Result<(), AccessLedgerError> {
+    let expected_labels = BTreeMap::from([
+        (LEDGER_KIND_LABEL.to_string(), GATE_KIND.to_string()),
+        (
+            LEASE_NAME_LABEL.to_string(),
+            expected_lease_name.to_string(),
+        ),
+        (LEASE_UID_LABEL.to_string(), expected_lease_uid.to_string()),
+    ]);
     if gate.name_any() != gate_name(expected_lease_uid)
-        || gate.labels().get(LEDGER_KIND_LABEL).map(String::as_str) != Some(GATE_KIND)
-        || gate.labels().get(LEASE_NAME_LABEL).map(String::as_str) != Some(expected_lease_name)
-        || gate.labels().get(LEASE_UID_LABEL).map(String::as_str) != Some(expected_lease_uid)
+        || gate.namespace().as_deref() != Some(expected_namespace)
+        || gate.labels() != &expected_labels
+        || !gate
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        || !gate
+            .metadata
+            .finalizers
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        || gate.metadata.deletion_timestamp.is_some()
         || gate.spec.as_ref() != Some(&LeaseSpec::default())
     {
         return Err(AccessLedgerError::Invalid("lease gate provenance"));
     }
-    match gate.annotations().get(STATE_ANNOTATION).map(String::as_str) {
+    let annotations = gate.annotations();
+    if annotations.len() != 2 || !annotations.contains_key(ENTRIES_ANNOTATION) {
+        return Err(AccessLedgerError::Invalid("lease gate annotations"));
+    }
+    match annotations.get(STATE_ANNOTATION).map(String::as_str) {
         Some(OPEN | CLOSED) => Ok(()),
         _ => Err(AccessLedgerError::Invalid("lease gate state")),
     }
@@ -465,18 +558,38 @@ fn validate_gate(
 
 fn validate_principal(
     ledger: &Lease,
+    expected_namespace: &str,
     expected_principal_hash: &str,
 ) -> Result<(), AccessLedgerError> {
+    let expected_labels =
+        BTreeMap::from([(LEDGER_KIND_LABEL.to_string(), PRINCIPAL_KIND.to_string())]);
     if ledger.name_any() != principal_name(expected_principal_hash)
-        || ledger.labels().get(LEDGER_KIND_LABEL).map(String::as_str) != Some(PRINCIPAL_KIND)
-        || ledger
-            .annotations()
-            .get(PRINCIPAL_ANNOTATION)
-            .map(String::as_str)
-            != Some(expected_principal_hash)
+        || ledger.namespace().as_deref() != Some(expected_namespace)
+        || ledger.labels() != &expected_labels
+        || !ledger
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        || !ledger
+            .metadata
+            .finalizers
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        || ledger.metadata.deletion_timestamp.is_some()
         || ledger.spec.as_ref() != Some(&LeaseSpec::default())
     {
         return Err(AccessLedgerError::Invalid("principal ledger provenance"));
+    }
+    let annotations = ledger.annotations();
+    if annotations.len() != 2
+        || annotations.get(PRINCIPAL_ANNOTATION).map(String::as_str)
+            != Some(expected_principal_hash)
+        || !annotations.contains_key(ENTRIES_ANNOTATION)
+    {
+        return Err(AccessLedgerError::Invalid("principal ledger annotations"));
     }
     Ok(())
 }
@@ -503,13 +616,70 @@ async fn patch_entries<T: Serialize>(
         .await?)
 }
 
+/// Run an acquisition PATCH in a task whose handle is stored in the guard.
+///
+/// Dropping a Kubernetes request future does not prove the API server rejected
+/// it. The owning request may be cancelled while the response is lost but the
+/// write is still in flight. Keeping the handle in [`AccessGuard`] lets Drop
+/// wait for that exact request to become terminal before it starts CAS cleanup.
+async fn patch_entries_for_acquire<T: Serialize>(
+    api: &Api<Lease>,
+    object: &Lease,
+    previous: &str,
+    entries: &BTreeMap<String, T>,
+    pending_write: &mut Option<tokio::task::JoinHandle<Result<Lease, kube::Error>>>,
+) -> Result<Lease, AccessLedgerError> {
+    if pending_write.is_some() {
+        return Err(AccessLedgerError::Invalid(
+            "overlapping access acquisition mutation",
+        ));
+    }
+    let next = serde_json::to_string(entries)?;
+    let patch = serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid(object)? },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv(object)? },
+        { "op": "test", "path": annotation_path(ENTRIES_ANNOTATION), "value": previous },
+        { "op": "replace", "path": annotation_path(ENTRIES_ANNOTATION), "value": next }
+    ]);
+    let api = api.clone();
+    let name = object.name_any();
+    *pending_write = Some(tokio::spawn(async move {
+        api.patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(
+                serde_json::from_value(patch).expect("valid access-ledger acquisition patch"),
+            ),
+        )
+        .await
+    }));
+    let result = pending_write
+        .as_mut()
+        .expect("acquisition PATCH handle was just installed")
+        .await;
+    pending_write.take();
+    match result {
+        Ok(result) => Ok(result?),
+        Err(error) => Err(AccessLedgerError::MutationTask(error)),
+    }
+}
+
 async fn add_gate_entry(
     api: &Api<Lease>,
     registration: &mut ReleaseRegistration,
+    pending_write: &mut Option<tokio::task::JoinHandle<Result<Lease, kube::Error>>>,
 ) -> Result<Option<Lease>, AccessLedgerError> {
+    let ledger_namespace = api
+        .namespace()
+        .ok_or(AccessLedgerError::Invalid("ledger namespace"))?;
     for _ in 0..MAX_CAS_ATTEMPTS {
         let gate = api.get(&registration.gate_name).await?;
-        validate_gate(&gate, &registration.sandbox_name, &registration.sandbox_uid)?;
+        validate_gate(
+            &gate,
+            ledger_namespace,
+            &registration.sandbox_name,
+            &registration.sandbox_uid,
+        )?;
         if lease_uid(&gate)? != registration.expected_gate_uid {
             return Err(AccessLedgerError::Invalid("persisted access gate UID"));
         }
@@ -536,7 +706,7 @@ async fn add_gate_entry(
                 replica: registration.replica.clone(),
             },
         );
-        match patch_entries(api, &gate, &previous, &entries).await {
+        match patch_entries_for_acquire(api, &gate, &previous, &entries, pending_write).await {
             Ok(updated) => return Ok(Some(updated)),
             Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
             Err(error) => return Err(error),
@@ -550,6 +720,7 @@ async fn add_principal_entry(
     namespace: &str,
     gate: &Lease,
     registration: &mut ReleaseRegistration,
+    pending_write: &mut Option<tokio::task::JoinHandle<Result<Lease, kube::Error>>>,
 ) -> Result<Option<Lease>, AccessLedgerError> {
     let name = registration.principal_name.clone();
     for _ in 0..MAX_CAS_ATTEMPTS {
@@ -570,7 +741,7 @@ async fn add_principal_entry(
             }
             Err(error) => return Err(error.into()),
         };
-        validate_principal(&ledger, &registration.principal_hash)?;
+        validate_principal(&ledger, namespace, &registration.principal_hash)?;
         registration.principal_uid = Some(lease_uid(&ledger)?.to_string());
         let previous = ledger
             .annotations()
@@ -589,7 +760,7 @@ async fn add_principal_entry(
                 replica: registration.replica.clone(),
             },
         );
-        match patch_entries(api, &ledger, &previous, &entries).await {
+        match patch_entries_for_acquire(api, &ledger, &previous, &entries, pending_write).await {
             Ok(updated) => return Ok(Some(updated)),
             Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
             Err(error) => return Err(error),
@@ -636,8 +807,16 @@ pub async fn acquire(
             operation_id: operation_id.clone(),
             replica: replica.clone(),
         },
+        pending_write: None,
     });
-    let Some(gate) = add_gate_entry(&api, &mut guard.registration).await? else {
+    let guard_mut = &mut *guard;
+    let Some(gate) = add_gate_entry(
+        &api,
+        &mut guard_mut.registration,
+        &mut guard_mut.pending_write,
+    )
+    .await?
+    else {
         let name = gate_name(&sandbox_uid);
         return match api.get(&name).await {
             Ok(gate)
@@ -649,8 +828,15 @@ pub async fn acquire(
             Err(error) => Err(error.into()),
         };
     };
-    let principal =
-        add_principal_entry(&api, ledger_namespace, &gate, &mut guard.registration).await?;
+    let guard_mut = &mut *guard;
+    let principal = add_principal_entry(
+        &api,
+        ledger_namespace,
+        &gate,
+        &mut guard_mut.registration,
+        &mut guard_mut.pending_write,
+    )
+    .await?;
     let Some(_principal) = principal else {
         remove_gate_entry(
             &api,
@@ -679,6 +865,9 @@ async fn remove_principal_entry(
     operation_id: &str,
     expected_entry: &PrincipalEntry,
 ) -> Result<(), AccessLedgerError> {
+    let ledger_namespace = api
+        .namespace()
+        .ok_or(AccessLedgerError::Invalid("ledger namespace"))?;
     for _ in 0..MAX_CAS_ATTEMPTS {
         let ledger = match api.get(name).await {
             Ok(ledger) => ledger,
@@ -691,7 +880,7 @@ async fn remove_principal_entry(
             // entry could only have been committed under the recorded UID.
             return Ok(());
         }
-        validate_principal(&ledger, expected_principal_hash)?;
+        validate_principal(&ledger, ledger_namespace, expected_principal_hash)?;
         let previous = ledger
             .annotations()
             .get(ENTRIES_ANNOTATION)
@@ -723,6 +912,9 @@ async fn remove_gate_entry(
     operation_id: &str,
     expected_entry: &GateEntry,
 ) -> Result<(), AccessLedgerError> {
+    let ledger_namespace = api
+        .namespace()
+        .ok_or(AccessLedgerError::Invalid("ledger namespace"))?;
     for _ in 0..MAX_CAS_ATTEMPTS {
         let gate = match api.get(name).await {
             Ok(gate) => gate,
@@ -735,7 +927,12 @@ async fn remove_gate_entry(
             // callers return Waiting and re-read the new gate on the next pass.
             return Ok(());
         }
-        validate_gate(&gate, expected_sandbox_name, expected_sandbox_uid)?;
+        validate_gate(
+            &gate,
+            ledger_namespace,
+            expected_sandbox_name,
+            expected_sandbox_uid,
+        )?;
         let previous = gate
             .annotations()
             .get(ENTRIES_ANNOTATION)
@@ -826,9 +1023,25 @@ async fn replica_is_live(
     client: &Client,
     replica: &ServingReplica,
 ) -> Result<bool, AccessLedgerError> {
+    replica.validate()?;
     let pods: Api<Pod> = Api::namespaced(client.clone(), &replica.namespace);
     match pods.get(&replica.pod_name).await {
-        Ok(pod) => Ok(pod.uid().as_deref() == Some(replica.pod_uid.as_str())),
+        Ok(pod) => {
+            if pod.namespace().as_deref() != Some(replica.namespace.as_str())
+                || pod.name_any() != replica.pod_name
+            {
+                return Err(AccessLedgerError::Invalid(
+                    "observed serving replica Pod provenance",
+                ));
+            }
+            let observed_uid =
+                pod.uid()
+                    .filter(|uid| !uid.is_empty())
+                    .ok_or(AccessLedgerError::Invalid(
+                        "observed serving replica Pod UID",
+                    ))?;
+            Ok(observed_uid == replica.pod_uid)
+        }
         Err(kube::Error::Api(response)) if response.code == 404 => Ok(false),
         Err(error) => Err(error.into()),
     }
@@ -854,7 +1067,7 @@ pub async fn close_and_drain(
         }
         Err(error) => return Err(error.into()),
     };
-    validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
+    validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
     if lease_uid(&gate)? != expected_gate.uid {
         return Err(AccessLedgerError::Invalid("persisted access gate UID"));
     }
@@ -913,11 +1126,12 @@ pub async fn close_and_drain(
     Ok(AccessDrain::Waiting)
 }
 
-/// Remove entries left by an older process in the same exact Pod.
+/// Remove entries left by an older process in this Pod serving slot.
 ///
 /// Called after the lease watch reaches `InitDone` and before Sandbox routes
-/// serve. The current process is then the only process that can own this Pod
-/// identity, making a different boot id proof that the old socket disappeared.
+/// serve. The current process is then the only process that can own this
+/// namespace/name: a different boot id in the same Pod or a different UID from
+/// a replaced Pod both prove that the old socket disappeared.
 pub async fn recover_replica(
     client: &Client,
     ledger_namespace: &str,
@@ -942,15 +1156,11 @@ pub async fn recover_replica(
             .get(LEASE_UID_LABEL)
             .cloned()
             .ok_or(AccessLedgerError::Invalid("lease gate UID label"))?;
-        validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
+        validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
         let gate_uid = lease_uid(&gate)?.to_string();
         let entries: BTreeMap<String, GateEntry> = parse_entries(&gate)?;
         for (operation_id, entry) in entries {
-            if entry.replica.namespace != replica.namespace
-                || entry.replica.pod_name != replica.pod_name
-                || entry.replica.pod_uid != replica.pod_uid
-                || entry.replica.boot_id == replica.boot_id
-            {
+            if !stale_for_current_replica(&entry.replica, replica) {
                 continue;
             }
             let principal_name = principal_name(&entry.principal_hash);
@@ -986,7 +1196,166 @@ pub async fn recover_replica(
     Ok(())
 }
 
-/// Delete empty access ledgers only after their authority object is gone.
+/// Retire operation entries only after the exact recorded Pod is absent or a
+/// same-named replacement has a different UID.
+///
+/// This runs periodically because a rolling Deployment can start the new API
+/// Pod while the old one is still live, then delete the old Pod without another
+/// startup pass. Every mutation re-reads the exact ledger object and uses its
+/// UID/resourceVersion plus the complete typed operation entry as CAS fences.
+/// An unreadable or malformed Pod/principal/gate is retained for a later pass.
+async fn reap_dead_replica_entries(
+    client: &Client,
+    api: &Api<Lease>,
+    gate: &Lease,
+    sandbox_name: &str,
+    sandbox_uid: &str,
+    entries: &BTreeMap<String, GateEntry>,
+) {
+    let Ok(gate_uid) = lease_uid(gate).map(str::to_string) else {
+        return;
+    };
+    for (operation_id, entry) in entries {
+        match replica_is_live(client, &entry.replica).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    gate = %gate.name_any(),
+                    operation = %operation_id,
+                    pod = %entry.replica.pod_name,
+                    %error,
+                    "retaining Sandbox access entry because replica identity is unverifiable"
+                );
+                continue;
+            }
+        }
+
+        let principal_name = principal_name(&entry.principal_hash);
+        let principal = match api.get(&principal_name).await {
+            Ok(principal) => Some(principal),
+            Err(kube::Error::Api(response)) if response.code == 404 => None,
+            Err(error) => {
+                warn!(
+                    gate = %gate.name_any(),
+                    operation = %operation_id,
+                    %error,
+                    "retaining Sandbox access entry because its principal ledger is unreadable"
+                );
+                continue;
+            }
+        };
+        if let Some(principal) = principal {
+            let principal_uid = match lease_uid(&principal) {
+                Ok(uid) => uid.to_string(),
+                Err(error) => {
+                    warn!(
+                        gate = %gate.name_any(),
+                        operation = %operation_id,
+                        %error,
+                        "retaining Sandbox access entry because its principal identity is malformed"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = remove_principal_entry(
+                api,
+                &principal_name,
+                &principal_uid,
+                &entry.principal_hash,
+                operation_id,
+                &PrincipalEntry {
+                    lease_uid: sandbox_uid.to_string(),
+                    gate_name: gate.name_any(),
+                    replica: entry.replica.clone(),
+                },
+            )
+            .await
+            {
+                warn!(
+                    gate = %gate.name_any(),
+                    operation = %operation_id,
+                    %error,
+                    "retaining Sandbox gate entry because principal cleanup is unverified"
+                );
+                continue;
+            }
+        }
+        if let Err(error) = remove_gate_entry(
+            api,
+            &gate.name_any(),
+            &gate_uid,
+            sandbox_name,
+            sandbox_uid,
+            operation_id,
+            entry,
+        )
+        .await
+        {
+            warn!(
+                gate = %gate.name_any(),
+                operation = %operation_id,
+                %error,
+                "could not retire a dead-replica Sandbox gate entry"
+            );
+        }
+    }
+}
+
+/// Retire principal-ledger entries independently of their paired gate.
+///
+/// This second direction is required for a process crash with a principal
+/// PATCH still in flight: the gate cleanup can linearize first and the late
+/// principal commit can otherwise survive without any gate entry pointing to
+/// it. The exact recorded Pod absence plus the full typed entry and object
+/// UID/resourceVersion are the only removal authority.
+async fn reap_dead_principal_entries(
+    client: &Client,
+    api: &Api<Lease>,
+    principal: &Lease,
+    principal_hash: &str,
+    entries: &BTreeMap<String, PrincipalEntry>,
+) {
+    let Ok(principal_uid) = lease_uid(principal).map(str::to_string) else {
+        return;
+    };
+    for (operation_id, entry) in entries {
+        match replica_is_live(client, &entry.replica).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    principal = %principal.name_any(),
+                    operation = %operation_id,
+                    pod = %entry.replica.pod_name,
+                    %error,
+                    "retaining Sandbox principal entry because replica identity is unverifiable"
+                );
+                continue;
+            }
+        }
+        if let Err(error) = remove_principal_entry(
+            api,
+            &principal.name_any(),
+            &principal_uid,
+            principal_hash,
+            operation_id,
+            entry,
+        )
+        .await
+        {
+            warn!(
+                principal = %principal.name_any(),
+                operation = %operation_id,
+                %error,
+                "could not retire a dead-replica Sandbox principal entry"
+            );
+        }
+    }
+}
+
+/// Retire dead-replica entries and delete empty access ledgers only after their
+/// authority object is gone.
 pub async fn reap_empty(
     client: &Client,
     sandbox_namespace: &str,
@@ -995,25 +1364,170 @@ pub async fn reap_empty(
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
     let sandboxes: Api<SandboxLease> = Api::namespaced(client.clone(), sandbox_namespace);
     let objects = api.list(&ListParams::default()).await?;
+    // A gate's immutable name commits to the parent UID, but its parent-name
+    // label is mutable. Never use that label's GET/404 as orphan proof: a
+    // damaged label could point away from a live parent. One unfiltered,
+    // unpaginated snapshot lets every gate candidate correlate by immutable
+    // parent UID while principal-only sweeps avoid the extra request.
+    let sandbox_snapshot = if objects
+        .iter()
+        .any(|object| object.labels().get(LEDGER_KIND_LABEL).map(String::as_str) == Some(GATE_KIND))
+    {
+        Some(sandboxes.list(&ListParams::default()).await?)
+    } else {
+        None
+    };
+    let sandbox_snapshot_complete = sandbox_snapshot.as_ref().is_none_or(|snapshot| {
+        snapshot
+            .metadata
+            .continue_
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+            && snapshot
+                .metadata
+                .resource_version
+                .as_deref()
+                .is_some_and(|resource_version| !resource_version.is_empty())
+            && snapshot.iter().all(|lease| {
+                lease.namespace().as_deref() == Some(sandbox_namespace)
+                    && lease.uid().is_some_and(|uid| !uid.is_empty())
+                    && !lease.name_any().is_empty()
+            })
+    });
+    // A strict gate entry owns cleanup ordering for its paired principal entry:
+    // principal first, gate second. Sweep only unpaired principal entries in
+    // their own pass so one stale LIST snapshot cannot attempt the same entry
+    // twice after its first CAS succeeds.
+    let mut paired_principal_entries = BTreeSet::new();
+    for gate in &objects {
+        if gate.labels().get(LEDGER_KIND_LABEL).map(String::as_str) != Some(GATE_KIND) {
+            continue;
+        }
+        let Some(sandbox_name) = gate.labels().get(LEASE_NAME_LABEL) else {
+            continue;
+        };
+        let Some(sandbox_uid) = gate.labels().get(LEASE_UID_LABEL) else {
+            continue;
+        };
+        if validate_gate(gate, ledger_namespace, sandbox_name, sandbox_uid).is_err() {
+            continue;
+        }
+        let Ok(entries) = parse_entries::<GateEntry>(gate) else {
+            continue;
+        };
+        paired_principal_entries.extend(
+            entries
+                .into_iter()
+                .map(|(operation_id, entry)| (principal_name(&entry.principal_hash), operation_id)),
+        );
+    }
     for object in objects {
         let kind = object.labels().get(LEDGER_KIND_LABEL).map(String::as_str);
         let removable = match kind {
-            Some(PRINCIPAL_KIND) => parse_entries::<serde_json::Value>(&object)?.is_empty(),
-            Some(GATE_KIND) if parse_entries::<serde_json::Value>(&object)?.is_empty() => {
-                let Some(name) = object.labels().get(LEASE_NAME_LABEL) else {
-                    return Err(AccessLedgerError::Invalid("lease gate name label"));
+            Some(PRINCIPAL_KIND) => {
+                let Some(principal_hash) = object.annotations().get(PRINCIPAL_ANNOTATION) else {
+                    warn!(object = %object.name_any(), "ignoring malformed Sandbox principal ledger during reap");
+                    continue;
                 };
-                let expected_uid = object
-                    .labels()
-                    .get(LEASE_UID_LABEL)
-                    .ok_or(AccessLedgerError::Invalid("lease gate UID label"))?;
-                match sandboxes.get(name).await {
-                    Ok(lease) => {
-                        lease.uid().as_deref() != Some(expected_uid.as_str())
-                            || clean_terminal_lease(&lease)
+                if let Err(error) = validate_principal(&object, ledger_namespace, principal_hash)
+                    .and_then(|()| lease_uid(&object).map(|_| ()))
+                    .and_then(|()| lease_rv(&object).map(|_| ()))
+                {
+                    warn!(object = %object.name_any(), %error, "ignoring malformed Sandbox principal ledger during reap");
+                    continue;
+                }
+                match parse_entries::<PrincipalEntry>(&object) {
+                    Ok(entries) if entries.is_empty() => true,
+                    Ok(entries) => {
+                        let principal_name = object.name_any();
+                        let unpaired: BTreeMap<_, _> = entries
+                            .into_iter()
+                            .filter(|(operation_id, _)| {
+                                !paired_principal_entries
+                                    .contains(&(principal_name.clone(), operation_id.clone()))
+                            })
+                            .collect();
+                        reap_dead_principal_entries(
+                            client,
+                            &api,
+                            &object,
+                            principal_hash,
+                            &unpaired,
+                        )
+                        .await;
+                        // Re-list after any cleanup attempt before deleting the
+                        // ledger object under a now-stale resourceVersion.
+                        false
                     }
-                    Err(kube::Error::Api(response)) if response.code == 404 => true,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        warn!(object = %object.name_any(), %error, "ignoring malformed Sandbox principal entries during reap");
+                        continue;
+                    }
+                }
+            }
+            Some(GATE_KIND) => {
+                let Some(name) = object.labels().get(LEASE_NAME_LABEL).cloned() else {
+                    warn!(object = %object.name_any(), "ignoring malformed Sandbox lease gate during reap");
+                    continue;
+                };
+                let Some(expected_uid) = object.labels().get(LEASE_UID_LABEL).cloned() else {
+                    warn!(object = %object.name_any(), "ignoring malformed Sandbox lease gate during reap");
+                    continue;
+                };
+                if let Err(error) = validate_gate(&object, ledger_namespace, &name, &expected_uid)
+                    .and_then(|()| lease_uid(&object).map(|_| ()))
+                    .and_then(|()| lease_rv(&object).map(|_| ()))
+                {
+                    warn!(object = %object.name_any(), %error, "ignoring malformed Sandbox lease gate during reap");
+                    continue;
+                }
+                let entries = match parse_entries::<GateEntry>(&object) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        warn!(object = %object.name_any(), %error, "ignoring malformed Sandbox lease-gate entries during reap");
+                        continue;
+                    }
+                };
+                if !entries.is_empty() {
+                    reap_dead_replica_entries(
+                        client,
+                        &api,
+                        &object,
+                        &name,
+                        &expected_uid,
+                        &entries,
+                    )
+                    .await;
+                    // Any successful cleanup changed resourceVersion; any
+                    // retained entry still owns the gate. Re-list before ever
+                    // considering object deletion.
+                    false
+                } else {
+                    if !sandbox_snapshot_complete {
+                        warn!(object = %object.name_any(), "retaining empty Sandbox lease gate because the parent ledger snapshot is incomplete");
+                        continue;
+                    }
+                    let Some(snapshot) = sandbox_snapshot.as_ref() else {
+                        warn!(object = %object.name_any(), "retaining empty Sandbox lease gate without a parent ledger snapshot");
+                        continue;
+                    };
+                    let mut matching = snapshot
+                        .iter()
+                        .filter(|lease| lease.uid().as_deref() == Some(expected_uid.as_str()));
+                    let parent = matching.next();
+                    if matching.next().is_some() {
+                        warn!(object = %object.name_any(), "retaining empty Sandbox lease gate because the parent UID is not unique");
+                        continue;
+                    }
+                    match parent {
+                        Some(lease) if lease.name_any() != name => {
+                            warn!(object = %object.name_any(), parent = %lease.name_any(), "retaining Sandbox lease gate with mutated parent-name provenance");
+                            continue;
+                        }
+                        Some(lease) => clean_terminal_lease(lease),
+                        None => true,
+                    }
                 }
             }
             _ => false,
@@ -1023,8 +1537,8 @@ pub async fn reap_empty(
         }
         let params = DeleteParams {
             preconditions: Some(Preconditions {
-                uid: object.metadata.uid.clone(),
-                resource_version: object.metadata.resource_version.clone(),
+                uid: Some(lease_uid(&object)?.to_string()),
+                resource_version: Some(lease_rv(&object)?.to_string()),
             }),
             ..DeleteParams::default()
         };
@@ -1052,6 +1566,16 @@ fn clean_terminal_lease(lease: &SandboxLease) -> bool {
                     && condition.status == SandboxConditionStatus::True
             })
         })
+}
+
+/// Whether startup can prove an operation belongs to a dead predecessor of
+/// this serving slot. Once the current Pod name resolves to `current.pod_uid`,
+/// Kubernetes name uniqueness proves both an older boot in the same Pod and a
+/// same-named Pod with an older UID can no longer own a live connection.
+fn stale_for_current_replica(entry: &ServingReplica, current: &ServingReplica) -> bool {
+    entry.namespace == current.namespace
+        && entry.pod_name == current.pod_name
+        && (entry.pod_uid != current.pod_uid || entry.boot_id != current.boot_id)
 }
 
 /// Periodically retire empty gate/principal records after their authority is
@@ -1153,6 +1677,86 @@ mod tests {
         }
     }
 
+    fn ledgers_with_one_operation(replica: &ServingReplica) -> (String, String, Value, Value) {
+        let gate_name = gate_name("sandbox-uid");
+        let principal_name = principal_name("principal-hash");
+        let operation_id = "operation-1";
+        let gate_entries = BTreeMap::from([(
+            operation_id.to_string(),
+            GateEntry {
+                principal_hash: "principal-hash".into(),
+                replica: replica.clone(),
+            },
+        )]);
+        let principal_entries = BTreeMap::from([(
+            operation_id.to_string(),
+            PrincipalEntry {
+                lease_uid: "sandbox-uid".into(),
+                gate_name: gate_name.clone(),
+                replica: replica.clone(),
+            },
+        )]);
+        let gate = lease_object(
+            &gate_name,
+            "gate-uid",
+            "1",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (
+                    ENTRIES_ANNOTATION.into(),
+                    serde_json::to_string(&gate_entries).unwrap(),
+                ),
+            ]),
+        );
+        let principal = lease_object(
+            &principal_name,
+            "principal-uid",
+            "1",
+            BTreeMap::from([(LEDGER_KIND_LABEL.into(), PRINCIPAL_KIND.into())]),
+            BTreeMap::from([
+                (PRINCIPAL_ANNOTATION.into(), "principal-hash".into()),
+                (
+                    ENTRIES_ANNOTATION.into(),
+                    serde_json::to_string(&principal_entries).unwrap(),
+                ),
+            ]),
+        );
+        (gate_name, principal_name, gate, principal)
+    }
+
+    async fn mount_reaper_snapshots(server: &MockServer, gate: &Value, principal: &Value) {
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/ledger/leases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"coordination.k8s.io/v1", "kind":"LeaseList",
+                "metadata":{"resourceVersion":"2"},
+                "items":[gate.clone(), principal.clone()]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxLeaseList",
+                "metadata":{"resourceVersion":"2"},
+                "items":[sandbox_lease()]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     #[derive(Clone)]
     struct PatchedLease {
         object: Value,
@@ -1171,6 +1775,52 @@ mod tests {
             object["metadata"]["resourceVersion"] = json!("2");
             object["metadata"]["annotations"][ENTRIES_ANNOTATION] = json!(entries);
             ResponseTemplate::new(200).set_body_json(object)
+        }
+    }
+
+    #[derive(Clone)]
+    struct AmbiguousGateLedger {
+        object: Value,
+        state: Arc<std::sync::Mutex<(String, u64)>>,
+        acquisition_patch_seen: Arc<tokio::sync::Notify>,
+    }
+
+    impl Respond for AmbiguousGateLedger {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let mut state = self.state.lock().unwrap();
+            let mut object = self.object.clone();
+            match request.method.as_str() {
+                "GET" => {
+                    object["metadata"]["resourceVersion"] = json!(state.1.to_string());
+                    object["metadata"]["annotations"][ENTRIES_ANNOTATION] = json!(state.0.clone());
+                    ResponseTemplate::new(200).set_body_json(object)
+                }
+                "PATCH" => {
+                    let patch: Value = serde_json::from_slice(&request.body).unwrap();
+                    let current_resource_version = state.1.to_string();
+                    if patch[0]["value"] != object["metadata"]["uid"]
+                        || patch[1]["value"].as_str() != Some(current_resource_version.as_str())
+                        || patch[2]["value"] != state.0
+                    {
+                        return k8s_error(409);
+                    }
+                    let next = patch[3]["value"].as_str().unwrap().to_string();
+                    let is_acquisition = next != "{}";
+                    state.0 = next;
+                    state.1 += 1;
+                    object["metadata"]["resourceVersion"] = json!(state.1.to_string());
+                    object["metadata"]["annotations"][ENTRIES_ANNOTATION] = json!(state.0.clone());
+                    drop(state);
+                    let response = ResponseTemplate::new(200).set_body_json(object);
+                    if is_acquisition {
+                        self.acquisition_patch_seen.notify_one();
+                        response.set_delay(std::time::Duration::from_millis(500))
+                    } else {
+                        response
+                    }
+                }
+                _ => ResponseTemplate::new(405),
+            }
         }
     }
 
@@ -1199,9 +1849,44 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovers_old_boots_and_same_named_pod_replacements_only() {
+        let current = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "new-pod-uid".into(),
+            boot_id: "new-boot-id".into(),
+        };
+        assert!(stale_for_current_replica(
+            &ServingReplica {
+                boot_id: "old-boot-id".into(),
+                ..current.clone()
+            },
+            &current
+        ));
+        assert!(stale_for_current_replica(
+            &ServingReplica {
+                pod_uid: "old-pod-uid".into(),
+                boot_id: "old-pod-boot-id".into(),
+                ..current.clone()
+            },
+            &current
+        ));
+        assert!(!stale_for_current_replica(&current, &current));
+        assert!(!stale_for_current_replica(
+            &ServingReplica {
+                pod_name: "kobe-1".into(),
+                pod_uid: "other-pod-uid".into(),
+                boot_id: "other-boot-id".into(),
+                ..current.clone()
+            },
+            &current
+        ));
+    }
+
+    #[test]
     fn gate_and_principal_objects_start_empty() {
         let gate = build_gate("ledger", "sandbox-a", "uid-a", OPEN);
-        validate_gate(&gate, "sandbox-a", "uid-a").unwrap();
+        validate_gate(&gate, "ledger", "sandbox-a", "uid-a").unwrap();
         assert_eq!(parse_entries::<GateEntry>(&gate).unwrap(), BTreeMap::new());
         let principal = build_principal("ledger", "principal");
         assert_eq!(
@@ -1352,6 +2037,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_named_gate_replacement_never_becomes_placement_authority() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let name = gate_name("sandbox-uid");
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        let replacement = lease_object(
+            &name,
+            "replacement-gate-uid",
+            "9",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("{collection}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replacement))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            verify_open_admitted_gate(&client, "ledger", &sandbox_lease()).await,
+            Err(AccessLedgerError::Invalid("persisted access gate UID"))
+        ));
+    }
+
+    #[tokio::test]
     async fn clean_terminal_parent_releases_the_empty_gate_before_record_retention() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
@@ -1397,9 +2115,14 @@ mod tests {
         });
         Mock::given(method("GET"))
             .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases/sandbox-a",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxLeaseList",
+                "metadata":{"resourceVersion":"9"},
+                "items":[parent]
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -1416,6 +2139,351 @@ mod tests {
             .await;
 
         reap_empty(&client, "kobe-system", "ledger").await.unwrap();
+    }
+
+    /// The parent-name hint is mutable and therefore cannot establish orphan
+    /// status. The immutable gate name still commits to the live parent UID;
+    /// a full unfiltered snapshot must find it and retain the gate.
+    #[tokio::test]
+    async fn mutated_parent_name_cannot_hide_a_live_gate_from_the_reaper() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let gate_name = gate_name("sandbox-uid");
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        let gate = lease_object(
+            &gate_name,
+            "gate-uid",
+            "7",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "missing-parent".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(collection))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"coordination.k8s.io/v1", "kind":"LeaseList",
+                "metadata":{"resourceVersion":"8"}, "items":[gate]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxLeaseList",
+                "metadata":{"resourceVersion":"9"},
+                "items":[sandbox_lease()]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        reap_empty(&client, "kobe-system", "ledger").await.unwrap();
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
+    /// A Deployment rollout can replace `kobe-old` with a differently named
+    /// Pod. Once the old exact Pod is 404, its operation is dead even though
+    /// the Sandbox gate remains open; both global ledgers must release only
+    /// that exact typed entry under UID/resourceVersion CAS.
+    #[tokio::test]
+    async fn periodic_reaper_recovers_entries_from_a_differently_named_rollout_pod() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let old_replica = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-old".into(),
+            pod_uid: "old-pod-uid".into(),
+            boot_id: "old-boot-id".into(),
+        };
+        let (gate_name, principal_name, gate, principal) = ledgers_with_one_operation(&old_replica);
+        mount_reaper_snapshots(&server, &gate, &principal).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kobe-system/pods/kobe-old"))
+            .respond_with(k8s_error(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        Mock::given(method("GET"))
+            .and(path(format!("{collection}/{principal_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(principal.clone()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{collection}/{principal_name}")))
+            .respond_with(PatchedLease { object: principal })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{collection}/{gate_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{collection}/{gate_name}")))
+            .respond_with(PatchedLease { object: gate })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        reap_empty(&client, "kobe-system", "ledger").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let patches: Vec<Value> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(patches.len(), 2);
+        assert!(patches.iter().all(|patch| {
+            patch[0]["path"] == "/metadata/uid"
+                && patch[1]["path"] == "/metadata/resourceVersion"
+                && patch[3]["value"] == "{}"
+        }));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
+    /// A process can die with the principal PATCH still in flight after its
+    /// gate entry has already been retired. The independent principal pass
+    /// must recover that late orphan from exact Pod absence and typed CAS.
+    #[tokio::test]
+    async fn periodic_reaper_recovers_an_unpaired_late_principal_entry() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let old_replica = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-old".into(),
+            pod_uid: "old-pod-uid".into(),
+            boot_id: "old-boot-id".into(),
+        };
+        let (_, principal_name, _, principal) = ledgers_with_one_operation(&old_replica);
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        Mock::given(method("GET"))
+            .and(path(collection))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"coordination.k8s.io/v1", "kind":"LeaseList",
+                "metadata":{"resourceVersion":"2"}, "items":[principal.clone()]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kobe-system/pods/kobe-old"))
+            .respond_with(k8s_error(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{collection}/{principal_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(principal.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{collection}/{principal_name}")))
+            .respond_with(PatchedLease { object: principal })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        reap_empty(&client, "kobe-system", "ledger").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let patch: Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method.as_str() == "PATCH")
+                .expect("dead exact replica must release its principal entry")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(patch[0]["value"], "principal-uid");
+        assert_eq!(patch[1]["value"], "1");
+        let previous: BTreeMap<String, PrincipalEntry> =
+            serde_json::from_str(patch[2]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(previous.len(), 1);
+        assert_eq!(previous.values().next().unwrap().replica, old_replica);
+        assert_eq!(patch[3]["value"], "{}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
+    async fn assert_periodic_reaper_preserves_entry(pod_response: ResponseTemplate) {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let replica = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-live".into(),
+            pod_uid: "live-pod-uid".into(),
+            boot_id: "live-boot-id".into(),
+        };
+        let (_, principal_name, gate, principal) = ledgers_with_one_operation(&replica);
+        mount_reaper_snapshots(&server, &gate, &principal).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kobe-system/pods/kobe-live"))
+            .respond_with(pod_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        reap_empty(&client, "kobe-system", "ledger").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method.as_str() != "PATCH" && request.method.as_str() != "DELETE"
+        }));
+        assert!(requests.iter().all(|request| {
+            request.url.path()
+                != format!("/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{principal_name}")
+        }));
+    }
+
+    #[tokio::test]
+    async fn periodic_reaper_preserves_entries_owned_by_a_live_exact_pod() {
+        assert_periodic_reaper_preserves_entry(ResponseTemplate::new(200).set_body_json(json!({
+            "apiVersion":"v1", "kind":"Pod",
+            "metadata":{
+                "name":"kobe-live", "namespace":"kobe-system", "uid":"live-pod-uid"
+            },
+            "spec":{"containers":[]}
+        })))
+        .await;
+    }
+
+    /// A transient GET failure and a 200 response without exact UID identity
+    /// are both uncertainty, never absence. Neither may free a global limit.
+    #[tokio::test]
+    async fn periodic_reaper_fails_closed_on_replica_observation_uncertainty() {
+        assert_periodic_reaper_preserves_entry(k8s_error(500)).await;
+        assert_periodic_reaper_preserves_entry(ResponseTemplate::new(200).set_body_json(json!({
+            "apiVersion":"v1", "kind":"Pod",
+            "metadata":{"name":"kobe-live", "namespace":"kobe-system"},
+            "spec":{"containers":[]}
+        })))
+        .await;
+    }
+
+    /// Every field on an admission token except its name is mutable. Even when
+    /// all of those hints are rewritten to imitate either access-ledger kind,
+    /// the reaper must not free live admission capacity. Malformed objects also
+    /// must not stop a later canonical empty ledger from being reclaimed.
+    #[tokio::test]
+    async fn reaper_skips_a_disguised_admission_token_and_continues() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+
+        let disguised_token = lease_object(
+            "sbx-quota-live-principal-0",
+            "quota-token-uid",
+            "11",
+            BTreeMap::from([(LEDGER_KIND_LABEL.into(), PRINCIPAL_KIND.into())]),
+            BTreeMap::from([
+                (PRINCIPAL_ANNOTATION.into(), "forged-principal".into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        let disguised_gate_token = lease_object(
+            "sbx-alias-live-principal-demo",
+            "alias-token-uid",
+            "12",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "absent-parent".into()),
+                (LEASE_UID_LABEL.into(), "forged-parent-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        let canonical_name = principal_name("idle-principal");
+        let canonical_principal = lease_object(
+            &canonical_name,
+            "principal-uid",
+            "13",
+            BTreeMap::from([(LEDGER_KIND_LABEL.into(), PRINCIPAL_KIND.into())]),
+            BTreeMap::from([
+                (PRINCIPAL_ANNOTATION.into(), "idle-principal".into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(collection))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"coordination.k8s.io/v1", "kind":"LeaseList",
+                "metadata":{"resourceVersion":"14"},
+                "items":[disguised_token, disguised_gate_token, canonical_principal]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxLeaseList",
+                "metadata":{"resourceVersion":"15"}, "items":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{collection}/{canonical_name}")))
+            .and(body_partial_json(json!({
+                "preconditions":{"uid":"principal-uid","resourceVersion":"13"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"v1", "kind":"Status", "status":"Success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        reap_empty(&client, "kobe-system", "ledger").await.unwrap();
+
+        let deletes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .collect();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            deletes[0].url.path(),
+            format!("{collection}/{canonical_name}")
+        );
     }
 
     #[tokio::test]
@@ -1561,8 +2629,9 @@ mod tests {
             .mount(&gate_server)
             .await;
         let mut gate_registration = test_registration(&replica);
+        let mut pending_write = None;
         assert!(
-            add_gate_entry(&gate_api, &mut gate_registration)
+            add_gate_entry(&gate_api, &mut gate_registration, &mut pending_write)
                 .await
                 .is_err()
         );
@@ -1599,12 +2668,14 @@ mod tests {
             .await;
         let gate_object: Lease = serde_json::from_value(gate_object).unwrap();
         let mut principal_registration = test_registration(&replica);
+        let mut pending_write = None;
         assert!(
             add_principal_entry(
                 &principal_api,
                 "ledger",
                 &gate_object,
                 &mut principal_registration,
+                &mut pending_write,
             )
             .await
             .is_err()
@@ -1612,6 +2683,129 @@ mod tests {
         assert_eq!(
             principal_registration.principal_uid.as_deref(),
             Some("principal-uid")
+        );
+    }
+
+    /// Cancelling a handler drops its acquisition future, but that does not
+    /// cancel a PATCH already accepted by the API server. Drop must await the
+    /// exact PATCH task before its GET+CAS cleanup, or a late response-lost
+    /// commit can recreate a same-boot entry after cleanup saw it absent.
+    #[tokio::test]
+    async fn aborted_acquisition_waits_for_the_ambiguous_patch_before_cleanup() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let replica = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "pod-uid".into(),
+            boot_id: "boot-id".into(),
+        };
+        let gate = gate_name("sandbox-uid");
+        let object = lease_object(
+            &gate,
+            "gate-uid",
+            "1",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        let state = Arc::new(std::sync::Mutex::new(("{}".to_string(), 1)));
+        let acquisition_patch_seen = Arc::new(tokio::sync::Notify::new());
+        Mock::given(path(format!(
+            "/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{gate}"
+        )))
+        .respond_with(AmbiguousGateLedger {
+            object,
+            state: state.clone(),
+            acquisition_patch_seen: acquisition_patch_seen.clone(),
+        })
+        .expect(4)
+        .mount(&server)
+        .await;
+
+        let acquire_client = client.clone();
+        let acquire_replica = replica.clone();
+        let acquire_task = tokio::spawn(async move {
+            acquire(
+                &acquire_client,
+                "ledger",
+                &sandbox_lease(),
+                "principal-hash",
+                &acquire_replica,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquisition_patch_seen.notified(),
+        )
+        .await
+        .expect("acquisition PATCH must become in flight");
+        acquire_task.abort();
+        assert!(matches!(
+            acquire_task.await,
+            Err(error) if error.is_cancelled()
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let before_patch_terminal = server.received_requests().await.unwrap();
+        assert_eq!(
+            before_patch_terminal
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["GET", "PATCH"],
+            "cleanup GET must wait for the ambiguous PATCH task"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.lock().unwrap().0 == "{}" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop cleanup must remove the committed entry");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["GET", "PATCH", "GET", "PATCH"]
+        );
+        let patches: Vec<Value> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        let admitted_entries: BTreeMap<String, GateEntry> =
+            serde_json::from_str(patches[0][3]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(admitted_entries.len(), 1);
+        assert_eq!(admitted_entries.values().next().unwrap().replica, replica);
+        assert_eq!(patches[1][0]["value"], "gate-uid");
+        assert_eq!(patches[1][1]["value"], "2");
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, GateEntry>>(
+                patches[1][2]["value"].as_str().unwrap()
+            )
+            .unwrap(),
+            admitted_entries
+        );
+        assert_eq!(patches[1][3]["value"], "{}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
         );
     }
 
@@ -1737,8 +2931,9 @@ mod tests {
             .await;
         let mut gate_registration = test_registration(&replica);
         gate_registration.principal_hash = "principal-new".into();
+        let mut pending_write = None;
         assert!(
-            add_gate_entry(&gate_api, &mut gate_registration)
+            add_gate_entry(&gate_api, &mut gate_registration, &mut pending_write)
                 .await
                 .unwrap()
                 .is_none()
@@ -1805,12 +3000,14 @@ mod tests {
         ))
         .unwrap();
         let mut principal_registration = test_registration(&replica);
+        let mut pending_write = None;
         assert!(
             add_principal_entry(
                 &principal_api,
                 "ledger",
                 &gate_object,
                 &mut principal_registration,
+                &mut pending_write,
             )
             .await
             .unwrap()

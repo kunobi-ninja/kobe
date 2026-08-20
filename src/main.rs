@@ -27,6 +27,17 @@ use api::auth::JwtAuthenticator;
 use api::routes::{AppState, build_router};
 use backend::{BackendDispatch, BackendFactory, K3sBackend};
 
+// One fully usable aliased Sandbox with an active operation needs a gate, a
+// quota token, an alias token, and its principal ledger simultaneously.
+const MIN_SANDBOX_LEDGER_OBJECT_LIMIT: u32 = 4;
+
+fn parse_sandbox_ledger_object_limit(value: &str) -> Option<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|limit| *limit >= MIN_SANDBOX_LEDGER_OBJECT_LIMIT)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the rustls crypto provider before any TLS usage.
@@ -133,12 +144,11 @@ async fn main() -> anyhow::Result<()> {
         };
         let object_limit = match std::env::var("KOBE_SANDBOX_LEDGER_OBJECT_LIMIT")
             .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|limit| *limit >= 2)
+            .and_then(|value| parse_sandbox_ledger_object_limit(&value))
         {
             Some(limit) => limit,
             None => {
-                error!("KOBE_SANDBOX_LEDGER_OBJECT_LIMIT must be an integer of at least 2");
+                error!("KOBE_SANDBOX_LEDGER_OBJECT_LIMIT must be an integer of at least 4");
                 std::process::exit(1);
             }
         };
@@ -834,6 +844,22 @@ mod controllers_test_anchor {
 mod diagnostics_test_anchor {
     #[allow(unused_imports)]
     use crate::diagnostics::bundle;
+}
+
+#[cfg(test)]
+mod sandbox_ledger_config_tests {
+    use super::{MIN_SANDBOX_LEDGER_OBJECT_LIMIT, parse_sandbox_ledger_object_limit};
+
+    /// The runtime validator must agree with the chart/schema contract. One
+    /// aliased lease with an active operation simultaneously consumes exactly
+    /// four objects: gate + quota + alias + principal ledger.
+    #[test]
+    fn object_limit_covers_gate_quota_alias_and_principal_ledger() {
+        assert_eq!(MIN_SANDBOX_LEDGER_OBJECT_LIMIT, 4);
+        assert_eq!(parse_sandbox_ledger_object_limit("4"), Some(4));
+        assert_eq!(parse_sandbox_ledger_object_limit("3"), None);
+        assert_eq!(parse_sandbox_ledger_object_limit("not-a-number"), None);
+    }
 }
 
 #[cfg(test)]

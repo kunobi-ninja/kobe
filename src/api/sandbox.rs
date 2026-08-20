@@ -2993,6 +2993,7 @@ async fn create_sandbox_lease<B: ClusterBackend>(
         }
     };
 
+    let mut admission_handoff_requires_quarantine = false;
     if let Err(err) = admit_sandbox_lease(
         &leases,
         &reservations,
@@ -3052,17 +3053,27 @@ async fn create_sandbox_lease<B: ClusterBackend>(
                         if !crate::sandbox_access_ledger::persisted_gate_reference(&current)
                             .is_ok_and(|actual| actual == access_gate)
                         {
-                            return sandbox_infra_error(
-                                "Failed to finalize Sandbox lease admission",
-                                "admitted lease has different access-gate provenance",
+                            // Admission itself is durable, so a 503 would invite
+                            // a duplicate create. Preserve the handle with the
+                            // normal 202 response; the controller independently
+                            // proves the exact open gate before creating any
+                            // footprint and quarantines this lease when it cannot.
+                            admission_handoff_requires_quarantine = true;
+                            error!(
+                                lease_id = %lease_id,
+                                error = %other,
+                                "admission committed without the expected access gate; \
+                                 preserving the durable handle for quarantine"
                             );
                         }
-                        warn!(
-                            lease_id = %lease_id,
-                            error = %other,
-                            "admission response was lost but the lease is admitted; \
-                             reporting success rather than inviting a duplicate retry"
-                        );
+                        if !admission_handoff_requires_quarantine {
+                            warn!(
+                                lease_id = %lease_id,
+                                error = %other,
+                                "admission response was lost but the lease is admitted; \
+                                 reporting success rather than inviting a duplicate retry"
+                            );
+                        }
                         // Fall through to the success response below.
                     }
                     _ => {
@@ -3081,12 +3092,21 @@ async fn create_sandbox_lease<B: ClusterBackend>(
         }
     }
 
-    info!(
-        lease_id = %lease_id,
-        pool = %request.pool,
-        identity = %identity.identity,
-        "Sandbox lease accepted for placement"
-    );
+    if admission_handoff_requires_quarantine {
+        warn!(
+            lease_id = %lease_id,
+            pool = %request.pool,
+            identity = %identity.identity,
+            "Sandbox lease admitted but not authorized for placement; returning its durable handle"
+        );
+    } else {
+        info!(
+            lease_id = %lease_id,
+            pool = %request.pool,
+            identity = %identity.identity,
+            "Sandbox lease accepted for placement"
+        );
+    }
 
     (
         StatusCode::ACCEPTED,
@@ -7594,8 +7614,7 @@ mod tests {
     /// Note this is NOT the same as the applied-but-lost case, which
     /// `admit_sandbox_lease` already resolves internally: with the outer
     /// re-read disabled, that one still passes. This test fails without it.
-    #[tokio::test]
-    async fn an_admission_that_lands_late_is_not_reported_as_failure() {
+    async fn assert_late_admission_returns_durable_handle(include_exact_gate: bool) {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
         let ledger = mount_reservation_api(&server, &[]).await;
@@ -7716,11 +7735,15 @@ mod tests {
                         },
                     )
                     .unwrap();
-                    serde_json::json!({
+                    let mut annotations = serde_json::json!({
                         SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_ADMITTED,
-                        SANDBOX_RESERVATIONS_ANNOTATION: provenance,
-                        crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION: gate_provenance
-                    })
+                        SANDBOX_RESERVATIONS_ANNOTATION: provenance
+                    });
+                    if include_exact_gate {
+                        annotations[crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION] =
+                            serde_json::json!(gate_provenance);
+                    }
+                    annotations
                 };
                 ResponseTemplate::new(200).set_body_json(object)
             })
@@ -7750,12 +7773,34 @@ mod tests {
         )
         .await;
 
+        let status = response.status();
+        let body = response_json(response).await;
         assert_eq!(
-            response.status(),
+            status,
             StatusCode::ACCEPTED,
-            "the lease is admitted and placeable; a 503 here makes the caller \
-             retry and create a second sandbox"
+            "an admitted lease must return its durable handle; a 503 here makes \
+             the caller retry and create a second sandbox"
         );
+        assert!(
+            body["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("sandbox-"))
+        );
+        assert_eq!(body["phase"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn an_admission_that_lands_late_is_not_reported_as_failure() {
+        assert_late_admission_returns_durable_handle(true).await;
+    }
+
+    /// A lost response may surface an `admitted` object whose gate annotation
+    /// was stripped by mutation. It is not placement authority, but it is still
+    /// a committed lease: return its 202 handle so the controller can
+    /// quarantine it without inviting a duplicate create.
+    #[tokio::test]
+    async fn admitted_without_the_exact_gate_returns_a_non_retry_handoff() {
+        assert_late_admission_returns_durable_handle(false).await;
     }
 
     /// A lease with a corrupted admission annotation must stay deletable.
