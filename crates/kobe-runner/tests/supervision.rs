@@ -177,6 +177,30 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+fn wait_for_pid(pidfile: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(pidfile)
+            && let Ok(pid) = raw.trim().parse::<i32>()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the descendant never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_process_gone(pid: i32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} survived process-group termination"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The command outlives the process that started it.
 ///
 /// This is the entire point of the runner. A "detached" execution that dies
@@ -332,16 +356,7 @@ fn cancelling_kills_the_whole_process_group() {
     );
 
     // Wait for the grandchild to exist before cancelling anything.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let grandchild = loop {
-        if let Ok(raw) = std::fs::read_to_string(&pidfile)
-            && let Ok(pid) = raw.trim().parse::<i32>()
-        {
-            break pid;
-        }
-        assert!(Instant::now() < deadline, "the grandchild never started");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let grandchild = wait_for_pid(&pidfile);
     assert!(alive(grandchild), "the grandchild must be running");
 
     let report = report_of(reply(
@@ -356,14 +371,68 @@ fn cancelling_kills_the_whole_process_group() {
     );
 
     // The descendant that nobody signalled directly is gone too.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while alive(grandchild) {
-        assert!(
-            Instant::now() < deadline,
-            "the grandchild survived the cancellation"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert_process_gone(grandchild);
+}
+
+/// Cancellation escalates even when the leader exits before its descendant.
+///
+/// The inner shell deliberately ignores SIGTERM. The outer session leader
+/// exits on SIGTERM, reproducing the case where treating leader exit as group
+/// exit leaked the remaining command.
+#[test]
+fn cancelling_escalates_after_the_leader_exits_first() {
+    let scratch = Scratch::new();
+    let pidfile = scratch.path().join("term-ignoring-child.pid");
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 60; done' & trap 'exit 0' TERM; wait",
+        pidfile.display()
+    );
+    start(
+        &scratch,
+        "sbxe-group-escalate",
+        &["/bin/sh", "-c", &script],
+        60,
+        4096,
+    );
+
+    let descendant = wait_for_pid(&pidfile);
+    assert!(alive(descendant), "the descendant must be running");
+
+    let _ = reply(
+        runner(&scratch, &["cancel", "--id", "sbxe-group-escalate"])
+            .output()
+            .unwrap(),
+    );
+    let report = settled(&scratch, "sbxe-group-escalate", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::Cancelled);
+    assert_eq!(report.reason.as_deref(), Some("cancelled_by_caller"));
+    assert_process_gone(descendant);
+}
+
+/// Timeout uses the same proven process-group teardown as cancellation.
+#[test]
+fn timeout_escalates_after_the_leader_exits_first() {
+    let scratch = Scratch::new();
+    let pidfile = scratch.path().join("timed-out-child.pid");
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 60; done' & trap 'exit 0' TERM; wait",
+        pidfile.display()
+    );
+    start(
+        &scratch,
+        "sbxe-timeout-escalate",
+        &["/bin/sh", "-c", &script],
+        1,
+        4096,
+    );
+
+    let descendant = wait_for_pid(&pidfile);
+    assert!(alive(descendant), "the descendant must be running");
+
+    let report = settled(&scratch, "sbxe-timeout-escalate", Duration::from_secs(20));
+    assert_eq!(report.state, RunnerState::TimedOut);
+    assert_eq!(report.reason.as_deref(), Some("timed_out"));
+    assert_process_gone(descendant);
 }
 
 /// A command that outruns its bound is stopped, and says so.

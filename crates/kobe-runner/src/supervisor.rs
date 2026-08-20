@@ -63,6 +63,7 @@ mod reason {
     pub const CANCELLED: &str = "cancelled_by_caller";
     pub const SIGNALLED: &str = "signalled";
     pub const SPAWN_FAILED: &str = "spawn_failed";
+    pub const SUPERVISOR_SETUP_FAILED: &str = "supervisor_setup_failed";
     pub const OUTCOME_UNOBSERVED: &str = "outcome_unobserved";
 }
 
@@ -79,6 +80,20 @@ pub fn supervise(spool: &Spool, id: &str) {
     };
 
     let started_at = now_unix_ms();
+    if enable_child_subreaper().is_err() {
+        // A Linux container's PID 1 is not required to reap orphans. Without
+        // becoming a subreaper, this process cannot prove that every member of
+        // the command's process group is gone before reporting cancellation.
+        let _ = spool.write_report(&ExecutionReport {
+            id: id.to_string(),
+            state: RunnerState::Unknown,
+            started_at_unix_ms: Some(started_at),
+            finished_at_unix_ms: Some(now_unix_ms()),
+            reason: Some(reason::SUPERVISOR_SETUP_FAILED.into()),
+            ..Default::default()
+        });
+        return;
+    }
     let mut child = match spawn(&request) {
         Ok(child) => child,
         Err(_) => {
@@ -119,12 +134,6 @@ pub fn supervise(spool: &Spool, id: &str) {
 
     let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
     let mut ended_by: Option<&'static str> = None;
-    // Set once the group has been killed. A process that will not die even
-    // after SIGKILL — blocked in an uninterruptible syscall against a wedged
-    // filesystem — must not keep this supervisor polling forever, because a
-    // supervisor that never exits is one that never records an outcome.
-    let mut give_up_at: Option<Instant> = None;
-
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -140,12 +149,11 @@ pub fn supervise(spool: &Spool, id: &str) {
                 ended_by = Some(reason::TIMED_OUT);
             }
             if ended_by.is_some() {
-                terminate_group(group, &mut child);
-                give_up_at = Some(Instant::now() + TERMINATION_GRACE);
+                // `None` is deliberately an Unknown outcome: reporting
+                // Cancelled or TimedOut while a descendant may still be alive
+                // would claim teardown the supervisor did not prove.
+                break terminate_group(group, &mut child);
             }
-        }
-        if give_up_at.is_some_and(|at| Instant::now() >= at) {
-            break None;
         }
 
         std::thread::sleep(POLL_INTERVAL);
@@ -279,24 +287,118 @@ fn spawn(request: &StartRequest) -> std::io::Result<Child> {
     command.spawn()
 }
 
-/// Terminate the process group and reap what is left.
-fn terminate_group(group: i32, child: &mut Child) {
+/// Make orphaned descendants reapable by this supervisor on Linux.
+///
+/// The runner is designed for containers, whose PID 1 is not guaranteed to
+/// reap. Becoming a subreaper before the command is spawned makes descendants
+/// that outlive their leader children of this process, so group absence can be
+/// proved instead of inferred from the leader's exit.
+#[cfg(target_os = "linux")]
+fn enable_child_subreaper() -> std::io::Result<()> {
+    // SAFETY: `PR_SET_CHILD_SUBREAPER` changes only this process's child-reaping
+    // behavior and requires no pointer arguments or privileges.
+    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_child_subreaper() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Terminate the process group and prove that it is empty.
+///
+/// A leader exiting is not proof: a descendant may ignore SIGTERM and keep
+/// consuming the lease. The return value is therefore the leader's observed
+/// status only when the whole group is absent. `None` means teardown could not
+/// be proven within the bounded TERM/KILL windows.
+fn terminate_group(group: i32, child: &mut Child) -> Option<std::process::ExitStatus> {
     // SAFETY: a plain `kill(2)`. The negative pid addresses the group, which is
     // the point — the leader alone leaves its children running on CPU the lease
     // is paying for.
     unsafe { libc::kill(-group, libc::SIGTERM) };
 
-    let deadline = Instant::now() + TERMINATION_GRACE;
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-            return;
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    let mut leader_status = None;
+    if drain_process_group(group, child, &mut leader_status) {
+        return leader_status;
     }
 
     // Asked politely, then not. A command that traps SIGTERM and declines to
     // exit still has to stop: the lease that pays for it is ending either way.
     unsafe { libc::kill(-group, libc::SIGKILL) };
+
+    if drain_process_group(group, child, &mut leader_status) {
+        leader_status
+    } else {
+        None
+    }
+}
+
+/// Reap the leader and adopted descendants until the group is absent or the
+/// bounded termination window expires.
+fn drain_process_group(
+    group: i32,
+    child: &mut Child,
+    leader_status: &mut Option<std::process::ExitStatus>,
+) -> bool {
+    let deadline = Instant::now() + TERMINATION_GRACE;
+    loop {
+        if leader_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => *leader_status = Some(status),
+                Ok(None) => {}
+                // Reaping the leader failed, so no honest terminal outcome can
+                // be recorded even if the kernel later drops the group.
+                Err(_) => return false,
+            }
+        }
+
+        // Never use raw waitpid before Child has reaped the leader: doing so
+        // could steal the status that std::process owns.
+        if leader_status.is_some() {
+            reap_adopted_group_members(group);
+        }
+
+        if leader_status.is_some() && !process_group_exists(group) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reap_adopted_group_members(group: i32) {
+    loop {
+        let mut status = 0;
+        // SAFETY: after the direct child has been reaped through Child, this
+        // non-blocking wait can only collect descendants adopted because this
+        // supervisor enabled subreaping.
+        let waited = unsafe { libc::waitpid(-group, &mut status, libc::WNOHANG) };
+        if waited <= 0 {
+            return;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_adopted_group_members(_group: i32) {}
+
+fn process_group_exists(group: i32) -> bool {
+    // SAFETY: signal zero performs existence/permission checking only.
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return true;
+    }
+
+    // EPERM still proves that a member exists. Any unexpected error fails
+    // closed; only ESRCH proves the group is absent.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// A stream being copied to disk, with a cap.
