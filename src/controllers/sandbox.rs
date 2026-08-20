@@ -54,6 +54,10 @@ pub struct SandboxContext {
     /// caller-selectable: a lease that could choose its namespace could place
     /// work next to somebody else's.
     pub namespace: String,
+    /// Dedicated, operator-only namespace for admission coordination Leases.
+    /// It is separate from workload/control-plane objects so a hard ledger
+    /// quota cannot starve unrelated controllers or leader election.
+    pub reservation_namespace: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1610,7 +1614,7 @@ async fn finish_release(
         .uid()
         .ok_or_else(|| SandboxPlacementError::Invalid(format!("lease {name} has no UID")))?;
     let reservations: Api<k8s_openapi::api::coordination::v1::Lease> =
-        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+        Api::namespaced(ctx.client.clone(), &ctx.reservation_namespace);
     if let Err(error) =
         crate::api::sandbox::release_reservations_for_lease(&reservations, lease, &uid).await
     {
@@ -3000,10 +3004,16 @@ fn lease_error_policy(
 }
 
 /// Run both placement controllers until shutdown.
-pub async fn run_sandbox_controller(client: Client, namespace: &str, shutdown: CancellationToken) {
+pub async fn run_sandbox_controller(
+    client: Client,
+    namespace: &str,
+    reservation_namespace: &str,
+    shutdown: CancellationToken,
+) {
     let ctx = Arc::new(SandboxContext {
         client: client.clone(),
         namespace: namespace.to_string(),
+        reservation_namespace: reservation_namespace.to_string(),
     });
 
     let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
@@ -3157,6 +3167,7 @@ pub(crate) mod tests {
         let ctx = Arc::new(SandboxContext {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.to_string(),
+            reservation_namespace: NS.to_string(),
         });
         for (path_value, kind, uid) in [
             (TEMPLATE_PATH, SANDBOX_TEMPLATE_KIND, "template-uid"),
@@ -3258,6 +3269,22 @@ pub(crate) mod tests {
 
     pub(crate) fn admitted_lease() -> SandboxLease {
         let created_at = chrono::Utc::now();
+        let requester = SandboxPrincipal {
+            provider: "oidc".into(),
+            requester_type: "user".into(),
+            issuer: "https://issuer.invalid".into(),
+            identity: "alice".into(),
+        };
+        let reservation_name = crate::api::sandbox::quota_reservation_name(
+            &crate::api::sandbox::principal_hash_for(&requester),
+            0,
+        );
+        let reservation_provenance = serde_json::json!([{
+            "kind": "quota",
+            "name": reservation_name,
+            "uid": "reservation-uid-1"
+        }])
+        .to_string();
         let reference = |api_version: &str, kind: &str, name: &str, uid: &str| {
             crate::crd::SandboxObjectReference {
                 api_version: api_version.into(),
@@ -3280,10 +3307,16 @@ pub(crate) mod tests {
                         .unwrap(),
                 )),
                 annotations: Some(
-                    [(
-                        SANDBOX_ADMISSION_ANNOTATION.to_string(),
-                        SANDBOX_ADMISSION_ADMITTED.to_string(),
-                    )]
+                    [
+                        (
+                            SANDBOX_ADMISSION_ANNOTATION.to_string(),
+                            SANDBOX_ADMISSION_ADMITTED.to_string(),
+                        ),
+                        (
+                            crate::api::sandbox::SANDBOX_RESERVATIONS_ANNOTATION.to_string(),
+                            reservation_provenance,
+                        ),
+                    ]
                     .into_iter()
                     .collect(),
                 ),
@@ -3298,12 +3331,7 @@ pub(crate) mod tests {
                 },
                 ttl: "1h".into(),
                 alias: None,
-                requester: SandboxPrincipal {
-                    provider: "oidc".into(),
-                    requester_type: "user".into(),
-                    issuer: "https://issuer.invalid".into(),
-                    identity: "alice".into(),
-                },
+                requester,
             },
             status: Some(SandboxLeaseStatus {
                 phase: crate::crd::SandboxLeasePhase::Provisioning,
@@ -3704,6 +3732,7 @@ pub(crate) mod tests {
         let ctx = Arc::new(SandboxContext {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.into(),
+            reservation_namespace: NS.into(),
         });
 
         let upstream = |kind: &str, uid: &str, resource_version: &str, status| {
@@ -5256,7 +5285,17 @@ pub(crate) mod tests {
                         "name": reservation_name(),
                         "namespace": NS,
                         "uid": "reservation-uid-1",
+                        "labels": {
+                            crate::api::sandbox::SANDBOX_RESERVATION_TYPE_LABEL: "quota",
+                            crate::api::sandbox::SANDBOX_RESERVATION_LEASE_UID_LABEL: "lease-uid-1",
+                            crate::api::sandbox::REQUESTER_HASH_LABEL:
+                                crate::api::sandbox::principal_hash_for(&admitted_lease().spec.requester),
+                        },
+                        "annotations": {
+                            crate::api::sandbox::SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION: LEASE,
+                        }
                     },
+                    "spec": {},
                 }],
             })))
             .mount(server)

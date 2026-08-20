@@ -39,6 +39,11 @@ pub struct AppState<B: ClusterBackend> {
     pub client: Client,
     pub authenticator: Arc<JwtAuthenticator>,
     pub namespace: String,
+    /// Dedicated namespace containing only Sandbox quota/alias coordination
+    /// Leases. Keeping this separate lets the chart enforce operator-only
+    /// writes and a hard object quota without affecting unrelated leader
+    /// elections in the control-plane namespace.
+    pub sandbox_reservation_namespace: String,
     /// Ambient default backend. **Never an authorization or dispatch input.**
     ///
     /// Before #79 the connect proxy fell back to this when pool/backend
@@ -3188,6 +3193,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
             datastore: Default::default(),
@@ -3218,6 +3224,7 @@ mod tests {
             client,
             backend: crate::testutil::MockBackend::new(),
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
             factory: None,
             datastore: Default::default(),
@@ -3307,6 +3314,7 @@ mod tests {
             client,
             backend: crate::testutil::MockBackend::new(),
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
             factory: None,
             datastore: Default::default(),
@@ -3737,6 +3745,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
             datastore: Default::default(),
@@ -3817,6 +3826,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: Some(factory),
             datastore,
@@ -3911,6 +3921,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: Some(factory),
             datastore,
@@ -4016,6 +4027,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: Some(factory),
             datastore,
@@ -4096,6 +4108,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
             datastore: Default::default(),
@@ -4543,6 +4556,7 @@ mod tests {
             client,
             backend,
             namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
             authenticator,
             factory: None,
             datastore: Default::default(),

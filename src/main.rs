@@ -8,6 +8,7 @@ mod metrics;
 pub mod pki;
 mod pool;
 mod sandbox;
+mod sandbox_ledger;
 mod sandbox_runtime;
 mod telemetry;
 mod velero;
@@ -100,6 +101,64 @@ async fn main() -> anyhow::Result<()> {
 
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
     let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
+    let sandbox_reservation_namespace = std::env::var("KOBE_SANDBOX_RESERVATION_NAMESPACE")
+        .unwrap_or_else(|_| format!("{namespace}-sandbox-ledger"));
+    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External
+        && (sandbox_reservation_namespace == namespace
+            || !crate::pool::is_valid_k8s_name(&sandbox_reservation_namespace))
+    {
+        error!(
+            namespace = %sandbox_reservation_namespace,
+            "KOBE_SANDBOX_RESERVATION_NAMESPACE must be a valid, dedicated Kubernetes namespace"
+        );
+        std::process::exit(1);
+    }
+    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+        let policy_name = match std::env::var("KOBE_SANDBOX_LEDGER_POLICY_NAME") {
+            Ok(value) if crate::pool::is_valid_k8s_name(&value) => value,
+            _ => {
+                error!("KOBE_SANDBOX_LEDGER_POLICY_NAME must name the enforced ledger controls");
+                std::process::exit(1);
+            }
+        };
+        let operator_username = match std::env::var("KOBE_OPERATOR_SERVICE_ACCOUNT_USERNAME") {
+            Ok(value) if value.starts_with("system:serviceaccount:") => value,
+            _ => {
+                error!(
+                    "KOBE_OPERATOR_SERVICE_ACCOUNT_USERNAME must be the exact operator identity"
+                );
+                std::process::exit(1);
+            }
+        };
+        let object_limit = match std::env::var("KOBE_SANDBOX_LEDGER_OBJECT_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|limit| *limit >= 2)
+        {
+            Some(limit) => limit,
+            None => {
+                error!("KOBE_SANDBOX_LEDGER_OBJECT_LIMIT must be an integer of at least 2");
+                std::process::exit(1);
+            }
+        };
+        if let Err(err) = sandbox_ledger::validate(
+            &client,
+            &sandbox_reservation_namespace,
+            &policy_name,
+            &operator_username,
+            object_limit,
+        )
+        .await
+        {
+            error!(error = %err, "Sandbox admission ledger validation failed");
+            std::process::exit(1);
+        }
+        info!(
+            namespace = %sandbox_reservation_namespace,
+            object_limit,
+            "Sandbox admission ledger validated"
+        );
+    }
 
     info!(namespace = %namespace, "Connected to Kubernetes");
 
@@ -159,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         client: client.clone(),
         authenticator: authenticator.clone(),
         namespace: namespace.clone(),
+        sandbox_reservation_namespace: sandbox_reservation_namespace.clone(),
         backend: backend.clone(),
         factory: Some(factory.clone()),
         datastore: datastore.clone(),
@@ -306,19 +366,20 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start the Sandbox admission reaper. Reservations are created before a
-    // SandboxLease is admitted and are garbage-collected only when that lease
-    // is DELETED — so a request that dies in between leaves a `pending` lease
-    // no controller will ever touch, with its quota slot and alias consumed
-    // forever. Recovery cannot depend on the affected caller retrying, so this
-    // sweeps for every principal. Independent of Sandbox placement (#73): it
-    // only touches admission objects.
+    // SandboxLease is admitted and deliberately remain independent from lease
+    // garbage collection, so a request that dies in between leaves a `pending`
+    // lease with its quota slot and alias consumed. Recovery cannot depend on
+    // the affected caller retrying, so this exact-shape-fenced sweep runs for
+    // every principal against the dedicated ledger namespace.
     let sandbox_reaper_client = client.clone();
     let sandbox_reaper_ns = namespace.clone();
+    let sandbox_reaper_reservation_ns = sandbox_reservation_namespace.clone();
     let sandbox_reaper_shutdown = shutdown.clone();
     let sandbox_reaper_handle = tokio::spawn(async move {
         api::sandbox::run_sandbox_admission_reaper(
             sandbox_reaper_client,
             &sandbox_reaper_ns,
+            &sandbox_reaper_reservation_ns,
             sandbox_reaper_shutdown,
         )
         .await;
@@ -332,11 +393,13 @@ async fn main() -> anyhow::Result<()> {
         if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
             let sandbox_client = client.clone();
             let sandbox_ns = namespace.clone();
+            let sandbox_reservation_ns = sandbox_reservation_namespace.clone();
             let sandbox_shutdown = shutdown.clone();
             let handle = tokio::spawn(async move {
                 controllers::sandbox::run_sandbox_controller(
                     sandbox_client,
                     &sandbox_ns,
+                    &sandbox_reservation_ns,
                     sandbox_shutdown,
                 )
                 .await;

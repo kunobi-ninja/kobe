@@ -178,6 +178,10 @@ jobs:
           helm repo add bitnami https://charts.bitnami.com/bitnami
           helm dependency build charts/kobe/
           helm template kobe charts/kobe/ --debug > /dev/null
+          helm lint charts/kobe/ --set agentSandbox.mode=external
+          helm template kobe charts/kobe/ \
+            --set agentSandbox.mode=external \
+            --debug > /dev/null
 
       - name: Verify CRDs match generated output
         run: |
@@ -189,11 +193,11 @@ jobs:
             }
           done
 
-  # Real API-server contract for the SandboxLease status protocol. Unit tests
-  # pin the JSON Patch and CEL text; this job proves Kubernetes actually
-  # accepts the intended writes and rejects stale identity/version writers and
-  # release-cause mutation. It installs only the CRD into kind: no Kobe image,
-  # Helm release or external Agent Sandbox runtime is involved.
+  # Real API-server contract for SandboxLease status and the admission ledger.
+  # Unit tests pin JSON Patch/CEL/object shape; this job proves Kubernetes
+  # rejects stale status writers, release-cause mutation, tenant reservation
+  # writes, and namespace object growth beyond the configured quota. No Kobe
+  # image, Helm release, or external Agent Sandbox runtime is involved.
   sandbox-apiserver-contract:
     name: Sandbox API-server Contract
     runs-on: kunobi-runners
@@ -225,7 +229,7 @@ jobs:
             crd/sandboxleases.kobe.kunobi.ninja \
             --timeout=60s
 
-      - name: Verify SandboxLease CEL and status fences
+      - name: Verify SandboxLease fences and admission-ledger isolation
         run: |
           export KOBE_SANDBOX_APISERVER_CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
           mise exec -- bun run ./hack/test-sandbox-apiserver.ts

@@ -98,6 +98,9 @@ containerSecurityContext:
 #             rather than falling back, so it cannot be switched on by accident.
 agentSandbox:
   mode: disabled
+  # Aggregate object ceiling across every caller. This namespace contains only
+  # admission tokens, so the quota cannot starve unrelated leader elections.
+  reservationObjectLimit: 4096
   # How long a SandboxLease that reached a clean terminal phase (`Released` or
   # `Expired`) is kept before the record is deleted. Those phases stop
   # consuming capacity when they are written, so this is not about reclaiming

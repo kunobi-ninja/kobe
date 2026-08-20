@@ -73,6 +73,14 @@ spec:
             # direct (non-Helm) deployment cannot route around it.
             - name: AGENT_SANDBOX_MODE
               value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
+            - name: KOBE_SANDBOX_RESERVATION_NAMESPACE
+              value: {{ include "kobe.sandboxLedgerNamespace" . | quote }}
+            - name: KOBE_SANDBOX_LEDGER_POLICY_NAME
+              value: {{ include "kobe.sandboxLedgerPolicyName" . | quote }}
+            - name: KOBE_SANDBOX_LEDGER_OBJECT_LIMIT
+              value: {{ .Values.agentSandbox.reservationObjectLimit | quote }}
+            - name: KOBE_OPERATOR_SERVICE_ACCOUNT_USERNAME
+              value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kobe.serviceAccountName" .) | quote }}
             # Retention window for terminal SandboxLease records. Always set,
             # including in `disabled` mode, so switching the mode on does not
             # also silently change the retention policy from whatever the

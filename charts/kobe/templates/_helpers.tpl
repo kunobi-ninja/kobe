@@ -54,6 +54,23 @@ Service account name.
 {{- end }}
 
 {{/*
+Dedicated namespace for the Sandbox admission CAS ledger. Release namespace
+and name are immutable Helm identity; the hash prevents cluster-scoped
+collisions between equal release names in different namespaces. This value is
+intentionally not configurable because moving the ledger would expose retained
+old tokens and reset admission capacity.
+*/}}
+{{- define "kobe.sandboxLedgerNamespace" -}}
+{{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $prefix := printf "%s-sandbox-ledger" .Release.Name | trunc 50 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix ($identity | sha256sum | trunc 12) -}}
+{{- end }}
+
+{{- define "kobe.sandboxLedgerPolicyName" -}}
+{{- include "kobe.sandboxLedgerNamespace" . }}
+{{- end }}
+
+{{/*
 kobe-sync sidecar image reference.
 */}}
 {{- define "kobe.syncImage" -}}

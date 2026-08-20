@@ -166,21 +166,23 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
-  # Leader election, AND the Sandbox admission ledger.
-  #
-  # `list` and `delete` are load-bearing for admission, not leader election:
-  # quota and alias reservations are coordination Leases, released by deleting
-  # them and found by listing on the owning lease's UID label. Without both,
-  # every release 403s and a caller's quota is consumed permanently on the
-  # first teardown — a failure no unit test sees, because it only exists once
-  # real RBAC applies.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
   # CRD discovery (Velero detection)
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get"]
+  # Startup proves the Sandbox ledger's fail-closed admission policy and Deny
+  # binding before serving Sandbox routes. Read-only: the chart, not the
+  # operator process, owns these cluster-scoped security controls.
+  {{- if ne .Values.agentSandbox.mode "disabled" }}
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    verbs: ["get"]
+  # Do not trust the configured username: prove the Kubernetes client is
+  # authenticated as that exact ServiceAccount before admitting Sandboxes.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["selfsubjectreviews"]
+    verbs: ["create"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -195,6 +197,38 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: {{ include "kobe.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election lives in the operator namespace. Keep it namespace-scoped;
+# Sandbox reservation access is a separate Role in the dedicated ledger
+# namespace, so neither responsibility grants coordination-Lease authority
+# cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kobe.fullname" . }}-leader-election
+  namespace: {{ .Values.operatorNamespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kobe.fullname" . }}-leader-election
+  namespace: {{ .Values.operatorNamespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kobe.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "kobe.fullname" . }}-leader-election
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -64,6 +64,34 @@ Every container must declare CPU, memory, and ephemeral-storage requests and
 limits. `defaultContainer` and each exposed port must refer to a declared
 container. Canary `argv` is executed directly, without an implicit shell.
 
+## Admission ledger namespace
+
+Sandbox quota slots and aliases are coordination `Lease` objects. When Sandbox
+mode is enabled, the chart creates a dedicated namespace named from the
+immutable Helm release identity (`<release>-sandbox-ledger-<hash>`) with:
+
+- a `ValidatingAdmissionPolicy` that permits Lease mutations only from the
+  exact Kobe operator ServiceAccount;
+- a namespace-wide Lease object quota, configured by
+  `agentSandbox.reservationObjectLimit` (default `4096`); and
+- namespace-scoped operator RBAC. The chart grants tenants no access there,
+  and the admission policy denies every non-operator Lease create, update, or
+  delete even if another administrator grants broader RBAC.
+
+The namespace, policy, binding, and quota are retained on Helm uninstall.
+Deleting any of them while a `SandboxLease` is live can free its admission slot
+before teardown is proved. Remove retained ledger resources only after every
+Sandbox lease and reservation has been verified absent. The admission policy
+requires Kubernetes 1.30 or newer with the `ValidatingAdmissionPolicy` and
+`ResourceQuota` admission plugins enabled. Before serving Sandbox routes, Kobe
+confirms its authenticated ServiceAccount identity and proves both plugins with
+server-side dry-run requests that must be denied; startup fails if either
+control is inactive.
+
+The namespace is intentionally not configurable. Moving it would both reset
+admission capacity and leave retained old reservations outside the active
+policy. The namespace contains no resources other than this ledger.
+
 ## Durable execution
 
 Kobe uses the same supervisor for wait-mode and detached commands. A raw
