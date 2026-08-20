@@ -1957,6 +1957,14 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     if let Err(err) = pool.spec.validate() {
         return sandbox_infra_error("SandboxPool configuration is invalid", err);
     }
+    if let Err(err) = crate::sandbox::require_current_sandbox_pool_ready(&pool) {
+        warn!(pool = %request.pool, error = %err, "Sandbox admission refused an uncertified pool");
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SandboxPool is not ready for new leases",
+            None,
+        );
+    }
     let pool_reference = match sandbox_pool_reference(&pool) {
         Ok(reference) => reference,
         Err(detail) => {
@@ -3975,6 +3983,20 @@ mod tests {
                 },
                 "isolation": { "tier": "trusted-runc" },
                 "readiness": { "canary": { "argv": ["/bin/true"], "timeout": "30s" } }
+            },
+            "status": {
+                "observedGeneration": 1,
+                "ready": 1,
+                "allocated": 0,
+                "quarantined": 0,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "Certified",
+                    "message": "test fixture represents a fully certified pool",
+                    "observedGeneration": 1,
+                    "lastTransitionTime": "2026-08-20T00:00:00Z"
+                }]
             }
         })
     }
@@ -4432,6 +4454,67 @@ mod tests {
             .await;
 
         lease_state
+    }
+
+    /// HTTP admission consumes only a current-generation Ready=True
+    /// certificate. Missing, stale, and explicitly false Pool status must stop
+    /// before the API creates even a pending SandboxLease.
+    #[tokio::test]
+    async fn admission_fails_closed_for_uncertified_pool_status() {
+        for variant in ["missing", "stale", "false"] {
+            let server = MockServer::start().await;
+            mount_sandbox_crds(&server).await;
+            let mut pool = pool_json();
+            match variant {
+                "missing" => {
+                    pool.as_object_mut().unwrap().remove("status");
+                }
+                "stale" => {
+                    pool["status"]["observedGeneration"] = serde_json::json!(0);
+                }
+                "false" => {
+                    pool["status"]["conditions"][0]["status"] = serde_json::json!("False");
+                    pool["status"]["conditions"][0]["reason"] =
+                        serde_json::json!("CertificationPending");
+                }
+                _ => unreachable!(),
+            }
+            Mock::given(method("GET"))
+                .and(path(
+                    "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+                .mount(&server)
+                .await;
+
+            let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+                State(test_state(&server)),
+                identity(),
+                Json(CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "variant {variant}"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| {
+                        request.method.as_str() == "POST"
+                            && request.url.path().ends_with("/sandboxleases")
+                    })
+                    .count(),
+                0,
+                "variant {variant} must fail before lease creation"
+            );
+        }
     }
 
     #[test]

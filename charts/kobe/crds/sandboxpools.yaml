@@ -309,6 +309,10 @@ spec:
                 minimum: 0.0
                 type: integer
               conditions:
+                description: |-
+                  Current-generation pool certification. `Ready=True` authorizes new
+                  leases; missing, stale, `False`, or `Unknown` conditions fail closed.
+                  Replica counters alone never authorize admission.
                 items:
                   description: Kubernetes-style condition with the generation from which it was derived.
                   properties:

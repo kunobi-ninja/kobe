@@ -19,9 +19,9 @@ use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 use thiserror::Error;
 
 use crate::crd::{
-    ResolvedSandboxPlacement, SandboxLeasePhase, SandboxLeaseStatus, SandboxObjectReference,
-    SandboxPoolSpec, SandboxPoolValidationError, SandboxResourceCeiling, SandboxTargetProvenance,
-    SandboxTemplateSpec,
+    ResolvedSandboxPlacement, SandboxConditionStatus, SandboxLeasePhase, SandboxLeaseStatus,
+    SandboxObjectReference, SandboxPool, SandboxPoolSpec, SandboxPoolValidationError,
+    SandboxResourceCeiling, SandboxTargetProvenance, SandboxTemplateSpec,
 };
 
 pub const AGENT_SANDBOX_API_VERSION: &str = "extensions.agents.x-k8s.io/v1beta1";
@@ -39,6 +39,89 @@ pub const SANDBOX_LEASE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-cleanup";
 const KOBE_API_VERSION: &str = "kobe.kunobi.ninja/v1alpha1";
 const SANDBOX_API_VERSION: &str = "agents.x-k8s.io/v1beta1";
 const CORE_API_VERSION: &str = "v1";
+
+/// Require the durable, current-generation readiness certificate used by both
+/// HTTP admission and the final pre-Claim placement check.
+///
+/// Capacity counters and an upstream WarmPool's `readyReplicas` are
+/// observations, not a safety certificate. A pool is admissible only when one
+/// `Ready=True` condition and the enclosing status were both derived from the
+/// pool's current generation. Missing, stale, duplicate, false, and unknown
+/// conditions all fail closed.
+pub fn require_current_sandbox_pool_ready(
+    pool: &SandboxPool,
+) -> Result<(), SandboxPoolReadinessError> {
+    let generation = pool
+        .metadata
+        .generation
+        .ok_or(SandboxPoolReadinessError::MissingGeneration)?;
+    let status = pool
+        .status
+        .as_ref()
+        .ok_or(SandboxPoolReadinessError::MissingStatus)?;
+    if status.observed_generation != Some(generation) {
+        return Err(SandboxPoolReadinessError::StaleStatus {
+            expected: generation,
+            observed: status.observed_generation,
+        });
+    }
+
+    let mut ready_conditions = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type == "Ready");
+    let ready = ready_conditions
+        .next()
+        .ok_or(SandboxPoolReadinessError::MissingReadyCondition)?;
+    if ready_conditions.next().is_some() {
+        return Err(SandboxPoolReadinessError::DuplicateReadyCondition);
+    }
+    if ready.observed_generation != Some(generation) {
+        return Err(SandboxPoolReadinessError::StaleReadyCondition {
+            expected: generation,
+            observed: ready.observed_generation,
+        });
+    }
+    if ready.status != SandboxConditionStatus::True {
+        return Err(SandboxPoolReadinessError::NotReady {
+            status: ready.status,
+            reason: ready.reason.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Why a SandboxPool cannot currently authorize new workload placement.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum SandboxPoolReadinessError {
+    #[error("SandboxPool has no metadata.generation")]
+    MissingGeneration,
+    #[error("SandboxPool has no status")]
+    MissingStatus,
+    #[error(
+        "SandboxPool status observed generation {observed:?}, expected current generation {expected}"
+    )]
+    StaleStatus {
+        expected: i64,
+        observed: Option<i64>,
+    },
+    #[error("SandboxPool status has no Ready condition")]
+    MissingReadyCondition,
+    #[error("SandboxPool status has duplicate Ready conditions")]
+    DuplicateReadyCondition,
+    #[error(
+        "SandboxPool Ready condition observed generation {observed:?}, expected current generation {expected}"
+    )]
+    StaleReadyCondition {
+        expected: i64,
+        observed: Option<i64>,
+    },
+    #[error("SandboxPool Ready condition is {status:?}: {reason}")]
+    NotReady {
+        status: SandboxConditionStatus,
+        reason: String,
+    },
+}
 
 /// Render one administrator-owned Kobe pool template into the pinned upstream
 /// Agent Sandbox contract.
@@ -1020,8 +1103,9 @@ pub enum SandboxLifecycleError {
 mod tests {
     use super::*;
     use crate::crd::{
-        SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary, SandboxIsolation,
-        SandboxPlacement, SandboxPortSpec, SandboxReadinessRequirements, SandboxResourceQuantity,
+        SandboxCondition, SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary,
+        SandboxIsolation, SandboxPlacement, SandboxPoolStatus, SandboxPortSpec,
+        SandboxReadinessRequirements, SandboxResourceQuantity,
     };
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
@@ -1079,6 +1163,105 @@ mod tests {
             controller: Some(true),
             block_owner_deletion: Some(true),
         }
+    }
+
+    fn pool_resource(status: Option<SandboxPoolStatus>) -> SandboxPool {
+        SandboxPool {
+            metadata: ObjectMeta {
+                name: Some("agents".into()),
+                namespace: Some("kobe".into()),
+                uid: Some("pool-uid".into()),
+                generation: Some(3),
+                ..Default::default()
+            },
+            spec: pool(),
+            status,
+        }
+    }
+
+    fn ready_condition(
+        status: SandboxConditionStatus,
+        observed_generation: Option<i64>,
+    ) -> SandboxCondition {
+        SandboxCondition {
+            condition_type: "Ready".into(),
+            status,
+            reason: "Certified".into(),
+            message: "all required certification gates passed".into(),
+            observed_generation,
+            last_transition_time: Some("2026-08-20T00:00:00Z".into()),
+        }
+    }
+
+    /// Admission authority comes only from a current-generation Ready=True
+    /// certificate; capacity counts and stale conditions cannot substitute.
+    #[test]
+    fn sandbox_pool_readiness_certificate_fails_closed() {
+        let certified = pool_resource(Some(SandboxPoolStatus {
+            observed_generation: Some(3),
+            ready: 2,
+            allocated: 1,
+            quarantined: 0,
+            conditions: vec![ready_condition(SandboxConditionStatus::True, Some(3))],
+        }));
+        assert_eq!(require_current_sandbox_pool_ready(&certified), Ok(()));
+
+        let missing_status = pool_resource(None);
+        assert_eq!(
+            require_current_sandbox_pool_ready(&missing_status),
+            Err(SandboxPoolReadinessError::MissingStatus)
+        );
+
+        let mut stale_status = certified.clone();
+        stale_status.status.as_mut().unwrap().observed_generation = Some(2);
+        assert!(matches!(
+            require_current_sandbox_pool_ready(&stale_status),
+            Err(SandboxPoolReadinessError::StaleStatus { .. })
+        ));
+
+        let mut missing_condition = certified.clone();
+        missing_condition
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .clear();
+        assert_eq!(
+            require_current_sandbox_pool_ready(&missing_condition),
+            Err(SandboxPoolReadinessError::MissingReadyCondition)
+        );
+
+        for status in [
+            SandboxConditionStatus::False,
+            SandboxConditionStatus::Unknown,
+        ] {
+            let mut not_ready = certified.clone();
+            not_ready.status.as_mut().unwrap().conditions = vec![ready_condition(status, Some(3))];
+            assert!(matches!(
+                require_current_sandbox_pool_ready(&not_ready),
+                Err(SandboxPoolReadinessError::NotReady { .. })
+            ));
+        }
+
+        let mut stale_condition = certified.clone();
+        stale_condition.status.as_mut().unwrap().conditions =
+            vec![ready_condition(SandboxConditionStatus::True, Some(2))];
+        assert!(matches!(
+            require_current_sandbox_pool_ready(&stale_condition),
+            Err(SandboxPoolReadinessError::StaleReadyCondition { .. })
+        ));
+
+        let mut duplicate = certified;
+        duplicate
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(ready_condition(SandboxConditionStatus::True, Some(3)));
+        assert_eq!(
+            require_current_sandbox_pool_ready(&duplicate),
+            Err(SandboxPoolReadinessError::DuplicateReadyCondition)
+        );
     }
 
     fn reference(kind: &str, name: &str, uid: &str) -> SandboxObjectReference {

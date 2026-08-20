@@ -533,6 +533,9 @@ pub struct SandboxPoolStatus {
     /// capacity remains allocated until its complete footprint is proven absent.
     #[serde(default)]
     pub quarantined: u32,
+    /// Current-generation pool certification. `Ready=True` authorizes new
+    /// leases; missing, stale, `False`, or `Unknown` conditions fail closed.
+    /// Replica counters alone never authorize admission.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         extend("x-kubernetes-list-type" = "map"),

@@ -25,8 +25,8 @@ use futures::StreamExt;
 use k8s_openapi::api::core::v1::Namespace;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{
-    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams, Preconditions,
-    PropagationPolicy,
+    Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
+    Preconditions, PropagationPolicy,
 };
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
@@ -38,7 +38,10 @@ use crate::api::sandbox::{
     SANDBOX_ADMISSION_ADMITTED, SANDBOX_ADMISSION_ANNOTATION,
     SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION,
 };
-use crate::crd::{SandboxLease, SandboxPlacement, SandboxPool};
+use crate::crd::{
+    SandboxCondition, SandboxConditionStatus, SandboxLease, SandboxLeasePhase, SandboxPlacement,
+    SandboxPool, SandboxPoolStatus,
+};
 use crate::sandbox::{
     AGENT_SANDBOX_API_VERSION, SANDBOX_CLAIM_KIND, SANDBOX_TEMPLATE_KIND, SANDBOX_WARM_POOL_KIND,
     build_sandbox_claim, build_sandbox_template, build_sandbox_warm_pool,
@@ -240,37 +243,361 @@ async fn ensure_upstream_pool_objects(
     Ok((template, warm_pool))
 }
 
+const POOL_READY_CONDITION: &str = "Ready";
+const POOL_CERTIFICATION_PENDING_REASON: &str = "CertificationPending";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarmPoolObservation {
+    replicas: u32,
+    ready_replicas: u32,
+}
+
+/// Observe the exact upstream objects that back one management pool.
+///
+/// Reconciliation writes the desired objects first, then this independent GET
+/// proves their exact Pool owner and reads the WarmPool controller's
+/// `replicas`/`readyReplicas`. A create/apply response is not reused as
+/// readiness evidence: it may predate the upstream controller's status write.
+async fn observe_management_pool(
+    ctx: &SandboxContext,
+    pool: &SandboxPool,
+) -> Result<WarmPoolObservation, SandboxPlacementError> {
+    let pool_uid = pool.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxPool {} has no UID to fence its upstream objects",
+            pool.name_any()
+        ))
+    })?;
+    let expected_owner = (
+        "kobe.kunobi.ninja/v1alpha1",
+        "SandboxPool",
+        pool.name_any(),
+        pool_uid,
+    );
+
+    let template_api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &ctx.namespace,
+        &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+    );
+    let template = template_api.get(&template_name(&pool.name_any())).await?;
+    if template.uid().is_none_or(|uid| uid.is_empty())
+        || !is_controlled_by(
+            &template,
+            expected_owner.0,
+            expected_owner.1,
+            &expected_owner.2,
+            &expected_owner.3,
+        )
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxTemplate {} is not the exact object owned by SandboxPool {} uid {}",
+            template_name(&pool.name_any()),
+            pool.name_any(),
+            expected_owner.3
+        )));
+    }
+
+    let warm_pool_api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &ctx.namespace,
+        &upstream_resource(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
+    );
+    let warm_pool = warm_pool_api.get(&warm_pool_name(&pool.name_any())).await?;
+    if warm_pool.uid().is_none_or(|uid| uid.is_empty())
+        || !is_controlled_by(
+            &warm_pool,
+            expected_owner.0,
+            expected_owner.1,
+            &expected_owner.2,
+            &expected_owner.3,
+        )
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxWarmPool {} is not the exact object owned by SandboxPool {} uid {}",
+            warm_pool_name(&pool.name_any()),
+            pool.name_any(),
+            expected_owner.3
+        )));
+    }
+
+    let status = warm_pool
+        .data
+        .get("status")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxWarmPool {} has no status",
+                warm_pool.name_any()
+            ))
+        })?;
+    let count = |field: &'static str| {
+        status
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                SandboxPlacementError::Invalid(format!(
+                    "SandboxWarmPool {} has invalid status.{field}",
+                    warm_pool.name_any()
+                ))
+            })
+    };
+    let observation = WarmPoolObservation {
+        replicas: count("replicas")?,
+        ready_replicas: count("readyReplicas")?,
+    };
+    if observation.ready_replicas > observation.replicas {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxWarmPool {} reports readyReplicas greater than replicas",
+            warm_pool.name_any()
+        )));
+    }
+    Ok(observation)
+}
+
+/// Count only admitted leases bound to the exact Pool UID.
+///
+/// The name label is intentionally not authoritative: a deleted-and-recreated
+/// pool has the same label, and older objects may be missing it. UID filtering
+/// over the complete namespace list keeps replacement capacity separate.
+fn pool_allocation_counts(
+    leases: impl IntoIterator<Item = SandboxLease>,
+    pool_uid: &str,
+) -> Result<(u32, u32), SandboxPlacementError> {
+    let mut allocated = 0u32;
+    let mut quarantined = 0u32;
+    for lease in leases {
+        if lease.spec.pool_ref.uid != pool_uid
+            || lease
+                .annotations()
+                .get(SANDBOX_ADMISSION_ANNOTATION)
+                .map(String::as_str)
+                != Some(SANDBOX_ADMISSION_ADMITTED)
+        {
+            continue;
+        }
+        let phase = lease
+            .status
+            .as_ref()
+            .map(|status| status.phase)
+            .unwrap_or_default();
+        if phase.consumes_capacity() {
+            allocated = allocated.checked_add(1).ok_or_else(|| {
+                SandboxPlacementError::Invalid(
+                    "SandboxPool allocated lease count exceeds u32".into(),
+                )
+            })?;
+        }
+        if phase == SandboxLeasePhase::Quarantined {
+            quarantined = quarantined.checked_add(1).ok_or_else(|| {
+                SandboxPlacementError::Invalid(
+                    "SandboxPool quarantined lease count exceeds u32".into(),
+                )
+            })?;
+        }
+    }
+    Ok((allocated, quarantined))
+}
+
+/// Build a current-generation, explicitly uncertified Pool status.
+///
+/// This delivery slice deliberately has no path to `Ready=True`. Upstream
+/// replica counts are useful operator telemetry, but the runtime, policy,
+/// network, and execution-canary certification gates are not implemented yet;
+/// admission must therefore remain closed.
+fn uncertified_pool_status(
+    pool: &SandboxPool,
+    ready: u32,
+    allocated: u32,
+    quarantined: u32,
+    reason: &str,
+    message: &str,
+) -> Result<SandboxPoolStatus, SandboxPlacementError> {
+    let generation = pool.metadata.generation.ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxPool {} has no generation to observe",
+            pool.name_any()
+        ))
+    })?;
+    let previous = pool.status.as_ref().and_then(|status| {
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == POOL_READY_CONDITION)
+    });
+    let last_transition_time = match previous {
+        Some(previous) if previous.status == SandboxConditionStatus::False => {
+            previous.last_transition_time.clone()
+        }
+        _ => Some(chrono::Utc::now().to_rfc3339()),
+    };
+    let mut conditions: Vec<_> = pool
+        .status
+        .as_ref()
+        .map(|status| status.conditions.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|condition| condition.condition_type != POOL_READY_CONDITION)
+        .collect();
+    conditions.push(SandboxCondition {
+        condition_type: POOL_READY_CONDITION.into(),
+        status: SandboxConditionStatus::False,
+        reason: reason.into(),
+        message: message.into(),
+        observed_generation: Some(generation),
+        last_transition_time,
+    });
+    Ok(SandboxPoolStatus {
+        observed_generation: Some(generation),
+        ready,
+        allocated,
+        quarantined,
+        conditions,
+    })
+}
+
+/// Replace Pool status only for the exact UID/resourceVersion reconciled.
+/// A lost race returns `false`; the winning watch event owns the next write.
+async fn patch_pool_status_fenced(
+    ctx: &SandboxContext,
+    pool: &SandboxPool,
+    status: &SandboxPoolStatus,
+) -> Result<bool, SandboxPlacementError> {
+    if pool.status.as_ref() == Some(status) {
+        return Ok(true);
+    }
+    let (Some(uid), Some(resource_version)) = (pool.uid(), pool.resource_version()) else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxPool {} has no UID or resourceVersion to fence status",
+            pool.name_any()
+        )));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+    let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    match pools
+        .patch_status(
+            &pool.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Reconcile one `SandboxPool` into its controller-owned upstream objects.
 ///
-/// Child-placement pools are skipped entirely: composing a child cluster is
-/// #74's job, and reconciling their template here would create management-
-/// cluster capacity for a pool that must never serve from the management
-/// cluster.
+/// Every placement reports exact-UID lease allocation. Management placement
+/// additionally creates and independently observes its exact-owned upstream
+/// Template/WarmPool. Child pools do not create management-cluster capacity.
+///
+/// This slice deliberately publishes `Ready=False`: `readyReplicas` alone is
+/// not certification. Admission remains closed until the runtime, policy,
+/// network, and execution-canary checks can write a current-generation
+/// `Ready=True` condition.
 pub async fn reconcile_pool(
     pool: Arc<SandboxPool>,
     ctx: Arc<SandboxContext>,
 ) -> Result<Action, SandboxPlacementError> {
     let name = pool.name_any();
+    let pool_uid = pool
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| SandboxPlacementError::Invalid(format!("SandboxPool {name} has no UID")))?;
+    let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let lease_list = match leases.list(&ListParams::default()).await {
+        Ok(leases) => leases,
+        Err(error) => {
+            let previous = pool.status.clone().unwrap_or_default();
+            let status = uncertified_pool_status(
+                &pool,
+                0,
+                previous.allocated,
+                previous.quarantined,
+                "LeaseAccountingUnavailable",
+                "Exact-UID lease accounting is unavailable; pool certification is withheld",
+            )?;
+            patch_pool_status_fenced(&ctx, &pool, &status).await?;
+            return Err(error.into());
+        }
+    };
+    let (allocated, quarantined) = pool_allocation_counts(lease_list, &pool_uid)?;
+
     if !matches!(pool.spec.placement, SandboxPlacement::Management {}) {
-        debug!(pool = %name, "not a management-placement pool; skipping");
-        return Ok(Action::await_change());
+        let status = uncertified_pool_status(
+            &pool,
+            0,
+            allocated,
+            quarantined,
+            POOL_CERTIFICATION_PENDING_REASON,
+            "Child placement runtime, policy, network, and execution-canary certification is not implemented",
+        )?;
+        if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
+            debug!(pool = %name, "child SandboxPool status write lost a race");
+            return Ok(Action::await_change());
+        }
+        debug!(pool = %name, "child SandboxPool remains uncertified");
+        return Ok(Action::requeue(std::time::Duration::from_secs(120)));
     }
 
     let owner = pool.controller_owner_ref(&()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!("SandboxPool {name} has no UID to own its objects"))
     })?;
 
-    ensure_upstream_pool_objects(
-        &ctx.client,
-        &ctx.namespace,
-        &name,
-        &pool.spec,
-        // Owner-referenced here, where the parent SandboxPool actually exists.
-        &owner,
-    )
-    .await?;
+    let observation = match async {
+        ensure_upstream_pool_objects(
+            &ctx.client,
+            &ctx.namespace,
+            &name,
+            &pool.spec,
+            // Owner-referenced here, where the parent SandboxPool actually exists.
+            &owner,
+        )
+        .await?;
+        observe_management_pool(&ctx, &pool).await
+    }
+    .await
+    {
+        Ok(observation) => observation,
+        Err(error) => {
+            let status = uncertified_pool_status(
+                &pool,
+                0,
+                allocated,
+                quarantined,
+                "UpstreamObservationUnavailable",
+                "Exact-owned Template/WarmPool replicas are unavailable; pool certification is withheld",
+            )?;
+            patch_pool_status_fenced(&ctx, &pool, &status).await?;
+            return Err(error);
+        }
+    };
+    let message = format!(
+        "Observed exact-owned Template/WarmPool replicas={}/readyReplicas={}; runtime, policy, network, and execution-canary certification is not implemented",
+        observation.replicas, observation.ready_replicas
+    );
+    let status = uncertified_pool_status(
+        &pool,
+        observation.ready_replicas,
+        allocated,
+        quarantined,
+        POOL_CERTIFICATION_PENDING_REASON,
+        &message,
+    )?;
+    if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
+        debug!(pool = %name, "SandboxPool status write lost a race");
+        return Ok(Action::await_change());
+    }
 
-    debug!(pool = %name, "reconciled upstream template and warm pool");
+    debug!(pool = %name, "reconciled upstream pool observations; certification remains pending");
     Ok(Action::requeue(std::time::Duration::from_secs(120)))
 }
 
@@ -520,6 +847,30 @@ pub async fn reconcile_lease(
         .and_then(|target| target.sandbox_claim.as_ref())
         .cloned();
     if recorded_claim.is_none() {
+        // Last possible cross-resource gate before creating workload. The Pool
+        // may have changed status while this reconcile recorded placement and
+        // upstream provenance, so the earlier object cannot authorize the
+        // Claim. Re-read strongly and require the same UID/generation plus a
+        // current-generation Ready=True certificate.
+        let current_pool = pools.get(&lease.spec.pool_ref.name).await?;
+        if current_pool.uid().as_deref() != Some(lease.spec.pool_ref.uid.as_str())
+            || current_pool.metadata.generation.unwrap_or_default()
+                != lease.spec.pool_ref.generation
+        {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "SandboxPool {} changed identity before SandboxClaim creation",
+                lease.spec.pool_ref.name
+            )));
+        }
+        if let Err(error) = crate::sandbox::require_current_sandbox_pool_ready(&current_pool) {
+            debug!(
+                lease = %name,
+                pool = %lease.spec.pool_ref.name,
+                error = %error,
+                "SandboxClaim creation withheld until current pool certification"
+            );
+            return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+        }
         match claims.create(&PostParams::default(), &claim).await {
             Ok(_) => info!(lease = %name, "created upstream SandboxClaim"),
             // A controller may have crashed after CREATE and before recording
@@ -2781,6 +3132,9 @@ pub(crate) mod tests {
 
     const POOL_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agents";
+    const POOL_STATUS_PATH: &str =
+        "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agents/status";
+    const LEASES_PATH: &str = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases";
     const CLAIMS_PATH: &str =
         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxclaims";
     const CLAIM_PATH: &str =
@@ -2885,7 +3239,20 @@ pub(crate) mod tests {
                     },
                 },
             },
-            status: None,
+            status: Some(SandboxPoolStatus {
+                observed_generation: Some(generation),
+                ready: 2,
+                allocated: 0,
+                quarantined: 0,
+                conditions: vec![SandboxCondition {
+                    condition_type: POOL_READY_CONDITION.into(),
+                    status: SandboxConditionStatus::True,
+                    reason: "Certified".into(),
+                    message: "test fixture represents a fully certified pool".into(),
+                    observed_generation: Some(generation),
+                    last_transition_time: Some("2026-08-20T00:00:00Z".into()),
+                }],
+            }),
         }
     }
 
@@ -3323,6 +3690,215 @@ pub(crate) mod tests {
             .iter()
             .find(|operation| operation["op"] == "add" && operation["path"] == "/status")
             .map(|operation| operation["value"].clone())
+    }
+
+    /// Pool status is an exact observation, not an optimistic capacity hint.
+    /// The controller must count only admitted exact-UID leases, observe the
+    /// exact-owned WarmPool, and still withhold Ready until certification is
+    /// implemented. The status write itself must be fenced to the Pool object
+    /// version that produced those observations.
+    #[tokio::test]
+    async fn pool_status_counts_exact_uid_and_withholds_uncertified_readiness() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let ctx = Arc::new(SandboxContext {
+            client: crate::testutil::mock_k8s_client(&server),
+            namespace: NS.into(),
+        });
+
+        let upstream = |kind: &str, uid: &str, resource_version: &str, status| {
+            serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION,
+                "kind": kind,
+                "metadata": {
+                    "name": "kobe-agents",
+                    "namespace": NS,
+                    "uid": uid,
+                    "resourceVersion": resource_version,
+                    "ownerReferences": [{
+                        "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                        "kind": "SandboxPool",
+                        "name": "agents",
+                        "uid": POOL_UID,
+                        "controller": true
+                    }]
+                },
+                "status": status
+            })
+        };
+        let template = upstream(
+            SANDBOX_TEMPLATE_KIND,
+            "template-uid",
+            "template-rv",
+            serde_json::json!({}),
+        );
+        let warm_pool = upstream(
+            SANDBOX_WARM_POOL_KIND,
+            "warm-pool-uid",
+            "warm-pool-rv",
+            serde_json::json!({ "replicas": 2, "readyReplicas": 1 }),
+        );
+        for (target, body) in [(TEMPLATE_PATH, template), (WARM_POOL_PATH, warm_pool)] {
+            Mock::given(method("GET"))
+                .and(path(target))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(target))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+
+        let counted = |name: &str, phase: SandboxLeasePhase, uid: &str, admitted: bool| {
+            let mut lease = admitted_lease();
+            lease.metadata.name = Some(name.into());
+            lease.metadata.uid = Some(format!("{name}-uid"));
+            lease.spec.pool_ref.uid = uid.into();
+            lease.status.as_mut().unwrap().phase = phase;
+            if !admitted {
+                lease.metadata.annotations.as_mut().unwrap().insert(
+                    SANDBOX_ADMISSION_ANNOTATION.into(),
+                    crate::api::sandbox::SANDBOX_ADMISSION_PENDING.into(),
+                );
+            }
+            lease
+        };
+        let leases = vec![
+            counted("ready", SandboxLeasePhase::Ready, POOL_UID, true),
+            counted(
+                "quarantined",
+                SandboxLeasePhase::Quarantined,
+                POOL_UID,
+                true,
+            ),
+            counted("released", SandboxLeasePhase::Released, POOL_UID, true),
+            counted(
+                "replacement",
+                SandboxLeasePhase::Ready,
+                "replacement-pool-uid",
+                true,
+            ),
+            counted(
+                "pending-admission",
+                SandboxLeasePhase::Ready,
+                POOL_UID,
+                false,
+            ),
+        ];
+        Mock::given(method("GET"))
+            .and(path(LEASES_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(leases)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.metadata.resource_version = Some("pool-rv".into());
+        Mock::given(method("PATCH"))
+            .and(path(POOL_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool.clone()))
+            .mount(&server)
+            .await;
+
+        reconcile_pool(Arc::new(pool), ctx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == POOL_STATUS_PATH
+            })
+            .expect("pool status must be written");
+        let patch: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(patch[0]["path"], "/metadata/uid");
+        assert_eq!(patch[0]["value"], POOL_UID);
+        assert_eq!(patch[1]["path"], "/metadata/resourceVersion");
+        assert_eq!(patch[1]["value"], "pool-rv");
+        let status = status_value_of(request).expect("status operation");
+        assert_eq!(status["observedGeneration"], POOL_GENERATION);
+        assert_eq!(status["ready"], 1);
+        assert_eq!(status["allocated"], 2);
+        assert_eq!(status["quarantined"], 1);
+        assert_eq!(status["conditions"][0]["type"], POOL_READY_CONDITION);
+        assert_eq!(status["conditions"][0]["status"], "False");
+        assert_eq!(
+            status["conditions"][0]["reason"],
+            POOL_CERTIFICATION_PENDING_REASON
+        );
+        assert_eq!(
+            status["conditions"][0]["observedGeneration"],
+            POOL_GENERATION
+        );
+        assert!(
+            status["conditions"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("replicas=2/readyReplicas=1")
+        );
+    }
+
+    /// A Ready pool can lose certification while a reconcile is preparing a
+    /// Claim. The second strong Pool GET is the last remote operation before
+    /// POST and must catch that flip instead of relying on the earlier read.
+    #[tokio::test]
+    async fn pre_claim_gate_catches_readiness_revoked_after_initial_pool_read() {
+        let (ctx, server) = test_context().await;
+        let ready = serde_json::to_value(management_pool(POOL_UID, POOL_GENERATION)).unwrap();
+        let mut revoked = ready.clone();
+        revoked["status"]["conditions"][0]["status"] = serde_json::json!("False");
+        revoked["status"]["conditions"][0]["reason"] =
+            serde_json::json!(POOL_CERTIFICATION_PENDING_REASON);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let response_reads = Arc::clone(&reads);
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(move |_: &wiremock::Request| {
+                let body = if response_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    ready.clone()
+                } else {
+                    revoked.clone()
+                };
+                ResponseTemplate::new(200).set_body_json(body)
+            })
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        let target = lease
+            .status
+            .as_mut()
+            .and_then(|status| status.target.as_mut())
+            .unwrap();
+        target.sandbox_claim = None;
+        target.sandbox = None;
+        target.pod = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_ne!(action, Action::await_change());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            requests_to(&server, "POST", CLAIMS_PATH).await,
+            0,
+            "revoked certification must stop the final Claim create"
+        );
+    }
+
+    #[test]
+    fn chart_grants_pool_status_without_pool_spec_mutation() {
+        let chart = include_str!("../../charts/kobe/templates/rbac.yaml");
+        assert!(chart.contains(
+            "resources: [\"sandboxpools/status\"]\n    verbs: [\"get\", \"patch\", \"update\"]"
+        ));
+        assert!(
+            chart.contains(
+                "resources: [\"sandboxpools\"]\n    verbs: [\"get\", \"list\", \"watch\"]"
+            )
+        );
     }
 
     /// An unready claim must not start the TTL clock.

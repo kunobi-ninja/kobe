@@ -47,6 +47,13 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxpools"]
     verbs: ["get", "list", "watch"]
+  # Pool reconciliation publishes exact allocation counts and a fail-closed
+  # readiness certificate. Keep status authority separate from pool spec:
+  # the operator may report observations but cannot rewrite administrator
+  # isolation, images, placement, or resource policy.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxpools/status"]
+    verbs: ["get", "patch", "update"]
   # Sandbox callers create lease intent through the HTTP API. Lifecycle
   # controllers, not admission, own the status subresource — which needs its
   # own rule: `/status` is a separate resource to RBAC, so a controller with
