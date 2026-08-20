@@ -128,8 +128,36 @@ jobs:
       - name: AUR -git pkgver tests
         run: ./scripts/aur/test-vcs-pkgver.sh
 
+      # RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) hits two h2 versions
+      # in this tree, and only one of them can be fixed today:
+      #
+      #   h2 0.4.x — OUR stack (hyper/kube, and the operator's own HTTP server,
+      #              which is where an untrusted peer could actually send these
+      #              frames). Fixed: pinned to 0.4.16 in Cargo.lock.
+      #   h2 0.3.x — reached only through the AWS SDK
+      #              (aws-config / aws-sdk-s3 -> aws-smithy-http-client), used
+      #              as a CLIENT against AWS endpoints. The advisory publishes
+      #              no patched 0.3 release, and even the newest
+      #              aws-smithy-http-client (1.3.0) still depends on 0.3, so
+      #              there is nothing to upgrade to. Revisit when the AWS SDK
+      #              moves off h2 0.3.
+      #
+      # `cargo audit` ignores by advisory ID, not by version, so the ignore
+      # below would ALSO mask a regression on the 0.4 line we just fixed. The
+      # explicit floor check runs first so that cannot happen silently.
       - name: Security audit
         run: |
+          python3 - <<'EOF'
+          import re, sys
+          versions = re.findall(r'name = "h2"\nversion = "([^"]+)"', open('Cargo.lock').read())
+          stale = [v for v in versions
+                   if v.startswith('0.4.')
+                   and tuple(int(p) for p in v.split('.')) < (0, 4, 16)]
+          if stale:
+              print(f"::error::h2 {stale} is below 0.4.16 (RUSTSEC-2026-0258)")
+              sys.exit(1)
+          print(f"h2 floor check OK: {versions}")
+          EOF
           cargo install cargo-audit --locked || true
           cargo audit \
             --ignore RUSTSEC-2023-0071 \
@@ -139,7 +167,8 @@ jobs:
             --ignore RUSTSEC-2026-0097 \
             --ignore RUSTSEC-2026-0098 \
             --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104
+            --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2026-0258
 
       - name: Install Helm
         uses: azure/setup-helm@v5
