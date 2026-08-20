@@ -1558,6 +1558,37 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
         .then_some(ReleaseReason::MissingCause)
 }
 
+/// Whether release won before any placement controller checkpoint.
+///
+/// Admission writes the deadline and exact reservation provenance before the
+/// `admitted` marker. Every placement step then writes one of
+/// `observedGeneration`, `placement`, `target`, or `claimCleanupFence` and ends
+/// its pass before a management Claim POST is possible. The Releasing status
+/// patch is UID/resourceVersion-fenced, so it cannot certify this shape while a
+/// competing placement checkpoint also commits.
+fn admitted_pending_is_allocation_free(
+    lease: &SandboxLease,
+    status: &crate::crd::SandboxLeaseStatus,
+) -> bool {
+    status.phase == crate::crd::SandboxLeasePhase::Pending
+        && status.observed_generation.is_none()
+        && status
+            .provisioning_deadline
+            .as_deref()
+            .is_some_and(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).is_ok())
+        && status.ready_at.is_none()
+        && status.expires_at.is_none()
+        && status.release_cause.is_none()
+        && status.placement.is_none()
+        && status.target.is_none()
+        && status.claim_cleanup_fence.is_none()
+        && status.sandbox_claim_tombstone.is_none()
+        && status.allocation_fence.is_none()
+        && status.conditions.is_empty()
+        && sandbox_finalizer_present(lease)
+        && crate::api::sandbox::admitted_reservation_provenance_is_valid(lease)
+}
+
 fn claim_reference_has_expected_shape(
     reference: &crate::crd::SandboxObjectReference,
     namespace: &str,
@@ -3754,20 +3785,120 @@ async fn management_target_footprint_absent(
     exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &claim_uids, sandbox).await
 }
 
+/// Prove the empty footprint behind an admission-only release tombstone.
+///
+/// `AdmissionOnlyV1` was persisted in the same fenced write that changed the
+/// exact fresh Pending status to Releasing. There is consequently no workload
+/// Claim UID or target provenance to recover. The retained Claim only closes
+/// the deterministic name; its UID is still scanned so a malformed descendant
+/// cannot be mistaken for absence.
+async fn admission_only_management_footprint_absent(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    tombstone: &SandboxObjectReference,
+    prior_claim_uid: Option<&str>,
+) -> TargetFootprintCheck {
+    let status = lease.status.clone().unwrap_or_default();
+    if status.claim_cleanup_fence != Some(crate::crd::SandboxClaimCleanupFence::AdmissionOnlyV1)
+        || status.observed_generation.is_some()
+        || status.ready_at.is_some()
+        || status.expires_at.is_some()
+        || status.placement.is_some()
+        || status.target.is_some()
+        || prior_claim_uid.is_some()
+        || status.sandbox_claim_tombstone.as_ref() != Some(tombstone)
+        || !recorded_reference_is_exact(
+            tombstone,
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &ctx.namespace,
+        )
+        || tombstone.name != claim_name(&lease.name_any())
+    {
+        return TargetFootprintCheck::Quarantine("admission_only_provenance_invalid");
+    }
+
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &sandbox_resource());
+    let check = claim_labelled_sandboxes_absent(&sandboxes, &tombstone.uid, None).await;
+    if check != TargetFootprintCheck::Verified {
+        return check;
+    }
+
+    for (api, present, unverifiable, transient) in [
+        (
+            Api::namespaced_with(
+                ctx.client.clone(),
+                &ctx.namespace,
+                &core_resource("Pod", "pods"),
+            ),
+            "admission_only_sandbox_owned_pod_present",
+            "pod_owner_chain_unverifiable",
+            "pod_owner_chain_transient",
+        ),
+        (
+            Api::namespaced_with(
+                ctx.client.clone(),
+                &ctx.namespace,
+                &core_resource("Service", "services"),
+            ),
+            "admission_only_sandbox_owned_service_present",
+            "service_owner_chain_unverifiable",
+            "service_owner_chain_transient",
+        ),
+    ] {
+        let check = unresolved_sandbox_children_absent(
+            &api,
+            &sandboxes,
+            tombstone,
+            present,
+            unverifiable,
+            transient,
+        )
+        .await;
+        if check != TargetFootprintCheck::Verified {
+            return check;
+        }
+    }
+
+    exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &[tombstone.uid.as_str()], None)
+        .await
+}
+
 /// Record the exact tombstone as the sole management Claim identity when the
 /// pre-POST cleanup protocol proves no active Claim could have disappeared.
 ///
-/// `FinalizerV1` is checkpointed before create and every active Claim body
-/// then carries Kobe's cleanup finalizer. Therefore, after the allocation
-/// fence is drained, observing only the newly-created inert tombstone proves
-/// that the active POST never committed. Legacy leases lack that checkpoint
-/// and remain fail-closed because their unrecorded Claim may have vanished.
+/// `AdmissionOnlyV1` is written with Releasing from an exact fresh Pending
+/// shape, so no producer POST was authorised; the tombstone plus empty scans
+/// prove that footprint stayed empty. `FinalizerV1` instead precedes create and
+/// makes every active Claim non-GC-dependent. After allocation drain, observing
+/// only the inert tombstone proves that active POST never committed. Leases
+/// with neither checkpoint remain fail-closed.
 async fn checkpoint_never_started_management_claim(
     lease: &SandboxLease,
     ctx: &SandboxContext,
     tombstone: &SandboxObjectReference,
+    prior_claim_uid: Option<&str>,
+    reason: ReleaseReason,
 ) -> Result<Action, SandboxPlacementError> {
     let mut next = lease.status.clone().unwrap_or_default();
+    if next.claim_cleanup_fence == Some(crate::crd::SandboxClaimCleanupFence::AdmissionOnlyV1) {
+        return match admission_only_management_footprint_absent(
+            lease,
+            ctx,
+            tombstone,
+            prior_claim_uid,
+        )
+        .await
+        {
+            TargetFootprintCheck::Verified => finish_release(lease, ctx, reason).await,
+            TargetFootprintCheck::Retry(check) => {
+                debug!(lease = %lease.name_any(), check, "admission-only footprint proof will retry");
+                Ok(Action::requeue(std::time::Duration::from_secs(10)))
+            }
+            TargetFootprintCheck::Quarantine(check) => quarantine_lease(lease, ctx, check).await,
+        };
+    }
     if next.claim_cleanup_fence != Some(crate::crd::SandboxClaimCleanupFence::FinalizerV1) {
         return quarantine_lease(lease, ctx, "claim_provenance_missing_after_absence").await;
     }
@@ -3836,6 +3967,9 @@ async fn drive_release(
         let mut next = status.clone();
         next.phase = phase;
         next.release_cause = proposed_cause;
+        if admitted_pending_is_allocation_free(lease, &status) {
+            next.claim_cleanup_fence = Some(crate::crd::SandboxClaimCleanupFence::AdmissionOnlyV1);
+        }
         if patch_lease_status_fenced(ctx, lease, &next).await? {
             info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
         } else {
@@ -4023,11 +4157,17 @@ async fn drive_release(
                     ManagementClaimTombstone::Retry(after) => {
                         return Ok(Action::requeue(after));
                     }
-                    ManagementClaimTombstone::Ready { tombstone_ref, .. } => {
+                    ManagementClaimTombstone::Ready {
+                        tombstone_ref,
+                        prior_claim_uid,
+                        ..
+                    } => {
                         return checkpoint_never_started_management_claim(
                             lease,
                             ctx,
                             &tombstone_ref,
+                            prior_claim_uid.as_deref(),
+                            reason,
                         )
                         .await;
                     }
@@ -4064,8 +4204,19 @@ async fn drive_release(
             return match ensure_management_claim_tombstone(lease, ctx, &claims).await? {
                 ManagementClaimTombstone::Checkpointed => Ok(Action::await_change()),
                 ManagementClaimTombstone::Retry(after) => Ok(Action::requeue(after)),
-                ManagementClaimTombstone::Ready { tombstone_ref, .. } => {
-                    checkpoint_never_started_management_claim(lease, ctx, &tombstone_ref).await
+                ManagementClaimTombstone::Ready {
+                    tombstone_ref,
+                    prior_claim_uid,
+                    ..
+                } => {
+                    checkpoint_never_started_management_claim(
+                        lease,
+                        ctx,
+                        &tombstone_ref,
+                        prior_claim_uid.as_deref(),
+                        reason,
+                    )
+                    .await
                 }
                 ManagementClaimTombstone::Quarantine(check) => {
                     quarantine_lease(lease, ctx, check).await
@@ -6922,6 +7073,22 @@ pub(crate) mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// Exact durable shape returned by successful admission before the first
+    /// placement-controller pass.
+    fn freshly_admitted_lease() -> SandboxLease {
+        let mut lease = admitted_lease();
+        let provisioning_deadline = lease
+            .status
+            .as_ref()
+            .and_then(|status| status.provisioning_deadline.clone());
+        lease.status = Some(SandboxLeaseStatus {
+            phase: crate::crd::SandboxLeasePhase::Pending,
+            provisioning_deadline,
+            ..Default::default()
+        });
+        lease
     }
 
     /// A lease whose canary pass is already recorded.
@@ -9831,6 +9998,130 @@ pub(crate) mod tests {
             .await,
             1
         );
+    }
+
+    /// A successful admission can be released before placement observes it.
+    /// The Releasing write itself certifies that exact Pending shape, then an
+    /// inert Claim tombstone and empty scans release quota without inventing a
+    /// management target or quarantining capacity.
+    #[tokio::test]
+    async fn release_before_first_controller_pass_proves_admission_only_absence() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+
+        let tombstone = tombstone_claim_json("admission-only-tombstone-uid", None);
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(ResponseTemplate::new(201).set_body_json(&tombstone))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&tombstone))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOXES_PATH))
+            .and(query_param(
+                "labelSelector",
+                format!("{UPSTREAM_CLAIM_UID_LABEL}=admission-only-tombstone-uid"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": "SandboxList", "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let mut lease = freshly_admitted_lease();
+        assert!(admitted_pending_is_allocation_free(
+            &lease,
+            lease.status.as_ref().unwrap()
+        ));
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION.to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+
+        for pass in 0..12 {
+            let before = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .count();
+            let _ = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .expect("admission-only cancellation must converge");
+            let statuses: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+                })
+                .filter_map(status_value_of)
+                .collect();
+            if let Some(latest) = statuses.get(before).cloned() {
+                lease.status =
+                    Some(serde_json::from_value(latest).expect("typed admission-only checkpoint"));
+                lease.metadata.resource_version = Some(format!("admission-only-rv-{pass}"));
+            }
+            if lease.status.as_ref().unwrap().phase == crate::crd::SandboxLeasePhase::Released {
+                break;
+            }
+        }
+
+        let status = lease.status.as_ref().unwrap();
+        assert_eq!(status.phase, crate::crd::SandboxLeasePhase::Released);
+        assert_eq!(
+            status.claim_cleanup_fence,
+            Some(crate::crd::SandboxClaimCleanupFence::AdmissionOnlyV1)
+        );
+        assert!(status.target.is_none(), "no workload target ever existed");
+        assert!(
+            !recorded_phases(&server)
+                .await
+                .iter()
+                .any(|phase| phase == "Quarantined")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            1
+        );
+        let claim_posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == CLAIMS_PATH
+            })
+            .collect();
+        assert_eq!(claim_posts.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&claim_posts[0].body).unwrap();
+        assert_eq!(body["spec"]["lifecycle"]["shutdownPolicy"], "Retain");
     }
 
     /// Cancellation can win after the management POST protocol was

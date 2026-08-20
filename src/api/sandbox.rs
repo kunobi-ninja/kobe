@@ -5572,6 +5572,19 @@ fn persisted_reservation_provenance(
     canonical_reservation_provenance(lease, &reservations)
 }
 
+/// Whether an admitted lease carries the complete exact reservation set.
+///
+/// The placement controller uses this when certifying the narrow
+/// admission-only cancellation shape. Keeping the parser here prevents that
+/// proof from accepting a merely present or caller-crafted annotation.
+pub(crate) fn admitted_reservation_provenance_is_valid(lease: &SandboxLease) -> bool {
+    lease
+        .annotations()
+        .get(SANDBOX_ADMISSION_ANNOTATION)
+        .is_some_and(|value| value == SANDBOX_ADMISSION_ADMITTED)
+        && persisted_reservation_provenance(lease).is_ok()
+}
+
 /// Why admission could not reserve its slot. Both refusals are ordinary,
 /// caller-visible outcomes rather than faults — the caller is over quota, or
 /// picked an alias someone else is already using.

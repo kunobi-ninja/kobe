@@ -602,6 +602,15 @@ pub struct SandboxLeaseStatus {
 /// Durable management-Claim deletion fence understood by this controller.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub enum SandboxClaimCleanupFence {
+    /// Release won while the lease still had the exact admission-only shape.
+    /// The UID/resourceVersion-fenced `Releasing` checkpoint therefore proves
+    /// no placement pass had authorised a Claim POST. Teardown may use an exact
+    /// inert tombstone plus empty descendant scans without inventing target
+    /// provenance for workload that never started.
+    AdmissionOnlyV1,
+    /// A management Claim cleanup finalizer was durable before the first POST,
+    /// or an exact non-deleting legacy Claim was atomically migrated to that
+    /// ownerless/finalized shape before this checkpoint was written.
     FinalizerV1,
 }
 

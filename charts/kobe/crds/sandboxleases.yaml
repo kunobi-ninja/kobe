@@ -129,14 +129,10 @@ spec:
                 - uid
                 type: object
               claimCleanupFence:
-                description: |-
-                  Protocol checkpoint written before any management `SandboxClaim` POST.
-                  `FinalizerV1` means every subsequently created Claim carries Kobe's
-                  cleanup finalizer from birth, so an unrecorded Claim cannot disappear
-                  before teardown either checkpoints its UID or proves the name absent.
+                description: Durable management-Claim deletion fence understood by this controller.
                 enum:
+                - AdmissionOnlyV1
                 - FinalizerV1
-                - null
                 nullable: true
                 type: string
               conditions:
