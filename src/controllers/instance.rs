@@ -18,15 +18,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{
-    BackendFactory, BootstrapJobPlan, ClusterBackend, resolve_bootstrap_addons,
-    resolve_bootstrap_jobs,
+    BackendCreationFootprint, BackendFactory, BootstrapJobPlan, ClusterBackend,
+    resolve_bootstrap_addons, resolve_bootstrap_jobs,
 };
 use crate::crd::{
     Addon, BackendConfig, BackendType, BootstrapRef, CIDRClaim, CIDRClaimPhase, CIDRClaimSpec,
     CheckResult, CleanupMode, ClusterConfig, ClusterInstance, ClusterInstanceCondition,
     ClusterInstanceNetwork, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
-    HealthCheckConfig, LeasePhase, ReadinessGate, SnapshotConfig, TEARDOWN_RECEIPT_SCHEMA_VERSION,
-    TeardownOutcome, TeardownReceipt,
+    HealthCheckConfig, LeasePhase, ReadinessGate, SnapshotConfig,
+    TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION, TEARDOWN_RECEIPT_SCHEMA_VERSION,
+    TeardownCreationManifest, TeardownOutcome, TeardownReceipt,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -352,6 +353,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 // is preserved (we never want to overwrite it
                                 // from an instance-controller patch).
                                 created_with: None,
+                                creation_manifest: None,
                                 teardown_identities: Vec::new(),
                                 message: Some("network allocated; awaiting provisioning".into()),
                                 // Overwritten centrally in patch_instance_status.
@@ -396,6 +398,27 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             let owner_ref = instance.controller_owner_ref(&());
             match provision_instance(&ctx, &config, &name, &ns, owner_ref.as_ref()).await {
                 Ok(()) => {
+                    // Seal the exact footprint while every created object, bound
+                    // PV, StorageClass and datastore OID is still observable.
+                    // Failure is honest ineligibility for VerifiedDestroy, not a
+                    // reason to break ordinary Standard-mode pools; a later
+                    // Creating/Ready reconcile retries the capture.
+                    match capture_creation_manifest(&ctx, &config, &instance, &ns).await {
+                        Ok(Some(manifest)) => {
+                            if let Err(error) =
+                                persist_creation_manifest_once(&instances_api, &instance, &manifest)
+                                    .await
+                            {
+                                warn!(instance = %name, error = %error, "could not persist creation manifest; will retry");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!(
+                            instance = %name,
+                            error = %format!("{error:#}"),
+                            "creation footprint is not fully observable; verified teardown remains ineligible"
+                        ),
+                    }
                     patch_instance_status(
                         &instances_api,
                         &instance,
@@ -447,6 +470,15 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Creating if status.provisioned => {
+            if status.creation_manifest.is_none()
+                && let Ok(Some(manifest)) =
+                    capture_creation_manifest(&ctx, &config, &instance, &ns).await
+                && persist_creation_manifest_once(&instances_api, &instance, &manifest)
+                    .await
+                    .is_ok()
+            {
+                return Ok(Action::requeue(std::time::Duration::from_secs(0)));
+            }
             let ready = evaluate_instance_readiness(&ctx, &config, &name, &ns).await?;
             if ready {
                 match reconcile_instance_bootstraps(&ctx, &config, &instance, &name, &ns).await {
@@ -760,6 +792,24 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Ready => {
+            if status.creation_manifest.is_none() {
+                match capture_creation_manifest(&ctx, &config, &instance, &ns).await {
+                    Ok(Some(manifest)) => {
+                        if persist_creation_manifest_once(&instances_api, &instance, &manifest)
+                            .await
+                            .is_ok()
+                        {
+                            return Ok(Action::requeue(std::time::Duration::from_secs(0)));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => debug!(
+                        instance = %name,
+                        error = %format!("{error:#}"),
+                        "creation manifest capture remains incomplete"
+                    ),
+                }
+            }
             // Record provisioner-assigned identities while the instance is
             // healthy. Doing this at teardown would let the teardown path
             // choose its own scope; recorded here, a later receipt has to
@@ -787,17 +837,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                 instance = %name,
                 "quarantined: retrying teardown verification for the same exact subject"
             );
-            // Only the deletion path can produce a receipt, so a quarantined
-            // instance that is not being deleted simply waits. It holds its
-            // finalizer and binding, so it is never selectable as capacity.
-            if instance.metadata.deletion_timestamp.is_none() {
-                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
-            }
             match verified_teardown_gate(&ctx, &instance, &name, &ns).await {
                 Some(outcome) => outcome,
-                // Not receipt-required after all (the lease changed or is
-                // gone): fall back to the ordinary path rather than holding
-                // capacity hostage forever.
+                // Cleanup mode or binding drift cannot downgrade an existing
+                // quarantine into standard deletion. Keep every handle while
+                // the exact verified contract cannot be recovered.
                 None => Ok(Action::requeue(std::time::Duration::from_secs(30))),
             }
         }
@@ -821,6 +865,13 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             if current.metadata.uid != instance.metadata.uid {
                 warn!(instance = %name, reason = "instance_uid_mismatch", "Refusing to delete same-named replacement");
                 return Ok(Action::await_change());
+            }
+            // Recycling is the normal destructive boundary. A verified lease
+            // must persist its attempt nonce here, before backend deletion;
+            // waiting for a later deletionTimestamp is too late because the
+            // ordinary backend delete below has already destroyed the scope.
+            if let Some(outcome) = verified_teardown_gate(&ctx, &current, &name, &ns).await {
+                return outcome;
             }
             match delete_instance_backend(&ctx, &config, &current, &name, &ns).await {
                 Ok(()) => {
@@ -1866,6 +1917,164 @@ async fn create_instance_backend<B: ClusterBackend + Clone>(
     }
 }
 
+/// Build the immutable creation manifest from controller-owned identity and a
+/// backend-observed live footprint.
+fn build_creation_manifest(
+    instance: &ClusterInstance,
+    namespace: &str,
+    footprint: BackendCreationFootprint,
+    sealed_at: String,
+) -> Result<TeardownCreationManifest, anyhow::Error> {
+    let created = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.created_with.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("instance has no creation provenance"))?;
+    let backend = created
+        .backend
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("instance has no immutable backend provenance"))?;
+    let network = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.network.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("instance has no persisted network allocation"))?;
+    let uid = instance
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("instance has no UID"))?;
+
+    let manifest = TeardownCreationManifest {
+        schema_version: TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION,
+        instance: crate::crd::ResourceRef {
+            name: instance.name_any(),
+            uid: Some(uid),
+        },
+        namespace: namespace.to_string(),
+        backend_type: backend.backend_type.clone(),
+        config_digest: backend.config_digest.clone(),
+        service_cidr: network.service_cidr.clone(),
+        cluster_cidr: network.cluster_cidr.clone(),
+        server_replicas: footprint.server_replicas,
+        agent_replicas: footprint.agent_replicas,
+        resources: footprint.resources,
+        storage: footprint.storage,
+        datastore: footprint.datastore,
+        sealed_at,
+    };
+    manifest
+        .validate()
+        .map_err(|reason| anyhow::anyhow!("invalid creation footprint: {reason}"))?;
+
+    // The earlier creation plan authenticates optional absence: a failed GET
+    // must not become permission to omit an agent, registry ConfigMap, volume,
+    // or datastore from the later concrete manifest. The connect-token is the
+    // sole exception because the lease controller creates it only at bind; it
+    // needs its own immutable binding footprint before this instance is used.
+    let planned: std::collections::BTreeSet<_> = created
+        .teardown_plan
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("instance has no creation-time teardown plan"))?
+        .iter()
+        .copied()
+        .filter(|subject| *subject != crate::crd::TeardownSubject::ConnectTokenSecret)
+        .collect();
+    let observed: std::collections::BTreeSet<_> =
+        manifest.required_subjects().into_iter().collect();
+    if planned != observed {
+        anyhow::bail!(
+            "concrete creation footprint does not match the controller-authenticated creation plan"
+        );
+    }
+    Ok(manifest)
+}
+
+/// Capture a manifest only from the backend pinned in immutable provenance.
+/// A current pool edit must not redirect capture to a different implementation.
+async fn capture_creation_manifest<B: ClusterBackend + Clone>(
+    ctx: &InstanceContext<B>,
+    config: &ResolvedInstanceConfig,
+    instance: &ClusterInstance,
+    namespace: &str,
+) -> Result<Option<TeardownCreationManifest>, anyhow::Error> {
+    if instance
+        .status
+        .as_ref()
+        .and_then(|status| status.creation_manifest.as_ref())
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let mut cluster_config = config.cluster.clone();
+    cluster_config.allocated_network = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.network.clone());
+    let footprint = if let Some(factory) = &ctx.factory {
+        let provenance = instance
+            .status
+            .as_ref()
+            .and_then(|status| status.created_with.as_ref())
+            .and_then(|created| created.backend.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("instance has no immutable backend provenance"))?;
+        factory
+            .backend_for_provenance(provenance)?
+            .capture_creation_footprint(&instance.name_any(), namespace, &cluster_config)
+            .await?
+    } else {
+        ctx.backend
+            .capture_creation_footprint(&instance.name_any(), namespace, &cluster_config)
+            .await?
+    };
+
+    footprint
+        .map(|footprint| {
+            build_creation_manifest(
+                instance,
+                namespace,
+                footprint,
+                chrono::Utc::now().to_rfc3339(),
+            )
+        })
+        .transpose()
+}
+
+/// Persist the sealed manifest exactly once, fenced to the observed object.
+///
+/// The CRD's root CEL rule independently rejects later mutation/removal. The
+/// UID/resourceVersion tests ensure two reconciles cannot race to authenticate
+/// different first manifests under the same name.
+async fn persist_creation_manifest_once(
+    instances: &Api<ClusterInstance>,
+    instance: &ClusterInstance,
+    manifest: &TeardownCreationManifest,
+) -> Result<(), kube::Error> {
+    let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
+    })?;
+    let resource_version = instance.resource_version().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other(
+            "instance has no resourceVersion",
+        )))
+    })?;
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status/creationManifest", "value": manifest }
+    ]));
+    instances
+        .patch_status(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn delete_instance_backend<B: ClusterBackend + Clone>(
     ctx: &InstanceContext<B>,
     config: &ResolvedInstanceConfig,
@@ -1957,27 +2166,127 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         return None;
     }
 
-    let started_at = chrono::Utc::now().to_rfc3339();
-
-    // The plan must come from what creation recorded. An instance created
-    // before verified teardown existed has no plan, and verifying it against a
-    // reconstructed guess would prove only that the guess was satisfied.
-    let Some(plan) = status
-        .created_with
-        .as_ref()
-        .and_then(|created| created.teardown_plan.clone())
-    else {
+    // The concrete immutable manifest, not a category list reconstructed at
+    // teardown, is the trust boundary. Missing or malformed provenance cannot
+    // authorize a destructive attempt or finalizer release.
+    let Some(manifest) = status.creation_manifest.as_ref() else {
         warn!(
             instance = %name,
-            "verified teardown requested but no creation-time plan was recorded; quarantining"
+            "verified teardown requested but no sealed creation manifest exists; quarantining"
         );
         return Some(
-            quarantine_instance(ctx, instance, name, namespace, "teardown_plan_missing").await,
+            quarantine_instance(ctx, instance, name, namespace, "creation_manifest_missing").await,
         );
+    };
+    if manifest.validate().is_err()
+        || manifest.instance.name != name
+        || manifest.instance.uid.as_deref() != Some(binding.instance.uid.as_str())
+        || manifest.backend_type != binding.backend.backend_type
+        || manifest.config_digest != binding.backend.config_digest
+    {
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "creation_manifest_invalid").await,
+        );
+    }
+    let Ok(manifest_digest) = manifest.digest() else {
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "creation_manifest_invalid").await,
+        );
+    };
+    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
+    let plan = manifest.required_subjects();
+    let recorded_identities = manifest.recorded_identities();
+
+    // A completed verified receipt may already be durable from a previous
+    // reconcile that crashed before finalizer removal. Consume it instead of
+    // starting a second destructive attempt.
+    if let Some(existing) = lease
+        .status
+        .as_ref()
+        .and_then(|lease_status| lease_status.teardown_receipt.as_ref())
+        && existing.outcome == TeardownOutcome::Verified
+    {
+        let expected = crate::crd::TeardownScope {
+            lease: &binding.lease,
+            instance: &manifest.instance,
+            pool: &binding.pool,
+            backend_type: &backend_type,
+            config_digest: &binding.backend.config_digest,
+            instance_spec_digest: &binding.instance_spec_digest,
+            creation_manifest_digest: &manifest_digest,
+            attempt_id: &existing.attempt_id,
+            creation_manifest: Some(manifest),
+            required_subjects: &plan,
+            instance_name: name,
+            recorded_identities: &recorded_identities,
+        };
+        if existing.permits_release_for(&expected) {
+            info!(instance = %name, attempt = %existing.attempt_id, "consuming already-persisted verified teardown receipt");
+            return Some(advance_verified_instance_deletion(ctx, instance, name, namespace).await);
+        }
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "receipt_manifest_mismatch").await,
+        );
+    }
+
+    // Persist the attempt nonce and start time BEFORE the first DELETE. If the
+    // operator crashes afterwards, the next reconcile resumes this exact nonce
+    // and idempotently repeats deletion; it never invents a post-hoc attempt.
+    let mut attempt_lease = lease.clone();
+    let pending = match lease
+        .status
+        .as_ref()
+        .and_then(|lease_status| lease_status.teardown_receipt.as_ref())
+        .filter(|receipt| receipt.outcome == TeardownOutcome::InProgress)
+    {
+        Some(receipt)
+            if pending_receipt_matches(receipt, binding, &manifest.instance, &manifest_digest) =>
+        {
+            receipt.clone()
+        }
+        Some(_) => {
+            return Some(
+                quarantine_instance(ctx, instance, name, namespace, "pending_attempt_mismatch")
+                    .await,
+            );
+        }
+        None => {
+            let receipt = TeardownReceipt {
+                schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                lease: binding.lease.clone(),
+                instance: manifest.instance.clone(),
+                pool: binding.pool.clone(),
+                backend_type: backend_type.clone(),
+                config_digest: binding.backend.config_digest.clone(),
+                instance_spec_digest: binding.instance_spec_digest.clone(),
+                creation_manifest_digest: manifest_digest.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: None,
+                checks: Vec::new(),
+                retry_count: lease
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.teardown_receipt.as_ref())
+                    .map_or(0, |receipt| receipt.retry_count.saturating_add(1)),
+                outcome: TeardownOutcome::InProgress,
+            };
+            match record_teardown_receipt(ctx, &lease, &receipt, namespace, None).await {
+                Ok(updated) => attempt_lease = updated,
+                Err(error) => {
+                    warn!(instance = %name, error = %error, "could not persist teardown attempt; no deletion issued");
+                    return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
+                }
+            }
+            receipt
+        }
     };
 
     let checks = match resolve_verified_backend(ctx, instance).await {
-        Some(backend) => match backend.delete_verified(name, namespace, &plan).await {
+        Some(backend) => match backend
+            .delete_verified_manifest(name, namespace, manifest)
+            .await
+        {
             Ok(checks) => checks,
             Err(_) => {
                 warn!(
@@ -2001,32 +2310,52 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     let outcome = TeardownReceipt::outcome_for(&checks);
     let receipt = TeardownReceipt {
         schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
-        attempt_id: uuid::Uuid::new_v4().to_string(),
-        lease: binding.lease.clone(),
-        instance: crate::crd::ResourceRef {
-            name: binding.instance.name.clone(),
-            uid: Some(binding.instance.uid.clone()),
-        },
-        pool: binding.pool.clone(),
-        backend_type: format!("{:?}", binding.backend.backend_type).to_lowercase(),
-        config_digest: binding.backend.config_digest.clone(),
-        instance_spec_digest: binding.instance_spec_digest.clone(),
-        started_at,
-        completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        attempt_id: pending.attempt_id.clone(),
+        lease: pending.lease.clone(),
+        instance: pending.instance.clone(),
+        pool: pending.pool.clone(),
+        backend_type: pending.backend_type.clone(),
+        config_digest: pending.config_digest.clone(),
+        instance_spec_digest: pending.instance_spec_digest.clone(),
+        creation_manifest_digest: pending.creation_manifest_digest.clone(),
+        started_at: pending.started_at.clone(),
+        completed_at: Some(completion_after(&pending.started_at)),
         checks,
-        retry_count: 0,
+        retry_count: pending.retry_count,
         outcome,
     };
 
     // Persist the evidence BEFORE releasing anything. A receipt written after
     // the finalizer is gone can be lost with the object it describes, and the
     // whole point is that it outlives the instance.
-    if let Err(error) = record_teardown_receipt(ctx, &lease, &receipt, namespace).await {
+    if let Err(error) = record_teardown_receipt(
+        ctx,
+        &attempt_lease,
+        &receipt,
+        namespace,
+        Some(&pending.attempt_id),
+    )
+    .await
+    {
         warn!(instance = %name, error = %error, "could not persist teardown receipt; retrying");
         return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
     }
 
-    if outcome != TeardownOutcome::Verified {
+    let expected = crate::crd::TeardownScope {
+        lease: &binding.lease,
+        instance: &manifest.instance,
+        pool: &binding.pool,
+        backend_type: &receipt.backend_type,
+        config_digest: &binding.backend.config_digest,
+        instance_spec_digest: &binding.instance_spec_digest,
+        creation_manifest_digest: &manifest_digest,
+        attempt_id: &pending.attempt_id,
+        creation_manifest: Some(manifest),
+        required_subjects: &plan,
+        instance_name: name,
+        recorded_identities: &recorded_identities,
+    };
+    if outcome != TeardownOutcome::Verified || !receipt.permits_release_for(&expected) {
         let unproven: Vec<&str> = receipt
             .checks
             .iter()
@@ -2044,12 +2373,83 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     }
 
     info!(instance = %name, "teardown verified; releasing the cleanup handle");
+    Some(advance_verified_instance_deletion(ctx, instance, name, namespace).await)
+}
+
+/// Move a receipt-proven instance through the Kubernetes deletion boundary.
+///
+/// The normal `Recycling` path has no deletionTimestamp yet. It requests an
+/// exact UID/resourceVersion-fenced delete while retaining the finalizer; the
+/// deletion reconcile then consumes the already-durable receipt and removes
+/// that finalizer. If deletion is already pending, only the latter step remains.
+async fn advance_verified_instance_deletion<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    instance: &ClusterInstance,
+    name: &str,
+    namespace: &str,
+) -> Result<Action, InstanceError> {
     cleanup_orphan_projected_resources(&ctx.client, name, namespace).await;
-    let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
-    if let Err(error) = remove_finalizer(&instances_api, instance, INSTANCE_FINALIZER).await {
-        return Some(Err(error.into()));
+    let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+    if instance.metadata.deletion_timestamp.is_some() {
+        remove_finalizer(&instances, instance, INSTANCE_FINALIZER).await?;
+        return Ok(Action::await_change());
     }
-    Some(Ok(Action::await_change()))
+
+    let uid = instance
+        .metadata
+        .uid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("verified instance has no UID"))?;
+    let resource_version = instance
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("verified instance has no resourceVersion"))?;
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid),
+            resource_version: Some(resource_version),
+        }),
+        ..Default::default()
+    };
+    tolerate_lost_race(
+        instances.delete(name, &params).await,
+        name,
+        "verified_fenced_delete",
+    )?;
+    Ok(Action::await_change())
+}
+
+/// Whether an unfinished receipt is the exact durable attempt this reconcile
+/// may resume. Any malformed timestamp or drifted identity holds quarantine; it
+/// never authorizes a fresh DELETE under the old nonce.
+fn pending_receipt_matches(
+    receipt: &TeardownReceipt,
+    binding: &crate::crd::LeaseBinding,
+    instance: &crate::crd::ResourceRef,
+    manifest_digest: &str,
+) -> bool {
+    receipt.schema_version == TEARDOWN_RECEIPT_SCHEMA_VERSION
+        && receipt.outcome == TeardownOutcome::InProgress
+        && !receipt.attempt_id.trim().is_empty()
+        && chrono::DateTime::parse_from_rfc3339(&receipt.started_at).is_ok()
+        && receipt.completed_at.is_none()
+        && receipt.checks.is_empty()
+        && receipt.lease == binding.lease
+        && receipt.instance == *instance
+        && receipt.pool == binding.pool
+        && receipt.backend_type == format!("{:?}", binding.backend.backend_type).to_lowercase()
+        && receipt.config_digest == binding.backend.config_digest
+        && receipt.instance_spec_digest == binding.instance_spec_digest
+        && receipt.creation_manifest_digest == manifest_digest
+}
+
+/// Produce an RFC3339 completion strictly after the persisted start even when a
+/// very fast mocked deletion completes inside the same clock tick.
+fn completion_after(started_at: &str) -> String {
+    let now = chrono::Utc::now().fixed_offset();
+    match chrono::DateTime::parse_from_rfc3339(started_at) {
+        Ok(started) if now <= started => (started + chrono::Duration::nanoseconds(1)).to_rfc3339(),
+        _ => now.to_rfc3339(),
+    }
 }
 
 /// Record the provisioner-assigned identities this instance owns, once.
@@ -2139,29 +2539,41 @@ async fn record_teardown_receipt<B: ClusterBackend>(
     lease: &ClusterLease,
     receipt: &TeardownReceipt,
     namespace: &str,
-) -> Result<(), anyhow::Error> {
+    expected_attempt: Option<&str>,
+) -> Result<ClusterLease, anyhow::Error> {
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
     let uid = lease
         .metadata
         .uid
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("lease has no UID"))?;
-    let patch = crate::controllers::lease::json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": uid },
-        { "op": "add", "path": "/status/teardownReceipt", "value": receipt }
-    ]));
-    tolerate_lost_race(
-        leases
-            .patch_status(
-                &lease.name_any(),
-                &PatchParams::default(),
-                &Patch::<()>::Json(patch),
-            )
-            .await,
-        &lease.name_any(),
-        "teardown_receipt",
-    )?;
-    Ok(())
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease has no resourceVersion"))?;
+    let mut operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
+    ];
+    if let Some(attempt_id) = expected_attempt {
+        operations.push(serde_json::json!({
+            "op": "test",
+            "path": "/status/teardownReceipt/attemptId",
+            "value": attempt_id
+        }));
+    }
+    operations.push(serde_json::json!({
+        "op": "add",
+        "path": "/status/teardownReceipt",
+        "value": receipt
+    }));
+    let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(operations));
+    Ok(leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?)
 }
 
 /// Hold the capacity back and keep every cleanup handle.
@@ -3854,5 +4266,83 @@ mod tests {
         add_finalizer(&instances_api, &instance, INSTANCE_FINALIZER)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn pending_attempt_resume_requires_every_fence_and_no_posthoc_evidence() {
+        let binding = crate::crd::LeaseBinding {
+            binding_id: "binding-1".into(),
+            lease: crate::crd::ResourceRef {
+                name: "lease-a".into(),
+                uid: Some("lease-uid".into()),
+            },
+            instance: crate::crd::BoundInstanceRef {
+                name: "pool-p-0".into(),
+                uid: "instance-uid".into(),
+                observed_generation: 1,
+            },
+            pool: crate::crd::ResourceRef {
+                name: "pool-p".into(),
+                uid: Some("pool-uid".into()),
+            },
+            backend: crate::crd::BackendProvenance {
+                backend_type: BackendType::K3s,
+                config_digest: "a".repeat(64),
+                capi: None,
+            },
+            instance_spec_digest: "spec-digest".into(),
+        };
+        let instance = crate::crd::ResourceRef {
+            name: "pool-p-0".into(),
+            uid: Some("instance-uid".into()),
+        };
+        let pending = TeardownReceipt {
+            schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
+            attempt_id: "attempt-1".into(),
+            lease: binding.lease.clone(),
+            instance: instance.clone(),
+            pool: binding.pool.clone(),
+            backend_type: "k3s".into(),
+            config_digest: binding.backend.config_digest.clone(),
+            instance_spec_digest: binding.instance_spec_digest.clone(),
+            creation_manifest_digest: "manifest-digest".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+            checks: Vec::new(),
+            retry_count: 0,
+            outcome: TeardownOutcome::InProgress,
+        };
+        assert!(pending_receipt_matches(
+            &pending,
+            &binding,
+            &instance,
+            "manifest-digest"
+        ));
+
+        let mut posthoc = pending.clone();
+        posthoc.completed_at = Some("2026-01-01T00:00:01Z".into());
+        assert!(!pending_receipt_matches(
+            &posthoc,
+            &binding,
+            &instance,
+            "manifest-digest"
+        ));
+        let mut replay = pending;
+        replay.attempt_id.clear();
+        assert!(!pending_receipt_matches(
+            &replay,
+            &binding,
+            &instance,
+            "manifest-digest"
+        ));
+    }
+
+    #[test]
+    fn completion_timestamp_is_rfc3339_and_strictly_after_start() {
+        let started = "2999-01-01T00:00:00Z";
+        let completed = completion_after(started);
+        let started = chrono::DateTime::parse_from_rfc3339(started).unwrap();
+        let completed = chrono::DateTime::parse_from_rfc3339(&completed).unwrap();
+        assert!(completed > started);
     }
 }

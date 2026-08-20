@@ -16,23 +16,28 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, ConfigMap, Container, EnvVar, EnvVarSource, Event as K8sEvent, HostPathVolumeSource,
-    KeyToPath, ObjectFieldSelector, PersistentVolumeClaim, Pod, PodAffinity, PodAffinityTerm,
-    PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort, ServiceSpec,
-    Toleration, Volume, VolumeMount,
+    KeyToPath, ObjectFieldSelector, PersistentVolume, PersistentVolumeClaim, Pod, PodAffinity,
+    PodAffinityTerm, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort,
+    ServiceSpec, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
+use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::Client;
 use kube::api::{
-    Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, PropagationPolicy,
+    Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions,
+    PropagationPolicy,
 };
+use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-use crate::backend::VerifiedDestroyUnsupported;
-use crate::crd::{CheckResult, TeardownCheck, TeardownSubject};
+use crate::backend::{BackendCreationFootprint, VerifiedDestroyUnsupported};
+use crate::crd::{
+    CheckResult, CreationManifestResource, DatastoreProvenance, KubernetesResourceIdentity,
+    StorageVolumeProvenance, TeardownCheck, TeardownCreationManifest, TeardownSubject,
+};
 
 use crate::crd::{
     Addon, ClusterConfig, IntraPlacementMode, KubeletSharedMountConfig, Placement, ReadinessGate,
@@ -1998,6 +2003,7 @@ impl K3sBackend {
         subject: TeardownSubject,
         bound_volumes: &std::result::Result<Vec<String>, String>,
         delete_outcome: &Result<()>,
+        manifest: Option<&TeardownCreationManifest>,
     ) -> TeardownCheck {
         // A failed delete means the footprint was never fully addressed, so no
         // subject can be claimed absent on the strength of this attempt.
@@ -2060,6 +2066,11 @@ impl K3sBackend {
                 verified.push(format!("{name}-connect-token"));
                 Self::absent_by_name(&api, &format!("{name}-connect-token")).await
             }
+            TeardownSubject::DatastoreCredentialSecret => {
+                let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+                verified.push(format!("{name}-datastore"));
+                Self::absent_by_name(&api, &format!("{name}-datastore")).await
+            }
             // Pods are label-selected rather than named: a StatefulSet's pods
             // outlive its deletion while terminating, which is precisely the
             // window an accepted DELETE would have hidden.
@@ -2121,27 +2132,83 @@ impl K3sBackend {
                     Api::namespaced(self.client.clone(), namespace);
                 Self::absent_by_name(&api, name).await
             }
-            TeardownSubject::Database => match self.datastore.current() {
-                None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
-                Some((pool, _)) => {
-                    verified.push(format!("database:k3s_{name}"));
-                    match datastore::database_exists(&pool, name, "k3s_").await {
-                        Ok(false) => (CheckResult::Verified, None),
-                        Ok(true) => (CheckResult::Unknown, Some("database_still_present".into())),
-                        Err(_) => (CheckResult::Unknown, Some("datastore_unreachable".into())),
+            TeardownSubject::Database => {
+                if let Some(manifest) = manifest {
+                    // Re-resolve against the manifest's endpoint digest after
+                    // deletion too. A hot-reload to another PostgreSQL server
+                    // where the same name is absent is not proof that the
+                    // original database was destroyed.
+                    match self
+                        .validate_manifest_datastore(name, manifest, false)
+                        .await
+                    {
+                        Ok(Some((_, false, _))) => (CheckResult::Verified, None),
+                        Ok(Some((_, true, _))) => {
+                            (CheckResult::Unknown, Some("database_still_present".into()))
+                        }
+                        Ok(None) => (
+                            CheckResult::Unknown,
+                            Some("datastore_provenance_invalid".into()),
+                        ),
+                        Err(_) => (
+                            CheckResult::Unknown,
+                            Some("datastore_provenance_changed".into()),
+                        ),
+                    }
+                } else {
+                    match self.datastore.current() {
+                        None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
+                        Some((pool, _)) => {
+                            verified.push(format!("database:k3s_{name}"));
+                            match datastore::database_exists(&pool, name, "k3s_").await {
+                                Ok(false) => (CheckResult::Verified, None),
+                                Ok(true) => {
+                                    (CheckResult::Unknown, Some("database_still_present".into()))
+                                }
+                                Err(_) => {
+                                    (CheckResult::Unknown, Some("datastore_unreachable".into()))
+                                }
+                            }
+                        }
                     }
                 }
-            },
-            TeardownSubject::DatabaseRole => match self.datastore.current() {
-                None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
-                Some((pool, _)) => {
-                    match datastore::cluster_role_exists(&pool, name, "k3s_").await {
-                        Ok(false) => (CheckResult::Verified, None),
-                        Ok(true) => (CheckResult::Unknown, Some("role_still_present".into())),
-                        Err(_) => (CheckResult::Unknown, Some("datastore_unreachable".into())),
+            }
+            TeardownSubject::DatabaseRole => {
+                if let Some(manifest) = manifest {
+                    match self
+                        .validate_manifest_datastore(name, manifest, false)
+                        .await
+                    {
+                        Ok(Some((_, _, false))) => (CheckResult::Verified, None),
+                        Ok(Some((_, _, true))) => {
+                            (CheckResult::Unknown, Some("role_still_present".into()))
+                        }
+                        Ok(None) => (
+                            CheckResult::Unknown,
+                            Some("datastore_provenance_invalid".into()),
+                        ),
+                        Err(_) => (
+                            CheckResult::Unknown,
+                            Some("datastore_provenance_changed".into()),
+                        ),
+                    }
+                } else {
+                    match self.datastore.current() {
+                        None => (CheckResult::Unknown, Some("datastore_unavailable".into())),
+                        Some((pool, _)) => {
+                            match datastore::cluster_role_exists(&pool, name, "k3s_").await {
+                                Ok(false) => (CheckResult::Verified, None),
+                                Ok(true) => {
+                                    (CheckResult::Unknown, Some("role_still_present".into()))
+                                }
+                                Err(_) => {
+                                    (CheckResult::Unknown, Some("datastore_unreachable".into()))
+                                }
+                            }
+                        }
                     }
                 }
-            },
+            }
         };
 
         TeardownCheck {
@@ -2151,7 +2218,9 @@ impl K3sBackend {
             // failed or uncertain check must not leave identities behind that
             // read as proof.
             verified: if result == CheckResult::Verified {
-                verified
+                manifest
+                    .map(|manifest| manifest.identities_for_subject(subject))
+                    .unwrap_or(verified)
             } else {
                 Vec::new()
             },
@@ -2172,6 +2241,601 @@ impl K3sBackend {
             Ok(Some(_)) => (CheckResult::Unknown, Some("still_present".into())),
             Err(_) => (CheckResult::Unknown, Some("lookup_failed".into())),
         }
+    }
+
+    /// Convert one live Kubernetes object into a UID-fenced manifest entry.
+    /// Missing identity is uncertainty, never a name-only fallback.
+    fn manifest_resource<K: Resource>(
+        object: &K,
+        subject: TeardownSubject,
+        api_version: &str,
+        kind: &str,
+    ) -> Result<CreationManifestResource> {
+        let metadata = object.meta();
+        let name = metadata
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{kind} has no name"))?;
+        let uid = metadata
+            .uid
+            .clone()
+            .filter(|uid| !uid.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{kind} {name} has no UID"))?;
+        Ok(CreationManifestResource {
+            subject,
+            resource: KubernetesResourceIdentity {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: metadata.namespace.clone(),
+                name,
+                uid,
+            },
+        })
+    }
+
+    /// Read the effective network/datastore provenance from the object that was
+    /// actually created, rather than from mutable operator configuration.
+    fn creation_runtime_datastore_endpoint(
+        statefulset: &StatefulSet,
+        service_cidr: &str,
+        cluster_cidr: &str,
+    ) -> Result<Option<String>> {
+        let statefulset_name = statefulset.name_any();
+        let server_args = statefulset
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.spec.as_ref())
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == "k3s-server")
+            })
+            .and_then(|container| container.args.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("StatefulSet {statefulset_name} has no server args"))?;
+        let values_for = |prefix: &str| {
+            server_args
+                .iter()
+                .filter_map(|argument| argument.strip_prefix(prefix))
+                .collect::<Vec<_>>()
+        };
+        if values_for("--service-cidr=").as_slice() != [service_cidr]
+            || values_for("--cluster-cidr=").as_slice() != [cluster_cidr]
+        {
+            anyhow::bail!(
+                "StatefulSet {statefulset_name} does not prove the allocated CIDR arguments"
+            );
+        }
+        let datastore_endpoints = values_for("--datastore-endpoint=");
+        if datastore_endpoints.len() > 1 {
+            anyhow::bail!(
+                "StatefulSet {statefulset_name} has ambiguous datastore endpoint arguments"
+            );
+        }
+        Ok(datastore_endpoints
+            .first()
+            .map(|endpoint| (*endpoint).into()))
+    }
+
+    async fn capture_named<K>(
+        api: &Api<K>,
+        name: &str,
+        subject: TeardownSubject,
+        api_version: &str,
+        kind: &str,
+    ) -> Result<CreationManifestResource>
+    where
+        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+        <K as Resource>::DynamicType: Default,
+    {
+        let object = api
+            .get(name)
+            .await
+            .with_context(|| format!("could not capture {kind} {name}"))?;
+        Self::manifest_resource(&object, subject, api_version, kind)
+    }
+
+    /// Confirm that a same-named live object is the exact UID captured in the
+    /// manifest. Absence is acceptable on a resumed idempotent attempt;
+    /// replacement is not.
+    async fn manifest_object_present<K>(
+        api: &Api<K>,
+        identity: &KubernetesResourceIdentity,
+    ) -> Result<bool>
+    where
+        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+        <K as Resource>::DynamicType: Default,
+    {
+        match api
+            .get_opt(&identity.name)
+            .await
+            .with_context(|| format!("could not read {} {}", identity.kind, identity.name))?
+        {
+            None => Ok(false),
+            Some(object) if object.meta().uid.as_deref() == Some(identity.uid.as_str()) => Ok(true),
+            Some(_) => anyhow::bail!(
+                "{} {} was recreated with a different UID",
+                identity.kind,
+                identity.name
+            ),
+        }
+    }
+
+    /// Delete exactly the object captured by the manifest. Kubernetes rejects
+    /// the request with 409 if the name was reused between preflight and DELETE.
+    async fn delete_manifest_object<K>(
+        api: &Api<K>,
+        identity: &KubernetesResourceIdentity,
+        force: bool,
+    ) -> Result<()>
+    where
+        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+        <K as Resource>::DynamicType: Default,
+    {
+        let params = DeleteParams {
+            grace_period_seconds: force.then_some(0),
+            propagation_policy: Some(PropagationPolicy::Background),
+            preconditions: Some(Preconditions {
+                uid: Some(identity.uid.clone()),
+                resource_version: None,
+            }),
+            ..DeleteParams::default()
+        };
+        match api.delete(&identity.name, &params).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "could not UID-fenced delete {} {}",
+                    identity.kind, identity.name
+                )
+            }),
+        }
+    }
+
+    async fn manifest_entry_present(
+        &self,
+        namespace: &str,
+        entry: &CreationManifestResource,
+    ) -> Result<bool> {
+        macro_rules! namespaced {
+            ($ty:ty) => {{
+                let api: Api<$ty> = Api::namespaced(self.client.clone(), namespace);
+                Self::manifest_object_present(&api, &entry.resource).await
+            }};
+        }
+        match entry.subject {
+            TeardownSubject::AgentDeployment => namespaced!(Deployment),
+            TeardownSubject::ServerStatefulSet => namespaced!(StatefulSet),
+            TeardownSubject::Service => namespaced!(Service),
+            TeardownSubject::PodDisruptionBudget => namespaced!(PodDisruptionBudget),
+            TeardownSubject::PublisherConfigMap | TeardownSubject::RegistriesConfigMap => {
+                namespaced!(ConfigMap)
+            }
+            TeardownSubject::TokenSecret
+            | TeardownSubject::KubeconfigSecret
+            | TeardownSubject::ConnectTokenSecret
+            | TeardownSubject::DatastoreCredentialSecret => namespaced!(Secret),
+            TeardownSubject::CidrClaim => namespaced!(crate::crd::CIDRClaim),
+            TeardownSubject::ServerDataPvcs => namespaced!(PersistentVolumeClaim),
+            TeardownSubject::ServerDataVolumes => {
+                let api: Api<PersistentVolume> = Api::all(self.client.clone());
+                Self::manifest_object_present(&api, &entry.resource).await
+            }
+            TeardownSubject::ServerPods => namespaced!(Pod),
+            TeardownSubject::Database | TeardownSubject::DatabaseRole => {
+                anyhow::bail!("datastore identity cannot be a Kubernetes manifest entry")
+            }
+        }
+    }
+
+    async fn delete_manifest_entry(
+        &self,
+        namespace: &str,
+        entry: &CreationManifestResource,
+    ) -> Result<()> {
+        macro_rules! namespaced {
+            ($ty:ty, $force:expr) => {{
+                let api: Api<$ty> = Api::namespaced(self.client.clone(), namespace);
+                Self::delete_manifest_object(&api, &entry.resource, $force).await
+            }};
+        }
+        match entry.subject {
+            TeardownSubject::AgentDeployment => namespaced!(Deployment, false),
+            TeardownSubject::ServerStatefulSet => namespaced!(StatefulSet, false),
+            TeardownSubject::Service => namespaced!(Service, false),
+            TeardownSubject::PodDisruptionBudget => namespaced!(PodDisruptionBudget, false),
+            TeardownSubject::PublisherConfigMap | TeardownSubject::RegistriesConfigMap => {
+                namespaced!(ConfigMap, false)
+            }
+            TeardownSubject::TokenSecret
+            | TeardownSubject::KubeconfigSecret
+            | TeardownSubject::ConnectTokenSecret
+            | TeardownSubject::DatastoreCredentialSecret => namespaced!(Secret, false),
+            TeardownSubject::CidrClaim => namespaced!(crate::crd::CIDRClaim, false),
+            TeardownSubject::ServerDataPvcs => namespaced!(PersistentVolumeClaim, false),
+            // Dynamic provisioners own PV deletion. Deleting the PV ourselves
+            // would turn "reclaimPolicy=Delete" into an unverified storage API.
+            TeardownSubject::ServerDataVolumes => Ok(()),
+            TeardownSubject::ServerPods => namespaced!(Pod, true),
+            TeardownSubject::Database | TeardownSubject::DatabaseRole => {
+                anyhow::bail!("datastore identity cannot be a Kubernetes manifest entry")
+            }
+        }
+    }
+
+    async fn require_name_absent<K>(api: &Api<K>, name: &str, kind: &str) -> Result<()>
+    where
+        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+        <K as Resource>::DynamicType: Default,
+    {
+        match api
+            .get_opt(name)
+            .await
+            .with_context(|| format!("could not verify optional {kind} {name} was absent"))?
+        {
+            None => Ok(()),
+            Some(_) => anyhow::bail!(
+                "optional {kind} {name} appeared after the creation manifest was sealed"
+            ),
+        }
+    }
+
+    async fn validate_absent_optional_names(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> Result<()> {
+        let has_subject = |subject| {
+            manifest
+                .resources
+                .iter()
+                .any(|entry| entry.subject == subject)
+        };
+        if !has_subject(TeardownSubject::AgentDeployment) {
+            let api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+            Self::require_name_absent(&api, &format!("{name}-agent"), "Deployment").await?;
+        }
+        if !has_subject(TeardownSubject::PodDisruptionBudget) {
+            let api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+            Self::require_name_absent(&api, &format!("{name}-server"), "PodDisruptionBudget")
+                .await?;
+        }
+        if !has_subject(TeardownSubject::RegistriesConfigMap) {
+            let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+            Self::require_name_absent(&api, &format!("{name}-registries"), "ConfigMap").await?;
+        }
+        if !has_subject(TeardownSubject::DatastoreCredentialSecret)
+            && matches!(manifest.datastore, DatastoreProvenance::EmbeddedSqlite)
+        {
+            let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+            Self::require_name_absent(&api, &format!("{name}-datastore"), "Secret").await?;
+        }
+        Ok(())
+    }
+
+    /// Revalidate every still-live UID and the storage facts that make deletion
+    /// data-destroying before issuing the first destructive request.
+    async fn validate_manifest_live(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> Result<()> {
+        for entry in &manifest.resources {
+            self.manifest_entry_present(namespace, entry).await?;
+        }
+
+        let claims: Api<crate::crd::CIDRClaim> = Api::namespaced(self.client.clone(), namespace);
+        if let Some(claim) = claims
+            .get_opt(name)
+            .await
+            .with_context(|| format!("could not revalidate CIDRClaim {name}"))?
+        {
+            let status = claim
+                .status
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("CIDRClaim {name} lost its status"))?;
+            if status.phase != crate::crd::CIDRClaimPhase::Bound
+                || status.service_cidr.as_deref() != Some(manifest.service_cidr.as_str())
+                || status.cluster_cidr.as_deref() != Some(manifest.cluster_cidr.as_str())
+            {
+                anyhow::bail!("CIDRClaim {name} allocation changed after manifest sealing");
+            }
+        }
+
+        self.validate_absent_optional_names(name, namespace, manifest)
+            .await?;
+
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
+        let storage_classes: Api<StorageClass> = Api::all(self.client.clone());
+        for volume in &manifest.storage {
+            let pvc = pvcs
+                .get_opt(&volume.pvc.name)
+                .await
+                .with_context(|| format!("could not revalidate PVC {}", volume.pvc.name))?;
+            if pvc
+                .as_ref()
+                .is_some_and(|pvc| pvc.meta().uid.as_deref() != Some(volume.pvc.uid.as_str()))
+            {
+                anyhow::bail!("PVC {} was recreated with a different UID", volume.pvc.name);
+            }
+            let pv = pvs
+                .get_opt(&volume.pv.name)
+                .await
+                .with_context(|| format!("could not revalidate PV {}", volume.pv.name))?;
+            if pv
+                .as_ref()
+                .is_some_and(|pv| pv.meta().uid.as_deref() != Some(volume.pv.uid.as_str()))
+            {
+                anyhow::bail!("PV {} was recreated with a different UID", volume.pv.name);
+            }
+            if pvc.is_some() && pv.is_none() {
+                anyhow::bail!(
+                    "captured PVC {} is live but its recorded PV {} is absent",
+                    volume.pvc.name,
+                    volume.pv.name
+                );
+            }
+
+            if let Some(pvc) = pvc.as_ref() {
+                let spec = pvc
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("PVC {} has no spec", volume.pvc.name))?;
+                if spec.volume_name.as_deref() != Some(volume.pv.name.as_str())
+                    || spec.storage_class_name.as_deref()
+                        != Some(volume.storage_class.name.as_str())
+                {
+                    anyhow::bail!("PVC {} binding provenance changed", volume.pvc.name);
+                }
+            }
+
+            if let Some(pv) = pv.as_ref() {
+                let spec = pv
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("PV {} has no spec", volume.pv.name))?;
+                let claim_ref = spec
+                    .claim_ref
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("PV {} lost its claimRef", volume.pv.name))?;
+                if claim_ref.name.as_deref() != Some(volume.pvc.name.as_str())
+                    || claim_ref.namespace.as_deref() != Some(namespace)
+                    || claim_ref.uid.as_deref() != Some(volume.pvc.uid.as_str())
+                    || spec.storage_class_name.as_deref()
+                        != Some(volume.storage_class.name.as_str())
+                    || spec.persistent_volume_reclaim_policy.as_deref()
+                        != Some(volume.pv_reclaim_policy.as_str())
+                {
+                    anyhow::bail!(
+                        "PV {} binding or reclaim provenance changed",
+                        volume.pv.name
+                    );
+                }
+
+                let storage_class = storage_classes
+                    .get(&volume.storage_class.name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "could not revalidate StorageClass {}",
+                            volume.storage_class.name
+                        )
+                    })?;
+                if storage_class.meta().uid.as_deref() != Some(volume.storage_class.uid.as_str())
+                    || storage_class.reclaim_policy.as_deref()
+                        != Some(volume.reclaim_policy.as_str())
+                {
+                    anyhow::bail!(
+                        "StorageClass {} identity or reclaimPolicy changed",
+                        volume.storage_class.name
+                    );
+                }
+            }
+        }
+
+        // The manifest records the datastore mode and network arguments that
+        // were rendered into the server workload. Re-read the still-live
+        // StatefulSet so mutable operator configuration cannot silently change
+        // what a later bind claims it will destroy. Absence is allowed here
+        // because teardown retries call this after the StatefulSet is gone.
+        let statefulsets: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+        if let Some(statefulset) = statefulsets
+            .get_opt(&format!("{name}-server"))
+            .await
+            .with_context(|| format!("could not revalidate StatefulSet {name}-server"))?
+        {
+            let endpoint = Self::creation_runtime_datastore_endpoint(
+                &statefulset,
+                &manifest.service_cidr,
+                &manifest.cluster_cidr,
+            )?;
+            match (&manifest.datastore, endpoint) {
+                (DatastoreProvenance::EmbeddedSqlite, None) => {}
+                (
+                    DatastoreProvenance::ExternalPostgres {
+                        endpoint_digest,
+                        database,
+                        role,
+                        ..
+                    },
+                    Some(endpoint),
+                ) => {
+                    if datastore::endpoint_identity_digest(&endpoint)? != *endpoint_digest {
+                        anyhow::bail!(
+                            "StatefulSet datastore endpoint changed after manifest sealing"
+                        );
+                    }
+                    let parsed = url::Url::parse(&endpoint)
+                        .context("StatefulSet datastore endpoint is not a valid URL")?;
+                    if parsed.username() != role
+                        || parsed.path().trim_start_matches('/') != database
+                    {
+                        anyhow::bail!(
+                            "StatefulSet datastore database or role changed after manifest sealing"
+                        );
+                    }
+                }
+                _ => anyhow::bail!("StatefulSet datastore mode changed after manifest sealing"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Match the currently connected PostgreSQL server and its live object OIDs
+    /// against the sealed manifest. Missing objects are acceptable only while
+    /// resuming teardown; placement requires both to remain present.
+    async fn validate_manifest_datastore(
+        &self,
+        name: &str,
+        manifest: &TeardownCreationManifest,
+        require_present: bool,
+    ) -> Result<Option<(sqlx::PgPool, bool, bool)>> {
+        let DatastoreProvenance::ExternalPostgres {
+            endpoint_digest,
+            system_identifier,
+            database,
+            database_oid,
+            role,
+            role_oid,
+        } = &manifest.datastore
+        else {
+            return Ok(None);
+        };
+
+        let expected = datastore::sanitize_db_name(name, "k3s_")?;
+        if database != &expected || role != &expected {
+            anyhow::bail!("datastore name does not match the instance identity");
+        }
+        let Some((pool, base_url)) = self.datastore.current() else {
+            anyhow::bail!("datastore connection is unavailable");
+        };
+        if datastore::endpoint_identity_digest(&base_url)? != *endpoint_digest {
+            anyhow::bail!("datastore endpoint identity changed");
+        }
+        let observed = datastore::cluster_object_identity(&pool, name, "k3s_").await?;
+        if observed.system_identifier != *system_identifier {
+            anyhow::bail!("datastore PostgreSQL cluster identity changed");
+        }
+        if observed
+            .database_oid
+            .as_deref()
+            .is_some_and(|observed| observed != database_oid)
+            || observed
+                .role_oid
+                .as_deref()
+                .is_some_and(|observed| observed != role_oid)
+        {
+            anyhow::bail!("datastore database or role was recreated");
+        }
+        if require_present && (observed.database_oid.is_none() || observed.role_oid.is_none()) {
+            anyhow::bail!("datastore database or role is absent");
+        }
+
+        Ok(Some((
+            pool,
+            observed.database_oid.is_some(),
+            observed.role_oid.is_some(),
+        )))
+    }
+
+    /// At placement time every recorded replica-derived object must still be
+    /// present, and no extra matching object may have appeared. Teardown retry
+    /// validation deliberately allows a shrinking subset, so this stricter
+    /// equality check belongs only in the pre-bind path.
+    async fn validate_manifest_multiplicity_for_bind(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> Result<()> {
+        let statefulsets: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+        let statefulset = statefulsets
+            .get(&format!("{name}-server"))
+            .await
+            .with_context(|| format!("could not read StatefulSet {name}-server before bind"))?;
+        let observed_servers = statefulset
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1)
+            .max(1) as u32;
+        if observed_servers != manifest.server_replicas {
+            anyhow::bail!("server replica multiplicity changed after manifest sealing");
+        }
+
+        if manifest.agent_replicas > 0 {
+            let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+            let deployment = deployments
+                .get(&format!("{name}-agent"))
+                .await
+                .with_context(|| format!("could not read Deployment {name}-agent before bind"))?;
+            let observed_agents = deployment
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(1)
+                .max(0) as u32;
+            if observed_agents != manifest.agent_replicas {
+                anyhow::bail!("agent replica multiplicity changed after manifest sealing");
+            }
+        }
+
+        let expected_pods: std::collections::BTreeSet<String> = manifest
+            .resources
+            .iter()
+            .filter(|entry| entry.subject == TeardownSubject::ServerPods)
+            .map(|entry| entry.resource.canonical_id())
+            .collect();
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let selector = format!("kobe.kunobi.ninja/cluster={name},kobe.kunobi.ninja/role=server");
+        let observed_pods: std::collections::BTreeSet<String> = pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .context("could not list server Pods before bind")?
+            .items
+            .iter()
+            .map(|pod| {
+                Self::manifest_resource(pod, TeardownSubject::ServerPods, "v1", "Pod")
+                    .map(|entry| entry.resource.canonical_id())
+            })
+            .collect::<Result<_>>()?;
+        if observed_pods != expected_pods {
+            anyhow::bail!("server Pod identities or multiplicity changed after manifest sealing");
+        }
+
+        let expected_pvcs: std::collections::BTreeSet<String> = manifest
+            .resources
+            .iter()
+            .filter(|entry| entry.subject == TeardownSubject::ServerDataPvcs)
+            .map(|entry| entry.resource.canonical_id())
+            .collect();
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        let observed_pvcs: std::collections::BTreeSet<String> = pvcs
+            .list(&ListParams::default())
+            .await
+            .context("could not list server PVCs before bind")?
+            .items
+            .iter()
+            .filter(|pvc| Self::is_server_data_pvc(&pvc.name_any(), name))
+            .map(|pvc| {
+                Self::manifest_resource(
+                    pvc,
+                    TeardownSubject::ServerDataPvcs,
+                    "v1",
+                    "PersistentVolumeClaim",
+                )
+                .map(|entry| entry.resource.canonical_id())
+            })
+            .collect::<Result<_>>()?;
+        if observed_pvcs != expected_pvcs {
+            anyhow::bail!("server PVC identities or multiplicity changed after manifest sealing");
+        }
+
+        Ok(())
     }
 
     fn is_server_data_pvc(pvc_name: &str, cluster: &str) -> bool {
@@ -2246,6 +2910,16 @@ impl K3sBackend {
                 }
             }
         }
+    }
+
+    /// Whether the datastore has an identity-addressed destruction primitive.
+    ///
+    /// Kubernetes deletion accepts UID preconditions. Embedded SQLite lives on
+    /// those fenced volumes. PostgreSQL `DROP DATABASE` instead accepts only a
+    /// name and cannot run in a transaction, so a prior OID check cannot fence
+    /// a concurrent same-name replacement.
+    fn verified_destroy_supports_datastore(datastore: &DatastoreProvenance) -> bool {
+        matches!(datastore, DatastoreProvenance::EmbeddedSqlite)
     }
 }
 
@@ -2570,6 +3244,15 @@ impl ClusterBackend for K3sBackend {
         // database and role behind with no way to reconstruct access to them.
         Self::delete_ignoring_not_found(&secrets, &format!("{name}-datastore")).await?;
 
+        // The CIDRClaim is owner-referenced by the ClusterInstance, but verified
+        // teardown holds that instance's finalizer until every footprint is
+        // proven absent. Relying on owner GC would therefore deadlock the proof:
+        // the claim cannot disappear until the finalizer is released, and the
+        // finalizer cannot release while the claim exists. Delete it explicitly.
+        let cidr_claims: Api<crate::crd::CIDRClaim> =
+            Api::namespaced(self.client.clone(), namespace);
+        Self::delete_ignoring_not_found(&cidr_claims, name).await?;
+
         // Force-delete any leftover pods carrying our cluster label.
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         Self::force_delete_instance_pods(&pods, name).await;
@@ -2580,6 +3263,451 @@ impl ClusterBackend for K3sBackend {
 
     fn supports_verified_destroy(&self) -> bool {
         true
+    }
+
+    /// Require the entire sealed footprint to remain live and unchanged before
+    /// a VerifiedDestroy lease is allowed to bind. Teardown validation permits
+    /// already-deleted entries for idempotent retries; this placement gate does
+    /// not.
+    async fn validate_creation_manifest_for_bind(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> Result<()> {
+        manifest
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if manifest.instance.name != name || manifest.namespace != namespace {
+            anyhow::bail!("creation manifest does not identify this instance");
+        }
+
+        self.validate_manifest_live(name, namespace, manifest)
+            .await?;
+        for entry in &manifest.resources {
+            if !self.manifest_entry_present(namespace, entry).await? {
+                anyhow::bail!(
+                    "captured {} {} is absent before bind",
+                    entry.resource.kind,
+                    entry.resource.name
+                );
+            }
+        }
+        self.validate_manifest_multiplicity_for_bind(name, namespace, manifest)
+            .await?;
+        self.validate_manifest_datastore(name, manifest, true)
+            .await?;
+        if !Self::verified_destroy_supports_datastore(&manifest.datastore) {
+            // PostgreSQL DROP DATABASE addresses a database by name and cannot
+            // run in a transaction block. An OID check followed by DROP can
+            // therefore race a drop/recreate and destroy a replacement. Keep
+            // external PostgreSQL manifests exact and auditable, but refuse a
+            // VerifiedDestroy placement until an identity-addressed deletion
+            // primitive exists.
+            anyhow::bail!("VerifiedDestroy does not support an external PostgreSQL datastore");
+        }
+        Ok(())
+    }
+
+    /// Capture the exact live k3s footprint after provisioning has completed.
+    ///
+    /// Every lookup is mandatory. A missing UID, wrong multiplicity, unbound PV,
+    /// unreadable StorageClass, non-Delete reclaim policy, or unavailable
+    /// datastore OID returns an error so the controller leaves the immutable
+    /// manifest absent and verified-destroy placement remains fail-closed.
+    async fn capture_creation_footprint(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> Result<Option<BackendCreationFootprint>> {
+        let mut resources = Vec::new();
+
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        let statefulsets: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let pdbs: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let claims: Api<crate::crd::CIDRClaim> = Api::namespaced(self.client.clone(), namespace);
+
+        let statefulset_name = format!("{name}-server");
+        let statefulset = statefulsets
+            .get(&statefulset_name)
+            .await
+            .with_context(|| format!("could not capture StatefulSet {statefulset_name}"))?;
+        let expected_network = config
+            .allocated_network
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("creation capture has no allocated network"))?;
+        let created_datastore_endpoint = Self::creation_runtime_datastore_endpoint(
+            &statefulset,
+            &expected_network.service_cidr,
+            &expected_network.cluster_cidr,
+        )?;
+        let server_replicas = statefulset
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1)
+            .max(1) as u32;
+        resources.push(Self::manifest_resource(
+            &statefulset,
+            TeardownSubject::ServerStatefulSet,
+            "apps/v1",
+            "StatefulSet",
+        )?);
+        resources.push(
+            Self::capture_named(
+                &services,
+                &format!("{name}-server"),
+                TeardownSubject::Service,
+                "v1",
+                "Service",
+            )
+            .await?,
+        );
+        resources.push(
+            Self::capture_named(
+                &configmaps,
+                &format!("{name}-kubeconfig-publisher"),
+                TeardownSubject::PublisherConfigMap,
+                "v1",
+                "ConfigMap",
+            )
+            .await?,
+        );
+        resources.push(
+            Self::capture_named(
+                &secrets,
+                &format!("{name}-token"),
+                TeardownSubject::TokenSecret,
+                "v1",
+                "Secret",
+            )
+            .await?,
+        );
+        resources.push(
+            Self::capture_named(
+                &secrets,
+                &format!("{name}-kubeconfig"),
+                TeardownSubject::KubeconfigSecret,
+                "v1",
+                "Secret",
+            )
+            .await?,
+        );
+        let claim = claims
+            .get(name)
+            .await
+            .with_context(|| format!("could not capture CIDRClaim {name}"))?;
+        let claim_status = claim
+            .status
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CIDRClaim {name} has no status"))?;
+        if claim_status.phase != crate::crd::CIDRClaimPhase::Bound
+            || claim_status.service_cidr.as_deref() != Some(expected_network.service_cidr.as_str())
+            || claim_status.cluster_cidr.as_deref() != Some(expected_network.cluster_cidr.as_str())
+        {
+            anyhow::bail!("CIDRClaim {name} no longer proves the allocated network");
+        }
+        resources.push(Self::manifest_resource(
+            &claim,
+            TeardownSubject::CidrClaim,
+            "kobe.kunobi.ninja/v1alpha1",
+            "CIDRClaim",
+        )?);
+
+        let agent_name = format!("{name}-agent");
+        let agent_replicas = match deployments
+            .get_opt(&agent_name)
+            .await
+            .with_context(|| format!("could not discover Deployment {agent_name}"))?
+        {
+            Some(deployment) => {
+                let replicas = deployment
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1)
+                    .max(0) as u32;
+                resources.push(Self::manifest_resource(
+                    &deployment,
+                    TeardownSubject::AgentDeployment,
+                    "apps/v1",
+                    "Deployment",
+                )?);
+                replicas
+            }
+            None => 0,
+        };
+        let pdb_name = format!("{name}-server");
+        match pdbs
+            .get_opt(&pdb_name)
+            .await
+            .with_context(|| format!("could not discover PodDisruptionBudget {pdb_name}"))?
+        {
+            Some(pdb) if server_replicas > 1 => {
+                resources.push(Self::manifest_resource(
+                    &pdb,
+                    TeardownSubject::PodDisruptionBudget,
+                    "policy/v1",
+                    "PodDisruptionBudget",
+                )?);
+            }
+            Some(_) => anyhow::bail!(
+                "unexpected PodDisruptionBudget {pdb_name} for a single-server instance"
+            ),
+            None if server_replicas > 1 => {
+                anyhow::bail!("required PodDisruptionBudget {pdb_name} is absent")
+            }
+            None => {}
+        }
+        let registries_name = format!("{name}-registries");
+        if let Some(configmap) = configmaps
+            .get_opt(&registries_name)
+            .await
+            .with_context(|| format!("could not discover ConfigMap {registries_name}"))?
+        {
+            resources.push(Self::manifest_resource(
+                &configmap,
+                TeardownSubject::RegistriesConfigMap,
+                "v1",
+                "ConfigMap",
+            )?);
+        }
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let selector = format!("kobe.kunobi.ninja/cluster={name},kobe.kunobi.ninja/role=server");
+        let mut server_pods = pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .context("could not capture server Pods")?
+            .items;
+        server_pods.sort_by_key(ResourceExt::name_any);
+        if server_pods.len() != server_replicas as usize {
+            anyhow::bail!(
+                "server Pod multiplicity mismatch: expected {}, observed {}",
+                server_replicas,
+                server_pods.len()
+            );
+        }
+        for pod in &server_pods {
+            resources.push(Self::manifest_resource(
+                pod,
+                TeardownSubject::ServerPods,
+                "v1",
+                "Pod",
+            )?);
+        }
+
+        let mut storage = Vec::new();
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        let mut data_pvcs: Vec<PersistentVolumeClaim> = pvcs
+            .list(&ListParams::default())
+            .await
+            .context("could not capture server PVCs")?
+            .items
+            .into_iter()
+            .filter(|pvc| Self::is_server_data_pvc(&pvc.name_any(), name))
+            .collect();
+        if !data_pvcs.is_empty() {
+            data_pvcs.sort_by_key(ResourceExt::name_any);
+            if data_pvcs.len() != server_replicas as usize {
+                anyhow::bail!(
+                    "server PVC multiplicity mismatch: expected {}, observed {}",
+                    server_replicas,
+                    data_pvcs.len()
+                );
+            }
+
+            let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
+            let storage_classes: Api<StorageClass> = Api::all(self.client.clone());
+            for pvc in data_pvcs {
+                let pvc_identity = Self::manifest_resource(
+                    &pvc,
+                    TeardownSubject::ServerDataPvcs,
+                    "v1",
+                    "PersistentVolumeClaim",
+                )?;
+                let pvc_spec = pvc
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("PVC {} has no spec", pvc.name_any()))?;
+                let pv_name = pvc_spec
+                    .volume_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("PVC {} is not bound", pvc.name_any()))?;
+                let storage_class_name = pvc_spec
+                    .storage_class_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("PVC {} has no live StorageClass", pvc.name_any())
+                    })?;
+                let pv = pvs
+                    .get(pv_name)
+                    .await
+                    .with_context(|| format!("could not capture PV {pv_name}"))?;
+                let pv_spec = pv
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("PV {pv_name} has no spec"))?;
+                let claim_ref = pv_spec
+                    .claim_ref
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("PV {pv_name} has no claimRef"))?;
+                if claim_ref.name.as_deref() != pvc.metadata.name.as_deref()
+                    || claim_ref.namespace.as_deref() != Some(namespace)
+                    || claim_ref.uid.as_deref() != pvc.metadata.uid.as_deref()
+                {
+                    anyhow::bail!("PV {pv_name} is not bound to the captured PVC identity");
+                }
+                if pv_spec.storage_class_name.as_deref() != Some(storage_class_name) {
+                    anyhow::bail!(
+                        "PV {pv_name} does not reference StorageClass {storage_class_name}"
+                    );
+                }
+                let pv_reclaim_policy = pv_spec
+                    .persistent_volume_reclaim_policy
+                    .clone()
+                    .filter(|policy| !policy.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("PV {pv_name} has no live persistentVolumeReclaimPolicy")
+                    })?;
+                if pv_reclaim_policy != "Delete" {
+                    anyhow::bail!("PV {pv_name} reclaimPolicy is {pv_reclaim_policy}, not Delete");
+                }
+                let pv_identity = Self::manifest_resource(
+                    &pv,
+                    TeardownSubject::ServerDataVolumes,
+                    "v1",
+                    "PersistentVolume",
+                )?;
+                let storage_class =
+                    storage_classes
+                        .get(storage_class_name)
+                        .await
+                        .with_context(|| {
+                            format!("could not capture StorageClass {storage_class_name}")
+                        })?;
+                let storage_class_identity = KubernetesResourceIdentity {
+                    api_version: "storage.k8s.io/v1".into(),
+                    kind: "StorageClass".into(),
+                    namespace: None,
+                    name: storage_class
+                        .metadata
+                        .name
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("StorageClass has no name"))?,
+                    uid: storage_class
+                        .metadata
+                        .uid
+                        .clone()
+                        .filter(|uid| !uid.trim().is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("StorageClass has no UID"))?,
+                };
+                let reclaim_policy = storage_class
+                    .reclaim_policy
+                    .clone()
+                    .filter(|policy| !policy.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "StorageClass {storage_class_name} has no live reclaimPolicy"
+                        )
+                    })?;
+                if reclaim_policy != "Delete" {
+                    anyhow::bail!(
+                        "StorageClass {storage_class_name} reclaimPolicy is {reclaim_policy}, not Delete"
+                    );
+                }
+                resources.push(pvc_identity.clone());
+                resources.push(pv_identity.clone());
+                storage.push(StorageVolumeProvenance {
+                    pvc: pvc_identity.resource,
+                    pv: pv_identity.resource,
+                    storage_class: storage_class_identity,
+                    reclaim_policy,
+                    pv_reclaim_policy,
+                });
+            }
+        }
+
+        let datastore = match created_datastore_endpoint {
+            None => {
+                if secrets
+                    .get_opt(&format!("{name}-datastore"))
+                    .await
+                    .context("could not confirm embedded datastore credential absence")?
+                    .is_some()
+                {
+                    anyhow::bail!(
+                        "StatefulSet uses embedded SQLite but a datastore credential Secret exists"
+                    );
+                }
+                DatastoreProvenance::EmbeddedSqlite
+            }
+            Some(created_endpoint) => {
+                let Some((pool, base_url)) = self.datastore.current() else {
+                    anyhow::bail!(
+                        "StatefulSet uses external PostgreSQL but the datastore is unavailable"
+                    );
+                };
+                let endpoint_digest = datastore::endpoint_identity_digest(&created_endpoint)?;
+                if endpoint_digest != datastore::endpoint_identity_digest(&base_url)? {
+                    anyhow::bail!(
+                        "StatefulSet datastore endpoint differs from the connected PostgreSQL server"
+                    );
+                }
+                let database = datastore::sanitize_db_name(name, "k3s_")?;
+                let role = database.clone();
+                let parsed_endpoint = url::Url::parse(&created_endpoint)
+                    .context("StatefulSet datastore endpoint is not a valid URL")?;
+                if parsed_endpoint.username() != role
+                    || parsed_endpoint.path().trim_start_matches('/') != database
+                {
+                    anyhow::bail!(
+                        "StatefulSet datastore endpoint does not select its exact database and role"
+                    );
+                }
+                let datastore_identity =
+                    datastore::cluster_object_identity(&pool, name, "k3s_").await?;
+                let database_oid = datastore_identity
+                    .database_oid
+                    .ok_or_else(|| anyhow::anyhow!("created database {database} is absent"))?;
+                let role_oid = datastore_identity
+                    .role_oid
+                    .ok_or_else(|| anyhow::anyhow!("created role {role} is absent"))?;
+                let system_identifier = datastore_identity.system_identifier;
+                resources.push(
+                    Self::capture_named(
+                        &secrets,
+                        &format!("{name}-datastore"),
+                        TeardownSubject::DatastoreCredentialSecret,
+                        "v1",
+                        "Secret",
+                    )
+                    .await?,
+                );
+                DatastoreProvenance::ExternalPostgres {
+                    endpoint_digest,
+                    system_identifier,
+                    database,
+                    database_oid,
+                    role,
+                    role_oid,
+                }
+            }
+        };
+
+        Ok(Some(BackendCreationFootprint {
+            server_replicas,
+            agent_replicas,
+            resources,
+            storage,
+            datastore,
+        }))
     }
 
     async fn capture_teardown_identities(
@@ -2595,43 +3723,136 @@ impl ClusterBackend for K3sBackend {
             .map_err(|reason| anyhow::anyhow!("could not capture bound volumes: {reason}"))
     }
 
-    /// Tear down and then *prove* the footprint is absent.
-    ///
-    /// The ordering matters and is the whole contract:
-    ///
-    /// 1. **Capture** what cannot be observed after deletion — chiefly the PVs
-    ///    the data PVCs are bound to. Once a PVC is gone its `volumeName` is
-    ///    unrecoverable, so a receipt written without capturing it first can
-    ///    never prove the backing volume was reclaimed.
-    /// 2. **Delete** via the ordinary path, so verified and unverified teardown
-    ///    cannot diverge in what they remove.
-    /// 3. **Poll to confirmed absence.** An accepted DELETE is not evidence:
-    ///    finalizers, terminating Pods and PV reclaim all complete
-    ///    asynchronously, and `delete()` today returns before any of it.
-    ///
-    /// Anything that cannot be observed becomes [`CheckResult::Unknown`], which
-    /// quarantines the capacity. That is the intended outcome, not a failure of
-    /// this function.
-    async fn delete_verified(
+    /// Tear down and prove the exact immutable creation manifest absent.
+    /// The manifest-less [`ClusterBackend::delete_verified`] default remains
+    /// unsupported so no caller can reconstruct a narrower scope at teardown.
+    async fn delete_verified_manifest(
         &self,
         name: &str,
         namespace: &str,
-        plan: &[TeardownSubject],
+        manifest: &TeardownCreationManifest,
     ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
-        // Captured BEFORE deletion; unrecoverable afterwards.
-        let bound_volumes = self.capture_bound_volumes(name, namespace).await;
+        if manifest.validate().is_err()
+            || manifest.instance.name != name
+            || manifest.namespace != namespace
+        {
+            return Ok(manifest
+                .required_subjects()
+                .into_iter()
+                .map(|subject| TeardownCheck {
+                    subject,
+                    result: CheckResult::Unknown,
+                    reason: Some("creation_manifest_invalid".into()),
+                    verified: Vec::new(),
+                })
+                .collect());
+        }
 
-        let delete_outcome = self.delete(name, namespace).await;
+        let bound_volumes = Ok(manifest
+            .storage
+            .iter()
+            .map(|volume| volume.pv.name.clone())
+            .collect());
+        let delete_outcome: Result<()> = async {
+            // Every same-named live object must still be the captured UID, and
+            // every live PV must retain its exact binding, class, and Delete
+            // policy. This preflight occurs before any destructive request.
+            self.validate_manifest_live(name, namespace, manifest)
+                .await?;
 
+            // UID preconditions make the preflight-to-delete race fail closed.
+            // The datastore credential is handled only after datastore mode is
+            // resolved below, and PV deletion remains the provisioner's job.
+            for entry in &manifest.resources {
+                if !matches!(
+                    entry.subject,
+                    TeardownSubject::DatastoreCredentialSecret
+                        | TeardownSubject::ServerDataVolumes
+                        | TeardownSubject::CidrClaim
+                ) {
+                    self.delete_manifest_entry(namespace, entry).await?;
+                }
+            }
+
+            // Credential rotation is fine; a different PostgreSQL cluster or
+            // recreated database/role is not. Revalidate the exact provenance
+            // after revoking the UID-fenced Kubernetes workload. Do not issue
+            // SQL DDL: DROP DATABASE is name-addressed and forbidden inside a
+            // transaction, so an OID check followed by DROP has an unavoidable
+            // replacement race. Existing external-datastore leases quarantine
+            // with their database, role, credential Secret, PV and CIDR intact;
+            // the pre-bind gate above prevents creating new ones.
+            let external = self
+                .validate_manifest_datastore(name, manifest, false)
+                .await?;
+            if !Self::verified_destroy_supports_datastore(&manifest.datastore) {
+                debug_assert!(external.is_some());
+                anyhow::bail!(
+                    "external PostgreSQL verified destroy is unsupported without an exact deletion fence"
+                );
+            }
+
+            if let Some(secret) = manifest
+                .resources
+                .iter()
+                .find(|entry| entry.subject == TeardownSubject::DatastoreCredentialSecret)
+            {
+                self.delete_manifest_entry(namespace, secret).await?;
+            }
+            self.validate_absent_optional_names(name, namespace, manifest)
+                .await?;
+            Ok(())
+        }
+        .await;
+        let plan = manifest.required_subjects();
+        let mut delete_outcome = delete_outcome;
+
+        // Keep the CIDR reservation until every other footprint is positively
+        // absent. Releasing it when DELETEs are merely accepted could allocate
+        // the same network to a new tenant while terminating guest Pods still
+        // route on the old CIDR.
+        if delete_outcome.is_ok() {
+            let mut non_network_verified = true;
+            for subject in plan
+                .iter()
+                .copied()
+                .filter(|subject| *subject != TeardownSubject::CidrClaim)
+            {
+                let check = self
+                    .verify_subject_absent(
+                        name,
+                        namespace,
+                        subject,
+                        &bound_volumes,
+                        &delete_outcome,
+                        Some(manifest),
+                    )
+                    .await;
+                if check.result != CheckResult::Verified {
+                    non_network_verified = false;
+                    break;
+                }
+            }
+            if non_network_verified
+                && let Some(claim) = manifest
+                    .resources
+                    .iter()
+                    .find(|entry| entry.subject == TeardownSubject::CidrClaim)
+                && let Err(error) = self.delete_manifest_entry(namespace, claim).await
+            {
+                delete_outcome = Err(error);
+            }
+        }
         let mut checks = Vec::with_capacity(plan.len());
         for subject in plan {
             checks.push(
                 self.verify_subject_absent(
                     name,
                     namespace,
-                    *subject,
+                    subject,
                     &bound_volumes,
                     &delete_outcome,
+                    Some(manifest),
                 )
                 .await,
             );
@@ -2700,6 +3921,35 @@ mod tests {
             taints: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn verified_destroy_rejects_name_addressed_external_postgres() {
+        assert!(K3sBackend::verified_destroy_supports_datastore(
+            &DatastoreProvenance::EmbeddedSqlite
+        ));
+        assert!(!K3sBackend::verified_destroy_supports_datastore(
+            &DatastoreProvenance::ExternalPostgres {
+                endpoint_digest: "b".repeat(64),
+                system_identifier: "72623859790382856".into(),
+                database: "k3s_c1".into(),
+                database_oid: "16384".into(),
+                role: "k3s_c1".into(),
+                role_oid: "16385".into(),
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_destroy_refuses_a_manifestless_scope() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        assert_eq!(
+            backend
+                .delete_verified("c1", "test-ns", &[TeardownSubject::ServerStatefulSet],)
+                .await,
+            Err(VerifiedDestroyUnsupported)
+        );
     }
 
     // =================================================================
@@ -2867,6 +4117,55 @@ mod tests {
         assert!(
             args.contains(&"--cluster-cidr=10.253.32.0/20".to_string()),
             "must use allocated cluster CIDR; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn creation_provenance_reads_the_runtime_datastore_and_rejects_overrides() {
+        use crate::crd::ClusterInstanceNetwork;
+        let mut config = base_config();
+        config.allocated_network = Some(ClusterInstanceNetwork {
+            service_cidr: "10.245.32.0/20".into(),
+            cluster_cidr: "10.253.32.0/20".into(),
+        });
+        let embedded = K3sBackend::build_server_statefulset("c", "ns", &config, None, 1);
+        assert_eq!(
+            K3sBackend::creation_runtime_datastore_endpoint(
+                &embedded,
+                "10.245.32.0/20",
+                "10.253.32.0/20"
+            )
+            .unwrap(),
+            None
+        );
+
+        let endpoint = "postgresql://role:secret@db.internal:5432/k3s_c";
+        let external = K3sBackend::build_server_statefulset("c", "ns", &config, Some(endpoint), 1);
+        assert_eq!(
+            K3sBackend::creation_runtime_datastore_endpoint(
+                &external,
+                "10.245.32.0/20",
+                "10.253.32.0/20"
+            )
+            .unwrap()
+            .as_deref(),
+            Some(endpoint)
+        );
+
+        let mut overridden = config;
+        overridden
+            .server_args
+            .push("--datastore-endpoint=postgresql://other/db".into());
+        let ambiguous =
+            K3sBackend::build_server_statefulset("c", "ns", &overridden, Some(endpoint), 1);
+        assert!(
+            K3sBackend::creation_runtime_datastore_endpoint(
+                &ambiguous,
+                "10.245.32.0/20",
+                "10.253.32.0/20"
+            )
+            .is_err(),
+            "a later user arg must not silently replace recorded provenance"
         );
     }
 
@@ -3692,7 +4991,7 @@ mod tests {
     // wiremock-based tests for create/delete flows
     // =================================================================
 
-    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::matchers::{body_json, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_client(server: &MockServer) -> kube::Client {
@@ -3706,6 +5005,121 @@ mod tests {
             "kind": "Secret",
             "metadata": { "name": name, "namespace": namespace }
         })
+    }
+
+    #[tokio::test]
+    async fn manifest_preflight_rejects_a_same_named_recreated_object() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/secrets/c1-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "c1-token",
+                    "namespace": "test-ns",
+                    "uid": "replacement-uid"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api: Api<Secret> = Api::namespaced(client, "test-ns");
+        let identity = KubernetesResourceIdentity {
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            namespace: Some("test-ns".into()),
+            name: "c1-token".into(),
+            uid: "original-uid".into(),
+        };
+        assert!(
+            K3sBackend::manifest_object_present(&api, &identity)
+                .await
+                .is_err(),
+            "name reuse must stop teardown before DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_delete_carries_the_captured_uid_precondition() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/namespaces/test-ns/secrets/c1-token"))
+            .and(body_json(serde_json::json!({
+                "propagationPolicy": "Background",
+                "preconditions": { "uid": "original-uid" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api: Api<Secret> = Api::namespaced(client, "test-ns");
+        let identity = KubernetesResourceIdentity {
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            namespace: Some("test-ns".into()),
+            name: "c1-token".into(),
+            uid: "original-uid".into(),
+        };
+        K3sBackend::delete_manifest_object(&api, &identity, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn manifest_database_absence_fails_closed_when_provenance_is_unreachable() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let manifest = TeardownCreationManifest {
+            schema_version: crate::crd::TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION,
+            instance: crate::crd::ResourceRef {
+                name: "c1".into(),
+                uid: Some("instance-uid".into()),
+            },
+            namespace: "test-ns".into(),
+            backend_type: crate::crd::BackendType::K3s,
+            config_digest: "a".repeat(64),
+            service_cidr: "10.240.0.0/20".into(),
+            cluster_cidr: "10.248.0.0/20".into(),
+            server_replicas: 1,
+            agent_replicas: 0,
+            resources: Vec::new(),
+            storage: Vec::new(),
+            datastore: DatastoreProvenance::ExternalPostgres {
+                endpoint_digest: "b".repeat(64),
+                system_identifier: "72623859790382856".into(),
+                database: "k3s_c1".into(),
+                database_oid: "16384".into(),
+                role: "k3s_c1".into(),
+                role_oid: "16385".into(),
+            },
+            sealed_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let check = backend
+            .verify_subject_absent(
+                "c1",
+                "test-ns",
+                TeardownSubject::Database,
+                &Ok(Vec::new()),
+                &Ok(()),
+                Some(&manifest),
+            )
+            .await;
+        assert_eq!(check.result, CheckResult::Unknown);
+        assert_eq!(
+            check.reason.as_deref(),
+            Some("datastore_provenance_changed")
+        );
+        assert!(check.verified.is_empty());
     }
 
     /// An object that is STILL THERE after teardown must not read as verified.
@@ -3739,6 +5153,7 @@ mod tests {
                 TeardownSubject::ServerStatefulSet,
                 &Ok(Vec::new()),
                 &Ok(()),
+                None,
             )
             .await;
 
@@ -3774,6 +5189,7 @@ mod tests {
                 TeardownSubject::ServerStatefulSet,
                 &Ok(Vec::new()),
                 &Ok(()),
+                None,
             )
             .await;
 
@@ -3811,6 +5227,7 @@ mod tests {
                 TeardownSubject::ServerStatefulSet,
                 &Ok(Vec::new()),
                 &Ok(()),
+                None,
             )
             .await;
 
@@ -3847,6 +5264,7 @@ mod tests {
                 TeardownSubject::ServerStatefulSet,
                 &Ok(Vec::new()),
                 &Ok(()),
+                None,
             )
             .await;
 
@@ -3882,6 +5300,7 @@ mod tests {
                 TeardownSubject::ServerStatefulSet,
                 &Ok(Vec::new()),
                 &Ok(()),
+                None,
             )
             .await;
 
@@ -3899,7 +5318,7 @@ mod tests {
 
         for subject in [TeardownSubject::Database, TeardownSubject::DatabaseRole] {
             let check = backend
-                .verify_subject_absent("c1", "test-ns", subject, &Ok(Vec::new()), &Ok(()))
+                .verify_subject_absent("c1", "test-ns", subject, &Ok(Vec::new()), &Ok(()), None)
                 .await;
             assert_eq!(check.result, CheckResult::Unknown, "{subject:?}");
             assert_eq!(check.reason.as_deref(), Some("datastore_unavailable"));
@@ -3920,6 +5339,7 @@ mod tests {
                 TeardownSubject::ServerStatefulSet,
                 &Ok(Vec::new()),
                 &Err(anyhow::anyhow!("delete blew up")),
+                None,
             )
             .await;
         assert_eq!(check.result, CheckResult::Unknown);
@@ -3940,6 +5360,7 @@ mod tests {
                 TeardownSubject::ServerDataVolumes,
                 &Err("pvc_list_failed".to_string()),
                 &Ok(()),
+                None,
             )
             .await;
         assert_eq!(check.result, CheckResult::Unknown);

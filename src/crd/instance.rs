@@ -1,5 +1,5 @@
 use crate::crd::teardown::TeardownSubject;
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -150,7 +150,7 @@ pub struct BoundInstanceRef {
 /// Instances may be pool-managed (`spec.poolRef` present) or standalone
 /// (`spec.poolRef` omitted). Backend-specific resources are implementation
 /// details owned by the reconciler for this instance.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, KubeSchema)]
 #[kube(
     group = "kobe.kunobi.ninja",
     version = "v1alpha1",
@@ -158,7 +158,9 @@ pub struct BoundInstanceRef {
     plural = "clusterinstances",
     shortname = "ci",
     status = "ClusterInstanceStatus",
-    namespaced
+    namespaced,
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.creationManifest) || (has(self.status) && self.status != null && has(self.status.creationManifest) && self.status.creationManifest == oldSelf.status.creationManifest)")
+        .message("status.creationManifest is immutable once sealed")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterInstanceSpec {
@@ -353,6 +355,16 @@ pub struct ClusterInstanceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_with: Option<ClusterInstanceProvenance>,
 
+    /// Immutable controller-authenticated inventory of the exact k3s footprint.
+    ///
+    /// Written once after provisioning, while concrete UIDs, PostgreSQL OIDs,
+    /// bound PVs, and the live StorageClass reclaim policy are observable. The
+    /// CRD rejects changing or removing it afterwards. Verified teardown must
+    /// fail closed while this is absent or invalid; it must never reconstruct a
+    /// smaller manifest from teardown-time observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_manifest: Option<crate::crd::TeardownCreationManifest>,
+
     /// Provisioner-assigned resource identities this instance owns — currently
     /// the PersistentVolumes its data claims are bound to.
     ///
@@ -544,6 +556,7 @@ mod tests {
                 pool_uid: None,
                 backend: None,
             }),
+            creation_manifest: None,
             message: Some("running bootstrap 'flux'".into()),
             conditions: vec![ClusterInstanceCondition {
                 condition_type: "Ready".into(),
@@ -1085,11 +1098,41 @@ mod tests {
             "binding",
             "conditions",
             "network",
+            "creationManifest",
         ] {
             assert!(
                 schema["status"]["properties"].get(key).is_some(),
                 "status schema must expose `{key}`: {}",
                 schema["status"]["properties"]
+            );
+        }
+    }
+
+    #[test]
+    fn crd_makes_the_sealed_creation_manifest_immutable() {
+        let crd = serde_json::to_value(ClusterInstance::crd()).unwrap();
+        let root = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let validations = root["x-kubernetes-validations"]
+            .as_array()
+            .expect("root CEL validations");
+        assert!(validations.iter().any(|validation| {
+            validation["rule"].as_str().is_some_and(|rule| {
+                rule.contains("status.creationManifest == oldSelf.status.creationManifest")
+            })
+        }));
+        let manifest = &root["properties"]["status"]["properties"]["creationManifest"];
+        for field in [
+            "instance",
+            "namespace",
+            "resources",
+            "storage",
+            "datastore",
+            "serviceCidr",
+            "clusterCidr",
+        ] {
+            assert!(
+                manifest["properties"].get(field).is_some(),
+                "creation manifest schema must retain {field}: {manifest}"
             );
         }
     }

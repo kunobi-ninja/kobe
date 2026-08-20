@@ -574,6 +574,7 @@ mod json_safety_tests {
                 backend_type: "k3s".into(),
                 config_digest: "cfg".into(),
                 instance_spec_digest: "spec".into(),
+                creation_manifest_digest: "manifest-digest".into(),
                 started_at: "2026-06-04T02:00:00Z".into(),
                 completed_at: Some("2026-06-04T02:01:00Z".into()),
                 checks: vec![crate::crd::TeardownCheck {

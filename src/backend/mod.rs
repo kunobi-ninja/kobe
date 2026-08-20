@@ -24,7 +24,25 @@ use crate::crd::{
     Addon, BackendType, BootstrapConfig, BootstrapJobSpec, BootstrapRef, ClusterConfig,
     ClusterPool, InterInstanceSpread, PersistenceConfig, ReadinessGate, SpreadStrength,
 };
-use crate::crd::{TeardownCheck, TeardownSubject};
+use crate::crd::{
+    CreationManifestResource, DatastoreProvenance, StorageVolumeProvenance, TeardownCheck,
+    TeardownCreationManifest, TeardownSubject,
+};
+
+/// Backend-observed portion of a sealed creation manifest.
+///
+/// The controller adds its own instance UID, immutable backend digest, network
+/// allocation, and seal timestamp. `None` from a backend means the backend does
+/// not implement verified teardown; an error means the live footprint could not
+/// be observed completely and must not be guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCreationFootprint {
+    pub server_replicas: u32,
+    pub agent_replicas: u32,
+    pub resources: Vec<CreationManifestResource>,
+    pub storage: Vec<StorageVolumeProvenance>,
+    pub datastore: DatastoreProvenance,
+}
 
 /// Fetch, or create once, the per-cluster PostgreSQL password.
 ///
@@ -326,6 +344,105 @@ impl ClusterBackend for BackendDispatch {
             Self::Capi(b) => b.delete(name, namespace).await,
             Self::Vkobe(b) => b.delete(name, namespace).await,
             Self::Vcluster(b) => b.delete(name, namespace).await,
+        }
+    }
+
+    async fn delete_verified(
+        &self,
+        name: &str,
+        namespace: &str,
+        plan: &[TeardownSubject],
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        match self {
+            Self::K3s(b) => b.delete_verified(name, namespace, plan).await,
+            Self::K0s(b) => b.delete_verified(name, namespace, plan).await,
+            Self::Capi(b) => b.delete_verified(name, namespace, plan).await,
+            Self::Vkobe(b) => b.delete_verified(name, namespace, plan).await,
+            Self::Vcluster(b) => b.delete_verified(name, namespace, plan).await,
+        }
+    }
+
+    async fn delete_verified_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        match self {
+            Self::K3s(b) => b.delete_verified_manifest(name, namespace, manifest).await,
+            Self::K0s(b) => b.delete_verified_manifest(name, namespace, manifest).await,
+            Self::Capi(b) => b.delete_verified_manifest(name, namespace, manifest).await,
+            Self::Vkobe(b) => b.delete_verified_manifest(name, namespace, manifest).await,
+            Self::Vcluster(b) => b.delete_verified_manifest(name, namespace, manifest).await,
+        }
+    }
+
+    async fn capture_teardown_identities(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>> {
+        match self {
+            Self::K3s(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::K0s(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::Capi(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::Vkobe(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::Vcluster(b) => b.capture_teardown_identities(name, namespace).await,
+        }
+    }
+
+    async fn capture_creation_footprint(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> Result<Option<BackendCreationFootprint>> {
+        match self {
+            Self::K3s(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::K0s(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::Capi(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::Vkobe(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::Vcluster(b) => b.capture_creation_footprint(name, namespace, config).await,
+        }
+    }
+
+    async fn validate_creation_manifest_for_bind(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> Result<()> {
+        match self {
+            Self::K3s(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+        }
+    }
+
+    fn supports_verified_destroy(&self) -> bool {
+        match self {
+            Self::K3s(b) => b.supports_verified_destroy(),
+            Self::K0s(b) => b.supports_verified_destroy(),
+            Self::Capi(b) => b.supports_verified_destroy(),
+            Self::Vkobe(b) => b.supports_verified_destroy(),
+            Self::Vcluster(b) => b.supports_verified_destroy(),
         }
     }
 
@@ -640,6 +757,20 @@ pub trait ClusterBackend: Send + Sync {
         async { Err(VerifiedDestroyUnsupported) }
     }
 
+    /// Verified teardown against the immutable concrete creation manifest.
+    /// Backends must not derive scope from teardown-time observations.
+    #[allow(dead_code)]
+    fn delete_verified_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
+    {
+        let _ = (name, namespace, manifest);
+        async { Err(VerifiedDestroyUnsupported) }
+    }
+
     /// Capture the provisioner-assigned resource identities this instance owns.
     ///
     /// Called while the instance is healthy, NOT at teardown. Bound
@@ -659,6 +790,38 @@ pub trait ClusterBackend: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send {
         let _ = (name, namespace);
         async { Ok(Vec::new()) }
+    }
+
+    /// Capture the complete concrete creation footprint while it is live.
+    ///
+    /// A backend that cannot implement this returns `Ok(None)`. A backend that
+    /// can implement it must return an error on any missing UID, failed live
+    /// lookup, unbound volume, or otherwise uncertain fact; callers leave the
+    /// manifest absent and verified-destroy placement remains ineligible.
+    #[allow(dead_code)]
+    fn capture_creation_footprint(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> impl std::future::Future<Output = Result<Option<BackendCreationFootprint>>> + Send {
+        let _ = (name, namespace, config);
+        async { Ok(None) }
+    }
+
+    /// Revalidate a sealed manifest immediately before a VerifiedDestroy bind.
+    /// A live lookup failure, UID/spec drift, lost datastore, or changed storage
+    /// policy must reject placement rather than create a lease already doomed
+    /// to quarantine.
+    #[allow(dead_code)]
+    fn validate_creation_manifest_for_bind(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let _ = (name, namespace, manifest);
+        async { anyhow::bail!("backend cannot validate a verified-destroy manifest") }
     }
 
     /// Whether this backend can produce teardown evidence at all.
@@ -1635,6 +1798,21 @@ mod tests {
             outcome,
             Err(VerifiedDestroyUnsupported),
             "an unimplemented backend must not return an empty (clean-looking) check list"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_dispatch_preserves_k3s_verified_destroy_capability() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = BackendDispatch::K3s(k3s::K3sBackend::new(
+            client,
+            datastore::SharedDatastore::default(),
+        ));
+        assert!(
+            backend.supports_verified_destroy(),
+            "factory callers hold BackendDispatch, so delegation is load-bearing"
         );
     }
 

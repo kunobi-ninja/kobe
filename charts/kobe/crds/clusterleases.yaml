@@ -324,7 +324,10 @@ spec:
                 nullable: true
                 properties:
                   attemptId:
-                    description: Unique per attempt; retries produce new attempts, never edit old ones.
+                    description: |-
+                      Unique per attempt. Reconcile resumes an `InProgress` nonce unchanged;
+                      a later retry may replace a terminal receipt with a new attempt, but it
+                      never rewrites the identity of an active attempt.
                     type: string
                   backendType:
                     description: Backend identity and immutable provenance digest observed at bind time.
@@ -365,6 +368,7 @@ spec:
                           - kubeconfigSecret
                           - cidrClaim
                           - connectTokenSecret
+                          - datastoreCredentialSecret
                           - serverDataPvcs
                           - serverDataVolumes
                           - database
@@ -396,6 +400,10 @@ spec:
                     nullable: true
                     type: string
                   configDigest:
+                    type: string
+                  creationManifestDigest:
+                    default: ''
+                    description: SHA-256 of the immutable controller-authenticated creation manifest.
                     type: string
                   instance:
                     description: Reference to another Kobe-managed resource in the same namespace.
@@ -442,6 +450,7 @@ spec:
                   outcome:
                     description: Aggregate verdict for one teardown attempt.
                     enum:
+                    - inProgress
                     - verified
                     - quarantined
                     type: string

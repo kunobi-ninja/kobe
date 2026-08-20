@@ -18,6 +18,8 @@ use kunobi_reload::{BoxError, FromMount, Mount, ReloadStatus, Reloadable, watch}
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
+use sha2::{Digest, Sha256};
+
 /// Maximum length for a PostgreSQL identifier (63 bytes).
 const MAX_IDENT_LEN: usize = 63;
 
@@ -182,6 +184,70 @@ pub fn sanitize_db_name(cluster_name: &str, prefix: &str) -> Result<String> {
         db_name.push_str(&digest[..8]);
     }
     Ok(db_name)
+}
+
+/// Non-secret identity of the PostgreSQL server selected by a connection URL.
+///
+/// Credentials, database path, query parameters, and fragments are deliberately
+/// excluded. The resulting digest can be persisted in CR status and compared at
+/// teardown without publishing a password or silently treating a different
+/// server as the one that held the instance database.
+pub fn endpoint_identity_digest(base_url: &str) -> Result<String> {
+    let parsed = url::Url::parse(base_url).context("Invalid PostgreSQL datastore URL")?;
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("PostgreSQL datastore URL has no host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(5432);
+    let identity = format!("{}://{host}:{port}", parsed.scheme().to_ascii_lowercase());
+    Ok(hex::encode(Sha256::digest(identity.as_bytes())))
+}
+
+/// PostgreSQL cluster and per-instance object identities observed by one
+/// backend session and one statement snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterObjectIdentity {
+    pub system_identifier: String,
+    pub database_oid: Option<String>,
+    pub role_oid: Option<String>,
+}
+
+/// Capture the cluster, database and role identity without mixing observations
+/// from different pooled connections. This matters when a hostname is backed
+/// by more than one server: three independent pool queries could otherwise
+/// assemble provenance that never existed on any one PostgreSQL cluster.
+/// The system identifier is initialized with the cluster, so DNS repointing or
+/// an in-place reinitialization cannot masquerade as the original datastore.
+pub async fn cluster_object_identity(
+    pool: &PgPool,
+    cluster_name: &str,
+    prefix: &str,
+) -> Result<ClusterObjectIdentity> {
+    let name = sanitize_db_name(cluster_name, prefix)?;
+    let (system_identifier, database_oid, role_oid): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            r#"
+        SELECT control.system_identifier::text,
+               (SELECT oid::text FROM pg_database WHERE datname = $1),
+               (SELECT oid::text FROM pg_roles WHERE rolname = $1)
+        FROM pg_control_system() AS control
+        "#,
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .context("Failed to capture PostgreSQL cluster object identity")?;
+    if system_identifier
+        .parse::<u64>()
+        .map_or(true, |identifier| identifier == 0)
+    {
+        bail!("PostgreSQL returned an invalid system identifier");
+    }
+    Ok(ClusterObjectIdentity {
+        system_identifier,
+        database_oid,
+        role_oid,
+    })
 }
 
 /// True iff `code` is PostgreSQL's `duplicate_database` SQLSTATE (`42P04`),
@@ -509,6 +575,25 @@ pub async fn drop_cluster_role(pool: &PgPool, cluster_name: &str, prefix: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_identity_excludes_credentials_and_database_path() {
+        let first = endpoint_identity_digest(
+            "postgresql://operator:old-secret@db.internal:5432/postgres?sslmode=require",
+        )
+        .unwrap();
+        let rotated = endpoint_identity_digest(
+            "postgresql://other:new-secret@db.internal:5432/template?application_name=kobe",
+        )
+        .unwrap();
+        let other_host = endpoint_identity_digest(
+            "postgresql://operator:old-secret@other.internal:5432/postgres",
+        )
+        .unwrap();
+        assert_eq!(first, rotated);
+        assert_ne!(first, other_host);
+        assert!(!first.contains("secret"));
+    }
 
     #[test]
     fn shared_datastore_none_is_default_and_returns_no_connection() {
