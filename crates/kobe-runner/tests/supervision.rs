@@ -374,6 +374,39 @@ fn cancelling_kills_the_whole_process_group() {
     assert_process_gone(grandchild);
 }
 
+/// A successful leader exit is not successful group completion.
+///
+/// Build scripts commonly background workers. The leader's zero exit status
+/// is retained, but the execution must not settle until those workers are gone.
+#[test]
+fn successful_leader_exit_drains_the_whole_process_group() {
+    let scratch = Scratch::new();
+    let pidfile = scratch.path().join("successful-background-child.pid");
+    let script = format!(
+        "sh -c 'trap \"\" TERM HUP; echo $$ > {}; while :; do sleep 60; done' & while [ ! -s {} ]; do sleep 0.05; done; exit 0",
+        pidfile.display(),
+        pidfile.display()
+    );
+    start(
+        &scratch,
+        "sbxe-successful-group-drain",
+        &["/bin/sh", "-c", &script],
+        60,
+        4096,
+    );
+
+    let descendant = wait_for_pid(&pidfile);
+    let report = settled(
+        &scratch,
+        "sbxe-successful-group-drain",
+        Duration::from_secs(20),
+    );
+    assert_eq!(report.state, RunnerState::Succeeded);
+    assert_eq!(report.exit_code, Some(0));
+    assert_eq!(report.reason.as_deref(), Some("completed"));
+    assert_process_gone(descendant);
+}
+
 /// Cancellation escalates even when the leader exits before its descendant.
 ///
 /// The inner shell deliberately ignores SIGTERM. The outer session leader

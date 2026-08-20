@@ -136,7 +136,18 @@ pub fn supervise(spool: &Spool, id: &str) {
     let mut ended_by: Option<&'static str> = None;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                // The session leader is only one member of the execution. A
+                // build script can exit zero after backgrounding compilers,
+                // and reporting Succeeded at that point would leave work
+                // running outside the execution record. Preserve the leader's
+                // status, but settle it only after the whole group is absent.
+                break if process_group_exists(group) {
+                    terminate_group_with_status(group, &mut child, Some(status))
+                } else {
+                    Some(status)
+                };
+            }
             Ok(None) => {}
             // The child cannot be reaped. Nobody can say what it did.
             Err(_) => break None,
@@ -317,12 +328,21 @@ fn enable_child_subreaper() -> std::io::Result<()> {
 /// status only when the whole group is absent. `None` means teardown could not
 /// be proven within the bounded TERM/KILL windows.
 fn terminate_group(group: i32, child: &mut Child) -> Option<std::process::ExitStatus> {
+    terminate_group_with_status(group, child, None)
+}
+
+/// Terminate the process group while preserving an already-observed leader
+/// status when natural completion won the race with cancellation or timeout.
+fn terminate_group_with_status(
+    group: i32,
+    child: &mut Child,
+    mut leader_status: Option<std::process::ExitStatus>,
+) -> Option<std::process::ExitStatus> {
     // SAFETY: a plain `kill(2)`. The negative pid addresses the group, which is
     // the point — the leader alone leaves its children running on CPU the lease
     // is paying for.
     unsafe { libc::kill(-group, libc::SIGTERM) };
 
-    let mut leader_status = None;
     if drain_process_group(group, child, &mut leader_status) {
         return leader_status;
     }
