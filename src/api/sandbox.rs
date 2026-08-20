@@ -1720,11 +1720,14 @@ async fn register_live_stream(
     target: &crate::api::sandbox_access::SandboxTarget,
 ) -> Result<crate::api::sandbox_streams::StreamGuard, StreamRegistrationDenied> {
     let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let identity = crate::api::sandbox_streams::StreamIdentity::from_ready_lease(lease)
+        .ok_or(StreamRegistrationDenied::LeaseEnded)?;
     match crate::api::sandbox_streams::register_confirmed(
         crate::api::sandbox_streams::registry(),
         &leases,
         &lease.name_any(),
         &target.lease_uid,
+        &identity,
     )
     .await
     {
@@ -1754,7 +1757,7 @@ fn stream_registration_denied(
             operation,
             "concurrency_limit",
             StatusCode::TOO_MANY_REQUESTS,
-            "Too many concurrent operations for this Sandbox lease",
+            "Too many concurrent Sandbox operations",
         ),
         StreamRegistrationDenied::LeaseEnded => access_denied_with(
             identity,
@@ -1783,6 +1786,7 @@ async fn prepare_upgrade<B: ClusterBackend>(
     requested_container: Option<&str>,
 ) -> Result<UpgradeContext, Response> {
     use crate::api::sandbox_access as access;
+    use crate::api::sandbox_transport as transport;
 
     require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await?;
     if !is_valid_k8s_name(id) {
@@ -1807,26 +1811,61 @@ async fn prepare_upgrade<B: ClusterBackend>(
     let guard = register_live_stream(&state.client, &state.namespace, &lease, &target)
         .await
         .map_err(|denied| stream_registration_denied(identity, id, operation.as_str(), denied))?;
+    let revoked = guard.cancelled();
 
     // Both placements go through the same resolution. Child composition
     // changes which cluster the Pod is in; it changes nothing about what the
     // caller may do, which is the equivalence #76 sets out to prove.
-    let cluster = match access::resolve_target_cluster(
-        &state.client,
-        &state.namespace,
-        &lease,
-        &target,
+    let cluster = match transport::bounded_setup(
+        access::resolve_target_cluster(&state.client, &state.namespace, &lease, &target),
+        &revoked,
     )
     .await
     {
-        Ok(cluster) => cluster,
-        Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        Ok(Ok(cluster)) => cluster,
+        Ok(Err(denied)) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        Err(transport::StreamEnd::Revoked) => {
+            return Err(stream_registration_denied(
+                identity,
+                id,
+                operation.as_str(),
+                StreamRegistrationDenied::LeaseEnded,
+            ));
+        }
+        Err(_) => {
+            return Err(stream_registration_denied(
+                identity,
+                id,
+                operation.as_str(),
+                StreamRegistrationDenied::Backend,
+            ));
+        }
     };
-    let scoped =
-        match crate::api::sandbox_credentials::scoped_client(&cluster, &target, operation).await {
-            Ok(client) => client,
-            Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
-        };
+    let scoped = match transport::bounded_setup(
+        crate::api::sandbox_credentials::scoped_client(&cluster, &target, operation),
+        &revoked,
+    )
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(denied)) => return Err(access_denied(identity, id, operation.as_str(), denied)),
+        Err(transport::StreamEnd::Revoked) => {
+            return Err(stream_registration_denied(
+                identity,
+                id,
+                operation.as_str(),
+                StreamRegistrationDenied::LeaseEnded,
+            ));
+        }
+        Err(_) => {
+            return Err(stream_registration_denied(
+                identity,
+                id,
+                operation.as_str(),
+                StreamRegistrationDenied::Backend,
+            ));
+        }
+    };
 
     Ok(UpgradeContext {
         target,
@@ -1896,9 +1935,16 @@ async fn sandbox_attach<B: ClusterBackend>(
         // recycled under the same name is a different workload, and attaching a
         // terminal to it would put a caller's keystrokes into somebody else's
         // container. Logs and exec already recheck; this path did not.
-        if !pod_identity_holds(&pods, &context.target).await {
-            transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
-            return;
+        match transport::bounded_setup(pod_identity_holds(&pods, &context.target), &revoked).await {
+            Ok(true) => {}
+            Ok(false) | Err(transport::StreamEnd::TargetError) => {
+                transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+            Err(end) => {
+                transport::close_with(&mut socket, end).await;
+                return;
+            }
         }
 
         let params = kube::api::AttachParams::default()
@@ -1910,14 +1956,24 @@ async fn sandbox_attach<B: ClusterBackend>(
             .stderr(!query.tty)
             .tty(query.tty);
 
-        let attached = match query.command.as_ref() {
-            Some(command) => pods.exec(&context.target.pod_name, command, &params).await,
-            None => pods.attach(&context.target.pod_name, &params).await,
-        };
+        let attached = transport::bounded_setup(
+            async {
+                match query.command.as_ref() {
+                    Some(command) => pods.exec(&context.target.pod_name, command, &params).await,
+                    None => pods.attach(&context.target.pod_name, &params).await,
+                }
+            },
+            &revoked,
+        )
+        .await;
         let mut attached = match attached {
-            Ok(attached) => attached,
-            Err(_) => {
+            Ok(Ok(attached)) => attached,
+            Ok(Err(_)) | Err(transport::StreamEnd::TargetError) => {
                 transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+            Err(end) => {
+                transport::close_with(&mut socket, end).await;
                 return;
             }
         };
@@ -1980,15 +2036,31 @@ async fn sandbox_port_forward<B: ClusterBackend>(
 
         // Same fence as attach: a recycled Pod under the recorded name would
         // forward the caller's connection into another tenant's workload.
-        if !pod_identity_holds(&pods, &context.target).await {
-            transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
-            return;
+        match transport::bounded_setup(pod_identity_holds(&pods, &context.target), &revoked).await {
+            Ok(true) => {}
+            Ok(false) | Err(transport::StreamEnd::TargetError) => {
+                transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+            Err(end) => {
+                transport::close_with(&mut socket, end).await;
+                return;
+            }
         }
 
-        let mut forwarder = match pods.portforward(&context.target.pod_name, &[port]).await {
-            Ok(forwarder) => forwarder,
-            Err(_) => {
+        let mut forwarder = match transport::bounded_setup(
+            pods.portforward(&context.target.pod_name, &[port]),
+            &revoked,
+        )
+        .await
+        {
+            Ok(Ok(forwarder)) => forwarder,
+            Ok(Err(_)) | Err(transport::StreamEnd::TargetError) => {
                 transport::close_with(&mut socket, transport::StreamEnd::TargetError).await;
+                return;
+            }
+            Err(end) => {
+                transport::close_with(&mut socket, end).await;
                 return;
             }
         };
@@ -8504,6 +8576,7 @@ mod tests {
         lease["status"] = serde_json::json!({
             "phase": "Ready",
             "observedGeneration": 1,
+            "readyAt": chrono::Utc::now().to_rfc3339(),
             "expiresAt": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
             "placement": { "type": "management" },
             "target": {

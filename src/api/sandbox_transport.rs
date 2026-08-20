@@ -46,6 +46,7 @@
 //! Kubernetes authenticates an upgraded connection once; nothing but an
 //! explicit cancel closes it.
 
+use std::future::Future;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -81,6 +82,27 @@ pub const MAX_STREAM_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 /// traffic from inside a sandbox whose occupant is, by construction, not
 /// trusted.
 pub const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Longest an upgraded operation may spend opening its exact target stream.
+///
+/// Stream limits cannot protect a handler that never reaches the pump. Pod
+/// identity reads, exec negotiation and port-forward setup are therefore
+/// bounded separately and remain revocable while the target API is stalled.
+pub const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound one target-setup future by both lease revocation and setup timeout.
+pub async fn bounded_setup<T, F>(operation: F, revoked: &CancellationToken) -> Result<T, StreamEnd>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = revoked.cancelled() => Err(StreamEnd::Revoked),
+        result = tokio::time::timeout(STREAM_SETUP_TIMEOUT, operation) => {
+            result.map_err(|_| StreamEnd::TargetError)
+        }
+    }
+}
 
 /// Why a stream ended.
 ///
@@ -276,6 +298,37 @@ impl StreamLimits {
     }
 }
 
+/// Await one already-authorized I/O operation without stepping outside the
+/// stream's revocation and time bounds.
+///
+/// The outer pump `select!` protects reads while they are pending. Writes and
+/// sink sends happen after a branch wins; awaiting them directly would let a
+/// stalled target or slow caller ignore release and every timeout forever.
+async fn bounded_io<T, E, F>(
+    operation: F,
+    limits: &StreamLimits,
+    revoked: &CancellationToken,
+    failure: StreamEnd,
+) -> Result<T, StreamEnd>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let now = tokio::time::Instant::now();
+    limits.check(now)?;
+    let deadline = limits.next_deadline(now);
+    tokio::select! {
+        biased;
+        _ = revoked.cancelled() => Err(StreamEnd::Revoked),
+        _ = tokio::time::sleep(deadline) => {
+            Err(limits
+                .check(tokio::time::Instant::now())
+                .err()
+                .unwrap_or(StreamEnd::IdleTimeout))
+        }
+        result = operation => result.map_err(|_| failure),
+    }
+}
+
 /// Copy bytes between the caller's WebSocket and one duplex target stream.
 ///
 /// Used for port-forward, where both sides are opaque byte streams. Exec has
@@ -330,8 +383,15 @@ where
                                 if let Err(end) = limits.record(bytes.len(), tokio::time::Instant::now()) {
                                     return end;
                                 }
-                                if target.write_all(&bytes).await.is_err() {
-                                    return StreamEnd::TargetError;
+                                if let Err(end) = bounded_io(
+                                    target.write_all(&bytes),
+                                    limits,
+                                    &revoked,
+                                    StreamEnd::TargetError,
+                                )
+                                .await
+                                {
+                                    return end;
                                 }
                             }
                         }
@@ -347,12 +407,15 @@ where
                         if let Err(end) = limits.record(count, tokio::time::Instant::now()) {
                             return end;
                         }
-                        if socket
-                            .send(server_frame(CHANNEL_STDOUT, &buffer[..count]))
-                            .await
-                            .is_err()
+                        if let Err(end) = bounded_io(
+                            socket.send(server_frame(CHANNEL_STDOUT, &buffer[..count])),
+                            limits,
+                            &revoked,
+                            StreamEnd::Completed,
+                        )
+                        .await
                         {
-                            return StreamEnd::Completed;
+                            return end;
                         }
                     }
                     Err(_) => return StreamEnd::TargetError,
@@ -368,13 +431,18 @@ where
 /// carry namespaces, node names, and other people's object names.
 pub async fn close_with(socket: &mut WebSocket, end: StreamEnd) {
     debug!(reason = end.code(), "closing Sandbox stream");
-    let _ = socket
-        .send(server_frame(
-            CHANNEL_ERROR,
-            format!(r#"{{"reason":"{}"}}"#, end.code()).as_bytes(),
-        ))
-        .await;
-    let _ = socket.send(Message::Close(None)).await;
+    // A peer that stopped reading must not retain its registry guard forever
+    // merely because the courtesy reason/close frames are backpressured.
+    let close = async {
+        let _ = socket
+            .send(server_frame(
+                CHANNEL_ERROR,
+                format!(r#"{{"reason":"{}"}}"#, end.code()).as_bytes(),
+            ))
+            .await;
+        let _ = socket.send(Message::Close(None)).await;
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(1), close).await;
 }
 
 /// Copy between the caller's WebSocket and a three-channel exec/attach session.
@@ -452,8 +520,15 @@ pub async fn pump_attached(
                                     // of bug that gets blamed on the workload.
                                     return StreamEnd::ProtocolViolation;
                                 };
-                                if stdin.write_all(&bytes).await.is_err() {
-                                    return StreamEnd::TargetError;
+                                if let Err(end) = bounded_io(
+                                    stdin.write_all(&bytes),
+                                    limits,
+                                    &revoked,
+                                    StreamEnd::TargetError,
+                                )
+                                .await
+                                {
+                                    return end;
                                 }
                             }
                             CallerFrame::Resize { width, height } => {
@@ -463,12 +538,15 @@ pub async fn pump_attached(
                                     // loudly where the session has no terminal.
                                     return StreamEnd::ProtocolViolation;
                                 };
-                                if resize
-                                    .send(kube::api::TerminalSize { width, height })
-                                    .await
-                                    .is_err()
+                                if let Err(end) = bounded_io(
+                                    resize.send(kube::api::TerminalSize { width, height }),
+                                    limits,
+                                    &revoked,
+                                    StreamEnd::TargetError,
+                                )
+                                .await
                                 {
-                                    return StreamEnd::TargetError;
+                                    return end;
                                 }
                             }
                         }
@@ -490,12 +568,15 @@ pub async fn pump_attached(
                         if let Err(end) = limits.record(count, tokio::time::Instant::now()) {
                             return end;
                         }
-                        if socket
-                            .send(server_frame(CHANNEL_STDOUT, &out_buffer[..count]))
-                            .await
-                            .is_err()
+                        if let Err(end) = bounded_io(
+                            socket.send(server_frame(CHANNEL_STDOUT, &out_buffer[..count])),
+                            limits,
+                            &revoked,
+                            StreamEnd::Completed,
+                        )
+                        .await
                         {
-                            return StreamEnd::Completed;
+                            return end;
                         }
                     }
                     Some(Err(_)) => return StreamEnd::TargetError,
@@ -513,12 +594,15 @@ pub async fn pump_attached(
                         if let Err(end) = limits.record(count, tokio::time::Instant::now()) {
                             return end;
                         }
-                        if socket
-                            .send(server_frame(CHANNEL_STDERR, &err_buffer[..count]))
-                            .await
-                            .is_err()
+                        if let Err(end) = bounded_io(
+                            socket.send(server_frame(CHANNEL_STDERR, &err_buffer[..count])),
+                            limits,
+                            &revoked,
+                            StreamEnd::Completed,
+                        )
+                        .await
                         {
-                            return StreamEnd::Completed;
+                            return end;
                         }
                     }
                     Some(Err(_)) => return StreamEnd::TargetError,
@@ -711,6 +795,42 @@ mod tests {
         assert_eq!(
             limits.next_deadline(start + Duration::from_secs(9999)),
             Duration::ZERO
+        );
+    }
+
+    /// Target negotiation is part of a live operation and cannot ignore a
+    /// release merely because the Kubernetes request has not answered yet.
+    #[tokio::test]
+    async fn a_blocked_setup_is_preempted_by_revocation() {
+        let revoked = CancellationToken::new();
+        revoked.cancel();
+
+        assert_eq!(
+            bounded_setup(std::future::pending::<()>(), &revoked)
+                .await
+                .unwrap_err(),
+            StreamEnd::Revoked
+        );
+    }
+
+    /// Once a pump branch starts writing, the same duration bound still owns
+    /// that await; a backpressured peer cannot turn it into an unbounded wait.
+    #[tokio::test]
+    async fn a_blocked_io_cannot_outlive_the_stream_deadline() {
+        let now = tokio::time::Instant::now();
+        let limits = StreamLimits::starting_at(now, Duration::from_secs(60), Duration::ZERO, 1024);
+        let revoked = CancellationToken::new();
+
+        assert_eq!(
+            bounded_io(
+                std::future::pending::<Result<(), ()>>(),
+                &limits,
+                &revoked,
+                StreamEnd::TargetError,
+            )
+            .await
+            .unwrap_err(),
+            StreamEnd::DurationExceeded
         );
     }
 
