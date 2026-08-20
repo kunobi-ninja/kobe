@@ -17,6 +17,12 @@ spec:
     - jsonPath: .status.ready
       name: Ready
       type: integer
+    - jsonPath: .status.allocated
+      name: Allocated
+      type: integer
+    - jsonPath: .status.quarantined
+      name: Quarantined
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -296,6 +302,9 @@ spec:
             properties:
               allocated:
                 default: 0
+                description: |-
+                  Admitted leases whose immutable pool UID matches this pool and whose
+                  current phase consumes capacity.
                 format: uint32
                 minimum: 0.0
                 type: integer
@@ -340,8 +349,20 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              quarantined:
+                default: 0
+                description: |-
+                  Subset of `allocated` leases in the `Quarantined` phase. Quarantined
+                  capacity remains allocated until its complete footprint is proven absent.
+                format: uint32
+                minimum: 0.0
+                type: integer
               ready:
                 default: 0
+                description: |-
+                  Clean, idle upstream Sandboxes reported by the exact reconciled
+                  WarmPool's `readyReplicas`; allocated and quarantined capacity is not
+                  counted as ready.
                 format: uint32
                 minimum: 0.0
                 type: integer

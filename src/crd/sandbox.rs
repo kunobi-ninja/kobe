@@ -25,6 +25,8 @@ use thiserror::Error;
     status = "SandboxPoolStatus",
     namespaced,
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.ready"}"#,
+    printcolumn = r#"{"name":"Allocated","type":"integer","jsonPath":".status.allocated"}"#,
+    printcolumn = r#"{"name":"Quarantined","type":"integer","jsonPath":".status.quarantined"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -518,10 +520,19 @@ pub struct SandboxPoolStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub observed_generation: Option<i64>,
+    /// Clean, idle upstream Sandboxes reported by the exact reconciled
+    /// WarmPool's `readyReplicas`; allocated and quarantined capacity is not
+    /// counted as ready.
     #[serde(default)]
     pub ready: u32,
+    /// Admitted leases whose immutable pool UID matches this pool and whose
+    /// current phase consumes capacity.
     #[serde(default)]
     pub allocated: u32,
+    /// Subset of `allocated` leases in the `Quarantined` phase. Quarantined
+    /// capacity remains allocated until its complete footprint is proven absent.
+    #[serde(default)]
+    pub quarantined: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         extend("x-kubernetes-list-type" = "map"),
@@ -811,6 +822,34 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_pool_status_wire_contract_is_camel_case_and_zero_defaulted() {
+        let status: SandboxPoolStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(status, SandboxPoolStatus::default());
+        assert_eq!(status.ready, 0);
+        assert_eq!(status.allocated, 0);
+        assert_eq!(status.quarantined, 0);
+
+        let encoded = serde_json::to_value(SandboxPoolStatus {
+            observed_generation: Some(7),
+            ready: 3,
+            allocated: 2,
+            quarantined: 1,
+            conditions: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "observedGeneration": 7,
+                "ready": 3,
+                "allocated": 2,
+                "quarantined": 1
+            })
+        );
+        assert!(encoded.get("observed_generation").is_none());
+    }
+
+    #[test]
     fn placement_rejects_both_or_neither_shapes() {
         assert_eq!(
             serde_json::from_value::<SandboxPlacement>(serde_json::json!({
@@ -969,6 +1008,32 @@ mod tests {
         assert_eq!(
             lease["spec"]["versions"][0]["subresources"]["status"],
             serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn sandbox_pool_status_schema_and_print_columns_are_exact() {
+        let pool = serde_json::to_value(SandboxPool::crd()).unwrap();
+        let version = &pool["spec"]["versions"][0];
+        let status = &version["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"];
+
+        for field in ["ready", "allocated", "quarantined"] {
+            assert_eq!(status[field]["type"], "integer");
+            assert_eq!(status[field]["format"], "uint32");
+            assert_eq!(status[field]["default"], 0);
+            assert_eq!(status[field]["minimum"], 0.0);
+        }
+        assert!(status.get("observedGeneration").is_some());
+        assert!(status.get("observed_generation").is_none());
+
+        assert_eq!(
+            version["additionalPrinterColumns"],
+            serde_json::json!([
+                {"jsonPath": ".status.ready", "name": "Ready", "type": "integer"},
+                {"jsonPath": ".status.allocated", "name": "Allocated", "type": "integer"},
+                {"jsonPath": ".status.quarantined", "name": "Quarantined", "type": "integer"},
+                {"jsonPath": ".metadata.creationTimestamp", "name": "Age", "type": "date"}
+            ])
         );
     }
 
