@@ -235,9 +235,10 @@ Lists leases currently associated with one pool. This is useful for operational 
 ## Sandbox leases
 
 <Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Admission is available once
-  their CRDs are installed. A lease remains `Pending` until a compatible Agent
-  Sandbox placement controller is enabled.
+  `SandboxPool` and `SandboxLease` are alpha APIs. Sandbox HTTP endpoints are
+  mounted only when `agentSandbox.mode=external` and Kobe validates the
+  operator-installed Agent Sandbox runtime at startup. Disabled mode serves no
+  Sandbox API, so it cannot admit a lease that no controller will reconcile.
 </Callout>
 
 Sandbox callers select an administrator-owned `SandboxPool`; they cannot send a

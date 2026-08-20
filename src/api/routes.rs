@@ -3612,14 +3612,20 @@ mod tests {
     #[tokio::test]
     async fn disabled_mode_serves_no_sandbox_api() {
         let (app, _server) = test_app_with_sandbox(false).await;
-        let request = http::Request::builder()
-            .method(Method::POST)
-            .uri("/v1/sandbox-leases")
-            .body(axum::body::Body::empty())
-            .unwrap();
+        for (method, uri) in [
+            (Method::POST, "/v1/sandbox-leases"),
+            (Method::POST, "/v1/sandbox-leases/sandbox-test/executions"),
+            (Method::GET, "/v1/sandbox-leases/sandbox-test/attach"),
+        ] {
+            let request = http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
 
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[tokio::test]

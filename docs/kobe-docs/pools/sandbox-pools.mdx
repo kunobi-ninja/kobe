@@ -6,9 +6,10 @@ description: Define bounded, administrator-owned Agent Sandbox templates and pla
 # Sandbox pools
 
 <Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Kobe admits lease intent, but
-  a lease remains `Pending` until a compatible Agent Sandbox placement
-  controller is enabled.
+  `SandboxPool` and `SandboxLease` are alpha APIs. Set
+  `agentSandbox.mode=external` only after installing a compatible Agent Sandbox
+  runtime. Kobe validates that runtime at startup and then mounts the Sandbox
+  HTTP API; disabled mode mounts no Sandbox endpoints.
 </Callout>
 
 Administrators author `SandboxPool` objects. API callers only choose an allowed
