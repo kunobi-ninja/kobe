@@ -272,6 +272,30 @@ pub async fn reconcile_lease(
         )));
     }
 
+    // Persist resolved management placement before creating any footprint.
+    // Access and teardown must never infer a backend from the current pool
+    // spec, and a later status write must not be able to retarget this lease.
+    // Returning after the fenced write also makes the durable record precede
+    // the first SandboxClaim creation rather than merely racing it.
+    if matches!(pool.spec.placement, SandboxPlacement::Management {}) {
+        let mut status = lease.status.clone().unwrap_or_default();
+        let placement = crate::sandbox::record_placement_once(
+            status.placement.as_ref(),
+            crate::crd::ResolvedSandboxPlacement::Management {},
+            &ctx.namespace,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        if status.placement.as_ref() != Some(&placement) {
+            status.placement = Some(placement);
+            if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+                info!(lease = %name, "recorded management Sandbox placement");
+            } else {
+                debug!(lease = %name, "management placement write lost a status race");
+            }
+            return Ok(Action::await_change());
+        }
+    }
+
     // Where this lease's Sandbox actually runs. Management placement uses the
     // operator's own cluster; child placement composes an exclusive one, which
     // may not be ready yet — in which case there is nothing to place into.
@@ -764,11 +788,10 @@ async fn finish_release(
 /// edited or deleted.
 async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
     let status = lease.status.clone().unwrap_or_default();
-    if matches!(
-        status.placement,
-        Some(crate::crd::ResolvedSandboxPlacement::ChildCluster { .. })
-    ) {
-        return true;
+    match status.placement {
+        Some(crate::crd::ResolvedSandboxPlacement::Management {}) => return false,
+        Some(crate::crd::ResolvedSandboxPlacement::ChildCluster { .. }) => return true,
+        None => {}
     }
 
     let internal: Api<crate::crd::ClusterLease> =
@@ -1473,6 +1496,45 @@ async fn patch_lease_status(
     Ok(())
 }
 
+/// Replace one lease status only if this is still the exact object version the
+/// reconcile read. Monotonic placement/provenance writes cannot use an
+/// unfenced merge: a stale replica could otherwise erase a newer identity or
+/// write through delete-and-recreate name reuse.
+///
+/// A conflict is treated as an ordinary lost race. The watch event for the
+/// winning write will reconcile the current object; retrying this stale value
+/// here would defeat the fence.
+async fn patch_lease_status_fenced(
+    ctx: &SandboxContext,
+    lease: &SandboxLease,
+    status: &crate::crd::SandboxLeaseStatus,
+) -> Result<bool, SandboxPlacementError> {
+    let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxLease {} has no UID or resourceVersion to fence status",
+            lease.name_any()
+        )));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+    let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Whether the upstream claim reports a Ready condition.
 ///
 /// Pure and defensive: an unparseable or absent status is NOT ready. Treating
@@ -1722,6 +1784,7 @@ pub(crate) mod tests {
                 name: Some(LEASE.into()),
                 namespace: Some(NS.into()),
                 uid: Some("lease-uid-1".into()),
+                resource_version: Some("lease-rv-1".into()),
                 generation: Some(1),
                 annotations: Some(
                     [(
@@ -1754,6 +1817,7 @@ pub(crate) mod tests {
                 provisioning_deadline: Some(
                     (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
                 ),
+                placement: Some(crate::crd::ResolvedSandboxPlacement::Management {}),
                 ..Default::default()
             }),
         }
@@ -1964,6 +2028,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// Management placement is durable before the first upstream object is
+    /// created, and the write is fenced to the exact lease version observed.
+    #[tokio::test]
+    async fn management_placement_is_persisted_before_claim_creation() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().placement = None;
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let patch_request = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("placement status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&patch_request.body).unwrap();
+        let operations = operations.as_array().unwrap();
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/uid"
+                && operation["value"] == "lease-uid-1"
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "lease-rv-1"
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status"
+                && operation["value"]["placement"]["type"] == "management"
+        }));
+    }
+
+    /// An admitted management pool cannot retarget a lease whose resolved
+    /// placement already names a child backend.
+    #[tokio::test]
+    async fn persisted_management_placement_cannot_change() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().placement =
+            Some(crate::crd::ResolvedSandboxPlacement::ChildCluster {
+                cluster_pool: crate::crd::SandboxObjectReference {
+                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                    kind: "ClusterPool".into(),
+                    namespace: Some(NS.into()),
+                    name: "child-pool".into(),
+                    uid: "child-pool-uid".into(),
+                    generation: Some(1),
+                },
+            });
+
+        let error = reconcile_lease(Arc::new(lease), ctx).await.unwrap_err();
+        assert!(
+            matches!(error, SandboxPlacementError::Invalid(ref message) if message.contains("cannot change")),
+            "expected immutable placement failure, got: {error}"
+        );
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+    }
+
+    /// Once management placement is explicit, a same-named child artifact is
+    /// irrelevant and must never redirect teardown into the child path.
+    #[tokio::test]
+    async fn explicit_management_placement_never_follows_a_derived_child_artifact() {
+        let (ctx, server) = test_context().await;
+        assert!(!is_child_placed(&admitted_lease(), &ctx).await);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "explicit management placement must not look up a derived child lease"
+        );
+    }
+
     /// An unadmitted lease is not placed, and the check costs no API call.
     ///
     /// A `pending` lease exists before its quota reservation commits. Placing
@@ -2026,19 +2193,9 @@ pub(crate) mod tests {
 
     /// The lease admission actually creates must be able to reach Ready.
     ///
-    /// REVIEW FINDING (expected to fail). Every other test in this module
-    /// starts from `admitted_lease()`, whose status is hand-written as
-    /// `phase: Provisioning` with a `provisioningDeadline` already set. No
-    /// production code path ever produces that state: `create_sandbox_lease`
-    /// writes `status: None`, and `begin_sandbox_provisioning` — the only
-    /// function that sets `Provisioning` and stamps the deadline — is called
-    /// from nowhere but its own unit test.
-    ///
-    /// So a real lease reaches this reconcile as `Pending` with no deadline,
-    /// `mark_sandbox_ready` refuses it with `MissingProvisioningDeadline`, and
-    /// the lease requeues every 30 seconds forever. It never becomes Ready, so
-    /// no Sandbox operation ever resolves. The fixture is what hides it: it
-    /// asserts the second half of a lifecycle whose first half is missing.
+    /// Each durable checkpoint is a separate reconcile: placement must be
+    /// recorded before a claim exists, then provisioning can create and bound
+    /// the workload on the next observed object version.
     #[tokio::test]
     async fn a_lease_in_the_state_admission_leaves_it_in_can_become_ready() {
         let (ctx, server) = test_context().await;
@@ -2075,15 +2232,27 @@ pub(crate) mod tests {
             .await;
         mount_teardown_scaffolding(&server).await;
 
-        // Exactly what the API writes on create: an admitted lease with no
-        // provisioning state at all. The canary pass is recorded because the
-        // websocket exec cannot be mocked — that is the same shortcut every
-        // other test here takes, and it is not what is under test.
+        // The canary pass is recorded because the websocket exec cannot be
+        // mocked; placement/provisioning ordering is what this test exercises.
         let mut lease = lease_past_the_canary();
         let status = lease.status.as_mut().unwrap();
         status.phase = crate::crd::SandboxLeasePhase::Pending;
         status.provisioning_deadline = None;
         status.observed_generation = None;
+        status.placement = None;
+
+        let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            requests_to(&server, "POST", CLAIMS_PATH).await,
+            0,
+            "placement must commit before claim creation"
+        );
+
+        lease.status.as_mut().unwrap().placement =
+            Some(crate::crd::ResolvedSandboxPlacement::Management {});
 
         reconcile_lease(Arc::new(lease), ctx).await.unwrap();
 
