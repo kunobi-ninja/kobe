@@ -43,8 +43,8 @@ use crate::crd::{
     SandboxPool, SandboxPoolStatus,
 };
 use crate::sandbox::{
-    AGENT_SANDBOX_API_VERSION, SANDBOX_CLAIM_KIND, SANDBOX_TEMPLATE_KIND, SANDBOX_WARM_POOL_KIND,
-    build_sandbox_claim, build_sandbox_template, build_sandbox_warm_pool,
+    AGENT_SANDBOX_API_VERSION, CHILD_SANDBOX_NAMESPACE, SANDBOX_CLAIM_KIND, SANDBOX_TEMPLATE_KIND,
+    SANDBOX_WARM_POOL_KIND, build_sandbox_claim, build_sandbox_template, build_sandbox_warm_pool,
 };
 
 /// Shared state for the Sandbox placement controllers.
@@ -2897,14 +2897,6 @@ async fn compose_child_target(
         claim_owner: Some(Box::new(namespace_owner)),
     }))
 }
-
-/// Namespace inside a child cluster that holds its Sandbox objects.
-///
-/// Fixed, and never derived from anything a caller supplies. The child cluster
-/// is exclusive to one lease, so there is nothing to disambiguate — and a
-/// caller-influenced namespace would be a way to reach objects the composition
-/// did not create.
-const CHILD_SANDBOX_NAMESPACE: &str = "kobe-sandbox";
 
 /// The readiness instant already persisted on a Ready lease, if any.
 fn persisted_ready_at(

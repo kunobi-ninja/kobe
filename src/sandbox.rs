@@ -30,6 +30,12 @@ pub const SANDBOX_WARM_POOL_KIND: &str = "SandboxWarmPool";
 pub const SANDBOX_CLAIM_KIND: &str = "SandboxClaim";
 pub const KOBE_MANAGED_BY: &str = "kobe-operator";
 pub const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
+/// Namespace inside an exclusive child cluster that holds Sandbox objects.
+///
+/// This is shared by placement and provenance validation: accepting a
+/// different namespace during recovery would let a damaged parent select a
+/// teardown path the controller never created.
+pub const CHILD_SANDBOX_NAMESPACE: &str = "kobe-sandbox";
 /// Keeps a [`SandboxLease`](crate::crd::SandboxLease) present until Kobe has
 /// durably proved its complete footprint absent and released its reservations.
 ///
@@ -788,6 +794,14 @@ fn validate_target_provenance(
                 || provenance.child_cluster_instance.is_some() =>
         {
             return Err(SandboxProvenanceError::UnexpectedChildReference);
+        }
+        ResolvedSandboxPlacement::ChildCluster { .. }
+            if provenance.namespace != CHILD_SANDBOX_NAMESPACE =>
+        {
+            return Err(SandboxProvenanceError::InvalidReference {
+                field: "namespace",
+                reason: "child target namespace does not match Kobe's fixed child namespace",
+            });
         }
         ResolvedSandboxPlacement::Management {} | ResolvedSandboxPlacement::ChildCluster { .. } => {
         }

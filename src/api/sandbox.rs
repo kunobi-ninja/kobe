@@ -2796,7 +2796,17 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     // must not consume the entire reaper margin before the clock starts.
     let active_admission_deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(SANDBOX_ACTIVE_ADMISSION_TIMEOUT_SECS);
-    create_sandbox_lease_until(state, identity, request, active_admission_deadline).await
+    // The admission state machine deliberately retains several exact object
+    // snapshots across cancellation branches. Keep that large future off the
+    // request task's stack; repeated endpoint calls must not grow a Tokio test
+    // or server worker frame enough to overflow it.
+    Box::pin(create_sandbox_lease_until(
+        state,
+        identity,
+        request,
+        active_admission_deadline,
+    ))
+    .await
 }
 
 async fn create_sandbox_lease_until<B: ClusterBackend>(
@@ -2829,10 +2839,18 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
         );
     }
 
-    if let Err(response) =
-        require_sandbox_crds(&state.client, &[SANDBOX_POOL_CRD, SANDBOX_LEASE_CRD]).await
+    match await_admission_stage_until(
+        active_admission_deadline,
+        &state.shutdown,
+        require_sandbox_crds(&state.client, &[SANDBOX_POOL_CRD, SANDBOX_LEASE_CRD]),
+    )
+    .await
     {
-        return response;
+        Ok(Ok(())) => {}
+        Ok(Err(response)) => return response,
+        Err(error) => {
+            return sandbox_infra_error("Sandbox lease admission preflight was interrupted", error);
+        }
     }
     let policy = policy_for(&identity);
 
@@ -2867,12 +2885,21 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     }
 
     let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
-    let pool = match pools.get(&request.pool).await {
-        Ok(pool) => pool,
-        Err(kube::Error::Api(error)) if error.code == 404 => {
+    let pool = match await_admission_stage_until(
+        active_admission_deadline,
+        &state.shutdown,
+        pools.get(&request.pool),
+    )
+    .await
+    {
+        Ok(Ok(pool)) => pool,
+        Ok(Err(kube::Error::Api(error))) if error.code == 404 => {
             return sandbox_error(StatusCode::NOT_FOUND, "SandboxPool not found", None);
         }
-        Err(err) => return sandbox_infra_error("Unable to load SandboxPool", err),
+        Ok(Err(err)) => return sandbox_infra_error("Unable to load SandboxPool", err),
+        Err(error) => {
+            return sandbox_infra_error("Sandbox lease admission preflight was interrupted", error);
+        }
     };
 
     if let Err(err) = pool.spec.validate() {
@@ -2980,16 +3007,16 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     // died between reserving and admitting. Runs before admission so a caller
     // locked out by their own crashed request recovers on their next attempt
     // rather than staying 429/409 forever.
-    if tokio::time::timeout_at(
+    if let Err(error) = await_admission_stage_until(
         active_admission_deadline,
+        &state.shutdown,
         cancel_expired_pending_admissions(&leases, &reservations, &identity, chrono::Utc::now()),
     )
     .await
-    .is_err()
     {
         return sandbox_infra_error(
             "Sandbox lease admission timed out during abandoned-admission recovery",
-            SandboxLeaseMutationError::AdmissionDeadlineExceeded,
+            error,
         );
     }
 
@@ -3012,25 +3039,40 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     // that Kubernetes did not accept the request. A CREATE that commits after
     // this future is dropped can leave only an unadmitted parent, which the
     // durable sweep cancels.
-    let created = match tokio::time::timeout_at(
+    let created = match await_admission_stage_until(
         active_admission_deadline,
+        &state.shutdown,
         leases.create(&PostParams::default(), &lease),
     )
     .await
     {
         Ok(Ok(created)) => created,
         Ok(Err(err)) => return sandbox_infra_error("Failed to create Sandbox lease", err),
-        Err(_) => {
-            return sandbox_infra_error(
-                "Sandbox lease admission timed out",
-                SandboxLeaseMutationError::AdmissionDeadlineExceeded,
-            );
+        Err(error) => {
+            return sandbox_infra_error("Sandbox lease admission was interrupted", error);
         }
     };
     if let Err(err) = validate_lease_shape(&lease, &created, SANDBOX_ADMISSION_PENDING) {
-        if let Err(cleanup_err) = delete_exact_pending_lease(&leases, &reservations, &created).await
+        match delete_exact_pending_lease_until(
+            &leases,
+            &reservations,
+            &created,
+            active_admission_deadline,
+            &state.shutdown,
+        )
+        .await
         {
-            error!(error = %cleanup_err, "Failed to remove malformed Sandbox lease create response");
+            Ok(()) => {}
+            Err(cleanup_err @ SandboxLeaseMutationError::AdmissionDeadlineExceeded)
+            | Err(cleanup_err @ SandboxLeaseMutationError::AdmissionShuttingDown) => {
+                return sandbox_infra_error(
+                    "Malformed Sandbox lease cleanup was interrupted",
+                    cleanup_err,
+                );
+            }
+            Err(cleanup_err) => {
+                error!(error = %cleanup_err, "Failed to remove malformed Sandbox lease create response");
+            }
         }
         return sandbox_infra_error("Sandbox lease create response failed validation", err);
     }
@@ -3055,31 +3097,63 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
         }) {
         Ok(deadline) => deadline,
         Err(err) => {
-            if let Err(cleanup_err) =
-                delete_exact_pending_lease(&leases, &reservations, &created).await
+            match delete_exact_pending_lease_until(
+                &leases,
+                &reservations,
+                &created,
+                active_admission_deadline,
+                &state.shutdown,
+            )
+            .await
             {
-                error!(error = %cleanup_err, "Failed to remove Sandbox lease without a provisioning deadline");
+                Ok(()) => {}
+                Err(cleanup_err @ SandboxLeaseMutationError::AdmissionDeadlineExceeded)
+                | Err(cleanup_err @ SandboxLeaseMutationError::AdmissionShuttingDown) => {
+                    return sandbox_infra_error(
+                        "Unbounded Sandbox lease cleanup was interrupted",
+                        cleanup_err,
+                    );
+                }
+                Err(cleanup_err) => {
+                    error!(error = %cleanup_err, "Failed to remove Sandbox lease without a provisioning deadline");
+                }
             }
             return sandbox_infra_error("Failed to bound Sandbox lease provisioning", err);
         }
     };
-    let created = match tokio::time::timeout_at(
+    let created = match await_admission_stage_until(
         active_admission_deadline,
+        &state.shutdown,
         persist_pending_provisioning_deadline(&leases, &created, &provisioning_deadline),
     )
     .await
     {
         Ok(Ok(created)) => created,
         Ok(Err(err)) => {
-            if let Err(cleanup_err) =
-                delete_exact_pending_lease(&leases, &reservations, &created).await
+            match delete_exact_pending_lease_until(
+                &leases,
+                &reservations,
+                &created,
+                active_admission_deadline,
+                &state.shutdown,
+            )
+            .await
             {
-                error!(error = %cleanup_err, "Failed to remove Sandbox lease after deadline checkpoint failure");
+                Ok(()) => {}
+                Err(cleanup_err @ SandboxLeaseMutationError::AdmissionDeadlineExceeded)
+                | Err(cleanup_err @ SandboxLeaseMutationError::AdmissionShuttingDown) => {
+                    return sandbox_infra_error(
+                        "Sandbox deadline checkpoint cleanup was interrupted",
+                        cleanup_err,
+                    );
+                }
+                Err(cleanup_err) => {
+                    error!(error = %cleanup_err, "Failed to remove Sandbox lease after deadline checkpoint failure");
+                }
             }
             return sandbox_infra_error("Failed to checkpoint Sandbox provisioning deadline", err);
         }
-        Err(_) => {
-            let timeout = SandboxLeaseMutationError::AdmissionDeadlineExceeded;
+        Err(bound) => {
             match resolve_timed_out_admission(
                 &leases,
                 &reservations,
@@ -3105,7 +3179,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                     );
                 }
                 AdmissionResolution::Cancelled => {
-                    return sandbox_infra_error("Sandbox lease admission timed out", timeout);
+                    return sandbox_infra_error("Sandbox lease admission was interrupted", bound);
                 }
                 AdmissionResolution::HandedOff => {
                     warn!(
@@ -3154,8 +3228,9 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     // The exact names and UIDs returned by CREATE are committed atomically with
     // the `admitted` marker below. Cleanup uses those persisted handles rather
     // than granting deletion authority to a label selector.
-    let admission_reservations = match tokio::time::timeout_at(
+    let admission_reservations = match await_admission_stage_until(
         active_admission_deadline,
+        &state.shutdown,
         acquire_admission_reservations(
             &leases,
             &reservations,
@@ -3169,10 +3244,18 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     {
         Ok(Ok(reservations)) => reservations,
         Ok(Err(AdmissionReservationError::QuotaExhausted)) => {
-            if let Err(err) = delete_exact_pending_lease(&leases, &reservations, &created).await {
+            if let Err(error) = delete_exact_pending_lease_until(
+                &leases,
+                &reservations,
+                &created,
+                active_admission_deadline,
+                &state.shutdown,
+            )
+            .await
+            {
                 return sandbox_infra_error(
                     "Sandbox quota reservation cleanup failed; lease remains unadmitted",
-                    err,
+                    error,
                 );
             }
             return sandbox_error(
@@ -3185,10 +3268,18 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
             );
         }
         Ok(Err(AdmissionReservationError::AliasTaken)) => {
-            if let Err(err) = delete_exact_pending_lease(&leases, &reservations, &created).await {
+            if let Err(error) = delete_exact_pending_lease_until(
+                &leases,
+                &reservations,
+                &created,
+                active_admission_deadline,
+                &state.shutdown,
+            )
+            .await
+            {
                 return sandbox_infra_error(
                     "Sandbox alias reservation cleanup failed; lease remains unadmitted",
-                    err,
+                    error,
                 );
             }
             return sandbox_error(
@@ -3201,15 +3292,20 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
             );
         }
         Ok(Err(err)) => {
-            if let Err(cleanup_err) =
-                delete_exact_pending_lease(&leases, &reservations, &created).await
+            if let Err(cleanup_err) = delete_exact_pending_lease_until(
+                &leases,
+                &reservations,
+                &created,
+                active_admission_deadline,
+                &state.shutdown,
+            )
+            .await
             {
                 error!(error = %cleanup_err, "Failed to remove Sandbox lease after reservation error");
             }
             return sandbox_infra_error("Failed to reserve Sandbox admission", err);
         }
-        Err(_) => {
-            let timeout = SandboxLeaseMutationError::AdmissionDeadlineExceeded;
+        Err(bound) => {
             match resolve_timed_out_admission(
                 &leases,
                 &reservations,
@@ -3235,7 +3331,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                     );
                 }
                 AdmissionResolution::Cancelled => {
-                    return sandbox_infra_error("Sandbox lease admission timed out", timeout);
+                    return sandbox_infra_error("Sandbox lease admission was interrupted", bound);
                 }
                 AdmissionResolution::HandedOff => {
                     warn!(
@@ -3256,8 +3352,9 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     };
 
     let mut admission_handoff_requires_quarantine = false;
-    let admission_result = match tokio::time::timeout_at(
+    let admission_result = match await_admission_stage_until(
         active_admission_deadline,
+        &state.shutdown,
         admit_sandbox_lease(
             &leases,
             &reservations,
@@ -3269,8 +3366,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     .await
     {
         Ok(result) => result,
-        Err(_) => {
-            let timeout = SandboxLeaseMutationError::AdmissionDeadlineExceeded;
+        Err(bound) => {
             match resolve_timed_out_admission(
                 &leases,
                 &reservations,
@@ -3289,7 +3385,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                     Ok(())
                 }
                 AdmissionResolution::Cancelled => {
-                    return sandbox_infra_error("Sandbox lease admission timed out", timeout);
+                    return sandbox_infra_error("Sandbox lease admission was interrupted", bound);
                 }
                 AdmissionResolution::HandedOff => {
                     warn!(
@@ -3321,8 +3417,14 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
             // Deleting the lease under its UID fence is what makes the release
             // safe, so it has to come first.
             SandboxLeaseMutationError::AdmissionNotCommitted => {
-                if let Err(cleanup_err) =
-                    delete_exact_pending_lease(&leases, &reservations, &created).await
+                if let Err(cleanup_err) = delete_exact_pending_lease_until(
+                    &leases,
+                    &reservations,
+                    &created,
+                    active_admission_deadline,
+                    &state.shutdown,
+                )
+                .await
                 {
                     error!(error = %cleanup_err, "Failed to remove Sandbox lease after admission failure");
                 }
@@ -3645,20 +3747,36 @@ async fn release_sandbox_lease<B: ClusterBackend>(
 ///
 /// Exact `pending`/`cancelled` markers are themselves CAS state and use the
 /// normal fenced cancellation path. A missing or unrecognised marker has no
-/// such authority: before direct parent deletion Kobe must validate the full
-/// UID-selected ledger result and prove it empty. A live token makes the
-/// object indistinguishable from an admitted Pending lease whose annotations
-/// were stripped, so it is retained unchanged.
+/// such authority: before direct parent deletion Kobe must scan the full
+/// ledger and prove that no deterministic token name for this principal could
+/// belong to the parent. A UID-label selector is insufficient because the
+/// label is mutable and can hide a live token. Any candidate makes the object
+/// indistinguishable from an admitted Pending lease whose annotations were
+/// stripped, so it is retained unchanged.
 async fn pristine_parent_has_no_live_reservations(
     reservations: &Api<Lease>,
     lease: &SandboxLease,
 ) -> Result<bool, SandboxLeaseMutationError> {
-    let uid = lease.uid().ok_or(SandboxLeaseMutationError::MissingUid)?;
-    Ok(
-        verified_reservations_for_lease(reservations, lease, &uid, None, false)
-            .await?
-            .is_empty(),
-    )
+    lease.uid().ok_or(SandboxLeaseMutationError::MissingUid)?;
+    let principal = principal_hash_for(&lease.spec.requester);
+    let alias_name = lease
+        .spec
+        .alias
+        .as_deref()
+        .map(|alias| alias_reservation_name(&principal, alias));
+    let listed = reservations.list(&ListParams::default()).await?;
+
+    // With damaged parent admission metadata, mutable token labels and
+    // annotations cannot prove which same-principal parent owns a slot. Names
+    // are immutable and derived from the principal, so conservatively retain
+    // the parent if any of its possible quota names (or exact alias name) is
+    // live. This path is recovery from corruption, where refusing deletion is
+    // safer than freeing quota underneath a hidden admitted Sandbox.
+    Ok(!listed.items.into_iter().any(|reservation| {
+        let name = reservation.name_any();
+        quota_reservation_slot(&name, &principal).is_some()
+            || alias_name.as_deref() == Some(name.as_str())
+    }))
 }
 
 /// Prove that a non-admitted lease already owns an active Sandbox lifecycle.
@@ -4120,6 +4238,48 @@ const SANDBOX_ACTIVE_ADMISSION_TIMEOUT_SECS: u64 = 480;
 /// Thirty seconds still permits several exact-state retries while remaining
 /// comfortably inside the two-minute margin before reaper eligibility.
 const SANDBOX_ADMISSION_RESOLUTION_TIMEOUT_SECS: u64 = 30;
+
+/// Poll one active-admission operation only while the request owns its budget.
+///
+/// The absolute deadline is shared by every Kubernetes await, including
+/// preflight and cleanup, so moving work between stages cannot silently extend
+/// the HTTP lifetime. Shutdown has the same bound: before parent creation it
+/// is a safe retryable refusal; after creation callers must use the durable
+/// admission arbiter and return a non-retry handoff when classification cannot
+/// finish.
+async fn await_admission_stage_until<T, F>(
+    deadline: tokio::time::Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
+    future: F,
+) -> Result<T, SandboxLeaseMutationError>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err(SandboxLeaseMutationError::AdmissionShuttingDown),
+        _ = tokio::time::sleep_until(deadline) => {
+            Err(SandboxLeaseMutationError::AdmissionDeadlineExceeded)
+        }
+        output = future => Ok(output),
+    }
+}
+
+/// Bound best-effort deletion by the same absolute request envelope.
+async fn delete_exact_pending_lease_until(
+    leases: &Api<SandboxLease>,
+    reservations: &Api<Lease>,
+    lease: &SandboxLease,
+    deadline: tokio::time::Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<(), SandboxLeaseMutationError> {
+    await_admission_stage_until(
+        deadline,
+        shutdown,
+        delete_exact_pending_lease(leases, reservations, lease),
+    )
+    .await?
+}
 
 /// Maximum wall-clock budget before the durable admission arbiter may cancel a
 /// still-pending attempt.
@@ -5651,10 +5811,17 @@ async fn reap_orphaned_admission_reservations(
         warn!("Sandbox orphan-reservation sweep has no ledger namespace");
         return;
     };
-    // The normal path is one LIST, not one GET per live token. Only candidates
-    // absent from this snapshot are re-read individually before deletion; that
-    // exact GET closes the cross-resource race where a parent and its token
-    // were created just after the LIST snapshot.
+    // List the ledger first and parents second. Any token in this ledger
+    // snapshot must have been created after its parent, so the later parent
+    // snapshot cannot miss a newly admitted owner. A stale parent can only
+    // defer orphan cleanup for one sweep, which is the safe direction.
+    let listed = match reservations.list(&ListParams::default()).await {
+        Ok(listed) => listed,
+        Err(error) => {
+            warn!(error = %error, "Sandbox orphan-reservation sweep could not list the ledger");
+            return;
+        }
+    };
     let live_parents: std::collections::BTreeMap<String, SandboxLease> = match leases
         .list(&ListParams::default())
         .await
@@ -5669,13 +5836,17 @@ async fn reap_orphaned_admission_reservations(
             return;
         }
     };
-    let listed = match reservations.list(&ListParams::default()).await {
-        Ok(listed) => listed,
-        Err(error) => {
-            warn!(error = %error, "Sandbox orphan-reservation sweep could not list the ledger");
-            return;
-        }
-    };
+
+    // Token-carried parent fields are mutable discovery hints, not deletion
+    // authority. The admitted parent persists the exact token name+UID; honor
+    // that authority even when the token's lease-name annotation or lease-UID
+    // label was changed to point somewhere else.
+    let live_persisted_tokens: std::collections::BTreeSet<(String, String)> = live_parents
+        .values()
+        .filter_map(|parent| persisted_reservation_provenance(parent).ok())
+        .flatten()
+        .map(|reservation| (reservation.name, reservation.uid))
+        .collect();
 
     for reservation in listed.items {
         let identity = match orphan_reservation_identity(&reservation, expected_namespace) {
@@ -5689,6 +5860,9 @@ async fn reap_orphaned_admission_reservations(
                 continue;
             }
         };
+        if live_persisted_tokens.contains(&(identity.name.clone(), identity.uid.clone())) {
+            continue;
+        }
         let live_parent = live_parents
             .get(&identity.lease_name)
             .filter(|parent| parent.uid().as_deref() == Some(identity.lease_uid.as_str()));
@@ -6280,6 +6454,8 @@ pub(crate) enum SandboxLeaseMutationError {
     ProvisioningDeadlineNotCommitted,
     #[error("SandboxLease admission exceeded its active handler deadline")]
     AdmissionDeadlineExceeded,
+    #[error("SandboxLease admission was interrupted by process shutdown")]
+    AdmissionShuttingDown,
     #[error("SandboxLease identity or server-owned admission fields changed")]
     LeaseShapeChanged,
     #[error("SandboxLease UID changed")]
@@ -8432,10 +8608,66 @@ mod tests {
         assert_eq!(options["preconditions"]["resourceVersion"], "9");
     }
 
+    /// Token-carried parent hints are not allowed to override the admitted
+    /// parent's exact persisted token set. Either hint may be changed to a
+    /// different valid value without turning a live reservation into an
+    /// orphan.
+    #[tokio::test]
+    async fn orphan_sweep_preserves_exact_tokens_persisted_by_a_live_parent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let principal = principal_hash(&identity());
+        let reservation_name = quota_reservation_name(&principal, 0);
+        let held = mount_reservation_api_owned(
+            &server,
+            &[(reservation_name.clone(), "sandbox-live-uid".into())],
+        )
+        .await;
+        let parent = lease_json("sandbox-live", "alice@example.com", "Pending");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(vec![parent])),
+            )
+            .mount(&server)
+            .await;
+
+        held.lock().unwrap().get_mut(&reservation_name).unwrap()["metadata"]["labels"]
+            [SANDBOX_RESERVATION_LEASE_UID_LABEL] = serde_json::json!("sandbox-different-uid");
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, TEST_LEDGER_NAMESPACE);
+        reap_orphaned_admission_reservations(&leases, &reservations).await;
+        assert!(held.lock().unwrap().contains_key(&reservation_name));
+
+        let mut guard = held.lock().unwrap();
+        let token = guard.get_mut(&reservation_name).unwrap();
+        token["metadata"]["labels"][SANDBOX_RESERVATION_LEASE_UID_LABEL] =
+            serde_json::json!("sandbox-live-uid");
+        token["metadata"]["annotations"][SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION] =
+            serde_json::json!("sandbox-different");
+        drop(guard);
+        reap_orphaned_admission_reservations(&leases, &reservations).await;
+
+        assert!(held.lock().unwrap().contains_key(&reservation_name));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
     #[test]
     fn active_timeout_precedes_controller_cancellation_deadline() {
         assert!(
-            SANDBOX_ACTIVE_ADMISSION_TIMEOUT_SECS < SANDBOX_PENDING_CANCEL_DEADLINE_SECS as u64
+            SANDBOX_ACTIVE_ADMISSION_TIMEOUT_SECS + SANDBOX_ADMISSION_RESOLUTION_TIMEOUT_SECS
+                < SANDBOX_PENDING_CANCEL_DEADLINE_SECS as u64
         );
     }
 
@@ -8501,6 +8733,218 @@ mod tests {
                 .all(|request| matches!(request.method.as_str(), "GET")),
             "no parent or reservation mutation may start after sweep budget expiry"
         );
+    }
+
+    /// CRD discovery is part of the request budget, not startup work the
+    /// handler may wait on forever.
+    #[tokio::test]
+    async fn admission_budget_bounds_a_stalled_crd_preflight() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{SANDBOX_POOL_CRD}"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(crd_json(SANDBOX_POOL_CRD, "sandboxpools", "SandboxPool")),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_sandbox_lease_until::<crate::testutil::MockBackend>(
+                test_state(&server),
+                identity(),
+                CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("the absolute deadline must stop a stalled CRD read");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() == "GET")
+        );
+    }
+
+    /// Shutdown before the durable parent exists is a bounded retryable
+    /// refusal and must not start a create after a stalled pool read.
+    #[tokio::test]
+    async fn shutdown_bounds_a_stalled_pool_preflight_before_parent_creation() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let state = test_state(&server);
+        let trigger = state.shutdown.clone();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                trigger.cancel();
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(pool_json())
+            })
+            .mount(&server)
+            .await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_sandbox_lease_until::<crate::testutil::MockBackend>(
+                state,
+                identity(),
+                CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("shutdown must stop a stalled pool read");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| !matches!(request.method.as_str(), "POST" | "PATCH" | "DELETE"))
+        );
+    }
+
+    /// Once CREATE has returned a durable parent, shutdown cannot answer 503:
+    /// the stalled status write could still commit. Hand the exact ID to the
+    /// reaper as a non-retry 202 instead.
+    #[tokio::test]
+    async fn shutdown_during_stalled_post_create_checkpoint_returns_pending_handle() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let parent = mount_create_api(&server, true, false).await;
+        let state = test_state(&server);
+        let trigger = state.shutdown.clone();
+        Mock::given(method("PATCH"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+/status$",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                trigger.cancel();
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({}))
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_sandbox_lease_until::<crate::testutil::MockBackend>(
+                state,
+                identity(),
+                CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("shutdown must hand off a durable admission promptly");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "admission_pending");
+        assert_eq!(body["retry"], false);
+        assert!(parent.lock().unwrap().is_some());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method.as_str() != "DELETE"
+                && !(request.method.as_str() == "POST"
+                    && request.url.path().contains("coordination.k8s.io"))
+        }));
+    }
+
+    /// Cleanup after a malformed CREATE response shares the original absolute
+    /// deadline. A stalled absence proof must not retain the HTTP task or begin
+    /// reservation admission after that budget expires.
+    #[tokio::test]
+    async fn admission_budget_bounds_stalled_post_create_cleanup() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let parent = mount_create_api(&server, true, false).await;
+        let create_parent = Arc::clone(&parent);
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases",
+            ))
+            .respond_with(move |request: &wiremock::Request| {
+                let mut object: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let name = object["metadata"]["name"].as_str().unwrap().to_string();
+                object["metadata"]["uid"] = serde_json::json!(format!("{name}-uid"));
+                object["metadata"]["resourceVersion"] = serde_json::json!("1");
+                *create_parent.lock().unwrap() = Some(object.clone());
+                ResponseTemplate::new(201).set_body_json(object)
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_sandbox_lease_until::<crate::testutil::MockBackend>(
+                test_state(&server),
+                identity(),
+                CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the original deadline must bound malformed-parent cleanup");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(parent.lock().unwrap().is_some());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method.as_str() != "DELETE"
+                && !(request.method.as_str() == "POST"
+                    && request.url.path().contains("coordination.k8s.io"))
+        }));
     }
 
     /// A lease that reached `phase`, carrying the `CleanupVerified` condition
@@ -10668,8 +11112,9 @@ mod tests {
     }
 
     /// A formerly admitted Pending lease whose annotations were stripped is
-    /// indistinguishable from pre-admission while its exact token survives.
-    /// The live ledger therefore vetoes parent deletion.
+    /// indistinguishable from pre-admission while a deterministic token
+    /// survives. Even removing the mutable lease-UID label cannot hide that
+    /// token from the full-ledger proof or authorize parent deletion.
     #[tokio::test]
     async fn stripped_admitted_pending_with_live_reservations_is_never_deleted() {
         let server = MockServer::start().await;
@@ -10686,6 +11131,12 @@ mod tests {
             ],
         )
         .await;
+        for token in held.lock().unwrap().values_mut() {
+            token["metadata"]["labels"]
+                .as_object_mut()
+                .unwrap()
+                .remove(SANDBOX_RESERVATION_LEASE_UID_LABEL);
+        }
         let ledger_before = held.lock().unwrap().clone();
         let mut object = pristine_pending_json("sandbox-stripped", None);
         object["metadata"]["uid"] = serde_json::json!(lease_uid);
@@ -10868,6 +11319,54 @@ mod tests {
                 "name": "children",
                 "uid": "child-pool-uid",
                 "generation": 1
+            }
+        });
+
+        assert_mismatched_active_release_is_retained(name, object).await;
+    }
+
+    /// Child placement always composes into Kobe's fixed child namespace.
+    /// Internally consistent references that echo a different top-level
+    /// namespace still cannot authorize admission repair or teardown.
+    #[tokio::test]
+    async fn child_target_in_a_noncanonical_namespace_never_repairs_admission() {
+        let name = "sandbox-child-wrong-namespace";
+        let mut object = active_release_json(name, Some("corrupt"));
+        object["status"]["placement"] = serde_json::json!({
+            "type": "childCluster",
+            "clusterPool": {
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "namespace": "test-ns",
+                "name": "children",
+                "uid": "child-pool-uid",
+                "generation": 1
+            }
+        });
+        object["status"]["target"] = serde_json::json!({
+            "namespace": "caller-selected",
+            "childClusterLease": {
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterLease",
+                "namespace": "test-ns",
+                "name": "kobe-sbx-child-wrong-namespace",
+                "uid": "child-lease-uid",
+                "generation": 1
+            },
+            "childClusterInstance": {
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "namespace": "test-ns",
+                "name": "child-instance",
+                "uid": "child-instance-uid",
+                "generation": 2
+            },
+            "sandboxClaim": {
+                "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                "kind": "SandboxClaim",
+                "namespace": "caller-selected",
+                "name": "claim",
+                "uid": "claim-uid"
             }
         });
 
