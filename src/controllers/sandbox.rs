@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
@@ -41,8 +41,8 @@ use crate::api::sandbox::{
     SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION,
 };
 use crate::crd::{
-    SandboxCondition, SandboxConditionStatus, SandboxLease, SandboxLeasePhase, SandboxPlacement,
-    SandboxPool, SandboxPoolStatus,
+    SandboxCondition, SandboxConditionStatus, SandboxLease, SandboxLeasePhase,
+    SandboxObjectReference, SandboxPlacement, SandboxPool, SandboxPoolStatus,
 };
 use crate::sandbox::{
     AGENT_SANDBOX_API_VERSION, CHILD_SANDBOX_NAMESPACE, SANDBOX_CLAIM_KIND, SANDBOX_TEMPLATE_KIND,
@@ -155,7 +155,7 @@ pub(super) enum ManagementClaimTombstone {
     /// The exact recorded Claim exists, is expired with `Retain`, and has a
     /// future reaping deadline.
     Ready {
-        claim: DynamicObject,
+        claim: Box<DynamicObject>,
         tombstone_ref: crate::crd::SandboxObjectReference,
         prior_claim_uid: Option<String>,
     },
@@ -186,6 +186,28 @@ fn upstream_resource(kind: &str, plural: &str) -> ApiResource {
         api_version: AGENT_SANDBOX_API_VERSION.into(),
         kind: kind.into(),
         plural: plural.into(),
+    }
+}
+
+/// One core/v1 resource addressed through the same dynamic-object machinery
+/// used for upstream Agent Sandbox kinds.
+fn core_resource(kind: &str, plural: &str) -> ApiResource {
+    ApiResource {
+        group: String::new(),
+        version: "v1".into(),
+        api_version: "v1".into(),
+        kind: kind.into(),
+        plural: plural.into(),
+    }
+}
+
+fn sandbox_resource() -> ApiResource {
+    ApiResource {
+        group: "agents.x-k8s.io".into(),
+        version: "v1beta1".into(),
+        api_version: crate::controllers::sandbox_canary::SANDBOX_API_VERSION.into(),
+        kind: crate::controllers::sandbox_canary::SANDBOX_KIND.into(),
+        plural: "sandboxes".into(),
     }
 }
 
@@ -2122,7 +2144,7 @@ pub(super) async fn ensure_management_claim_tombstone(
     }
 
     Ok(ManagementClaimTombstone::Ready {
-        claim: observed,
+        claim: Box::new(observed),
         tombstone_ref: recorded.expect("checked above").clone(),
         prior_claim_uid: prior.map(|reference| reference.uid.clone()),
     })
@@ -2130,15 +2152,849 @@ pub(super) async fn ensure_management_claim_tombstone(
 
 /// Tear one lease down and give its capacity back — but only against proof.
 ///
-/// The order is the point. The upstream claim is deleted, its absence is
-/// *verified*, and only then are the quota and alias reservations released.
-/// Releasing reservations first would let the freed slot be handed to the next
-/// caller while the previous Sandbox was still running, which is precisely the
-/// over-subscription the ledger exists to prevent.
+/// The order is the point. The upstream Claim name is first occupied by an
+/// exact expired `Retain` tombstone, every recorded or discoverable descendant
+/// is then proven absent, and only then are quota and alias reservations
+/// released. Releasing reservations first would let the freed slot be handed
+/// to the next caller while the previous Sandbox was still running, which is
+/// precisely the over-subscription the ledger exists to prevent.
 ///
 /// Uncertainty quarantines rather than releases. A lease whose teardown cannot
 /// be verified keeps consuming its slot: under-counting capacity is recoverable
 /// by an operator, silently double-booking a Sandbox host is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetFootprintCheck {
+    Verified,
+    Retry(&'static str),
+    Quarantine(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactObjectAbsence {
+    Absent,
+    Present,
+    Replaced,
+    Unverifiable,
+    Transient,
+}
+
+const UPSTREAM_CLAIM_UID_LABEL: &str = "agents.x-k8s.io/claim-uid";
+
+/// Validate one recorded namespaced object identity before it is trusted as
+/// teardown evidence. Corrupt status must withhold capacity, not redirect an
+/// absence check into another namespace or kind.
+fn recorded_reference_is_exact(
+    reference: &SandboxObjectReference,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+) -> bool {
+    reference.api_version == api_version
+        && reference.kind == kind
+        && reference.namespace.as_deref() == Some(namespace)
+        && !reference.name.is_empty()
+        && !reference.uid.is_empty()
+}
+
+/// Determine whether an absent Service reference is legitimate.
+///
+/// New exposed-port leases checkpoint the exact Service UID before Ready. For
+/// an older lease that lacks it, the exact Pool generation is the only durable
+/// source for whether a Service was required. A missing/replaced/stale Pool
+/// cannot prove the negative and therefore fails closed.
+async fn missing_service_provenance_is_allowed(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+) -> TargetFootprintCheck {
+    // A cancelled Provisioning lease may legitimately never have reached the
+    // point where the upstream controller created a Service. Label-scoped
+    // enumeration behind the inert Claim tombstone proves that negative. Once Ready was
+    // reached, however, exposed ports imply a Service existed and its exact
+    // identity had to be checkpointed.
+    if lease
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_at.as_ref())
+        .is_none()
+    {
+        return TargetFootprintCheck::Verified;
+    }
+    let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    match pools.get(&lease.spec.pool_ref.name).await {
+        Ok(pool)
+            if pool.uid().as_deref() == Some(lease.spec.pool_ref.uid.as_str())
+                && pool.metadata.generation == Some(lease.spec.pool_ref.generation) =>
+        {
+            if pool.spec.template.exposed_ports.is_empty() {
+                TargetFootprintCheck::Verified
+            } else {
+                TargetFootprintCheck::Quarantine("required_service_provenance_missing")
+            }
+        }
+        Ok(_) => TargetFootprintCheck::Quarantine("service_requirement_pool_identity_changed"),
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            TargetFootprintCheck::Quarantine("service_requirement_unverifiable")
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            TargetFootprintCheck::Quarantine("service_requirement_pool_missing")
+        }
+        Err(_) => TargetFootprintCheck::Retry("service_requirement_lookup_transient"),
+    }
+}
+
+/// Require complete, exact management provenance before any destructive call.
+///
+/// The Claim is required once placement started. Descendants are optional
+/// while Provisioning because cancellation may race their creation; when
+/// present, each reference must still be exact and internally consistent.
+/// Ready leases require the full Pod identity and an exact Service identity
+/// when their exact Pool generation exposed ports.
+async fn validate_management_target_provenance(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+) -> TargetFootprintCheck {
+    let Some(target) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.target.as_ref())
+    else {
+        return TargetFootprintCheck::Quarantine("management_target_provenance_missing");
+    };
+    if target.namespace != ctx.namespace {
+        return TargetFootprintCheck::Quarantine("management_target_namespace_changed");
+    }
+    let Some(claim) = target.sandbox_claim.as_ref() else {
+        return TargetFootprintCheck::Quarantine("claim_provenance_missing");
+    };
+    if !recorded_reference_is_exact(
+        claim,
+        AGENT_SANDBOX_API_VERSION,
+        SANDBOX_CLAIM_KIND,
+        &ctx.namespace,
+    ) {
+        return TargetFootprintCheck::Quarantine("management_target_provenance_invalid");
+    }
+    if target.sandbox.as_ref().is_some_and(|sandbox| {
+        !recorded_reference_is_exact(
+            sandbox,
+            crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+            crate::controllers::sandbox_canary::SANDBOX_KIND,
+            &ctx.namespace,
+        )
+    }) || target
+        .pod
+        .as_ref()
+        .is_some_and(|pod| !recorded_reference_is_exact(pod, "v1", "Pod", &ctx.namespace))
+        || (target.pod.is_some() && target.sandbox.is_none())
+        || (target.service.is_some() && target.sandbox.is_none())
+    {
+        return TargetFootprintCheck::Quarantine("management_target_provenance_invalid");
+    }
+    if lease
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_at.as_ref())
+        .is_some()
+        && target.pod.is_none()
+    {
+        return TargetFootprintCheck::Quarantine("pod_provenance_missing");
+    }
+    match target.service.as_ref() {
+        Some(service) if recorded_reference_is_exact(service, "v1", "Service", &ctx.namespace) => {
+            TargetFootprintCheck::Verified
+        }
+        Some(_) => TargetFootprintCheck::Quarantine("service_provenance_invalid"),
+        None => missing_service_provenance_is_allowed(lease, ctx).await,
+    }
+}
+
+enum ManagementDescendantCheckpoint {
+    Current,
+    Updated(Box<crate::crd::SandboxTargetProvenance>),
+    Check(TargetFootprintCheck),
+}
+
+/// Capture exact descendant identities while the Claim can still name them.
+///
+/// Cancellation during Provisioning is allowed to observe no assigned
+/// Sandbox at all. If one is assigned and already exists, its UID and every
+/// currently discoverable Pod/Service UID are checkpointed in lease status in
+/// a separate reconcile before tombstone conversion. That closes the race
+/// where the workload Claim disappears and only a descendant remains.
+async fn checkpoint_management_descendants(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    claims: &Api<DynamicObject>,
+) -> ManagementDescendantCheckpoint {
+    let validation = validate_management_target_provenance(lease, ctx).await;
+    if validation != TargetFootprintCheck::Verified {
+        return ManagementDescendantCheckpoint::Check(validation);
+    }
+    let current_target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
+    let claim_ref = current_target.sandbox_claim.as_ref().unwrap();
+    let claim = match claims.get(&claim_ref.name).await {
+        Ok(claim) if claim.uid().as_deref() == Some(claim_ref.uid.as_str()) => claim,
+        // The workload Claim may already be gone and a release tombstone (or
+        // a delayed active POST) may now occupy the name. The tombstone helper
+        // validates and checkpoints that distinct UID; descendant proof joins
+        // both Claim identities afterward.
+        Ok(_) => return ManagementDescendantCheckpoint::Current,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return ManagementDescendantCheckpoint::Current;
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                "claim_absence_unverifiable",
+            ));
+        }
+        Err(_) => {
+            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+                "claim_lookup_transient",
+            ));
+        }
+    };
+    let Some(sandbox_name) = claim
+        .data
+        .get("status")
+        .and_then(|status| status.get("sandbox"))
+        .and_then(|sandbox| sandbox.get("name"))
+        .and_then(|name| name.as_str())
+        .filter(|name| !name.is_empty())
+    else {
+        return ManagementDescendantCheckpoint::Current;
+    };
+
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &sandbox_resource());
+    let sandbox = match sandboxes.get(sandbox_name).await {
+        Ok(sandbox) => sandbox,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return ManagementDescendantCheckpoint::Current;
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                "sandbox_absence_unverifiable",
+            ));
+        }
+        Err(_) => {
+            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+                "sandbox_lookup_transient",
+            ));
+        }
+    };
+    if !metadata_is_controlled_by(
+        &sandbox.metadata,
+        &claim_ref.api_version,
+        &claim_ref.kind,
+        &claim_ref.name,
+        &claim_ref.uid,
+    ) {
+        return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+            "sandbox_owner_identity_changed",
+        ));
+    }
+    let sandbox_ref = match target_reference(
+        crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+        crate::controllers::sandbox_canary::SANDBOX_KIND,
+        &ctx.namespace,
+        &sandbox,
+    ) {
+        Ok(reference) => reference,
+        Err(_) => {
+            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                "sandbox_identity_unverifiable",
+            ));
+        }
+    };
+    if current_target
+        .sandbox
+        .as_ref()
+        .is_some_and(|recorded| recorded != &sandbox_ref)
+    {
+        return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+            "sandbox_identity_changed_during_teardown",
+        ));
+    }
+
+    let mut proposed = current_target.clone();
+    proposed.sandbox = Some(sandbox_ref.clone());
+
+    if let Some(service_name) = sandbox
+        .data
+        .get("status")
+        .and_then(|status| status.get("service"))
+        .and_then(|service| service.as_str())
+        .filter(|service| !service.is_empty())
+    {
+        let services: Api<DynamicObject> = Api::namespaced_with(
+            ctx.client.clone(),
+            &ctx.namespace,
+            &core_resource("Service", "services"),
+        );
+        match services.get(service_name).await {
+            Ok(service)
+                if metadata_is_controlled_by(
+                    &service.metadata,
+                    &sandbox_ref.api_version,
+                    &sandbox_ref.kind,
+                    &sandbox_ref.name,
+                    &sandbox_ref.uid,
+                ) =>
+            {
+                match target_reference("v1", "Service", &ctx.namespace, &service) {
+                    Ok(reference) => proposed.service = Some(reference),
+                    Err(_) => {
+                        return ManagementDescendantCheckpoint::Check(
+                            TargetFootprintCheck::Quarantine("service_identity_unverifiable"),
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                    "service_owner_identity_changed",
+                ));
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                    "service_absence_unverifiable",
+                ));
+            }
+            Err(_) => {
+                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+                    "service_lookup_transient",
+                ));
+            }
+        }
+    }
+
+    if let Some(selector) = sandbox
+        .data
+        .get("status")
+        .and_then(|status| status.get("selector"))
+        .and_then(|selector| selector.as_str())
+        .filter(|selector| !selector.is_empty())
+    {
+        let pods: Api<DynamicObject> = Api::namespaced_with(
+            ctx.client.clone(),
+            &ctx.namespace,
+            &core_resource("Pod", "pods"),
+        );
+        let matching = match pods.list(&ListParams::default().labels(selector)).await {
+            Ok(pods) => pods,
+            Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                    "pod_enumeration_unverifiable",
+                ));
+            }
+            Err(_) => {
+                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(
+                    "pod_enumeration_transient",
+                ));
+            }
+        };
+        if matching.items.len() > 1 {
+            return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                "pod_selector_ambiguous",
+            ));
+        }
+        if let Some(pod) = matching.items.into_iter().next() {
+            if !metadata_is_controlled_by(
+                &pod.metadata,
+                &sandbox_ref.api_version,
+                &sandbox_ref.kind,
+                &sandbox_ref.name,
+                &sandbox_ref.uid,
+            ) {
+                return ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(
+                    "pod_owner_identity_changed",
+                ));
+            }
+            match target_reference("v1", "Pod", &ctx.namespace, &pod) {
+                Ok(reference) => proposed.pod = Some(reference),
+                Err(_) => {
+                    return ManagementDescendantCheckpoint::Check(
+                        TargetFootprintCheck::Quarantine("pod_identity_unverifiable"),
+                    );
+                }
+            }
+        }
+    }
+
+    if &proposed == current_target {
+        ManagementDescendantCheckpoint::Current
+    } else {
+        ManagementDescendantCheckpoint::Updated(Box::new(proposed))
+    }
+}
+
+/// Observe whether one exact recorded object is absent.
+///
+/// A same-named replacement and an owner-chain change are durable identity
+/// failures, not absence. Authorization failures are likewise durable; other
+/// API failures are retried while the lease continues holding capacity.
+async fn exact_object_absence(
+    api: &Api<DynamicObject>,
+    reference: &SandboxObjectReference,
+    expected_owner: &SandboxObjectReference,
+) -> ExactObjectAbsence {
+    match api.get(&reference.name).await {
+        Ok(object) if object.uid().as_deref() != Some(reference.uid.as_str()) => {
+            ExactObjectAbsence::Replaced
+        }
+        Ok(object)
+            if !metadata_is_controlled_by(
+                &object.metadata,
+                &expected_owner.api_version,
+                &expected_owner.kind,
+                &expected_owner.name,
+                &expected_owner.uid,
+            ) =>
+        {
+            ExactObjectAbsence::Replaced
+        }
+        Ok(_) => ExactObjectAbsence::Present,
+        Err(kube::Error::Api(error)) if error.code == 404 => ExactObjectAbsence::Absent,
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            ExactObjectAbsence::Unverifiable
+        }
+        Err(_) => ExactObjectAbsence::Transient,
+    }
+}
+
+fn classify_exact_absence(
+    absence: ExactObjectAbsence,
+    present: &'static str,
+    replaced: &'static str,
+    unverifiable: &'static str,
+    transient: &'static str,
+) -> TargetFootprintCheck {
+    match absence {
+        ExactObjectAbsence::Absent => TargetFootprintCheck::Verified,
+        ExactObjectAbsence::Present => TargetFootprintCheck::Retry(present),
+        ExactObjectAbsence::Replaced => TargetFootprintCheck::Quarantine(replaced),
+        ExactObjectAbsence::Unverifiable => TargetFootprintCheck::Quarantine(unverifiable),
+        ExactObjectAbsence::Transient => TargetFootprintCheck::Retry(transient),
+    }
+}
+
+/// Enumerate persistent storage tied to the exact recorded Sandbox owner.
+///
+/// Kobe sets both upstream volume-claim policies to `Disallowed`, so the only
+/// valid result is an empty set. Any exact-owned PVC is therefore a policy
+/// violation and any PV whose `claimRef.uid` points to it is retained evidence
+/// of the same unexpected tenant storage. Neither is deleted automatically:
+/// quarantine preserves the evidence for an operator.
+async fn exact_owned_storage_is_absent(
+    client: &Client,
+    namespace: &str,
+    claim_uids: &[&str],
+    sandbox: Option<&SandboxObjectReference>,
+) -> TargetFootprintCheck {
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+    let owned: Vec<_> = match pvcs.list(&ListParams::default()).await {
+        Ok(pvcs) => pvcs
+            .into_iter()
+            .filter(|pvc| {
+                sandbox.is_some_and(|sandbox| {
+                    metadata_is_controlled_by(
+                        &pvc.metadata,
+                        &sandbox.api_version,
+                        &sandbox.kind,
+                        &sandbox.name,
+                        &sandbox.uid,
+                    )
+                }) || pvc
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(UPSTREAM_CLAIM_UID_LABEL))
+                    .is_some_and(|uid| claim_uids.contains(&uid.as_str()))
+            })
+            .collect(),
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return TargetFootprintCheck::Quarantine("pvc_enumeration_unverifiable");
+        }
+        Err(_) => return TargetFootprintCheck::Retry("pvc_enumeration_transient"),
+    };
+    let pvc_uids: Vec<_> = owned
+        .iter()
+        .filter_map(|pvc| pvc.uid().filter(|uid| !uid.is_empty()))
+        .collect();
+
+    let volumes: Api<PersistentVolume> = Api::all(client.clone());
+    let associated_volumes = match volumes.list(&ListParams::default()).await {
+        Ok(volumes) => volumes
+            .into_iter()
+            .filter(|volume| {
+                volume
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.claim_ref.as_ref())
+                    .and_then(|claim| claim.uid.as_ref())
+                    .is_some_and(|uid| pvc_uids.iter().any(|pvc_uid| pvc_uid == uid))
+            })
+            .count(),
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return TargetFootprintCheck::Quarantine("pv_enumeration_unverifiable");
+        }
+        Err(_) => return TargetFootprintCheck::Retry("pv_enumeration_transient"),
+    };
+
+    if owned.is_empty() && associated_volumes == 0 {
+        TargetFootprintCheck::Verified
+    } else {
+        warn!(
+            sandbox = sandbox
+                .map(|sandbox| sandbox.name.as_str())
+                .unwrap_or("<unassigned>"),
+            pvc_count = owned.len(),
+            pv_count = associated_volumes,
+            "unexpected persistent storage is still associated with a Sandbox"
+        );
+        TargetFootprintCheck::Quarantine("unexpected_persistent_storage")
+    }
+}
+
+/// Preflight management teardown before converting the Claim to a tombstone.
+///
+/// Storage is enumerated before tombstone conversion so a retained PV cannot
+/// outlive and erase the PVC identity needed to associate it with this exact
+/// Sandbox.
+async fn preflight_management_target(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+) -> TargetFootprintCheck {
+    let validation = validate_management_target_provenance(lease, ctx).await;
+    if validation != TargetFootprintCheck::Verified {
+        return validation;
+    }
+    let target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
+    let claim = target.sandbox_claim.as_ref().unwrap();
+    exact_owned_storage_is_absent(
+        &ctx.client,
+        &ctx.namespace,
+        &[claim.uid.as_str()],
+        target.sandbox.as_ref(),
+    )
+    .await
+}
+
+/// Require the upstream Claim-UID Sandbox index to be empty.
+///
+/// This closes the create-after-observe race for cancelled Provisioning
+/// leases that never had a descendant UID to checkpoint. An unrecorded live
+/// Sandbox quarantines because its children cannot be joined safely after it
+/// disappears; a recorded live Sandbox is "not yet". Replacements and
+/// authorization failures are durable uncertainty.
+async fn claim_labelled_sandboxes_absent(
+    api: &Api<DynamicObject>,
+    claim_uid: &str,
+    recorded: Option<&SandboxObjectReference>,
+) -> TargetFootprintCheck {
+    let selector = format!("{UPSTREAM_CLAIM_UID_LABEL}={claim_uid}");
+    match api.list(&ListParams::default().labels(&selector)).await {
+        Ok(objects) if objects.items.is_empty() => TargetFootprintCheck::Verified,
+        Ok(objects) => match recorded {
+            Some(recorded)
+                if objects.items.len() == 1
+                    && objects.items[0].name_any() == recorded.name
+                    && objects.items[0].uid().as_deref() == Some(recorded.uid.as_str()) =>
+            {
+                TargetFootprintCheck::Retry("claim_labelled_sandbox_still_present")
+            }
+            Some(_) => TargetFootprintCheck::Quarantine("claim_labelled_sandbox_replaced"),
+            None => TargetFootprintCheck::Quarantine("claim_labelled_sandbox_unrecorded"),
+        },
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            TargetFootprintCheck::Quarantine("sandbox_enumeration_unverifiable")
+        }
+        Err(_) => TargetFootprintCheck::Retry("sandbox_enumeration_transient"),
+    }
+}
+
+/// Enumerate children whose controller owner is the exact recorded Sandbox.
+///
+/// Agent Sandbox v0.5.4 does not copy the Claim UID label onto Services (it
+/// uses a sandbox-name hash), so label-only proof would miss a late Service.
+/// Owner UID is the stable join shared by Pod, Service and PVC.
+async fn exact_owned_objects_absent(
+    api: &Api<DynamicObject>,
+    sandbox: &SandboxObjectReference,
+    recorded: Option<&SandboxObjectReference>,
+    present: &'static str,
+    replaced: &'static str,
+    unverifiable: &'static str,
+    transient: &'static str,
+) -> TargetFootprintCheck {
+    match api.list(&ListParams::default()).await {
+        Ok(objects) => {
+            let owned: Vec<_> = objects
+                .items
+                .into_iter()
+                .filter(|object| {
+                    metadata_is_controlled_by(
+                        &object.metadata,
+                        &sandbox.api_version,
+                        &sandbox.kind,
+                        &sandbox.name,
+                        &sandbox.uid,
+                    )
+                })
+                .collect();
+            if owned.is_empty() {
+                TargetFootprintCheck::Verified
+            } else if recorded.is_some_and(|recorded| {
+                owned.iter().any(|object| {
+                    object.name_any() == recorded.name
+                        && object.uid().as_deref() != Some(recorded.uid.as_str())
+                })
+            }) {
+                TargetFootprintCheck::Quarantine(replaced)
+            } else {
+                TargetFootprintCheck::Retry(present)
+            }
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            TargetFootprintCheck::Quarantine(unverifiable)
+        }
+        Err(_) => TargetFootprintCheck::Retry(transient),
+    }
+}
+
+/// Resolve Agent Sandbox owner chains when cancellation happened before Kobe
+/// could record a Sandbox UID.
+///
+/// A child whose owner Sandbox is already absent is deliberately treated as
+/// unresolved rather than unrelated: it may be the orphan left by this Claim.
+/// Live owners for another exact Claim can be excluded safely; everything else
+/// retries or quarantines while capacity stays held.
+async fn unresolved_sandbox_children_absent(
+    api: &Api<DynamicObject>,
+    sandboxes: &Api<DynamicObject>,
+    claim: &SandboxObjectReference,
+    present: &'static str,
+    unverifiable: &'static str,
+    transient: &'static str,
+) -> TargetFootprintCheck {
+    let objects = match api.list(&ListParams::default()).await {
+        Ok(objects) => objects,
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return TargetFootprintCheck::Quarantine(unverifiable);
+        }
+        Err(_) => return TargetFootprintCheck::Retry(transient),
+    };
+    for owner in objects.items.iter().filter_map(|object| {
+        object
+            .metadata
+            .owner_references
+            .as_ref()
+            .and_then(|owners| {
+                owners.iter().find(|owner| {
+                    owner.controller == Some(true)
+                        && owner.api_version
+                            == crate::controllers::sandbox_canary::SANDBOX_API_VERSION
+                        && owner.kind == crate::controllers::sandbox_canary::SANDBOX_KIND
+                })
+            })
+    }) {
+        match sandboxes.get(&owner.name).await {
+            Ok(sandbox) if sandbox.uid().as_deref() == Some(owner.uid.as_str()) => {
+                if metadata_is_controlled_by(
+                    &sandbox.metadata,
+                    &claim.api_version,
+                    &claim.kind,
+                    &claim.name,
+                    &claim.uid,
+                ) || sandbox
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(UPSTREAM_CLAIM_UID_LABEL))
+                    .is_some_and(|uid| uid == &claim.uid)
+                {
+                    return TargetFootprintCheck::Retry(present);
+                }
+            }
+            // A replacement or absent owner cannot prove this orphan belongs
+            // to another Claim; wait for garbage collection instead.
+            Ok(_) => {
+                return TargetFootprintCheck::Retry(present);
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return TargetFootprintCheck::Retry(present);
+            }
+            Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                return TargetFootprintCheck::Quarantine(unverifiable);
+            }
+            Err(_) => return TargetFootprintCheck::Retry(transient),
+        }
+    }
+    TargetFootprintCheck::Verified
+}
+
+/// Prove every management descendant absent behind an exact inert Claim.
+///
+/// The retained expired Claim keeps its deterministic name occupied, fencing
+/// delayed creates. The original workload Claim UID remains the join for
+/// descendants created before teardown; a replacement tombstone UID is also
+/// searched because a stale active POST may have won just before conversion.
+async fn management_target_footprint_absent(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    tombstone: &SandboxObjectReference,
+    prior_claim_uid: Option<&str>,
+) -> TargetFootprintCheck {
+    let validation = validate_management_target_provenance(lease, ctx).await;
+    if validation != TargetFootprintCheck::Verified {
+        return validation;
+    }
+    let target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
+    let claim = target.sandbox_claim.as_ref().unwrap();
+    if lease
+        .status
+        .as_ref()
+        .and_then(|status| status.sandbox_claim_tombstone.as_ref())
+        != Some(tombstone)
+        || prior_claim_uid != Some(claim.uid.as_str())
+        || !recorded_reference_is_exact(
+            tombstone,
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &ctx.namespace,
+        )
+        || tombstone.name != claim.name
+    {
+        return TargetFootprintCheck::Quarantine("claim_tombstone_provenance_invalid");
+    }
+    let sandbox = target.sandbox.as_ref();
+
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &sandbox_resource());
+    if let Some(sandbox) = sandbox {
+        let check = classify_exact_absence(
+            exact_object_absence(&sandboxes, sandbox, claim).await,
+            "sandbox_still_present",
+            "sandbox_identity_changed_during_teardown",
+            "sandbox_absence_unverifiable",
+            "sandbox_absence_transient",
+        );
+        if check != TargetFootprintCheck::Verified {
+            return check;
+        }
+    }
+
+    let pods: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &ctx.namespace,
+        &core_resource("Pod", "pods"),
+    );
+    if let (Some(pod), Some(sandbox)) = (target.pod.as_ref(), sandbox) {
+        let check = classify_exact_absence(
+            exact_object_absence(&pods, pod, sandbox).await,
+            "pod_still_present",
+            "pod_identity_changed_during_teardown",
+            "pod_absence_unverifiable",
+            "pod_absence_transient",
+        );
+        if check != TargetFootprintCheck::Verified {
+            return check;
+        }
+    }
+
+    let services: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &ctx.namespace,
+        &core_resource("Service", "services"),
+    );
+    if let (Some(service), Some(sandbox)) = (target.service.as_ref(), sandbox) {
+        let check = classify_exact_absence(
+            exact_object_absence(&services, service, sandbox).await,
+            "service_still_present",
+            "service_identity_changed_during_teardown",
+            "service_absence_unverifiable",
+            "service_absence_transient",
+        );
+        if check != TargetFootprintCheck::Verified {
+            return check;
+        }
+    }
+
+    let mut claim_refs = vec![claim];
+    if tombstone.uid != claim.uid {
+        claim_refs.push(tombstone);
+    }
+    for claim_ref in &claim_refs {
+        let check = claim_labelled_sandboxes_absent(&sandboxes, &claim_ref.uid, sandbox).await;
+        if check != TargetFootprintCheck::Verified {
+            return check;
+        }
+    }
+
+    if let Some(sandbox) = sandbox {
+        for check in [
+            exact_owned_objects_absent(
+                &pods,
+                sandbox,
+                target.pod.as_ref(),
+                "sandbox_owned_pod_still_present",
+                "sandbox_owned_pod_replaced",
+                "pod_enumeration_unverifiable",
+                "pod_enumeration_transient",
+            )
+            .await,
+            exact_owned_objects_absent(
+                &services,
+                sandbox,
+                target.service.as_ref(),
+                "sandbox_owned_service_still_present",
+                "sandbox_owned_service_replaced",
+                "service_enumeration_unverifiable",
+                "service_enumeration_transient",
+            )
+            .await,
+        ] {
+            if check != TargetFootprintCheck::Verified {
+                return check;
+            }
+        }
+    } else {
+        for claim_ref in &claim_refs {
+            for check in [
+                unresolved_sandbox_children_absent(
+                    &pods,
+                    &sandboxes,
+                    claim_ref,
+                    "unresolved_sandbox_owned_pod_present",
+                    "pod_owner_chain_unverifiable",
+                    "pod_owner_chain_transient",
+                )
+                .await,
+                unresolved_sandbox_children_absent(
+                    &services,
+                    &sandboxes,
+                    claim_ref,
+                    "unresolved_sandbox_owned_service_present",
+                    "service_owner_chain_unverifiable",
+                    "service_owner_chain_transient",
+                )
+                .await,
+            ] {
+                if check != TargetFootprintCheck::Verified {
+                    return check;
+                }
+            }
+        }
+    }
+
+    let claim_uids: Vec<_> = claim_refs
+        .iter()
+        .map(|claim_ref| claim_ref.uid.as_str())
+        .collect();
+    exact_owned_storage_is_absent(&ctx.client, &ctx.namespace, &claim_uids, sandbox).await
+}
+
 async fn drive_release(
     lease: &SandboxLease,
     ctx: &SandboxContext,
@@ -2278,7 +3134,7 @@ async fn drive_release(
     }
 
     // Scoped identities are externally usable capabilities. Remove and prove
-    // them absent before deleting the management Claim, including when an old
+    // them absent before retiring the management workload, including when an old
     // controller already checkpointed footprint absence. A lease without Pod
     // provenance could never mint one, so there is nothing to clean.
     if !child_placed
@@ -2356,7 +3212,11 @@ async fn drive_release(
         let observed = match claims.get(&claim).await {
             Ok(observed) => observed,
             Err(kube::Error::Api(error)) if error.code == 404 => {
-                return finish_release(lease, ctx, reason).await;
+                // A Claim can disappear before its Sandbox grandchildren. If
+                // its exact UID was never checkpointed there is no identity
+                // with which to prove those descendants absent.
+                return quarantine_lease(lease, ctx, "claim_provenance_missing_after_absence")
+                    .await;
             }
             Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
                 return quarantine_lease(lease, ctx, "claim_absence_unverifiable").await;
@@ -2417,50 +3277,80 @@ async fn drive_release(
         return quarantine_lease(lease, ctx, "claim_provenance_invalid").await;
     }
 
-    // Foreground propagation: the claim must not report gone while the Sandbox
-    // it owns is still running, because that reported absence is what releases
-    // the caller's quota slot.
-    let delete = DeleteParams {
-        propagation_policy: Some(PropagationPolicy::Foreground),
-        preconditions: Some(Preconditions {
-            uid: Some(recorded_claim.uid.clone()),
-            resource_version: None,
-        }),
-        ..Default::default()
-    };
-    match claims.delete(&claim, &delete).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(error)) if error.code == 404 => {}
-        Err(kube::Error::Api(error)) if error.code == 409 => {
-            return quarantine_lease(lease, ctx, "claim_uid_precondition_failed").await;
+    match checkpoint_management_descendants(lease, ctx, &claims).await {
+        ManagementDescendantCheckpoint::Current => {}
+        ManagementDescendantCheckpoint::Updated(target) => {
+            let mut next = status.clone();
+            next.target = Some(*target);
+            if patch_lease_status_fenced(ctx, lease, &next).await? {
+                info!(lease = %name, "checkpointed management descendants before teardown");
+            } else {
+                debug!(lease = %name, "descendant checkpoint lost a status race");
+            }
+            return Ok(Action::await_change());
         }
-        // Cannot even ask for deletion. Retry — this is not yet evidence of
-        // anything, and quarantining on a transient error would strand
-        // capacity that is fine.
-        Err(error) => {
-            warn!(lease = %name, error = %error, "could not delete upstream claim");
+        ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Retry(check)) => {
+            debug!(lease = %name, check, "management descendant checkpoint will retry");
             return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+        ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Quarantine(check)) => {
+            return quarantine_lease(lease, ctx, check).await;
+        }
+        ManagementDescendantCheckpoint::Check(TargetFootprintCheck::Verified) => {}
+    }
+
+    match preflight_management_target(lease, ctx).await {
+        TargetFootprintCheck::Verified => {}
+        TargetFootprintCheck::Retry(check) => {
+            debug!(lease = %name, check, "management teardown preflight will retry");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+        TargetFootprintCheck::Quarantine(check) => {
+            return quarantine_lease(lease, ctx, check).await;
         }
     }
 
-    // Only a 404 proves absence. A successful DELETE means "accepted", and a
-    // claim mid-foreground-deletion is still very much there.
-    match claim_absence(&claims, &claim, &recorded_claim.uid).await {
-        ClaimAbsence::Verified => {}
-        // Not gone yet. Foreground deletion takes as long as the Sandbox takes
-        // to stop, and "still deleting" is a normal state, not a fault. The
-        // lease stays in Releasing and keeps holding its slot meanwhile.
-        ClaimAbsence::StillPresent => {
-            debug!(lease = %name, "upstream claim still present; waiting for teardown");
+    // Keep the deterministic Claim name occupied by an exact expired `Retain`
+    // tombstone. Deleting it would reopen the name for a delayed stale POST,
+    // allowing workload to resurrect after FootprintAbsent was checkpointed.
+    let (tombstone, prior_claim_uid) =
+        match ensure_management_claim_tombstone(lease, ctx, &claims).await? {
+            ManagementClaimTombstone::Checkpointed => return Ok(Action::await_change()),
+            ManagementClaimTombstone::Ready {
+                claim: current,
+                tombstone_ref,
+                prior_claim_uid,
+            } => {
+                if require_exact_reference(
+                    &tombstone_ref,
+                    AGENT_SANDBOX_API_VERSION,
+                    SANDBOX_CLAIM_KIND,
+                    &ctx.namespace,
+                    &claim,
+                    &current,
+                )
+                .is_err()
+                {
+                    return quarantine_lease(lease, ctx, "claim_tombstone_identity_changed").await;
+                }
+                (tombstone_ref, prior_claim_uid)
+            }
+            ManagementClaimTombstone::Retry(after) => return Ok(Action::requeue(after)),
+            ManagementClaimTombstone::Quarantine(check) => {
+                return quarantine_lease(lease, ctx, check).await;
+            }
+        };
+
+    match management_target_footprint_absent(lease, ctx, &tombstone, prior_claim_uid.as_deref())
+        .await
+    {
+        TargetFootprintCheck::Verified => {}
+        TargetFootprintCheck::Retry(check) => {
+            debug!(lease = %name, check, "recorded management footprint is not absent yet");
             return Ok(Action::requeue(std::time::Duration::from_secs(10)));
         }
-        // We are not permitted to look, and retrying will not grant the
-        // permission. This is durable uncertainty.
-        ClaimAbsence::Unverifiable => {
-            return quarantine_lease(lease, ctx, "claim_absence_unverifiable").await;
-        }
-        ClaimAbsence::Replaced => {
-            return quarantine_lease(lease, ctx, "claim_identity_changed_during_teardown").await;
+        TargetFootprintCheck::Quarantine(check) => {
+            return quarantine_lease(lease, ctx, check).await;
         }
     }
 
@@ -2470,10 +3360,11 @@ async fn drive_release(
 
 /// Release the admission reservations and reach the terminal phase.
 ///
-/// Only ever called once the footprint has been *proven* absent — by the claim
-/// for management placement, by the child cluster for a composition. Both
-/// placements share this tail so their release semantics cannot drift apart,
-/// which is the equivalence #76 sets out to prove.
+/// Only ever called once the footprint has been *proven* absent — by an exact
+/// Claim tombstone plus descendant scans for management placement, or by the
+/// child cluster for a composition. Both placements share this tail so their
+/// release semantics cannot drift apart, which is the equivalence #76 sets
+/// out to prove.
 async fn finish_release(
     lease: &SandboxLease,
     ctx: &SandboxContext,
@@ -3478,52 +4369,6 @@ async fn acknowledge_unbound_child_proof(
         Ok(_) => Ok(true),
         Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
         Err(error) => Err(error.into()),
-    }
-}
-
-/// What one absence check established.
-///
-/// Three outcomes, not two, because "still there" and "cannot tell" call for
-/// opposite responses: the first is a normal step in a deletion that is still
-/// running, the second means the evidence will never arrive. Collapsing them
-/// would either quarantine every healthy teardown or release capacity on the
-/// strength of an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaimAbsence {
-    /// Observed absent. The only outcome that releases capacity.
-    Verified,
-    /// Still responding — including mid-deletion, with a `deletionTimestamp`.
-    StillPresent,
-    /// The recorded claim is gone, but its name now resolves to another UID.
-    /// That object is never deleted or counted as proof of clean teardown.
-    Replaced,
-    /// The question could not be answered and retrying will not change that.
-    Unverifiable,
-}
-
-/// Whether the upstream claim is provably gone.
-///
-/// Absence is proven by a 404 and nothing else. Reading "I could not check" as
-/// "it is gone" is how a live Sandbox's capacity gets handed to somebody else.
-async fn claim_absence(
-    claims: &Api<DynamicObject>,
-    claim: &str,
-    expected_uid: &str,
-) -> ClaimAbsence {
-    match claims.get(claim).await {
-        Ok(current) if current.uid().as_deref() == Some(expected_uid) => ClaimAbsence::StillPresent,
-        Ok(_) => ClaimAbsence::Replaced,
-        Err(kube::Error::Api(error)) if error.code == 404 => ClaimAbsence::Verified,
-        // Not permitted to look. Retrying will not grant the permission, so
-        // this is durable uncertainty rather than a transient failure.
-        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-            ClaimAbsence::Unverifiable
-        }
-        // Anything else — a 500, a timeout, a torn connection — may well clear
-        // on its own. Treat it as "not yet" and come back; the lease keeps
-        // holding its capacity in the meantime, so waiting costs correctness
-        // nothing.
-        Err(_) => ClaimAbsence::StillPresent,
     }
 }
 
@@ -4790,7 +5635,7 @@ pub(crate) mod tests {
         SandboxTemplateSpec,
     };
     use kube::api::ObjectMeta;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const NS: &str = "test-ns";
@@ -4811,9 +5656,14 @@ pub(crate) mod tests {
         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxtemplates/kobe-agents";
     const WARM_POOL_PATH: &str =
         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxwarmpools/kobe-agents";
+    const SANDBOXES_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes";
     const SANDBOX_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx";
     const PODS_PATH: &str = "/api/v1/namespaces/test-ns/pods";
+    const POD_PATH: &str = "/api/v1/namespaces/test-ns/pods/sandbox-pod";
+    const SERVICES_PATH: &str = "/api/v1/namespaces/test-ns/services";
     const SERVICE_PATH: &str = "/api/v1/namespaces/test-ns/services/sandbox-service";
+    const PVCS_PATH: &str = "/api/v1/namespaces/test-ns/persistentvolumeclaims";
+    const PVS_PATH: &str = "/api/v1/persistentvolumes";
     const LEASE_STATUS_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1/status";
     const LEASE_PATH: &str =
@@ -5095,6 +5945,27 @@ pub(crate) mod tests {
             },
             "status": status,
         })
+    }
+
+    fn tombstone_claim_json(uid: &str, prior_claim_uid: Option<&str>) -> serde_json::Value {
+        let mut claim = claim_json(serde_json::json!({}));
+        claim["metadata"]["uid"] = uid.into();
+        claim["metadata"]["annotations"] = serde_json::json!({
+            SANDBOX_CLAIM_TOMBSTONE_RETAIN_UNTIL_ANNOTATION:
+                (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()
+        });
+        if let Some(prior_claim_uid) = prior_claim_uid {
+            claim["metadata"]["labels"][SANDBOX_CLAIM_TOMBSTONE_PRIOR_UID_LABEL] =
+                prior_claim_uid.into();
+        }
+        claim["spec"] = serde_json::json!({
+            "warmPoolRef": { "name": "kobe-agents" },
+            "lifecycle": {
+                "shutdownTime": (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                "shutdownPolicy": "Retain"
+            }
+        });
+        claim
     }
 
     async fn mount_resolved_sandbox(server: &MockServer) {
@@ -6864,20 +7735,6 @@ pub(crate) mod tests {
     async fn remediated_quarantine_releases_only_after_fresh_proof() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path(CLAIM_PATH))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(CLAIM_PATH))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
-            })))
-            .mount(&server)
-            .await;
         Mock::given(method("PATCH"))
             .and(path(LEASE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
@@ -7052,6 +7909,10 @@ pub(crate) mod tests {
         ) {
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
         }
+        status.sandbox_claim_tombstone = status
+            .target
+            .as_ref()
+            .and_then(|target| target.sandbox_claim.clone());
         lease
     }
 
@@ -7357,7 +8218,10 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Mount the status PATCH and the reservation list/delete a teardown needs.
+    /// Mount the status PATCH, empty exact footprint, and reservation tail.
+    ///
+    /// Footprint mocks are deliberately low priority so an invariant test can
+    /// replace one observation without rebuilding the rest of the teardown.
     async fn mount_teardown_scaffolding(server: &MockServer) {
         Mock::given(method("PATCH"))
             .and(path(LEASE_STATUS_PATH))
@@ -7367,6 +8231,15 @@ pub(crate) mod tests {
                 "metadata": { "name": LEASE, "namespace": NS },
                 "spec": admitted_lease().spec,
             })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(tombstone_claim_json("claim-uid", Some("claim-uid"))),
+            )
+            .with_priority(10)
             .mount(server)
             .await;
         Mock::given(method("GET"))
@@ -7406,6 +8279,433 @@ pub(crate) mod tests {
             })))
             .mount(server)
             .await;
+        for path_value in [SANDBOX_PATH, POD_PATH, SERVICE_PATH] {
+            Mock::given(method("GET"))
+                .and(path(path_value))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+                })))
+                .with_priority(10)
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(SANDBOXES_PATH))
+            .and(query_param(
+                "labelSelector",
+                format!("{UPSTREAM_CLAIM_UID_LABEL}=claim-uid"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": "SandboxList", "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .with_priority(10)
+            .mount(server)
+            .await;
+        for (path_value, kind) in [(PODS_PATH, "PodList"), (SERVICES_PATH, "ServiceList")] {
+            Mock::given(method("GET"))
+                .and(path(path_value))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "v1", "kind": kind,
+                    "metadata": { "resourceVersion": "1" }, "items": []
+                })))
+                .with_priority(10)
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(PVCS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaimList",
+                "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .with_priority(10)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PVS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeList",
+                "metadata": { "resourceVersion": "1" }, "items": []
+            })))
+            .with_priority(10)
+            .mount(server)
+            .await;
+    }
+
+    /// An exact Claim tombstone is only one part of proof: a recorded Pod that
+    /// is still present keeps both the footprint checkpoint and capacity held.
+    #[tokio::test]
+    async fn claim_tombstone_waits_for_recorded_pod_absence() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(POD_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": "sandbox-pod", "namespace": NS, "uid": "pod-uid",
+                    "ownerReferences": [{
+                        "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                        "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                        "name": "sbx", "uid": "sandbox-uid", "controller": true
+                    }]
+                }
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(
+            Arc::new(releasing_lease(crate::crd::SandboxLeasePhase::Releasing)),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(recorded_phases(&server).await, Vec::<String>::new());
+        assert_eq!(requests_to(&server, "GET", POD_PATH).await, 1);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+    }
+
+    /// A same-named downstream object with another UID is not evidence that
+    /// the recorded object disappeared cleanly; teardown quarantines.
+    #[tokio::test]
+    async fn same_named_downstream_replacement_quarantines() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOX_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                "metadata": { "name": "sbx", "namespace": NS, "uid": "replacement-uid" }
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(
+            Arc::new(releasing_lease(crate::crd::SandboxLeasePhase::Releasing)),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+        assert_eq!(requests_to(&server, "GET", POD_PATH).await, 0);
+    }
+
+    /// Authorization failures are durable uncertainty, while an ordinary API
+    /// outage retries without converting uncertainty into absence.
+    #[tokio::test]
+    async fn downstream_absence_errors_fail_closed() {
+        for (code, reason, quarantined) in [
+            (401, "Unauthorized", true),
+            (403, "Forbidden", true),
+            (500, "InternalError", false),
+        ] {
+            let (ctx, server) = test_context().await;
+            mount_teardown_scaffolding(&server).await;
+            Mock::given(method("GET"))
+                .and(path(SERVICE_PATH))
+                .respond_with(
+                    ResponseTemplate::new(code).set_body_json(serde_json::json!({
+                        "kind": "Status", "status": "Failure", "code": code, "reason": reason
+                    })),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+
+            let action = reconcile_lease(
+                Arc::new(releasing_lease(crate::crd::SandboxLeasePhase::Releasing)),
+                ctx,
+            )
+            .await
+            .unwrap();
+            if quarantined {
+                assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+                assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+            } else {
+                assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+                assert_eq!(recorded_phases(&server).await, Vec::<String>::new());
+            }
+            assert_eq!(
+                requests_to(
+                    &server,
+                    "DELETE",
+                    &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+                )
+                .await,
+                0
+            );
+        }
+    }
+
+    /// Exposed ports require an exact Service UID checkpoint. Pool identity is
+    /// rechecked before using its template as that requirement proof.
+    #[tokio::test]
+    async fn exposed_ports_without_service_provenance_quarantine_before_tombstone_proof() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .service = None;
+        lease.status.as_mut().unwrap().ready_at = Some(chrono::Utc::now().to_rfc3339());
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", PVCS_PATH).await, 0);
+    }
+
+    /// Storage is disallowed, so an exact Sandbox-owned PVC and its bound PV
+    /// are retained as quarantine evidence and never silently ignored.
+    #[tokio::test]
+    async fn exact_owned_pvc_and_associated_pv_quarantine_before_tombstone_conversion() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(PVCS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaimList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [{
+                    "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "name": "data", "namespace": NS, "uid": "pvc-uid",
+                        "ownerReferences": [{
+                            "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                            "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                            "name": "sbx", "uid": "sandbox-uid", "controller": true
+                        }]
+                    }
+                }]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PVS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [{
+                    "apiVersion": "v1", "kind": "PersistentVolume",
+                    "metadata": { "name": "pv-data", "uid": "pv-uid" },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "capacity": { "storage": "1Gi" },
+                        "persistentVolumeReclaimPolicy": "Retain",
+                        "claimRef": { "namespace": NS, "name": "data", "uid": "pvc-uid" }
+                    }
+                }]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let action = reconcile_lease(
+            Arc::new(releasing_lease(crate::crd::SandboxLeasePhase::Releasing)),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+        assert_eq!(requests_to(&server, "GET", PVS_PATH).await, 1);
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+    }
+
+    /// Cancelling before the upstream controller assigns a Sandbox is a clean
+    /// teardown only after Claim-UID scoped descendant lists are all empty.
+    #[tokio::test]
+    async fn cancel_while_provisioning_without_assigned_sandbox_finishes_cleanly() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.sandbox = None;
+        target.pod = None;
+        target.service = None;
+
+        let action = reconcile_release_after_checkpoint(lease, ctx, &server).await;
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            recorded_phases(&server).await,
+            vec!["Releasing".to_string(), "Released".to_string()]
+        );
+        assert_eq!(requests_to(&server, "GET", SANDBOXES_PATH).await, 1);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            1
+        );
+    }
+
+    /// A descendant created after Claim observation is caught by the exact
+    /// Claim-UID index and quarantined when no durable Sandbox UID exists.
+    #[tokio::test]
+    async fn late_created_claim_labelled_descendant_retains_capacity() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOXES_PATH))
+            .and(query_param(
+                "labelSelector",
+                format!("{UPSTREAM_CLAIM_UID_LABEL}=claim-uid"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": "SandboxList", "metadata": { "resourceVersion": "2" },
+                "items": [{
+                    "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                    "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                    "metadata": {
+                        "name": "late-sbx", "namespace": NS, "uid": "late-sandbox-uid",
+                        "labels": { (UPSTREAM_CLAIM_UID_LABEL): "claim-uid" },
+                        "ownerReferences": [{
+                            "apiVersion": AGENT_SANDBOX_API_VERSION,
+                            "kind": SANDBOX_CLAIM_KIND, "name": "kobe-sbx-1",
+                            "uid": "claim-uid", "controller": true
+                        }]
+                    }
+                }]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.sandbox = None;
+        target.pod = None;
+        target.service = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+    }
+
+    /// Agent Sandbox v0.5.4 Services have only a Sandbox owner UID (not the
+    /// Claim UID label). Exact-owner enumeration still catches a late Service.
+    #[tokio::test]
+    async fn late_service_without_claim_uid_label_retains_capacity() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(SERVICES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "ServiceList",
+                "metadata": { "resourceVersion": "2" },
+                "items": [{
+                    "apiVersion": "v1", "kind": "Service",
+                    "metadata": {
+                        "name": "late-service", "namespace": NS, "uid": "late-service-uid",
+                        "labels": { "agents.x-k8s.io/sandbox-name-hash": "opaque" },
+                        "ownerReferences": [{
+                            "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                            "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                            "name": "sbx", "uid": "sandbox-uid", "controller": true
+                        }]
+                    }
+                }]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.sandbox = None;
+        target.pod = None;
+        target.service = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(10)));
+        assert_eq!(recorded_phases(&server).await, Vec::<String>::new());
+        assert_eq!(requests_to(&server, "GET", SERVICES_PATH).await, 1);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+    }
+
+    /// If the Claim already identifies a live Sandbox, teardown checkpoints
+    /// all discoverable exact descendant UIDs before tombstone conversion.
+    #[tokio::test]
+    async fn live_claim_descendants_are_checkpointed_before_tombstone_conversion() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        mount_resolved_sandbox(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(claim_json(
+                serde_json::json!({ "sandbox": { "name": "sbx" } }),
+            )))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.sandbox = None;
+        target.pod = None;
+        target.service = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        let status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("descendant checkpoint");
+        assert_eq!(status["target"]["sandbox"]["uid"], "sandbox-uid");
+        assert_eq!(status["target"]["pod"]["uid"], "pod-uid");
+        assert_eq!(status["target"]["service"]["uid"], "service-uid");
     }
 
     /// Let one status writer win, then make every stale writer lose its
@@ -7433,9 +8733,9 @@ pub(crate) mod tests {
 
     /// A crash can land after CREATE but before the claim UID checkpoint. The
     /// release path first recovers the exact lease-owned identity and ends the
-    /// pass; it never deletes an object known only by a derived name.
+    /// pass; it never converts an object known only by a derived name.
     #[tokio::test]
-    async fn teardown_recovers_missing_claim_provenance_before_delete() {
+    async fn teardown_recovers_missing_claim_provenance_before_tombstone_conversion() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
         Mock::given(method("GET"))
@@ -7557,9 +8857,8 @@ pub(crate) mod tests {
         assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
     }
 
-    /// A successful DELETE is only an acknowledgement. If the same name is
-    /// already occupied by another UID when absence is checked, teardown is
-    /// unproven and the reservation remains held.
+    /// If the recorded Claim name is already occupied by another UID, the
+    /// pre-teardown descendant checkpoint quarantines before touching it.
     #[tokio::test]
     async fn teardown_rejects_a_same_named_claim_replacement() {
         let (ctx, server) = test_context().await;
@@ -7582,7 +8881,7 @@ pub(crate) mod tests {
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
         let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
         assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
-        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 1);
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
         assert_eq!(
             requests_to(
                 &server,
@@ -7712,11 +9011,12 @@ pub(crate) mod tests {
     async fn quarantine_status_conflict_cannot_write_through_name_reuse() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path(CLAIM_PATH))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "kind": "Status", "status": "Failure", "code": 409, "reason": "Conflict"
+        Mock::given(method("GET"))
+            .and(path(SERVICE_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 403, "reason": "Forbidden"
             })))
+            .with_priority(1)
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))
@@ -8009,26 +9309,12 @@ pub(crate) mod tests {
     /// The quota slot is what stops a pool being over-subscribed. Returning it
     /// while the workload is still running would let the next caller be placed
     /// onto capacity that is still occupied — so the reservation is released
-    /// only after the claim is observed absent, never merely after a DELETE was
-    /// accepted.
+    /// only after the exact Claim tombstone is held and every descendant is
+    /// observed absent.
     #[tokio::test]
-    async fn capacity_returns_only_once_the_claim_is_proven_gone() {
+    async fn capacity_returns_only_once_tombstone_and_descendants_are_proven() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path(CLAIM_PATH))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(CLAIM_PATH))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
-            })))
-            .mount(&server)
-            .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
         reconcile_release_after_checkpoint(lease, ctx, &server).await;
@@ -8042,23 +9328,18 @@ pub(crate) mod tests {
             ],
             "intent and footprint proof must be durable before the terminal write"
         );
-        let delete = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .find(|request| request.method.as_str() == "DELETE" && request.url.path() == CLAIM_PATH)
-            .expect("claim DELETE");
-        let delete_options: serde_json::Value =
-            serde_json::from_slice(&delete.body).expect("DeleteOptions body");
-        assert_eq!(delete_options["preconditions"]["uid"], "claim-uid");
+        assert_eq!(
+            requests_to(&server, "DELETE", CLAIM_PATH).await,
+            0,
+            "the tombstone must keep the deterministic Claim name occupied"
+        );
         let requests = server.received_requests().await.unwrap_or_default();
-        let claim_delete = requests
+        let first_claim_read = requests
             .iter()
             .position(|request| {
-                request.method.as_str() == "DELETE" && request.url.path() == CLAIM_PATH
+                request.method.as_str() == "GET" && request.url.path() == CLAIM_PATH
             })
-            .unwrap();
+            .expect("exact tombstone read");
         let credential_checks: Vec<_> = requests
             .iter()
             .enumerate()
@@ -8073,10 +9354,10 @@ pub(crate) mod tests {
         assert_eq!(
             credential_checks
                 .iter()
-                .filter(|credential_check| **credential_check < claim_delete)
+                .filter(|credential_check| **credential_check < first_claim_read)
                 .count(),
             12,
-            "all four operations x three identity objects must be proven absent before Claim deletion"
+            "all four operations x three identity objects must be proven absent before tombstone proof"
         );
         assert_eq!(
             requests_to(
@@ -8090,11 +9371,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// RBAC uncertainty stops before Claim deletion and quota release. A 403
+    /// RBAC uncertainty stops before tombstone proof and quota release. A 403
     /// is not evidence that an identity is absent, so the finalizer must retain
     /// the whole lease for operator inspection.
     #[tokio::test]
-    async fn unverifiable_scoped_identity_quarantines_before_claim_delete() {
+    async fn unverifiable_scoped_identity_quarantines_before_tombstone_proof() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
         let first_name = crate::api::sandbox_credentials::credential_name(
@@ -8132,24 +9413,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// A claim that is still there is "not yet", not "gone" and not "broken".
-    ///
-    /// Foreground deletion takes as long as the Sandbox takes to stop. If that
-    /// window released the quota slot, a pool would be over-subscribed for
-    /// exactly as long as teardown takes — the busiest possible moment. The
-    /// lease stays in Releasing and keeps holding its capacity.
+    /// A deleting Claim cannot be the durable name tombstone. Its name lock is
+    /// about to disappear, so cleanup quarantines and keeps holding capacity.
     #[tokio::test]
-    async fn a_claim_still_being_deleted_holds_its_capacity() {
+    async fn a_deleting_claim_quarantines_and_holds_capacity() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path(CLAIM_PATH))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
-            )
-            .mount(&server)
-            .await;
-        // Present, with a deletionTimestamp: accepted, not finished.
         Mock::given(method("GET"))
             .and(path(CLAIM_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -8167,16 +9436,12 @@ pub(crate) mod tests {
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
         let action = reconcile_release_after_checkpoint(lease, ctx, &server).await;
-        assert_ne!(
-            action,
-            Action::await_change(),
-            "teardown must be re-checked"
-        );
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
 
         assert_eq!(
             recorded_phases(&server).await,
-            vec!["Releasing".to_string()],
-            "no terminal phase while the Sandbox may still be running"
+            vec!["Releasing".to_string(), "Quarantined".to_string()],
+            "a disappearing Claim name is not a durable resurrection fence"
         );
         assert_eq!(
             requests_to(
@@ -8251,20 +9516,6 @@ pub(crate) mod tests {
     async fn an_elapsed_ttl_expires_the_lease_and_frees_its_slot() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        Mock::given(method("DELETE"))
-            .and(path(CLAIM_PATH))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(CLAIM_PATH))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
-            })))
-            .mount(&server)
-            .await;
 
         let mut lease = admitted_lease();
         let status = lease.status.as_mut().unwrap();
@@ -8277,6 +9528,7 @@ pub(crate) mod tests {
         assert_eq!(
             recorded_phases(&server).await,
             vec![
+                "Releasing".to_string(),
                 "Releasing".to_string(),
                 "Releasing".to_string(),
                 "Expired".to_string()
