@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use kube::api::{
-    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams,
+    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams, Preconditions,
     PropagationPolicy,
 };
 use kube::runtime::controller::{Action, Controller};
@@ -331,6 +331,33 @@ pub async fn reconcile_lease(
     // queuing, and not at readiness, which is what the runtime TTL is for.
     let mut status = lease.status.clone().unwrap_or_default();
     let observed_generation = lease.metadata.generation.unwrap_or_default();
+
+    if target.owned {
+        let Some(proposed) = observed_management_pool_provenance(&ctx, &pool, &status).await?
+        else {
+            debug!(lease = %name, "management Sandbox pool objects not ready");
+            return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+        };
+        let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        let merged = crate::sandbox::merge_target_provenance(
+            status.target.as_ref(),
+            proposed,
+            placement,
+            &ctx.namespace,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        if status.target.as_ref() != Some(&merged) {
+            status.target = Some(merged);
+            if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+                debug!(lease = %name, "recorded management pool provenance");
+            } else {
+                debug!(lease = %name, "management pool provenance write lost a status race");
+            }
+            return Ok(Action::await_change());
+        }
+    }
+
     if status.phase == crate::crd::SandboxLeasePhase::Pending {
         let provisioning_timeout = crate::pool::parse_duration(&pool.spec.provisioning_timeout)
             .ok_or_else(|| {
@@ -346,13 +373,16 @@ pub async fn reconcile_lease(
             provisioning_timeout,
         )
         .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-        patch_lease_status(&ctx, &name, &serde_json::json!(next)).await?;
-        info!(lease = %name, "Sandbox lease is provisioning");
-        // Carry on in the same pass with the status just written, rather than
-        // requeueing to read back what is already in hand. A lease that had to
-        // wait a whole reconcile between being accepted and being placed would
-        // spend that time doing nothing, and the deadline is already ticking.
-        status = next;
+        if patch_lease_status_fenced(&ctx, &lease, &next).await? {
+            info!(lease = %name, "Sandbox lease is provisioning");
+        } else {
+            debug!(lease = %name, "Provisioning checkpoint lost a status race");
+        }
+        // Every durable checkpoint ends this pass. A real apiserver increments
+        // resourceVersion on the write, so continuing with `lease` would make
+        // every later optimistic patch stale even though in-memory `next` is
+        // current in every other respect.
+        return Ok(Action::await_change());
     }
 
     let owner = lease.controller_owner_ref(&()).ok_or_else(|| {
@@ -371,19 +401,85 @@ pub async fn reconcile_lease(
     let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
     let claims: Api<DynamicObject> =
         Api::namespaced_with(target.client.clone(), &target.namespace, &resource);
-    match claims.create(&PostParams::default(), &claim).await {
-        Ok(_) => info!(lease = %name, "created upstream SandboxClaim"),
-        // Already placed. One claim per lease is the invariant, and this
-        // reconcile simply lost the race to satisfy it.
-        Err(kube::Error::Api(error)) if error.code == 409 => {
-            debug!(lease = %name, "claim already exists")
+    let recorded_claim = status
+        .target
+        .as_ref()
+        .and_then(|target| target.sandbox_claim.as_ref())
+        .cloned();
+    if recorded_claim.is_none() {
+        match claims.create(&PostParams::default(), &claim).await {
+            Ok(_) => info!(lease = %name, "created upstream SandboxClaim"),
+            // A controller may have crashed after CREATE and before recording
+            // the returned UID. GET plus the owner fence below recovers only
+            // that exact lease-owned allocation.
+            Err(kube::Error::Api(error)) if error.code == 409 => {
+                debug!(lease = %name, "claim already exists")
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => return Err(error.into()),
     }
 
     // The claim exists. Everything below turns "an object was created" into a
     // lease that is actually usable and actually bounded.
     let claim = claims.get(&claim_name(&name)).await?;
+    if let Some(recorded) = recorded_claim.as_ref() {
+        require_exact_reference(
+            recorded,
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &target.namespace,
+            &claim_name(&name),
+            &claim,
+        )?;
+    }
+    if target.owned {
+        let lease_uid = lease.uid().ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxLease {name} has no UID to fence its claim"
+            ))
+        })?;
+        if !is_controlled_by(
+            &claim,
+            "kobe.kunobi.ninja/v1alpha1",
+            "SandboxLease",
+            &name,
+            &lease_uid,
+        ) {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "SandboxClaim {} is not controlled by SandboxLease {name} uid {lease_uid}",
+                claim.name_any()
+            )));
+        }
+        let mut proposed = status.target.clone().ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "lease {name} has no management pool provenance before claim creation"
+            ))
+        })?;
+        proposed.sandbox_claim = Some(target_reference(
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &target.namespace,
+            &claim,
+        )?);
+        let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        let merged = crate::sandbox::merge_target_provenance(
+            status.target.as_ref(),
+            proposed,
+            placement,
+            &ctx.namespace,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        if status.target.as_ref() != Some(&merged) {
+            status.target = Some(merged);
+            if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+                debug!(lease = %name, "recorded management claim provenance");
+            } else {
+                debug!(lease = %name, "management claim provenance write lost a status race");
+            }
+            return Ok(Action::await_change());
+        }
+    }
     if !upstream_claim_is_ready(&claim) {
         debug!(lease = %name, "claim not Ready yet; TTL clock has not started");
         return Ok(Action::requeue(std::time::Duration::from_secs(10)));
@@ -425,21 +521,20 @@ pub async fn reconcile_lease(
             );
             return Ok(Action::requeue(std::time::Duration::from_secs(10)));
         }
-        patch_lease_status(
-            &ctx,
-            &name,
-            &serde_json::json!({
-                "conditions": with_condition(
-                    &lease,
-                    READINESS_CANARY_CONDITION,
-                    crate::crd::SandboxConditionStatus::True,
-                    "CanaryPassed",
-                    "Pool readiness canary exited zero inside the Sandbox",
-                ),
-            }),
-        )
-        .await?;
-        debug!(lease = %name, "readiness canary passed");
+        status.conditions = with_condition_for_status(
+            &status,
+            lease.metadata.generation,
+            READINESS_CANARY_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "CanaryPassed",
+            "Pool readiness canary exited zero inside the Sandbox",
+        );
+        if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+            debug!(lease = %name, "readiness canary passed");
+        } else {
+            warn!(lease = %name, "canary passed but its status checkpoint lost a race");
+        }
+        return Ok(Action::await_change());
     }
 
     // Record exactly which objects this lease resolved to. #81 routes every
@@ -447,8 +542,39 @@ pub async fn reconcile_lease(
     // a name reused between placement and access would send a caller's exec
     // into somebody else's Pod. Recorded here, where the objects have just
     // been observed, rather than looked up again at access time.
-    if let Some(provenance) = observed_provenance(&target, &claim, &lease).await {
+    if target.owned && !management_provenance_is_complete(&status) {
+        let provenance = match observed_provenance(&target, &claim, &status).await {
+            Ok(Some(provenance)) => provenance,
+            Ok(None) => {
+                debug!(lease = %name, "management Sandbox target provenance not ready");
+                return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+            }
+            Err(error) => return Err(SandboxPlacementError::Invalid(error)),
+        };
+        let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        let merged = crate::sandbox::merge_target_provenance(
+            status.target.as_ref(),
+            provenance,
+            placement,
+            &ctx.namespace,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        status.target = Some(merged);
+        if patch_lease_status_fenced(&ctx, &lease, &status).await? {
+            debug!(lease = %name, "recorded management Sandbox and Pod provenance");
+        } else {
+            debug!(lease = %name, "management target provenance write lost a status race");
+        }
+        return Ok(Action::await_change());
+    } else if !target.owned
+        && let Ok(Some(provenance)) = observed_provenance(&target, &claim, &status).await
+    {
         patch_lease_status(&ctx, &name, &serde_json::json!({ "target": provenance })).await?;
+    }
+
+    if target.owned && !management_provenance_is_complete(&status) {
+        return Ok(Action::requeue(std::time::Duration::from_secs(10)));
     }
 
     // Runtime TTL starts HERE, at observed readiness — not when the request
@@ -533,7 +659,14 @@ pub async fn reconcile_lease(
 
     // Only now is the lease Ready: the Sandbox exists, and its shutdown is
     // bounded even if this controller never runs again.
-    patch_lease_status(&ctx, &name, &serde_json::json!(next_status)).await?;
+    if target.owned {
+        if !patch_lease_status_fenced(&ctx, &lease, &next_status).await? {
+            debug!(lease = %name, "Ready write lost a status race");
+            return Ok(Action::await_change());
+        }
+    } else {
+        patch_lease_status(&ctx, &name, &serde_json::json!(next_status)).await?;
+    }
     info!(lease = %name, "Sandbox lease Ready; runtime TTL started");
 
     Ok(Action::requeue(std::time::Duration::from_secs(30)))
@@ -590,8 +723,6 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
         crate::crd::SandboxLeasePhase::Released
         | crate::crd::SandboxLeasePhase::Expired
         | crate::crd::SandboxLeasePhase::Quarantined => return None,
-        // Already releasing: teardown was interrupted and is not proven done.
-        crate::crd::SandboxLeasePhase::Releasing => return Some(ReleaseReason::InProgress),
         _ => {}
     }
 
@@ -602,14 +733,29 @@ fn release_reason(lease: &SandboxLease) -> Option<ReleaseReason> {
         return Some(ReleaseReason::Requested);
     }
 
-    // An unparseable expiry is NOT treated as expired. Deleting a live
+    let now = chrono::Utc::now();
+    // An unparseable deadline is NOT treated as elapsed. Deleting a live
     // workload because a timestamp failed to parse is the more damaging
     // reading of the same uncertainty; the lease stays put and stays visible.
-    let expires_at = status
+    let runtime_elapsed = status
         .expires_at
         .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
-    (chrono::Utc::now() >= expires_at).then_some(ReleaseReason::Expired)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|deadline| now >= deadline);
+    let provisioning_elapsed = status.ready_at.is_none()
+        && status
+            .provisioning_deadline
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|deadline| now >= deadline);
+    if runtime_elapsed || provisioning_elapsed {
+        return Some(ReleaseReason::Expired);
+    }
+
+    // Already releasing without a surviving request/deadline signal: teardown
+    // was interrupted and is not proven done. The two durable signals above
+    // preserve the original terminal outcome across the phase checkpoint.
+    (status.phase == crate::crd::SandboxLeasePhase::Releasing).then_some(ReleaseReason::InProgress)
 }
 
 /// Tear one lease down and give its capacity back — but only against proof.
@@ -643,13 +789,14 @@ async fn drive_release(
             false,
         )
         .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-        patch_lease_status(
-            ctx,
-            &name,
-            &serde_json::json!({ "phase": phase, "message": reason.as_str() }),
-        )
-        .await?;
-        info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
+        let mut next = status.clone();
+        next.phase = phase;
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            info!(lease = %name, reason = reason.as_str(), "releasing Sandbox lease");
+        } else {
+            debug!(lease = %name, "Releasing checkpoint lost a status race");
+        }
+        return Ok(Action::await_change());
     }
 
     // A child-placed lease is torn down by destroying its cluster, not by
@@ -668,17 +815,102 @@ async fn drive_release(
     let claims: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &resource);
     let claim = claim_name(&name);
+    let recorded_claim = status
+        .target
+        .as_ref()
+        .and_then(|target| target.sandbox_claim.as_ref())
+        .cloned();
+
+    // Older objects and create-before-checkpoint crashes may have a live claim
+    // but no recorded UID. Recover only an object controlled by this exact
+    // lease, persist its identity, and end the pass before deleting anything.
+    let recorded_claim = if let Some(recorded) = recorded_claim {
+        recorded
+    } else {
+        let observed = match claims.get(&claim).await {
+            Ok(observed) => observed,
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return finish_release(lease, ctx, reason).await;
+            }
+            Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                return quarantine_lease(lease, ctx, "claim_absence_unverifiable").await;
+            }
+            Err(error) => {
+                warn!(lease = %name, error = %error, "could not recover upstream claim identity");
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+        };
+        let lease_uid = lease.uid().ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxLease {name} has no UID to recover claim provenance"
+            ))
+        })?;
+        if !is_controlled_by(
+            &observed,
+            "kobe.kunobi.ninja/v1alpha1",
+            "SandboxLease",
+            &name,
+            &lease_uid,
+        ) {
+            return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
+        }
+        let reference = target_reference(
+            AGENT_SANDBOX_API_VERSION,
+            SANDBOX_CLAIM_KIND,
+            &ctx.namespace,
+            &observed,
+        )?;
+        let mut next = status.clone();
+        let target = next
+            .target
+            .get_or_insert_with(|| crate::crd::SandboxTargetProvenance {
+                namespace: ctx.namespace.clone(),
+                child_cluster_lease: None,
+                child_cluster_instance: None,
+                sandbox_template: None,
+                sandbox_warm_pool: None,
+                sandbox_claim: None,
+                sandbox: None,
+                pod: None,
+            });
+        if target.namespace != ctx.namespace {
+            return quarantine_lease(lease, ctx, "claim_namespace_changed").await;
+        }
+        target.sandbox_claim = Some(reference);
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            info!(lease = %name, "recovered management claim provenance before teardown");
+        } else {
+            debug!(lease = %name, "claim recovery checkpoint lost a status race");
+        }
+        return Ok(Action::await_change());
+    };
+
+    if recorded_claim.api_version != AGENT_SANDBOX_API_VERSION
+        || recorded_claim.kind != SANDBOX_CLAIM_KIND
+        || recorded_claim.namespace.as_deref() != Some(ctx.namespace.as_str())
+        || recorded_claim.name != claim
+        || recorded_claim.uid.is_empty()
+    {
+        return quarantine_lease(lease, ctx, "claim_provenance_invalid").await;
+    }
 
     // Foreground propagation: the claim must not report gone while the Sandbox
     // it owns is still running, because that reported absence is what releases
     // the caller's quota slot.
     let delete = DeleteParams {
         propagation_policy: Some(PropagationPolicy::Foreground),
+        preconditions: Some(Preconditions {
+            uid: Some(recorded_claim.uid.clone()),
+            resource_version: None,
+        }),
         ..Default::default()
     };
     match claims.delete(&claim, &delete).await {
         Ok(_) => {}
         Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            return quarantine_lease(lease, ctx, "claim_uid_precondition_failed").await;
+        }
         // Cannot even ask for deletion. Retry — this is not yet evidence of
         // anything, and quarantining on a transient error would strand
         // capacity that is fine.
@@ -690,7 +922,7 @@ async fn drive_release(
 
     // Only a 404 proves absence. A successful DELETE means "accepted", and a
     // claim mid-foreground-deletion is still very much there.
-    match claim_absence(&claims, &claim).await {
+    match claim_absence(&claims, &claim, &recorded_claim.uid).await {
         ClaimAbsence::Verified => {}
         // Not gone yet. Foreground deletion takes as long as the Sandbox takes
         // to stop, and "still deleting" is a normal state, not a fault. The
@@ -703,6 +935,9 @@ async fn drive_release(
         // permission. This is durable uncertainty.
         ClaimAbsence::Unverifiable => {
             return quarantine_lease(lease, ctx, "claim_absence_unverifiable").await;
+        }
+        ClaimAbsence::Replaced => {
+            return quarantine_lease(lease, ctx, "claim_identity_changed_during_teardown").await;
         }
     }
 
@@ -1032,6 +1267,9 @@ enum ClaimAbsence {
     Verified,
     /// Still responding — including mid-deletion, with a `deletionTimestamp`.
     StillPresent,
+    /// The recorded claim is gone, but its name now resolves to another UID.
+    /// That object is never deleted or counted as proof of clean teardown.
+    Replaced,
     /// The question could not be answered and retrying will not change that.
     Unverifiable,
 }
@@ -1040,9 +1278,14 @@ enum ClaimAbsence {
 ///
 /// Absence is proven by a 404 and nothing else. Reading "I could not check" as
 /// "it is gone" is how a live Sandbox's capacity gets handed to somebody else.
-async fn claim_absence(claims: &Api<DynamicObject>, claim: &str) -> ClaimAbsence {
+async fn claim_absence(
+    claims: &Api<DynamicObject>,
+    claim: &str,
+    expected_uid: &str,
+) -> ClaimAbsence {
     match claims.get(claim).await {
-        Ok(_) => ClaimAbsence::StillPresent,
+        Ok(current) if current.uid().as_deref() == Some(expected_uid) => ClaimAbsence::StillPresent,
+        Ok(_) => ClaimAbsence::Replaced,
         Err(kube::Error::Api(error)) if error.code == 404 => ClaimAbsence::Verified,
         // Not permitted to look. Retrying will not grant the permission, so
         // this is durable uncertainty rather than a transient failure.
@@ -1144,11 +1387,29 @@ fn with_condition(
     reason: &str,
     message: &str,
 ) -> Vec<crate::crd::SandboxCondition> {
-    let existing = lease
-        .status
-        .as_ref()
-        .map(|status| status.conditions.clone())
-        .unwrap_or_default();
+    let status_value = lease.status.clone().unwrap_or_default();
+    with_condition_for_status(
+        &status_value,
+        lease.metadata.generation,
+        condition_type,
+        status,
+        reason,
+        message,
+    )
+}
+
+/// Upsert a condition into the current in-memory status. Reconcile checkpoints
+/// use this form so a later full-status write cannot erase a condition written
+/// earlier in the same pass.
+fn with_condition_for_status(
+    current: &crate::crd::SandboxLeaseStatus,
+    observed_generation: Option<i64>,
+    condition_type: &str,
+    status: crate::crd::SandboxConditionStatus,
+    reason: &str,
+    message: &str,
+) -> Vec<crate::crd::SandboxCondition> {
+    let existing = current.conditions.clone();
     let previous = existing
         .iter()
         .find(|condition| condition.condition_type == condition_type);
@@ -1166,10 +1427,171 @@ fn with_condition(
         status,
         reason: reason.to_string(),
         message: message.to_string(),
-        observed_generation: lease.metadata.generation,
+        observed_generation,
         last_transition_time,
     });
     conditions
+}
+
+/// Whether a Kubernetes object is controlled by the exact parent identity we
+/// expect. A matching name is insufficient after delete-and-recreate.
+fn is_controlled_by(
+    object: &DynamicObject,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+    uid: &str,
+) -> bool {
+    object
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners.iter().any(|owner| {
+                owner.api_version == api_version
+                    && owner.kind == kind
+                    && owner.name == name
+                    && owner.uid == uid
+                    && owner.controller == Some(true)
+            })
+        })
+}
+
+fn target_reference(
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    object: &DynamicObject,
+) -> Result<crate::crd::SandboxObjectReference, SandboxPlacementError> {
+    let uid = object.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "{kind} {} has no UID to record as Sandbox provenance",
+            object.name_any()
+        ))
+    })?;
+    Ok(crate::crd::SandboxObjectReference {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: Some(namespace.to_string()),
+        name: object.name_any(),
+        uid,
+        // UID is the identity fence. Upstream generations move when the pool
+        // controller corrects spec drift; recording one would turn a safe
+        // in-place reconciliation into an apparent identity replacement.
+        generation: None,
+    })
+}
+
+/// Prove that a live object is still the exact identity previously recorded in
+/// lease status. A same-named replacement is not the original allocation.
+fn require_exact_reference(
+    recorded: &crate::crd::SandboxObjectReference,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    object: &DynamicObject,
+) -> Result<(), SandboxPlacementError> {
+    let live_uid = object.uid().unwrap_or_else(|| "<none>".into());
+    let generation_matches = recorded
+        .generation
+        .is_none_or(|generation| object.metadata.generation == Some(generation));
+    if recorded.api_version != api_version
+        || recorded.kind != kind
+        || recorded.namespace.as_deref() != Some(namespace)
+        || recorded.name != name
+        || recorded.uid != live_uid
+        || !generation_matches
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "recorded {kind} provenance cannot change: expected {namespace}/{name} uid {}, observed uid {live_uid}",
+            recorded.uid
+        )));
+    }
+    Ok(())
+}
+
+/// Observe the exact management-cluster pool objects a lease will consume.
+/// Missing objects are ordinary pool reconciliation lag; foreign or
+/// same-named replacements fail closed.
+async fn observed_management_pool_provenance(
+    ctx: &SandboxContext,
+    pool: &SandboxPool,
+    status: &crate::crd::SandboxLeaseStatus,
+) -> Result<Option<crate::crd::SandboxTargetProvenance>, SandboxPlacementError> {
+    let resources = [
+        (
+            upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+            template_name(&pool.name_any()),
+            SANDBOX_TEMPLATE_KIND,
+        ),
+        (
+            upstream_resource(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
+            warm_pool_name(&pool.name_any()),
+            SANDBOX_WARM_POOL_KIND,
+        ),
+    ];
+    let mut observed = Vec::with_capacity(resources.len());
+    for (resource, name, kind) in resources {
+        let objects: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), &ctx.namespace, &resource);
+        let object = match objects.get(&name).await {
+            Ok(object) => object,
+            Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let pool_uid = pool.uid().ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxPool {} has no UID to fence its upstream objects",
+                pool.name_any()
+            ))
+        })?;
+        if !is_controlled_by(
+            &object,
+            "kobe.kunobi.ninja/v1alpha1",
+            "SandboxPool",
+            &pool.name_any(),
+            &pool_uid,
+        ) {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "{kind} {name} is not controlled by SandboxPool {} uid {pool_uid}",
+                pool.name_any()
+            )));
+        }
+        observed.push(target_reference(
+            AGENT_SANDBOX_API_VERSION,
+            kind,
+            &ctx.namespace,
+            &object,
+        )?);
+    }
+
+    let mut proposed = status
+        .target
+        .clone()
+        .unwrap_or(crate::crd::SandboxTargetProvenance {
+            namespace: ctx.namespace.clone(),
+            child_cluster_lease: None,
+            child_cluster_instance: None,
+            sandbox_template: None,
+            sandbox_warm_pool: None,
+            sandbox_claim: None,
+            sandbox: None,
+            pod: None,
+        });
+    proposed.sandbox_template = Some(observed.remove(0));
+    proposed.sandbox_warm_pool = Some(observed.remove(0));
+    Ok(Some(proposed))
+}
+
+fn management_provenance_is_complete(status: &crate::crd::SandboxLeaseStatus) -> bool {
+    status.target.as_ref().is_some_and(|target| {
+        target.sandbox_template.is_some()
+            && target.sandbox_warm_pool.is_some()
+            && target.sandbox_claim.is_some()
+            && target.sandbox.is_some()
+            && target.pod.is_some()
+    })
 }
 
 /// Build the full target provenance for a placed, ready lease.
@@ -1186,22 +1608,22 @@ fn with_condition(
 async fn observed_provenance(
     target: &Target,
     claim: &DynamicObject,
-    lease: &SandboxLease,
-) -> Option<crate::crd::SandboxTargetProvenance> {
-    let claim_uid = claim.uid()?;
+    status: &crate::crd::SandboxLeaseStatus,
+) -> Result<Option<crate::crd::SandboxTargetProvenance>, String> {
+    let Some(claim_uid) = claim.uid().filter(|uid| !uid.is_empty()) else {
+        return Ok(None);
+    };
     let resolved = crate::controllers::sandbox_canary::resolve_sandbox_pod(
         &target.client,
         &target.namespace,
         claim,
     )
-    .await
-    .ok()
-    .flatten()?;
+    .await?;
+    let Some(resolved) = resolved else {
+        return Ok(None);
+    };
 
-    let existing = lease
-        .status
-        .as_ref()
-        .and_then(|status| status.target.clone());
+    let existing = status.target.clone();
     let reference =
         |api_version: &str, kind: &str, name: &str, uid: &str| crate::crd::SandboxObjectReference {
             api_version: api_version.to_string(),
@@ -1212,7 +1634,7 @@ async fn observed_provenance(
             generation: None,
         };
 
-    Some(crate::crd::SandboxTargetProvenance {
+    Ok(Some(crate::crd::SandboxTargetProvenance {
         namespace: target.namespace.clone(),
         child_cluster_lease: existing
             .as_ref()
@@ -1244,7 +1666,7 @@ async fn observed_provenance(
             &resolved.pod_name,
             &resolved.pod_uid,
         )),
-    })
+    }))
 }
 
 /// Where one lease's Sandbox is placed.
@@ -1709,6 +2131,12 @@ pub(crate) mod tests {
         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxclaims";
     const CLAIM_PATH: &str =
         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxclaims/kobe-sbx-1";
+    const TEMPLATE_PATH: &str =
+        "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxtemplates/kobe-agents";
+    const WARM_POOL_PATH: &str =
+        "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxwarmpools/kobe-agents";
+    const SANDBOX_PATH: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxes/sbx";
+    const PODS_PATH: &str = "/api/v1/namespaces/test-ns/pods";
     const LEASE_STATUS_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1/status";
 
@@ -1719,6 +2147,32 @@ pub(crate) mod tests {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.to_string(),
         });
+        for (path_value, kind, uid) in [
+            (TEMPLATE_PATH, SANDBOX_TEMPLATE_KIND, "template-uid"),
+            (WARM_POOL_PATH, SANDBOX_WARM_POOL_KIND, "warm-pool-uid"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(path_value))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": AGENT_SANDBOX_API_VERSION,
+                    "kind": kind,
+                    "metadata": {
+                        "name": "kobe-agents",
+                        "namespace": NS,
+                        "uid": uid,
+                        "ownerReferences": [{
+                            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                            "kind": "SandboxPool",
+                            "name": "agents",
+                            "uid": POOL_UID,
+                            "controller": true,
+                        }],
+                    },
+                })))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+        }
         (ctx, server)
     }
 
@@ -1779,6 +2233,16 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn admitted_lease() -> SandboxLease {
+        let reference = |api_version: &str, kind: &str, name: &str, uid: &str| {
+            crate::crd::SandboxObjectReference {
+                api_version: api_version.into(),
+                kind: kind.into(),
+                namespace: Some(NS.into()),
+                name: name.into(),
+                uid: uid.into(),
+                generation: None,
+            }
+        };
         SandboxLease {
             metadata: ObjectMeta {
                 name: Some(LEASE.into()),
@@ -1818,6 +2282,36 @@ pub(crate) mod tests {
                     (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
                 ),
                 placement: Some(crate::crd::ResolvedSandboxPlacement::Management {}),
+                target: Some(crate::crd::SandboxTargetProvenance {
+                    namespace: NS.into(),
+                    child_cluster_lease: None,
+                    child_cluster_instance: None,
+                    sandbox_template: Some(reference(
+                        AGENT_SANDBOX_API_VERSION,
+                        SANDBOX_TEMPLATE_KIND,
+                        "kobe-agents",
+                        "template-uid",
+                    )),
+                    sandbox_warm_pool: Some(reference(
+                        AGENT_SANDBOX_API_VERSION,
+                        SANDBOX_WARM_POOL_KIND,
+                        "kobe-agents",
+                        "warm-pool-uid",
+                    )),
+                    sandbox_claim: Some(reference(
+                        AGENT_SANDBOX_API_VERSION,
+                        SANDBOX_CLAIM_KIND,
+                        "kobe-sbx-1",
+                        "claim-uid",
+                    )),
+                    sandbox: Some(reference(
+                        crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                        crate::controllers::sandbox_canary::SANDBOX_KIND,
+                        "sbx",
+                        "sandbox-uid",
+                    )),
+                    pod: Some(reference("v1", "Pod", "sandbox-pod", "pod-uid")),
+                }),
                 ..Default::default()
             }),
         }
@@ -1847,9 +2341,49 @@ pub(crate) mod tests {
         serde_json::json!({
             "apiVersion": AGENT_SANDBOX_API_VERSION,
             "kind": SANDBOX_CLAIM_KIND,
-            "metadata": { "name": "kobe-sbx-1", "namespace": NS, "resourceVersion": "77" },
+            "metadata": {
+                "name": "kobe-sbx-1",
+                "namespace": NS,
+                "uid": "claim-uid",
+                "resourceVersion": "77",
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "SandboxLease",
+                    "name": LEASE,
+                    "uid": "lease-uid-1",
+                    "controller": true,
+                }],
+            },
             "status": status,
         })
+    }
+
+    async fn mount_resolved_sandbox(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(SANDBOX_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                "kind": crate::controllers::sandbox_canary::SANDBOX_KIND,
+                "metadata": { "name": "sbx", "namespace": NS, "uid": "sandbox-uid" },
+                "status": { "selector": "kobe.test/sandbox=sbx" },
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PODS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": { "resourceVersion": "1" },
+                "items": [{
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": { "name": "sandbox-pod", "namespace": NS, "uid": "pod-uid" },
+                    "status": { "phase": "Running" },
+                }],
+            })))
+            .mount(server)
+            .await;
     }
 
     async fn requests_to(server: &MockServer, method: &str, target: &str) -> usize {
@@ -1860,6 +2394,17 @@ pub(crate) mod tests {
             .iter()
             .filter(|request| request.method.as_str() == method && request.url.path() == target)
             .count()
+    }
+
+    fn status_value_of(request: &wiremock::Request) -> Option<serde_json::Value> {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+        if let Some(status) = body.get("status") {
+            return Some(status.clone());
+        }
+        body.as_array()?
+            .iter()
+            .find(|operation| operation["op"] == "add" && operation["path"] == "/status")
+            .map(|operation| operation["value"].clone())
     }
 
     /// An unready claim must not start the TTL clock.
@@ -1935,18 +2480,12 @@ pub(crate) mod tests {
             )
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(path(CLAIMS_PATH))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "kind": "Status", "status": "Failure", "code": 409, "reason": "AlreadyExists"
-            })))
-            .mount(&server)
-            .await;
         Mock::given(method("GET"))
             .and(path(CLAIM_PATH))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
-                    "conditions": [{ "type": "Ready", "status": "True" }]
+                    "conditions": [{ "type": "Ready", "status": "True" }],
+                    "sandbox": { "name": "sbx" }
                 }))),
             )
             .mount(&server)
@@ -2131,6 +2670,253 @@ pub(crate) mod tests {
         );
     }
 
+    /// Pool object identities are checkpointed before a claim can refer to
+    /// them. This prevents a same-named foreign WarmPool from becoming the
+    /// source of tenant workloads.
+    #[tokio::test]
+    async fn management_pool_provenance_is_persisted_before_claim_creation() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().target = None;
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        let target = &statuses.last().expect("pool provenance status")["target"];
+        assert_eq!(target["sandboxTemplate"]["uid"], "template-uid");
+        assert_eq!(target["sandboxWarmPool"]["uid"], "warm-pool-uid");
+        assert!(target.get("sandboxClaim").is_none());
+    }
+
+    /// A lost optimistic status race ends the pass. In particular, a stale
+    /// Provisioning checkpoint cannot fall through to claim creation or Ready
+    /// side effects under the resourceVersion it just invalidated.
+    #[tokio::test]
+    async fn a_conflicted_provisioning_checkpoint_has_no_later_side_effects() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "Conflict"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Pending;
+        status.provisioning_deadline = None;
+        status.observed_generation = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert_eq!(requests_to(&server, "PATCH", CLAIM_PATH).await, 0);
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 1);
+    }
+
+    /// An unready claim is still an allocated identity. Record it before the
+    /// normal readiness requeue so restart-safe cleanup can address the exact
+    /// object rather than a derived name.
+    #[tokio::test]
+    async fn claim_provenance_is_written_before_unready_requeue() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "AlreadyExists"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": [{ "type": "Ready", "status": "False" }]
+                }))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.sandbox_claim = None;
+        target.sandbox = None;
+        target.pod = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "PATCH", CLAIM_PATH).await, 0);
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert_eq!(
+            statuses.last().expect("claim provenance status")["target"]["sandboxClaim"]["uid"],
+            "claim-uid"
+        );
+    }
+
+    /// A recorded claim UID cannot be replaced by a same-named object between
+    /// reconciles, even when the replacement carries a plausible owner name.
+    #[tokio::test]
+    async fn same_named_replacement_claim_is_rejected() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "AlreadyExists"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": [{ "type": "Ready", "status": "False" }]
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim
+            .as_mut()
+            .unwrap()
+            .uid = "original-claim-uid".into();
+
+        let error = reconcile_lease(Arc::new(lease), ctx).await.unwrap_err();
+        assert!(
+            matches!(error, SandboxPlacementError::Invalid(ref message) if message.contains("SandboxClaim") && message.contains("cannot change")),
+            "expected immutable claim provenance failure, got: {error}"
+        );
+        assert_eq!(
+            requests_to(&server, "POST", CLAIMS_PATH).await,
+            0,
+            "a recorded claim is never recreated"
+        );
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+    }
+
+    /// Ready is a later checkpoint than Sandbox/Pod discovery. A partial
+    /// target is enriched durably and requeued, never exposed as Ready first.
+    #[tokio::test]
+    async fn management_ready_requires_complete_persisted_provenance() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CLAIMS_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 409, "reason": "AlreadyExists"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
+                    "conditions": [{ "type": "Ready", "status": "True" }],
+                    "sandbox": { "name": "sbx" }
+                }))),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+        mount_resolved_sandbox(&server).await;
+
+        let mut lease = lease_past_the_canary();
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.sandbox = None;
+        target.pod = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "PATCH", CLAIM_PATH).await, 0);
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        let status = statuses.last().expect("target provenance status");
+        assert_ne!(status["phase"], "Ready");
+        assert_eq!(status["target"]["sandbox"]["uid"], "sandbox-uid");
+        assert_eq!(status["target"]["pod"]["uid"], "pod-uid");
+    }
+
     /// An unadmitted lease is not placed, and the check costs no API call.
     ///
     /// A `pending` lease exists before its quota reservation commits. Placing
@@ -2218,7 +3004,8 @@ pub(crate) mod tests {
             .and(path(CLAIM_PATH))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({
-                    "conditions": [{ "type": "Ready", "status": "True" }]
+                    "conditions": [{ "type": "Ready", "status": "True" }],
+                    "sandbox": { "name": "sbx" }
                 }))),
             )
             .mount(&server)
@@ -2231,28 +3018,53 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         mount_teardown_scaffolding(&server).await;
+        mount_resolved_sandbox(&server).await;
 
-        // The canary pass is recorded because the websocket exec cannot be
-        // mocked; placement/provisioning ordering is what this test exercises.
-        let mut lease = lease_past_the_canary();
-        let status = lease.status.as_mut().unwrap();
-        status.phase = crate::crd::SandboxLeasePhase::Pending;
-        status.provisioning_deadline = None;
-        status.observed_generation = None;
-        status.placement = None;
+        // This is the actual CR shape after admission: admitted annotation and
+        // no controller-authored status. Every returned checkpoint is fed into
+        // the next reconcile at a distinct resourceVersion, as Kubernetes
+        // would do. The websocket canary itself cannot be served by wiremock;
+        // its already-persisted condition is injected at that one boundary.
+        let mut lease = admitted_lease();
+        lease.status = None;
 
+        for (resource_version, checkpoint) in [
+            ("lease-rv-2", "placement"),
+            ("lease-rv-3", "pool provenance"),
+            ("lease-rv-4", "Provisioning"),
+            ("lease-rv-5", "claim provenance"),
+        ] {
+            let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .unwrap();
+            assert_eq!(action, Action::await_change(), "{checkpoint} checkpoint");
+            advance_lease_to_latest_status(&mut lease, &server, resource_version).await;
+            if checkpoint != "claim provenance" {
+                assert_eq!(
+                    requests_to(&server, "POST", CLAIMS_PATH).await,
+                    0,
+                    "claim creation must wait through {checkpoint}"
+                );
+            }
+        }
+
+        lease.status.as_mut().unwrap().conditions = with_condition(
+            &lease,
+            READINESS_CANARY_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "CanaryPassed",
+            "recorded at the websocket boundary",
+        );
+        lease.metadata.resource_version = Some("lease-rv-6".into());
         let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
             .await
             .unwrap();
-        assert_eq!(action, Action::await_change());
         assert_eq!(
-            requests_to(&server, "POST", CLAIMS_PATH).await,
-            0,
-            "placement must commit before claim creation"
+            action,
+            Action::await_change(),
+            "target provenance checkpoint"
         );
-
-        lease.status.as_mut().unwrap().placement =
-            Some(crate::crd::ResolvedSandboxPlacement::Management {});
+        advance_lease_to_latest_status(&mut lease, &server, "lease-rv-7").await;
 
         reconcile_lease(Arc::new(lease), ctx).await.unwrap();
 
@@ -2263,6 +3075,24 @@ pub(crate) mod tests {
             "a lease created through the API must be able to reach Ready; \
              recorded phases were {:?}",
             recorded_phases(&server).await
+        );
+        let ready_status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .find(|status| status["phase"] == "Ready")
+            .expect("Ready status write");
+        assert!(
+            ready_status["conditions"]
+                .as_array()
+                .is_some_and(|conditions| {
+                    conditions.iter().any(|condition| {
+                        condition["type"] == READINESS_CANARY_CONDITION
+                            && condition["status"] == "True"
+                    })
+                })
         );
     }
 
@@ -2403,9 +3233,44 @@ pub(crate) mod tests {
         lease
     }
 
+    /// Run the destructive half only after the durable Releasing checkpoint
+    /// has been observed at a new Kubernetes resourceVersion.
+    async fn reconcile_release_after_checkpoint(
+        mut lease: SandboxLease,
+        ctx: Arc<SandboxContext>,
+    ) -> Action {
+        if lease.status.as_ref().unwrap().phase != crate::crd::SandboxLeasePhase::Releasing {
+            let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+                .await
+                .expect("Releasing checkpoint");
+            assert_eq!(action, Action::await_change());
+            lease.status.as_mut().unwrap().phase = crate::crd::SandboxLeasePhase::Releasing;
+            lease.metadata.resource_version = Some("lease-rv-after-releasing".into());
+        }
+        reconcile_lease(Arc::new(lease), ctx)
+            .await
+            .expect("release after checkpoint")
+    }
+
+    async fn advance_lease_to_latest_status(
+        lease: &mut SandboxLease,
+        server: &MockServer,
+        resource_version: &str,
+    ) {
+        let status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("durable status checkpoint");
+        lease.status = Some(serde_json::from_value(status).expect("typed SandboxLeaseStatus"));
+        lease.metadata.resource_version = Some(resource_version.into());
+    }
+
     fn phase_of(request: &wiremock::Request) -> Option<String> {
-        let body: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
-        body.get("status")?
+        status_value_of(request)?
             .get("phase")?
             .as_str()
             .map(str::to_string)
@@ -2465,6 +3330,54 @@ pub(crate) mod tests {
             .await;
     }
 
+    /// A crash can land after CREATE but before the claim UID checkpoint. The
+    /// release path first recovers the exact lease-owned identity and ends the
+    /// pass; it never deletes an object known only by a derived name.
+    #[tokio::test]
+    async fn teardown_recovers_missing_claim_provenance_before_delete() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(claim_json(serde_json::json!({}))),
+            )
+            .mount(&server)
+            .await;
+
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .sandbox_claim = None;
+
+        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        let recovered = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("recovered status");
+        assert_eq!(recovered["target"]["sandboxClaim"]["uid"], "claim-uid");
+    }
+
     /// Capacity comes back only against proof that the Sandbox is gone.
     ///
     /// The quota slot is what stops a pool being over-subscribed. Returning it
@@ -2492,13 +3405,23 @@ pub(crate) mod tests {
             .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
-        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        reconcile_release_after_checkpoint(lease, ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await,
             vec!["Releasing".to_string(), "Released".to_string()],
             "intent must be visible in status before the terminal write"
         );
+        let delete = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| request.method.as_str() == "DELETE" && request.url.path() == CLAIM_PATH)
+            .expect("claim DELETE");
+        let delete_options: serde_json::Value =
+            serde_json::from_slice(&delete.body).expect("DeleteOptions body");
+        assert_eq!(delete_options["preconditions"]["uid"], "claim-uid");
         assert_eq!(
             requests_to(
                 &server,
@@ -2537,6 +3460,7 @@ pub(crate) mod tests {
                 "metadata": {
                     "name": "kobe-sbx-1",
                     "namespace": NS,
+                    "uid": "claim-uid",
                     "deletionTimestamp": "2026-01-01T00:00:00Z",
                 },
             })))
@@ -2544,7 +3468,7 @@ pub(crate) mod tests {
             .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
-        let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        let action = reconcile_release_after_checkpoint(lease, ctx).await;
         assert_ne!(
             action,
             Action::await_change(),
@@ -2593,7 +3517,7 @@ pub(crate) mod tests {
             .await;
 
         let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
-        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        reconcile_release_after_checkpoint(lease, ctx).await;
 
         let phases = recorded_phases(&server).await;
         assert_eq!(
@@ -2649,7 +3573,7 @@ pub(crate) mod tests {
         status.phase = crate::crd::SandboxLeasePhase::Ready;
         status.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
 
-        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        reconcile_release_after_checkpoint(lease, ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await,
@@ -2687,8 +3611,15 @@ pub(crate) mod tests {
         );
         assert_eq!(
             release_reason(&releasing_lease(SandboxLeasePhase::Releasing)),
+            Some(ReleaseReason::Requested),
+            "the durable request preserves its terminal outcome"
+        );
+        let mut interrupted = admitted_lease();
+        interrupted.status.as_mut().unwrap().phase = SandboxLeasePhase::Releasing;
+        assert_eq!(
+            release_reason(&interrupted),
             Some(ReleaseReason::InProgress),
-            "an interrupted teardown resumes"
+            "an interrupted teardown without another durable cause still resumes"
         );
 
         for terminal in [
@@ -2950,9 +3881,7 @@ pub(crate) mod tests {
             .await;
         mount_child_release_patch(&server).await;
 
-        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
-            .await
-            .unwrap();
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
 
         assert_eq!(
             requests_to(&server, "DELETE", CLAIM_PATH).await,
@@ -3004,9 +3933,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
-            .await
-            .unwrap();
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
 
         assert_eq!(
             requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await,
@@ -3049,9 +3976,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
-            .await
-            .unwrap();
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -3089,7 +4014,7 @@ pub(crate) mod tests {
             .unwrap()
             .child_cluster_lease = None;
 
-        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        reconcile_release_after_checkpoint(lease, ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -3172,7 +4097,7 @@ pub(crate) mod tests {
         status.placement = None;
         status.target = None;
 
-        reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        reconcile_release_after_checkpoint(lease, ctx).await;
 
         assert!(
             !recorded_phases(&server)
@@ -3215,9 +4140,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
-            .await
-            .unwrap();
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -3258,9 +4181,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
-            .await
-            .unwrap();
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
@@ -3294,9 +4215,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        reconcile_lease(Arc::new(child_placed_lease("child-lease-uid")), ctx)
-            .await
-            .unwrap();
+        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx).await;
 
         assert_eq!(
             recorded_phases(&server).await.last().map(String::as_str),
