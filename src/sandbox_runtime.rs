@@ -30,9 +30,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentSandboxMode {
-    /// Sandbox features are off. Nothing is validated and no Sandbox API is
-    /// served. The default, so an upgrade never starts depending on a runtime
-    /// the operator has not installed.
+    /// New Sandbox admission and placement are off. No Sandbox API is served,
+    /// but lifecycle/reaper loops stay active to drain leases and tombstones
+    /// created while External was enabled. The default, so a fresh install
+    /// never starts depending on a runtime the operator has not installed.
     #[default]
     Disabled,
     /// Kobe installs the pinned release and the identical child bootstrap.

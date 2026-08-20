@@ -421,7 +421,10 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    let access_ledger_reaper_handle = if agent_sandbox_mode.enabled() {
+    // Access/execution records and retained lease tombstones remain cleanup
+    // obligations after admission is disabled. Keep every reaper alive in
+    // cleanup-only mode; disabling new work must not strand old authority.
+    let access_ledger_reaper_handle = {
         let access_client = client.clone();
         let access_sandbox_ns = namespace.clone();
         let access_ledger_ns = sandbox_reservation_namespace.clone();
@@ -435,79 +438,65 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
         }))
-    } else {
-        None
     };
 
-    // Start Sandbox placement, but ONLY when a validated runtime is present.
-    // Spawning it in `disabled` mode would have it watch CRDs that may not
-    // exist and log errors forever; spawning it without the #72 validation
-    // would let it write objects an incompatible runtime cannot reconcile.
-    let (sandbox_controller_handle, execution_reaper_handle) = if agent_sandbox_mode.enabled() {
-        let sandbox_client = client.clone();
-        let sandbox_ns = namespace.clone();
-        let sandbox_reservation_ns = sandbox_reservation_namespace.clone();
-        let sandbox_shutdown = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            controllers::sandbox::run_sandbox_controller(
-                sandbox_client,
-                &sandbox_ns,
-                &sandbox_reservation_ns,
-                agent_sandbox_mode,
-                sandbox_shutdown,
-            )
-            .await;
-        });
+    // The lifecycle controller always runs. Managed and External enable
+    // placement after runtime validation; Disabled is cleanup-only and drains
+    // every lease admitted by the previous configuration.
+    let sandbox_client = client.clone();
+    let sandbox_ns = namespace.clone();
+    let sandbox_reservation_ns = sandbox_reservation_namespace.clone();
+    let sandbox_shutdown = shutdown.clone();
+    let sandbox_controller_handle = Some(tokio::spawn(async move {
+        controllers::sandbox::run_sandbox_controller(
+            sandbox_client,
+            &sandbox_ns,
+            &sandbox_reservation_ns,
+            agent_sandbox_mode,
+            sandbox_shutdown,
+        )
+        .await;
+    }));
 
-        // Queued executions whose setup owner disappeared are settled here.
-        // Running executions remain fail-closed until the exact runner
-        // reports a terminal result (or NotFound); elapsed wall time alone
-        // is never evidence that their process stopped.
-        let execution_reaper_client = client.clone();
-        let execution_reaper_ns = namespace.clone();
-        let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
-        let execution_reaper_shutdown = shutdown.clone();
-        let execution_reaper_handle = tokio::spawn(async move {
-            api::sandbox_executions::run_execution_reaper(
-                execution_reaper_client,
-                &execution_reaper_ns,
-                &execution_reaper_reservation_ns,
-                std::time::Duration::from_secs(60),
-                execution_reaper_shutdown,
-            )
-            .await;
-        });
-        // Terminal lease records are retired here. `Released` and `Expired`
-        // stop consuming capacity when they are written, so nothing leaks —
-        // the objects just accumulate, one per Sandbox ever leased, until
-        // etcd carries a row for every Sandbox that ever existed. The window
-        // is measured in days because the record is an audit trail, and the
-        // tick is hourly because nothing on that scale is worth a minute's
-        // list churn against the API server.
-        let lease_reaper_client = client.clone();
-        let lease_reaper_ns = namespace.clone();
-        let lease_reaper_shutdown = shutdown.clone();
-        let lease_retention = api::sandbox::sandbox_lease_retention(
-            std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
-                .ok()
-                .as_deref(),
-        );
-        tokio::spawn(async move {
-            api::sandbox::run_sandbox_lease_reaper(
-                lease_reaper_client,
-                &lease_reaper_ns,
-                std::time::Duration::from_secs(3600),
-                lease_retention,
-                lease_reaper_shutdown,
-            )
-            .await;
-        });
+    // Executions left Running by a process that disappeared are settled even
+    // after mode changes. Cleanup-only must not turn old records into polls
+    // that can never finish.
+    let execution_reaper_client = client.clone();
+    let execution_reaper_ns = namespace.clone();
+    let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
+    let execution_reaper_shutdown = shutdown.clone();
+    let execution_reaper_handle = Some(tokio::spawn(async move {
+        api::sandbox_executions::run_execution_reaper(
+            execution_reaper_client,
+            &execution_reaper_ns,
+            &execution_reaper_reservation_ns,
+            std::time::Duration::from_secs(60),
+            execution_reaper_shutdown,
+        )
+        .await;
+    }));
 
-        (Some(handle), Some(execution_reaper_handle))
-    } else {
-        info!("Sandbox placement not started (agentSandbox.mode is disabled)");
-        (None, None)
-    };
+    // Terminal records and all retained allocation tombstones remain served in
+    // Disabled mode. The mode switch may stop new admission; it never retires
+    // the controller's existing cleanup obligations.
+    let lease_reaper_client = client.clone();
+    let lease_reaper_ns = namespace.clone();
+    let lease_reaper_shutdown = shutdown.clone();
+    let lease_retention = api::sandbox::sandbox_lease_retention(
+        std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
+            .ok()
+            .as_deref(),
+    );
+    tokio::spawn(async move {
+        api::sandbox::run_sandbox_lease_reaper(
+            lease_reaper_client,
+            &lease_reaper_ns,
+            std::time::Duration::from_secs(3600),
+            lease_retention,
+            lease_reaper_shutdown,
+        )
+        .await;
+    });
 
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
     // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller

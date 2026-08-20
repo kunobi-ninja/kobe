@@ -621,11 +621,14 @@ pub enum SandboxLeasePhase {
 
 /// Durable cause of Sandbox teardown. Runtime and provisioning expiry both end
 /// in `Expired`, but remain distinct for operator diagnostics and billing.
+/// `ModeDisabled` records an operator-wide drain rather than misreporting it as
+/// a caller request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub enum SandboxReleaseCause {
     Requested,
     RuntimeTtl,
     ProvisioningDeadline,
+    ModeDisabled,
 }
 
 impl std::fmt::Display for SandboxLeasePhase {
@@ -1089,7 +1092,13 @@ mod tests {
         let status_schema = &root_schema["properties"]["status"];
         assert_eq!(
             status_schema["properties"]["releaseCause"]["enum"],
-            serde_json::json!(["Requested", "RuntimeTtl", "ProvisioningDeadline", null])
+            serde_json::json!([
+                "Requested",
+                "RuntimeTtl",
+                "ProvisioningDeadline",
+                "ModeDisabled",
+                null
+            ])
         );
         assert!(status_schema.get("x-kubernetes-validations").is_none());
         let validations = root_schema["x-kubernetes-validations"].as_array().unwrap();

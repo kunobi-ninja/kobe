@@ -261,6 +261,7 @@ spec:
                 - Requested
                 - RuntimeTtl
                 - ProvisioningDeadline
+                - ModeDisabled
                 - null
                 nullable: true
                 type: string

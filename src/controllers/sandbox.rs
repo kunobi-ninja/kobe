@@ -49,7 +49,7 @@ use crate::sandbox::{
     SANDBOX_WARM_POOL_KIND, build_sandbox_claim, build_sandbox_template, build_sandbox_warm_pool,
 };
 
-/// Shared state for the Sandbox placement controllers.
+/// Shared state for Sandbox placement and cleanup controllers.
 pub struct SandboxContext {
     pub client: Client,
     /// Operator-owned namespace the upstream objects live in. Never
@@ -71,6 +71,10 @@ pub struct SandboxContext {
     /// uses it to require the pinned built-in bootstrap only in managed mode;
     /// external mode never installs or adopts runtime infrastructure.
     pub runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
+    /// Whether this process may create or advance Sandbox workload placement.
+    /// Disabled-mode controllers set this false but still reconcile every
+    /// admitted lease through verified teardown.
+    pub placement_enabled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -789,6 +793,14 @@ pub async fn reconcile_lease(
         return drive_release(&lease, &ctx, reason).await;
     }
 
+    // `disabled` stops admission and placement, but it must not stop lifecycle
+    // ownership for leases admitted by the previous configuration. Drain every
+    // nonterminal lease through the ordinary, evidence-gated release path.
+    // Existing Releasing causes were handled above and remain immutable.
+    if !ctx.placement_enabled {
+        return drive_release(&lease, &ctx, ReleaseReason::ModeDisabled).await;
+    }
+
     // `admitted` is only the arbitration winner; it is not sufficient workload
     // authority on its own. The same atomic patch must also have persisted the
     // exact pre-created gate name+UID, and that object must still be the
@@ -1334,6 +1346,9 @@ enum ReleaseReason {
     RuntimeTtl,
     /// Setup did not finish within the pool's provisioning bound.
     ProvisioningDeadline,
+    /// The operator disabled new Sandbox service. Existing leases are drained
+    /// through the same proof path rather than being left finalized forever.
+    ModeDisabled,
     /// Legacy or corrupt Releasing state without the atomic cause checkpoint.
     /// This is quarantined before any destructive action.
     MissingCause,
@@ -1345,6 +1360,7 @@ impl ReleaseReason {
             Self::Requested => "ReleaseRequested",
             Self::RuntimeTtl => "RuntimeTtlElapsed",
             Self::ProvisioningDeadline => "ProvisioningDeadlineElapsed",
+            Self::ModeDisabled => "ModeDisabled",
             Self::MissingCause => "ReleaseCauseMissing",
         }
     }
@@ -1356,6 +1372,7 @@ impl ReleaseReason {
             Self::ProvisioningDeadline => {
                 Some(crate::crd::SandboxReleaseCause::ProvisioningDeadline)
             }
+            Self::ModeDisabled => Some(crate::crd::SandboxReleaseCause::ModeDisabled),
             Self::MissingCause => None,
         }
     }
@@ -1365,6 +1382,7 @@ impl ReleaseReason {
             crate::crd::SandboxReleaseCause::Requested => Self::Requested,
             crate::crd::SandboxReleaseCause::RuntimeTtl => Self::RuntimeTtl,
             crate::crd::SandboxReleaseCause::ProvisioningDeadline => Self::ProvisioningDeadline,
+            crate::crd::SandboxReleaseCause::ModeDisabled => Self::ModeDisabled,
         }
     }
 
@@ -1376,7 +1394,7 @@ impl ReleaseReason {
     fn terminal_phase(self) -> crate::crd::SandboxLeasePhase {
         match self {
             Self::RuntimeTtl | Self::ProvisioningDeadline => crate::crd::SandboxLeasePhase::Expired,
-            Self::Requested => crate::crd::SandboxLeasePhase::Released,
+            Self::Requested | Self::ModeDisabled => crate::crd::SandboxLeasePhase::Released,
             Self::MissingCause => unreachable!("missing release cause must quarantine"),
         }
     }
@@ -6307,7 +6325,11 @@ fn lease_error_policy(
     Action::requeue(std::time::Duration::from_secs(15))
 }
 
-/// Run both placement controllers until shutdown.
+/// Run Sandbox lifecycle until shutdown.
+///
+/// Pool placement is started only when `placement_enabled`. The lease loop is
+/// always started: switching External to Disabled is a drain operation, not a
+/// way to abandon finalizers, quota reservations, or retained tombstones.
 pub async fn run_sandbox_controller(
     client: Client,
     namespace: &str,
@@ -6315,6 +6337,7 @@ pub async fn run_sandbox_controller(
     runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
     shutdown: CancellationToken,
 ) {
+    let placement_enabled = runtime_mode.enabled();
     let ctx = Arc::new(SandboxContext {
         client: client.clone(),
         namespace: namespace.to_string(),
@@ -6322,25 +6345,34 @@ pub async fn run_sandbox_controller(
         shutdown: shutdown.clone(),
         access_ledger_enabled: true,
         runtime_mode,
+        placement_enabled,
     });
 
     let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
     let leases: Api<SandboxLease> = Api::namespaced(client, namespace);
 
-    info!("Starting Sandbox placement controller (management)");
+    if placement_enabled {
+        info!("Starting Sandbox placement and lifecycle controllers (management)");
+    } else {
+        info!("Starting Sandbox lifecycle controller in cleanup-only mode");
+    }
 
     let pool_ctx = ctx.clone();
     let pool_shutdown = shutdown.clone();
     let pool_loop = async move {
-        Controller::new(pools, Config::default())
-            .graceful_shutdown_on(async move { pool_shutdown.cancelled().await })
-            .run(reconcile_pool, pool_error_policy, pool_ctx)
-            .for_each(|result| async move {
-                if let Err(error) = result {
-                    error!(error = %error, "SandboxPool controller error");
-                }
-            })
-            .await;
+        if placement_enabled {
+            Controller::new(pools, Config::default())
+                .graceful_shutdown_on(async move { pool_shutdown.cancelled().await })
+                .run(reconcile_pool, pool_error_policy, pool_ctx)
+                .for_each(|result| async move {
+                    if let Err(error) = result {
+                        error!(error = %error, "SandboxPool controller error");
+                    }
+                })
+                .await;
+        } else {
+            pool_shutdown.cancelled().await;
+        }
     };
 
     let lease_shutdown = shutdown.clone();
@@ -6357,7 +6389,7 @@ pub async fn run_sandbox_controller(
     };
 
     tokio::join!(pool_loop, lease_loop);
-    info!("Sandbox placement controller shut down");
+    info!("Sandbox lifecycle controller shut down");
 }
 
 #[cfg(test)]
@@ -6490,6 +6522,7 @@ pub(crate) mod tests {
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
+            placement_enabled: true,
         });
         for (path_value, kind, uid) in [
             (TEMPLATE_PATH, SANDBOX_TEMPLATE_KIND, "template-uid"),
@@ -7171,6 +7204,7 @@ pub(crate) mod tests {
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
+            placement_enabled: true,
         });
 
         let upstream = |kind: &str, uid: &str, resource_version: &str, status| {
@@ -8725,6 +8759,44 @@ pub(crate) mod tests {
         let status = status_value_of(&request).unwrap();
         assert_eq!(status["phase"], "Releasing");
         assert_eq!(status["releaseCause"], "Requested");
+    }
+
+    /// Disabled mode is cleanup-only, not controller-off. It atomically
+    /// checkpoints a distinct drain cause before reading a pool or touching a
+    /// Claim, so an External -> Disabled rollout cannot strand an admitted
+    /// finalizer or accidentally continue placement.
+    #[tokio::test]
+    async fn disabled_mode_drains_admitted_lease_before_any_placement() {
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().placement_enabled = false;
+        let lease = admitted_lease();
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(requests_to(&server, "GET", POOL_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+        assert_eq!(requests_to(&server, "GET", ALLOCATION_FENCE_PATH).await, 0);
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                request.method.as_str() == "PATCH" && request.url.path() == LEASE_STATUS_PATH
+            })
+            .expect("cleanup-only Releasing checkpoint");
+        let status = status_value_of(&request).unwrap();
+        assert_eq!(status["phase"], "Releasing");
+        assert_eq!(status["releaseCause"], "ModeDisabled");
     }
 
     const RESERVATIONS_PATH: &str = "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases";
