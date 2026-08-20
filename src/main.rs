@@ -494,7 +494,7 @@ async fn main() -> anyhow::Result<()> {
     let execution_reaper_ns = namespace.clone();
     let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
     let execution_reaper_shutdown = shutdown.clone();
-    let execution_reaper_handle = Some(tokio::spawn(async move {
+    let execution_reaper_handle = tokio::spawn(async move {
         api::sandbox_executions::run_execution_reaper(
             execution_reaper_client,
             &execution_reaper_ns,
@@ -503,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
             execution_reaper_shutdown,
         )
         .await;
-    }));
+    });
 
     // Terminal records and all retained allocation tombstones remain served in
     // Disabled mode. The mode switch may stop new admission; it never retires
@@ -516,7 +516,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .as_deref(),
     );
-    tokio::spawn(async move {
+    let lease_reaper_handle = tokio::spawn(async move {
         api::sandbox::run_sandbox_lease_reaper(
             lease_reaper_client,
             &lease_reaper_ns,
@@ -592,10 +592,15 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => error!("IPAM controller panicked: {e}"),
                 }
             }
-            result = sandbox_reaper_handle => {
+            result = first_sandbox_reaper_exit(
+                sandbox_reaper_handle,
+                execution_reaper_handle,
+                lease_reaper_handle,
+            ) => {
+                let (reaper, result) = result;
                 match result {
-                    Ok(()) => warn!("Sandbox admission reaper exited unexpectedly"),
-                    Err(e) => error!("Sandbox admission reaper panicked: {e}"),
+                    Ok(()) => warn!(reaper = reaper.name(), "Sandbox reaper exited unexpectedly"),
+                    Err(e) => error!(reaper = reaper.name(), "Sandbox reaper panicked: {e}"),
                 }
             }
             result = await_optional_critical_task(access_ledger_reaper_handle) => {
@@ -626,12 +631,6 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("Sandbox placement controller exited unexpectedly"),
                     Err(e) => error!("Sandbox placement controller panicked: {e}"),
-                }
-            }
-            result = await_optional_critical_task(execution_reaper_handle) => {
-                match result {
-                    Ok(()) => warn!("Sandbox execution reaper exited unexpectedly"),
-                    Err(e) => error!("Sandbox execution reaper panicked: {e}"),
                 }
             }
         }
@@ -709,6 +708,45 @@ async fn await_critical_task_readiness(
                 Err(error) => anyhow::bail!("{task_name} failed before initial synchronization: {error}"),
             }
         }
+    }
+}
+
+/// The Sandbox cleanup worker whose task ended first.
+///
+/// Each variant owns a durable obligation that can outlive the request or
+/// process which created it, so every one belongs in the fatal-task monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxReaperExit {
+    Admission,
+    Execution,
+    Lease,
+}
+
+impl SandboxReaperExit {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Execution => "execution",
+            Self::Lease => "lease",
+        }
+    }
+}
+
+/// Wait for any Sandbox reaper to return or panic.
+///
+/// Keeping all three [`tokio::task::JoinHandle`] values in this future makes a
+/// clean early return observable. Dropping the execution or lease handles
+/// would silently detach those reapers and let the operator continue serving
+/// after cleanup had stopped.
+async fn first_sandbox_reaper_exit(
+    mut admission: tokio::task::JoinHandle<()>,
+    mut execution: tokio::task::JoinHandle<()>,
+    mut lease: tokio::task::JoinHandle<()>,
+) -> (SandboxReaperExit, Result<(), tokio::task::JoinError>) {
+    tokio::select! {
+        result = &mut admission => (SandboxReaperExit::Admission, result),
+        result = &mut execution => (SandboxReaperExit::Execution, result),
+        result = &mut lease => (SandboxReaperExit::Lease, result),
     }
 }
 
@@ -917,8 +955,9 @@ mod sandbox_ledger_config_tests {
 #[cfg(test)]
 mod critical_task_supervision_tests {
     use super::{
-        acquire_while_critical_task_runs, await_critical_task_readiness,
-        await_optional_critical_task, cancel_before_step_down, sandbox_controller_startup,
+        SandboxReaperExit, acquire_while_critical_task_runs, await_critical_task_readiness,
+        await_optional_critical_task, cancel_before_step_down, first_sandbox_reaper_exit,
+        sandbox_controller_startup,
     };
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -1084,6 +1123,39 @@ mod critical_task_supervision_tests {
 
         assert!(!completed, "a pending step_down must report timeout");
         assert!(shutdown.is_cancelled());
+    }
+
+    /// Every Sandbox reaper owns durable cleanup obligations. The fatal-task
+    /// monitor must wake for a clean early return from any one of them, not
+    /// only for the admission reaper that happened to retain its handle first.
+    #[tokio::test]
+    async fn every_sandbox_reaper_exit_wakes_supervision() {
+        let (which, result) = first_sandbox_reaper_exit(
+            tokio::spawn(async {}),
+            tokio::spawn(std::future::pending()),
+            tokio::spawn(std::future::pending()),
+        )
+        .await;
+        assert_eq!(which, SandboxReaperExit::Admission);
+        result.expect("admission reaper should return cleanly in the fixture");
+
+        let (which, result) = first_sandbox_reaper_exit(
+            tokio::spawn(std::future::pending()),
+            tokio::spawn(async {}),
+            tokio::spawn(std::future::pending()),
+        )
+        .await;
+        assert_eq!(which, SandboxReaperExit::Execution);
+        result.expect("execution reaper should return cleanly in the fixture");
+
+        let (which, result) = first_sandbox_reaper_exit(
+            tokio::spawn(std::future::pending()),
+            tokio::spawn(std::future::pending()),
+            tokio::spawn(async {}),
+        )
+        .await;
+        assert_eq!(which, SandboxReaperExit::Lease);
+        result.expect("lease reaper should return cleanly in the fixture");
     }
 }
 

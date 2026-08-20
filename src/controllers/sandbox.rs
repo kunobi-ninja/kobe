@@ -6822,6 +6822,46 @@ fn lease_error_policy(
     Action::requeue(std::time::Duration::from_secs(15))
 }
 
+/// The independently running half of the Sandbox controller pair that ended.
+///
+/// Returning either value while shutdown is not cancelled is fatal: pool
+/// placement without lease cleanup can strand or overbook work, while lease
+/// cleanup without pool reconciliation can certify stale capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxControllerExit {
+    Pool,
+    Lease,
+}
+
+/// Wait for the first critical Sandbox controller loop to end.
+///
+/// Enabled mode races the pool and lease loops so one clean early return is
+/// observable by the process supervisor. Cleanup-only mode intentionally does
+/// not poll the synthetic pool future; only the always-required lease loop may
+/// complete it.
+async fn first_sandbox_controller_exit<P, L>(
+    placement_enabled: bool,
+    pool_loop: P,
+    lease_loop: L,
+) -> SandboxControllerExit
+where
+    P: std::future::Future<Output = ()>,
+    L: std::future::Future<Output = ()>,
+{
+    tokio::pin!(pool_loop);
+    tokio::pin!(lease_loop);
+
+    if placement_enabled {
+        tokio::select! {
+            () = &mut pool_loop => SandboxControllerExit::Pool,
+            () = &mut lease_loop => SandboxControllerExit::Lease,
+        }
+    } else {
+        lease_loop.await;
+        SandboxControllerExit::Lease
+    }
+}
+
 /// Run Sandbox lifecycle until shutdown.
 ///
 /// Pool placement is started only when `placement_enabled`. The lease loop is
@@ -6885,8 +6925,12 @@ pub async fn run_sandbox_controller(
             .await;
     };
 
-    tokio::join!(pool_loop, lease_loop);
-    info!("Sandbox lifecycle controller shut down");
+    let exited = first_sandbox_controller_exit(placement_enabled, pool_loop, lease_loop).await;
+    if shutdown.is_cancelled() {
+        info!(loop_name = ?exited, "Sandbox lifecycle controller shut down");
+    } else {
+        error!(loop_name = ?exited, "Sandbox controller loop exited unexpectedly");
+    }
 }
 
 #[cfg(test)]
@@ -6912,6 +6956,44 @@ pub(crate) mod tests {
         ] {
             assert!(derived.starts_with("kobe-"), "{derived}");
         }
+    }
+
+    /// Either half of the enabled controller pair is safety-critical. A clean
+    /// early return is therefore still fatal and must not be hidden behind the
+    /// other half's long-lived future.
+    #[tokio::test]
+    async fn enabled_controller_pair_returns_when_either_loop_exits() {
+        assert_eq!(
+            first_sandbox_controller_exit(true, std::future::ready(()), std::future::pending(),)
+                .await,
+            SandboxControllerExit::Pool,
+        );
+        assert_eq!(
+            first_sandbox_controller_exit(true, std::future::pending(), std::future::ready(()),)
+                .await,
+            SandboxControllerExit::Lease,
+        );
+    }
+
+    /// Cleanup-only mode deliberately has no pool loop. Its synthetic disabled
+    /// branch must never mask or manufacture lifecycle-controller completion.
+    #[tokio::test]
+    async fn cleanup_only_controller_waits_exclusively_for_lease_loop() {
+        let still_running = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            first_sandbox_controller_exit(false, std::future::ready(()), std::future::pending()),
+        )
+        .await;
+        assert!(
+            still_running.is_err(),
+            "the disabled pool branch must not wake supervision",
+        );
+
+        assert_eq!(
+            first_sandbox_controller_exit(false, std::future::pending(), std::future::ready(()),)
+                .await,
+            SandboxControllerExit::Lease,
+        );
     }
 
     fn claim_with(status: serde_json::Value) -> DynamicObject {
