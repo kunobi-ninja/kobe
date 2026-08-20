@@ -948,6 +948,9 @@ pub async fn reconcile_lease(
             }
         }
     };
+    let claim_resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
+    let claims: Api<DynamicObject> =
+        Api::namespaced_with(target.client.clone(), &target.namespace, &claim_resource);
 
     if target.owned {
         let Some(proposed) = observed_management_pool_provenance(&ctx, &pool, &status).await?
@@ -974,11 +977,54 @@ pub async fn reconcile_lease(
             return Ok(Action::await_change());
         }
 
-        // Checkpoint the deletion protocol before the first management Claim
-        // POST. From this write onward every create body carries Kobe's Claim
-        // cleanup finalizer, so release can distinguish a genuinely unstarted
-        // allocation from a legacy create whose unrecorded object vanished.
+        // Migrate a Claim emitted by the previous protocol before claiming the
+        // FinalizerV1 invariant. The finalizer and ownerRef removal are one
+        // UID/RV-fenced metadata patch; ending the pass prevents any workload
+        // use before a fresh read sees the complete fence.
         if status.claim_cleanup_fence.is_none() {
+            match claims.get(&claim_name(&name)).await {
+                Ok(observed) => {
+                    if let Some(recorded) = status
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.sandbox_claim.as_ref())
+                    {
+                        require_exact_reference(
+                            recorded,
+                            AGENT_SANDBOX_API_VERSION,
+                            SANDBOX_CLAIM_KIND,
+                            &target.namespace,
+                            &claim_name(&name),
+                            &observed,
+                        )?;
+                    }
+                    match ensure_management_claim_fenced(
+                        &claims,
+                        &observed,
+                        &lease,
+                        &target.namespace,
+                    )
+                    .await?
+                    {
+                        ManagementClaimFence::Ready => {}
+                        ManagementClaimFence::Patched => {
+                            info!(lease = %name, claim = %observed.name_any(), "migrated exact legacy management Claim cleanup fence");
+                            return Ok(Action::await_change());
+                        }
+                        ManagementClaimFence::Foreign => {
+                            return Err(SandboxPlacementError::Invalid(format!(
+                                "management SandboxClaim {} cannot be migrated to the cleanup fence",
+                                observed.name_any()
+                            )));
+                        }
+                    }
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            // Only a verified 404 or a freshly-read fenced Claim reaches this
+            // checkpoint. Every later create body also carries the finalizer.
             status.claim_cleanup_fence = Some(crate::crd::SandboxClaimCleanupFence::FinalizerV1);
             if patch_lease_status_fenced(&ctx, &lease, &status).await? {
                 debug!(lease = %name, "recorded management Claim cleanup fence");
@@ -1013,9 +1059,6 @@ pub async fn reconcile_lease(
         claim_owner,
     );
 
-    let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
-    let claims: Api<DynamicObject> =
-        Api::namespaced_with(target.client.clone(), &target.namespace, &resource);
     let recorded_claim = status
         .target
         .as_ref()
@@ -1051,6 +1094,21 @@ pub async fn reconcile_lease(
             "SandboxClaim {} is not labelled for SandboxLease {name} uid {lease_uid}",
             claim.name_any()
         )));
+    }
+    if target.owned {
+        match ensure_management_claim_fenced(&claims, &claim, &lease, &target.namespace).await? {
+            ManagementClaimFence::Ready => {}
+            ManagementClaimFence::Patched => {
+                info!(lease = %name, claim = %claim.name_any(), "fenced exact legacy management Claim before use");
+                return Ok(Action::await_change());
+            }
+            ManagementClaimFence::Foreign => {
+                return Err(SandboxPlacementError::Invalid(format!(
+                    "management SandboxClaim {} has unverifiable cleanup ownership",
+                    claim.name_any()
+                )));
+            }
+        }
     }
     if target.owned
         && status.claim_cleanup_fence == Some(crate::crd::SandboxClaimCleanupFence::FinalizerV1)
@@ -1088,11 +1146,6 @@ pub async fn reconcile_lease(
             )));
         }
         None if !metadata_has_no_owner_references(&claim.metadata) => {
-            if exact_legacy_claim_owner(&lease, &claim) {
-                let _ = remove_exact_legacy_claim_owner(&claims, &claim).await?;
-                info!(lease = %name, claim = %claim.name_any(), "removed exact legacy management Claim ownerRef");
-                return Ok(Action::await_change());
-            }
             return Err(SandboxPlacementError::Invalid(format!(
                 "management SandboxClaim {} has foreign or ambiguous ownerReferences",
                 claim.name_any()
@@ -1583,7 +1636,12 @@ fn claim_is_expired_retain_tombstone(
         });
     let deletion_is_safely_fenced =
         claim.metadata.deletion_timestamp.is_none() || cleanup_finalizer_present;
-    retain && expired && retained && labelled && deletion_is_safely_fenced
+    retain
+        && expired
+        && retained
+        && labelled
+        && deletion_is_safely_fenced
+        && metadata_has_no_owner_references(&claim.metadata)
 }
 
 fn claim_tombstone_covers_provisioning_deadline(
@@ -1723,6 +1781,7 @@ async fn patch_management_claim_tombstone(
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/metadata/ownerReferences", "value": [] },
         { "op": "add", "path": "/metadata/annotations", "value": annotations },
         { "op": "add", "path": "/metadata/labels", "value": labels },
         { "op": "add", "path": "/metadata/finalizers", "value": retained_finalizers },
@@ -1745,28 +1804,100 @@ async fn patch_management_claim_tombstone(
     }
 }
 
-async fn remove_exact_legacy_claim_owner(
+fn sandbox_claim_cleanup_finalizer_present(claim: &DynamicObject) -> bool {
+    claim
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|finalizer| finalizer == crate::sandbox::SANDBOX_CLAIM_CLEANUP_FINALIZER)
+        })
+}
+
+fn sandbox_claim_has_tombstone_shape(claim: &DynamicObject) -> bool {
+    claim
+        .labels()
+        .get(SANDBOX_CLAIM_TOMBSTONE_LABEL)
+        .is_some_and(|value| value == "true")
+        || claim
+            .annotations()
+            .contains_key(SANDBOX_CLAIM_TOMBSTONE_RETAIN_UNTIL_ANNOTATION)
+        || claim
+            .data
+            .pointer("/spec/lifecycle/shutdownPolicy")
+            .and_then(serde_json::Value::as_str)
+            == Some("Retain")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagementClaimFence {
+    Ready,
+    Patched,
+    Foreign,
+}
+
+/// Migrate one exact live management Claim to the current cleanup fence.
+///
+/// The base protocol emitted a Claim controlled by the outer SandboxLease and
+/// without Kobe's cleanup finalizer. Clearing only that owner reference leaves
+/// a crash window where the owner-independent Claim can disappear before the
+/// status checkpoint. One UID/resourceVersion-fenced patch therefore installs
+/// the finalizer and removes the sole exact legacy owner atomically. The caller
+/// must end its pass after `Patched` and authorize creation/use only after a
+/// fresh read reports `Ready`.
+async fn ensure_management_claim_fenced(
     claims: &Api<DynamicObject>,
     claim: &DynamicObject,
-) -> Result<bool, SandboxPlacementError> {
+    lease: &SandboxLease,
+    namespace: &str,
+) -> Result<ManagementClaimFence, SandboxPlacementError> {
+    let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+        return Ok(ManagementClaimFence::Foreign);
+    };
+    let ownership_is_safe =
+        metadata_has_no_owner_references(&claim.metadata) || exact_legacy_claim_owner(lease, claim);
+    if claim.name_any() != claim_name(&lease.name_any())
+        || claim.namespace().as_deref() != Some(namespace)
+        || claim.metadata.deletion_timestamp.is_some()
+        || sandbox_claim_has_tombstone_shape(claim)
+        || !ownership_is_safe
+        || !claim_matches_release_shape(
+            claim,
+            &lease_uid,
+            &warm_pool_name(&lease.spec.pool_ref.name),
+        )
+    {
+        return Ok(ManagementClaimFence::Foreign);
+    }
+    if metadata_has_no_owner_references(&claim.metadata)
+        && sandbox_claim_cleanup_finalizer_present(claim)
+    {
+        return Ok(ManagementClaimFence::Ready);
+    }
+
     let Some(uid) = claim.uid().filter(|uid| !uid.is_empty()) else {
         return Err(SandboxPlacementError::Invalid(format!(
-            "SandboxClaim {} has no UID for ownerRef migration",
+            "SandboxClaim {} has no UID for cleanup-fence migration",
             claim.name_any()
         )));
     };
     let Some(resource_version) = claim.resource_version() else {
         return Err(SandboxPlacementError::Invalid(format!(
-            "SandboxClaim {} has no resourceVersion for ownerRef migration",
+            "SandboxClaim {} has no resourceVersion for cleanup-fence migration",
             claim.name_any()
         )));
     };
-    let owners = claim.metadata.owner_references.clone().unwrap_or_default();
+    let mut finalizers = claim.metadata.finalizers.clone().unwrap_or_default();
+    if !sandbox_claim_cleanup_finalizer_present(claim) {
+        finalizers.push(crate::sandbox::SANDBOX_CLAIM_CLEANUP_FINALIZER.to_string());
+    }
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
-        { "op": "test", "path": "/metadata/ownerReferences", "value": owners },
-        { "op": "replace", "path": "/metadata/ownerReferences", "value": [] }
+        { "op": "add", "path": "/metadata/ownerReferences", "value": [] },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
     ]));
     match claims
         .patch(
@@ -1776,8 +1907,10 @@ async fn remove_exact_legacy_claim_owner(
         )
         .await
     {
-        Ok(_) => Ok(true),
-        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(false),
+        Ok(_) => Ok(ManagementClaimFence::Patched),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => {
+            Ok(ManagementClaimFence::Patched)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -2713,18 +2846,30 @@ pub(super) async fn ensure_management_claim_tombstone(
         ));
     }
 
-    if !metadata_has_no_owner_references(&observed.metadata) {
-        if !exact_legacy_claim_owner(lease, &observed) {
-            return Ok(ManagementClaimTombstone::Quarantine(
-                "claim_ownerref_legacy_unverifiable",
-            ));
-        }
-        if remove_exact_legacy_claim_owner(claims, &observed).await? {
-            info!(lease = %lease.name_any(), claim = %name, "removed exact legacy Claim ownerRef");
-        }
-        return Ok(ManagementClaimTombstone::Retry(
-            std::time::Duration::from_secs(1),
+    if !metadata_has_no_owner_references(&observed.metadata)
+        && !exact_legacy_claim_owner(lease, &observed)
+    {
+        return Ok(ManagementClaimTombstone::Quarantine(
+            "claim_ownerref_legacy_unverifiable",
         ));
+    }
+    if !sandbox_claim_has_tombstone_shape(&observed)
+        && observed.metadata.deletion_timestamp.is_none()
+    {
+        match ensure_management_claim_fenced(claims, &observed, lease, &ctx.namespace).await? {
+            ManagementClaimFence::Ready => {}
+            ManagementClaimFence::Patched => {
+                info!(lease = %lease.name_any(), claim = %name, "migrated exact legacy Claim cleanup fence before tombstone conversion");
+                return Ok(ManagementClaimTombstone::Retry(
+                    std::time::Duration::from_secs(1),
+                ));
+            }
+            ManagementClaimFence::Foreign => {
+                return Ok(ManagementClaimTombstone::Quarantine(
+                    "claim_ownerref_legacy_unverifiable",
+                ));
+            }
+        }
     }
 
     let reference = target_reference(
@@ -3935,12 +4080,23 @@ async fn drive_release(
         if !claim_is_for_lease(&observed, &lease_uid) {
             return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
         }
-        if !metadata_has_no_owner_references(&observed.metadata) {
-            if !exact_legacy_claim_owner(lease, &observed) {
+        if observed.metadata.deletion_timestamp.is_some() {
+            if !metadata_has_no_owner_references(&observed.metadata)
+                || !sandbox_claim_cleanup_finalizer_present(&observed)
+            {
                 return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
             }
-            let _ = remove_exact_legacy_claim_owner(&claims, &observed).await?;
-            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+        } else {
+            match ensure_management_claim_fenced(&claims, &observed, lease, &ctx.namespace).await? {
+                ManagementClaimFence::Ready => {}
+                ManagementClaimFence::Patched => {
+                    info!(lease = %name, claim = %observed.name_any(), "migrated exact legacy management Claim during release recovery");
+                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                }
+                ManagementClaimFence::Foreign => {
+                    return quarantine_lease(lease, ctx, "claim_identity_unverifiable").await;
+                }
+            }
         }
         let reference = target_reference(
             AGENT_SANDBOX_API_VERSION,
@@ -6803,8 +6959,36 @@ pub(crate) mod tests {
                 },
                 "finalizers": [crate::sandbox::SANDBOX_CLAIM_CLEANUP_FINALIZER],
             },
+            "spec": {
+                "warmPoolRef": { "name": "kobe-agents" },
+                "lifecycle": {
+                    "shutdownTime": "2026-08-20T00:10:00Z",
+                    "shutdownPolicy": "DeleteForeground"
+                }
+            },
             "status": status,
         })
+    }
+
+    /// Byte-for-byte ownership/finalizer shape emitted by the base management
+    /// Claim producer before the cleanup-fence protocol.
+    fn base_legacy_claim_json(status: serde_json::Value) -> serde_json::Value {
+        let mut claim = claim_json(status);
+        claim["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("finalizers");
+        claim["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxLease",
+            "name": LEASE,
+            "uid": "lease-uid-1",
+            "controller": true,
+        }]);
+        claim["spec"]["lifecycle"] = serde_json::json!({
+            "shutdownPolicy": "DeleteForeground"
+        });
+        claim
     }
 
     fn tombstone_claim_json(uid: &str, prior_claim_uid: Option<&str>) -> serde_json::Value {
@@ -7723,6 +7907,113 @@ pub(crate) mod tests {
         assert_eq!(target["sandboxTemplate"]["uid"], "template-uid");
         assert_eq!(target["sandboxWarmPool"]["uid"], "warm-pool-uid");
         assert!(target.get("sandboxClaim").is_none());
+    }
+
+    /// A controller upgrade can observe the base Claim after its CREATE but
+    /// before any new cleanup checkpoint exists. The exact legacy owner and
+    /// cleanup finalizer are migrated in one UID/resourceVersion-fenced patch;
+    /// the pass ends before status claims the new invariant or uses the Claim.
+    #[tokio::test]
+    async fn legacy_management_claim_is_atomically_fenced_before_use() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(management_pool(POOL_UID, POOL_GENERATION)),
+            )
+            .mount(&server)
+            .await;
+
+        let legacy = base_legacy_claim_json(serde_json::json!({
+            "conditions": [{ "type": "Ready", "status": "False" }]
+        }));
+        let mut migrated = legacy.clone();
+        migrated["metadata"]["resourceVersion"] = "claim-rv-2".into();
+        migrated["metadata"]["ownerReferences"] = serde_json::json!([]);
+        migrated["metadata"]["finalizers"] =
+            serde_json::json!([crate::sandbox::SANDBOX_CLAIM_CLEANUP_FINALIZER]);
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&legacy))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&migrated))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&migrated))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(LEASE_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(admitted_lease()))
+            .mount(&server)
+            .await;
+
+        let mut lease = admitted_lease();
+        lease.status.as_mut().unwrap().claim_cleanup_fence = None;
+        let first = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(first, Action::await_change());
+        assert_eq!(requests_to(&server, "PATCH", CLAIM_PATH).await, 1);
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+        assert_eq!(requests_to(&server, "POST", CLAIMS_PATH).await, 0);
+
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH" && request.url.path() == CLAIM_PATH)
+            .expect("legacy Claim migration patch");
+        let operations: Vec<serde_json::Value> = serde_json::from_slice(&request.body).unwrap();
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/uid"
+                && operation["value"] == "claim-uid"
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "77"
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/metadata/ownerReferences"
+                && operation["value"] == serde_json::json!([])
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/metadata/finalizers"
+                && operation["value"].as_array().is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value == crate::sandbox::SANDBOX_CLAIM_CLEANUP_FINALIZER)
+                })
+        }));
+
+        let second = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
+        assert_eq!(second, Action::await_change());
+        assert_eq!(requests_to(&server, "PATCH", CLAIM_PATH).await, 1);
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 1);
+        let status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("cleanup-fence status checkpoint");
+        assert_eq!(status["claimCleanupFence"], "FinalizerV1");
     }
 
     /// A lost optimistic status race ends the pass. In particular, a stale
@@ -9908,24 +10199,37 @@ pub(crate) mod tests {
         assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
     }
 
-    /// Even an exact UID label cannot make a management claim safe when it is
-    /// still a GC dependent. Recovery refuses the legacy/foreign ownerRef
-    /// shape before any delete or quota release.
+    /// Release recovery accepts only the exact base ownerRef shape, then adds
+    /// the cleanup finalizer and clears that owner atomically before recording
+    /// the missing Claim UID. No delete or quota release can cross this
+    /// restart boundary.
     #[tokio::test]
-    async fn teardown_rejects_a_gc_dependent_management_claim() {
+    async fn teardown_migrates_exact_legacy_management_claim_before_recovery() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        let mut dependent = claim_json(serde_json::json!({}));
-        dependent["metadata"]["ownerReferences"] = serde_json::json!([{
-            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-            "kind": "SandboxLease",
-            "name": LEASE,
-            "uid": "lease-uid-1",
-            "controller": true,
-        }]);
+        let dependent = base_legacy_claim_json(serde_json::json!({}));
+        let mut migrated = dependent.clone();
+        migrated["metadata"]["resourceVersion"] = "claim-rv-2".into();
+        migrated["metadata"]["ownerReferences"] = serde_json::json!([]);
+        migrated["metadata"]["finalizers"] =
+            serde_json::json!([crate::sandbox::SANDBOX_CLAIM_CLEANUP_FINALIZER]);
         Mock::given(method("GET"))
             .and(path(CLAIM_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(dependent))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&dependent))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&migrated))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(CLAIM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&migrated))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -9938,11 +10242,38 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .sandbox_claim = None;
+        lease.status.as_mut().unwrap().sandbox_claim_tombstone = None;
+
+        let action = reconcile_lease(Arc::new(lease.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
+        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
+        assert_eq!(requests_to(&server, "PATCH", CLAIM_PATH).await, 1);
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+        assert!(recorded_phases(&server).await.is_empty());
 
         let action = reconcile_lease(Arc::new(lease), ctx).await.unwrap();
-        assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
-        assert_eq!(requests_to(&server, "DELETE", CLAIM_PATH).await, 0);
-        assert_eq!(recorded_phases(&server).await, vec!["Quarantined"]);
+        assert_eq!(action, Action::await_change());
+        assert_eq!(requests_to(&server, "PATCH", LEASE_STATUS_PATH).await, 1);
+        let recovered = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find_map(status_value_of)
+            .expect("recovered legacy Claim identity");
+        assert_eq!(recovered["target"]["sandboxClaim"]["uid"], "claim-uid");
     }
 
     /// If the recorded Claim name is already occupied by another UID, the
