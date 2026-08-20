@@ -38,6 +38,32 @@ fn parse_sandbox_ledger_object_limit(value: &str) -> Option<u32> {
         .filter(|limit| *limit >= MIN_SANDBOX_LEDGER_OBJECT_LIMIT)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SandboxControllerStartup {
+    lifecycle_enabled: bool,
+    runtime_mode: sandbox_runtime::AgentSandboxMode,
+}
+
+impl SandboxControllerStartup {
+    const fn placement_enabled(self) -> bool {
+        self.runtime_mode.enabled()
+    }
+}
+
+/// Decide Sandbox controller startup independently from admission mode.
+///
+/// Disabled stops new placement, but cleanup remains a startup prerequisite:
+/// existing leases, finalizers, reservations, and retained tombstones were
+/// created under an earlier External configuration and must still drain.
+const fn sandbox_controller_startup(
+    mode: sandbox_runtime::AgentSandboxMode,
+) -> SandboxControllerStartup {
+    SandboxControllerStartup {
+        lifecycle_enabled: true,
+        runtime_mode: mode,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the rustls crypto provider before any TLS usage.
@@ -447,16 +473,19 @@ async fn main() -> anyhow::Result<()> {
     let sandbox_ns = namespace.clone();
     let sandbox_reservation_ns = sandbox_reservation_namespace.clone();
     let sandbox_shutdown = shutdown.clone();
-    let sandbox_controller_handle = Some(tokio::spawn(async move {
-        controllers::sandbox::run_sandbox_controller(
-            sandbox_client,
-            &sandbox_ns,
-            &sandbox_reservation_ns,
-            agent_sandbox_mode,
-            sandbox_shutdown,
-        )
-        .await;
-    }));
+    let sandbox_startup = sandbox_controller_startup(agent_sandbox_mode);
+    let sandbox_controller_handle = sandbox_startup.lifecycle_enabled.then(|| {
+        tokio::spawn(async move {
+            controllers::sandbox::run_sandbox_controller(
+                sandbox_client,
+                &sandbox_ns,
+                &sandbox_reservation_ns,
+                sandbox_startup.runtime_mode,
+                sandbox_shutdown,
+            )
+            .await;
+        })
+    });
 
     // Executions left Running by a process that disappeared are settled even
     // after mode changes. Cleanup-only must not turn old records into polls
@@ -889,10 +918,22 @@ mod sandbox_ledger_config_tests {
 mod critical_task_supervision_tests {
     use super::{
         acquire_while_critical_task_runs, await_critical_task_readiness,
-        await_optional_critical_task, cancel_before_step_down,
+        await_optional_critical_task, cancel_before_step_down, sandbox_controller_startup,
     };
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    /// Disabled mode is cleanup-only, not lifecycle-off. Startup must still
+    /// supervise the controller that drains old leases while withholding every
+    /// new placement side effect.
+    #[test]
+    fn disabled_startup_keeps_sandbox_lifecycle_cleanup_enabled() {
+        let startup =
+            sandbox_controller_startup(crate::sandbox_runtime::AgentSandboxMode::Disabled);
+
+        assert!(startup.lifecycle_enabled);
+        assert!(!startup.placement_enabled());
+    }
 
     /// A follower must fail closed if its per-replica revoker exits while
     /// leader acquisition is still pending.

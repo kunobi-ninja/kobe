@@ -305,23 +305,19 @@ pub fn build_internal_cluster_lease(
     })
 }
 
-fn internal_lease_identity_is_for_sandbox(
+fn internal_lease_base_identity_is_for_sandbox(
     internal: &ClusterLease,
     sandbox_lease: &SandboxLease,
 ) -> bool {
-    let Some(sandbox_uid) = sandbox_lease.uid().filter(|uid| !uid.is_empty()) else {
+    if sandbox_lease.uid().is_none_or(|uid| uid.is_empty()) {
         return false;
-    };
+    }
     internal.name_any() == internal_lease_name(&sandbox_lease.name_any())
         && internal.namespace() == sandbox_lease.namespace()
         && internal
             .labels()
             .get("app.kubernetes.io/managed-by")
             .is_some_and(|value| value == crate::sandbox::KOBE_MANAGED_BY)
-        && internal
-            .labels()
-            .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
-            .is_some_and(|value| value == &sandbox_uid)
         && internal.spec.requester.requester_type == "kobe:sandbox-composition"
         && internal.spec.requester.identity == "kobe-operator"
         && internal.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
@@ -344,26 +340,41 @@ pub(crate) fn internal_lease_ownership(
     internal: &ClusterLease,
     sandbox_lease: &SandboxLease,
 ) -> InternalLeaseOwnership {
-    if !internal_lease_identity_is_for_sandbox(internal, sandbox_lease)
+    if !internal_lease_base_identity_is_for_sandbox(internal, sandbox_lease)
         || internal.metadata.deletion_timestamp.is_some()
     {
         return InternalLeaseOwnership::Foreign;
     }
-    let Some(owners) = internal.metadata.owner_references.as_ref() else {
-        return InternalLeaseOwnership::Ownerless;
-    };
-    if owners.is_empty() {
-        return InternalLeaseOwnership::Ownerless;
-    }
     let Some(sandbox_uid) = sandbox_lease.uid().filter(|uid| !uid.is_empty()) else {
         return InternalLeaseOwnership::Foreign;
     };
+    let uid_label = internal
+        .labels()
+        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL);
+    let Some(owners) = internal.metadata.owner_references.as_ref() else {
+        return if uid_label == Some(&sandbox_uid) {
+            InternalLeaseOwnership::Ownerless
+        } else {
+            InternalLeaseOwnership::Foreign
+        };
+    };
+    if owners.is_empty() {
+        return if uid_label == Some(&sandbox_uid) {
+            InternalLeaseOwnership::Ownerless
+        } else {
+            InternalLeaseOwnership::Foreign
+        };
+    }
     if owners.len() == 1
         && owners[0].api_version == SandboxLease::api_version(&()).as_ref()
         && owners[0].kind == SandboxLease::kind(&()).as_ref()
         && owners[0].name == sandbox_lease.name_any()
         && owners[0].uid == sandbox_uid
         && owners[0].controller == Some(true)
+        // The exact v1167179 object had no lease-UID label. Accept that byte
+        // shape, or a partially migrated exact label, but never a conflicting
+        // label from a same-named replacement outer lease.
+        && uid_label.is_none_or(|value| value == &sandbox_uid)
     {
         InternalLeaseOwnership::ExactLegacy
     } else {
@@ -388,7 +399,7 @@ pub(crate) fn internal_lease_matches_composition_identity(
     cluster_pool_ref: &str,
     lifetime: Duration,
 ) -> bool {
-    internal_lease_identity_is_for_sandbox(internal, sandbox_lease)
+    internal_lease_ownership(internal, sandbox_lease) != InternalLeaseOwnership::Foreign
         && internal.spec.pool_ref == cluster_pool_ref
         && internal.spec.ttl == format!("{}s", lifetime.as_secs())
 }
