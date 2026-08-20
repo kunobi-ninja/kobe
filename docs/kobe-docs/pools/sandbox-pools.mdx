@@ -74,12 +74,16 @@ namespace named from the immutable Helm release identity
 - a `ValidatingAdmissionPolicy` that permits Lease mutations only from the
   exact Kobe operator ServiceAccount;
 - a namespace-wide Lease object quota, configured by
-  `agentSandbox.reservationObjectLimit` (default `4096`); and
+  `agentSandbox.reservationObjectLimit` (default `4096`, minimum `4`); and
 - namespace-scoped operator RBAC. The chart grants tenants no access there,
   and the admission policy denies every non-operator Lease create, update, or
   delete even if another administrator grants broader RBAC.
 
 The namespace, policy, binding, and quota are retained on Helm uninstall.
+Before admission, Kobe creates one exact access gate per Sandbox; admission
+then adds one quota token and, when requested, one alias token. Each principal
+with active operations adds one shared principal ledger. This is why values
+below the documented minimum cannot represent one fully usable aliased lease.
 Deleting any of them while a `SandboxLease` is live can free its admission slot
 or erase the proof that all API replicas drained before teardown. Remove
 retained ledger resources only after every Sandbox lease, reservation, and

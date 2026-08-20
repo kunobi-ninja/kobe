@@ -8,11 +8,13 @@
 //! - one gate per `SandboxLease` UID, containing at most eight operations;
 //! - one ledger per authenticated principal, containing at most 32 operations.
 //!
-//! Handlers enter the lease gate first and the principal ledger second. The
-//! lifecycle controller closes the same gate before teardown and waits until
-//! every entry is gone. A close racing an entry is therefore serialized by one
-//! `resourceVersion`; there is no check-then-act window in which a late handler
-//! can mint a credential after cleanup has started.
+//! Admission creates the lease gate before reserving capacity or publishing an
+//! admitted `SandboxLease`. Handlers enter that existing gate first and the
+//! principal ledger second. The lifecycle controller closes the same gate
+//! before teardown and waits until every entry is gone. A close racing an entry
+//! is therefore serialized by one `resourceVersion`; there is no check-then-act
+//! window in which a late handler can mint a credential after cleanup starts,
+//! and teardown never needs to CREATE a gate while the ledger quota is full.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,16 +29,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::crd::SandboxLease;
+use crate::crd::{SandboxConditionStatus, SandboxLease, SandboxLeasePhase};
 
 const LEDGER_KIND_LABEL: &str = "kobe.kunobi.ninja/sandbox-access-kind";
 const LEASE_NAME_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-name";
-const LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
+// Deliberately distinct from the admission-reservation UID label. Pending
+// admission cleanup lists that label to discover quota/alias tokens; treating
+// an access gate as a token would either delete the teardown barrier early or
+// reject cleanup because its object shape is intentionally different.
+const LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-access-lease-uid";
 const GATE_KIND: &str = "lease-gate";
 const PRINCIPAL_KIND: &str = "principal-ledger";
 const STATE_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-access-state";
 const ENTRIES_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-access-entries";
 const PRINCIPAL_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-principal-hash";
+/// Exact API-server identity of the pre-admission access gate.
+pub const ACCESS_GATE_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-access-gate";
 const OPEN: &str = "open";
 const CLOSED: &str = "closed";
 const MAX_CAS_ATTEMPTS: usize = 64;
@@ -82,6 +90,17 @@ struct PrincipalEntry {
     lease_uid: String,
     gate_name: String,
     replica: ServingReplica,
+}
+
+/// Immutable, non-secret handle persisted atomically with Sandbox admission.
+///
+/// The deterministic name prevents duplicate gates; the UID prevents a
+/// same-named replacement from becoming teardown or access authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccessGateReference {
+    pub name: String,
+    pub uid: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +155,7 @@ struct ReleaseRegistration {
     sandbox_name: String,
     sandbox_uid: String,
     gate_name: String,
+    expected_gate_uid: String,
     gate_uid: Option<String>,
     principal_name: String,
     principal_uid: Option<String>,
@@ -282,12 +302,11 @@ fn optimistic_conflict(error: &kube::Error) -> bool {
     }
 }
 
-async fn get_or_create_gate(
+async fn get_or_create_open_gate(
     api: &Api<Lease>,
     namespace: &str,
     lease_name: &str,
     expected_lease_uid: &str,
-    initial_state: &'static str,
 ) -> Result<(Lease, bool), AccessLedgerError> {
     let name = gate_name(expected_lease_uid);
     match api.get(&name).await {
@@ -296,7 +315,7 @@ async fn get_or_create_gate(
             match api
                 .create(
                     &PostParams::default(),
-                    &build_gate(namespace, lease_name, expected_lease_uid, initial_state),
+                    &build_gate(namespace, lease_name, expected_lease_uid, OPEN),
                 )
                 .await
             {
@@ -305,6 +324,122 @@ async fn get_or_create_gate(
                 Err(error) => Err(error.into()),
             }
         }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Create the empty, open access gate before a lease can be admitted.
+///
+/// This is an admission invariant rather than lazy handler setup. Every
+/// admitted lease must already occupy its deterministic gate name, otherwise a
+/// full ledger quota could prevent teardown from closing the gate and proving
+/// access drained. Existing gates are accepted only when their exact
+/// lease-name/UID provenance, open state, and empty entry set all match.
+pub async fn prepare_open_gate(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+) -> Result<AccessGateReference, AccessLedgerError> {
+    let sandbox_name = lease.name_any();
+    let sandbox_uid = lease
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    let (gate, _) =
+        get_or_create_open_gate(&api, ledger_namespace, &sandbox_name, &sandbox_uid).await?;
+    validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
+    if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN) {
+        return Err(AccessLedgerError::Invalid("lease gate state"));
+    }
+    if !parse_entries::<GateEntry>(&gate)?.is_empty() {
+        return Err(AccessLedgerError::Invalid(
+            "pre-admission lease gate entries",
+        ));
+    }
+    Ok(AccessGateReference {
+        name: gate.name_any(),
+        uid: lease_uid(&gate)?.to_string(),
+    })
+}
+
+/// Encode one exact gate handle for the atomic admission metadata patch.
+pub fn encode_gate_reference(reference: &AccessGateReference) -> Result<String, AccessLedgerError> {
+    if reference.name.trim().is_empty() || reference.uid.trim().is_empty() {
+        return Err(AccessLedgerError::Invalid("access gate reference"));
+    }
+    Ok(serde_json::to_string(reference)?)
+}
+
+/// Read the exact gate handle committed with an admitted SandboxLease.
+pub fn persisted_gate_reference(
+    lease: &SandboxLease,
+) -> Result<AccessGateReference, AccessLedgerError> {
+    let encoded =
+        lease
+            .annotations()
+            .get(ACCESS_GATE_ANNOTATION)
+            .ok_or(AccessLedgerError::Invalid(
+                "persisted access gate reference",
+            ))?;
+    let reference: AccessGateReference = serde_json::from_str(encoded)?;
+    let sandbox_uid = lease
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    if reference.name != gate_name(&sandbox_uid) || reference.uid.trim().is_empty() {
+        return Err(AccessLedgerError::Invalid(
+            "persisted access gate reference",
+        ));
+    }
+    Ok(reference)
+}
+
+/// Remove an empty pre-admission gate after the exact parent is proven absent.
+///
+/// The caller owns the parent-404 fence. This helper never treats a DELETE
+/// response as absence: it UID/resourceVersion-deletes the exact open gate and
+/// then requires a 404, so failed admission cannot accumulate gates until the
+/// namespace quota blocks unrelated cleanup.
+pub async fn remove_pre_admission_gate(
+    api: &Api<Lease>,
+    lease: &SandboxLease,
+) -> Result<(), AccessLedgerError> {
+    let sandbox_name = lease.name_any();
+    let sandbox_uid = lease
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    let name = gate_name(&sandbox_uid);
+    let gate = match api.get(&name).await {
+        Ok(gate) => gate,
+        Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
+    if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN)
+        || !parse_entries::<GateEntry>(&gate)?.is_empty()
+    {
+        return Err(AccessLedgerError::Invalid("pre-admission lease gate state"));
+    }
+    let expected_uid = lease_uid(&gate)?.to_string();
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(expected_uid.clone()),
+            resource_version: Some(lease_rv(&gate)?.to_string()),
+        }),
+        ..DeleteParams::default()
+    };
+    let deletion = api.delete(&name, &params).await;
+    match api.get(&name).await {
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+        Ok(replacement) if lease_uid(&replacement)? != expected_uid => Ok(()),
+        Ok(_) => match deletion {
+            Ok(_) => Err(AccessLedgerError::Invalid(
+                "pre-admission gate deletion not confirmed",
+            )),
+            Err(error) => Err(error.into()),
+        },
         Err(error) => Err(error.into()),
     }
 }
@@ -370,19 +505,14 @@ async fn patch_entries<T: Serialize>(
 
 async fn add_gate_entry(
     api: &Api<Lease>,
-    namespace: &str,
     registration: &mut ReleaseRegistration,
 ) -> Result<Option<Lease>, AccessLedgerError> {
     for _ in 0..MAX_CAS_ATTEMPTS {
-        let (gate, _) = get_or_create_gate(
-            api,
-            namespace,
-            &registration.sandbox_name,
-            &registration.sandbox_uid,
-            OPEN,
-        )
-        .await?;
+        let gate = api.get(&registration.gate_name).await?;
         validate_gate(&gate, &registration.sandbox_name, &registration.sandbox_uid)?;
+        if lease_uid(&gate)? != registration.expected_gate_uid {
+            return Err(AccessLedgerError::Invalid("persisted access gate UID"));
+        }
         // Arm exact cleanup before the PATCH await. If the request task is
         // cancelled after the apiserver commits but before its response is
         // observed, Drop still has the only UID it may mutate.
@@ -472,12 +602,17 @@ async fn add_principal_entry(
 pub async fn acquire(
     client: &Client,
     ledger_namespace: &str,
-    sandbox_name: &str,
-    sandbox_uid: &str,
+    lease: &SandboxLease,
     principal_hash: &str,
     replica: &ServingReplica,
 ) -> Result<AccessAcquire, AccessLedgerError> {
     replica.validate()?;
+    let sandbox_name = lease.name_any();
+    let sandbox_uid = lease
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    let expected_gate = persisted_gate_reference(lease)?;
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
     let operation_id = uuid::Uuid::new_v4().to_string();
     // Construct the cleanup owner before the first API await. Request-task
@@ -490,9 +625,10 @@ pub async fn acquire(
             namespace: ledger_namespace.into(),
         }),
         registration: ReleaseRegistration {
-            sandbox_name: sandbox_name.into(),
-            sandbox_uid: sandbox_uid.into(),
-            gate_name: gate_name(sandbox_uid),
+            sandbox_name: sandbox_name.clone(),
+            sandbox_uid: sandbox_uid.clone(),
+            gate_name: expected_gate.name,
+            expected_gate_uid: expected_gate.uid,
             gate_uid: None,
             principal_name: principal_name(principal_hash),
             principal_uid: None,
@@ -501,8 +637,8 @@ pub async fn acquire(
             replica: replica.clone(),
         },
     });
-    let Some(gate) = add_gate_entry(&api, ledger_namespace, &mut guard.registration).await? else {
-        let name = gate_name(sandbox_uid);
+    let Some(gate) = add_gate_entry(&api, &mut guard.registration).await? else {
+        let name = gate_name(&sandbox_uid);
         return match api.get(&name).await {
             Ok(gate)
                 if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) == Some(CLOSED) =>
@@ -520,8 +656,8 @@ pub async fn acquire(
             &api,
             &gate.name_any(),
             lease_uid(&gate)?,
-            sandbox_name,
-            sandbox_uid,
+            &sandbox_name,
+            &sandbox_uid,
             &operation_id,
             &GateEntry {
                 principal_hash: principal_hash.into(),
@@ -709,12 +845,18 @@ pub async fn close_and_drain(
         .uid()
         .filter(|uid| !uid.is_empty())
         .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    let expected_gate = persisted_gate_reference(lease)?;
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
-    let (gate, created) =
-        get_or_create_gate(&api, ledger_namespace, &sandbox_name, &sandbox_uid, CLOSED).await?;
+    let gate = match api.get(&expected_gate.name).await {
+        Ok(gate) => gate,
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            return Err(AccessLedgerError::Invalid("missing admitted lease gate"));
+        }
+        Err(error) => return Err(error.into()),
+    };
     validate_gate(&gate, &sandbox_name, &sandbox_uid)?;
-    if created {
-        return Ok(AccessDrain::Checkpointed);
+    if lease_uid(&gate)? != expected_gate.uid {
+        return Err(AccessLedgerError::Invalid("persisted access gate UID"));
     }
     if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) == Some(OPEN) {
         match close_gate(&api, &gate).await {
@@ -866,7 +1008,10 @@ pub async fn reap_empty(
                     .get(LEASE_UID_LABEL)
                     .ok_or(AccessLedgerError::Invalid("lease gate UID label"))?;
                 match sandboxes.get(name).await {
-                    Ok(lease) => lease.uid().as_deref() != Some(expected_uid.as_str()),
+                    Ok(lease) => {
+                        lease.uid().as_deref() != Some(expected_uid.as_str())
+                            || clean_terminal_lease(&lease)
+                    }
                     Err(kube::Error::Api(response)) if response.code == 404 => true,
                     Err(error) => return Err(error.into()),
                 }
@@ -890,6 +1035,23 @@ pub async fn reap_empty(
         }
     }
     Ok(())
+}
+
+fn clean_terminal_lease(lease: &SandboxLease) -> bool {
+    let Some(status) = lease.status.as_ref() else {
+        return false;
+    };
+    matches!(
+        status.phase,
+        SandboxLeasePhase::Released | SandboxLeasePhase::Expired
+    ) && ["FootprintAbsent", "CleanupVerified"]
+        .iter()
+        .all(|expected| {
+            status.conditions.iter().any(|condition| {
+                condition.condition_type == *expected
+                    && condition.status == SandboxConditionStatus::True
+            })
+        })
 }
 
 /// Periodically retire empty gate/principal records after their authority is
@@ -959,7 +1121,14 @@ mod tests {
     fn sandbox_lease() -> SandboxLease {
         serde_json::from_value(json!({
             "apiVersion":"kobe.kunobi.ninja/v1alpha1", "kind":"SandboxLease",
-            "metadata":{"name":"sandbox-a","namespace":"kobe-system","uid":"sandbox-uid"},
+            "metadata":{
+                "name":"sandbox-a","namespace":"kobe-system","uid":"sandbox-uid",
+                "annotations":{
+                    ACCESS_GATE_ANNOTATION: serde_json::to_string(&AccessGateReference {
+                        name: gate_name("sandbox-uid"), uid: "gate-uid".into()
+                    }).unwrap()
+                }
+            },
             "spec":{
                 "poolRef":{"name":"pool","uid":"pool-uid","generation":1},
                 "ttl":"1m",
@@ -974,6 +1143,7 @@ mod tests {
             sandbox_name: "sandbox-a".into(),
             sandbox_uid: "sandbox-uid".into(),
             gate_name: gate_name("sandbox-uid"),
+            expected_gate_uid: "gate-uid".into(),
             gate_uid: None,
             principal_name: principal_name("principal-hash"),
             principal_uid: None,
@@ -1040,8 +1210,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_fully_proven_clean_terminal_lease_releases_its_gate_object() {
+        let mut lease = sandbox_lease();
+        let mut status = crate::crd::SandboxLeaseStatus {
+            phase: SandboxLeasePhase::Released,
+            ..Default::default()
+        };
+        lease.status = Some(status.clone());
+        assert!(!clean_terminal_lease(&lease));
+
+        for condition_type in ["FootprintAbsent", "CleanupVerified"] {
+            status.conditions.push(crate::crd::SandboxCondition {
+                condition_type: condition_type.into(),
+                status: SandboxConditionStatus::True,
+                ..Default::default()
+            });
+        }
+        lease.status = Some(status);
+        assert!(clean_terminal_lease(&lease));
+
+        lease.status.as_mut().unwrap().phase = SandboxLeasePhase::Quarantined;
+        assert!(!clean_terminal_lease(&lease));
+    }
+
     #[tokio::test]
-    async fn a_missing_gate_is_created_closed_before_drain_can_pass() {
+    async fn admission_prepares_the_empty_open_gate_before_capacity() {
         let server = MockServer::start().await;
         let client = mock_client(&server);
         let name = gate_name("sandbox-uid");
@@ -1062,7 +1256,7 @@ mod tests {
                 (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
             ]),
             BTreeMap::from([
-                (STATE_ANNOTATION.into(), CLOSED.into()),
+                (STATE_ANNOTATION.into(), OPEN.into()),
                 (ENTRIES_ANNOTATION.into(), "{}".into()),
             ]),
         );
@@ -1073,11 +1267,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let lease = sandbox_lease();
-        assert_eq!(
-            close_and_drain(&client, "ledger", &lease).await.unwrap(),
-            AccessDrain::Checkpointed
-        );
+        prepare_open_gate(&client, "ledger", &sandbox_lease())
+            .await
+            .unwrap();
         let requests = server.received_requests().await.unwrap();
         let post: Value = serde_json::from_slice(
             &requests
@@ -1087,7 +1279,143 @@ mod tests {
                 .body,
         )
         .unwrap();
-        assert_eq!(post["metadata"]["annotations"][STATE_ANNOTATION], CLOSED);
+        assert_eq!(post["metadata"]["annotations"][STATE_ANNOTATION], OPEN);
+        assert_eq!(post["metadata"]["annotations"][ENTRIES_ANNOTATION], "{}");
+    }
+
+    #[tokio::test]
+    async fn teardown_never_allocates_a_missing_gate_under_quota_pressure() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let name = gate_name("sandbox-uid");
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        Mock::given(method("GET"))
+            .and(path(format!("{collection}/{name}")))
+            .respond_with(k8s_error(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            close_and_drain(&client, "ledger", &sandbox_lease()).await,
+            Err(AccessLedgerError::Invalid("missing admitted lease gate"))
+        ));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "POST")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_named_gate_replacement_never_becomes_teardown_authority() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let name = gate_name("sandbox-uid");
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        let replacement = lease_object(
+            &name,
+            "replacement-gate-uid",
+            "9",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("{collection}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replacement))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            close_and_drain(&client, "ledger", &sandbox_lease()).await,
+            Err(AccessLedgerError::Invalid("persisted access gate UID"))
+        ));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "PATCH")
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_terminal_parent_releases_the_empty_gate_before_record_retention() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let name = gate_name("sandbox-uid");
+        let collection = "/apis/coordination.k8s.io/v1/namespaces/ledger/leases";
+        let gate = lease_object(
+            &name,
+            "gate-uid",
+            "7",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), CLOSED.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(collection))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"coordination.k8s.io/v1", "kind":"LeaseList",
+                "metadata":{"resourceVersion":"8"}, "items":[gate]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut parent = sandbox_lease();
+        let conditions = ["FootprintAbsent", "CleanupVerified"]
+            .into_iter()
+            .map(|condition_type| crate::crd::SandboxCondition {
+                condition_type: condition_type.into(),
+                status: SandboxConditionStatus::True,
+                ..Default::default()
+            })
+            .collect();
+        parent.status = Some(crate::crd::SandboxLeaseStatus {
+            phase: SandboxLeasePhase::Released,
+            conditions,
+            ..Default::default()
+        });
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases/sandbox-a",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{collection}/{name}")))
+            .and(body_partial_json(json!({
+                "preconditions":{"uid":"gate-uid","resourceVersion":"7"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "apiVersion":"v1", "kind":"Status", "status":"Success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        reap_empty(&client, "kobe-system", "ledger").await.unwrap();
     }
 
     #[tokio::test]
@@ -1109,14 +1437,7 @@ mod tests {
         let gate_object = lease_object(&gate, "gate-uid", "1", gate_labels, gate_annotations);
         Mock::given(method("GET"))
             .and(path(format!("{collection}/{gate}")))
-            .respond_with(k8s_error(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(collection))
-            .and(body_partial_json(json!({"metadata":{"name":gate}})))
-            .respond_with(ResponseTemplate::new(201).set_body_json(gate_object.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object.clone()))
             .expect(1)
             .mount(&server)
             .await;
@@ -1171,8 +1492,7 @@ mod tests {
         let AccessAcquire::Acquired(guard) = acquire(
             &client,
             "ledger",
-            "sandbox-a",
-            "sandbox-uid",
+            &sandbox_lease(),
             "principal-hash",
             &replica,
         )
@@ -1242,7 +1562,7 @@ mod tests {
             .await;
         let mut gate_registration = test_registration(&replica);
         assert!(
-            add_gate_entry(&gate_api, "ledger", &mut gate_registration)
+            add_gate_entry(&gate_api, &mut gate_registration)
                 .await
                 .is_err()
         );
@@ -1418,7 +1738,7 @@ mod tests {
         let mut gate_registration = test_registration(&replica);
         gate_registration.principal_hash = "principal-new".into();
         assert!(
-            add_gate_entry(&gate_api, "ledger", &mut gate_registration)
+            add_gate_entry(&gate_api, &mut gate_registration)
                 .await
                 .unwrap()
                 .is_none()

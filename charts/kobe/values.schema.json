@@ -19,7 +19,7 @@
       "properties": {
         "mode": { "type": "string", "enum": ["disabled", "external", "managed"] },
         "leaseRetention": { "type": "string", "minLength": 1 },
-        "reservationObjectLimit": { "type": "integer", "minimum": 2, "maximum": 1000000 }
+        "reservationObjectLimit": { "type": "integer", "minimum": 4, "maximum": 1000000 }
       },
       "required": ["mode", "reservationObjectLimit"]
     },

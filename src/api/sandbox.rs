@@ -1882,8 +1882,7 @@ async fn register_live_stream<B: ClusterBackend>(
         match crate::sandbox_access_ledger::acquire(
             &state.client,
             &state.sandbox_reservation_namespace,
-            &lease.name_any(),
-            &target.lease_uid,
+            lease,
             &identity.principal_key(),
             replica,
         )
@@ -2912,6 +2911,29 @@ async fn create_sandbox_lease<B: ClusterBackend>(
         }
     };
 
+    // Every admitted lease owns its distributed access gate before capacity is
+    // reserved. Lazy creation in a handler would leave a no-operation lease
+    // unable to enter teardown when the protected ledger quota is full, while
+    // lazy creation in teardown would make cleanup depend on allocating the
+    // very resource whose exhaustion cleanup must relieve.
+    let access_gate = match crate::sandbox_access_ledger::prepare_open_gate(
+        &state.client,
+        &state.sandbox_reservation_namespace,
+        &created,
+    )
+    .await
+    {
+        Ok(reference) => reference,
+        Err(err) => {
+            if let Err(cleanup_err) =
+                delete_exact_pending_lease(&leases, &reservations, &created).await
+            {
+                error!(error = %cleanup_err, "Failed to remove Sandbox lease after access-gate preparation failure");
+            }
+            return sandbox_infra_error("Failed to prepare Sandbox access gate", err);
+        }
+    };
+
     // Quota and alias admission use atomic, per-principal Kubernetes Lease
     // reservations. Advisory LIST checks above improve error latency, but only
     // these CREATE operations are authoritative across API replicas.
@@ -2971,8 +2993,14 @@ async fn create_sandbox_lease<B: ClusterBackend>(
         }
     };
 
-    if let Err(err) =
-        admit_sandbox_lease(&leases, &reservations, &created, &admission_reservations).await
+    if let Err(err) = admit_sandbox_lease(
+        &leases,
+        &reservations,
+        &created,
+        &admission_reservations,
+        &access_gate,
+    )
+    .await
     {
         match err {
             // Provably NOT admitted. Remove the lease, which releases its own
@@ -3019,6 +3047,14 @@ async fn create_sandbox_lease<B: ClusterBackend>(
                             return sandbox_infra_error(
                                 "Failed to finalize Sandbox lease admission",
                                 other,
+                            );
+                        }
+                        if !crate::sandbox_access_ledger::persisted_gate_reference(&current)
+                            .is_ok_and(|actual| actual == access_gate)
+                        {
+                            return sandbox_infra_error(
+                                "Failed to finalize Sandbox lease admission",
+                                "admitted lease has different access-gate provenance",
                             );
                         }
                         warn!(
@@ -4131,18 +4167,21 @@ async fn admit_sandbox_lease(
     reservations: &Api<Lease>,
     lease: &SandboxLease,
     admission_reservations: &[AdmissionReservation],
+    access_gate: &crate::sandbox_access_ledger::AccessGateReference,
 ) -> Result<(), SandboxLeaseMutationError> {
     let name = lease.name_any();
     let resource_version = lease
         .resource_version()
         .ok_or(SandboxLeaseMutationError::MissingResourceVersion)?;
     let reservation_provenance = encoded_reservation_provenance(lease, admission_reservations)?;
+    let access_gate_provenance = crate::sandbox_access_ledger::encode_gate_reference(access_gate)?;
     let patch = serde_json::json!({
         "metadata": {
             "resourceVersion": resource_version,
             "annotations": {
                 SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_ADMITTED,
-                SANDBOX_RESERVATIONS_ANNOTATION: reservation_provenance
+                SANDBOX_RESERVATIONS_ANNOTATION: reservation_provenance,
+                crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION: access_gate_provenance
             }
         }
     });
@@ -4158,6 +4197,11 @@ async fn admit_sandbox_lease(
                 return Err(SandboxLeaseMutationError::ReservationProvenanceChanged(
                     "admission response changed the persisted reservation set".into(),
                 ));
+            }
+            if !crate::sandbox_access_ledger::persisted_gate_reference(&admitted)
+                .is_ok_and(|actual| actual == *access_gate)
+            {
+                return Err(SandboxLeaseMutationError::AccessGateProvenanceChanged);
             }
             Ok(())
         }
@@ -4187,6 +4231,11 @@ async fn admit_sandbox_lease(
                             "lost admission response contains different reservation provenance"
                                 .into(),
                         ));
+                    }
+                    if !crate::sandbox_access_ledger::persisted_gate_reference(&current)
+                        .is_ok_and(|actual| actual == *access_gate)
+                    {
+                        return Err(SandboxLeaseMutationError::AccessGateProvenanceChanged);
                     }
                     Ok(())
                 }
@@ -4840,7 +4889,7 @@ async fn delete_exact_pending_lease(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             // This GET is the required absence proof. The lease is already
             // gone, but reservations may still be awaiting explicit cleanup.
-            return release_reservations_for_lease(reservations, lease, &expected_uid).await;
+            return finish_pending_ledger_cleanup(reservations, lease, &expected_uid).await;
         }
         Err(error) => return Err(error.into()),
     };
@@ -4894,7 +4943,7 @@ async fn delete_exact_pending_lease(
                         reread
                     }
                     Err(kube::Error::Api(error)) if error.code == 404 => {
-                        return release_reservations_for_lease(reservations, lease, &expected_uid)
+                        return finish_pending_ledger_cleanup(reservations, lease, &expected_uid)
                             .await;
                     }
                     Err(_) => return Err(patch_error.into()),
@@ -4919,7 +4968,7 @@ async fn delete_exact_pending_lease(
     // keep this exact lease present, so an explicit 404 is the release fence.
     match leases.get(&current.name_any()).await {
         Err(kube::Error::Api(error)) if error.code == 404 => {
-            release_reservations_for_lease(reservations, lease, &expected_uid).await
+            finish_pending_ledger_cleanup(reservations, lease, &expected_uid).await
         }
         Ok(remaining) if remaining.uid().as_deref() != Some(expected_uid.as_str()) => {
             Err(SandboxLeaseMutationError::UidChanged)
@@ -4930,6 +4979,16 @@ async fn delete_exact_pending_lease(
         },
         Err(error) => Err(error.into()),
     }
+}
+
+async fn finish_pending_ledger_cleanup(
+    reservations: &Api<Lease>,
+    lease: &SandboxLease,
+    expected_uid: &str,
+) -> Result<(), SandboxLeaseMutationError> {
+    release_reservations_for_lease(reservations, lease, expected_uid).await?;
+    crate::sandbox_access_ledger::remove_pre_admission_gate(reservations, lease).await?;
+    Ok(())
 }
 
 fn without_sandbox_cleanup_finalizer(lease: &SandboxLease) -> SandboxLease {
@@ -5044,6 +5103,10 @@ pub(crate) enum SandboxLeaseMutationError {
     ReservationShapeChanged { name: String, reason: String },
     #[error("Sandbox reservation provenance changed: {0}")]
     ReservationProvenanceChanged(String),
+    #[error("Sandbox access-gate provenance changed")]
+    AccessGateProvenanceChanged,
+    #[error(transparent)]
+    AccessLedger(#[from] crate::sandbox_access_ledger::AccessLedgerError),
     #[error(transparent)]
     Lifecycle(#[from] crate::sandbox::SandboxLifecycleError),
     #[error(transparent)]
@@ -6114,12 +6177,31 @@ mod tests {
                     && request.url.path().ends_with("/status")
             })
             .expect("provisioning deadline status patch");
+        let access_gate_index = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path()
+                        == "/apis/coordination.k8s.io/v1/namespaces/sandbox-ledger/leases"
+                    && serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(
+                        |object| {
+                            object["metadata"]["labels"]["kobe.kunobi.ninja/sandbox-access-kind"]
+                                == "lease-gate"
+                        },
+                    )
+            })
+            .expect("distributed access gate create");
         let reservation_index = requests
             .iter()
             .position(|request| {
                 request.method.as_str() == "POST"
                     && request.url.path()
                         == "/apis/coordination.k8s.io/v1/namespaces/sandbox-ledger/leases"
+                    && serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(
+                        |object| {
+                            object["metadata"]["labels"][SANDBOX_RESERVATION_TYPE_LABEL].is_string()
+                        },
+                    )
             })
             .expect("admission reservation create");
         let admission_index = requests
@@ -6132,9 +6214,10 @@ mod tests {
             .expect("admission metadata patch");
         assert!(
             create_index < deadline_index
-                && deadline_index < reservation_index
+                && deadline_index < access_gate_index
+                && access_gate_index < reservation_index
                 && reservation_index < admission_index,
-            "the durable deadline must precede quota reservation and admission"
+            "the durable deadline and access gate must precede capacity reservation and admission"
         );
 
         let create = &requests[create_index];
@@ -6929,8 +7012,9 @@ mod tests {
         assert!(remaining.contains_key(&alias_reservation_name(&principal, "review")));
     }
 
-    /// The happy path must take exactly one quota slot and one alias, so a
-    /// caller's second lease cannot silently reuse the first one's slot.
+    /// The happy path must take exactly one access gate, one quota slot, and
+    /// one alias, so a caller's second lease cannot silently reuse the first
+    /// lease's capacity or teardown barrier.
     #[tokio::test]
     async fn create_acquires_exactly_one_quota_slot_and_one_alias() {
         let server = MockServer::start().await;
@@ -6954,15 +7038,31 @@ mod tests {
         let remaining = held.lock().unwrap().clone();
         assert_eq!(
             remaining.len(),
-            2,
-            "expected one slot + one alias: {remaining:?}"
+            3,
+            "expected one gate + one slot + one alias: {remaining:?}"
         );
         assert!(remaining.contains_key(&quota_reservation_name(&principal, 0)));
         assert!(remaining.contains_key(&alias_reservation_name(&principal, "review")));
+        assert_eq!(
+            remaining
+                .values()
+                .filter(|object| {
+                    object["metadata"]["labels"]["kobe.kunobi.ninja/sandbox-access-kind"]
+                        == "lease-gate"
+                })
+                .count(),
+            1
+        );
 
         let admitted: SandboxLease =
             serde_json::from_value(lease_state.lock().unwrap().clone().expect("admitted lease"))
                 .unwrap();
+        let access_gate = crate::sandbox_access_ledger::persisted_gate_reference(&admitted)
+            .expect("admission persists the exact access gate");
+        assert_eq!(
+            remaining[&access_gate.name]["metadata"]["uid"].as_str(),
+            Some(access_gate.uid.as_str())
+        );
         let provenance = persisted_reservation_provenance(&admitted).unwrap();
         assert_eq!(provenance.len(), 2);
         for reservation in provenance {
@@ -7498,7 +7598,7 @@ mod tests {
     async fn an_admission_that_lands_late_is_not_reported_as_failure() {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
-        mount_reservation_api(&server, &[]).await;
+        let ledger = mount_reservation_api(&server, &[]).await;
         Mock::given(method("GET"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
@@ -7576,6 +7676,7 @@ mod tests {
         let reads = Arc::new(Mutex::new(0u32));
         let get_state = Arc::clone(&created_state);
         let get_reads = Arc::clone(&reads);
+        let get_ledger = Arc::clone(&ledger);
         Mock::given(method("GET"))
             .and(path_regex(
                 r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sandbox-[a-z0-9]+$",
@@ -7597,9 +7698,28 @@ mod tests {
                         name,
                     }])
                     .unwrap();
+                    let gate = get_ledger
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .find(|object| {
+                            object["metadata"]["labels"]
+                                ["kobe.kunobi.ninja/sandbox-access-kind"]
+                                == "lease-gate"
+                        })
+                        .cloned()
+                        .expect("prepared access gate");
+                    let gate_provenance = crate::sandbox_access_ledger::encode_gate_reference(
+                        &crate::sandbox_access_ledger::AccessGateReference {
+                            name: gate["metadata"]["name"].as_str().unwrap().into(),
+                            uid: gate["metadata"]["uid"].as_str().unwrap().into(),
+                        },
+                    )
+                    .unwrap();
                     serde_json::json!({
                         SANDBOX_ADMISSION_ANNOTATION: SANDBOX_ADMISSION_ADMITTED,
-                        SANDBOX_RESERVATIONS_ANNOTATION: provenance
+                        SANDBOX_RESERVATIONS_ANNOTATION: provenance,
+                        crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION: gate_provenance
                     })
                 };
                 ResponseTemplate::new(200).set_body_json(object)

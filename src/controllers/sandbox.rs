@@ -5216,31 +5216,36 @@ pub(crate) mod tests {
         lease
     }
 
-    /// The distributed gate is a durable teardown checkpoint: the pass that
-    /// creates it closed must stop before credentials, Claims, or reservations
-    /// are touched. The next pass is the first one allowed to observe it empty.
+    /// The distributed gate is a durable teardown checkpoint: admission has
+    /// already created it open, and the pass that closes it must stop before
+    /// credentials, Claims, or reservations are touched. The next pass is the
+    /// first one allowed to observe it empty.
     #[tokio::test]
     async fn release_checkpoints_a_closed_access_gate_before_teardown() {
         use sha2::{Digest, Sha256};
 
         let (mut ctx, server) = test_context().await;
         Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
-        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
         let lease_uid = lease.uid().unwrap();
         let gate = format!(
             "kobe-access-g-{}",
             &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
         );
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION.into(),
+            crate::sandbox_access_ledger::encode_gate_reference(
+                &crate::sandbox_access_ledger::AccessGateReference {
+                    name: gate.clone(),
+                    uid: "access-gate-uid".into(),
+                },
+            )
+            .unwrap(),
+        );
         let gate_path = format!("{RESERVATIONS_PATH}/{gate}");
         Mock::given(method("GET"))
             .and(path(&gate_path))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(RESERVATIONS_PATH))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "coordination.k8s.io/v1",
                 "kind": "Lease",
                 "metadata": {
@@ -5251,7 +5256,32 @@ pub(crate) mod tests {
                     "labels": {
                         "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
                         "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
-                        "kobe.kunobi.ninja/sandbox-lease-uid": lease_uid,
+                        "kobe.kunobi.ninja/sandbox-access-lease-uid": lease_uid,
+                    },
+                    "annotations": {
+                        "kobe.kunobi.ninja/sandbox-access-state": "open",
+                        "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                    },
+                },
+                "spec": {},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": gate,
+                    "namespace": NS,
+                    "uid": "access-gate-uid",
+                    "resourceVersion": "1",
+                    "labels": {
+                        "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                        "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
+                        "kobe.kunobi.ninja/sandbox-access-lease-uid": lease_uid,
                     },
                     "annotations": {
                         "kobe.kunobi.ninja/sandbox-access-state": "closed",
@@ -5283,17 +5313,14 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|request| request.method.as_str() == "POST")
+            .find(|request| request.method.as_str() == "PATCH")
             .expect("closed gate checkpoint");
         let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
         assert_eq!(
-            body["metadata"]["annotations"]["kobe.kunobi.ninja/sandbox-access-state"],
-            "closed"
+            body[2]["path"],
+            "/metadata/annotations/kobe.kunobi.ninja~1sandbox-access-state"
         );
-        assert_eq!(
-            body["metadata"]["annotations"]["kobe.kunobi.ninja/sandbox-access-entries"],
-            "{}"
-        );
+        assert_eq!(body[3]["value"], "closed");
     }
 
     /// Run the destructive half only after the durable Releasing checkpoint
