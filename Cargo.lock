@@ -2724,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "kobe-runner"
-version = "0.39.1"
+version = "0.40.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
