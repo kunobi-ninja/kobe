@@ -51,5 +51,9 @@ ENV BUILD_COMMIT=${BUILD_COMMIT}
 COPY . .
 # Operator-side binaries only (the `kobe` CLI lives in the kobectl member and is
 # released as a signed standalone binary, not bundled in the operator image).
-RUN cargo build --release --bin kobe-operator --bin kobe-sync --bin kubeconfig-publisher --bin kobe-host-reaper && \
+# The dependency layer compiled stub sources for both workspace packages.
+# Their mtimes can be newer than the real files copied above, so Cargo may
+# otherwise reuse a stub `kobe-runner` library with no `protocol` module.
+RUN cargo clean --release -p kobe-operator -p kobe-runner && \
+    cargo build --release --bin kobe-operator --bin kobe-sync --bin kubeconfig-publisher --bin kobe-host-reaper && \
     ls -la target/release/kobe-operator target/release/kobe-sync target/release/kubeconfig-publisher target/release/kobe-host-reaper
