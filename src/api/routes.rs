@@ -73,6 +73,11 @@ pub struct AppState<B: ClusterBackend> {
     /// nothing; see [`crate::api::sandbox_rate_limit`] for why it is charged
     /// per attempt rather than per admitted lease.
     pub sandbox_admission_limiter: crate::api::sandbox_rate_limit::AdmissionRateLimiter,
+    /// Process-wide shutdown signal. Admission resolution selects on this so
+    /// an ambiguous Kubernetes response cannot hold Axum graceful shutdown
+    /// open indefinitely. The durable SandboxLease remains the handoff to the
+    /// next supervised admission-reaper instance.
+    pub shutdown: tokio_util::sync::CancellationToken,
     /// Whether the upstream Agent Sandbox runtime was explicitly enabled and
     /// validated at startup. Disabled deployments do not mount Sandbox HTTP
     /// routes, so they cannot admit leases that no controller will reconcile.
@@ -3205,6 +3210,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled,
         };
 
@@ -3237,6 +3243,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -3328,6 +3335,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -3760,6 +3768,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -3842,6 +3851,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -3938,6 +3948,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -4045,6 +4056,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -4127,6 +4139,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
 
@@ -4576,6 +4589,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         };
         (state, server)

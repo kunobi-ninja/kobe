@@ -260,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         datastore: datastore.clone(),
         connect_cache: Default::default(),
         sandbox_admission_limiter: Default::default(),
+        shutdown: shutdown.clone(),
         sandbox_enabled: agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External,
     };
 
@@ -783,6 +784,28 @@ async fn detect_velero(client: &Client) -> Option<VeleroCoordinator> {
     }
 }
 
+const LEADER_STEP_DOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Broadcast process shutdown before bounded cooperative leader step-down.
+///
+/// `LeaderGuard::step_down` performs Kubernetes I/O and can block during the
+/// same outage that triggered termination. HTTP graceful shutdown and every
+/// cancellation-aware controller must observe the token first; leadership
+/// release is then a time-bounded best-effort availability optimization, never
+/// the gate on process draining or exit. Returns whether step-down completed.
+async fn cancel_before_step_down<F, Fut>(
+    shutdown: &CancellationToken,
+    timeout: std::time::Duration,
+    step_down: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    shutdown.cancel();
+    tokio::time::timeout(timeout, step_down()).await.is_ok()
+}
+
 async fn shutdown_signal(
     mut leader_guard: kunobi_ha::leader::LeaderGuard,
     shutdown: CancellationToken,
@@ -818,12 +841,19 @@ async fn shutdown_signal(
         _ = shutdown.cancelled() => error!("Critical background task exited, shutting down"),
     }
 
-    // Cooperative step-down so the next replica picks up the Lease quickly
-    // (within retry_period) instead of waiting for the full lease TTL to
-    // expire.
-    leader_guard.step_down().await;
-
-    shutdown.cancel();
+    // Wake HTTP and every controller before cooperative step-down. The latter
+    // may block on the very API outage that caused shutdown; it must not hold
+    // graceful drain hostage.
+    if !cancel_before_step_down(&shutdown, LEADER_STEP_DOWN_TIMEOUT, || {
+        leader_guard.step_down()
+    })
+    .await
+    {
+        warn!(
+            timeout = ?LEADER_STEP_DOWN_TIMEOUT,
+            "Leader step-down timed out; continuing shutdown"
+        );
+    }
     info!("Shutdown signal sent to all background tasks");
 }
 
@@ -866,7 +896,7 @@ mod sandbox_ledger_config_tests {
 mod critical_task_supervision_tests {
     use super::{
         acquire_while_critical_task_runs, await_critical_task_readiness,
-        await_optional_critical_task,
+        await_optional_critical_task, cancel_before_step_down,
     };
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -997,6 +1027,29 @@ mod critical_task_supervision_tests {
         .await;
 
         assert!(result.is_err(), "an absent task must stay pending");
+    }
+
+    /// A Kubernetes outage may block cooperative leader release forever. HTTP
+    /// draining and admission handoff must already have observed shutdown.
+    #[tokio::test]
+    async fn shutdown_is_broadcast_and_blocked_leader_step_down_is_bounded() {
+        let shutdown = CancellationToken::new();
+        let observed = shutdown.clone();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            cancel_before_step_down(&shutdown, Duration::from_millis(20), move || {
+                assert!(
+                    observed.is_cancelled(),
+                    "step_down must not start before shutdown is visible"
+                );
+                std::future::pending::<()>()
+            }),
+        )
+        .await
+        .expect("the shutdown helper itself must return after its step-down bound");
+
+        assert!(!completed, "a pending step_down must report timeout");
+        assert!(shutdown.is_cancelled());
     }
 }
 

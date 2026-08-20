@@ -1,10 +1,11 @@
 // Real Kubernetes API-server regression gate for SandboxLease status and the
 // admission-ledger abuse boundary.
 //
-// Unit tests prove that Kobe builds UID/resourceVersion-fenced JSON Patches
-// and emits the intended CEL. This test proves that a real API server enforces
-// both contracts. It needs only the SandboxLease CRD and native admission/RBAC
-// APIs, not Kobe or the external Agent Sandbox runtime.
+// Unit tests prove that Kobe builds UID/resourceVersion/state-fenced JSON
+// Patches and emits the intended CEL. This test proves that a real API server
+// enforces both contracts, including one-winner admission cancellation. It
+// needs only the SandboxLease CRD and native admission/RBAC APIs, not Kobe or
+// the external Agent Sandbox runtime.
 
 const context = Bun.env.KOBE_SANDBOX_APISERVER_CONTEXT ?? Bun.argv[2];
 if (!context) {
@@ -34,6 +35,7 @@ type Lease = {
 	metadata: {
 		uid: string;
 		resourceVersion: string;
+		annotations?: Record<string, string>;
 	};
 	status?: {
 		phase?: string;
@@ -571,7 +573,13 @@ function leaseManifest(name: string): string {
 	return JSON.stringify({
 		apiVersion: "kobe.kunobi.ninja/v1alpha1",
 		kind: "SandboxLease",
-		metadata: { name, namespace },
+		metadata: {
+			name,
+			namespace,
+			annotations: {
+				"kobe.kunobi.ninja/sandbox-admission": "pending",
+			},
+		},
 		spec: {
 			poolRef: { name: "contract", uid: "pool-contract-uid", generation: 1 },
 			ttl: "1m",
@@ -583,6 +591,33 @@ function leaseManifest(name: string): string {
 			},
 		},
 	});
+}
+
+async function patchLease(
+	name: string,
+	uid: string,
+	resourceVersion: string,
+	operations: JsonPatchOperation[],
+	allowFailure = false,
+): Promise<CommandResult> {
+	const patch: JsonPatchOperation[] = [
+		{ op: "test", path: "/metadata/uid", value: uid },
+		{ op: "test", path: "/metadata/resourceVersion", value: resourceVersion },
+		...operations,
+	];
+	return kubectl(
+		[
+			"patch",
+			resource,
+			name,
+			"-n",
+			namespace,
+			"--type=json",
+			"-p",
+			JSON.stringify(patch),
+		],
+		{ allowFailure },
+	);
 }
 
 async function createLease(name: string): Promise<Lease> {
@@ -812,6 +847,80 @@ async function testJsonPatchFences(): Promise<void> {
 	);
 }
 
+async function testAdmissionCancellationCas(): Promise<void> {
+	const admissionPath =
+		"/metadata/annotations/kobe.kunobi.ninja~1sandbox-admission";
+	const name = "cancellation-wins-cas";
+	const pending = await createLease(name);
+
+	await patchLease(name, pending.metadata.uid, pending.metadata.resourceVersion, [
+		{ op: "test", path: admissionPath, value: "pending" },
+		{ op: "replace", path: admissionPath, value: "cancelled" },
+	]);
+	let current = await getLease(name);
+	assert(
+		current.metadata.annotations?.["kobe.kunobi.ninja/sandbox-admission"] ===
+			"cancelled",
+		"cancellation checkpoint did not land",
+	);
+	info("pending -> cancelled UID/resourceVersion/state CAS accepted");
+
+	const staleAdmission = await patchLease(
+		name,
+		pending.metadata.uid,
+		pending.metadata.resourceVersion,
+		[
+			{ op: "test", path: admissionPath, value: "pending" },
+			{ op: "replace", path: admissionPath, value: "admitted" },
+		],
+		true,
+	);
+	assert(
+		staleAdmission.exitCode !== 0,
+		"API server accepted admission after cancellation won the CAS",
+	);
+	current = await getLease(name);
+	assert(
+		current.metadata.annotations?.["kobe.kunobi.ninja/sandbox-admission"] ===
+			"cancelled",
+		"stale admission changed the cancelled checkpoint",
+	);
+	info("stale pending -> admitted writer rejected after cancellation");
+
+	const admissionName = "admission-wins-cas";
+	const secondPending = await createLease(admissionName);
+	await patchLease(
+		admissionName,
+		secondPending.metadata.uid,
+		secondPending.metadata.resourceVersion,
+		[
+			{ op: "test", path: admissionPath, value: "pending" },
+			{ op: "replace", path: admissionPath, value: "admitted" },
+		],
+	);
+	const staleCancellation = await patchLease(
+		admissionName,
+		secondPending.metadata.uid,
+		secondPending.metadata.resourceVersion,
+		[
+			{ op: "test", path: admissionPath, value: "pending" },
+			{ op: "replace", path: admissionPath, value: "cancelled" },
+		],
+		true,
+	);
+	assert(
+		staleCancellation.exitCode !== 0,
+		"API server accepted cancellation after admission won the CAS",
+	);
+	current = await getLease(admissionName);
+	assert(
+		current.metadata.annotations?.["kobe.kunobi.ninja/sandbox-admission"] ===
+			"admitted",
+		"stale cancellation changed the admitted winner",
+	);
+	info("stale pending -> cancelled writer rejected after admission");
+}
+
 await kubectl(["create", "namespace", namespace]);
 try {
 	console.log(
@@ -819,6 +928,7 @@ try {
 	);
 	await testReleaseCauseCel();
 	await testJsonPatchFences();
+	await testAdmissionCancellationCas();
 	await testAdmissionLedgerBoundary();
 	console.log("SandboxLease API-server contract passed");
 } finally {

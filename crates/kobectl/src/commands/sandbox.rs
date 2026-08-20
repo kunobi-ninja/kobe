@@ -496,6 +496,13 @@ async fn wait_until_ready(config: &ResolvedConfig, lease: &str) -> Result<()> {
         .await
         .context("could not reach the Kobe endpoint")?;
 
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // A create may return the durable `admission_pending` handle while
+            // the server-owned arbiter is still settling. If cancellation
+            // wins, that exact object is deleted and 404 is the terminal
+            // admission-failed signal. Never POST another lease implicitly.
+            anyhow::bail!("sandbox {lease} admission was cancelled before it became ready");
+        }
         if response.status().is_success() {
             let current: SandboxLeaseResponse = response
                 .json()
@@ -682,6 +689,27 @@ mod tests {
             truncated: false,
             reason: None,
         }
+    }
+
+    /// The shutdown handoff extends, rather than replaces, the create schema.
+    /// Older kobectl builds only know `id` and `phase`; keeping both means they
+    /// retain the durable handle and poll instead of retrying the POST.
+    #[test]
+    fn admission_pending_create_response_is_backward_compatible() {
+        let lease: SandboxLeaseResponse = serde_json::from_value(serde_json::json!({
+            "id": "sandbox-handoff",
+            "phase": "Pending",
+            "pool": "agent-small",
+            "ttl": "1h",
+            "provisioning_deadline": "2026-08-10T00:10:00Z",
+            "status": "admission_pending",
+            "retry": false,
+            "statusUrl": "/v1/sandbox-leases/sandbox-handoff"
+        }))
+        .expect("the non-retry handoff must retain the legacy polling fields");
+
+        assert_eq!(lease.id, "sandbox-handoff");
+        assert_eq!(lease.phase, "Pending");
     }
 
     /// The remote exit code is this process's exit code.

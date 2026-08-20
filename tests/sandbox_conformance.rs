@@ -307,6 +307,12 @@ impl LeasedSandbox {
             body["provisioning_deadline"].as_str().is_some(),
             "accepted lease has no provisioning_deadline: {body}"
         );
+        if body["status"] == "admission_pending" {
+            anyhow::ensure!(
+                body["retry"] == false && body["statusUrl"] == format!("/v1/sandbox-leases/{id}"),
+                "admission_pending must be a durable non-retry handle: {body}"
+            );
+        }
         Ok(Self {
             api,
             id,
@@ -328,7 +334,7 @@ impl LeasedSandbox {
     async fn wait_ready(&self, within: Duration) -> anyhow::Result<Value> {
         let deadline = Instant::now() + within;
         loop {
-            let (_, body) = self
+            let (status, body) = self
                 .api
                 .json(
                     reqwest::Method::GET,
@@ -336,6 +342,10 @@ impl LeasedSandbox {
                     None,
                 )
                 .await?;
+            anyhow::ensure!(
+                status != reqwest::StatusCode::NOT_FOUND,
+                "sandbox admission was cancelled before Ready: {body}"
+            );
             match body["phase"].as_str() {
                 Some("Ready") => return Ok(body),
                 Some(terminal @ ("Released" | "Expired" | "Quarantined")) => {

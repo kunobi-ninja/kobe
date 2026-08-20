@@ -663,6 +663,44 @@ pub fn require_resolved_placement<'a>(
     Ok(placement)
 }
 
+/// Require placement/target provenance that can safely select a teardown path.
+///
+/// Progressive placement may record a partial target while it discovers
+/// objects. Admission repair is stricter: management placement must use the
+/// operator namespace and carry no child identities, while child placement
+/// must carry both the exact internal lease and bound instance. Every present
+/// reference is also checked for its canonical GVK, namespace, non-empty UID,
+/// and required generation. Without this proof, choosing either teardown path
+/// could release quota while the footprint belonging to the other path
+/// survives.
+pub fn require_release_safe_target_provenance<'a>(
+    status: &'a SandboxLeaseStatus,
+    management_namespace: &str,
+) -> Result<&'a SandboxTargetProvenance, SandboxProvenanceError> {
+    let placement = require_resolved_placement(status, management_namespace)?;
+    let target = status
+        .target
+        .as_ref()
+        .ok_or(SandboxProvenanceError::MissingTargetProvenance)?;
+    validate_target_provenance(target, placement, management_namespace)?;
+    match placement {
+        ResolvedSandboxPlacement::Management {} if target.namespace != management_namespace => {
+            return Err(SandboxProvenanceError::InvalidReference {
+                field: "namespace",
+                reason: "management target namespace does not match the operator namespace",
+            });
+        }
+        ResolvedSandboxPlacement::ChildCluster { .. }
+            if target.child_cluster_lease.is_none() || target.child_cluster_instance.is_none() =>
+        {
+            return Err(SandboxProvenanceError::IncompleteChildProvenance);
+        }
+        ResolvedSandboxPlacement::Management {} | ResolvedSandboxPlacement::ChildCluster { .. } => {
+        }
+    }
+    Ok(target)
+}
+
 /// Merge progressively discovered target references without permitting any
 /// existing identity to be changed or cleared. Equality covers API version,
 /// kind, namespace, name, UID, and generation, so delete/recreate name reuse is
@@ -916,6 +954,10 @@ pub enum SandboxProvenanceError {
     },
     #[error("management placement cannot record child-cluster references")]
     UnexpectedChildReference,
+    #[error("resolved Sandbox placement has no target provenance")]
+    MissingTargetProvenance,
+    #[error("childCluster placement requires exact lease and instance provenance")]
+    IncompleteChildProvenance,
 }
 
 /// Compute the absolute setup bound from the API-server creation timestamp.

@@ -247,7 +247,9 @@ credentials. Responses never contain a management or child-cluster kubeconfig.
 
 ### `POST /v1/sandbox-leases`
 
-Creates caller-safe Sandbox intent and returns `202 Accepted`.
+Creates caller-safe Sandbox intent and returns `202 Accepted`. The response
+includes `Location: /v1/sandbox-leases/:id`; poll that URL until the lease is
+ready or terminal.
 
 ```json
 {
@@ -276,6 +278,33 @@ When a requested TTL is reduced, `effective_ttl` reports the accepted value.
 `provisioning_deadline` is anchored to the API-server creation time and already
 includes queueing or controller downtime; retrying reconciliation never resets
 it.
+
+If Kobe is shutting down or cannot safely classify a lost Kubernetes response,
+it preserves the same legacy fields and adds an explicit non-retry handoff:
+
+```json
+{
+  "id": "sandbox-a1b2c3d4e5f6",
+  "phase": "Pending",
+  "pool": "agent-small",
+  "ttl": "30m",
+  "provisioning_deadline": "2026-08-20T12:10:00Z",
+  "status": "admission_pending",
+  "retry": false,
+  "statusUrl": "/v1/sandbox-leases/sandbox-a1b2c3d4e5f6"
+}
+```
+
+This response is not confirmation that placement was accepted. Do not repeat
+the create: retain `id` and poll `Location`/`statusUrl`. The admission arbiter
+will either admit that exact lease or cancel it; a later `404` means
+cancellation won. `phase: "Pending"` remains present so older clients also keep
+polling the handle instead of treating it as placeable.
+
+This server-side handoff does not make the create idempotent if the client loses
+the final HTTP response itself. Until the create API accepts a caller-owned
+idempotency key, do not blindly retry an ambiguous transport failure; reconcile
+the caller's lease list first.
 
 | Status | Meaning |
 |---|---|
