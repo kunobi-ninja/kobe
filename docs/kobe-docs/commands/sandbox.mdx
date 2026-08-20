@@ -130,6 +130,10 @@ disconnect, the retry finds the original execution rather than starting a
 second one — which matters most for the commands you would least like to run
 twice.
 
+The CLI retries one transport or response-body failure automatically, using
+the same request and idempotency key with fresh authorization. It never
+retries an HTTP error response.
+
 An `Unknown` state means Kobe could not establish what happened: the command
 may have run. It is deliberately **not** reported as a failure, because a
 failure invites an automatic retry of something that may already have had

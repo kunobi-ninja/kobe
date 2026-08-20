@@ -190,19 +190,10 @@ async fn exec_once(
         timeout,
         idempotency_key,
     })?;
-    let token = get_auth_header(config, "POST", &path, &body).await?;
-    let response = with_auth(
-        authed_client().post(format!("{}{path}", config.endpoint)),
-        &token,
-    )
-    .header("Content-Type", "application/json")
-    .body(body)
-    .send()
-    .await
-    .context("could not reach the Kobe endpoint")?;
-
-    let status = response.status();
-    let payload = response.text().await.unwrap_or_default();
+    let (status, payload) = retry_transport_once(|| send_exec_request(config, &path, &body))
+        .await
+        .map_err(ExecRequestAttemptError::into_inner)
+        .context("could not reach the Kobe endpoint")?;
     if !status.is_success() {
         // The server's own message, not a guess. A CLI that invents an
         // explanation for a status it does not understand sends people looking
@@ -210,6 +201,74 @@ async fn exec_once(
         anyhow::bail!("execution failed (HTTP {status}): {}", payload.trim());
     }
     serde_json::from_str(&payload).context("could not parse the execution response")
+}
+
+/// Send one execution POST, including a freshly generated authorization value.
+///
+/// Kept as one attempt so [`retry_transport_once`] can repeat exactly the same
+/// semantic body and idempotency key while regenerating time-sensitive auth.
+async fn send_exec_request(
+    config: &ResolvedConfig,
+    path: &str,
+    body: &[u8],
+) -> std::result::Result<(reqwest::StatusCode, String), ExecRequestAttemptError> {
+    let token = get_auth_header(config, "POST", path, body)
+        .await
+        .map_err(ExecRequestAttemptError::Auth)?;
+    let response = with_auth(
+        authed_client().post(format!("{}{path}", config.endpoint)),
+        &token,
+    )
+    .header("Content-Type", "application/json")
+    .body(body.to_vec())
+    .send()
+    .await
+    .map_err(|error| ExecRequestAttemptError::Transport(error.into()))?;
+    let status = response.status();
+    let payload = response
+        .text()
+        .await
+        .map_err(|error| ExecRequestAttemptError::Transport(error.into()))?;
+    Ok((status, payload))
+}
+
+/// Failure classification for one execution POST attempt.
+///
+/// Only failures after authorization has been produced are ambiguous: the
+/// server may have accepted the request before the connection or response body
+/// was lost. Authentication failures are local and cannot have started an
+/// execution, so repeating them would only conceal the real problem.
+#[derive(Debug)]
+enum ExecRequestAttemptError {
+    Auth(anyhow::Error),
+    Transport(anyhow::Error),
+}
+
+impl ExecRequestAttemptError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Auth(error) | Self::Transport(error) => error,
+        }
+    }
+}
+
+/// Retry one ambiguous transport/body-read failure exactly once.
+///
+/// HTTP responses are successful transport results — including 4xx/5xx — and
+/// are never retried here. The execution idempotency key makes the second
+/// transport attempt safe; a third would only hide a persistently broken path.
+async fn retry_transport_once<Attempt, Future, Output>(
+    mut attempt: Attempt,
+) -> std::result::Result<Output, ExecRequestAttemptError>
+where
+    Attempt: FnMut() -> Future,
+    Future: std::future::Future<Output = std::result::Result<Output, ExecRequestAttemptError>>,
+{
+    match attempt().await {
+        Ok(output) => Ok(output),
+        Err(ExecRequestAttemptError::Transport(_)) => attempt().await,
+        Err(error) => Err(error),
+    }
 }
 
 /// Print the result in the requested form.
@@ -689,6 +748,77 @@ mod tests {
         assert_eq!(body["idempotencyKey"], "key-1");
         assert!(body.get("idempotency_key").is_none());
         assert_eq!(body["cwd"], "/workspace");
+    }
+
+    /// An ambiguous transport loss repeats the exact semantic request once.
+    ///
+    /// Changing either the serialized body or its embedded idempotency key
+    /// would turn recovery from a lost response into a second execution.
+    #[tokio::test]
+    async fn transport_retry_reuses_the_same_body_and_idempotency_key() {
+        let body = br#"{"command":["/agent","run"],"idempotencyKey":"key-1"}"#.to_vec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut attempt = 0;
+
+        let result = retry_transport_once(|| {
+            attempt += 1;
+            let current_attempt = attempt;
+            let body = body.clone();
+            let seen = std::sync::Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(body);
+                if current_attempt == 1 {
+                    Err(ExecRequestAttemptError::Transport(anyhow::anyhow!(
+                        "response lost"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*seen.lock().unwrap(), vec![body.clone(), body]);
+    }
+
+    /// A broken transport is attempted at most twice.
+    ///
+    /// Authentication failures and HTTP statuses are not ambiguous sends, so
+    /// neither is retried. This also keeps a persistent outage from becoming
+    /// an unbounded client-side loop.
+    #[tokio::test]
+    async fn transport_retry_sends_at_most_twice_and_never_retries_http_or_auth() {
+        let mut transport_attempts = 0;
+        let result: std::result::Result<(), ExecRequestAttemptError> = retry_transport_once(|| {
+            transport_attempts += 1;
+            async {
+                Err(ExecRequestAttemptError::Transport(anyhow::anyhow!(
+                    "still disconnected"
+                )))
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(ExecRequestAttemptError::Transport(_))));
+        assert_eq!(transport_attempts, 2);
+
+        let mut auth_attempts = 0;
+        let result: std::result::Result<(), ExecRequestAttemptError> = retry_transport_once(|| {
+            auth_attempts += 1;
+            async { Err(ExecRequestAttemptError::Auth(anyhow::anyhow!("no signer"))) }
+        })
+        .await;
+        assert!(matches!(result, Err(ExecRequestAttemptError::Auth(_))));
+        assert_eq!(auth_attempts, 1);
+
+        let mut http_attempts = 0;
+        let result: std::result::Result<_, ExecRequestAttemptError> = retry_transport_once(|| {
+            http_attempts += 1;
+            async { Ok((reqwest::StatusCode::SERVICE_UNAVAILABLE, "retry later")) }
+        })
+        .await;
+        assert_eq!(result.unwrap().0, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(http_attempts, 1);
     }
 
     /// Machine output is versioned and keeps the streams apart.

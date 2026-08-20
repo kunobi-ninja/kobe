@@ -23,15 +23,13 @@
 //! back what the winner reserved. A read-then-write here is the classic way to
 //! produce two spawns from one idempotency key.
 //!
-//! # A deviation from #82, stated plainly
+//! # Two matching reservations
 //!
-//! #82 says to reserve the key *in the target*. This reserves it in Kobe's own
-//! API instead. The difference would matter if two independent Kobe
-//! deployments could drive one Sandbox — they cannot: a lease belongs to one
-//! pool in one installation — and reserving in the target would require a
-//! writable, durable path inside a container Kobe does not control, which is
-//! the runner contract this issue defers. Reserving in Kobe is durable,
-//! atomic, and available today.
+//! Kobe first reserves the caller's key in its own API so an operator restart
+//! cannot forget it. `kobe-runner` then reserves the same derived execution id
+//! inside the exact target before spawning. The API object is the durable
+//! cross-restart authority; the target spool is what makes a lost runner-start
+//! response idempotent without trusting a long-lived exec connection.
 
 use kube::api::{Api, ObjectMeta, PostParams};
 use kube::{Resource, ResourceExt};
@@ -39,7 +37,7 @@ use kube::{Resource, ResourceExt};
 use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget};
 use crate::crd::{
     ExecutionState, ReuseVerdict, SandboxExecution, SandboxExecutionSpec, SandboxLease,
-    execution_name, request_digest, reuse_verdict,
+    execution_name, legacy_request_digest, request_digest, reuse_verdict,
 };
 
 /// How long a `Running` execution may go unresolved before it becomes
@@ -208,6 +206,8 @@ pub async fn reserve_execution(
         &request.timeout,
         request.detached,
     );
+    let legacy_digest =
+        legacy_request_digest(&request.argv, request.cwd.as_deref(), &request.timeout);
     let name = execution_name(&target.lease_uid, &request.idempotency_key);
     let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
 
@@ -239,6 +239,10 @@ pub async fn reserve_execution(
             request_digest: digest.clone(),
             timeout: request.timeout.clone(),
             detached: request.detached,
+            // Response timing is not supervision provenance: both wait and
+            // detached mode use the runner now. Persist that fact so a later
+            // cancellation cannot fall through to record-only cancellation.
+            runner_managed: Some(true),
         },
         status: None,
     };
@@ -251,7 +255,23 @@ pub async fn reserve_execution(
                 .get(&name)
                 .await
                 .map_err(|_| ExecutionRequestError::Backend)?;
-            match reuse_verdict(&existing.spec, &target.lease_uid, &digest) {
+            if existing.spec.lease_uid == target.lease_uid
+                && !execution_pod_identity_holds(&existing.spec, &target.pod_uid)
+            {
+                // The key still names the old execution, but its runner spool
+                // belonged to a different Pod. Never reinterpret that id in a
+                // replacement Pod wearing the lease's current target name.
+                return Err(ExecutionRequestError::Denied(
+                    SandboxAccessDenied::TargetUnresolved,
+                ));
+            }
+            match compatible_reuse_verdict(
+                &existing.spec,
+                &target.lease_uid,
+                &digest,
+                &legacy_digest,
+                request.detached,
+            ) {
                 ReuseVerdict::SameRequest => Ok(Reservation::AlreadyExists(Box::new(existing))),
                 ReuseVerdict::Conflict => Err(ExecutionRequestError::IdempotencyConflict),
                 // A key belonging to another lease is not this caller's to
@@ -263,6 +283,40 @@ pub async fn reserve_execution(
             }
         }
         Err(_) => Err(ExecutionRequestError::Backend),
+    }
+}
+
+/// Whether an execution still addresses the exact Pod that reserved it.
+///
+/// The runner id is meaningful only inside that Pod's spool. Re-pointing it at
+/// a replacement Pod could turn `NotFound` into a false outcome or, worse,
+/// address an unrelated process that happens to use the same derived id.
+pub fn execution_pod_identity_holds(existing: &SandboxExecutionSpec, pod_uid: &str) -> bool {
+    existing.pod_uid == pod_uid
+}
+
+/// Compare a retry across the digest-format rolling upgrade.
+///
+/// The legacy hash omitted response mode. It is accepted only for a record
+/// that also predates explicit runner provenance and whose stored `detached`
+/// bit matches the request, so compatibility cannot collapse wait and detached
+/// commands back into one identity.
+fn compatible_reuse_verdict(
+    existing: &SandboxExecutionSpec,
+    lease_uid: &str,
+    digest: &str,
+    legacy_digest: &str,
+    detached: bool,
+) -> ReuseVerdict {
+    match reuse_verdict(existing, lease_uid, digest) {
+        ReuseVerdict::Conflict
+            if existing.runner_managed.is_none()
+                && existing.detached == detached
+                && existing.request_digest == legacy_digest =>
+        {
+            ReuseVerdict::SameRequest
+        }
+        verdict => verdict,
     }
 }
 
@@ -657,6 +711,7 @@ mod tests {
                 request_digest: "d".repeat(64),
                 timeout: "60s".into(),
                 detached: false,
+                runner_managed: None,
             },
             status: state.map(|state| crate::crd::SandboxExecutionStatus {
                 state,
@@ -681,6 +736,92 @@ mod tests {
                 "{state} must not spawn again"
             );
         }
+    }
+
+    /// An exact retry survives a rolling upgrade from the legacy digest, but
+    /// the compatibility path cannot erase the wait/detached distinction or
+    /// apply to records written with current runner provenance.
+    #[test]
+    fn legacy_digest_reuse_is_exact_and_upgrade_bounded() {
+        let argv = vec!["/agent".to_string(), "run".to_string()];
+        let legacy_digest = legacy_request_digest(&argv, Some("/work"), "60s");
+        let current_digest = request_digest(&argv, Some("/work"), "60s", false);
+        assert_eq!(
+            legacy_digest, "030c080c54aa88834e6249c7c3b544e9754b49a565a0c7696c4a06d38a8b5751",
+            "the pre-upgrade digest format is a persisted compatibility vector"
+        );
+        assert_ne!(legacy_digest, current_digest);
+
+        let mut existing = SandboxExecutionSpec {
+            lease_uid: "lease-uid".into(),
+            pod_uid: "pod-uid".into(),
+            idempotency_key: "key-1".into(),
+            request_digest: legacy_digest.clone(),
+            timeout: "60s".into(),
+            detached: false,
+            runner_managed: None,
+        };
+        assert_eq!(
+            compatible_reuse_verdict(
+                &existing,
+                "lease-uid",
+                &current_digest,
+                &legacy_digest,
+                false,
+            ),
+            ReuseVerdict::SameRequest
+        );
+        assert_eq!(
+            compatible_reuse_verdict(
+                &existing,
+                "lease-uid",
+                &request_digest(&argv, Some("/work"), "60s", true),
+                &legacy_digest,
+                true,
+            ),
+            ReuseVerdict::Conflict,
+            "a legacy wait record cannot answer a detached request"
+        );
+        let changed_argv = vec!["/agent".to_string(), "other".to_string()];
+        assert_eq!(
+            compatible_reuse_verdict(
+                &existing,
+                "lease-uid",
+                &request_digest(&changed_argv, Some("/work"), "60s", false),
+                &legacy_request_digest(&changed_argv, Some("/work"), "60s"),
+                false,
+            ),
+            ReuseVerdict::Conflict,
+            "changed argv must remain a conflict"
+        );
+
+        existing.runner_managed = Some(true);
+        assert_eq!(
+            compatible_reuse_verdict(
+                &existing,
+                "lease-uid",
+                &current_digest,
+                &legacy_digest,
+                false,
+            ),
+            ReuseVerdict::Conflict,
+            "current records never use the compatibility digest"
+        );
+        assert_eq!(
+            compatible_reuse_verdict(
+                &existing,
+                "another-lease",
+                &current_digest,
+                &legacy_digest,
+                false,
+            ),
+            ReuseVerdict::Foreign
+        );
+        assert!(execution_pod_identity_holds(&existing, "pod-uid"));
+        assert!(
+            !execution_pod_identity_holds(&existing, "replacement-pod-uid"),
+            "a runner id may never be reinterpreted in a replacement Pod"
+        );
     }
 
     /// `Unknown` is declared on a deadline, and never guessed.

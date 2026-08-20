@@ -161,6 +161,31 @@ fn execution_response(
     }
 }
 
+/// Whether a reused POST may return its record immediately.
+///
+/// Detached requests are handle-based and return `202` while active. Legacy
+/// raw wait-mode records have no runner output to recover. A current
+/// runner-managed wait request returns `None` so the handler resumes polling or
+/// reads its retained terminal output instead of silently returning empty
+/// streams after a lost HTTP response.
+fn reused_execution_response_status(
+    execution: &crate::crd::SandboxExecution,
+) -> Option<StatusCode> {
+    let current = execution
+        .status
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or_default();
+    if execution.spec.detached {
+        return Some(if current.is_terminal() {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        });
+    }
+    (!execution_is_runner_managed(&execution.spec)).then_some(StatusCode::OK)
+}
+
 fn execution_denied(
     identity: &AuthIdentity,
     lease: &str,
@@ -268,9 +293,11 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         Err(error) => return execution_denied(&identity, &id, &error),
     };
 
-    let reserved = match reservation {
-        // Somebody already reserved this exact request. Return what they got,
-        // and spawn nothing — this is the whole point of the key.
+    let (reserved, fresh) = match reservation {
+        // Somebody already reserved this exact request. Detached callers keep
+        // the handle/poll contract. Wait callers resume observing the same
+        // runner record below; they never spawn it again, but a lost response
+        // must not turn exact retained output into an empty successful result.
         executions::Reservation::AlreadyExists(existing) => {
             info!(
                 principal = %identity.identity,
@@ -280,9 +307,12 @@ async fn create_sandbox_execution<B: ClusterBackend>(
                 outcome = "deduplicated",
                 "Sandbox access"
             );
-            return (StatusCode::OK, Json(execution_response(&existing, None))).into_response();
+            if let Some(status) = reused_execution_response_status(&existing) {
+                return (status, Json(execution_response(&existing, None))).into_response();
+            }
+            (existing, false)
         }
-        executions::Reservation::Reserved(reserved) => reserved,
+        executions::Reservation::Reserved(reserved) => (reserved, true),
     };
 
     let cluster = match access::resolve_target_cluster(
@@ -295,24 +325,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     {
         Ok(cluster) => cluster,
         Err(denied) => {
-            executions::record_terminal(
-                &state.client,
-                &state.namespace,
-                &reserved,
-                ExecutionState::Unknown,
-                None,
-                denied.reason_code(),
-            )
-            .await;
-            return access_denied(&identity, &id, "execution", denied);
-        }
-    };
-    let scoped =
-        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
-            .await
-        {
-            Ok(client) => client,
-            Err(denied) => {
+            if fresh {
                 executions::record_terminal(
                     &state.client,
                     &state.namespace,
@@ -322,6 +335,27 @@ async fn create_sandbox_execution<B: ClusterBackend>(
                     denied.reason_code(),
                 )
                 .await;
+            }
+            return access_denied(&identity, &id, "execution", denied);
+        }
+    };
+    let scoped =
+        match credentials::scoped_client(&cluster, &target, credentials::SandboxOperation::Exec)
+            .await
+        {
+            Ok(client) => client,
+            Err(denied) => {
+                if fresh {
+                    executions::record_terminal(
+                        &state.client,
+                        &state.namespace,
+                        &reserved,
+                        ExecutionState::Unknown,
+                        None,
+                        denied.reason_code(),
+                    )
+                    .await;
+                }
                 return access_denied(&identity, &id, "execution", denied);
             }
         };
@@ -329,7 +363,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // Belt and braces: a reservation that is not fresh must never spawn, even
     // though `Reserved` is fresh by construction. The cost of the check is
     // nothing; the cost of the case it guards is a duplicate `terraform apply`.
-    if !executions::may_spawn(&reserved) {
+    if fresh && !executions::may_spawn(&reserved) {
         return sandbox_error(
             StatusCode::CONFLICT,
             "This execution has already been started",
@@ -346,26 +380,36 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
         Ok(guard) => guard,
         Err(denied) => {
-            // Nothing spawned, so cancellation is exact even when the final
-            // lease revalidation itself failed.
-            let reason = match denied {
-                StreamRegistrationDenied::LimitReached => "concurrency_limit",
-                StreamRegistrationDenied::LeaseEnded => "lease_ended",
-                StreamRegistrationDenied::Backend => "lease_revalidation_failed",
-            };
-            executions::record_terminal(
-                &state.client,
-                &state.namespace,
-                &reserved,
-                ExecutionState::Cancelled,
-                None,
-                reason,
-            )
-            .await;
+            if fresh {
+                // Nothing spawned, so cancellation is exact even when the
+                // final lease revalidation itself failed. A reused record may
+                // already be running, so a retry failure never settles it.
+                let reason = match denied {
+                    StreamRegistrationDenied::LimitReached => "concurrency_limit",
+                    StreamRegistrationDenied::LeaseEnded => "lease_ended",
+                    StreamRegistrationDenied::Backend => "lease_revalidation_failed",
+                };
+                executions::record_terminal(
+                    &state.client,
+                    &state.namespace,
+                    &reserved,
+                    ExecutionState::Cancelled,
+                    None,
+                    reason,
+                )
+                .await;
+            }
             return stream_registration_denied(&identity, &id, "execution", denied);
         }
     };
     let revoked = guard.cancelled();
+
+    if !fresh {
+        return resume_wait_with_runner(
+            &state, &identity, &id, &target, &container, &reserved, &scoped, revoked,
+        )
+        .await;
+    }
 
     // Recompute after credential creation and stream registration. Authority
     // can expire while those network calls run; using the earlier remainder
@@ -519,14 +563,134 @@ async fn run_with_runner<B: ClusterBackend>(
         return runner_started_response(state, identity, id, reserved, &report).await;
     }
 
+    complete_wait_mode(
+        state,
+        identity,
+        id,
+        target,
+        container,
+        reserved,
+        scoped,
+        &runner_path,
+        report,
+        revoked,
+    )
+    .await
+}
+
+/// Resume a wait-mode request after its first HTTP response was lost.
+///
+/// The durable record and runner id are reused exactly; this path never calls
+/// `start`. A `Running` record resumes polling, while a terminal record reads
+/// the retained streams so retrying cannot turn real output into empty output.
+#[allow(clippy::too_many_arguments)]
+async fn resume_wait_with_runner<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    record: &crate::crd::SandboxExecution,
+    scoped: &kube::Client,
+    revoked: tokio_util::sync::CancellationToken,
+) -> Response {
+    use crate::api::sandbox_runner as runner;
+    use crate::crd::ExecutionState;
+
+    let current = record
+        .status
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or_default();
+    if current == ExecutionState::Queued {
+        // Kobe durably reserved the key but never recorded a spawn. Reusing
+        // must not manufacture one: Queued is the exact, retry-safe answer.
+        return (StatusCode::OK, Json(execution_response(record, None))).into_response();
+    }
+    let Some(runner_path) = target.runner_path.clone() else {
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This runner-managed execution can no longer be reached",
+            None,
+        );
+    };
+    if current.is_terminal() {
+        return wait_output_response(
+            state,
+            identity,
+            id,
+            target,
+            container,
+            record,
+            scoped,
+            &runner_path,
+            revoked,
+            None,
+        )
+        .await;
+    }
+
+    let polled = complete_before_revocation(
+        &revoked,
+        runner::poll(scoped, target, container, &runner_path, &record.name_any()),
+    )
+    .await;
+    let report = match polled {
+        Some(Ok(report)) => report,
+        Some(Err(failure)) => {
+            return sandbox_error(failure.http_status(), failure.to_string(), None);
+        }
+        None => {
+            let cancelled =
+                runner::cancel(scoped, target, container, &runner_path, &record.name_any()).await;
+            record_revoked_outcome(state, record, cancelled).await;
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access; runner cancellation was requested",
+                None,
+            );
+        }
+    };
+
+    complete_wait_mode(
+        state,
+        identity,
+        id,
+        target,
+        container,
+        record,
+        scoped,
+        &runner_path,
+        report,
+        revoked,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_wait_mode<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    record: &crate::crd::SandboxExecution,
+    scoped: &kube::Client,
+    runner_path: &str,
+    report: kobe_runner::protocol::ExecutionReport,
+    revoked: tokio_util::sync::CancellationToken,
+) -> Response {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+
     let report = match wait_for_runner(
         scoped,
         target,
         container,
-        &runner_path,
-        &reserved.name_any(),
+        runner_path,
+        &record.name_any(),
         report,
-        revoked,
+        revoked.clone(),
     )
     .await
     {
@@ -537,31 +701,11 @@ async fn run_with_runner<B: ClusterBackend>(
             // Unknown here would discard a recoverable outcome.
             return sandbox_error(failure.http_status(), failure.to_string(), None);
         }
-        Err(WaitRunnerFailure::Revoked(Ok(report))) => {
-            let outcome = runner::outcome_from_report(&report);
-            if outcome.state.is_terminal() {
-                executions::record_terminal(
-                    &state.client,
-                    &state.namespace,
-                    reserved,
-                    outcome.state,
-                    outcome.exit_code,
-                    &outcome.reason,
-                )
-                .await;
-            }
+        Err(WaitRunnerFailure::Revoked(cancelled)) => {
+            record_revoked_outcome(state, record, cancelled).await;
             return sandbox_error(
                 StatusCode::GONE,
                 "Sandbox lease stopped permitting access; runner cancellation was requested",
-                None,
-            );
-        }
-        Err(WaitRunnerFailure::Revoked(Err(failure))) => {
-            // No terminal claim: teardown remains responsible for proving the
-            // process group is gone.
-            return sandbox_error(
-                failure.http_status(),
-                "Sandbox lease ended and runner termination could not be confirmed",
                 None,
             );
         }
@@ -571,52 +715,163 @@ async fn run_with_runner<B: ClusterBackend>(
     executions::record_terminal(
         &state.client,
         &state.namespace,
-        reserved,
+        record,
         outcome.state,
         outcome.exit_code,
         &outcome.reason,
     )
     .await;
 
-    let output = match runner::read_wait_output(
-        scoped,
+    wait_output_response(
+        state,
+        identity,
+        id,
         target,
         container,
-        &runner_path,
-        &reserved.name_any(),
+        record,
+        scoped,
+        runner_path,
+        revoked,
+        Some(outcome),
     )
     .await
-    {
-        Ok(output) => crate::api::sandbox_access::SandboxExecResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            success: outcome.state == ExecutionState::Succeeded,
-            exit_code: outcome.exit_code,
-            truncated: output.truncated,
-        },
-        Err(failure) => {
+}
+
+async fn record_revoked_outcome<B: ClusterBackend>(
+    state: &AppState<B>,
+    record: &crate::crd::SandboxExecution,
+    cancelled: Result<
+        kobe_runner::protocol::ExecutionReport,
+        crate::api::sandbox_runner::RunnerCallFailure,
+    >,
+) {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+
+    let Ok(report) = cancelled else {
+        // No terminal claim: teardown remains responsible for proving the
+        // process group is gone.
+        return;
+    };
+    let outcome = runner::outcome_from_report(&report);
+    if outcome.state.is_terminal() {
+        executions::record_terminal(
+            &state.client,
+            &state.namespace,
+            record,
+            outcome.state,
+            outcome.exit_code,
+            &outcome.reason,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_output_response<B: ClusterBackend>(
+    state: &AppState<B>,
+    identity: &AuthIdentity,
+    id: &str,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    record: &crate::crd::SandboxExecution,
+    scoped: &kube::Client,
+    runner_path: &str,
+    revoked: tokio_util::sync::CancellationToken,
+    observed_outcome: Option<crate::api::sandbox_runner::RunnerOutcome>,
+) -> Response {
+    use crate::api::sandbox_executions as executions;
+    use crate::api::sandbox_runner as runner;
+
+    let output = complete_before_revocation(
+        &revoked,
+        runner::read_wait_output(scoped, target, container, runner_path, &record.name_any()),
+    )
+    .await;
+    let output = match output {
+        Some(Ok(output)) => output,
+        Some(Err(failure)) => {
             // The outcome is durable and exact; output retrieval is a separate
             // transport failure and must not rewrite it to Unknown.
             return sandbox_error(failure.http_status(), failure.to_string(), None);
         }
+        None => {
+            return sandbox_error(
+                StatusCode::GONE,
+                "Sandbox lease stopped permitting access while execution output was read",
+                None,
+            );
+        }
     };
-    let refreshed = executions::refresh(&state.client, &state.namespace, reserved).await;
-    let record = refreshed.as_ref().unwrap_or(reserved);
+
+    let refreshed = executions::refresh(&state.client, &state.namespace, record).await;
+    let response_record = response_record_with_observed_outcome(
+        refreshed.unwrap_or_else(|| record.clone()),
+        observed_outcome,
+    );
+    let status = response_record.status.clone().unwrap_or_default();
+    let output = crate::api::sandbox_access::SandboxExecResponse {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        success: status.state == crate::crd::ExecutionState::Succeeded,
+        exit_code: status.exit_code,
+        truncated: output.truncated,
+    };
     info!(
         principal = %identity.identity,
         lease = %id,
-        execution = %reserved.name_any(),
+        execution = %response_record.name_any(),
         operation = "execution",
         outcome = "allowed",
-        state = %outcome.state,
-        exit_code = ?outcome.exit_code,
+        state = %status.state,
+        exit_code = ?status.exit_code,
         "Sandbox access"
     );
     (
         StatusCode::OK,
-        Json(execution_response(record, Some(output))),
+        Json(execution_response(&response_record, Some(output))),
     )
         .into_response()
+}
+
+/// Overlay an exact runner outcome on the record used for the HTTP response.
+///
+/// Status persistence is best-effort. A transient failed PATCH or refresh must
+/// not erase an exit code the runner just reported to this request; the next
+/// reconciliation can repair the durable copy.
+fn response_record_with_observed_outcome(
+    mut response_record: crate::crd::SandboxExecution,
+    observed_outcome: Option<crate::api::sandbox_runner::RunnerOutcome>,
+) -> crate::crd::SandboxExecution {
+    // A successful runner poll is the exact outcome even if persisting or
+    // refreshing its status had a transient failure. Keep durable metadata,
+    // but never discard an observed exit code in the HTTP response.
+    if let Some(outcome) = observed_outcome {
+        let status = response_record.status.get_or_insert_default();
+        status.state = outcome.state;
+        status.exit_code = outcome.exit_code;
+        status.reason = Some(outcome.reason);
+    }
+    response_record
+}
+
+/// Complete one bounded operation only while the lease still permits access.
+///
+/// Revocation is biased when both branches become ready together. Dropping the
+/// operation future aborts an in-flight runner exec and prevents later log
+/// chunks from being requested under a lease that has ended.
+async fn complete_before_revocation<F>(
+    revoked: &tokio_util::sync::CancellationToken,
+    operation: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = revoked.cancelled() => None,
+        output = operation => Some(output),
+    }
 }
 
 async fn runner_started_response<B: ClusterBackend>(
@@ -838,10 +1093,24 @@ async fn get_sandbox_execution<B: ClusterBackend>(
     .await
     {
         Ok(Some(record)) => {
-            // Every durable execution is runner-supervised. A wait client may
-            // disconnect before Kobe persists the outcome, so GET reconciles
-            // both modes rather than echoing a stale Running record.
-            let record = reconcile_runner(&state, &lease, &target, &record).await;
+            if !crate::api::sandbox_executions::execution_pod_identity_holds(
+                &record.spec,
+                &target.pod_uid,
+            ) {
+                return sandbox_error(
+                    StatusCode::GONE,
+                    "This execution belonged to a replaced Sandbox Pod",
+                    None,
+                );
+            }
+            // Current executions are runner-supervised in both modes. Legacy
+            // raw wait records are not: polling their id against the runner
+            // would turn a valid pre-upgrade Running record into Unknown.
+            let record = if execution_is_runner_managed(&record.spec) {
+                reconcile_runner(&state, &lease, &target, &record).await
+            } else {
+                record
+            };
             (StatusCode::OK, Json(execution_response(&record, None))).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -930,6 +1199,23 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         Err(error) => return execution_denied(&identity, &id, &error),
     };
 
+    if !crate::api::sandbox_executions::execution_pod_identity_holds(&record.spec, &target.pod_uid)
+    {
+        return sandbox_error(
+            StatusCode::GONE,
+            "This execution belonged to a replaced Sandbox Pod",
+            None,
+        );
+    }
+
+    if !execution_is_runner_managed(&record.spec) {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Retained output is unavailable for this legacy wait-mode execution",
+            None,
+        );
+    }
+
     let Some(runner_path) = target.runner_path.clone() else {
         return sandbox_error(
             StatusCode::CONFLICT,
@@ -938,9 +1224,16 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         );
     };
 
-    // Polled first, so the state reported alongside the output is the one that
-    // was true when the output was read — not the one Kobe last wrote.
-    let record = reconcile_runner(&state, &lease, &target, &record).await;
+    // Output reads are live operations too. Holding a guard ensures release,
+    // expiry, or quarantine interrupts every runner call below rather than
+    // allowing a second stream read under authority that has ended.
+    let guard = match register_live_stream(&state.client, &state.namespace, &lease, &target).await {
+        Ok(guard) => guard,
+        Err(denied) => {
+            return stream_registration_denied(&identity, &id, "execution-logs", denied);
+        }
+    };
+    let revoked = guard.cancelled();
 
     let cluster = match access::resolve_target_cluster(
         &state.client,
@@ -964,24 +1257,50 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
     };
 
+    // Polled first, so the state reported alongside the output is the one that
+    // was true when the output was read — not the one Kobe last wrote. Legacy
+    // raw records were refused above, so this id is always runner-owned.
+    let record = match complete_before_revocation(
+        &revoked,
+        reconcile_runner(&state, &lease, &target, &record),
+    )
+    .await
+    {
+        Some(record) => record,
+        None => {
+            return runner_output_revoked_response(
+                &state,
+                &record,
+                &scoped,
+                &target,
+                &target.container,
+                &runner_path,
+            )
+            .await;
+        }
+    };
+
     let mut windows = Vec::new();
     for (stream, offset) in [
         (LogStream::Stdout, query.stdout_offset.unwrap_or(0)),
         (LogStream::Stderr, query.stderr_offset.unwrap_or(0)),
     ] {
-        match runner::read_output(
-            &scoped,
-            &target,
-            &target.container,
-            &runner_path,
-            &record.name_any(),
-            stream,
-            offset,
+        let read = complete_before_revocation(
+            &revoked,
+            runner::read_output(
+                &scoped,
+                &target,
+                &target.container,
+                &runner_path,
+                &record.name_any(),
+                stream,
+                offset,
+            ),
         )
-        .await
-        {
-            Ok(chunk) => windows.push(chunk),
-            Err(failure) => {
+        .await;
+        match read {
+            Some(Ok(chunk)) => windows.push(chunk),
+            Some(Err(failure)) => {
                 info!(
                     principal = %identity.identity,
                     lease = %id,
@@ -992,6 +1311,17 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                     "Sandbox access"
                 );
                 return sandbox_error(failure.http_status(), failure.to_string(), None);
+            }
+            None => {
+                return runner_output_revoked_response(
+                    &state,
+                    &record,
+                    &scoped,
+                    &target,
+                    &target.container,
+                    &runner_path,
+                )
+                .await;
             }
         }
     }
@@ -1037,6 +1367,42 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         }),
     )
         .into_response()
+}
+
+/// Stop a still-active supervised execution when output access is revoked.
+///
+/// Terminal executions need no cancellation. For an active one, the only
+/// runner call permitted after revocation is the process-group cancellation;
+/// its confirmed result is persisted before the caller receives `410 Gone`.
+async fn runner_output_revoked_response<B: ClusterBackend>(
+    state: &AppState<B>,
+    record: &crate::crd::SandboxExecution,
+    scoped: &kube::Client,
+    target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    runner_path: &str,
+) -> Response {
+    let current = record
+        .status
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or_default();
+    if !current.is_terminal() {
+        let cancelled = crate::api::sandbox_runner::cancel(
+            scoped,
+            target,
+            container,
+            runner_path,
+            &record.name_any(),
+        )
+        .await;
+        record_revoked_outcome(state, record, cancelled).await;
+    }
+    sandbox_error(
+        StatusCode::GONE,
+        "Sandbox lease stopped permitting access while execution output was read",
+        None,
+    )
 }
 
 /// Cancel one execution.
@@ -1108,6 +1474,16 @@ enum RunnerCancellation {
     Handled(Response),
 }
 
+/// Whether cancellation must be confirmed by `kobe-runner`.
+///
+/// New records state this explicitly because wait and detached mode are both
+/// supervised. Legacy records predate that field: detached executions used the
+/// runner, while wait-mode executions used raw Kubernetes exec and may use the
+/// record-only fallback.
+fn execution_is_runner_managed(spec: &crate::crd::SandboxExecutionSpec) -> bool {
+    spec.runner_managed.unwrap_or(spec.detached)
+}
+
 async fn cancel_runner<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
@@ -1145,8 +1521,15 @@ async fn cancel_runner<B: ClusterBackend>(
             (StatusCode::OK, Json(execution_response(&record, None))).into_response(),
         );
     }
+    if !executions::execution_pod_identity_holds(&record.spec, &target.pod_uid) {
+        return RunnerCancellation::Handled(sandbox_error(
+            StatusCode::GONE,
+            "This execution belonged to a replaced Sandbox Pod",
+            None,
+        ));
+    }
     let Some(runner_path) = target.runner_path.clone() else {
-        if !record.spec.detached {
+        if !execution_is_runner_managed(&record.spec) {
             return RunnerCancellation::NotRunnerManaged;
         }
         return RunnerCancellation::Handled(access_denied_with(
@@ -1155,7 +1538,7 @@ async fn cancel_runner<B: ClusterBackend>(
             "execution-cancel",
             "runner_missing",
             StatusCode::SERVICE_UNAVAILABLE,
-            "Detached execution termination could not be confirmed",
+            "Runner-supervised execution termination could not be confirmed",
         ));
     };
 
@@ -1226,6 +1609,10 @@ async fn cancel_runner<B: ClusterBackend>(
             )
             .await;
             let refreshed = executions::refresh(&state.client, &state.namespace, &record).await;
+            let response_record = response_record_with_observed_outcome(
+                refreshed.unwrap_or_else(|| record.clone()),
+                Some(outcome.clone()),
+            );
             info!(
                 principal = %identity.identity,
                 lease = %id,
@@ -1238,10 +1625,7 @@ async fn cancel_runner<B: ClusterBackend>(
             RunnerCancellation::Handled(
                 (
                     StatusCode::OK,
-                    Json(execution_response(
-                        refreshed.as_ref().unwrap_or(&record),
-                        None,
-                    )),
+                    Json(execution_response(&response_record, None)),
                 )
                     .into_response(),
             )
@@ -7806,41 +8190,220 @@ mod tests {
         assert_ne!(response.status(), StatusCode::CONFLICT);
     }
 
-    /// A detached record may fall back to record-only cancellation only when
-    /// it was actually wait-mode. Missing runner provenance is uncertainty
-    /// about a live process, so it must remain Running and retryable.
+    /// A pre-runner wait record has no retained runner output to address.
+    ///
+    /// Attempting to poll that id would receive runner `NotFound` and corrupt
+    /// a valid rolling-upgrade record to `Unknown`, so the boundary is refused
+    /// before any runner access is attempted.
     #[tokio::test]
-    async fn detached_cancel_without_runner_never_records_a_fake_cancellation() {
+    async fn legacy_wait_logs_are_refused_without_runner_reconciliation() {
         let server = MockServer::start().await;
         mount_sandbox_crds(&server).await;
-        mount_ready_sandbox(&server, pool_json()).await;
+        mount_ready_sandbox(&server, pool_json_with_runner()).await;
+        let mut legacy = execution_json(false);
+        legacy["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runnerManaged");
         Mock::given(method("GET"))
             .and(path_regex(
                 r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/sbxe-.*$",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(execution_json(true)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(legacy))
             .mount(&server)
             .await;
 
-        let response = cancel_sandbox_execution::<crate::testutil::MockBackend>(
+        let response = get_sandbox_execution_logs::<crate::testutil::MockBackend>(
             State(test_state(&server)),
             identity(),
             Path(("sandbox-own".into(), "sbxe-1".into())),
+            Query(ExecutionLogsQuery {
+                stdout_offset: None,
+                stderr_offset: None,
+            }),
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// A runner-managed record never falls back to record-only cancellation.
+    /// Missing runner access is uncertainty about a live process, so both wait
+    /// and detached mode must remain Running and retryable.
+    #[tokio::test]
+    async fn runner_managed_cancel_without_runner_never_records_a_fake_cancellation() {
+        for detached in [false, true] {
+            let server = MockServer::start().await;
+            mount_sandbox_crds(&server).await;
+            mount_ready_sandbox(&server, pool_json()).await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/apis/kobe\.kunobi\.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/sbxe-.*$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(execution_json(detached)))
+                .mount(&server)
+                .await;
+
+            let response = cancel_sandbox_execution::<crate::testutil::MockBackend>(
+                State(test_state(&server)),
+                identity(),
+                Path(("sandbox-own".into(), "sbxe-1".into())),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .all(|request| {
+                        !(request.method.as_str() == "PATCH"
+                            && request.url.path().contains("/sandboxexecutions/"))
+                    }),
+                "an unconfirmed runner-managed process must remain Running"
+            );
+        }
+    }
+
+    /// A supervised wait-mode execution must never fall through to the legacy
+    /// record-only cancellation path when its Pool no longer exposes a runner.
+    ///
+    /// `detached` describes response timing, not supervision, after wait mode
+    /// moved to the runner. The optional provenance field preserves the exact
+    /// old behavior for records created before that change.
+    #[test]
+    fn runner_managed_wait_execution_never_falls_back_to_record_only_cancellation() {
+        let spec = |detached, runner_managed| crate::crd::SandboxExecutionSpec {
+            lease_uid: "lease-uid".into(),
+            pod_uid: "pod-uid".into(),
+            idempotency_key: "key-1".into(),
+            request_digest: "d".repeat(64),
+            timeout: "60s".into(),
+            detached,
+            runner_managed,
+        };
+
+        assert!(execution_is_runner_managed(&spec(false, Some(true))));
         assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .all(|request| {
-                    !(request.method.as_str() == "PATCH"
-                        && request.url.path().contains("/sandboxexecutions/"))
-                }),
-            "an unconfirmed detached process must remain Running"
+            execution_is_runner_managed(&spec(true, None)),
+            "legacy detached records were runner-managed"
+        );
+        assert!(
+            !execution_is_runner_managed(&spec(false, None)),
+            "only legacy wait records may use record-only cancellation"
+        );
+        assert!(
+            !execution_is_runner_managed(&spec(true, Some(false))),
+            "explicit provenance takes precedence over the legacy inference"
+        );
+    }
+
+    /// Retrying a wait-mode POST after its response was lost resumes the exact
+    /// runner record. It must not return the durable status with empty streams,
+    /// and it must never select the fresh-start path again.
+    #[test]
+    fn lost_wait_response_resumes_the_exact_runner_record() {
+        let mut record: crate::crd::SandboxExecution =
+            serde_json::from_value(execution_json(false)).unwrap();
+        assert_eq!(
+            reused_execution_response_status(&record),
+            None,
+            "current wait mode must resume runner polling/output"
+        );
+
+        record.status.as_mut().unwrap().state = crate::crd::ExecutionState::Failed;
+        record.status.as_mut().unwrap().exit_code = Some(42);
+        assert_eq!(
+            reused_execution_response_status(&record),
+            None,
+            "terminal wait mode must recover retained output"
+        );
+        let response = execution_response(
+            &record,
+            Some(crate::api::sandbox_access::SandboxExecResponse {
+                stdout: "retained-out".into(),
+                stderr: "retained-err".into(),
+                success: false,
+                exit_code: Some(42),
+                truncated: false,
+            }),
+        );
+        assert_eq!(response.exit_code, Some(42));
+        assert_eq!(response.stdout.as_deref(), Some("retained-out"));
+        assert_eq!(response.stderr.as_deref(), Some("retained-err"));
+
+        let mut stale_running = record.clone();
+        stale_running.status.as_mut().unwrap().state = crate::crd::ExecutionState::Running;
+        stale_running.status.as_mut().unwrap().exit_code = None;
+        let exact = response_record_with_observed_outcome(
+            stale_running,
+            Some(crate::api::sandbox_runner::RunnerOutcome {
+                state: crate::crd::ExecutionState::Failed,
+                exit_code: Some(42),
+                reason: "exited".into(),
+            }),
+        );
+        assert_eq!(
+            exact.status.as_ref().unwrap().state,
+            crate::crd::ExecutionState::Failed,
+            "a transient status persistence failure must not hide the observed outcome"
+        );
+        assert_eq!(exact.status.as_ref().unwrap().exit_code, Some(42));
+
+        record.spec.runner_managed = None;
+        assert_eq!(
+            reused_execution_response_status(&record),
+            Some(StatusCode::OK),
+            "legacy raw wait records keep their old record-only response"
+        );
+        record.spec.detached = true;
+        record.status.as_mut().unwrap().state = crate::crd::ExecutionState::Running;
+        assert_eq!(
+            reused_execution_response_status(&record),
+            Some(StatusCode::ACCEPTED),
+            "detached retries remain handle-based"
+        );
+    }
+
+    /// Revocation wins while retained output is being read and drops the
+    /// in-flight operation, so no later runner log chunk can be requested.
+    #[tokio::test]
+    async fn revocation_aborts_wait_output_retrieval() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropSignal(std::sync::Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let revoked = tokio_util::sync::CancellationToken::new();
+        let observed = revoked.clone();
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let dropped_by_operation = dropped.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            complete_before_revocation(&observed, async move {
+                let _drop_signal = DropSignal(dropped_by_operation);
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .await
+        });
+
+        started_rx.await.unwrap();
+        revoked.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("revocation must stop output retrieval")
+            .unwrap();
+        assert_eq!(result, None);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the in-flight runner operation must be dropped"
         );
     }
 
@@ -7925,7 +8488,8 @@ mod tests {
                 "idempotencyKey": "key-1",
                 "requestDigest": "d".repeat(64),
                 "timeout": "60s",
-                "detached": detached
+                "detached": detached,
+                "runnerManaged": true
             },
             "status": { "state": "Running" }
         })

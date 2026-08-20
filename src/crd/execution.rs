@@ -79,9 +79,19 @@ pub struct SandboxExecutionSpec {
     #[schemars(length(min = 1))]
     pub timeout: String,
 
-    /// Whether the caller waited for the result.
+    /// Whether the caller requested a detached handle instead of waiting for
+    /// the result. This controls response timing, not runner supervision.
     #[serde(default)]
     pub detached: bool,
+
+    /// Whether `kobe-runner` supervises this execution and cancellation must
+    /// therefore be confirmed by that runner.
+    ///
+    /// Optional for upgrade compatibility. Records created before wait mode
+    /// moved to the runner omit it; for those, only detached executions were
+    /// runner-managed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_managed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
@@ -259,6 +269,25 @@ pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
 /// one's result would be a wrong answer rather than a cached one.
 #[allow(dead_code)]
 pub fn request_digest(argv: &[String], cwd: Option<&str>, timeout: &str, detached: bool) -> String {
+    request_digest_with_mode(argv, cwd, timeout, Some(detached))
+}
+
+/// Digest emitted before lifecycle mode became part of the request identity.
+///
+/// Kept only to recognise exact live records across a rolling upgrade. New
+/// reservations always use [`request_digest`], and callers must also match the
+/// legacy record's explicit `detached` field before this digest is accepted.
+#[allow(dead_code)]
+pub fn legacy_request_digest(argv: &[String], cwd: Option<&str>, timeout: &str) -> String {
+    request_digest_with_mode(argv, cwd, timeout, None)
+}
+
+fn request_digest_with_mode(
+    argv: &[String],
+    cwd: Option<&str>,
+    timeout: &str,
+    detached: Option<bool>,
+) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -280,10 +309,12 @@ pub fn request_digest(argv: &[String], cwd: Option<&str>, timeout: &str, detache
     }
     hasher.update((timeout.len() as u64).to_be_bytes());
     hasher.update(timeout.as_bytes());
-    // Wait and detached mode have different lifecycle semantics. Treating
-    // them as one request could return a wait-mode record to a caller that
-    // asked for a reconnectable execution, or vice versa.
-    hasher.update([u8::from(detached)]);
+    if let Some(detached) = detached {
+        // Wait and detached mode have different lifecycle semantics. Treating
+        // them as one request could return a wait-mode record to a caller that
+        // asked for a reconnectable execution, or vice versa.
+        hasher.update([u8::from(detached)]);
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -357,6 +388,7 @@ mod tests {
             request_digest: digest.into(),
             timeout: "60s".into(),
             detached: false,
+            runner_managed: None,
         }
     }
 
@@ -471,6 +503,25 @@ mod tests {
             reuse_verdict(&original, "lease-b", "digest-1"),
             ReuseVerdict::Foreign
         );
+    }
+
+    /// Runner supervision provenance is additive across an in-place CRD
+    /// upgrade. Legacy records omit it; new records can state it explicitly
+    /// without changing the meaning of `detached`.
+    #[test]
+    fn runner_management_provenance_preserves_legacy_wire_records() {
+        let legacy = serde_json::to_value(spec("lease-a", "digest-1")).unwrap();
+        assert!(legacy.get("runnerManaged").is_none());
+        let decoded: SandboxExecutionSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.runner_managed, None);
+
+        let current = SandboxExecutionSpec {
+            runner_managed: Some(true),
+            ..spec("lease-a", "digest-1")
+        };
+        let encoded = serde_json::to_value(current).unwrap();
+        assert_eq!(encoded["runnerManaged"], true);
+        assert_eq!(encoded["detached"], false);
     }
 
     /// The digest covers everything that changes what runs, unambiguously.

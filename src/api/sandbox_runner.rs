@@ -1,12 +1,13 @@
 //! Kobe's half of the Sandbox runner contract (#82).
 //!
-//! # Why detached execution needs a second process at all
+//! # Why durable execution needs a second process at all
 //!
 //! A Kubernetes exec is a connection. Everything Kobe starts through one dies
 //! with it: the caller disconnects, the operator restarts, a node drains, and
-//! the command goes with them. A "detached" execution built on that is worse
-//! than none, because the caller has already built on a guarantee that was
-//! never there — and finds out from the work that did not happen.
+//! the command goes with them. Wait mode also needs exact `cwd`, timeout, exit
+//! status, retained output and process-group cancellation. Building either
+//! response mode on raw exec would make those guarantees depend on whether the
+//! HTTP connection happened to survive.
 //!
 //! So the container runs [`kobe-runner`](kobe_runner), which is re-executed
 //! into a session of its own and reparented to the container's init. Kobe then
