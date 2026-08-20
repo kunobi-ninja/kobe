@@ -579,6 +579,12 @@ pub struct SandboxLeaseStatus {
     /// fence delayed creates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_claim_tombstone: Option<SandboxObjectReference>,
+    /// Exact management-cluster coordination `Lease` that closes allocation
+    /// before teardown begins. Create paths must observe its absence inside a
+    /// bounded final authorization window; release drains that window before
+    /// it may checkpoint footprint absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_fence: Option<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         extend("x-kubernetes-list-type" = "map"),

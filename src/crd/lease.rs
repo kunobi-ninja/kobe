@@ -98,6 +98,14 @@ pub struct ClusterLeaseStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teardown_receipt: Option<TeardownReceipt>,
 
+    /// API-server-observed proof that a terminal lease never acquired a
+    /// binding or even a display `clusterName`. `VerifiedDestroy` leases keep
+    /// this proof-bearing handle until their composing Sandbox acknowledges it;
+    /// otherwise the handle's 404 would erase the only evidence that there was
+    /// no child cluster to destroy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbound_release_verified_at: Option<String>,
+
     /// Position in the priority queue (0 = not queued, 1 = next).
     #[serde(default)]
     pub queue_position: u32,
@@ -577,6 +585,7 @@ mod json_safety_tests {
                 retry_count: 0,
                 outcome: crate::crd::TeardownOutcome::Verified,
             }),
+            unbound_release_verified_at: None,
         };
         let once = serde_json::to_value(&original).unwrap();
         let back: ClusterLeaseStatus = serde_json::from_value(once.clone()).unwrap();

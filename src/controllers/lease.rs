@@ -16,6 +16,7 @@ use crate::crd::{
     BackendProvenance, BoundInstanceRef, ClusterInstance, ClusterInstancePhase, ClusterLease,
     ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase, ClusterPoolStatus,
     LeaseBinding, LeasePhase, ResourceRef, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
+    UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
 };
 use crate::diagnostics;
 use crate::lease_binding::BindingResolutionError;
@@ -516,6 +517,38 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 warn!(lease = %name, "best-effort connect-token delete failed (continuing): {e:#}");
             }
 
+            // A composition-only lease that reached a terminal phase before
+            // binding never owned a cluster. That absence is useful proof to
+            // the outer SandboxLease, but deleting this handle immediately
+            // would erase it before the outer controller can checkpoint it.
+            // Persist an explicit NeverBound proof and retain the exact handle
+            // until the outer lease ACKs this exact timestamp.
+            if lease.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
+                && status.binding.is_none()
+                && status.cluster_name.is_none()
+                && status.teardown_receipt.is_none()
+            {
+                if !unbound_release_proof_is_complete(&status) {
+                    record_unbound_release_proof(&leases_api, &lease, &status).await?;
+                    return Ok(Action::await_change());
+                }
+                let proof = status
+                    .unbound_release_verified_at
+                    .as_deref()
+                    .expect("complete proof has a timestamp");
+                if lease
+                    .annotations()
+                    .get(UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
+                    .is_some_and(|ack| ack == proof)
+                {
+                    info!(lease = %name, "Retiring ACKed NeverBound proof handle");
+                    delete_lease_crd(&leases_api, &lease).await;
+                    return Ok(Action::await_change());
+                }
+                debug!(lease = %name, "retaining terminal NeverBound proof until its composing Sandbox ACKs");
+                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+            }
+
             let resolved = match crate::lease_binding::resolve_lease_binding(
                 &ctx.client,
                 &ns,
@@ -895,6 +928,7 @@ async fn finalize_binding<B: ClusterBackend>(
         message: None,
         conditions: Vec::new(),
         teardown_receipt: None,
+        unbound_release_verified_at: None,
     };
     new_status.conditions =
         derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
@@ -969,10 +1003,86 @@ async fn delete_lease_crd(leases_api: &Api<ClusterLease>, lease: &ClusterLease) 
 /// durable proof that capacity was destroyed, so it outlives the lease until a
 /// consumer acknowledges it.
 fn teardown_receipt_unconsumed(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
-    status.teardown_receipt.is_some()
-        && !lease
+    status.teardown_receipt.as_ref().is_some_and(|receipt| {
+        lease
             .annotations()
-            .contains_key(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+            .get(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+            != Some(&receipt.attempt_id)
+    })
+}
+
+const ALLOCATION_ABSENT_CONDITION: &str = "AllocationAbsent";
+
+fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
+    let timestamp = status
+        .unbound_release_verified_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    timestamp.is_some()
+        && status.conditions.iter().any(|condition| {
+            condition.condition_type == ALLOCATION_ABSENT_CONDITION
+                && condition.status == "True"
+                && condition.reason == "NeverBound"
+        })
+}
+
+async fn record_unbound_release_proof(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> Result<(), LeaseError> {
+    let Some(uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!("lease UID missing")));
+    };
+    let Some(resource_version) = lease.resource_version() else {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "lease resourceVersion missing"
+        )));
+    };
+    let verified_at = status
+        .unbound_release_verified_at
+        .clone()
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let previous = status
+        .conditions
+        .iter()
+        .find(|condition| condition.condition_type == ALLOCATION_ABSENT_CONDITION);
+    let transition = previous
+        .filter(|condition| condition.status == "True" && condition.reason == "NeverBound")
+        .and_then(|condition| condition.last_transition_time.clone())
+        .unwrap_or_else(|| verified_at.clone());
+    let mut conditions: Vec<_> = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type != ALLOCATION_ABSENT_CONDITION)
+        .cloned()
+        .collect();
+    conditions.push(ClusterLeaseCondition {
+        condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+        status: "True".into(),
+        reason: "NeverBound".into(),
+        message: "Terminal lease never acquired a ClusterInstance binding".into(),
+        last_transition_time: Some(transition),
+    });
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "add", "path": "/status/unboundReleaseVerifiedAt", "value": verified_at },
+        { "op": "add", "path": "/status/conditions", "value": conditions }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn mark_binding_unverified(

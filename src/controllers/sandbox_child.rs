@@ -22,7 +22,6 @@
 
 use std::time::Duration;
 
-#[cfg(test)]
 use kube::Resource;
 use kube::api::ObjectMeta;
 use kube::{Client, ResourceExt};
@@ -262,14 +261,7 @@ pub fn build_internal_cluster_lease(
     })
 }
 
-/// Whether an internal lease carries the exact durable identity of one outer
-/// Sandbox lease.
-///
-/// This intentionally rejects legacy owner references. Even a correct-looking
-/// reference would reintroduce the GC race this identity scheme avoids. A
-/// same-named object with a missing or different UID label is foreign and must
-/// never be released, observed as placement, or adopted.
-pub fn internal_lease_is_for_sandbox(
+fn internal_lease_identity_is_for_sandbox(
     internal: &ClusterLease,
     sandbox_lease: &SandboxLease,
 ) -> bool {
@@ -278,11 +270,6 @@ pub fn internal_lease_is_for_sandbox(
     };
     internal.name_any() == internal_lease_name(&sandbox_lease.name_any())
         && internal.namespace() == sandbox_lease.namespace()
-        && internal
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_none_or(Vec::is_empty)
         && internal
             .labels()
             .get("app.kubernetes.io/managed-by")
@@ -296,6 +283,72 @@ pub fn internal_lease_is_for_sandbox(
         && internal.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
 }
 
+/// Ownership state of an otherwise exact internal composition handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InternalLeaseOwnership {
+    /// Current format: durable UID labels and no GC dependency.
+    Ownerless,
+    /// Exact sole controller owner from a pre-migration Kobe build. It may be
+    /// removed under UID/resourceVersion tests before the object is used.
+    ExactLegacy,
+    /// Foreign, ambiguous, deleting, or otherwise not safely migratable.
+    Foreign,
+}
+
+/// Classify legacy ownership without silently treating GC dependence as safe.
+pub(crate) fn internal_lease_ownership(
+    internal: &ClusterLease,
+    sandbox_lease: &SandboxLease,
+) -> InternalLeaseOwnership {
+    if !internal_lease_identity_is_for_sandbox(internal, sandbox_lease)
+        || internal.metadata.deletion_timestamp.is_some()
+    {
+        return InternalLeaseOwnership::Foreign;
+    }
+    let Some(owners) = internal.metadata.owner_references.as_ref() else {
+        return InternalLeaseOwnership::Ownerless;
+    };
+    if owners.is_empty() {
+        return InternalLeaseOwnership::Ownerless;
+    }
+    let Some(sandbox_uid) = sandbox_lease.uid().filter(|uid| !uid.is_empty()) else {
+        return InternalLeaseOwnership::Foreign;
+    };
+    if owners.len() == 1
+        && owners[0].api_version == SandboxLease::api_version(&()).as_ref()
+        && owners[0].kind == SandboxLease::kind(&()).as_ref()
+        && owners[0].name == sandbox_lease.name_any()
+        && owners[0].uid == sandbox_uid
+        && owners[0].controller == Some(true)
+    {
+        InternalLeaseOwnership::ExactLegacy
+    } else {
+        InternalLeaseOwnership::Foreign
+    }
+}
+
+/// Whether an internal lease carries the exact durable identity of one outer
+/// Sandbox lease in the current ownerless format.
+pub fn internal_lease_is_for_sandbox(
+    internal: &ClusterLease,
+    sandbox_lease: &SandboxLease,
+) -> bool {
+    internal_lease_ownership(internal, sandbox_lease) == InternalLeaseOwnership::Ownerless
+}
+
+/// Whether a legacy-owner migration is permitted without changing the
+/// immutable composition request.
+pub(crate) fn internal_lease_matches_composition_identity(
+    internal: &ClusterLease,
+    sandbox_lease: &SandboxLease,
+    cluster_pool_ref: &str,
+    lifetime: Duration,
+) -> bool {
+    internal_lease_identity_is_for_sandbox(internal, sandbox_lease)
+        && internal.spec.pool_ref == cluster_pool_ref
+        && internal.spec.ttl == format!("{}s", lifetime.as_secs())
+}
+
 /// Placement additionally requires the immutable request shape this controller
 /// intended. Identity alone authorises recovery; it does not authorise silently
 /// changing pools or shortening the child lifetime after a create race.
@@ -306,8 +359,12 @@ pub fn internal_lease_matches_composition(
     lifetime: Duration,
 ) -> bool {
     internal_lease_is_for_sandbox(internal, sandbox_lease)
-        && internal.spec.pool_ref == cluster_pool_ref
-        && internal.spec.ttl == format!("{}s", lifetime.as_secs())
+        && internal_lease_matches_composition_identity(
+            internal,
+            sandbox_lease,
+            cluster_pool_ref,
+            lifetime,
+        )
 }
 
 /// The identity Kobe uses for its own compositions.

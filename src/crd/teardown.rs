@@ -184,6 +184,13 @@ pub struct TeardownReceipt {
 pub const TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION: &str =
     "kobe.kunobi.ninja/teardown-receipt-acknowledged";
 
+/// Set by the composing Sandbox after it durably records that an internal
+/// `ClusterLease` reached a terminal phase without ever binding an instance.
+/// The value is the exact `unboundReleaseVerifiedAt` timestamp, so a stale ACK
+/// cannot retire a newly recreated proof-bearing handle.
+pub const UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION: &str =
+    "kobe.kunobi.ninja/unbound-release-proof-acknowledged";
+
 /// Current schema version emitted by this build.
 pub const TEARDOWN_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
