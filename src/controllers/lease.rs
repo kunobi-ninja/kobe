@@ -32,9 +32,80 @@ struct SandboxCompositionIdentity {
 enum SandboxCompositionGate {
     NotComposition,
     Authorized,
+    NeedsMigration(SandboxCompositionIdentity),
     Closed(SandboxCompositionIdentity),
     Invalid,
     Retry,
+}
+
+/// Produce the owner-independent metadata fence for one exact composition.
+///
+/// Unknown labels, annotations, and finalizers are preserved. The known
+/// identity fields are overwritten only after the caller has validated every
+/// pre-existing value against `identity`.
+fn sandbox_composition_retention_metadata(
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+    stale_rejected: bool,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let now = chrono::Utc::now();
+    let mut labels = lease.metadata.labels.clone().unwrap_or_default();
+    labels.insert(
+        crate::sandbox::SANDBOX_LEASE_UID_LABEL.into(),
+        identity.outer_uid.clone(),
+    );
+    labels.insert(
+        crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL.into(),
+        "true".into(),
+    );
+    let mut annotations = lease.metadata.annotations.clone().unwrap_or_default();
+    annotations.insert(
+        crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.into(),
+        identity.outer_name.clone(),
+    );
+    if stale_rejected {
+        annotations.insert(
+            crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION.into(),
+            identity.outer_uid.clone(),
+        );
+    }
+    let deadline_is_live = annotations
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
+    if !deadline_is_live {
+        annotations.insert(
+            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.into(),
+            crate::controllers::sandbox_child::child_handle_retention_deadline(now).to_rfc3339(),
+        );
+    }
+    let mut finalizers = lease.metadata.finalizers.clone().unwrap_or_default();
+    if !finalizers.iter().any(|finalizer| {
+        finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+    }) {
+        finalizers.push(crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER.into());
+    }
+    (labels, annotations, finalizers)
+}
+
+fn sandbox_composition_retention_fence_matches(
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+) -> bool {
+    let (labels, annotations, finalizers) =
+        sandbox_composition_retention_metadata(lease, identity, false);
+    lease
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+        && lease.metadata.labels.as_ref() == Some(&labels)
+        && lease.metadata.annotations.as_ref() == Some(&annotations)
+        && lease.metadata.finalizers.as_ref() == Some(&finalizers)
 }
 
 /// Authorize an internal Sandbox composition at the last controller boundary
@@ -52,29 +123,21 @@ async fn sandbox_composition_allocation_gate(
     if lease.spec.requester.requester_type != "kobe:sandbox-composition" {
         return SandboxCompositionGate::NotComposition;
     }
-    let Some(outer_uid) = lease
-        .labels()
-        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
-        .filter(|uid| !uid.is_empty())
-        .cloned()
-    else {
-        return SandboxCompositionGate::Invalid;
-    };
     let derived_outer = lease
         .name_any()
         .strip_prefix("kobe-sbx-")
         .filter(|name| !name.is_empty())
         .map(str::to_string);
-    let outer_name = match (
-        lease
-            .annotations()
-            .get(crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION),
-        derived_outer,
-    ) {
-        (Some(annotated), Some(derived)) if annotated == &derived => annotated.clone(),
-        (None, Some(derived)) => derived,
-        _ => return SandboxCompositionGate::Invalid,
+    let Some(outer_name) = derived_outer else {
+        return SandboxCompositionGate::Invalid;
     };
+    if lease
+        .annotations()
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION)
+        .is_some_and(|annotated| annotated != &outer_name)
+    {
+        return SandboxCompositionGate::Invalid;
+    }
     if lease
         .labels()
         .get("app.kubernetes.io/managed-by")
@@ -84,20 +147,41 @@ async fn sandbox_composition_allocation_gate(
     {
         return SandboxCompositionGate::Invalid;
     }
-    if let Some(owners) = lease
+
+    // Base producers had no outer-UID label: the sole exact controller owner
+    // was their identity. Newer producers use the UID label and no ownerRef.
+    // During a rolling upgrade both may be present, but they must agree.
+    let labelled_uid = lease
+        .labels()
+        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+        .filter(|uid| !uid.is_empty())
+        .cloned();
+    let legacy_uid = match lease
         .metadata
         .owner_references
         .as_ref()
         .filter(|owners| !owners.is_empty())
-        && (owners.len() != 1
-            || owners[0].api_version != "kobe.kunobi.ninja/v1alpha1"
-            || owners[0].kind != "SandboxLease"
-            || owners[0].name != outer_name
-            || owners[0].uid != outer_uid
-            || owners[0].controller != Some(true))
+    {
+        None => None,
+        Some(owners)
+            if owners.len() == 1
+                && owners[0].api_version == "kobe.kunobi.ninja/v1alpha1"
+                && owners[0].kind == "SandboxLease"
+                && owners[0].name == outer_name
+                && !owners[0].uid.is_empty()
+                && owners[0].controller == Some(true) =>
+        {
+            Some(owners[0].uid.clone())
+        }
+        Some(_) => return SandboxCompositionGate::Invalid,
+    };
+    if matches!((&labelled_uid, &legacy_uid), (Some(labelled), Some(legacy)) if labelled != legacy)
     {
         return SandboxCompositionGate::Invalid;
     }
+    let Some(outer_uid) = labelled_uid.or(legacy_uid) else {
+        return SandboxCompositionGate::Invalid;
+    };
 
     let identity = SandboxCompositionIdentity {
         outer_name: outer_name.clone(),
@@ -136,9 +220,55 @@ async fn sandbox_composition_allocation_gate(
         ))
         .await
     {
-        Err(kube::Error::Api(error)) if error.code == 404 => SandboxCompositionGate::Authorized,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            if sandbox_composition_retention_fence_matches(lease, &identity) {
+                SandboxCompositionGate::Authorized
+            } else {
+                SandboxCompositionGate::NeedsMigration(identity)
+            }
+        }
         Ok(_) => SandboxCompositionGate::Closed(identity),
         Err(_) => SandboxCompositionGate::Retry,
+    }
+}
+
+/// Atomically migrate an exact base composition before it can enter the queue.
+///
+/// The base object depended on the outer `SandboxLease` ownerRef and lacked its
+/// durable UID label. A single UID/resourceVersion-fenced metadata patch clears
+/// the GC edge and installs the label, tombstone marker, retention deadline,
+/// and finalizer. The caller always ends the pass after this function.
+async fn migrate_sandbox_composition_retention_fence(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+) -> Result<Action, LeaseError> {
+    let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let (labels, annotations, finalizers) =
+        sandbox_composition_retention_metadata(lease, identity, false);
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/metadata/ownerReferences", "value": [] },
+        { "op": "add", "path": "/metadata/labels", "value": labels },
+        { "op": "add", "path": "/metadata/annotations", "value": annotations },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+    ]));
+    match leases
+        .patch(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(Action::await_change()),
+        Err(error) if optimistic_conflict(&error) => {
+            Ok(Action::requeue(std::time::Duration::from_secs(1)))
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -155,37 +285,8 @@ async fn close_stale_sandbox_composition(
     let Some(resource_version) = lease.resource_version() else {
         return Ok(Action::requeue(std::time::Duration::from_secs(300)));
     };
-    let now = chrono::Utc::now();
-    let mut labels = lease.metadata.labels.clone().unwrap_or_default();
-    labels.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL.into(),
-        "true".into(),
-    );
-    let mut annotations = lease.metadata.annotations.clone().unwrap_or_default();
-    annotations.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.into(),
-        identity.outer_name.clone(),
-    );
-    annotations.insert(
-        crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION.into(),
-        identity.outer_uid.clone(),
-    );
-    let deadline_is_live = annotations
-        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
-    if !deadline_is_live {
-        annotations.insert(
-            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.into(),
-            crate::controllers::sandbox_child::child_handle_retention_deadline(now).to_rfc3339(),
-        );
-    }
-    let mut finalizers = lease.metadata.finalizers.clone().unwrap_or_default();
-    if !finalizers.iter().any(|finalizer| {
-        finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
-    }) {
-        finalizers.push(crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER.into());
-    }
+    let (labels, annotations, finalizers) =
+        sandbox_composition_retention_metadata(lease, identity, true);
     let fenced = lease
         .metadata
         .owner_references
@@ -529,6 +630,11 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     if status.phase == LeasePhase::Pending {
         match sandbox_composition_allocation_gate(&ctx.client, &ns, &lease).await {
             SandboxCompositionGate::NotComposition | SandboxCompositionGate::Authorized => {}
+            SandboxCompositionGate::NeedsMigration(identity) => {
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return migrate_sandbox_composition_retention_fence(&leases_api, &lease, &identity)
+                    .await;
+            }
             SandboxCompositionGate::Closed(identity) => {
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 return close_stale_sandbox_composition(
@@ -1264,6 +1370,11 @@ async fn finalize_binding<B: ClusterBackend>(
             }
         }
         SandboxCompositionGate::Authorized => {}
+        SandboxCompositionGate::NeedsMigration(identity) => {
+            let _ =
+                migrate_sandbox_composition_retention_fence(&leases_api, &lease, &identity).await?;
+            return Ok(false);
+        }
         SandboxCompositionGate::Closed(identity) => {
             let _ = close_stale_sandbox_composition(
                 &ctx.client,
@@ -3035,6 +3146,26 @@ mod tests {
         .unwrap()
     }
 
+    /// Exact metadata identity emitted by the base child-composition producer:
+    /// managed-by plus the sole outer controller owner, but no outer UID label,
+    /// retention annotations, tombstone label, or finalizer.
+    fn base_legacy_sandbox_composition_handle(
+        outer_name: &str,
+        resource_version: &str,
+    ) -> ClusterLease {
+        let mut value = serde_json::to_value(delayed_sandbox_composition_handle(
+            outer_name,
+            resource_version,
+            false,
+        ))
+        .unwrap();
+        value["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::sandbox::SANDBOX_LEASE_UID_LABEL);
+        serde_json::from_value(value).unwrap()
+    }
+
     fn closed_outer_sandbox(outer_name: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
@@ -3061,6 +3192,136 @@ mod tests {
                 "releaseCause": "Requested"
             }
         })
+    }
+
+    fn open_outer_sandbox(outer_name: &str) -> serde_json::Value {
+        let mut outer = closed_outer_sandbox(outer_name);
+        outer["metadata"]["annotations"] = serde_json::json!({
+            crate::api::sandbox::SANDBOX_ADMISSION_ANNOTATION:
+                crate::api::sandbox::SANDBOX_ADMISSION_ADMITTED
+        });
+        outer["status"] = serde_json::json!({
+            "phase": "Provisioning",
+            "observedGeneration": 1
+        });
+        outer
+    }
+
+    /// A true base object has no UID label, so the exact sole ownerRef is the
+    /// only safe migration source. Even with an open outer lease, the consumer
+    /// must install the full owner-independent fence and end the pass before a
+    /// pool lookup, queue write, status write, or instance reservation.
+    #[tokio::test]
+    async fn base_legacy_sandbox_composition_is_migrated_before_open_queue() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = base_legacy_sandbox_composition_handle(outer_name, "10");
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let outer_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+        );
+        let fence_path = format!(
+            "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+            crate::controllers::sandbox::allocation_fence_name(outer_name)
+        );
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(outer_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(fence_path))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        let mut migrated = serde_json::to_value(&lease).unwrap();
+        migrated["metadata"]["resourceVersion"] = "11".into();
+        migrated["metadata"]["ownerReferences"] = serde_json::json!([]);
+        Mock::given(method("PATCH"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(migrated))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/clusterpools/child-pool")
+                || request.url.path() == child_status_path
+        }));
+        let patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_path
+            })
+            .expect("base-handle migration patch");
+        let operations: Vec<serde_json::Value> = serde_json::from_slice(&patch.body).unwrap();
+        for (path, value) in [
+            ("/metadata/uid", serde_json::json!("late-child-uid")),
+            ("/metadata/resourceVersion", serde_json::json!("10")),
+        ] {
+            assert!(operations.iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == path
+                    && operation["value"] == value
+            }));
+        }
+        assert!(operations.iter().any(|operation| {
+            operation["path"] == "/metadata/ownerReferences"
+                && operation["value"] == serde_json::json!([])
+        }));
+        let labels = &operations
+            .iter()
+            .find(|operation| operation["path"] == "/metadata/labels")
+            .expect("UID/tombstone labels")["value"];
+        assert_eq!(
+            labels[crate::sandbox::SANDBOX_LEASE_UID_LABEL],
+            "late-outer-uid"
+        );
+        assert_eq!(
+            labels[crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL],
+            "true"
+        );
+        let annotations = &operations
+            .iter()
+            .find(|operation| operation["path"] == "/metadata/annotations")
+            .expect("outer identity and retention annotations")["value"];
+        assert_eq!(
+            annotations[crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION],
+            outer_name
+        );
+        assert!(
+            annotations
+                .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).ok())
+                .is_some_and(|deadline| deadline > chrono::Utc::now())
+        );
+        assert!(operations.iter().any(|operation| {
+            operation["path"] == "/metadata/finalizers"
+                && operation["value"].as_array().is_some_and(|finalizers| {
+                    finalizers.iter().any(|finalizer| {
+                        finalizer
+                            == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+                    })
+                })
+        }));
     }
 
     /// A POST from the previous producer can commit after release published its
