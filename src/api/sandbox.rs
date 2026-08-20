@@ -4155,11 +4155,20 @@ fn expected_reservation_kind(
 }
 
 fn quota_reservation_slot(name: &str, principal: &str) -> Option<u32> {
-    let prefix = format!("sbx-{SANDBOX_RESERVATION_QUOTA}-{principal}-");
-    let raw_slot = name.strip_prefix(&prefix)?;
+    let (encoded_principal, slot) = parsed_quota_reservation_name(name)?;
+    (encoded_principal == principal).then_some(slot)
+}
+
+/// Split one canonical quota-token name without trusting its mutable labels.
+fn parsed_quota_reservation_name(name: &str) -> Option<(&str, u32)> {
+    let raw = name
+        .strip_prefix("sbx-")?
+        .strip_prefix(SANDBOX_RESERVATION_QUOTA)?
+        .strip_prefix('-')?;
+    let (principal, raw_slot) = raw.rsplit_once('-')?;
     let slot = raw_slot.parse::<u32>().ok()?;
     (slot < MAX_SANDBOX_CONCURRENCY_SLOTS && quota_reservation_name(principal, slot) == name)
-        .then_some(slot)
+        .then_some((principal, slot))
 }
 
 fn counts_toward_advisory_quota(
@@ -5847,8 +5856,56 @@ async fn reap_orphaned_admission_reservations(
         .flatten()
         .map(|reservation| (reservation.name, reservation.uid))
         .collect();
+    let live_principals: std::collections::BTreeSet<String> = live_parents
+        .values()
+        .filter(|parent| {
+            parent
+                .status
+                .as_ref()
+                .is_none_or(|status| status.phase.consumes_capacity())
+                && persisted_reservation_provenance(parent).is_err()
+        })
+        .map(|parent| principal_hash_for(&parent.spec.requester))
+        .collect();
+    let live_alias_tokens: std::collections::BTreeSet<String> = live_parents
+        .values()
+        .filter(|parent| {
+            parent
+                .status
+                .as_ref()
+                .is_none_or(|status| status.phase.consumes_capacity())
+                && persisted_reservation_provenance(parent).is_err()
+        })
+        .filter_map(|parent| {
+            parent.spec.alias.as_deref().map(|alias| {
+                alias_reservation_name(&principal_hash_for(&parent.spec.requester), alias)
+            })
+        })
+        .collect();
 
     for reservation in listed.items {
+        let reservation_name = reservation.name_any();
+        // Admission cannot atomically couple a coordination-Lease CREATE to the
+        // parent PATCH that persists its exact token set. Between those writes,
+        // the parent is live and Pending while the token has no parent-side
+        // provenance yet. Token-carried labels and annotations are mutable, so
+        // they cannot authorize orphan deletion during that window: a changed
+        // parent hint could make the token look detached, let this sweep delete
+        // it, and then allow the already-in-flight admission CAS to commit.
+        //
+        // The token name is immutable and encodes the principal (plus alias,
+        // when applicable). Conservatively retain any deterministic name that
+        // could belong to a capacity-owning parent which has not yet persisted
+        // exact provenance. Parents with valid provenance are covered by the
+        // exact name+UID set above, so an unrelated live lease does not delay
+        // safe orphan cleanup. Once the ambiguous parent is absent or terminal,
+        // the normal exact-name+UID cleanup below remains available.
+        if parsed_quota_reservation_name(&reservation_name)
+            .is_some_and(|(principal, _)| live_principals.contains(principal))
+            || live_alias_tokens.contains(&reservation_name)
+        {
+            continue;
+        }
         let identity = match orphan_reservation_identity(&reservation, expected_namespace) {
             Ok(identity) => identity,
             Err(reason) => {
@@ -8643,13 +8700,14 @@ mod tests {
         reap_orphaned_admission_reservations(&leases, &reservations).await;
         assert!(held.lock().unwrap().contains_key(&reservation_name));
 
-        let mut guard = held.lock().unwrap();
-        let token = guard.get_mut(&reservation_name).unwrap();
-        token["metadata"]["labels"][SANDBOX_RESERVATION_LEASE_UID_LABEL] =
-            serde_json::json!("sandbox-live-uid");
-        token["metadata"]["annotations"][SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION] =
-            serde_json::json!("sandbox-different");
-        drop(guard);
+        {
+            let mut guard = held.lock().unwrap();
+            let token = guard.get_mut(&reservation_name).unwrap();
+            token["metadata"]["labels"][SANDBOX_RESERVATION_LEASE_UID_LABEL] =
+                serde_json::json!("sandbox-live-uid");
+            token["metadata"]["annotations"][SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION] =
+                serde_json::json!("sandbox-different");
+        }
         reap_orphaned_admission_reservations(&leases, &reservations).await;
 
         assert!(held.lock().unwrap().contains_key(&reservation_name));
@@ -8661,6 +8719,225 @@ mod tests {
                 .iter()
                 .all(|request| request.method.as_str() != "DELETE")
         );
+    }
+
+    /// A token exists before its exact name+UID set can be persisted on the
+    /// parent. Mutable token hints must not let the orphan sweep delete that
+    /// token while the admission CAS is already in flight: the CAS may still
+    /// commit afterwards, which would leave a live admitted Sandbox uncounted.
+    #[tokio::test]
+    async fn orphan_sweep_retains_token_during_pending_to_admitted_cas() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let principal = principal_hash(&identity());
+        let reservation_name = quota_reservation_name(&principal, 0);
+        let token_uid = format!("{reservation_name}-uid");
+        let held = mount_reservation_api_owned(
+            &server,
+            &[(reservation_name.clone(), "sandbox-racing-uid".into())],
+        )
+        .await;
+        {
+            let mut guard = held.lock().unwrap();
+            let token = guard.get_mut(&reservation_name).unwrap();
+            token["metadata"]["labels"][SANDBOX_RESERVATION_LEASE_UID_LABEL] =
+                serde_json::json!("sandbox-absent-uid");
+            token["metadata"]["annotations"][SANDBOX_RESERVATION_LEASE_NAME_ANNOTATION] =
+                serde_json::json!("sandbox-absent");
+        }
+
+        let parent: SandboxLease = serde_json::from_value(pristine_pending_json(
+            "sandbox-racing",
+            Some(SANDBOX_ADMISSION_PENDING),
+        ))
+        .unwrap();
+        let parent_state = Arc::new(Mutex::new(serde_json::to_value(&parent).unwrap()));
+        let leases_path = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases";
+        let parent_path = format!("{leases_path}/sandbox-racing");
+
+        let list_state = Arc::clone(&parent_state);
+        Mock::given(method("GET"))
+            .and(path(leases_path))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(crate::testutil::k8s_list_response(vec![
+                    list_state.lock().unwrap().clone(),
+                ]))
+            })
+            .mount(&server)
+            .await;
+        let get_state = Arc::clone(&parent_state);
+        Mock::given(method("GET"))
+            .and(path(parent_path.clone()))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(get_state.lock().unwrap().clone())
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{leases_path}/sandbox-absent")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        let reservation = AdmissionReservation {
+            kind: SandboxReservationKind::Quota,
+            name: reservation_name.clone(),
+            uid: token_uid,
+        };
+        let persisted =
+            encoded_reservation_provenance(&parent, std::slice::from_ref(&reservation)).unwrap();
+        let patch_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allow_commit = Arc::new(tokio::sync::Notify::new());
+        let patch_state = Arc::clone(&parent_state);
+        let patch_signal = Arc::clone(&patch_started);
+        let commit_signal = Arc::clone(&allow_commit);
+        Mock::given(method("PATCH"))
+            .and(path(parent_path))
+            .respond_with(move |_: &wiremock::Request| {
+                patch_signal.store(true, Ordering::SeqCst);
+                let state = Arc::clone(&patch_state);
+                let signal = Arc::clone(&commit_signal);
+                let persisted = persisted.clone();
+                tokio::spawn(async move {
+                    signal.notified().await;
+                    let mut parent = state.lock().unwrap();
+                    parent["metadata"]["annotations"][SANDBOX_ADMISSION_ANNOTATION] =
+                        serde_json::json!(SANDBOX_ADMISSION_ADMITTED);
+                    parent["metadata"]["annotations"][SANDBOX_RESERVATIONS_ANNOTATION] =
+                        serde_json::json!(persisted);
+                    parent["metadata"]["resourceVersion"] = serde_json::json!("2");
+                });
+                // Model a committed PATCH whose response is lost. The delay
+                // keeps the client future in flight until the test releases the
+                // server-side commit after the orphan sweep snapshot.
+                ResponseTemplate::new(500)
+                    .set_delay(std::time::Duration::from_secs(1))
+                    .set_body_json(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "reason": "InternalError", "code": 500
+                    }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, TEST_LEDGER_NAMESPACE);
+        let admit_leases = leases.clone();
+        let admit_reservations = reservations.clone();
+        let admit_parent = parent.clone();
+        let admit_reservation = reservation.clone();
+        let admission = tokio::spawn(async move {
+            admit_sandbox_lease(
+                &admit_leases,
+                &admit_reservations,
+                &admit_parent,
+                &[admit_reservation],
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !patch_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the admission PATCH must be in flight");
+
+        reap_orphaned_admission_reservations(&leases, &reservations).await;
+        assert!(held.lock().unwrap().contains_key(&reservation_name));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+
+        allow_commit.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), admission)
+            .await
+            .expect("the lost-response admission must resolve")
+            .unwrap()
+            .unwrap();
+        reap_orphaned_admission_reservations(&leases, &reservations).await;
+        assert!(held.lock().unwrap().contains_key(&reservation_name));
+        assert_eq!(
+            parent_state.lock().unwrap()["metadata"]["annotations"][SANDBOX_ADMISSION_ANNOTATION],
+            SANDBOX_ADMISSION_ADMITTED
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
+    }
+
+    /// Broad protection is needed only before a parent has exact provenance.
+    /// Once a live admitted lease names its own token, another orphaned slot for
+    /// the same principal remains independently reclaimable after parent 404.
+    #[tokio::test]
+    async fn orphan_sweep_reclaims_unrelated_slot_beside_exact_live_provenance() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let principal = principal_hash(&identity());
+        let live_name = quota_reservation_name(&principal, 0);
+        let orphan_name = quota_reservation_name(&principal, 1);
+        let held = mount_reservation_api_owned(
+            &server,
+            &[
+                (live_name.clone(), "sandbox-live-uid".into()),
+                (orphan_name.clone(), "sandbox-missing-uid".into()),
+            ],
+        )
+        .await;
+        let mut parent = lease_json("sandbox-live", "alice@example.com", "Pending");
+        parent["metadata"]["finalizers"] = serde_json::json!([SANDBOX_LEASE_FINALIZER]);
+        let leases_path = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases";
+        Mock::given(method("GET"))
+            .and(path(leases_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(vec![parent])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{leases_path}/sandbox-missing")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "NotFound", "code": 404
+            })))
+            .mount(&server)
+            .await;
+
+        let client = crate::testutil::mock_k8s_client(&server);
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "test-ns");
+        let reservations: Api<Lease> = Api::namespaced(client, TEST_LEDGER_NAMESPACE);
+        reap_orphaned_admission_reservations(&leases, &reservations).await;
+
+        {
+            let guard = held.lock().unwrap();
+            assert!(guard.contains_key(&live_name));
+            assert!(!guard.contains_key(&orphan_name));
+        }
+        let deletes: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .map(|request| request.url.path().rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(deletes, vec![orphan_name]);
     }
 
     #[test]
