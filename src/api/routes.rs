@@ -63,6 +63,10 @@ pub struct AppState<B: ClusterBackend> {
     /// nothing; see [`crate::api::sandbox_rate_limit`] for why it is charged
     /// per attempt rather than per admitted lease.
     pub sandbox_admission_limiter: crate::api::sandbox_rate_limit::AdmissionRateLimiter,
+    /// Whether the upstream Agent Sandbox runtime was explicitly enabled and
+    /// validated at startup. Disabled deployments do not mount Sandbox HTTP
+    /// routes, so they cannot admit leases that no controller will reconcile.
+    pub sandbox_enabled: bool,
 }
 
 /// Per-lease connect-proxy context cache. Newtype over a shared, mutex-guarded
@@ -275,7 +279,7 @@ async fn kunobi_auth_discovery<B: ClusterBackend>(State(state): State<AppState<B
 
 pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> Router {
     // Concurrency-limited API routes
-    let api_routes = Router::new()
+    let mut api_routes = Router::new()
         .route("/v1/leases", post(create_lease::<B>))
         .route("/v1/leases", get(list_leases::<B>))
         .route("/v1/leases/{id}", get(get_lease::<B>))
@@ -284,9 +288,11 @@ pub fn build_router<B: ClusterBackend + Clone + 'static>(state: AppState<B>) -> 
         .route("/v1/leases/{id}/diagnostics", get(get_diagnostics::<B>))
         .route("/v1/pools", get(list_pools::<B>))
         .route("/v1/pools/{name}", get(get_pool::<B>))
-        .route("/v1/pools/{name}/leases", get(list_pool_leases::<B>))
-        .merge(crate::api::sandbox::routes::<B>())
-        .layer(axum::middleware::from_fn(concurrency_limit));
+        .route("/v1/pools/{name}/leases", get(list_pool_leases::<B>));
+    if state.sandbox_enabled {
+        api_routes = api_routes.merge(crate::api::sandbox::routes::<B>());
+    }
+    let api_routes = api_routes.layer(axum::middleware::from_fn(concurrency_limit));
 
     let connect_routes = Router::new()
         .route("/connect/{id}", any(connect_proxy_root::<B>))
@@ -3171,7 +3177,7 @@ mod tests {
     use tower::ServiceExt;
 
     /// Helper: build an axum Router backed by MockBackend and wiremock.
-    async fn test_app() -> (Router, wiremock::MockServer) {
+    async fn test_app_with_sandbox(sandbox_enabled: bool) -> (Router, wiremock::MockServer) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
@@ -3187,9 +3193,14 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled,
         };
 
         (build_router(state), server)
+    }
+
+    async fn test_app() -> (Router, wiremock::MockServer) {
+        test_app_with_sandbox(true).await
     }
 
     /// Release is a mutation, so it must pin the exact object it authorized.
@@ -3212,6 +3223,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         use wiremock::matchers::{method, path};
@@ -3300,6 +3312,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         use wiremock::matchers::{method, path};
@@ -3593,6 +3606,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Disabled mode must expose no Sandbox API at all. In particular, POST
+    /// cannot reserve quota for a lease when the placement and release
+    /// controllers were deliberately not started.
+    #[tokio::test]
+    async fn disabled_mode_serves_no_sandbox_api() {
+        let (app, _server) = test_app_with_sandbox(false).await;
+        let request = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/sandbox-leases")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn test_livez_returns_200() {
         let (app, _server) = test_app().await;
@@ -3707,6 +3736,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -3786,6 +3816,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -3879,6 +3910,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         use wiremock::matchers::{header, method, path, path_regex};
@@ -3983,6 +4015,7 @@ mod tests {
             datastore,
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         use wiremock::matchers::{method, path_regex};
@@ -4062,6 +4095,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
 
         let response = connect_proxy::<crate::testutil::MockBackend>(
@@ -4508,6 +4542,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         };
         (state, server)
     }

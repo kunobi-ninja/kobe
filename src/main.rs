@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         datastore: datastore.clone(),
         connect_cache: Default::default(),
         sandbox_admission_limiter: Default::default(),
+        sandbox_enabled: agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External,
     };
 
     let app = build_router(state);

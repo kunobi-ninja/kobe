@@ -3614,6 +3614,7 @@ mod tests {
             datastore: Default::default(),
             connect_cache: Default::default(),
             sandbox_admission_limiter: Default::default(),
+            sandbox_enabled: true,
         }
     }
 

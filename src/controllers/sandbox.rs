@@ -205,7 +205,9 @@ pub async fn reconcile_pool(
 ///
 /// Creation is `create`-then-tolerate-409 rather than apply: exactly one claim
 /// per lease is the invariant, and a create that loses the race has already
-/// been satisfied by whoever won it.
+/// been satisfied by whoever won it. Terminal leases are inert: once cleanup
+/// has reached `Released`, `Expired`, or `Quarantined`, reconciliation must not
+/// resolve a pool or recreate any part of the workload.
 pub async fn reconcile_lease(
     lease: Arc<SandboxLease>,
     ctx: Arc<SandboxContext>,
@@ -222,6 +224,18 @@ pub async fn reconcile_lease(
         != Some(SANDBOX_ADMISSION_ADMITTED)
     {
         debug!(lease = %name, "not admitted; placement declines");
+        return Ok(Action::await_change());
+    }
+
+    if matches!(
+        lease.status.as_ref().map(|status| status.phase),
+        Some(
+            crate::crd::SandboxLeasePhase::Released
+                | crate::crd::SandboxLeasePhase::Expired
+                | crate::crd::SandboxLeasePhase::Quarantined
+        )
+    ) {
+        debug!(lease = %name, "terminal Sandbox lease is inert");
         return Ok(Action::await_change());
     }
 
@@ -1977,6 +1991,36 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "placement must decline before it touches the API at all"
+        );
+    }
+
+    /// Terminal leases never recreate capacity after teardown has finished or
+    /// become unverifiable. This guard belongs at the reconcile boundary: the
+    /// release classifier intentionally returns no new release reason for a
+    /// terminal phase, which must mean "stop", never "resume placement".
+    #[tokio::test]
+    async fn terminal_leases_never_recreate_capacity() {
+        let (ctx, server) = test_context().await;
+
+        for phase in [
+            crate::crd::SandboxLeasePhase::Released,
+            crate::crd::SandboxLeasePhase::Expired,
+            crate::crd::SandboxLeasePhase::Quarantined,
+        ] {
+            let mut lease = admitted_lease();
+            lease.status.as_mut().unwrap().phase = phase;
+
+            let action = reconcile_lease(Arc::new(lease), ctx.clone()).await.unwrap();
+            assert_eq!(action, Action::await_change(), "terminal phase {phase}");
+        }
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "terminal reconciliation must not resolve a pool or recreate a claim"
         );
     }
 
