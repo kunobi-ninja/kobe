@@ -35,8 +35,9 @@ use tracing::{debug, info, warn};
 
 use crate::backend::{BackendCreationFootprint, VerifiedDestroyUnsupported};
 use crate::crd::{
-    CheckResult, CreationManifestResource, DatastoreProvenance, KubernetesResourceIdentity,
-    StorageVolumeProvenance, TeardownCheck, TeardownCreationManifest, TeardownSubject,
+    CheckResult, CreationControlRelation, CreationManifestResource, DatastoreProvenance,
+    KubernetesResourceIdentity, StorageVolumeProvenance, TeardownCheck, TeardownCreationManifest,
+    TeardownSubject,
 };
 
 use crate::crd::{
@@ -51,6 +52,7 @@ use super::{
 
 /// Labels applied to all resources managed by this backend.
 const MANAGED_BY: &str = "kobe-operator";
+const INSTANCE_UID_LABEL: &str = "kobe.kunobi.ninja/instance-uid";
 
 /// Record a best-effort backend resource-op failure into
 /// `kobe_backend_delete_failures_total`. Only `op="delete"` is emitted today
@@ -139,6 +141,9 @@ case "${POD_NAME}" in
       echo "publish failed, retrying..."
       sleep 2
     done
+    kubectl label secret ${CLUSTER_NAME}-kubeconfig \
+      --namespace=${NAMESPACE} \
+      kobe.kunobi.ninja/instance-uid=${INSTANCE_UID} --overwrite
     echo "Kubeconfig Secret published, sleeping..."
     ;;
   *)
@@ -674,6 +679,181 @@ impl K3sBackend {
         labels
     }
 
+    fn stamp_instance_control(
+        metadata: &mut ObjectMeta,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) {
+        metadata.owner_references = Some(vec![owner.clone()]);
+        metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert(INSTANCE_UID_LABEL.to_string(), owner.uid.clone());
+    }
+
+    fn require_instance_control(
+        metadata: &ObjectMeta,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) -> Result<()> {
+        let owner_matches = metadata.owner_references.as_ref().is_some_and(|owners| {
+            owners.iter().any(|candidate| {
+                candidate.api_version == owner.api_version
+                    && candidate.kind == owner.kind
+                    && candidate.name == owner.name
+                    && candidate.uid == owner.uid
+                    && candidate.controller == Some(true)
+            })
+        });
+        let label_matches = metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(INSTANCE_UID_LABEL))
+            == Some(&owner.uid);
+        if owner_matches && label_matches {
+            Ok(())
+        } else {
+            anyhow::bail!("resource is not controlled by the exact ClusterInstance UID")
+        }
+    }
+
+    /// Refuse to server-side-apply over a same-named object that was not
+    /// created for this exact ClusterInstance incarnation. This check runs
+    /// before any create-side mutation, so `force()` cannot turn a foreign or
+    /// pre-existing object into something that later looks manifest-owned.
+    async fn require_owned_or_absent<K>(
+        api: &Api<K>,
+        name: &str,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) -> Result<()>
+    where
+        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+        <K as Resource>::DynamicType: Default,
+    {
+        if let Some(existing) = api
+            .get_opt(name)
+            .await
+            .with_context(|| format!("could not authenticate existing resource {name}"))?
+        {
+            Self::require_instance_control(existing.meta(), owner)
+                .with_context(|| format!("refusing to adopt pre-existing resource {name}"))?;
+        }
+        Ok(())
+    }
+
+    /// Create a deterministic object without an adoption window, or update an
+    /// existing object only under its exact owner and resourceVersion.
+    ///
+    /// A preflight GET followed by forced SSA is insufficient: a foreign
+    /// object can win the absent-name race between those requests and then be
+    /// stamped as ours. POST makes absence atomic. On 409, the follow-up apply
+    /// carries the authenticated object's resourceVersion, so delete/recreate
+    /// between GET and PATCH conflicts instead of adopting the replacement.
+    async fn create_or_apply_owned<K>(
+        api: &Api<K>,
+        name: &str,
+        mut desired: K,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) -> Result<K>
+    where
+        K: Resource<DynamicType = ()>
+            + Clone
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + std::fmt::Debug,
+    {
+        match api.create(&PostParams::default(), &desired).await {
+            Ok(created) => {
+                Self::require_instance_control(created.meta(), owner)?;
+                Ok(created)
+            }
+            Err(kube::Error::Api(response)) if response.code == 409 => {
+                let existing = api.get(name).await.with_context(|| {
+                    format!("could not authenticate existing resource {name} after create conflict")
+                })?;
+                Self::require_instance_control(existing.meta(), owner)
+                    .with_context(|| format!("refusing to adopt pre-existing resource {name}"))?;
+                let resource_version = existing.resource_version().ok_or_else(|| {
+                    anyhow::anyhow!("existing controlled resource {name} has no resourceVersion")
+                })?;
+                desired.meta_mut().resource_version = Some(resource_version);
+                let updated = api
+                    .patch(
+                        name,
+                        &PatchParams::apply("kobe-operator").force(),
+                        &Patch::Apply(&desired),
+                    )
+                    .await
+                    .with_context(|| format!("failed to apply controlled resource {name}"))?;
+                Self::require_instance_control(updated.meta(), owner)?;
+                Ok(updated)
+            }
+            Err(error) => Err(error).with_context(|| format!("failed to create resource {name}")),
+        }
+    }
+
+    /// Authenticate every deterministic target before the first mutation.
+    /// PVCs are created by the StatefulSet from a controller-stamped template;
+    /// their exact ClusterInstance UID label is the durable control relation
+    /// retained even when the PVC retention policy omits an ownerReference.
+    async fn authenticate_creation_targets(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) -> Result<()> {
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let mut secret_names = vec![format!("{name}-token"), format!("{name}-kubeconfig")];
+        if self.datastore.current().is_some() {
+            secret_names.push(format!("{name}-datastore"));
+        }
+        for secret_name in secret_names {
+            Self::require_owned_or_absent(&secrets, &secret_name, owner).await?;
+        }
+
+        let config_maps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        Self::require_owned_or_absent(&config_maps, &format!("{name}-kubeconfig-publisher"), owner)
+            .await?;
+        if has_registry_mirrors(config) {
+            Self::require_owned_or_absent(&config_maps, &format!("{name}-registries"), owner)
+                .await?;
+        }
+
+        let stateful_sets: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+        Self::require_owned_or_absent(&stateful_sets, &format!("{name}-server"), owner).await?;
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        Self::require_owned_or_absent(&services, &format!("{name}-server"), owner).await?;
+
+        if config.servers > 1 {
+            let pdbs: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
+            Self::require_owned_or_absent(&pdbs, &format!("{name}-server"), owner).await?;
+        }
+        if config.agents.is_some_and(|agents| agents > 0) {
+            let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+            Self::require_owned_or_absent(&deployments, &format!("{name}-agent"), owner).await?;
+        }
+
+        if config.persistence.is_some() {
+            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+            for ordinal in 0..config.servers.max(1) {
+                let pvc_name = format!("data-{name}-server-{ordinal}");
+                if let Some(existing) = pvcs
+                    .get_opt(&pvc_name)
+                    .await
+                    .with_context(|| format!("could not authenticate existing PVC {pvc_name}"))?
+                    && existing
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get(INSTANCE_UID_LABEL))
+                        != Some(&owner.uid)
+                {
+                    anyhow::bail!("refusing to adopt pre-existing PVC {pvc_name}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Labels for server pods specifically.
     fn server_labels(name: &str, pool_name: Option<&str>) -> BTreeMap<String, String> {
         let mut labels = Self::cluster_labels(name, pool_name);
@@ -702,12 +882,20 @@ impl K3sBackend {
     /// an operator older than #145) is repaired in place rather than left
     /// keyless — pods mount that key via `subPath`, and a subPath naming an
     /// absent key wedges the pod in `ContainerCreating`.
-    async fn create_token_secret(&self, name: &str, namespace: &str) -> Result<()> {
+    async fn create_token_secret(
+        &self,
+        name: &str,
+        namespace: &str,
+        owner: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+    ) -> Result<()> {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let secret_name = format!("{name}-token");
 
         match secrets.get(&secret_name).await {
             Ok(existing) => {
+                if let Some(owner) = owner {
+                    Self::require_instance_control(&existing.metadata, owner)?;
+                }
                 Self::validate_token_secret(&existing, &secret_name)?;
                 debug!(cluster = name, "Token secret already exists; preserving it");
                 return self
@@ -723,13 +911,17 @@ impl K3sBackend {
 
         let token = Self::generate_token();
         let node_password = Self::generate_node_password();
+        let mut metadata = ObjectMeta {
+            name: Some(secret_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(Self::cluster_labels(name, None)),
+            ..Default::default()
+        };
+        if let Some(owner) = owner {
+            Self::stamp_instance_control(&mut metadata, owner);
+        }
         let secret = Secret {
-            metadata: ObjectMeta {
-                name: Some(secret_name.clone()),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name, None)),
-                ..Default::default()
-            },
+            metadata,
             string_data: Some({
                 let mut data = BTreeMap::new();
                 data.insert("token".to_string(), token);
@@ -745,6 +937,9 @@ impl K3sBackend {
                 let winner = secrets.get(&secret_name).await.with_context(|| {
                     format!("Failed to read token secret {secret_name} after create conflict")
                 })?;
+                if let Some(owner) = owner {
+                    Self::require_instance_control(&winner.metadata, owner)?;
+                }
                 Self::validate_token_secret(&winner, &secret_name)?;
                 debug!(
                     cluster = name,
@@ -761,6 +956,55 @@ impl K3sBackend {
         }
 
         Ok(())
+    }
+
+    /// Reserve the kubeconfig Secret name under the exact ClusterInstance
+    /// owner before the publisher Pod starts. The publisher only fills the
+    /// `kubeconfig` data key; it never gets an opportunity to adopt a
+    /// same-named foreign object between create preflight and readiness.
+    async fn ensure_kubeconfig_secret_placeholder(
+        &self,
+        name: &str,
+        namespace: &str,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) -> Result<()> {
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let secret_name = format!("{name}-kubeconfig");
+        if let Some(existing) = secrets
+            .get_opt(&secret_name)
+            .await
+            .with_context(|| format!("Failed to authenticate kubeconfig Secret {secret_name}"))?
+        {
+            return Self::require_instance_control(&existing.metadata, owner)
+                .with_context(|| format!("refusing to adopt kubeconfig Secret {secret_name}"));
+        }
+
+        let mut metadata = ObjectMeta {
+            name: Some(secret_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(Self::cluster_labels(name, None)),
+            ..Default::default()
+        };
+        Self::stamp_instance_control(&mut metadata, owner);
+        let placeholder = Secret {
+            metadata,
+            ..Default::default()
+        };
+        match secrets.create(&PostParams::default(), &placeholder).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 409 => {
+                let winner = secrets.get(&secret_name).await.with_context(|| {
+                    format!("Failed to authenticate kubeconfig Secret {secret_name} after create conflict")
+                })?;
+                Self::require_instance_control(&winner.metadata, owner).with_context(|| {
+                    format!(
+                        "refusing to adopt concurrently-created kubeconfig Secret {secret_name}"
+                    )
+                })
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to reserve kubeconfig Secret {secret_name}")),
+        }
     }
 
     /// Backfill `node-password` into a token Secret that predates it.
@@ -824,17 +1068,26 @@ impl K3sBackend {
     }
 
     /// Create the ConfigMap containing the kubeconfig publisher script.
-    async fn create_publisher_configmap(&self, name: &str, namespace: &str) -> Result<()> {
+    async fn create_publisher_configmap(
+        &self,
+        name: &str,
+        namespace: &str,
+        owner: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+    ) -> Result<()> {
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
         let cm_name = format!("{name}-kubeconfig-publisher");
 
+        let mut metadata = ObjectMeta {
+            name: Some(cm_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(Self::cluster_labels(name, None)),
+            ..Default::default()
+        };
+        if let Some(owner) = owner {
+            Self::stamp_instance_control(&mut metadata, owner);
+        }
         let cm = ConfigMap {
-            metadata: ObjectMeta {
-                name: Some(cm_name.clone()),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name, None)),
-                ..Default::default()
-            },
+            metadata,
             data: Some({
                 let mut data = BTreeMap::new();
                 data.insert(
@@ -846,15 +1099,44 @@ impl K3sBackend {
             ..Default::default()
         };
 
-        cms.patch(
-            &cm_name,
-            &PatchParams::apply("kobe-operator").force(),
-            &Patch::Apply(&cm),
-        )
-        .await
-        .with_context(|| format!("Failed to apply publisher ConfigMap {cm_name}"))?;
+        if let Some(owner) = owner {
+            Self::create_or_apply_owned(&cms, &cm_name, cm, owner).await?;
+        } else {
+            cms.patch(
+                &cm_name,
+                &PatchParams::apply("kobe-operator").force(),
+                &Patch::Apply(&cm),
+            )
+            .await
+            .with_context(|| format!("Failed to apply publisher ConfigMap {cm_name}"))?;
+        }
 
         debug!(cluster = name, "Publisher ConfigMap applied");
+        Ok(())
+    }
+
+    async fn seal_kubeconfig_secret_control(
+        &self,
+        name: &str,
+        namespace: &str,
+        owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    ) -> Result<()> {
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let secret_name = format!("{name}-kubeconfig");
+        let secret = secrets
+            .get(&secret_name)
+            .await
+            .with_context(|| format!("Failed to authenticate kubeconfig Secret {secret_name}"))?;
+        Self::require_instance_control(&secret.metadata, owner)?;
+        if secret
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(INSTANCE_UID_LABEL))
+            != Some(&owner.uid)
+        {
+            anyhow::bail!("kubeconfig Secret was not published for this ClusterInstance UID");
+        }
         Ok(())
     }
 
@@ -868,6 +1150,7 @@ impl K3sBackend {
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
+        owner: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<bool> {
         let Some(mirrors) = &config.registry_mirrors else {
             return Ok(false);
@@ -879,13 +1162,17 @@ impl K3sBackend {
         let cms: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
         let cm_name = format!("{name}-registries");
 
+        let mut metadata = ObjectMeta {
+            name: Some(cm_name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(Self::cluster_labels(name, config.pool_name.as_deref())),
+            ..Default::default()
+        };
+        if let Some(owner) = owner {
+            Self::stamp_instance_control(&mut metadata, owner);
+        }
         let cm = ConfigMap {
-            metadata: ObjectMeta {
-                name: Some(cm_name.clone()),
-                namespace: Some(namespace.to_string()),
-                labels: Some(Self::cluster_labels(name, config.pool_name.as_deref())),
-                ..Default::default()
-            },
+            metadata,
             data: Some({
                 let mut data = BTreeMap::new();
                 data.insert("registries.yaml".to_string(), yaml);
@@ -894,13 +1181,17 @@ impl K3sBackend {
             ..Default::default()
         };
 
-        cms.patch(
-            &cm_name,
-            &PatchParams::apply("kobe-operator").force(),
-            &Patch::Apply(&cm),
-        )
-        .await
-        .with_context(|| format!("Failed to apply registries ConfigMap {cm_name}"))?;
+        if let Some(owner) = owner {
+            Self::create_or_apply_owned(&cms, &cm_name, cm, owner).await?;
+        } else {
+            cms.patch(
+                &cm_name,
+                &PatchParams::apply("kobe-operator").force(),
+                &Patch::Apply(&cm),
+            )
+            .await
+            .with_context(|| format!("Failed to apply registries ConfigMap {cm_name}"))?;
+        }
 
         debug!(cluster = name, "Registries ConfigMap applied");
         Ok(true)
@@ -1654,7 +1945,8 @@ impl K3sBackend {
     /// Wait for the k3s cluster to become ready.
     ///
     /// Polls BOTH conditions in the SAME loop and only returns `Ok` when:
-    ///   (a) the `{name}-kubeconfig` Secret exists (published by pod-0), AND
+    ///   (a) the controller-owned `{name}-kubeconfig` Secret contains a
+    ///       non-empty `kubeconfig` key published by pod-0, AND
     ///   (b) the server StatefulSet reports enough ready replicas
     ///       (`server_sts_ready` against its CLAMPED `status.replicas`).
     ///
@@ -1696,9 +1988,13 @@ impl K3sBackend {
         let max_attempts = 120 + 36 * (servers.saturating_sub(1)) as usize;
 
         for attempt in 0..max_attempts {
-            // (a) kubeconfig Secret present?
+            // (a) controller-reserved Secret has published kubeconfig data?
             let secret_ready = match secrets.get(&secret_name).await {
-                Ok(_) => true,
+                Ok(secret) => secret
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("kubeconfig"))
+                    .is_some_and(|value| !value.0.is_empty()),
                 Err(kube::Error::Api(ae)) if ae.code == 404 => false,
                 // Transient (non-404) errors are not fatal: log and keep
                 // polling within the budget rather than failing the whole
@@ -1730,7 +2026,7 @@ impl K3sBackend {
                 info!(
                     cluster = name,
                     attempts = attempt + 1,
-                    "k3s cluster ready (kubeconfig secret present and server StatefulSet ready)"
+                    "k3s cluster ready (kubeconfig published and server StatefulSet ready)"
                 );
                 return Ok(());
             }
@@ -2245,12 +2541,11 @@ impl K3sBackend {
 
     /// Convert one live Kubernetes object into a UID-fenced manifest entry.
     /// Missing identity is uncertainty, never a name-only fallback.
-    fn manifest_resource<K: Resource>(
+    fn resource_identity<K: Resource>(
         object: &K,
-        subject: TeardownSubject,
         api_version: &str,
         kind: &str,
-    ) -> Result<CreationManifestResource> {
+    ) -> Result<KubernetesResourceIdentity> {
         let metadata = object.meta();
         let name = metadata
             .name
@@ -2262,15 +2557,68 @@ impl K3sBackend {
             .clone()
             .filter(|uid| !uid.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("{kind} {name} has no UID"))?;
+        Ok(KubernetesResourceIdentity {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: metadata.namespace.clone(),
+            name,
+            uid,
+        })
+    }
+
+    fn manifest_resource<K: Resource>(
+        object: &K,
+        subject: TeardownSubject,
+        api_version: &str,
+        kind: &str,
+        controller: &KubernetesResourceIdentity,
+        control_relation: CreationControlRelation,
+    ) -> Result<CreationManifestResource> {
+        let metadata = object.meta();
+        match control_relation {
+            CreationControlRelation::ControllerOwner => {
+                let controlled = metadata.owner_references.as_ref().is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner.api_version == controller.api_version
+                            && owner.kind == controller.kind
+                            && owner.name == controller.name
+                            && owner.uid == controller.uid
+                            && owner.controller == Some(true)
+                    })
+                });
+                if !controlled {
+                    anyhow::bail!(
+                        "{} {} is not controlled by exact {} UID {}",
+                        kind,
+                        metadata.name.as_deref().unwrap_or("<unknown>"),
+                        controller.kind,
+                        controller.uid
+                    );
+                }
+            }
+            CreationControlRelation::InstanceUidLabel => {
+                if metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(INSTANCE_UID_LABEL))
+                    != Some(&controller.uid)
+                {
+                    anyhow::bail!(
+                        "{} {} lacks exact ClusterInstance UID control label",
+                        kind,
+                        metadata.name.as_deref().unwrap_or("<unknown>")
+                    );
+                }
+            }
+            // The typed PV claimRef is validated alongside storage provenance,
+            // immediately before this helper is called.
+            CreationControlRelation::ClaimRef => {}
+        }
         Ok(CreationManifestResource {
             subject,
-            resource: KubernetesResourceIdentity {
-                api_version: api_version.to_string(),
-                kind: kind.to_string(),
-                namespace: metadata.namespace.clone(),
-                name,
-                uid,
-            },
+            resource: Self::resource_identity(object, api_version, kind)?,
+            controller: controller.clone(),
+            control_relation,
         })
     }
 
@@ -2323,6 +2671,8 @@ impl K3sBackend {
         subject: TeardownSubject,
         api_version: &str,
         kind: &str,
+        controller: &KubernetesResourceIdentity,
+        control_relation: CreationControlRelation,
     ) -> Result<CreationManifestResource>
     where
         K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -2332,12 +2682,20 @@ impl K3sBackend {
             .get(name)
             .await
             .with_context(|| format!("could not capture {kind} {name}"))?;
-        Self::manifest_resource(&object, subject, api_version, kind)
+        Self::manifest_resource(
+            &object,
+            subject,
+            api_version,
+            kind,
+            controller,
+            control_relation,
+        )
     }
 
     /// Confirm that a same-named live object is the exact UID captured in the
     /// manifest. Absence is acceptable on a resumed idempotent attempt;
     /// replacement is not.
+    #[cfg(test)]
     async fn manifest_object_present<K>(
         api: &Api<K>,
         identity: &KubernetesResourceIdentity,
@@ -2359,6 +2717,65 @@ impl K3sBackend {
                 identity.name
             ),
         }
+    }
+
+    async fn manifest_entry_object_present<K>(
+        api: &Api<K>,
+        entry: &CreationManifestResource,
+    ) -> Result<bool>
+    where
+        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+        <K as Resource>::DynamicType: Default,
+    {
+        let Some(object) = api.get_opt(&entry.resource.name).await.with_context(|| {
+            format!(
+                "could not read {} {}",
+                entry.resource.kind, entry.resource.name
+            )
+        })?
+        else {
+            return Ok(false);
+        };
+        if object.meta().uid.as_deref() != Some(entry.resource.uid.as_str()) {
+            anyhow::bail!(
+                "{} {} was recreated with a different UID",
+                entry.resource.kind,
+                entry.resource.name
+            );
+        }
+        match entry.control_relation {
+            CreationControlRelation::ControllerOwner => {
+                if !object
+                    .meta()
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            owner.api_version == entry.controller.api_version
+                                && owner.kind == entry.controller.kind
+                                && owner.name == entry.controller.name
+                                && owner.uid == entry.controller.uid
+                                && owner.controller == Some(true)
+                        })
+                    })
+                {
+                    anyhow::bail!("captured object lost its exact controller owner");
+                }
+            }
+            CreationControlRelation::InstanceUidLabel => {
+                if object
+                    .meta()
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(INSTANCE_UID_LABEL))
+                    != Some(&entry.controller.uid)
+                {
+                    anyhow::bail!("captured PVC lost its exact instance UID label");
+                }
+            }
+            CreationControlRelation::ClaimRef => {}
+        }
+        Ok(true)
     }
 
     /// Delete exactly the object captured by the manifest. Kubernetes rejects
@@ -2401,7 +2818,7 @@ impl K3sBackend {
         macro_rules! namespaced {
             ($ty:ty) => {{
                 let api: Api<$ty> = Api::namespaced(self.client.clone(), namespace);
-                Self::manifest_object_present(&api, &entry.resource).await
+                Self::manifest_entry_object_present(&api, entry).await
             }};
         }
         match entry.subject {
@@ -2420,7 +2837,7 @@ impl K3sBackend {
             TeardownSubject::ServerDataPvcs => namespaced!(PersistentVolumeClaim),
             TeardownSubject::ServerDataVolumes => {
                 let api: Api<PersistentVolume> = Api::all(self.client.clone());
-                Self::manifest_object_present(&api, &entry.resource).await
+                Self::manifest_entry_object_present(&api, entry).await
             }
             TeardownSubject::ServerPods => namespaced!(Pod),
             TeardownSubject::Database | TeardownSubject::DatabaseRole => {
@@ -2799,8 +3216,7 @@ impl K3sBackend {
             .items
             .iter()
             .map(|pod| {
-                Self::manifest_resource(pod, TeardownSubject::ServerPods, "v1", "Pod")
-                    .map(|entry| entry.resource.canonical_id())
+                Self::resource_identity(pod, "v1", "Pod").map(|identity| identity.canonical_id())
             })
             .collect::<Result<_>>()?;
         if observed_pods != expected_pods {
@@ -2822,13 +3238,8 @@ impl K3sBackend {
             .iter()
             .filter(|pvc| Self::is_server_data_pvc(&pvc.name_any(), name))
             .map(|pvc| {
-                Self::manifest_resource(
-                    pvc,
-                    TeardownSubject::ServerDataPvcs,
-                    "v1",
-                    "PersistentVolumeClaim",
-                )
-                .map(|entry| entry.resource.canonical_id())
+                Self::resource_identity(pvc, "v1", "PersistentVolumeClaim")
+                    .map(|identity| identity.canonical_id())
             })
             .collect::<Result<_>>()?;
         if observed_pvcs != expected_pvcs {
@@ -2982,28 +3393,37 @@ impl ClusterBackend for K3sBackend {
         fingerprint_rendered(&sts, &deploy)
     }
 
-    #[tracing::instrument(skip(self, config, addons, _owner_ref), fields(cluster = name, namespace))]
+    #[tracing::instrument(skip(self, config, addons, owner_ref), fields(cluster = name, namespace))]
     async fn create(
         &self,
         name: &str,
         namespace: &str,
         config: &ClusterConfig,
         addons: &[Addon],
-        // k3s pool members are themselves k8s resources owned via labels +
-        // explicit cleanup; the OwnerRef plumbing is for vkobe's child
-        // resources where defense-in-depth GC matters more.
-        _owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
+        owner_ref: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>,
     ) -> Result<()> {
         info!(cluster = name, "Creating k3s cluster");
-
+        if let Some(owner) = owner_ref {
+            self.authenticate_creation_targets(name, namespace, config, owner)
+                .await?;
+        }
         // 1. Create token secret
-        self.create_token_secret(name, namespace).await?;
+        self.create_token_secret(name, namespace, owner_ref).await?;
+
+        // Reserve the publisher's output name under the exact instance owner
+        // before any workload can write it. Readiness below requires the data
+        // key, so the empty placeholder cannot make the instance Ready.
+        if let Some(owner) = owner_ref {
+            self.ensure_kubeconfig_secret_placeholder(name, namespace, owner)
+                .await?;
+        }
 
         // 2. Create publisher ConfigMap
-        self.create_publisher_configmap(name, namespace).await?;
+        self.create_publisher_configmap(name, namespace, owner_ref)
+            .await?;
 
         // 2b. Optionally create registries.yaml ConfigMap (k3s containerd mirrors)
-        self.create_registries_configmap(name, namespace, config)
+        self.create_registries_configmap(name, namespace, config, owner_ref)
             .await?;
 
         // 3. If PostgreSQL configured, create per-cluster database. Read the
@@ -3026,6 +3446,7 @@ impl ClusterBackend for K3sBackend {
                 name,
                 namespace,
                 Self::cluster_labels(name, None),
+                owner_ref,
             )
             .await?;
             datastore::ensure_cluster_role(&pool, name, "k3s_", &password).await?;
@@ -3045,37 +3466,80 @@ impl ClusterBackend for K3sBackend {
 
         // 4. Create server StatefulSet. The replica count is the clamped
         // `config.servers.max(1)` (the builder never reads config.servers).
-        let sts = Self::build_server_statefulset(
+        let mut sts = Self::build_server_statefulset(
             name,
             namespace,
             config,
             datastore_endpoint.as_deref(),
             config.servers.max(1),
         );
+        if let Some(owner) = owner_ref {
+            Self::stamp_instance_control(&mut sts.metadata, owner);
+            if let Some(spec) = sts.spec.as_mut() {
+                spec.template
+                    .metadata
+                    .get_or_insert_with(ObjectMeta::default)
+                    .labels
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(INSTANCE_UID_LABEL.to_string(), owner.uid.clone());
+                if let Some(pod_spec) = spec.template.spec.as_mut()
+                    && let Some(publisher) = pod_spec
+                        .containers
+                        .iter_mut()
+                        .find(|container| container.name == "kubeconfig-publisher")
+                {
+                    publisher.env.get_or_insert_with(Vec::new).push(EnvVar {
+                        name: "INSTANCE_UID".into(),
+                        value: Some(owner.uid.clone()),
+                        ..Default::default()
+                    });
+                }
+                if let Some(templates) = spec.volume_claim_templates.as_mut() {
+                    for template in templates {
+                        template
+                            .metadata
+                            .labels
+                            .get_or_insert_with(BTreeMap::new)
+                            .insert(INSTANCE_UID_LABEL.to_string(), owner.uid.clone());
+                    }
+                }
+            }
+        }
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         let sts_name = format!("{name}-server");
-        sts_api
-            .patch(
-                &sts_name,
-                &PatchParams::apply("kobe-operator").force(),
-                &Patch::Apply(&sts),
-            )
-            .await
-            .with_context(|| format!("Failed to apply server StatefulSet for {name}"))?;
+        if let Some(owner) = owner_ref {
+            Self::create_or_apply_owned(&sts_api, &sts_name, sts, owner).await?;
+        } else {
+            sts_api
+                .patch(
+                    &sts_name,
+                    &PatchParams::apply("kobe-operator").force(),
+                    &Patch::Apply(&sts),
+                )
+                .await
+                .with_context(|| format!("Failed to apply server StatefulSet for {name}"))?;
+        }
         info!(cluster = name, "Server StatefulSet applied");
 
         // 5. Create Service
-        let svc = Self::build_service(name, namespace, config);
+        let mut svc = Self::build_service(name, namespace, config);
+        if let Some(owner) = owner_ref {
+            Self::stamp_instance_control(&mut svc.metadata, owner);
+        }
         let svc_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let svc_name = format!("{name}-server");
-        svc_api
-            .patch(
-                &svc_name,
-                &PatchParams::apply("kobe-operator").force(),
-                &Patch::Apply(&svc),
-            )
-            .await
-            .with_context(|| format!("Failed to apply Service for {name}"))?;
+        if let Some(owner) = owner_ref {
+            Self::create_or_apply_owned(&svc_api, &svc_name, svc, owner).await?;
+        } else {
+            svc_api
+                .patch(
+                    &svc_name,
+                    &PatchParams::apply("kobe-operator").force(),
+                    &Patch::Apply(&svc),
+                )
+                .await
+                .with_context(|| format!("Failed to apply Service for {name}"))?;
+        }
         info!(cluster = name, "Service applied");
 
         // 5b. For HA (servers>1) ONLY, additively create a PodDisruptionBudget.
@@ -3085,17 +3549,24 @@ impl ClusterBackend for K3sBackend {
         // does one-pod-at-a-time + readiness). Single-server stays
         // byte-for-byte unchanged (no PDB created).
         if config.servers > 1 {
-            let pdb = Self::build_pod_disruption_budget(name, namespace, config);
+            let mut pdb = Self::build_pod_disruption_budget(name, namespace, config);
+            if let Some(owner) = owner_ref {
+                Self::stamp_instance_control(&mut pdb.metadata, owner);
+            }
             let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(self.client.clone(), namespace);
             let pdb_name = format!("{name}-server");
-            pdb_api
-                .patch(
-                    &pdb_name,
-                    &PatchParams::apply("kobe-operator").force(),
-                    &Patch::Apply(&pdb),
-                )
-                .await
-                .with_context(|| format!("Failed to apply PodDisruptionBudget for {name}"))?;
+            if let Some(owner) = owner_ref {
+                Self::create_or_apply_owned(&pdb_api, &pdb_name, pdb, owner).await?;
+            } else {
+                pdb_api
+                    .patch(
+                        &pdb_name,
+                        &PatchParams::apply("kobe-operator").force(),
+                        &Patch::Apply(&pdb),
+                    )
+                    .await
+                    .with_context(|| format!("Failed to apply PodDisruptionBudget for {name}"))?;
+            }
             info!(
                 cluster = name,
                 servers = config.servers,
@@ -3106,22 +3577,41 @@ impl ClusterBackend for K3sBackend {
         // 6. Wait for readiness: kubeconfig Secret published by pod-0 AND the
         // server StatefulSet reporting readyReplicas >= clamped replicas.
         self.wait_ready(name, namespace, config.servers).await?;
+        if let Some(owner) = owner_ref {
+            self.seal_kubeconfig_secret_control(name, namespace, owner)
+                .await?;
+        }
 
         // 7. Create agent Deployment if requested
         if let Some(agents) = config.agents
             && agents > 0
         {
-            let deploy = Self::build_agent_deployment(name, namespace, config, agents);
+            let mut deploy = Self::build_agent_deployment(name, namespace, config, agents);
+            if let Some(owner) = owner_ref {
+                Self::stamp_instance_control(&mut deploy.metadata, owner);
+            }
+            if let (Some(owner), Some(spec)) = (owner_ref, deploy.spec.as_mut()) {
+                spec.template
+                    .metadata
+                    .get_or_insert_with(ObjectMeta::default)
+                    .labels
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(INSTANCE_UID_LABEL.to_string(), owner.uid.clone());
+            }
             let deploy_api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
             let deploy_name = format!("{name}-agent");
-            deploy_api
-                .patch(
-                    &deploy_name,
-                    &PatchParams::apply("kobe-operator").force(),
-                    &Patch::Apply(&deploy),
-                )
-                .await
-                .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
+            if let Some(owner) = owner_ref {
+                Self::create_or_apply_owned(&deploy_api, &deploy_name, deploy, owner).await?;
+            } else {
+                deploy_api
+                    .patch(
+                        &deploy_name,
+                        &PatchParams::apply("kobe-operator").force(),
+                        &Patch::Apply(&deploy),
+                    )
+                    .await
+                    .with_context(|| format!("Failed to apply agent Deployment for {name}"))?;
+            }
             info!(cluster = name, agents = agents, "Agent Deployment applied");
         }
 
@@ -3323,6 +3813,15 @@ impl ClusterBackend for K3sBackend {
     ) -> Result<Option<BackendCreationFootprint>> {
         let mut resources = Vec::new();
 
+        let instances: Api<crate::crd::ClusterInstance> =
+            Api::namespaced(self.client.clone(), namespace);
+        let instance = instances
+            .get(name)
+            .await
+            .with_context(|| format!("could not authenticate ClusterInstance {name}"))?;
+        let instance_identity =
+            Self::resource_identity(&instance, "kobe.kunobi.ninja/v1alpha1", "ClusterInstance")?;
+
         let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
         let statefulsets: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
@@ -3356,7 +3855,14 @@ impl ClusterBackend for K3sBackend {
             TeardownSubject::ServerStatefulSet,
             "apps/v1",
             "StatefulSet",
+            &instance_identity,
+            CreationControlRelation::ControllerOwner,
         )?);
+        let statefulset_identity = resources
+            .last()
+            .expect("StatefulSet manifest entry was just pushed")
+            .resource
+            .clone();
         resources.push(
             Self::capture_named(
                 &services,
@@ -3364,6 +3870,8 @@ impl ClusterBackend for K3sBackend {
                 TeardownSubject::Service,
                 "v1",
                 "Service",
+                &instance_identity,
+                CreationControlRelation::ControllerOwner,
             )
             .await?,
         );
@@ -3374,6 +3882,8 @@ impl ClusterBackend for K3sBackend {
                 TeardownSubject::PublisherConfigMap,
                 "v1",
                 "ConfigMap",
+                &instance_identity,
+                CreationControlRelation::ControllerOwner,
             )
             .await?,
         );
@@ -3384,6 +3894,8 @@ impl ClusterBackend for K3sBackend {
                 TeardownSubject::TokenSecret,
                 "v1",
                 "Secret",
+                &instance_identity,
+                CreationControlRelation::ControllerOwner,
             )
             .await?,
         );
@@ -3394,6 +3906,8 @@ impl ClusterBackend for K3sBackend {
                 TeardownSubject::KubeconfigSecret,
                 "v1",
                 "Secret",
+                &instance_identity,
+                CreationControlRelation::ControllerOwner,
             )
             .await?,
         );
@@ -3416,6 +3930,8 @@ impl ClusterBackend for K3sBackend {
             TeardownSubject::CidrClaim,
             "kobe.kunobi.ninja/v1alpha1",
             "CIDRClaim",
+            &instance_identity,
+            CreationControlRelation::ControllerOwner,
         )?);
 
         let agent_name = format!("{name}-agent");
@@ -3436,6 +3952,8 @@ impl ClusterBackend for K3sBackend {
                     TeardownSubject::AgentDeployment,
                     "apps/v1",
                     "Deployment",
+                    &instance_identity,
+                    CreationControlRelation::ControllerOwner,
                 )?);
                 replicas
             }
@@ -3453,6 +3971,8 @@ impl ClusterBackend for K3sBackend {
                     TeardownSubject::PodDisruptionBudget,
                     "policy/v1",
                     "PodDisruptionBudget",
+                    &instance_identity,
+                    CreationControlRelation::ControllerOwner,
                 )?);
             }
             Some(_) => anyhow::bail!(
@@ -3474,6 +3994,8 @@ impl ClusterBackend for K3sBackend {
                 TeardownSubject::RegistriesConfigMap,
                 "v1",
                 "ConfigMap",
+                &instance_identity,
+                CreationControlRelation::ControllerOwner,
             )?);
         }
 
@@ -3498,6 +4020,8 @@ impl ClusterBackend for K3sBackend {
                 TeardownSubject::ServerPods,
                 "v1",
                 "Pod",
+                &statefulset_identity,
+                CreationControlRelation::ControllerOwner,
             )?);
         }
 
@@ -3529,6 +4053,8 @@ impl ClusterBackend for K3sBackend {
                     TeardownSubject::ServerDataPvcs,
                     "v1",
                     "PersistentVolumeClaim",
+                    &instance_identity,
+                    CreationControlRelation::InstanceUidLabel,
                 )?;
                 let pvc_spec = pvc
                     .spec
@@ -3584,6 +4110,8 @@ impl ClusterBackend for K3sBackend {
                     TeardownSubject::ServerDataVolumes,
                     "v1",
                     "PersistentVolume",
+                    &pvc_identity.resource,
+                    CreationControlRelation::ClaimRef,
                 )?;
                 let storage_class =
                     storage_classes
@@ -3687,6 +4215,8 @@ impl ClusterBackend for K3sBackend {
                         TeardownSubject::DatastoreCredentialSecret,
                         "v1",
                         "Secret",
+                        &instance_identity,
+                        CreationControlRelation::ControllerOwner,
                     )
                     .await?,
                 );
@@ -5003,7 +5533,8 @@ mod tests {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
-            "metadata": { "name": name, "namespace": namespace }
+            "metadata": { "name": name, "namespace": namespace },
+            "data": { "kubeconfig": "a3ViZWNvbmZpZw==" }
         })
     }
 
@@ -5374,6 +5905,296 @@ mod tests {
         assert!(backend.supports_verified_destroy());
     }
 
+    #[tokio::test]
+    async fn creation_preflight_refuses_foreign_objects_before_any_mutation() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            name: "c1".into(),
+            uid: "instance-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/secrets/c1-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "c1-token",
+                    "namespace": "test-ns",
+                    "uid": "foreign-secret-uid",
+                    "resourceVersion": "1",
+                    "labels": { "kobe.kunobi.ninja/instance-uid": owner.uid },
+                    "ownerReferences": [{
+                        "apiVersion": owner.api_version,
+                        "kind": owner.kind,
+                        "name": owner.name,
+                        "uid": "foreign-instance-uid",
+                        "controller": true
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = backend
+            .authenticate_creation_targets("c1", "test-ns", &base_config(), &owner)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing to adopt"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, http::Method::GET);
+    }
+
+    #[tokio::test]
+    async fn create_or_apply_never_adopts_the_create_conflict_winner() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            name: "c1".into(),
+            uid: "instance-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let cms: Api<ConfigMap> = Api::namespaced(backend.client.clone(), "test-ns");
+        let mut desired = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("c1-publisher".into()),
+                namespace: Some("test-ns".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        K3sBackend::stamp_instance_control(&mut desired.metadata, &owner);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/configmaps"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "AlreadyExists", "code": 409
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/configmaps/c1-publisher"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "c1-publisher",
+                    "namespace": "test-ns",
+                    "uid": "foreign-uid",
+                    "resourceVersion": "7",
+                    "labels": { "kobe.kunobi.ninja/instance-uid": "foreign-instance" },
+                    "ownerReferences": [{
+                        "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                        "kind": "ClusterInstance",
+                        "name": "c1",
+                        "uid": "foreign-instance",
+                        "controller": true
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = K3sBackend::create_or_apply_owned(&cms, "c1-publisher", desired, &owner)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing to adopt"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method != http::Method::PATCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_or_apply_fences_the_authenticated_incarnation_by_resource_version() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            name: "c1".into(),
+            uid: "instance-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let controlled = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "c1-publisher",
+                "namespace": "test-ns",
+                "uid": "configmap-uid",
+                "resourceVersion": "7",
+                "labels": { "kobe.kunobi.ninja/instance-uid": owner.uid },
+                "ownerReferences": [{
+                    "apiVersion": owner.api_version,
+                    "kind": owner.kind,
+                    "name": owner.name,
+                    "uid": owner.uid,
+                    "controller": true
+                }]
+            }
+        });
+        let cms: Api<ConfigMap> = Api::namespaced(backend.client.clone(), "test-ns");
+        let mut desired = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("c1-publisher".into()),
+                namespace: Some("test-ns".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        K3sBackend::stamp_instance_control(&mut desired.metadata, &owner);
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/configmaps"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "reason": "AlreadyExists", "code": 409
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/configmaps/c1-publisher"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&controlled))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/namespaces/test-ns/configmaps/c1-publisher"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&controlled))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        K3sBackend::create_or_apply_owned(&cms, "c1-publisher", desired, &owner)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let apply = requests
+            .iter()
+            .find(|request| request.method == http::Method::PATCH)
+            .expect("fenced apply");
+        let body: serde_json::Value = serde_json::from_slice(&apply.body).unwrap();
+        assert_eq!(body["metadata"]["resourceVersion"], "7");
+    }
+
+    #[tokio::test]
+    async fn kubeconfig_placeholder_never_adopts_a_foreign_secret() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            name: "c1".into(),
+            uid: "instance-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/secrets/c1-kubeconfig"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "c1-kubeconfig",
+                    "namespace": "test-ns",
+                    "uid": "foreign-secret-uid",
+                    "labels": { "kobe.kunobi.ninja/instance-uid": owner.uid },
+                    "ownerReferences": [{
+                        "apiVersion": owner.api_version,
+                        "kind": owner.kind,
+                        "name": owner.name,
+                        "uid": "foreign-instance-uid",
+                        "controller": true
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = backend
+            .ensure_kubeconfig_secret_placeholder("c1", "test-ns", &owner)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing to adopt"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == http::Method::GET)
+        );
+    }
+
+    #[tokio::test]
+    async fn kubeconfig_placeholder_is_created_with_exact_instance_control() {
+        let server = MockServer::start().await;
+        let backend = K3sBackend::new(mock_client(&server), Default::default());
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            name: "c1".into(),
+            uid: "instance-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/test-ns/secrets/c1-kubeconfig"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(crate::testutil::k8s_not_found("secrets", "c1-kubeconfig")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/secrets"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "c1-kubeconfig",
+                    "namespace": "test-ns",
+                    "uid": "secret-uid"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        backend
+            .ensure_kubeconfig_secret_placeholder("c1", "test-ns", &owner)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let create = requests
+            .iter()
+            .find(|request| request.method == http::Method::POST)
+            .expect("placeholder POST");
+        let body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+        assert_eq!(body["metadata"]["labels"][INSTANCE_UID_LABEL], owner.uid);
+        assert!(
+            body["metadata"]["ownerReferences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["uid"] == owner.uid && candidate["controller"] == true)
+        );
+        assert!(body.get("data").is_none() || body["data"].is_null());
+    }
+
     /// A fully-formed token Secret: join token AND node password, as every
     /// Secret written since #145 carries.
     fn token_secret_response(name: &str, namespace: &str, token: &[u8]) -> serde_json::Value {
@@ -5490,13 +6311,13 @@ mod tests {
             .await;
 
         backend
-            .create_token_secret("test-cluster", "test-ns")
+            .create_token_secret("test-cluster", "test-ns", None)
             .await
             .unwrap();
         let original = persisted_token.lock().unwrap().clone().unwrap();
 
         backend
-            .create_token_secret("test-cluster", "test-ns")
+            .create_token_secret("test-cluster", "test-ns", None)
             .await
             .unwrap();
 
@@ -5563,7 +6384,7 @@ mod tests {
             .await;
 
         backend
-            .create_token_secret("test-cluster", "test-ns")
+            .create_token_secret("test-cluster", "test-ns", None)
             .await
             .unwrap();
     }
@@ -5606,7 +6427,7 @@ mod tests {
             .await;
 
         backend
-            .create_token_secret("test-cluster", "test-ns")
+            .create_token_secret("test-cluster", "test-ns", None)
             .await
             .unwrap();
 
@@ -5670,7 +6491,7 @@ mod tests {
             .await;
 
         backend
-            .create_token_secret("test-cluster", "test-ns")
+            .create_token_secret("test-cluster", "test-ns", None)
             .await
             .unwrap();
 
@@ -5720,7 +6541,7 @@ mod tests {
         // No PATCH mock is mounted: any write at all fails the test.
 
         backend
-            .create_token_secret("test-cluster", "test-ns")
+            .create_token_secret("test-cluster", "test-ns", None)
             .await
             .unwrap();
     }

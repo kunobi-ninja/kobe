@@ -119,13 +119,17 @@ Returns the full lease, including `kubeconfig` once the phase is `Bound`.
 }
 ```
 
-Possible values for `phase`: `Pending`, `Bound`, `Released`, `Expired`, `Recycling`.
+Possible values for `phase`: `Pending`, `Bound`, `Released`, `Expired`,
+`Recycling`, `Quarantined`.
 
 ---
 
 ## `DELETE /v1/leases/:id`
 
-Releases a lease immediately. The cluster is destroyed and a fresh replacement is queued. Returns `204 No Content`.
+Releases a lease immediately. The cluster is destroyed and a fresh replacement
+is queued. Returns `204 No Content`. A lease already in `Quarantined` returns
+`409 Conflict` with reason `TeardownQuarantined`; release cannot downgrade or
+discard incomplete cleanup evidence.
 
 ---
 
@@ -169,11 +173,13 @@ Lists all pools accessible to your identity, including their policy and capacity
 [
   {
     "name": "ci-small",
+    "phase": "Healthy",
     "ready": 3,
     "leased": 1,
     "creating": 0,
     "recycling": 0,
     "unhealthy": 0,
+    "quarantined": 0,
     "queueDepth": 0,
     "policy": {
       "mode": "fixed",
@@ -195,11 +201,13 @@ Returns status for a single pool.
 ```json
 {
   "name": "ci-small",
+  "phase": "Healthy",
   "ready": 3,
   "leased": 1,
   "creating": 0,
   "recycling": 0,
   "unhealthy": 0,
+  "quarantined": 0,
   "queueDepth": 0,
   "policy": {
     "mode": "fixed",

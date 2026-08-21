@@ -463,6 +463,8 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status.releaseCause is immutable once recorded"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))")
         .message("status FootprintAbsent proof is immutable once recorded"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownReceiptAcknowledgement) || (has(self.status) && self.status != null && has(self.status.childTeardownReceiptAcknowledgement) && self.status.childTeardownReceiptAcknowledgement == oldSelf.status.childTeardownReceiptAcknowledgement)")
+        .message("status.childTeardownReceiptAcknowledgement is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != 'FootprintAbsent' || (c.status == 'True' && has(self.status.releaseCause) && self.status.phase in ['Releasing', 'Released', 'Expired']))")
         .message("FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSecret) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret) && self.status.target.childClusterKubeconfigSecret == oldSelf.status.target.childClusterKubeconfigSecret)")
@@ -477,6 +479,10 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status.childTeardownMode is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.childTeardownMode) || (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret))")
         .message("childTeardownMode requires exact child placement and kubeconfig Secret provenance"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.placement) && self.status.placement.type == 'childCluster')")
+        .message("a child teardown receipt acknowledgement requires child placement"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))")
+        .message("a child teardown receipt acknowledgement requires FootprintAbsent=True in the same checkpoint"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -611,6 +617,14 @@ pub struct SandboxLeaseStatus {
     /// receipt must linearize target absence before records can be retired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_teardown_mode: Option<SandboxChildTeardownMode>,
+
+    /// Durable consumer acknowledgement of the exact internal ClusterLease
+    /// teardown receipt. This is the receipt's SHA-256 acknowledgement token,
+    /// written atomically with `FootprintAbsent=True` before the producer is
+    /// ACKed or allowed to discard its full receipt bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(equal = 71), pattern("^sha256:[0-9a-f]{64}$"))]
+    pub child_teardown_receipt_acknowledgement: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         extend("x-kubernetes-list-type" = "map"),
@@ -1163,6 +1177,9 @@ mod tests {
             "!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.releaseCause) || (has(self.status) && self.status != null && has(self.status.releaseCause) && self.status.releaseCause == oldSelf.status.releaseCause)",
             "!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))",
             "!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != 'FootprintAbsent' || (c.status == 'True' && has(self.status.releaseCause) && self.status.phase in ['Releasing', 'Released', 'Expired']))",
+            "!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownReceiptAcknowledgement) || (has(self.status) && self.status != null && has(self.status.childTeardownReceiptAcknowledgement) && self.status.childTeardownReceiptAcknowledgement == oldSelf.status.childTeardownReceiptAcknowledgement)",
+            "!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.placement) && self.status.placement.type == 'childCluster')",
+            "!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))",
         ] {
             assert!(
                 validations
@@ -1171,6 +1188,9 @@ mod tests {
                 "missing root validation: {rule}"
             );
         }
+        let acknowledgement = &status_schema["properties"]["childTeardownReceiptAcknowledgement"];
+        assert_eq!(acknowledgement["type"], "string");
+        assert_eq!(acknowledgement["pattern"], "^sha256:[0-9a-f]{64}$");
     }
 
     /// Child authentication and teardown interpretation are restart authority,

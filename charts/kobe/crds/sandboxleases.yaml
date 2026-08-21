@@ -145,6 +145,17 @@ spec:
                 - FinalizerV1
                 nullable: true
                 type: string
+              childTeardownReceiptAcknowledgement:
+                description: |-
+                  Durable consumer acknowledgement of the exact internal ClusterLease
+                  teardown receipt. This is the receipt's SHA-256 acknowledgement token,
+                  written atomically with `FootprintAbsent=True` before the producer is
+                  ACKed or allowed to discard its full receipt bytes.
+                maxLength: 71
+                minLength: 71
+                nullable: true
+                pattern: ^sha256:[0-9a-f]{64}$
+                type: string
               conditions:
                 items:
                   description: Kubernetes-style condition with the generation from which it was derived.
@@ -627,6 +638,8 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.releaseCause) || (has(self.status) && self.status != null && has(self.status.releaseCause) && self.status.releaseCause == oldSelf.status.releaseCause)'
         - message: status FootprintAbsent proof is immutable once recorded
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True'') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
+        - message: status.childTeardownReceiptAcknowledgement is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownReceiptAcknowledgement) || (has(self.status) && self.status != null && has(self.status.childTeardownReceiptAcknowledgement) && self.status.childTeardownReceiptAcknowledgement == oldSelf.status.childTeardownReceiptAcknowledgement)'
         - message: FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause
           rule: '!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != ''FootprintAbsent'' || (c.status == ''True'' && has(self.status.releaseCause) && self.status.phase in [''Releasing'', ''Released'', ''Expired'']))'
         - message: status.target.childClusterKubeconfigSecret is immutable once recorded
@@ -641,6 +654,10 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownMode) || (has(self.status) && self.status != null && has(self.status.childTeardownMode) && self.status.childTeardownMode == oldSelf.status.childTeardownMode)'
         - message: childTeardownMode requires exact child placement and kubeconfig Secret provenance
           rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownMode) || (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret))'
+        - message: a child teardown receipt acknowledgement requires child placement
+          rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.placement) && self.status.placement.type == ''childCluster'')'
+        - message: a child teardown receipt acknowledgement requires FootprintAbsent=True in the same checkpoint
+          rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
     served: true
     storage: true
     subresources:

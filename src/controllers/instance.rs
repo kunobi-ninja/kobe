@@ -347,11 +347,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 health_failures: status.health_failures,
                                 spec_hash: status.spec_hash.clone(),
                                 network: Some(net.clone()),
-                                // `created_with: None` lets `skip_serializing_if`
-                                // omit the field from the JSON Merge Patch, so
-                                // the on-disk provenance written at create time
-                                // is preserved (we never want to overwrite it
-                                // from an instance-controller patch).
+                                // `patch_instance_status` treats this `None` as
+                                // "preserve the freshly observed value" before
+                                // replacing `/status` under UID/resourceVersion
+                                // tests. The instance controller must never
+                                // overwrite creation provenance.
                                 created_with: None,
                                 creation_manifest: None,
                                 teardown_identities: Vec::new(),
@@ -2133,37 +2133,42 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     // pool, which is a bypass of the whole mechanism rather than an edge case.
     let already_quarantined = status.phase == ClusterInstancePhase::Quarantined;
 
-    // Does the bound lease actually ask for this?
+    // The reciprocal binding is the immutable cleanup contract. The live lease
+    // spec is checked only for agreement; it is never allowed to downgrade the
+    // teardown mode selected before tenant access was granted.
+    if binding.cleanup_mode != CleanupMode::VerifiedDestroy {
+        if already_quarantined {
+            return Some(
+                quarantine_instance(ctx, instance, name, namespace, "binding_mode_missing").await,
+            );
+        }
+        return None;
+    }
+
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
     let lease = match leases.get(&binding.lease.name).await {
         Ok(lease) => lease,
         Err(error) => {
-            if already_quarantined {
-                warn!(
-                    instance = %name,
-                    error = %error,
-                    "quarantined instance's lease is unreadable; holding quarantine rather \
-                     than releasing on the unverified path"
-                );
-                return Some(
-                    quarantine_instance(ctx, instance, name, namespace, "lease_unreadable").await,
-                );
-            }
-            return None;
-        }
-    };
-    if lease.spec.cleanup_mode.unwrap_or_default() != CleanupMode::VerifiedDestroy {
-        if already_quarantined {
             warn!(
                 instance = %name,
-                "quarantined instance's lease no longer requests verified teardown; \
-                 holding quarantine — capacity still has unproven state"
+                error = %error,
+                "verified instance's lease is unreadable; holding quarantine rather than \
+                 releasing on the unverified path"
             );
             return Some(
-                quarantine_instance(ctx, instance, name, namespace, "mode_downgraded").await,
+                quarantine_instance(ctx, instance, name, namespace, "lease_unreadable").await,
             );
         }
-        return None;
+    };
+    if !lease_uid_matches_binding(&lease, binding) {
+        warn!(instance = %name, "verified teardown lease UID differs from binding provenance");
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "lease_uid_mismatch").await,
+        );
+    }
+    if lease.spec.cleanup_mode.unwrap_or_default() != binding.cleanup_mode {
+        warn!(instance = %name, "lease cleanup mode differs from immutable binding provenance");
+        return Some(quarantine_instance(ctx, instance, name, namespace, "mode_downgraded").await);
     }
 
     // The concrete immutable manifest, not a category list reconstructed at
@@ -2193,19 +2198,45 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             quarantine_instance(ctx, instance, name, namespace, "creation_manifest_invalid").await,
         );
     };
+    if binding.creation_manifest_digest.as_deref() != Some(manifest_digest.as_str()) {
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "binding_manifest_mismatch").await,
+        );
+    }
+    if binding.creation_manifest.as_ref() != Some(manifest) {
+        return Some(
+            quarantine_instance(ctx, instance, name, namespace, "binding_manifest_mismatch").await,
+        );
+    }
     let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
-    let plan = manifest.required_subjects();
-    let recorded_identities = manifest.recorded_identities();
+    let Some(connect_token_identity) = binding.connect_token.as_ref() else {
+        return Some(
+            quarantine_instance(
+                ctx,
+                instance,
+                name,
+                namespace,
+                "connect_token_footprint_missing",
+            )
+            .await,
+        );
+    };
+    let mut plan = manifest.required_subjects();
+    plan.push(crate::crd::TeardownSubject::ConnectTokenSecret);
+    let mut recorded_identities = manifest.recorded_identities();
+    recorded_identities.push(connect_token_identity.canonical_id());
 
     // A completed verified receipt may already be durable from a previous
     // reconcile that crashed before finalizer removal. Consume it instead of
     // starting a second destructive attempt.
-    if let Some(existing) = lease
-        .status
-        .as_ref()
-        .and_then(|lease_status| lease_status.teardown_receipt.as_ref())
-        && existing.outcome == TeardownOutcome::Verified
+    if let Some((existing, durable_attempt)) = lease.status.as_ref().and_then(|lease_status| {
+        Some((
+            lease_status.teardown_receipt.as_ref()?,
+            lease_status.teardown_attempt_id.as_deref()?,
+        ))
+    }) && existing.outcome == TeardownOutcome::Verified
     {
+        let existing = existing.clone();
         let expected = crate::crd::TeardownScope {
             lease: &binding.lease,
             instance: &manifest.instance,
@@ -2214,14 +2245,24 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             config_digest: &binding.backend.config_digest,
             instance_spec_digest: &binding.instance_spec_digest,
             creation_manifest_digest: &manifest_digest,
-            attempt_id: &existing.attempt_id,
+            cleanup_mode: binding.cleanup_mode,
+            attempt_id: durable_attempt,
             creation_manifest: Some(manifest),
+            connect_token_identity: Some(connect_token_identity),
             required_subjects: &plan,
             instance_name: name,
             recorded_identities: &recorded_identities,
         };
-        if existing.permits_release_for(&expected) {
+        if existing.attempt_id == durable_attempt && existing.permits_release_for(&expected) {
             info!(instance = %name, attempt = %existing.attempt_id, "consuming already-persisted verified teardown receipt");
+            if let Err(error) = mark_exact_lease_recycling_after_verified(
+                ctx, &lease, binding, &existing, namespace,
+            )
+            .await
+            {
+                warn!(instance = %name, error = %error, "could not publish verified lease transition; withholding instance deletion");
+                return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
+            }
             return Some(advance_verified_instance_deletion(ctx, instance, name, namespace).await);
         }
         return Some(
@@ -2240,7 +2281,17 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         .filter(|receipt| receipt.outcome == TeardownOutcome::InProgress)
     {
         Some(receipt)
-            if pending_receipt_matches(receipt, binding, &manifest.instance, &manifest_digest) =>
+            if lease
+                .status
+                .as_ref()
+                .and_then(|status| status.teardown_attempt_id.as_deref())
+                == Some(receipt.attempt_id.as_str())
+                && pending_receipt_matches(
+                    receipt,
+                    binding,
+                    &manifest.instance,
+                    &manifest_digest,
+                ) =>
         {
             receipt.clone()
         }
@@ -2261,6 +2312,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
                 config_digest: binding.backend.config_digest.clone(),
                 instance_spec_digest: binding.instance_spec_digest.clone(),
                 creation_manifest_digest: manifest_digest.clone(),
+                cleanup_mode: binding.cleanup_mode,
                 started_at: chrono::Utc::now().to_rfc3339(),
                 completed_at: None,
                 checks: Vec::new(),
@@ -2282,7 +2334,15 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         }
     };
 
-    let checks = match resolve_verified_backend(ctx, instance).await {
+    let connect_check = crate::api::connect::delete_lease_connect_token_verified(
+        &ctx.client,
+        namespace,
+        &binding.lease.name,
+        binding.lease.uid.as_deref().unwrap_or_default(),
+        connect_token_identity,
+    )
+    .await;
+    let mut checks = match resolve_verified_backend(ctx, instance).await {
         Some(backend) => match backend
             .delete_verified_manifest(name, namespace, manifest)
             .await
@@ -2306,6 +2366,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             );
         }
     };
+    checks.push(connect_check);
 
     let outcome = TeardownReceipt::outcome_for(&checks);
     let receipt = TeardownReceipt {
@@ -2318,6 +2379,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         config_digest: pending.config_digest.clone(),
         instance_spec_digest: pending.instance_spec_digest.clone(),
         creation_manifest_digest: pending.creation_manifest_digest.clone(),
+        cleanup_mode: pending.cleanup_mode,
         started_at: pending.started_at.clone(),
         completed_at: Some(completion_after(&pending.started_at)),
         checks,
@@ -2328,7 +2390,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     // Persist the evidence BEFORE releasing anything. A receipt written after
     // the finalizer is gone can be lost with the object it describes, and the
     // whole point is that it outlives the instance.
-    if let Err(error) = record_teardown_receipt(
+    let receipt_lease = match record_teardown_receipt(
         ctx,
         &attempt_lease,
         &receipt,
@@ -2337,9 +2399,12 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     )
     .await
     {
-        warn!(instance = %name, error = %error, "could not persist teardown receipt; retrying");
-        return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
-    }
+        Ok(updated) => updated,
+        Err(error) => {
+            warn!(instance = %name, error = %error, "could not persist teardown receipt; retrying");
+            return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
+        }
+    };
 
     let expected = crate::crd::TeardownScope {
         lease: &binding.lease,
@@ -2349,8 +2414,10 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         config_digest: &binding.backend.config_digest,
         instance_spec_digest: &binding.instance_spec_digest,
         creation_manifest_digest: &manifest_digest,
+        cleanup_mode: binding.cleanup_mode,
         attempt_id: &pending.attempt_id,
         creation_manifest: Some(manifest),
+        connect_token_identity: Some(connect_token_identity),
         required_subjects: &plan,
         instance_name: name,
         recorded_identities: &recorded_identities,
@@ -2372,8 +2439,25 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         );
     }
 
+    if let Err(error) =
+        mark_exact_lease_recycling_after_verified(ctx, &receipt_lease, binding, &receipt, namespace)
+            .await
+    {
+        warn!(instance = %name, error = %error, "could not publish verified lease transition; withholding instance deletion");
+        return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
+    }
+
     info!(instance = %name, "teardown verified; releasing the cleanup handle");
     Some(advance_verified_instance_deletion(ctx, instance, name, namespace).await)
+}
+
+fn lease_uid_matches_binding(lease: &ClusterLease, binding: &crate::crd::LeaseBinding) -> bool {
+    binding
+        .lease
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.trim().is_empty())
+        .is_some_and(|uid| lease.metadata.uid.as_deref() == Some(uid))
 }
 
 /// Move a receipt-proven instance through the Kubernetes deletion boundary.
@@ -2440,6 +2524,7 @@ fn pending_receipt_matches(
         && receipt.config_digest == binding.backend.config_digest
         && receipt.instance_spec_digest == binding.instance_spec_digest
         && receipt.creation_manifest_digest == manifest_digest
+        && receipt.cleanup_mode == binding.cleanup_mode
 }
 
 /// Produce an RFC3339 completion strictly after the persisted start even when a
@@ -2555,10 +2640,30 @@ async fn record_teardown_receipt<B: ClusterBackend>(
         serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
     ];
     if let Some(attempt_id) = expected_attempt {
+        if receipt.attempt_id != attempt_id {
+            anyhow::bail!("terminal receipt changed the durable teardown attempt");
+        }
+        operations.push(serde_json::json!({
+            "op": "test",
+            "path": "/status/teardownAttemptId",
+            "value": attempt_id
+        }));
         operations.push(serde_json::json!({
             "op": "test",
             "path": "/status/teardownReceipt/attemptId",
             "value": attempt_id
+        }));
+    } else {
+        if receipt.outcome != TeardownOutcome::InProgress
+            || receipt.completed_at.is_some()
+            || receipt.attempt_id.trim().is_empty()
+        {
+            anyhow::bail!("a destructive attempt must begin as durable InProgress evidence");
+        }
+        operations.push(serde_json::json!({
+            "op": "add",
+            "path": "/status/teardownAttemptId",
+            "value": receipt.attempt_id
         }));
     }
     operations.push(serde_json::json!({
@@ -2570,6 +2675,114 @@ async fn record_teardown_receipt<B: ClusterBackend>(
     Ok(leases
         .patch_status(
             &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?)
+}
+
+async fn mark_exact_lease_quarantined<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    binding: &crate::crd::LeaseBinding,
+    namespace: &str,
+    reason: &str,
+) -> Result<ClusterLease, anyhow::Error> {
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    let lease = leases.get(&binding.lease.name).await?;
+    if !lease_uid_matches_binding(&lease, binding) {
+        anyhow::bail!("cannot quarantine a replacement ClusterLease");
+    }
+    let mut status = lease.status.clone().unwrap_or_default();
+    if status.binding.as_ref() != Some(binding) {
+        anyhow::bail!("cannot quarantine a lease with different binding provenance");
+    }
+    if status.phase == LeasePhase::Quarantined {
+        return Ok(lease);
+    }
+    let uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("lease has no UID"))?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease has no resourceVersion"))?;
+    let previous_phase = status.phase.clone();
+    let previous_conditions = status.conditions.clone();
+    status.phase = LeasePhase::Quarantined;
+    status.message = Some(format!("teardown quarantined: {reason}"));
+    status.conditions = crate::controllers::lease::derive_lease_conditions(
+        &status,
+        &previous_conditions,
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": previous_phase },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+    Ok(leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?)
+}
+
+async fn mark_exact_lease_recycling_after_verified<B: ClusterBackend>(
+    ctx: &InstanceContext<B>,
+    lease: &ClusterLease,
+    binding: &crate::crd::LeaseBinding,
+    receipt: &TeardownReceipt,
+    namespace: &str,
+) -> Result<ClusterLease, anyhow::Error> {
+    if !lease_uid_matches_binding(lease, binding) {
+        anyhow::bail!("cannot resume a replacement ClusterLease");
+    }
+    let mut status = lease.status.clone().unwrap_or_default();
+    if status.binding.as_ref() != Some(binding)
+        || status.teardown_receipt.as_ref() != Some(receipt)
+        || receipt.outcome != TeardownOutcome::Verified
+    {
+        anyhow::bail!("verified lease transition lost its exact binding or receipt");
+    }
+    if status.phase == LeasePhase::Recycling {
+        return Ok(lease.clone());
+    }
+    let uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("lease has no UID"))?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease has no resourceVersion"))?;
+    let previous_phase = status.phase.clone();
+    let previous_conditions = status.conditions.clone();
+    status.phase = LeasePhase::Recycling;
+    status.message = Some("teardown receipt verified; awaiting durable acknowledgement".into());
+    status.conditions = crate::controllers::lease::derive_lease_conditions(
+        &status,
+        &previous_conditions,
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": previous_phase },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/teardownReceipt", "value": receipt },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
+    Ok(leases
+        .patch_status(
+            &binding.lease.name,
             &PatchParams::default(),
             &Patch::<()>::Json(patch),
         )
@@ -2590,9 +2803,16 @@ async fn quarantine_instance<B: ClusterBackend>(
 ) -> Result<Action, InstanceError> {
     let instances_api: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
     let mut next = instance.status.clone().unwrap_or_default();
+    let transition_time = chrono::Utc::now().to_rfc3339();
     next.phase = ClusterInstancePhase::Quarantined;
-    next.state_since = Some(chrono::Utc::now().to_rfc3339());
+    next.state_since = Some(transition_time.clone());
     next.message = Some(format!("quarantined: {reason}"));
+    let previous_conditions = instance
+        .status
+        .as_ref()
+        .map(|status| status.conditions.as_slice())
+        .unwrap_or(&[]);
+    next.conditions = derive_instance_conditions(&next, previous_conditions, &transition_time);
 
     // Fenced, not a bare merge patch. Two ways an unfenced write goes wrong:
     // a stale reconcile holding an older view could overwrite `Quarantined`
@@ -2628,6 +2848,18 @@ async fn quarantine_instance<B: ClusterBackend>(
             return Ok(Action::requeue(std::time::Duration::from_secs(5)));
         }
         Err(error) => return Err(error.into()),
+    }
+    if let Some(binding) = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.as_ref())
+        && let Err(error) = mark_exact_lease_quarantined(ctx, binding, namespace, reason).await
+    {
+        // The instance quarantine is the hard safety boundary. Keep it even if
+        // the lease was deleted/replaced or the status write races; a later
+        // reconcile retries the exact lease transition without ever releasing
+        // the instance handle.
+        warn!(instance = %name, error = %error, "could not surface quarantine on the exact lease");
     }
     // Bounded backoff: a transient API failure may resolve, and the same exact
     // subject can then produce a verified receipt.
@@ -3164,13 +3396,52 @@ fn derive_instance_conditions(
 ///
 /// Derives `status.conditions` from the just-built `status`, preserving
 /// `lastTransitionTime` against the instance's *current* on-disk
-/// conditions (`instance.status.conditions`), then JSON-Merge-Patches
-/// `{ "status": status }`.
+/// conditions (`instance.status.conditions`), then replaces status under exact
+/// UID/resourceVersion tests. A stale writer can therefore conflict but can
+/// never overwrite a newer `Quarantined` transition.
+fn preserve_omitted_status_fields(
+    status: &mut ClusterInstanceStatus,
+    current: &ClusterInstanceStatus,
+) {
+    // The status writer replaces `/status` atomically so stale writes can be
+    // resourceVersion-fenced. Recreate JSON-Merge-Patch's historical "omitted
+    // means preserve" contract for fields whose serde shape uses
+    // `skip_serializing_if`; most call sites intentionally construct a partial
+    // status with `..Default::default()`.
+    if status.binding.is_none() {
+        status.binding = current.binding.clone();
+    }
+    if status.active_bootstrap.is_none() {
+        status.active_bootstrap = current.active_bootstrap.clone();
+    }
+    if status.spec_hash.is_none() {
+        status.spec_hash = current.spec_hash.clone();
+    }
+    if status.network.is_none() {
+        status.network = current.network.clone();
+    }
+    if status.created_with.is_none() {
+        status.created_with = current.created_with.clone();
+    }
+    if status.creation_manifest.is_none() {
+        status.creation_manifest = current.creation_manifest.clone();
+    }
+    if status.teardown_identities.is_empty() {
+        status.teardown_identities = current.teardown_identities.clone();
+    }
+    if status.message.is_none() {
+        status.message = current.message.clone();
+    }
+}
+
 async fn patch_instance_status(
     instances_api: &Api<ClusterInstance>,
     instance: &ClusterInstance,
     mut status: ClusterInstanceStatus,
 ) -> Result<(), kube::Error> {
+    if let Some(current) = instance.status.as_ref() {
+        preserve_omitted_status_fields(&mut status, current);
+    }
     let prev = instance
         .status
         .as_ref()
@@ -3179,12 +3450,24 @@ async fn patch_instance_status(
     let now = chrono::Utc::now().to_rfc3339();
     status.conditions = derive_instance_conditions(&status, prev, &now);
 
-    let patch = serde_json::json!({ "status": status });
+    let uid = instance.metadata.uid.as_deref().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
+    })?;
+    let resource_version = instance.resource_version().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other(
+            "instance has no resourceVersion",
+        )))
+    })?;
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
     instances_api
         .patch_status(
             &instance.name_any(),
-            &PatchParams::apply("kobe-operator"),
-            &Patch::Merge(&patch),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
         )
         .await?;
     Ok(())
@@ -3210,7 +3493,7 @@ fn error_policy<B: ClusterBackend>(
 mod tests {
     use super::*;
     use crate::testutil::MockBackend;
-    use wiremock::matchers::{body_json, body_partial_json, method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Find a derived condition by type. Panics if absent (tests assert
@@ -3264,6 +3547,7 @@ mod tests {
             ClusterInstancePhase::Recycling,
             ClusterInstancePhase::Unhealthy,
             ClusterInstancePhase::Failed,
+            ClusterInstancePhase::Quarantined,
         ] {
             let phase_name = phase_reason(&phase).to_string();
             // not provisioned, not bootstrapped
@@ -3407,6 +3691,62 @@ mod tests {
     }
 
     #[test]
+    fn fenced_status_replacement_preserves_sealed_provenance_fields() {
+        let manifest = TeardownCreationManifest {
+            schema_version: TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION,
+            instance: crate::crd::ResourceRef {
+                name: "instance-a".into(),
+                uid: Some("instance-uid".into()),
+            },
+            namespace: "test-ns".into(),
+            backend_type: BackendType::K3s,
+            config_digest: "a".repeat(64),
+            service_cidr: "10.0.0.0/16".into(),
+            cluster_cidr: "10.1.0.0/16".into(),
+            server_replicas: 1,
+            agent_replicas: 0,
+            resources: Vec::new(),
+            storage: Vec::new(),
+            datastore: crate::crd::DatastoreProvenance::EmbeddedSqlite,
+            sealed_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let current = ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Creating,
+            creation_manifest: Some(manifest.clone()),
+            created_with: Some(crate::crd::ClusterInstanceProvenance {
+                operator_version: "test".into(),
+                ..Default::default()
+            }),
+            teardown_identities: vec!["pv-uid".into()],
+            network: Some(ClusterInstanceNetwork {
+                service_cidr: "10.0.0.0/16".into(),
+                cluster_cidr: "10.1.0.0/16".into(),
+            }),
+            spec_hash: Some("spec-hash".into()),
+            message: Some("old message".into()),
+            ..Default::default()
+        };
+        let mut next = ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Ready,
+            provisioned: true,
+            bootstrapped: true,
+            ..Default::default()
+        };
+        preserve_omitted_status_fields(&mut next, &current);
+
+        assert_eq!(next.creation_manifest, Some(manifest));
+        assert_eq!(next.created_with, current.created_with);
+        assert_eq!(next.teardown_identities, vec!["pv-uid"]);
+        assert_eq!(next.network, current.network);
+        assert_eq!(next.spec_hash.as_deref(), Some("spec-hash"));
+        assert_eq!(next.message.as_deref(), Some("old message"));
+        // Actively managed clears remain clears; only omitted fields are
+        // carried through.
+        assert!(next.lease_ref.is_none());
+        assert!(next.idle_since.is_none());
+    }
+
+    #[test]
     fn status_serializes_conditions_and_message_when_present() {
         let st = ClusterInstanceStatus {
             phase: ClusterInstancePhase::Ready,
@@ -3483,6 +3823,235 @@ mod tests {
             velero: None,
         });
         (ctx, server, backend)
+    }
+
+    fn teardown_surface_binding() -> crate::crd::LeaseBinding {
+        crate::crd::LeaseBinding {
+            binding_id: "binding-surface".into(),
+            lease: crate::crd::ResourceRef {
+                name: "lease-surface".into(),
+                uid: Some("lease-surface-uid".into()),
+            },
+            instance: crate::crd::BoundInstanceRef {
+                name: "instance-surface".into(),
+                uid: "instance-surface-uid".into(),
+                observed_generation: 1,
+            },
+            pool: crate::crd::ResourceRef {
+                name: "pool-surface".into(),
+                uid: Some("pool-surface-uid".into()),
+            },
+            backend: crate::crd::BackendProvenance {
+                backend_type: BackendType::K3s,
+                config_digest: "a".repeat(64),
+                capi: None,
+            },
+            instance_spec_digest: "b".repeat(64),
+            cleanup_mode: CleanupMode::VerifiedDestroy,
+            creation_manifest_digest: Some("c".repeat(64)),
+            creation_manifest: None,
+            connect_token: None,
+        }
+    }
+
+    fn teardown_surface_receipt(binding: &crate::crd::LeaseBinding) -> TeardownReceipt {
+        TeardownReceipt {
+            schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
+            attempt_id: "attempt-surface".into(),
+            lease: binding.lease.clone(),
+            instance: crate::crd::ResourceRef {
+                name: binding.instance.name.clone(),
+                uid: Some(binding.instance.uid.clone()),
+            },
+            pool: binding.pool.clone(),
+            backend_type: "k3s".into(),
+            config_digest: binding.backend.config_digest.clone(),
+            instance_spec_digest: binding.instance_spec_digest.clone(),
+            creation_manifest_digest: binding.creation_manifest_digest.clone().unwrap(),
+            cleanup_mode: CleanupMode::VerifiedDestroy,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:01:00Z".into()),
+            checks: vec![crate::crd::TeardownCheck {
+                subject: crate::crd::TeardownSubject::ServerStatefulSet,
+                result: crate::crd::CheckResult::Verified,
+                reason: None,
+                verified: vec!["exact-subject".into()],
+            }],
+            retry_count: 0,
+            outcome: TeardownOutcome::Verified,
+        }
+    }
+
+    fn teardown_surface_lease(
+        phase: LeasePhase,
+        uid: &str,
+        binding: &crate::crd::LeaseBinding,
+        receipt: Option<&TeardownReceipt>,
+    ) -> ClusterLease {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": binding.lease.name,
+                "namespace": "test-ns",
+                "uid": uid,
+                "resourceVersion": "42"
+            },
+            "spec": {
+                "poolRef": binding.pool.name,
+                "ttl": "1h",
+                "requester": { "type": "kobe:test", "identity": "operator" },
+                "cleanupMode": "VerifiedDestroy"
+            },
+            "status": {
+                "phase": phase,
+                "binding": binding,
+                "teardownAttemptId": receipt.map(|receipt| receipt.attempt_id.clone()),
+                "teardownReceipt": receipt
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn quarantine_is_published_on_the_exact_lease_and_cannot_hit_a_replacement() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let lease = teardown_surface_lease(
+            LeasePhase::Recycling,
+            binding.lease.uid.as_deref().unwrap(),
+            &binding,
+            None,
+        );
+        let endpoint =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-surface";
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{endpoint}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+
+        mark_exact_lease_quarantined(&ctx, &binding, "test-ns", "proof_missing")
+            .await
+            .unwrap();
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("lease quarantine status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/uid"
+                && operation["value"] == "lease-surface-uid"
+        }));
+        let status = operations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["path"] == "/status")
+            .unwrap();
+        assert_eq!(status["value"]["phase"], "Quarantined");
+
+        let (replacement_ctx, replacement_server, _) = test_instance_context().await;
+        let replacement =
+            teardown_surface_lease(LeasePhase::Recycling, "replacement-uid", &binding, None);
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replacement))
+            .mount(&replacement_server)
+            .await;
+        assert!(
+            mark_exact_lease_quarantined(&replacement_ctx, &binding, "test-ns", "proof_missing",)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            replacement_server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.method.as_str() == "PATCH")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_exact_verified_receipt_resumes_a_quarantined_lease() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let receipt = teardown_surface_receipt(&binding);
+        let lease = teardown_surface_lease(
+            LeasePhase::Quarantined,
+            binding.lease.uid.as_deref().unwrap(),
+            &binding,
+            Some(&receipt),
+        );
+        let endpoint = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-surface/status";
+        Mock::given(method("PATCH"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+
+        mark_exact_lease_recycling_after_verified(&ctx, &lease, &binding, &receipt, "test-ns")
+            .await
+            .unwrap();
+        let request = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("verified resume patch");
+        let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        for path in [
+            "/metadata/uid",
+            "/metadata/resourceVersion",
+            "/status/phase",
+            "/status/binding",
+            "/status/teardownReceipt",
+        ] {
+            assert!(
+                operations
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|operation| { operation["op"] == "test" && operation["path"] == path })
+            );
+        }
+        assert_eq!(
+            operations
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|operation| operation["path"] == "/status")
+                .unwrap()["value"]["phase"],
+            "Recycling"
+        );
+
+        let mut wrong_receipt = receipt.clone();
+        wrong_receipt.attempt_id = "another-attempt".into();
+        assert!(
+            mark_exact_lease_recycling_after_verified(
+                &ctx,
+                &lease,
+                &binding,
+                &wrong_receipt,
+                "test-ns",
+            )
+            .await
+            .is_err()
+        );
     }
 
     fn standalone_instance(
@@ -3567,12 +4136,6 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/standalone-1/status",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "status": {
-                    "phase": "Creating",
-                    "provisioned": true
-                }
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("standalone-1")))
             .mount(&server)
             .await;
@@ -3592,13 +4155,6 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/standalone-2/status",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "status": {
-                    "phase": "Ready",
-                    "provisioned": true,
-                    "healthFailures": 0
-                }
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("standalone-2")))
             .mount(&server)
             .await;
@@ -3622,6 +4178,8 @@ mod tests {
                 "metadata": {
                     "name": "standalone-3",
                     "namespace": "test-ns",
+                    "uid": "standalone-3-uid",
+                    "resourceVersion": "10",
                     "finalizers": [INSTANCE_FINALIZER]
                 },
                 "spec": {
@@ -3646,13 +4204,6 @@ mod tests {
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/standalone-3/status",
             ))
-            .and(body_partial_json(serde_json::json!({
-                "status": {
-                    "phase": "Recycling",
-                    "leaseRef": null,
-                    "healthFailures": 3
-                }
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(instance_api_response("standalone-3")))
             .mount(&server)
             .await;
@@ -4291,6 +4842,10 @@ mod tests {
                 capi: None,
             },
             instance_spec_digest: "spec-digest".into(),
+            cleanup_mode: CleanupMode::VerifiedDestroy,
+            creation_manifest_digest: Some("manifest-digest".into()),
+            creation_manifest: None,
+            connect_token: None,
         };
         let instance = crate::crd::ResourceRef {
             name: "pool-p-0".into(),
@@ -4306,6 +4861,7 @@ mod tests {
             config_digest: binding.backend.config_digest.clone(),
             instance_spec_digest: binding.instance_spec_digest.clone(),
             creation_manifest_digest: "manifest-digest".into(),
+            cleanup_mode: CleanupMode::VerifiedDestroy,
             started_at: "2026-01-01T00:00:00Z".into(),
             completed_at: None,
             checks: Vec::new(),
@@ -4335,6 +4891,33 @@ mod tests {
             &instance,
             "manifest-digest"
         ));
+
+        let exact_lease: ClusterLease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": { "name": "lease-a", "namespace": "test-ns", "uid": "lease-uid" },
+            "spec": {
+                "poolRef": "pool-p",
+                "ttl": "1h",
+                "requester": { "type": "test:ci", "identity": "test" },
+                "cleanupMode": "VerifiedDestroy"
+            }
+        }))
+        .unwrap();
+        assert!(lease_uid_matches_binding(&exact_lease, &binding));
+        let replacement: ClusterLease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": { "name": "lease-a", "namespace": "test-ns", "uid": "replacement-uid" },
+            "spec": {
+                "poolRef": "pool-p",
+                "ttl": "1h",
+                "requester": { "type": "test:ci", "identity": "test" },
+                "cleanupMode": "VerifiedDestroy"
+            }
+        }))
+        .unwrap();
+        assert!(!lease_uid_matches_binding(&replacement, &binding));
     }
 
     #[test]

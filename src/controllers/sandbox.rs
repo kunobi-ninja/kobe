@@ -2643,36 +2643,22 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
             continue;
         };
         let status = handle.status.as_ref().cloned().unwrap_or_default();
-        let receipt_verified = status.teardown_receipt.as_ref().is_some_and(|receipt| {
-            let binding_matches = status.binding.as_ref().is_some_and(|binding| {
-                receipt.lease == binding.lease
-                    && receipt.instance.name == binding.instance.name
-                    && receipt.instance.uid.as_deref() == Some(binding.instance.uid.as_str())
-                    && receipt.pool == binding.pool
-            });
-            receipt.outcome == crate::crd::TeardownOutcome::Verified
-                && receipt.completed_at.is_some()
-                && receipt.schema_version == crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION
-                && crate::crd::TeardownReceipt::outcome_for(&receipt.checks)
-                    == crate::crd::TeardownOutcome::Verified
-                && receipt.lease.name == handle.name_any()
-                && receipt.lease.uid.as_deref() == handle.uid().as_deref()
-                && binding_matches
+        let receipt_token = status
+            .teardown_receipt
+            .as_ref()
+            .and_then(|receipt| validated_retained_receipt_token(&handle, receipt));
+        let receipt_verified = receipt_token.is_some();
+        let receipt_acked = receipt_token.as_ref().is_some_and(|token| {
+            annotations.get(crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION) == Some(token)
         });
-        let receipt_acked = receipt_verified
-            && status.teardown_receipt.as_ref().is_some_and(|receipt| {
-                annotations.get(crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
-                    == Some(&receipt.attempt_id)
-            });
+        let unbound_token =
+            crate::controllers::lease::unbound_release_acknowledgement_token(&status);
         let unbound_verified = unbound_child_release_is_proven(&handle, None);
         let unbound_acked = unbound_verified
-            && status
-                .unbound_release_verified_at
-                .as_ref()
-                .is_some_and(|proof| {
-                    annotations.get(crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
-                        == Some(proof)
-                });
+            && unbound_token.as_ref().is_some_and(|token| {
+                annotations.get(crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
+                    == Some(token)
+            });
         let stale_rejected = annotations
             .get(crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION)
             == Some(outer_uid);
@@ -4463,6 +4449,44 @@ async fn drive_release(
     finish_release(lease, ctx, reason).await
 }
 
+/// Atomically consume a verified child receipt into the outer absence proof.
+///
+/// Execution cleanup has completed before this call. Recording the exact
+/// receipt hash and `FootprintAbsent=True` together prevents either checkpoint
+/// from being replayed with different receipt bytes after a restart.
+async fn checkpoint_child_receipt_absence(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    token: &str,
+) -> Result<Action, SandboxPlacementError> {
+    let name = lease.name_any();
+    let status = lease.status.clone().unwrap_or_default();
+    if let Some(existing) = status.child_teardown_receipt_acknowledgement.as_deref() {
+        if existing != token {
+            return quarantine_lease(lease, ctx, "child_receipt_acknowledgement_changed").await;
+        }
+        if footprint_absence_proven(&status) {
+            return Ok(Action::await_change());
+        }
+    }
+    let mut next = status.clone();
+    next.child_teardown_receipt_acknowledgement = Some(token.to_string());
+    next.conditions = with_condition_for_status(
+        &status,
+        lease.metadata.generation,
+        FOOTPRINT_ABSENT_CONDITION,
+        crate::crd::SandboxConditionStatus::True,
+        "ChildReceiptConsumed",
+        "Exact child teardown receipt and execution cleanup were verified",
+    );
+    if patch_lease_status_fenced(ctx, lease, &next).await? {
+        info!(lease = %name, "child receipt and footprint absence checkpointed");
+    } else {
+        debug!(lease = %name, "child receipt checkpoint lost a status race");
+    }
+    Ok(Action::await_change())
+}
+
 /// Release the admission reservations and reach the terminal phase.
 ///
 /// Only ever called once the footprint has been *proven* absent — by an exact
@@ -4768,6 +4792,40 @@ enum ChildTargetAbsenceProof {
     NeverBound,
 }
 
+enum ChildProofAcknowledgement {
+    Receipt {
+        receipt: crate::crd::TeardownReceipt,
+        token: String,
+    },
+    NeverBound {
+        attempt_id: String,
+        verified_at: String,
+        token: String,
+    },
+}
+
+impl ChildProofAcknowledgement {
+    fn annotation(&self) -> &'static str {
+        match self {
+            Self::Receipt { .. } => crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
+            Self::NeverBound { .. } => crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
+        }
+    }
+
+    fn token(&self) -> &str {
+        match self {
+            Self::Receipt { token, .. } | Self::NeverBound { token, .. } => token,
+        }
+    }
+
+    fn absence_proof(&self) -> ChildTargetAbsenceProof {
+        match self {
+            Self::Receipt { .. } => ChildTargetAbsenceProof::VerifiedDestroyReceipt,
+            Self::NeverBound { .. } => ChildTargetAbsenceProof::NeverBound,
+        }
+    }
+}
+
 /// Retire execution authority before `FootprintAbsent` is allowed to become
 /// durable. Receipt-backed cleanup may mark an exact running record cancelled
 /// because the whole target is gone; NeverBound requires an empty manifest and
@@ -4912,12 +4970,14 @@ async fn release_child_composition(
                         .as_ref()
                         .is_some_and(|receipt| {
                             recorded_pool.is_some_and(|pool| {
-                                receipt_proves_child_gone(
+                                validated_child_receipt_token(
+                                    &unrecorded,
                                     receipt,
                                     &reference,
                                     recorded_instance,
                                     pool,
                                 )
+                                .is_some()
                             })
                         })
                         || unbound_child_release_is_proven(&unrecorded, recorded_instance);
@@ -5111,36 +5171,38 @@ async fn release_child_composition(
             let recorded_pool = recorded_child_pool(&status, &ctx.namespace);
             let child_status = current.status.clone().unwrap_or_default();
 
-            match child_status.teardown_receipt.as_ref() {
-                Some(receipt)
-                    if recorded_pool.is_some_and(|recorded_pool| {
-                        receipt_proves_child_gone(
-                            receipt,
-                            recorded,
-                            recorded_instance,
-                            recorded_pool,
-                        )
-                    }) =>
-                {
-                    if let Some(action) = cleanup_child_executions_after_proof(
-                        lease,
-                        ctx,
-                        ChildTargetAbsenceProof::VerifiedDestroyReceipt,
-                    )
-                    .await?
-                    {
-                        return Ok(action);
-                    }
-                    info!(lease = %name, "child teardown receipt verified");
-                    return finish_release(lease, ctx, reason).await;
-                }
-                // A receipt exists but is not about this instance, or does not
-                // say Verified. Present-but-wrong is worse than absent: it is
-                // the case a laxer check would accept.
-                Some(_) => {
+            if let Some(receipt) = child_status.teardown_receipt.as_ref() {
+                let Some(recorded_pool) = recorded_pool else {
+                    return quarantine_lease(lease, ctx, "child_pool_provenance_invalid").await;
+                };
+                let Some(token) = validated_child_receipt_token(
+                    &current,
+                    receipt,
+                    recorded,
+                    recorded_instance,
+                    recorded_pool,
+                ) else {
                     return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
+                };
+                if status
+                    .child_teardown_receipt_acknowledgement
+                    .as_deref()
+                    .is_some_and(|checkpoint| checkpoint != token)
+                {
+                    return quarantine_lease(lease, ctx, "child_receipt_acknowledgement_changed")
+                        .await;
                 }
-                None => {}
+                if let Some(action) = cleanup_child_executions_after_proof(
+                    lease,
+                    ctx,
+                    ChildTargetAbsenceProof::VerifiedDestroyReceipt,
+                )
+                .await?
+                {
+                    return Ok(action);
+                }
+                info!(lease = %name, "child teardown receipt and execution cleanup verified");
+                return checkpoint_child_receipt_absence(lease, ctx, &token).await;
             }
 
             // #80 could not prove the cluster's own teardown. A complete
@@ -5565,32 +5627,58 @@ async fn finish_child_release_after_proof(
         .target
         .as_ref()
         .and_then(|target| target.child_cluster_instance.as_ref());
-    let (ack_annotation, proof_path, proof_value, absence_proof) = if let Some(receipt) = current
+    let proof = if let Some(receipt) = current
         .status
         .as_ref()
         .and_then(|status| status.teardown_receipt.as_ref())
-        .filter(|receipt| {
-            recorded_pool.is_some_and(|recorded_pool| {
-                receipt_proves_child_gone(receipt, recorded, recorded_instance, recorded_pool)
-            })
-        }) {
-        (
-            crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
-            "/status/teardownReceipt/attemptId",
-            receipt.attempt_id.clone(),
-            ChildTargetAbsenceProof::VerifiedDestroyReceipt,
-        )
+    {
+        let Some(recorded_pool) = recorded_pool else {
+            return record_post_proof_cleanup_failure(
+                lease,
+                ctx,
+                "ChildPoolProvenanceMissing",
+                "Workload absence is proven, but exact child pool provenance is missing",
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        };
+        let Some(token) = validated_child_receipt_token(
+            &current,
+            receipt,
+            recorded,
+            recorded_instance,
+            recorded_pool,
+        ) else {
+            return record_post_proof_cleanup_failure(
+                lease,
+                ctx,
+                "ChildReceiptChangedAfterCheckpoint",
+                "Workload absence is proven, but the exact child receipt no longer validates",
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        };
+        ChildProofAcknowledgement::Receipt {
+            receipt: receipt.clone(),
+            token,
+        }
     } else if unbound_child_release_is_proven(&current, recorded_instance) {
-        (
-            crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
-            "/status/unboundReleaseVerifiedAt",
-            current
-                .status
-                .as_ref()
-                .and_then(|status| status.unbound_release_verified_at.clone())
+        let child_status = current
+            .status
+            .as_ref()
+            .expect("verified NeverBound proof has status");
+        ChildProofAcknowledgement::NeverBound {
+            attempt_id: child_status
+                .teardown_attempt_id
+                .clone()
+                .expect("verified NeverBound proof has an attempt"),
+            verified_at: child_status
+                .unbound_release_verified_at
+                .clone()
                 .expect("verified NeverBound proof has a timestamp"),
-            ChildTargetAbsenceProof::NeverBound,
-        )
+            token: crate::controllers::lease::unbound_release_acknowledgement_token(child_status)
+                .expect("verified NeverBound proof has an attempt-bound token"),
+        }
     } else {
         return record_post_proof_cleanup_failure(
             lease,
@@ -5607,7 +5695,7 @@ async fn finish_child_release_after_proof(
     // now, while the exact receipt/NeverBound handle is still retained and
     // before ACK, handle deletion, reservation release, or terminal status.
     if ctx.access_ledger_enabled {
-        let outcome = match absence_proof {
+        let outcome = match proof.absence_proof() {
             ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
                 crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
                     &ctx.client,
@@ -5657,11 +5745,28 @@ async fn finish_child_release_after_proof(
         }
     }
 
+    if let ChildProofAcknowledgement::Receipt { token, .. } = &proof {
+        match status.child_teardown_receipt_acknowledgement.as_deref() {
+            Some(checkpoint) if checkpoint == token => {}
+            Some(_) => {
+                return record_post_proof_cleanup_failure(
+                    lease,
+                    ctx,
+                    "ChildReceiptCheckpointChanged",
+                    "Workload absence is proven, but its receipt checkpoint changed",
+                    std::time::Duration::from_secs(300),
+                )
+                .await;
+            }
+            None => return checkpoint_child_receipt_absence(lease, ctx, token).await,
+        }
+    }
+
     let ack_is_exact = |handle: &crate::crd::ClusterLease| {
         handle
             .annotations()
-            .get(ack_annotation)
-            .is_some_and(|ack| ack == &proof_value)
+            .get(proof.annotation())
+            .is_some_and(|ack| ack == proof.token())
     };
     let stale_rejection_is_exact = |handle: &crate::crd::ClusterLease| {
         lease.uid().is_some_and(|outer_uid| {
@@ -5673,14 +5778,7 @@ async fn finish_child_release_after_proof(
     };
 
     if current.metadata.deletion_timestamp.is_some() {
-        // The consumer may have rejected and retired a late Pending handle
-        // while this exact outer lease was already Releasing. At this point
-        // FootprintAbsent and the exact receipt/NeverBound proof were both
-        // revalidated above, so that exact rejection marker is equivalent to
-        // the ACK the outer would otherwise write.
-        if (!ack_is_exact(&current) && !stale_rejection_is_exact(&current))
-            || !internal_handle_retention_fence_matches(&current, lease, chrono::Utc::now(), true)
-        {
+        if !internal_handle_retention_fence_matches(&current, lease, chrono::Utc::now(), true) {
             return record_post_proof_cleanup_failure(
                 lease,
                 ctx,
@@ -5689,6 +5787,16 @@ async fn finish_child_release_after_proof(
                 std::time::Duration::from_secs(300),
             )
             .await;
+        }
+        // The receipt finalizer keeps a directly-deleted handle patchable. ACK
+        // it here after exact proof revalidation; the producer may remove that
+        // finalizer only after observing this token. A stale-rejected Pending
+        // handle already carries the equivalent exact outer-UID fence.
+        if !ack_is_exact(&current) && !stale_rejection_is_exact(&current) {
+            let Some(_) = acknowledge_child_proof(&internal, &current, &proof).await? else {
+                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+            };
+            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
         }
         return finish_release(lease, ctx, reason).await;
     }
@@ -5722,15 +5830,7 @@ async fn finish_child_release_after_proof(
     }
 
     if !ack_is_exact(&current) {
-        let Some(updated) = acknowledge_child_proof(
-            &internal,
-            &current,
-            ack_annotation,
-            proof_path,
-            &proof_value,
-        )
-        .await?
-        else {
+        let Some(updated) = acknowledge_child_proof(&internal, &current, &proof).await? else {
             debug!(lease = %name, "child proof ACK lost an object race");
             return Ok(Action::requeue(std::time::Duration::from_secs(5)));
         };
@@ -5797,44 +5897,128 @@ async fn finish_child_release_after_proof(
     }
 }
 
-/// Whether a child teardown receipt proves THIS lease's cluster gone.
+/// Validate a child producer's receipt against controller-owned bind-time
+/// scope and return its exact acknowledgement token.
 ///
-/// #80's own gate already ran inside the `ClusterLease` controller before the
-/// receipt was written; this is the outer lease checking the one thing that
-/// gate cannot know — that the evidence is about the instance this Sandbox was
-/// actually placed on.
-///
-/// A same-named replacement instance is fresh capacity, not proof the original
-/// was reset, so the UID recorded at composition time is what must match. An
-/// unrecorded instance UID fails closed: two absent UIDs would otherwise
-/// compare equal and any receipt would satisfy any lease.
-fn receipt_proves_child_gone(
+/// No expected field is reconstructed from the receipt. The reciprocal
+/// binding supplies cleanup mode, creation manifest, connect-token UID and
+/// durable attempt; the outer Sandbox supplies the exact handle, pool and
+/// instance identities it checkpointed before release.
+fn validated_child_receipt_token(
+    lease: &crate::crd::ClusterLease,
     receipt: &crate::crd::TeardownReceipt,
     recorded_lease: &crate::crd::SandboxObjectReference,
     recorded_instance: Option<&crate::crd::SandboxObjectReference>,
     recorded_pool: &crate::crd::SandboxObjectReference,
-) -> bool {
-    if receipt.outcome != crate::crd::TeardownOutcome::Verified
-        || receipt.completed_at.is_none()
-        || crate::crd::TeardownReceipt::outcome_for(&receipt.checks)
-            != crate::crd::TeardownOutcome::Verified
-        || receipt.schema_version != crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION
+) -> Option<String> {
+    let namespace = recorded_lease.namespace.as_deref()?;
+    let status = lease.status.as_ref()?;
+    let binding = status.binding.as_ref()?;
+    if lease.name_any() != recorded_lease.name
+        || lease.uid().as_deref() != Some(recorded_lease.uid.as_str())
+        || lease.metadata.generation != recorded_lease.generation
+        || binding.lease.name != recorded_lease.name
+        || binding.lease.uid.as_deref() != Some(recorded_lease.uid.as_str())
+        || binding.pool.name != recorded_pool.name
+        || binding.pool.uid.as_deref() != Some(recorded_pool.uid.as_str())
     {
-        return false;
+        return None;
     }
     let Some(expected) = recorded_instance else {
-        return false;
+        return None;
     };
-    let Some(proven) = receipt.instance.uid.as_deref() else {
-        return false;
+    if expected.uid.is_empty()
+        || binding.instance.name != expected.name
+        || binding.instance.uid != expected.uid
+        || binding.instance.observed_generation != expected.generation?
+    {
+        return None;
+    }
+
+    validated_binding_receipt_token(lease, receipt, namespace)
+}
+
+/// Validate the producer-owned half of a retained receipt.
+///
+/// The outer consumer additionally checks its independently checkpointed
+/// handle, pool and instance references in [`validated_child_receipt_token`].
+/// The tombstone sweep can still revalidate this controller-owned reciprocal
+/// binding after the outer Sandbox has legitimately disappeared.
+fn validated_binding_receipt_token(
+    lease: &crate::crd::ClusterLease,
+    receipt: &crate::crd::TeardownReceipt,
+    namespace: &str,
+) -> Option<String> {
+    let status = lease.status.as_ref()?;
+    let binding = status.binding.as_ref()?;
+    let durable_attempt = status.teardown_attempt_id.as_deref()?;
+    if status.phase != crate::crd::LeasePhase::Recycling
+        || lease.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
+        || binding.cleanup_mode != crate::crd::CleanupMode::VerifiedDestroy
+        || receipt.attempt_id != durable_attempt
+    {
+        return None;
+    }
+    let manifest = binding.creation_manifest.as_ref()?;
+    if manifest.validate().is_err()
+        || manifest.namespace != namespace
+        || manifest.instance.name != binding.instance.name
+        || manifest.instance.uid.as_deref() != Some(binding.instance.uid.as_str())
+        || manifest.backend_type != binding.backend.backend_type
+        || manifest.config_digest != binding.backend.config_digest
+    {
+        return None;
+    }
+    let manifest_digest = manifest.digest().ok()?;
+    if binding.creation_manifest_digest.as_deref() != Some(manifest_digest.as_str()) {
+        return None;
+    }
+    let connect_token = binding.connect_token.as_ref()?;
+    if crate::api::connect::require_connect_token_identity_shape(
+        connect_token,
+        namespace,
+        &binding.lease.name,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let mut required_subjects = manifest.required_subjects();
+    required_subjects.push(crate::crd::TeardownSubject::ConnectTokenSecret);
+    let mut recorded_identities = manifest.recorded_identities();
+    recorded_identities.push(connect_token.canonical_id());
+    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
+    let scope = crate::crd::TeardownScope {
+        lease: &binding.lease,
+        instance: &manifest.instance,
+        pool: &binding.pool,
+        backend_type: &backend_type,
+        config_digest: &binding.backend.config_digest,
+        instance_spec_digest: &binding.instance_spec_digest,
+        creation_manifest_digest: &manifest_digest,
+        cleanup_mode: binding.cleanup_mode,
+        attempt_id: durable_attempt,
+        creation_manifest: Some(manifest),
+        connect_token_identity: Some(connect_token),
+        required_subjects: &required_subjects,
+        instance_name: &binding.instance.name,
+        recorded_identities: &recorded_identities,
     };
-    !expected.uid.is_empty()
-        && proven == expected.uid
-        && receipt.instance.name == expected.name
-        && receipt.lease.name == recorded_lease.name
-        && receipt.lease.uid.as_deref() == Some(recorded_lease.uid.as_str())
-        && receipt.pool.name == recorded_pool.name
-        && receipt.pool.uid.as_deref() == Some(recorded_pool.uid.as_str())
+    receipt
+        .permits_release_for(&scope)
+        .then(|| receipt.acknowledgement_token())
+        .flatten()
+}
+
+/// Revalidate a retained producer receipt using only its controller-owned
+/// reciprocal binding. This is used by the post-retention tombstone sweep,
+/// after the outer Sandbox may no longer exist to supply duplicate references.
+fn validated_retained_receipt_token(
+    lease: &crate::crd::ClusterLease,
+    receipt: &crate::crd::TeardownReceipt,
+) -> Option<String> {
+    let namespace = lease.namespace()?;
+    validated_binding_receipt_token(lease, receipt, &namespace)
 }
 
 fn recorded_child_pool<'a>(
@@ -5925,16 +6109,7 @@ fn unbound_child_release_is_proven(
         && status.cluster_name.is_none()
         && status.teardown_receipt.is_none()
         && recorded_instance.is_none()
-        && status
-            .unbound_release_verified_at
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some()
-        && status.conditions.iter().any(|condition| {
-            condition.condition_type == "AllocationAbsent"
-                && condition.status == "True"
-                && condition.reason == "NeverBound"
-        })
+        && crate::controllers::lease::unbound_release_acknowledgement_token(&status).is_some()
 }
 
 /// Ask the internal lease to release, fenced on the exact object.
@@ -5974,14 +6149,12 @@ async fn request_child_release(
 
 /// ACK the exact receipt or NeverBound proof after the outer checkpoint.
 ///
-/// The annotation value names the exact proof attempt/timestamp, not a boolean,
-/// and both the object and proof fields are tested in the same JSON patch.
+/// Receipt ACK tests the complete receipt and binding, not only its attempt
+/// nonce. NeverBound ACK tests both the durable attempt and absence timestamp.
 async fn acknowledge_child_proof(
     internal: &Api<crate::crd::ClusterLease>,
     current: &crate::crd::ClusterLease,
-    annotation: &str,
-    proof_path: &str,
-    proof: &str,
+    proof: &ChildProofAcknowledgement,
 ) -> Result<Option<crate::crd::ClusterLease>, SandboxPlacementError> {
     let (Some(uid), Some(resource_version)) = (current.uid(), current.resource_version()) else {
         return Err(SandboxPlacementError::Invalid(
@@ -5989,13 +6162,37 @@ async fn acknowledge_child_proof(
         ));
     };
     let mut annotations = current.metadata.annotations.clone().unwrap_or_default();
-    annotations.insert(annotation.into(), proof.to_string());
-    let patch = crate::controllers::lease::json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": uid },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
-        { "op": "test", "path": proof_path, "value": proof },
-        { "op": "add", "path": "/metadata/annotations", "value": annotations }
-    ]));
+    annotations.insert(proof.annotation().into(), proof.token().to_string());
+    let mut operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
+    ];
+    match proof {
+        ChildProofAcknowledgement::Receipt { receipt, .. } => {
+            operations.extend([
+                serde_json::json!({ "op": "test", "path": "/spec/cleanupMode", "value": "VerifiedDestroy" }),
+                serde_json::json!({ "op": "test", "path": "/status/binding", "value": current.status.as_ref().and_then(|status| status.binding.as_ref()) }),
+                serde_json::json!({ "op": "test", "path": "/status/teardownAttemptId", "value": receipt.attempt_id }),
+                serde_json::json!({ "op": "test", "path": "/status/teardownReceipt", "value": receipt }),
+            ]);
+        }
+        ChildProofAcknowledgement::NeverBound {
+            attempt_id,
+            verified_at,
+            ..
+        } => {
+            operations.extend([
+                serde_json::json!({ "op": "test", "path": "/status/teardownAttemptId", "value": attempt_id }),
+                serde_json::json!({ "op": "test", "path": "/status/unboundReleaseVerifiedAt", "value": verified_at }),
+            ]);
+        }
+    }
+    operations.push(serde_json::json!({
+        "op": "add",
+        "path": "/metadata/annotations",
+        "value": annotations
+    }));
+    let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(operations));
     match internal
         .patch(
             &current.name_any(),
@@ -11732,17 +11929,15 @@ pub(crate) mod tests {
     async fn restart_from_footprint_proof_skips_claim_and_child_teardown() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        mount_child_handle_cleanup(
-            &server,
-            1,
-            Some(verified_receipt("kobe-abc123", "child-instance-uid")),
-        )
-        .await;
+        let receipt = verified_receipt("kobe-abc123", "child-instance-uid");
+        let receipt_token = receipt_acknowledgement_token(&receipt);
+        mount_child_handle_cleanup(&server, 1, Some(receipt)).await;
         let mut lease = child_placed_lease("child-lease-uid");
         {
             let status = lease.status.as_mut().unwrap();
             status.phase = crate::crd::SandboxLeasePhase::Releasing;
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+            status.child_teardown_receipt_acknowledgement = Some(receipt_token);
         }
         lease.status.as_mut().unwrap().conditions = with_condition(
             &lease,
@@ -11818,12 +12013,9 @@ pub(crate) mod tests {
     async fn reservation_failure_retains_footprint_proof_for_retry() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
-        mount_child_handle_cleanup(
-            &server,
-            1,
-            Some(verified_receipt("kobe-abc123", "child-instance-uid")),
-        )
-        .await;
+        let receipt = verified_receipt("kobe-abc123", "child-instance-uid");
+        let receipt_token = receipt_acknowledgement_token(&receipt);
+        mount_child_handle_cleanup(&server, 1, Some(receipt)).await;
         Mock::given(method("GET"))
             .and(path(RESERVATIONS_PATH))
             .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
@@ -11840,6 +12032,7 @@ pub(crate) mod tests {
             let status = lease.status.as_mut().unwrap();
             status.phase = crate::crd::SandboxLeasePhase::Releasing;
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+            status.child_teardown_receipt_acknowledgement = Some(receipt_token);
         }
         lease.status.as_mut().unwrap().conditions = with_condition(
             &lease,
@@ -12527,6 +12720,7 @@ pub(crate) mod tests {
             status["binding"] = serde_json::to_value(child_binding()).unwrap();
         }
         if let Some(receipt) = receipt {
+            status["teardownAttemptId"] = receipt["attemptId"].clone();
             status["teardownReceipt"] = receipt;
         }
         serde_json::json!({
@@ -12564,7 +12758,103 @@ pub(crate) mod tests {
         })
     }
 
+    fn child_creation_manifest() -> crate::crd::TeardownCreationManifest {
+        use crate::crd::{
+            CreationControlRelation, CreationManifestResource, KubernetesResourceIdentity,
+        };
+
+        let instance = KubernetesResourceIdentity {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some(NS.into()),
+            name: "kobe-abc123".into(),
+            uid: "child-instance-uid".into(),
+        };
+        let namespaced =
+            |api_version: &str, kind: &str, name: &str, uid: &str| KubernetesResourceIdentity {
+                api_version: api_version.into(),
+                kind: kind.into(),
+                namespace: Some(NS.into()),
+                name: name.into(),
+                uid: uid.into(),
+            };
+        let stateful_set = namespaced("apps/v1", "StatefulSet", "kobe-abc123-server", "sts-uid");
+        let owned = |subject, resource| CreationManifestResource {
+            subject,
+            resource,
+            controller: instance.clone(),
+            control_relation: CreationControlRelation::ControllerOwner,
+        };
+        let manifest = crate::crd::TeardownCreationManifest {
+            schema_version: crate::crd::TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION,
+            instance: crate::crd::ResourceRef {
+                name: "kobe-abc123".into(),
+                uid: Some("child-instance-uid".into()),
+            },
+            namespace: NS.into(),
+            backend_type: crate::crd::BackendType::K3s,
+            config_digest: crate::crd::BackendProvenance::from_config(&crate::crd::BackendConfig {
+                backend_type: crate::crd::BackendType::K3s,
+                ..Default::default()
+            })
+            .unwrap()
+            .config_digest,
+            service_cidr: "10.43.0.0/16".into(),
+            cluster_cidr: "10.42.0.0/16".into(),
+            server_replicas: 1,
+            agent_replicas: 0,
+            resources: vec![
+                owned(
+                    crate::crd::TeardownSubject::ServerStatefulSet,
+                    stateful_set.clone(),
+                ),
+                owned(
+                    crate::crd::TeardownSubject::Service,
+                    namespaced("v1", "Service", "kobe-abc123-server", "service-uid"),
+                ),
+                owned(
+                    crate::crd::TeardownSubject::PublisherConfigMap,
+                    namespaced(
+                        "v1",
+                        "ConfigMap",
+                        "kobe-abc123-kubeconfig-publisher",
+                        "publisher-uid",
+                    ),
+                ),
+                owned(
+                    crate::crd::TeardownSubject::TokenSecret,
+                    namespaced("v1", "Secret", "kobe-abc123-token", "token-uid"),
+                ),
+                owned(
+                    crate::crd::TeardownSubject::KubeconfigSecret,
+                    namespaced("v1", "Secret", "kobe-abc123-kubeconfig", "kubeconfig-uid"),
+                ),
+                owned(
+                    crate::crd::TeardownSubject::CidrClaim,
+                    namespaced(
+                        "kobe.kunobi.ninja/v1alpha1",
+                        "CIDRClaim",
+                        "kobe-abc123",
+                        "cidr-uid",
+                    ),
+                ),
+                CreationManifestResource {
+                    subject: crate::crd::TeardownSubject::ServerPods,
+                    resource: namespaced("v1", "Pod", "kobe-abc123-server-0", "pod-uid"),
+                    controller: stateful_set,
+                    control_relation: CreationControlRelation::ControllerOwner,
+                },
+            ],
+            storage: Vec::new(),
+            datastore: crate::crd::DatastoreProvenance::EmbeddedSqlite,
+            sealed_at: "2026-01-01T00:00:00Z".into(),
+        };
+        assert_eq!(manifest.validate(), Ok(()));
+        manifest
+    }
+
     fn child_binding() -> crate::crd::LeaseBinding {
+        let manifest = child_creation_manifest();
         crate::crd::LeaseBinding {
             binding_id: "31ec124f-b731-4e85-8d74-b306f2da7772".into(),
             lease: crate::crd::ResourceRef {
@@ -12580,11 +12870,22 @@ pub(crate) mod tests {
                 name: "children".into(),
                 uid: Some("cluster-pool-uid".into()),
             },
-            backend: crate::crd::BackendProvenance::from_config(
-                &crate::crd::BackendConfig::default(),
-            )
-            .unwrap(),
-            instance_spec_digest: "0123456789abcdef".into(),
+            backend: crate::crd::BackendProvenance {
+                backend_type: crate::crd::BackendType::K3s,
+                config_digest: manifest.config_digest.clone(),
+                capi: None,
+            },
+            instance_spec_digest: "d".repeat(64),
+            cleanup_mode: crate::crd::CleanupMode::VerifiedDestroy,
+            creation_manifest_digest: Some(manifest.digest().unwrap()),
+            creation_manifest: Some(manifest),
+            connect_token: Some(crate::crd::KubernetesResourceIdentity {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: Some(NS.into()),
+                name: "kobe-sbx-sbx-1-connect-token".into(),
+                uid: "connect-token-uid".into(),
+            }),
         }
     }
 
@@ -12609,6 +12910,9 @@ pub(crate) mod tests {
 
     fn child_cluster_instance_json() -> serde_json::Value {
         let binding = child_binding();
+        let spec_hash = binding.instance_spec_digest.clone();
+        let backend = binding.backend.clone();
+        let creation_manifest = binding.creation_manifest.clone();
         serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "ClusterInstance",
@@ -12633,12 +12937,13 @@ pub(crate) mod tests {
                 "bootstrapped": true,
                 "leaseRef": { "name": "kobe-sbx-sbx-1", "uid": "child-lease-uid" },
                 "binding": binding,
-                "specHash": "0123456789abcdef",
+                "specHash": spec_hash,
+                "creationManifest": creation_manifest,
                 "createdWith": {
                     "operatorVersion": "v0.40.0",
                     "backendType": "k3s",
                     "poolUid": "cluster-pool-uid",
-                    "backend": child_binding().backend
+                    "backend": backend
                 }
             }
         })
@@ -13160,14 +13465,25 @@ current-context: child
         visible_reads: u64,
         receipt: Option<serde_json::Value>,
     ) {
-        let mut visible = child_cluster_lease("child-lease-uid", "Released", receipt.clone());
+        let phase = if receipt.is_some() {
+            "Recycling"
+        } else {
+            "Released"
+        };
+        let mut visible = child_cluster_lease("child-lease-uid", phase, receipt.clone());
         let (ack_key, proof_value) = if let Some(receipt) = receipt.as_ref() {
+            let receipt: crate::crd::TeardownReceipt =
+                serde_json::from_value(receipt.clone()).expect("receipt fixture parses");
             (
                 crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
-                receipt["attemptId"].as_str().unwrap().to_string(),
+                receipt
+                    .acknowledgement_token()
+                    .expect("complete receipt acknowledgement token"),
             )
         } else {
+            let attempt = "never-bound-attempt-1";
             let proof = "2026-08-20T00:00:00Z".to_string();
+            visible["status"]["teardownAttemptId"] = attempt.into();
             visible["status"]["unboundReleaseVerifiedAt"] = proof.clone().into();
             visible["status"]["conditions"] = serde_json::json!([{
                 "type": "AllocationAbsent",
@@ -13178,7 +13494,7 @@ current-context: child
             }]);
             (
                 crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
-                proof,
+                format!("{attempt}:{proof}"),
             )
         };
         serde_json::from_value::<crate::crd::ClusterLease>(visible.clone())
@@ -13216,20 +13532,52 @@ current-context: child
 
     /// A receipt about the exact instance recorded at composition time.
     fn verified_receipt(instance_name: &str, instance_uid: &str) -> serde_json::Value {
-        serde_json::json!({
-            "schemaVersion": crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION,
-            "attemptId": "attempt-1",
-            "lease": { "name": "kobe-sbx-sbx-1", "uid": "child-lease-uid" },
-            "instance": { "name": instance_name, "uid": instance_uid },
-            "pool": { "name": "children", "uid": "cluster-pool-uid" },
-            "backendType": "k3s",
-            "configDigest": "digest",
-            "instanceSpecDigest": "spec-digest",
-            "startedAt": "2026-01-01T00:00:00Z",
-            "completedAt": "2026-01-01T00:05:00Z",
-            "checks": [{ "subject": "serverStatefulSet", "result": "verified" }],
-            "outcome": "verified",
+        let binding = child_binding();
+        let manifest = binding.creation_manifest.as_ref().unwrap();
+        let connect_token = binding.connect_token.as_ref().unwrap();
+        let mut subjects = manifest.required_subjects();
+        subjects.push(crate::crd::TeardownSubject::ConnectTokenSecret);
+        let checks = subjects
+            .into_iter()
+            .map(|subject| crate::crd::TeardownCheck {
+                subject,
+                result: crate::crd::CheckResult::Verified,
+                reason: None,
+                verified: if subject == crate::crd::TeardownSubject::ConnectTokenSecret {
+                    vec![connect_token.canonical_id()]
+                } else {
+                    manifest.identities_for_subject(subject)
+                },
+            })
+            .collect();
+        serde_json::to_value(crate::crd::TeardownReceipt {
+            schema_version: crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION,
+            attempt_id: "attempt-1".into(),
+            lease: binding.lease,
+            instance: crate::crd::ResourceRef {
+                name: instance_name.into(),
+                uid: Some(instance_uid.into()),
+            },
+            pool: binding.pool,
+            backend_type: "k3s".into(),
+            config_digest: binding.backend.config_digest,
+            instance_spec_digest: binding.instance_spec_digest,
+            creation_manifest_digest: binding.creation_manifest_digest.unwrap(),
+            cleanup_mode: crate::crd::CleanupMode::VerifiedDestroy,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:05:00Z".into()),
+            checks,
+            retry_count: 0,
+            outcome: crate::crd::TeardownOutcome::Verified,
         })
+        .unwrap()
+    }
+
+    fn receipt_acknowledgement_token(receipt: &serde_json::Value) -> String {
+        serde_json::from_value::<crate::crd::TeardownReceipt>(receipt.clone())
+            .expect("receipt fixture parses")
+            .acknowledgement_token()
+            .expect("complete receipt acknowledgement token")
     }
 
     const CLUSTER_LEASE_PATH: &str =
@@ -13874,8 +14222,10 @@ current-context: child
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
         let pending = child_cluster_lease("child-lease-uid", "Pending", None);
+        let attempt = "never-bound-attempt-1";
         let proof = "2026-08-20T00:00:00Z";
         let mut never_bound = child_cluster_lease("child-lease-uid", "Released", None);
+        never_bound["status"]["teardownAttemptId"] = attempt.into();
         never_bound["status"]["unboundReleaseVerifiedAt"] = proof.into();
         never_bound["status"]["conditions"] = serde_json::json!([{
             "type": "AllocationAbsent",
@@ -13887,7 +14237,8 @@ current-context: child
         let mut acknowledged = never_bound.clone();
         acknowledged["metadata"]["resourceVersion"] = "43".into();
         acknowledged["metadata"]["annotations"]
-            [crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION] = proof.into();
+            [crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION] =
+            format!("{attempt}:{proof}").into();
         let mut terminating = acknowledged.clone();
         terminating["metadata"]["resourceVersion"] = "44".into();
         terminating["metadata"]["deletionTimestamp"] = "2026-08-20T00:10:00Z".into();
@@ -14249,7 +14600,7 @@ current-context: child
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(child_cluster_lease(
                     "child-lease-uid",
-                    "Released",
+                    "Recycling",
                     Some(verified_receipt("kobe-abc123", "child-instance-uid")),
                 )),
             )
@@ -14318,8 +14669,10 @@ current-context: child
         .to_string();
         mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
 
+        let attempt = "never-bound-attempt-1";
         let proof = "2026-08-20T00:00:00Z";
         let mut never_bound = child_cluster_lease("child-lease-uid", "Released", None);
+        never_bound["status"]["teardownAttemptId"] = attempt.into();
         never_bound["status"]["unboundReleaseVerifiedAt"] = proof.into();
         never_bound["status"]["conditions"] = serde_json::json!([{
             "type": "AllocationAbsent",
@@ -14448,7 +14801,7 @@ current-context: child
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(child_cluster_lease(
                     "child-lease-uid",
-                    "Released",
+                    "Recycling",
                     Some(verified_receipt("kobe-later", "a-later-instance-uid")),
                 )),
             )
@@ -14538,7 +14891,20 @@ current-context: child
         };
         let proves = |receipt: &crate::crd::TeardownReceipt,
                       instance: Option<&crate::crd::SandboxObjectReference>| {
-            receipt_proves_child_gone(receipt, &recorded_lease, instance, &recorded_pool)
+            let lease: crate::crd::ClusterLease = serde_json::from_value(child_cluster_lease(
+                "child-lease-uid",
+                "Recycling",
+                Some(serde_json::to_value(receipt).unwrap()),
+            ))
+            .unwrap();
+            validated_child_receipt_token(
+                &lease,
+                receipt,
+                &recorded_lease,
+                instance,
+                &recorded_pool,
+            )
+            .is_some()
         };
 
         let good = parse(verified_receipt("kobe-abc123", "child-instance-uid"));

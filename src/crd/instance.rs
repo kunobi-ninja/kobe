@@ -1,4 +1,6 @@
-use crate::crd::teardown::TeardownSubject;
+use crate::crd::teardown::{
+    CleanupMode, KubernetesResourceIdentity, TeardownCreationManifest, TeardownSubject,
+};
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -132,6 +134,35 @@ pub struct LeaseBinding {
     pub backend: BackendProvenance,
     /// Instance creation/spec digest observed when the pair was bound.
     pub instance_spec_digest: String,
+
+    /// Cleanup contract captured when the reservation was created.
+    ///
+    /// This is authoritative for teardown. Reading the mutable lease spec at
+    /// teardown would allow a `VerifiedDestroy` lease to be downgraded after it
+    /// had used the capacity. `serde(default)` keeps legacy Standard bindings
+    /// readable, while the bind path writes this field for every new pair.
+    #[serde(default)]
+    pub cleanup_mode: CleanupMode,
+
+    /// Digest of the exact immutable creation manifest admitted at bind time.
+    /// Required when `cleanupMode=VerifiedDestroy`; absent for legacy Standard
+    /// bindings that predate creation manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_manifest_digest: Option<String>,
+
+    /// The immutable manifest itself, retained with the lease so a receipt
+    /// consumer can reconstruct the controller-authenticated teardown scope
+    /// after the `ClusterInstance` has been deleted. Required together with
+    /// `creationManifestDigest` for `VerifiedDestroy`; absent for Standard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_manifest: Option<TeardownCreationManifest>,
+
+    /// Exact lease-scoped connect-token Secret created before access is
+    /// granted. Its UID is part of the reciprocal binding so a same-named
+    /// replacement is never accepted, and verified teardown must prove this
+    /// exact Secret absent before it can emit a terminal receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_token: Option<KubernetesResourceIdentity>,
 }
 
 /// UID- and generation-fenced identity of the bound `ClusterInstance`.
@@ -160,7 +191,11 @@ pub struct BoundInstanceRef {
     status = "ClusterInstanceStatus",
     namespaced,
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.creationManifest) || (has(self.status) && self.status != null && has(self.status.creationManifest) && self.status.creationManifest == oldSelf.status.creationManifest)")
-        .message("status.creationManifest is immutable once sealed")
+        .message("status.creationManifest is immutable once sealed"),
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Lease","type":"string","jsonPath":".status.leaseRef.name"}"#,
+    printcolumn = r#"{"name":"Manifest","type":"integer","jsonPath":".status.creationManifest.schemaVersion"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterInstanceSpec {
@@ -312,16 +347,11 @@ pub struct ClusterInstanceStatus {
     /// `pool::profile_spec_hash` for the encoding (`{:016x}` of a `u64`).
     /// Equality comparison works directly via `==` on the string form.
     ///
-    /// `skip_serializing_if` is critical: this field is owned by the profile
-    /// controller (which writes `Some(...)` once at create time and on
-    /// subsequent reconciles), but the instance controller carries it through
-    /// every status patch via `spec_hash: status.spec_hash`. If the instance
-    /// controller's `status` read happens before the profile controller's
-    /// write, it holds `None` locally — and a JSON Merge Patch carrying
-    /// `"specHash": null` would *remove* the field from disk per RFC 7396.
-    /// Skipping serialization on `None` makes the field absent from the JSON
-    /// instead, which JSON Merge Patch interprets as "preserve on-disk
-    /// value" — closing the race regardless of which controller wins.
+    /// The instance and profile controllers replace status only after a fresh
+    /// read and copy this field forward under UID/resourceVersion tests.
+    /// `skip_serializing_if` remains part of the wire-compatibility contract for
+    /// older merge-patch writers: `None` is omitted rather than encoded as a
+    /// destructive RFC 7396 `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_hash: Option<String>,
 
@@ -345,13 +375,10 @@ pub struct ClusterInstanceStatus {
     /// treat the absence as "unknown / pre-provenance" and decide
     /// per-policy whether to migrate or leave alone.
     ///
-    /// `skip_serializing_if = "Option::is_none"` is critical here, same
-    /// pattern as `spec_hash` above: every status patch from the
-    /// instance controller constructs a fresh `ClusterInstanceStatus`
-    /// where this field defaults to `None`. Without `skip_serializing_if`,
-    /// the JSON Merge Patch would carry `"createdWith": null` and wipe
-    /// the on-disk value (RFC 7396). Skipping the field on `None`
-    /// preserves the original write through every subsequent patch.
+    /// Current status writers explicitly copy this value from a fresh,
+    /// UID/resourceVersion-fenced read before replacing status. The
+    /// `skip_serializing_if` shape is retained for older merge-patch writers so
+    /// `None` cannot serialize as a destructive RFC 7396 `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_with: Option<ClusterInstanceProvenance>,
 
@@ -386,12 +413,9 @@ pub struct ClusterInstanceStatus {
     /// so it always describes the most recent transition rather than a
     /// stale value.
     ///
-    /// `skip_serializing_if = "Option::is_none"` protects it from
-    /// cross-controller Merge-Patch erasure, same pattern as `spec_hash`:
-    /// a writer that leaves this `None` (e.g. the profile controller, or
-    /// a "ready / no message" instance-controller path) must omit the key
-    /// entirely, otherwise a JSON Merge Patch carrying `"message": null`
-    /// would wipe the on-disk value (RFC 7396).
+    /// Current full-status writers copy the observed message when their local
+    /// value is `None`; `skip_serializing_if` also protects compatibility with
+    /// older merge-patch writers by omitting a destructive RFC 7396 `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 
@@ -402,13 +426,10 @@ pub struct ClusterInstanceStatus {
     /// `kubectl` and ops tooling a familiar, machine-readable surface for
     /// *why* the instance is where it is.
     ///
-    /// `skip_serializing_if = "Vec::is_empty"` protects the list from
-    /// cross-controller Merge-Patch erasure, same pattern as `spec_hash`:
-    /// the profile controller (a separate status writer) re-emits status
-    /// without conditions of its own, so an empty `Vec` must be omitted
-    /// from the JSON entirely — otherwise a JSON Merge Patch carrying
-    /// `"conditions": []` would replace the on-disk list with an empty
-    /// one (RFC 7396 / array-replacement).
+    /// The profile controller copies existing conditions when it has no new
+    /// list, and the instance controller derives them centrally. Omitting an
+    /// empty list remains wire-compatible with older merge-patch writers, where
+    /// `"conditions": []` would erase the on-disk array.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<ClusterInstanceCondition>,
 }
@@ -918,6 +939,16 @@ mod tests {
             },
             backend: BackendProvenance::from_config(&BackendConfig::default()).unwrap(),
             instance_spec_digest: "0123456789abcdef".into(),
+            cleanup_mode: CleanupMode::VerifiedDestroy,
+            creation_manifest_digest: Some("manifest-digest".into()),
+            creation_manifest: None,
+            connect_token: Some(KubernetesResourceIdentity {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: Some("default".into()),
+                name: "lease-a-connect-token".into(),
+                uid: "token-uid".into(),
+            }),
         };
         let value = serde_json::to_value(&binding).unwrap();
         assert_eq!(value["bindingId"], "binding-1");
@@ -1135,6 +1166,9 @@ mod tests {
                 "creation manifest schema must retain {field}: {manifest}"
             );
         }
+        let binding = &root["properties"]["status"]["properties"]["binding"]["properties"];
+        assert_eq!(binding["creationManifestDigest"]["type"], "string");
+        assert_eq!(binding["creationManifest"]["type"], "object");
     }
 
     /// Legacy refs omit UID while new refs add it without changing the object

@@ -25,8 +25,8 @@ use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{
-    ClusterLease, ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase,
-    Requester,
+    ClusterLease, ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, ClusterPoolPhase,
+    LeaseBinding, LeasePhase, Requester,
 };
 use crate::lease_binding::{BindingResolutionError, BindingResolveMode, resolve_lease_binding};
 use crate::metrics;
@@ -517,11 +517,14 @@ struct PoolPolicyResponse {
 #[serde(rename_all = "camelCase")]
 struct ProfileResponse {
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<ClusterPoolPhase>,
     ready: u32,
     leased: u32,
     creating: u32,
     recycling: u32,
     unhealthy: u32,
+    quarantined: u32,
     queue_depth: u32,
     policy: PoolPolicyResponse,
 }
@@ -542,6 +545,8 @@ enum ErrorReason {
     /// Healthy-but-empty warm pool: still coming up. (Carried on a 202, not a
     /// 503 — the lease is expected to bind shortly.)
     Warming,
+    /// Release was refused because verified teardown remains quarantined.
+    TeardownQuarantined,
 }
 
 impl From<crate::metrics::LeaseUnsatisfiableReason> for ErrorReason {
@@ -595,11 +600,13 @@ fn profile_response(profile: &ClusterPool) -> ProfileResponse {
     let status = profile.status.clone().unwrap_or_default();
     ProfileResponse {
         name: profile.name_any(),
+        phase: status.phase,
         ready: status.ready,
         leased: status.leased,
         creating: status.creating,
         recycling: status.recycling,
         unhealthy: status.unhealthy,
+        quarantined: status.quarantined,
         queue_depth: status.queue_depth,
         policy: pool_policy_response(profile),
     }
@@ -763,7 +770,7 @@ fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Respons
         .max(pool.spec.size);
     let in_flight = status
         .as_ref()
-        .map(|s| s.ready + s.leased + s.creating + s.recycling + s.unhealthy)
+        .map(|s| s.ready + s.leased + s.creating + s.recycling + s.unhealthy + s.quarantined)
         .unwrap_or(0);
     let at_capacity = in_flight >= capacity;
 
@@ -778,6 +785,10 @@ fn pool_preflight_rejection(profile: &str, pool: &ClusterPool) -> Option<Respons
         Some(ClusterPoolPhase::Failing) if ready == 0 => Some(R::PoolExhausted),
         // In a backoff window AND no headroom to create or hand out a cluster.
         Some(ClusterPoolPhase::Backoff) if ready == 0 && at_capacity => Some(R::CapacityBlocked),
+        // Quarantine is deliberately capacity-holding. With no Ready member,
+        // accepting another lease would create a queue that cannot advance
+        // until teardown evidence is repaired.
+        Some(ClusterPoolPhase::Quarantined) if ready == 0 => Some(R::CapacityBlocked),
         // Failing/Backoff with Ready members, healthy-but-empty, scaling up,
         // idle, etc.: bindable now or a transient warm-up — proceed to the
         // normal 202 path.
@@ -1386,12 +1397,13 @@ async fn get_lease<B: ClusterBackend>(
                     None => Err(BindingResolutionError::LeaseUidMismatch),
                 };
                 if let Ok(resolved) = resolved {
-                    let cluster_name = resolved.binding.instance.name;
+                    let cluster_name = resolved.binding.instance.name.clone();
                     match connect_server_url(&headers, &id) {
                         Ok(server_url) => match ensure_lease_connect_token(
                             &state.client,
                             &state.namespace,
                             &lease,
+                            &resolved.binding,
                         )
                         .await
                         {
@@ -1577,11 +1589,42 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 .with_label_values(&["hit"])
                 .inc();
 
+            // Cache the expensive backend context, never the authorization.
+            // The Secret may have been deleted or recreated under the same
+            // name since this entry was built.
+            let live_token = match validate_lease_connect_token(
+                &state.client,
+                &state.namespace,
+                &lease_id,
+                connect_token,
+            )
+            .await
+            {
+                Ok(Some(token)) => token,
+                Ok(None) => {
+                    state.connect_cache.evict(&lease_id);
+                    return connect_reject(
+                        metrics::ConnectOutcome::InvalidToken,
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid lease token",
+                    );
+                }
+                Err(error) => {
+                    state.connect_cache.evict(&lease_id);
+                    return connect_infra_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to validate lease token",
+                        &error,
+                        metrics::ConnectErrorReason::LeaseLookup,
+                    );
+                }
+            };
+
             let resolved = match resolve_lease_binding(
                 &state.client,
                 &state.namespace,
                 &lease_id,
-                &cache_key.lease_uid,
+                &live_token.lease_uid,
                 BindingResolveMode::Access,
             )
             .await
@@ -1599,7 +1642,15 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 }
             };
 
-            if resolved.binding != ctx.binding
+            if live_token.lease_uid != cache_key.lease_uid
+                || resolved
+                    .binding
+                    .connect_token
+                    .as_ref()
+                    .is_some_and(|identity| identity != &live_token.identity)
+                || (resolved.binding.cleanup_mode.requires_receipt()
+                    && resolved.binding.connect_token.is_none())
+                || resolved.binding != ctx.binding
                 || resolved.binding.instance.uid != cache_key.instance_uid
             {
                 state.connect_cache.evict(&lease_id);
@@ -1631,7 +1682,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             // ── Full cold path: authenticate the token to its owner lease UID,
             // run exact resolution, dispatch from immutable provenance, then
             // extract/build/cache the backend context. ─────────────────────
-            let authenticated_lease_uid = match validate_lease_connect_token(
+            let authenticated_token = match validate_lease_connect_token(
                 &state.client,
                 &state.namespace,
                 &lease_id,
@@ -1639,7 +1690,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
             )
             .await
             {
-                Ok(Some(uid)) => uid,
+                Ok(Some(token)) => token,
                 Ok(None) => {
                     state.connect_cache.evict(&lease_id);
                     warn!(
@@ -1676,7 +1727,7 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                 &state.client,
                 &state.namespace,
                 &lease_id,
-                &authenticated_lease_uid,
+                &authenticated_token.lease_uid,
                 BindingResolveMode::Access,
             )
             .await
@@ -1693,6 +1744,22 @@ async fn connect_proxy_inner<B: ClusterBackend>(
                     return binding_resolution_response(err);
                 }
             };
+            if resolved
+                .binding
+                .connect_token
+                .as_ref()
+                .is_some_and(|identity| identity != &authenticated_token.identity)
+                || (resolved.binding.cleanup_mode.requires_receipt()
+                    && resolved.binding.connect_token.is_none())
+            {
+                state.connect_cache.evict(&lease_id);
+                return connect_reject_with_reason(
+                    metrics::ConnectOutcome::BackendError,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Lease connect-token identity changed",
+                    Some(metrics::ConnectErrorReason::CacheFence),
+                );
+            }
             let cluster = resolved.binding.instance.name.as_str();
             let resolved_backend = format!("{:?}", resolved.binding.backend.backend_type);
             let Some(factory) = state.factory.as_ref() else {
@@ -2112,6 +2179,21 @@ async fn release_lease<B: ClusterBackend>(
 
     let status = lease.status.clone().unwrap_or_default();
 
+    if status.phase == LeasePhase::Quarantined {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Lease is quarantined".to_string(),
+                detail: Some(
+                    "Verified teardown evidence is incomplete; release cannot downgrade it"
+                        .to_string(),
+                ),
+                reason: Some(ErrorReason::TeardownQuarantined),
+            }),
+        )
+            .into_response();
+    }
+
     if matches!(
         status.phase,
         LeasePhase::Released | LeasePhase::Expired | LeasePhase::Recycling
@@ -2129,6 +2211,7 @@ async fn release_lease<B: ClusterBackend>(
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
         { "op": "add", "path": "/status/phase", "value": "Released" }
     ]));
     if let Err(e) = leases_api
@@ -2506,6 +2589,7 @@ struct StatusPool {
     ready: u32,
     leased: u32,
     total: u32,
+    quarantined: u32,
 }
 
 /// Get accessible pools by provider/requester_type string.
@@ -2545,7 +2629,13 @@ async fn accessible_pool_statuses<B: ClusterBackend>(
                 name: profile.name_any(),
                 ready: status.ready,
                 leased: status.leased,
-                total: status.ready + status.leased + status.creating,
+                total: status.ready
+                    + status.leased
+                    + status.creating
+                    + status.recycling
+                    + status.unhealthy
+                    + status.quarantined,
+                quarantined: status.quarantined,
             }
         })
         .filter(|p| {
@@ -2888,6 +2978,10 @@ mod tests {
             )
             .unwrap(),
             instance_spec_digest: "0123456789abcdef".to_string(),
+            cleanup_mode: crate::crd::CleanupMode::Standard,
+            creation_manifest_digest: None,
+            creation_manifest: None,
+            connect_token: None,
         };
         ConnectCtx {
             cached_at: Instant::now(),
@@ -3463,6 +3557,10 @@ mod tests {
             )
             .unwrap(),
             instance_spec_digest: "0123456789abcdef".to_string(),
+            cleanup_mode: crate::crd::CleanupMode::Standard,
+            creation_manifest_digest: None,
+            creation_manifest: None,
+            connect_token: None,
         }
     }
 
@@ -3792,6 +3890,19 @@ mod tests {
                 "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
             ))
             .respond_with(ResponseTemplate::new(404))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
+            )
+            .with_priority(2)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -3912,9 +4023,10 @@ mod tests {
     /// The cache is a *credential* cache, never an *authorization* cache. It
     /// pins exactly which work a hit is allowed to skip:
     ///
-    /// - skipped on a hit: the connect-token Secret read and the backend
-    ///   kubeconfig read (both `expect(1)` — the expensive, mintable part);
-    /// - repeated on every hit: the UID-fenced binding resolution, which
+    /// - skipped on a hit: the backend kubeconfig read (the expensive,
+    ///   mintable part);
+    /// - repeated on every hit: connect-token authentication and UID-fenced
+    ///   binding resolution, which
     ///   re-GETs the lease (`expect(2)`) so release, expiry, or a rebind to a
     ///   different `ClusterInstance` UID is observed on the *next* request
     ///   rather than at cache-TTL expiry.
@@ -3955,8 +4067,8 @@ mod tests {
         use wiremock::matchers::{header, method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
 
-        // Token authentication runs only on the cold miss; the hit reuses the
-        // cached, token-fenced entry.
+        // Token authentication runs on every request. The cache holds backend
+        // context, not authorization, so deletion/replacement revokes at once.
         Mock::given(method("GET"))
             .and(path_regex(
                 "/api/v1/namespaces/.*/secrets/lease-abc-connect-token",
@@ -3965,7 +4077,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_json(secret_object_json("lease-abc-connect-token", "lease-token")),
             )
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         mount_exact_connect_objects(&server).await;
@@ -4017,8 +4129,8 @@ mod tests {
             "the miss should have populated the cache"
         );
 
-        // Second request: served from cache. The `expect(1)` mocks above will
-        // fail on server drop if this re-read the Secret or the lease.
+        // Second request: backend context is cached, while the exact Secret and
+        // binding are deliberately re-read.
         let second = make_request().await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(response_text(second).await, r#"{"gitVersion":"v1.32.0"}"#);
@@ -4811,5 +4923,24 @@ mod tests {
         ))
         .unwrap();
         assert!(pool_preflight_rejection("e2e-basic", &pool).is_none());
+    }
+
+    #[test]
+    fn pool_preflight_holds_quarantined_capacity_but_serves_ready_members() {
+        let held: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "Quarantined", "quarantined": 1, "ready": 0 }),
+        ))
+        .unwrap();
+        let response = pool_preflight_rejection("e2e-basic", &held)
+            .expect("quarantined-only capacity cannot advance a lease queue");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mixed: ClusterPool = serde_json::from_value(pool_with_status(
+            "e2e-basic",
+            serde_json::json!({ "phase": "Quarantined", "quarantined": 1, "ready": 1 }),
+        ))
+        .unwrap();
+        assert!(pool_preflight_rejection("e2e-basic", &mixed).is_none());
     }
 }

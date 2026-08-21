@@ -40,6 +40,10 @@ Queries `GET /v1/status` on the configured endpoint. Shows the operator version,
 
 Useful for verifying connectivity and checking which auth methods the endpoint accepts before logging in.
 
+Authenticated pool rows include the pool phase and a `quarantined` count. A
+non-zero count means cleanup evidence is incomplete and that capacity remains
+withheld; it is not reported as healthy or available.
+
 ---
 
 ## `kobe version`

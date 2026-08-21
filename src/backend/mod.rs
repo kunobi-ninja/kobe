@@ -65,12 +65,20 @@ pub(crate) async fn ensure_datastore_password(
     name: &str,
     namespace: &str,
     labels: BTreeMap<String, String>,
+    owner: Option<&OwnerReference>,
 ) -> Result<String> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret_name = format!("{name}-datastore");
 
-    if let Some(existing) = read_datastore_password(&secrets, &secret_name).await? {
-        return Ok(existing);
+    match secrets.get(&secret_name).await {
+        Ok(existing) => {
+            if let Some(owner) = owner {
+                require_exact_owner(&existing.metadata, owner)?;
+            }
+            return datastore_password_from_secret(&existing, &secret_name);
+        }
+        Err(kube::Error::Api(response)) if response.code == 404 => {}
+        Err(error) => return Err(error).context("Failed to read datastore password Secret"),
     }
 
     let password = {
@@ -80,13 +88,21 @@ pub(crate) async fn ensure_datastore_password(
         hex::encode(bytes)
     };
 
+    let mut metadata = ObjectMeta {
+        name: Some(secret_name.clone()),
+        namespace: Some(namespace.to_string()),
+        labels: Some(labels),
+        ..Default::default()
+    };
+    if let Some(owner) = owner {
+        metadata.owner_references = Some(vec![owner.clone()]);
+        metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("kobe.kunobi.ninja/instance-uid".into(), owner.uid.clone());
+    }
     let secret = Secret {
-        metadata: ObjectMeta {
-            name: Some(secret_name.clone()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
+        metadata,
         string_data: Some({
             let mut data = BTreeMap::new();
             data.insert("password".to_string(), password.clone());
@@ -100,37 +116,47 @@ pub(crate) async fn ensure_datastore_password(
         Err(kube::Error::Api(ae)) if ae.code == 409 => {
             // Lost the race. The other writer's password is the one the role
             // will be created with, so adopt it rather than overwriting.
-            read_datastore_password(&secrets, &secret_name)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Secret {secret_name} vanished after a 409"))
+            let existing = secrets
+                .get(&secret_name)
+                .await
+                .with_context(|| format!("Secret {secret_name} vanished after a 409"))?;
+            if let Some(owner) = owner {
+                require_exact_owner(&existing.metadata, owner)?;
+            }
+            datastore_password_from_secret(&existing, &secret_name)
         }
         Err(e) => Err(e).with_context(|| format!("Failed to create Secret {secret_name}")),
     }
 }
 
-async fn read_datastore_password(
-    secrets: &Api<Secret>,
-    secret_name: &str,
-) -> Result<Option<String>> {
-    match secrets.get(secret_name).await {
-        Ok(existing) => {
-            let raw = existing
-                .data
-                .as_ref()
-                .and_then(|d| d.get("password"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Secret {secret_name} exists but has no `password` key")
-                })?;
-            let pw = String::from_utf8(raw.0.clone())
-                .with_context(|| format!("Secret {secret_name} password is not valid UTF-8"))?;
-            if pw.is_empty() {
-                anyhow::bail!("Secret {secret_name} has an empty password");
-            }
-            Ok(Some(pw))
-        }
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("Failed to read Secret {secret_name}")),
+fn require_exact_owner(metadata: &ObjectMeta, expected: &OwnerReference) -> Result<()> {
+    if metadata.owner_references.as_ref().is_some_and(|owners| {
+        owners.iter().any(|owner| {
+            owner.api_version == expected.api_version
+                && owner.kind == expected.kind
+                && owner.name == expected.name
+                && owner.uid == expected.uid
+                && owner.controller == Some(true)
+        })
+    }) {
+        Ok(())
+    } else {
+        anyhow::bail!("pre-existing Secret is not owned by the exact ClusterInstance UID")
     }
+}
+
+fn datastore_password_from_secret(secret: &Secret, secret_name: &str) -> Result<String> {
+    let raw = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("password"))
+        .ok_or_else(|| anyhow::anyhow!("Secret {secret_name} exists but has no `password` key"))?;
+    let password = String::from_utf8(raw.0.clone())
+        .with_context(|| format!("Secret {secret_name} password is not valid UTF-8"))?;
+    if password.is_empty() {
+        anyhow::bail!("Secret {secret_name} has an empty password");
+    }
+    Ok(password)
 }
 
 pub use capi::CapiBackend;

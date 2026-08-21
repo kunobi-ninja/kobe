@@ -22,6 +22,8 @@ pub(crate) struct PoolPolicySummary {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PoolSummary {
     pub name: String,
+    #[serde(default)]
+    pub phase: Option<String>,
     pub ready: u32,
     #[serde(default, alias = "claimed")]
     pub leased: u32,
@@ -31,6 +33,8 @@ pub(crate) struct PoolSummary {
     pub recycling: u32,
     #[serde(default)]
     pub unhealthy: u32,
+    #[serde(default)]
+    pub quarantined: u32,
     #[serde(default)]
     pub queue_depth: u32,
     #[serde(default)]
@@ -98,10 +102,16 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], i
             println!();
         }
 
-        println!("{indent}{}", pool.name);
+        let phase = pool.phase.as_deref().unwrap_or("Unknown");
+        println!("{indent}{}  {phase}", pool.name);
         println!(
-            "{indent}  ready {}  leased {}  creating {}  recycling {}  queue {}",
-            pool.ready, pool.leased, pool.creating, pool.recycling, pool.queue_depth
+            "{indent}  ready {}  leased {}  creating {}  recycling {}  quarantined {}  queue {}",
+            pool.ready,
+            pool.leased,
+            pool.creating,
+            pool.recycling,
+            pool.quarantined,
+            pool.queue_depth
         );
         if let Some(policy) = format_policy(pool) {
             println!("{indent}  {policy}");

@@ -196,7 +196,7 @@ pub(crate) async fn resolve_lease_binding(
         .binding
         .clone()
         .ok_or(BindingResolutionError::BindingMissing)?;
-    validate_binding_shape(&binding)?;
+    validate_binding_shape(&binding, namespace)?;
 
     if binding.lease.name != lease_name || binding.lease.uid.as_deref() != Some(expected_lease_uid)
     {
@@ -396,7 +396,10 @@ pub(crate) async fn verify_instance_teardown(
     Ok(())
 }
 
-fn validate_binding_shape(binding: &LeaseBinding) -> Result<(), BindingResolutionError> {
+fn validate_binding_shape(
+    binding: &LeaseBinding,
+    namespace: &str,
+) -> Result<(), BindingResolutionError> {
     if binding.binding_id.is_empty() || binding.binding_id.len() > 128 {
         return Err(BindingResolutionError::BindingMalformed("binding_id"));
     }
@@ -419,6 +422,37 @@ fn validate_binding_shape(binding: &LeaseBinding) -> Result<(), BindingResolutio
         .backend
         .dispatch_config()
         .map_err(BindingResolutionError::BindingMalformed)?;
+    match (
+        binding.creation_manifest_digest.as_deref(),
+        binding.creation_manifest.as_ref(),
+    ) {
+        (Some(digest), Some(manifest))
+            if manifest.validate().is_ok()
+                && manifest.digest().ok().as_deref() == Some(digest)
+                && manifest.namespace == namespace
+                && manifest.instance.name == binding.instance.name
+                && manifest.instance.uid.as_deref() == Some(binding.instance.uid.as_str())
+                && manifest.backend_type == binding.backend.backend_type
+                && manifest.config_digest == binding.backend.config_digest => {}
+        (None, None) if !binding.cleanup_mode.requires_receipt() => {}
+        _ => {
+            return Err(BindingResolutionError::BindingMalformed(
+                "creation_manifest",
+            ));
+        }
+    }
+    if binding.cleanup_mode.requires_receipt() {
+        let connect_token = binding
+            .connect_token
+            .as_ref()
+            .ok_or(BindingResolutionError::BindingMalformed("connect_token"))?;
+        crate::api::connect::require_connect_token_identity_shape(
+            connect_token,
+            namespace,
+            &binding.lease.name,
+        )
+        .map_err(|_| BindingResolutionError::BindingMalformed("connect_token"))?;
+    }
     Ok(())
 }
 
@@ -463,17 +497,21 @@ mod tests {
             backend,
             instance_spec_digest:
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            cleanup_mode: crate::crd::CleanupMode::Standard,
+            creation_manifest_digest: None,
+            creation_manifest: None,
+            connect_token: None,
         }
     }
 
     #[test]
     fn binding_shape_rejects_missing_uids_generation_and_digests() {
         let mut candidate = binding();
-        assert!(validate_binding_shape(&candidate).is_ok());
+        assert!(validate_binding_shape(&candidate, "test-ns").is_ok());
 
         candidate.lease.uid = None;
         assert_eq!(
-            validate_binding_shape(&candidate)
+            validate_binding_shape(&candidate, "test-ns")
                 .unwrap_err()
                 .reason_code(),
             "binding_malformed"
@@ -481,11 +519,11 @@ mod tests {
 
         candidate = binding();
         candidate.instance.observed_generation = 0;
-        assert!(validate_binding_shape(&candidate).is_err());
+        assert!(validate_binding_shape(&candidate, "test-ns").is_err());
 
         candidate = binding();
         candidate.backend.config_digest = "not-a-digest".into();
-        assert!(validate_binding_shape(&candidate).is_err());
+        assert!(validate_binding_shape(&candidate, "test-ns").is_err());
     }
 
     fn exact_objects() -> (

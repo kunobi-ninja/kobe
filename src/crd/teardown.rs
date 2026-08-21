@@ -159,6 +159,22 @@ impl KubernetesResourceIdentity {
 pub struct CreationManifestResource {
     pub subject: TeardownSubject,
     pub resource: KubernetesResourceIdentity,
+    /// Exact identity that controlled creation of this object.
+    pub controller: KubernetesResourceIdentity,
+    /// How the live object proves the controller relationship.
+    pub control_relation: CreationControlRelation,
+}
+
+/// Kubernetes control edge authenticated while the object is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum CreationControlRelation {
+    /// `metadata.ownerReferences` contains this exact controller UID.
+    ControllerOwner,
+    /// A StatefulSet PVC carries the immutable ClusterInstance UID label.
+    InstanceUidLabel,
+    /// A PV's live `spec.claimRef.uid` is this exact PVC UID.
+    ClaimRef,
 }
 
 /// Live dynamic-storage facts captured while the PVC and PV are both bound.
@@ -361,6 +377,47 @@ impl TeardownCreationManifest {
         }
     }
 
+    fn instance_identity(&self) -> KubernetesResourceIdentity {
+        KubernetesResourceIdentity {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some(self.namespace.clone()),
+            name: self.instance.name.clone(),
+            uid: self.instance.uid.clone().unwrap_or_default(),
+        }
+    }
+
+    fn control_shape_matches(&self, entry: &CreationManifestResource) -> bool {
+        let instance = self.instance_identity();
+        match entry.subject {
+            TeardownSubject::ServerPods => {
+                let statefulset = self
+                    .resources
+                    .iter()
+                    .find(|candidate| candidate.subject == TeardownSubject::ServerStatefulSet);
+                entry.control_relation == CreationControlRelation::ControllerOwner
+                    && statefulset
+                        .is_some_and(|statefulset| entry.controller == statefulset.resource)
+            }
+            TeardownSubject::ServerDataPvcs => {
+                entry.control_relation == CreationControlRelation::InstanceUidLabel
+                    && entry.controller == instance
+            }
+            TeardownSubject::ServerDataVolumes => {
+                entry.control_relation == CreationControlRelation::ClaimRef
+                    && self
+                        .storage
+                        .iter()
+                        .any(|volume| volume.pv == entry.resource && volume.pvc == entry.controller)
+            }
+            TeardownSubject::Database | TeardownSubject::DatabaseRole => false,
+            _ => {
+                entry.control_relation == CreationControlRelation::ControllerOwner
+                    && entry.controller == instance
+            }
+        }
+    }
+
     /// Validate the sealed manifest before it becomes an authorization input.
     pub fn validate(&self) -> Result<(), CreationManifestInvalid> {
         let instance_fenced = self
@@ -381,10 +438,12 @@ impl TeardownCreationManifest {
             || self.cluster_cidr.trim().is_empty()
             || self.server_replicas == 0
             || chrono::DateTime::parse_from_rfc3339(&self.sealed_at).is_err()
-            || self
-                .resources
-                .iter()
-                .any(|entry| !entry.resource.is_complete() || !self.resource_shape_matches(entry))
+            || self.resources.iter().any(|entry| {
+                !entry.resource.is_complete()
+                    || !entry.controller.is_complete()
+                    || !self.resource_shape_matches(entry)
+                    || !self.control_shape_matches(entry)
+            })
         {
             return Err(CreationManifestInvalid::IncompleteIdentity);
         }
@@ -686,6 +745,10 @@ pub struct TeardownReceipt {
     /// SHA-256 of the immutable controller-authenticated creation manifest.
     #[serde(default)]
     pub creation_manifest_digest: String,
+    /// Cleanup contract captured in the reciprocal binding. A receipt for a
+    /// Standard teardown can never release VerifiedDestroy capacity.
+    #[serde(default)]
+    pub cleanup_mode: CleanupMode,
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
@@ -708,10 +771,15 @@ pub const TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION: &str =
 
 /// Set by the composing Sandbox after it durably records that an internal
 /// `ClusterLease` reached a terminal phase without ever binding an instance.
-/// The value is the exact `unboundReleaseVerifiedAt` timestamp, so a stale ACK
-/// cannot retire a newly recreated proof-bearing handle.
+/// The value is `<teardownAttemptId>:<unboundReleaseVerifiedAt>`, so a stale
+/// ACK cannot retire a later proof attempt on the same retained handle.
 pub const UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION: &str =
     "kobe.kunobi.ninja/unbound-release-proof-acknowledged";
+
+/// Retains a receipt-bearing lease until its exact receipt identity has been
+/// acknowledged by the owning consumer.
+pub const TEARDOWN_RECEIPT_RETENTION_FINALIZER: &str =
+    "kobe.kunobi.ninja/teardown-receipt-retention";
 
 /// Current schema version emitted by this build.
 pub const TEARDOWN_RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -731,6 +799,39 @@ impl TeardownReceipt {
         } else {
             TeardownOutcome::Verified
         }
+    }
+
+    /// Stable acknowledgement token for this exact terminal receipt.
+    ///
+    /// The value intentionally includes every capability fence a consumer must
+    /// have observed: attempt nonce, all three Kubernetes UIDs, creation
+    /// manifest digest, and cleanup mode. A boolean annotation (or an old
+    /// attempt ID alone) could acknowledge a newer receipt after a retry.
+    pub fn acknowledgement_token(&self) -> Option<String> {
+        if self.schema_version != TEARDOWN_RECEIPT_SCHEMA_VERSION
+            || self.outcome != TeardownOutcome::Verified
+            || self.checks.is_empty()
+            || Self::outcome_for(&self.checks) != TeardownOutcome::Verified
+            || !self.completed_after_start()
+            || self.attempt_id.trim().is_empty()
+            || self.creation_manifest_digest.trim().is_empty()
+            || self.cleanup_mode != CleanupMode::VerifiedDestroy
+        {
+            return None;
+        }
+        let lease_uid = self.lease.uid.as_deref()?.trim();
+        let instance_uid = self.instance.uid.as_deref()?.trim();
+        let pool_uid = self.pool.uid.as_deref()?.trim();
+        if lease_uid.is_empty() || instance_uid.is_empty() || pool_uid.is_empty() {
+            return None;
+        }
+        let _ = (lease_uid, instance_uid, pool_uid);
+        // Hash the entire schema-versioned terminal record. This includes the
+        // required attempt/UID/manifest/mode fences and also prevents a token
+        // from acknowledging changed checks or timestamps under the same
+        // nominal attempt identity.
+        let encoded = serde_json::to_vec(self).ok()?;
+        Some(format!("sha256:{}", hex::encode(Sha256::digest(encoded))))
     }
 
     /// Whether this receipt releases the exact footprint described by
@@ -791,6 +892,7 @@ impl TeardownReceipt {
             || self.config_digest != expected.config_digest
             || self.instance_spec_digest != expected.instance_spec_digest
             || self.creation_manifest_digest != expected.creation_manifest_digest
+            || self.cleanup_mode != expected.cleanup_mode
         {
             return false;
         }
@@ -839,7 +941,14 @@ impl TeardownReceipt {
             // Otherwise `ServerStatefulSet = Verified` proves only that
             // *something* of that category was inspected.
             if let Some(manifest) = expected.creation_manifest {
-                let identities = manifest.identities_for_subject(*subject);
+                let identities = if *subject == TeardownSubject::ConnectTokenSecret {
+                    expected
+                        .connect_token_identity
+                        .map(|identity| vec![identity.canonical_id()])
+                        .unwrap_or_default()
+                } else {
+                    manifest.identities_for_subject(*subject)
+                };
                 check.verified.len() == identities.len()
                     && identities
                         .iter()
@@ -891,6 +1000,7 @@ pub struct TeardownScope<'a> {
     pub config_digest: &'a str,
     pub instance_spec_digest: &'a str,
     pub creation_manifest_digest: &'a str,
+    pub cleanup_mode: CleanupMode,
     /// Nonce persisted before the first destructive request.
     pub attempt_id: &'a str,
     /// Controller-authenticated creation record used to keep each concrete
@@ -898,6 +1008,9 @@ pub struct TeardownScope<'a> {
     /// Without this association, a receipt could place a PV UID under the Pod
     /// check and still satisfy flattened identity coverage.
     pub creation_manifest: Option<&'a TeardownCreationManifest>,
+    /// Lease-scoped footprint captured in the reciprocal binding. It cannot be
+    /// part of the instance creation manifest because no lease existed then.
+    pub connect_token_identity: Option<&'a KubernetesResourceIdentity>,
     /// Every subject this instance actually created. Optional footprints that
     /// were never created are simply absent — which is why the list must come
     /// from the creation record, not be inferred at teardown time.
@@ -1148,9 +1261,27 @@ mod tests {
         name: &str,
         uid: &str,
     ) -> CreationManifestResource {
+        let (controller, control_relation) = match subject {
+            TeardownSubject::ServerPods => (
+                manifest_identity("apps/v1", "StatefulSet", "pool-p-0-server", "sts-uid", true),
+                CreationControlRelation::ControllerOwner,
+            ),
+            _ => (
+                manifest_identity(
+                    "kobe.kunobi.ninja/v1alpha1",
+                    "ClusterInstance",
+                    "pool-p-0",
+                    "instance-uid",
+                    true,
+                ),
+                CreationControlRelation::ControllerOwner,
+            ),
+        };
         CreationManifestResource {
             subject,
             resource: manifest_identity(api_version, kind, name, uid, true),
+            controller,
+            control_relation,
         }
     }
 
@@ -1320,10 +1451,20 @@ mod tests {
         manifest.resources.push(CreationManifestResource {
             subject: TeardownSubject::ServerDataPvcs,
             resource: pvc.clone(),
+            controller: manifest_identity(
+                "kobe.kunobi.ninja/v1alpha1",
+                "ClusterInstance",
+                "pool-p-0",
+                "instance-uid",
+                true,
+            ),
+            control_relation: CreationControlRelation::InstanceUidLabel,
         });
         manifest.resources.push(CreationManifestResource {
             subject: TeardownSubject::ServerDataVolumes,
             resource: pv.clone(),
+            controller: pvc.clone(),
+            control_relation: CreationControlRelation::ClaimRef,
         });
         manifest.storage.push(StorageVolumeProvenance {
             pvc,
@@ -1345,7 +1486,8 @@ mod tests {
         unrecorded.storage[0].pv.uid = "unrecorded-pv-uid".into();
         assert_eq!(
             unrecorded.validate(),
-            Err(CreationManifestInvalid::StorageUnverifiable)
+            Err(CreationManifestInvalid::IncompleteIdentity),
+            "the PV claimRef control edge must match the exact recorded PV/PVC pair"
         );
     }
 
@@ -1658,6 +1800,7 @@ mod tests {
             config_digest: "digest".into(),
             instance_spec_digest: "spec-digest".into(),
             creation_manifest_digest: "manifest-digest".into(),
+            cleanup_mode: CleanupMode::VerifiedDestroy,
             started_at: "2026-01-01T00:00:00Z".into(),
             completed_at: Some("2026-01-01T00:01:00Z".into()),
             checks,
@@ -1677,6 +1820,65 @@ mod tests {
                 .into_iter()
                 .collect(),
         }
+    }
+
+    #[test]
+    fn acknowledgement_token_is_bound_to_the_entire_verified_receipt() {
+        let base = receipt(
+            vec![check(
+                TeardownSubject::ServerStatefulSet,
+                CheckResult::Verified,
+            )],
+            TeardownOutcome::Verified,
+        );
+        let token = base
+            .acknowledgement_token()
+            .expect("a complete verified receipt has an ACK token");
+
+        let mutations: Vec<Box<dyn Fn(&mut TeardownReceipt)>> = vec![
+            Box::new(|receipt| receipt.attempt_id = "attempt-2".into()),
+            Box::new(|receipt| receipt.creation_manifest_digest = "other-manifest".into()),
+            Box::new(|receipt| receipt.lease.uid = Some("other-lease".into())),
+            Box::new(|receipt| receipt.instance.uid = Some("other-instance".into())),
+            Box::new(|receipt| receipt.pool.uid = Some("other-pool".into())),
+            Box::new(|receipt| receipt.checks[0].verified.push("extra-object".into())),
+            Box::new(|receipt| receipt.completed_at = Some("2026-01-01T00:02:00Z".into())),
+        ];
+        for mutate in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                changed.acknowledgement_token().as_deref(),
+                Some(token.as_str())
+            );
+        }
+
+        let mut standard = base.clone();
+        standard.cleanup_mode = CleanupMode::Standard;
+        assert!(standard.acknowledgement_token().is_none());
+        let mut quarantined = base;
+        quarantined.outcome = TeardownOutcome::Quarantined;
+        assert!(quarantined.acknowledgement_token().is_none());
+    }
+
+    #[test]
+    fn manifest_control_identity_cannot_be_substituted() {
+        let manifest = minimal_creation_manifest();
+        assert!(manifest.validate().is_ok());
+
+        let mut foreign_controller = manifest.clone();
+        foreign_controller.resources[0].controller.uid = "foreign-instance-uid".into();
+        assert_eq!(
+            foreign_controller.validate(),
+            Err(CreationManifestInvalid::IncompleteIdentity)
+        );
+
+        let mut wrong_relation = manifest;
+        wrong_relation.resources[0].control_relation = CreationControlRelation::InstanceUidLabel;
+        assert_eq!(
+            wrong_relation.validate(),
+            Err(CreationManifestInvalid::IncompleteIdentity)
+        );
     }
 
     fn lease_ref() -> ResourceRef {
@@ -1710,8 +1912,10 @@ mod tests {
             config_digest: "digest",
             instance_spec_digest: "spec-digest",
             creation_manifest_digest: "manifest-digest",
+            cleanup_mode: CleanupMode::VerifiedDestroy,
             attempt_id: "attempt-1",
             creation_manifest: None,
+            connect_token_identity: None,
             required_subjects: required,
             instance_name: "pool-p-0",
             recorded_identities: &[],
@@ -1733,8 +1937,10 @@ mod tests {
             config_digest: &manifest.config_digest,
             instance_spec_digest: "spec-digest",
             creation_manifest_digest: &manifest_digest,
+            cleanup_mode: CleanupMode::VerifiedDestroy,
             attempt_id: "attempt-1",
             creation_manifest: Some(&manifest),
+            connect_token_identity: None,
             required_subjects: &required,
             instance_name: "pool-p-0",
             recorded_identities: &recorded,
@@ -1794,6 +2000,73 @@ mod tests {
             !extra.permits_release_for(&expected),
             "a manifest-bound receipt must prove exactly that subject's identities"
         );
+    }
+
+    #[test]
+    fn release_requires_the_exact_connect_token_and_cleanup_contract() {
+        let manifest = minimal_creation_manifest();
+        let manifest_digest = manifest.digest().unwrap();
+        let token = manifest_identity(
+            "v1",
+            "Secret",
+            "lease-a-connect-token",
+            "connect-token-uid",
+            true,
+        );
+        let mut required = manifest.required_subjects();
+        required.push(TeardownSubject::ConnectTokenSecret);
+        let mut recorded = manifest.recorded_identities();
+        recorded.push(token.canonical_id());
+        let refs = (lease_ref(), manifest.instance.clone(), pool_ref());
+        let expected = TeardownScope {
+            lease: &refs.0,
+            instance: &refs.1,
+            pool: &refs.2,
+            backend_type: "k3s",
+            config_digest: &manifest.config_digest,
+            instance_spec_digest: "spec-digest",
+            creation_manifest_digest: &manifest_digest,
+            cleanup_mode: CleanupMode::VerifiedDestroy,
+            attempt_id: "attempt-1",
+            creation_manifest: Some(&manifest),
+            connect_token_identity: Some(&token),
+            required_subjects: &required,
+            instance_name: "pool-p-0",
+            recorded_identities: &recorded,
+        };
+        let mut checks: Vec<TeardownCheck> = manifest
+            .required_subjects()
+            .into_iter()
+            .map(|subject| TeardownCheck {
+                subject,
+                result: CheckResult::Verified,
+                reason: None,
+                verified: manifest.identities_for_subject(subject),
+            })
+            .collect();
+        checks.push(TeardownCheck {
+            subject: TeardownSubject::ConnectTokenSecret,
+            result: CheckResult::Verified,
+            reason: None,
+            verified: vec![token.canonical_id()],
+        });
+        let mut proof = receipt(checks, TeardownOutcome::Verified);
+        proof.instance = manifest.instance.clone();
+        proof.config_digest = manifest.config_digest.clone();
+        proof.creation_manifest_digest = manifest_digest.clone();
+        assert!(proof.permits_release_for(&expected));
+
+        let token_check = proof
+            .checks
+            .iter_mut()
+            .find(|check| check.subject == TeardownSubject::ConnectTokenSecret)
+            .unwrap();
+        token_check.verified = vec!["k8s:v1:Secret:test:lease-a-connect-token:replacement".into()];
+        assert!(!proof.permits_release_for(&expected));
+
+        let mut downgraded = expected;
+        downgraded.cleanup_mode = CleanupMode::Standard;
+        assert!(!proof.permits_release_for(&downgraded));
     }
 
     #[test]
@@ -1979,8 +2252,10 @@ mod tests {
             config_digest: "digest",
             instance_spec_digest: "spec-digest",
             creation_manifest_digest: "manifest-digest",
+            cleanup_mode: CleanupMode::VerifiedDestroy,
             attempt_id: "attempt-1",
             creation_manifest: None,
+            connect_token_identity: None,
             required_subjects: &required,
             instance_name: "pool-p-0",
             recorded_identities: identities,

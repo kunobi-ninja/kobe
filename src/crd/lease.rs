@@ -1,4 +1,4 @@
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ use crate::crd::teardown::{CleanupMode, TeardownReceipt};
 /// Created when a user/CI leases a cluster via the HTTP API.
 /// The lease controller binds it to a warm cluster, tracks TTL,
 /// and handles release/expiry/recycling.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, KubeSchema)]
 #[kube(
     group = "kobe.kunobi.ninja",
     version = "v1alpha1",
@@ -18,7 +18,21 @@ use crate::crd::teardown::{CleanupMode, TeardownReceipt};
     plural = "clusterleases",
     shortname = "cl",
     status = "ClusterLeaseStatus",
-    namespaced
+    namespaced,
+    validation = Rule::new("has(self.spec.cleanupMode) == has(oldSelf.spec.cleanupMode) && (!has(self.spec.cleanupMode) || self.spec.cleanupMode == oldSelf.spec.cleanupMode)")
+        .message("spec.cleanupMode is immutable, including implicit Standard"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAttemptId) || (has(self.status) && self.status != null && has(self.status.teardownAttemptId) && (self.status.teardownAttemptId == oldSelf.status.teardownAttemptId || (has(oldSelf.status.teardownReceipt) && oldSelf.status.teardownReceipt.outcome != 'inProgress' && has(self.status.teardownReceipt) && self.status.teardownReceipt.outcome == 'inProgress' && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId)))")
+        .message("status.teardownAttemptId changes only when a new InProgress retry is durably begun"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || (has(self.spec.cleanupMode) ? self.status.binding.cleanupMode == self.spec.cleanupMode : self.status.binding.cleanupMode == 'Standard')")
+        .message("status.binding cleanupMode must match the immutable lease cleanup contract"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.teardownReceipt) || (has(self.status.binding) && has(self.status.teardownAttemptId) && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId && self.status.teardownReceipt.cleanupMode == self.status.binding.cleanupMode)")
+        .message("status.teardownReceipt must match the durable attempt and reciprocal binding cleanup contract"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.unboundReleaseVerifiedAt) || (has(self.status.teardownAttemptId) && !has(self.status.binding) && !has(self.status.clusterName) && !has(self.status.teardownReceipt) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'))")
+        .message("unbound release proof requires an attempt-bound NeverBound condition and no allocation identity"),
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Cleanup","type":"string","jsonPath":".spec.cleanupMode"}"#,
+    printcolumn = r#"{"name":"Receipt","type":"string","jsonPath":".status.teardownReceipt.outcome"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterLeaseSpec {
@@ -105,6 +119,13 @@ pub struct ClusterLeaseStatus {
     /// no child cluster to destroy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unbound_release_verified_at: Option<String>,
+
+    /// Durable nonce written before the first destructive request. Kept
+    /// separate from the mutable InProgress-to-terminal receipt so consumers
+    /// can verify that the terminal record belongs to the exact attempt the
+    /// controller began, rather than trusting a nonce supplied by that record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_attempt_id: Option<String>,
 
     /// Position in the priority queue (0 = not queued, 1 = next).
     #[serde(default)]
@@ -575,6 +596,7 @@ mod json_safety_tests {
                 config_digest: "cfg".into(),
                 instance_spec_digest: "spec".into(),
                 creation_manifest_digest: "manifest-digest".into(),
+                cleanup_mode: crate::crd::CleanupMode::VerifiedDestroy,
                 started_at: "2026-06-04T02:00:00Z".into(),
                 completed_at: Some("2026-06-04T02:01:00Z".into()),
                 checks: vec![crate::crd::TeardownCheck {
@@ -587,6 +609,7 @@ mod json_safety_tests {
                 outcome: crate::crd::TeardownOutcome::Verified,
             }),
             unbound_release_verified_at: None,
+            teardown_attempt_id: Some("attempt-1".into()),
         };
         let once = serde_json::to_value(&original).unwrap();
         let back: ClusterLeaseStatus = serde_json::from_value(once.clone()).unwrap();
@@ -627,6 +650,41 @@ mod json_safety_tests {
             "status subresource missing: {}",
             versions[0]["subresources"]
         );
+    }
+
+    #[test]
+    fn crd_makes_cleanup_mode_presence_and_value_immutable_at_the_root() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(ClusterLease::crd()).unwrap();
+        let rules =
+            crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["x-kubernetes-validations"]
+                .as_array()
+                .expect("root transition rules");
+        assert!(rules.iter().any(|rule| {
+            rule["rule"]
+                == "has(self.spec.cleanupMode) == has(oldSelf.spec.cleanupMode) && (!has(self.spec.cleanupMode) || self.spec.cleanupMode == oldSelf.spec.cleanupMode)"
+        }));
+        for expected in [
+            "status.binding.cleanupMode == self.spec.cleanupMode",
+            "status.teardownReceipt.attemptId == self.status.teardownAttemptId",
+            "c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'",
+        ] {
+            assert!(rules.iter().any(|rule| {
+                rule["rule"]
+                    .as_str()
+                    .is_some_and(|rule| rule.contains(expected))
+            }));
+        }
+        assert!(rules.iter().any(|rule| {
+            rule["rule"].as_str().is_some_and(|rule| {
+                rule.contains("status.teardownAttemptId")
+                    && rule.contains("teardownReceipt.outcome == 'inProgress'")
+                    && rule.contains("teardownReceipt.attemptId == self.status.teardownAttemptId")
+            })
+        }));
+        let status = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"];
+        assert_eq!(status["teardownAttemptId"]["type"], "string");
     }
 
     #[test]

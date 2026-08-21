@@ -1173,6 +1173,7 @@ impl ClusterBackend for K0sBackend {
                 name,
                 namespace,
                 Self::cluster_labels(name, None),
+                None,
             )
             .await?;
             datastore::ensure_cluster_role(&pool, name, DB_PREFIX, &password).await?;
