@@ -224,14 +224,17 @@ jobs:
       - name: Install bun, kind and kubectl
         run: mise install bun kind kubectl
 
-      - name: Create kind and install the SandboxLease CRD
+      - name: Create kind and install the Sandbox CRDs
         run: |
           mise exec -- kind create cluster --name "$SANDBOX_CONTRACT_CLUSTER" --wait 120s
           CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
-          mise exec -- kubectl --context "$CONTEXT" apply -f charts/kobe/crds/sandboxleases.yaml
+          mise exec -- kubectl --context "$CONTEXT" apply \
+            -f charts/kobe/crds/sandboxleases.yaml \
+            -f charts/kobe/crds/sandboxpools.yaml
           mise exec -- kubectl --context "$CONTEXT" wait \
             --for=condition=Established \
             crd/sandboxleases.kobe.kunobi.ninja \
+            crd/sandboxpools.kobe.kunobi.ninja \
             --timeout=60s
 
       - name: Verify SandboxLease fences and admission-ledger isolation

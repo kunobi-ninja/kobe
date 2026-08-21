@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Administrator-owned class of Agent Sandbox capacity.
+///
+/// Root CRD CEL can couple the status generation markers to one another, but
+/// Kubernetes does not expose `metadata.generation` to CRD validation rules.
+/// The API and controllers therefore revalidate those markers against the
+/// live object's generation before they admit work or trust readiness.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, KubeSchema, PartialEq, Eq)]
 #[kube(
     group = "kobe.kunobi.ninja",
@@ -24,16 +29,16 @@ use thiserror::Error;
     shortname = "sp",
     status = "SandboxPoolStatus",
     namespaced,
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || !self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True') || (has(self.status.observedGeneration) && self.status.observedGeneration == self.metadata.generation && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True' && has(c.observedGeneration) && c.observedGeneration == self.metadata.generation) && has(self.status.certification) && self.status.certification.phase == 'certified' && self.status.certification.observedGeneration == self.metadata.generation && has(self.status.certification.certifiedAt))")
-        .message("Ready=True requires a current-generation durable Certified receipt"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || !self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True') || (has(self.status.observedGeneration) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration) && has(self.status.certification) && self.status.certification.phase == 'certified' && self.status.certification.observedGeneration == self.status.observedGeneration && has(self.status.certification.certifiedAt))")
+        .message("Ready=True requires a coherent observed-generation durable Certified receipt"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint != self.status.certification.fingerprint || (oldSelf.status.certification.sandboxTemplate == self.status.certification.sandboxTemplate && oldSelf.status.certification.sandboxWarmPool == self.status.certification.sandboxWarmPool && (!has(oldSelf.status.certification.sandboxClaim) || (has(self.status.certification.sandboxClaim) && oldSelf.status.certification.sandboxClaim == self.status.certification.sandboxClaim)) && (!has(oldSelf.status.certification.sandbox) || (has(self.status.certification.sandbox) && oldSelf.status.certification.sandbox == self.status.certification.sandbox)) && (!has(oldSelf.status.certification.pod) || (has(self.status.certification.pod) && oldSelf.status.certification.pod == self.status.certification.pod)) && (!has(oldSelf.status.certification.service) || (has(self.status.certification.service) && oldSelf.status.certification.service == self.status.certification.service)) && (!has(oldSelf.status.certification.persistentVolumeClaims) || (has(self.status.certification.persistentVolumeClaims) && oldSelf.status.certification.persistentVolumeClaims == self.status.certification.persistentVolumeClaims)) && (!has(oldSelf.status.certification.persistentVolumes) || (has(self.status.certification.persistentVolumes) && oldSelf.status.certification.persistentVolumes == self.status.certification.persistentVolumes)) && (!has(oldSelf.status.certification.baselineIdleSandboxUids) || (has(self.status.certification.baselineIdleSandboxUids) && oldSelf.status.certification.baselineIdleSandboxUids == self.status.certification.baselineIdleSandboxUids)) && (!has(oldSelf.status.certification.teardownFence) || (has(self.status.certification.teardownFence) && oldSelf.status.certification.teardownFence == self.status.certification.teardownFence)) && (!has(oldSelf.status.certification.drainGeneration) || (has(self.status.certification.drainGeneration) && oldSelf.status.certification.drainGeneration == self.status.certification.drainGeneration)) && (!has(oldSelf.status.certification.replenishGeneration) || (has(self.status.certification.replenishGeneration) && oldSelf.status.certification.replenishGeneration == self.status.certification.replenishGeneration)) && (!has(oldSelf.status.certification.canaryPassedAt) || (has(self.status.certification.canaryPassedAt) && oldSelf.status.certification.canaryPassedAt == self.status.certification.canaryPassedAt)) && (!has(oldSelf.status.certification.certifiedAt) || (has(self.status.certification.certifiedAt) && oldSelf.status.certification.certifiedAt == self.status.certification.certifiedAt)))))")
         .message("exact certification references are immutable within one fingerprint"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == 'certified' || (oldSelf.status.certification.phase in ['initialized', 'cleanupBlocked'] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))")
         .message("an active certification fingerprint cannot be abandoned before exact cleanup"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == 'childCluster' && self.status.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.status.placementAuthority.kind == 'ClusterPool' && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)")
         .message("placementAuthority must identify the exact child ClusterPool"),
-    validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == 'childCluster' && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'False' && c.reason == 'CompositionEligible' && has(c.observedGeneration) && c.observedGeneration == self.metadata.generation)))")
-        .message("placementAuthority is published only with current-generation CompositionEligible status"),
+    validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == 'childCluster' && has(self.status.observedGeneration) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'False' && c.reason == 'CompositionEligible' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration)))")
+        .message("placementAuthority is published only with coherent CompositionEligible status"),
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Allocated","type":"integer","jsonPath":".status.allocated"}"#,
     printcolumn = r#"{"name":"Quarantined","type":"integer","jsonPath":".status.quarantined"}"#,
@@ -1430,19 +1435,22 @@ mod tests {
                 .expect("SandboxPool root CEL validations");
         assert!(pool_validations.iter().any(|validation| {
             validation["message"]
-                == "Ready=True requires a current-generation durable Certified receipt"
+                == "Ready=True requires a coherent observed-generation durable Certified receipt"
         }));
         let ready_rule = pool_validations
             .iter()
             .find(|validation| {
                 validation["message"]
-                    == "Ready=True requires a current-generation durable Certified receipt"
+                    == "Ready=True requires a coherent observed-generation durable Certified receipt"
             })
             .expect("Ready receipt CEL")["rule"]
             .as_str()
             .expect("CEL rule string");
-        assert!(ready_rule.contains("self.status.observedGeneration == self.metadata.generation"));
-        assert!(ready_rule.contains("c.observedGeneration == self.metadata.generation"));
+        assert!(ready_rule.contains("c.observedGeneration == self.status.observedGeneration"));
+        assert!(ready_rule.contains(
+            "self.status.certification.observedGeneration == self.status.observedGeneration"
+        ));
+        assert!(!ready_rule.contains("metadata.generation"));
         assert!(
             !pool_validations.iter().any(|validation| {
                 validation["message"]
@@ -1664,7 +1672,7 @@ mod tests {
         let pool_validations = pool_root["x-kubernetes-validations"].as_array().unwrap();
         for message in [
             "placementAuthority must identify the exact child ClusterPool",
-            "placementAuthority is published only with current-generation CompositionEligible status",
+            "placementAuthority is published only with coherent CompositionEligible status",
         ] {
             assert!(
                 pool_validations
