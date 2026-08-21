@@ -28,8 +28,8 @@ use super::sandbox_rate_limit::RateLimitDecision;
 use crate::backend::ClusterBackend;
 use crate::crd::{
     ResolvedSandboxPlacement, SandboxCondition, SandboxLease, SandboxLeasePhase, SandboxLeaseSpec,
-    SandboxPool, SandboxPoolReference, SandboxPrincipal, SandboxReleaseCause,
-    SandboxTargetProvenance, SandboxVerb,
+    SandboxPlacement, SandboxPlacementAuthority, SandboxPool, SandboxPoolReference,
+    SandboxPrincipal, SandboxReleaseCause, SandboxTargetProvenance, SandboxVerb,
 };
 use crate::pool::{is_valid_k8s_name, parse_duration};
 use crate::sandbox::{SANDBOX_LEASE_FINALIZER, aggregate_resource_limits, resource_ceiling_allows};
@@ -3031,6 +3031,16 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
             );
         }
     };
+    let placement_authority = match sandbox_placement_authority_for_admission(&pool) {
+        Ok(authority) => authority,
+        Err(detail) => {
+            return sandbox_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SandboxPool placement authority is incomplete",
+                Some(detail),
+            );
+        }
+    };
 
     let requested_ttl = request.ttl.as_deref().unwrap_or(&pool.spec.default_ttl);
     let Some(requested_duration) =
@@ -3136,6 +3146,7 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
         &lease_id,
         &state.namespace,
         pool_reference,
+        placement_authority,
         &effective_ttl,
         request.alias.as_deref(),
         &identity,
@@ -4171,6 +4182,7 @@ fn build_sandbox_lease(
     id: &str,
     namespace: &str,
     pool_ref: SandboxPoolReference,
+    placement_authority: Option<SandboxPlacementAuthority>,
     ttl: &str,
     alias: Option<&str>,
     identity: &AuthIdentity,
@@ -4200,6 +4212,7 @@ fn build_sandbox_lease(
         },
         spec: SandboxLeaseSpec {
             pool_ref,
+            placement_authority,
             ttl: ttl.into(),
             alias: alias.map(str::to_owned),
             requester: SandboxPrincipal {
@@ -5317,6 +5330,64 @@ fn sandbox_pool_reference(pool: &SandboxPool) -> Result<SandboxPoolReference, St
         uid,
         generation,
     })
+}
+
+/// Copy only controller-certified child placement identity into a new lease.
+/// Management leases retain their existing wire shape.
+fn sandbox_placement_authority_for_admission(
+    pool: &SandboxPool,
+) -> Result<Option<SandboxPlacementAuthority>, String> {
+    let recorded = pool
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_authority.as_ref());
+    match &pool.spec.placement {
+        SandboxPlacement::Management {} => {
+            if recorded.is_some() {
+                return Err(
+                    "management SandboxPool unexpectedly records placementAuthority".into(),
+                );
+            }
+            Ok(None)
+        }
+        SandboxPlacement::ChildCluster { cluster_pool_ref } => {
+            let status = pool
+                .status
+                .as_ref()
+                .ok_or_else(|| "child SandboxPool has no status".to_string())?;
+            let authority = recorded.ok_or_else(|| {
+                "child SandboxPool has no certified placementAuthority".to_string()
+            })?;
+            let namespace = pool
+                .namespace()
+                .ok_or_else(|| "SandboxPool has no namespace".to_string())?;
+            if authority.api_version != "kobe.kunobi.ninja/v1alpha1"
+                || authority.kind != "ClusterPool"
+                || authority.namespace != namespace
+                || authority.name != *cluster_pool_ref
+                || authority.uid.is_empty()
+                || authority.generation < 1
+            {
+                return Err(
+                    "child SandboxPool placementAuthority does not match its exact ClusterPool"
+                        .into(),
+                );
+            }
+            let composition_eligible = status.conditions.iter().any(|condition| {
+                condition.condition_type == "Ready"
+                    && condition.status == crate::crd::SandboxConditionStatus::False
+                    && condition.reason == "CompositionEligible"
+                    && condition.observed_generation == pool.metadata.generation
+            });
+            if !composition_eligible {
+                return Err(
+                    "child SandboxPool placementAuthority lacks current CompositionEligible status"
+                        .into(),
+                );
+            }
+            Ok(Some(authority.clone()))
+        }
+    }
 }
 
 /// Persist the admission-time setup bound before quota can be committed.
@@ -7590,6 +7661,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn composition_eligible_child_pool_remains_closed_to_http_admission() {
+        let server = MockServer::start().await;
+        mount_sandbox_crds(&server).await;
+        let mut pool = pool_json();
+        pool["spec"]["placement"] = serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "children"
+        });
+        pool["status"]["placementAuthority"] = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "namespace": "test-ns",
+            "name": "children",
+            "uid": "cluster-pool-uid",
+            "generation": 1
+        });
+        pool["status"]["conditions"] = serde_json::json!([{
+            "type": "Ready",
+            "status": "False",
+            "reason": "CompositionEligible",
+            "message": "discovery only",
+            "observedGeneration": 1
+        }]);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool))
+            .mount(&server)
+            .await;
+
+        let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            identity(),
+            Json(CreateSandboxLeaseRequest {
+                pool: "agent-small".into(),
+                ttl: Some("1h".into()),
+                alias: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && request.url.path().ends_with("/sandboxleases")
+                })
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn request_rejects_server_owned_and_unsafe_fields() {
         for field in [
@@ -7598,6 +7727,7 @@ mod tests {
             "runtimeClassName",
             "podSpec",
             "credentials",
+            "placementAuthority",
         ] {
             let mut value = serde_json::json!({ "pool": "agent-small", "ttl": "1h" });
             value[field] = serde_json::json!({ "identity": "mallory" });
@@ -7615,12 +7745,14 @@ mod tests {
             "sandbox-abc",
             "kobe",
             pool_reference(),
+            None,
             "30m",
             Some("review"),
             &identity,
         );
         assert_eq!(lease.spec.requester.identity, identity.identity);
         assert_eq!(lease.spec.alias.as_deref(), Some("review"));
+        assert!(lease.spec.placement_authority.is_none());
         assert!(lease.status.is_none());
         assert_eq!(
             normalized_finalizers(&lease),
@@ -7628,6 +7760,7 @@ mod tests {
             "cleanup fencing must exist on the initial object, not arrive later from a controller"
         );
         let json = serde_json::to_string(&lease).unwrap();
+        assert!(!json.contains("placementAuthority"));
         for forbidden in ["kubeconfig", "bearer", "token", "credentials", "podSpec"] {
             assert!(
                 !json
@@ -7637,12 +7770,73 @@ mod tests {
         }
     }
 
+    /// Admission snapshots UID and generation; a later same-named ClusterPool
+    /// replacement cannot rewrite the lease's server-owned authority.
+    #[test]
+    fn admission_copies_child_authority_without_following_name_reuse() {
+        let mut value = pool_json();
+        value["spec"]["placement"] = serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "children"
+        });
+        value["status"]["placementAuthority"] = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "namespace": "test-ns",
+            "name": "children",
+            "uid": "original-cluster-pool-uid",
+            "generation": 4
+        });
+        value["status"]["conditions"] = serde_json::json!([{
+            "type": "Ready",
+            "status": "False",
+            "reason": "CompositionEligible",
+            "message": "discovery only",
+            "observedGeneration": 1
+        }]);
+        let mut pool: SandboxPool = serde_json::from_value(value).unwrap();
+        let copied = sandbox_placement_authority_for_admission(&pool)
+            .unwrap()
+            .expect("child authority");
+        let expected = build_sandbox_lease(
+            "sandbox-abc",
+            "test-ns",
+            pool_reference(),
+            Some(copied.clone()),
+            "30m",
+            None,
+            &identity(),
+        );
+
+        let replacement = SandboxPlacementAuthority {
+            uid: "replacement-cluster-pool-uid".into(),
+            generation: 1,
+            ..copied.clone()
+        };
+        pool.status.as_mut().unwrap().placement_authority = Some(replacement.clone());
+        assert_eq!(
+            sandbox_placement_authority_for_admission(&pool).unwrap(),
+            Some(replacement.clone())
+        );
+        assert_eq!(expected.spec.placement_authority, Some(copied));
+
+        let mut rewritten = expected.clone();
+        rewritten.metadata.uid = Some("lease-uid".into());
+        rewritten.metadata.resource_version = Some("1".into());
+        rewritten.spec.placement_authority = Some(replacement);
+        assert!(matches!(
+            validate_lease_shape(&expected, &rewritten, SANDBOX_ADMISSION_PENDING),
+            Err(SandboxLeaseMutationError::LeaseShapeChanged)
+        ));
+    }
+
     #[test]
     fn admission_rejects_any_cleanup_finalizer_drift() {
         let expected = build_sandbox_lease(
             "sandbox-abc",
             "kobe",
             pool_reference(),
+            None,
             "30m",
             None,
             &identity(),
@@ -7681,6 +7875,7 @@ mod tests {
             "sandbox-abc",
             "kobe",
             pool_reference(),
+            None,
             "30m",
             None,
             &identity(),
@@ -7780,6 +7975,7 @@ mod tests {
             "sandbox-abc",
             "test-ns",
             pool_reference(),
+            None,
             "1h",
             None,
             &base,

@@ -30,6 +30,10 @@ use thiserror::Error;
         .message("exact certification references are immutable within one fingerprint"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == 'certified' || (oldSelf.status.certification.phase in ['initialized', 'cleanupBlocked'] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))")
         .message("an active certification fingerprint cannot be abandoned before exact cleanup"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == 'childCluster' && self.status.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.status.placementAuthority.kind == 'ClusterPool' && self.status.placementAuthority.namespace == self.metadata.namespace && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)")
+        .message("placementAuthority must identify the exact same-namespace child ClusterPool"),
+    validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == 'childCluster' && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'False' && c.reason == 'CompositionEligible' && has(c.observedGeneration) && c.observedGeneration == self.metadata.generation)))")
+        .message("placementAuthority is published only with current-generation CompositionEligible status"),
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Allocated","type":"integer","jsonPath":".status.allocated"}"#,
     printcolumn = r#"{"name":"Quarantined","type":"integer","jsonPath":".status.quarantined"}"#,
@@ -491,6 +495,12 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("a child teardown receipt acknowledgement requires child placement"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'FootprintAbsent' && c.status == 'True'))")
         .message("a child teardown receipt acknowledgement requires FootprintAbsent=True in the same checkpoint"),
+    validation = Rule::new("!has(oldSelf.spec.placementAuthority) ? !has(self.spec.placementAuthority) : (has(self.spec.placementAuthority) && self.spec.placementAuthority == oldSelf.spec.placementAuthority)")
+        .message("spec.placementAuthority is immutable"),
+    validation = Rule::new("!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.spec.placementAuthority.kind == 'ClusterPool' && self.spec.placementAuthority.namespace == self.metadata.namespace)")
+        .message("spec.placementAuthority must identify a same-namespace ClusterPool"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == 'management' && !has(self.spec.placementAuthority)) || (self.status.placement.type == 'childCluster' && has(self.spec.placementAuthority) && self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))")
+        .message("resolved placement must match the immutable admission placementAuthority"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -500,6 +510,11 @@ pub struct SandboxLeaseSpec {
     /// Exact SandboxPool admitted by Kobe. UID and generation fence pool
     /// recreation or mutation between HTTP admission and placement.
     pub pool_ref: SandboxPoolReference,
+    /// Server-owned exact child `ClusterPool` identity copied from the admitted
+    /// [`SandboxPoolStatus`]. It is absent for management placement and may not
+    /// be added, removed, or changed after the `SandboxLease` CREATE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_authority: Option<SandboxPlacementAuthority>,
     #[schemars(length(min = 1))]
     pub ttl: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,6 +531,28 @@ pub struct SandboxLeaseSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxPoolReference {
+    #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
+    pub name: String,
+    #[schemars(length(min = 1))]
+    pub uid: String,
+    #[schemars(range(min = 1))]
+    pub generation: i64,
+}
+
+/// Exact child `ClusterPool` identity authorized by pool reconciliation.
+///
+/// Every identity component is required because a same-named replacement is
+/// different capacity. Admission copies this value into a lease before any
+/// placement controller is allowed to create an internal `ClusterLease`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxPlacementAuthority {
+    #[schemars(length(min = 1))]
+    pub api_version: String,
+    #[schemars(length(min = 1))]
+    pub kind: String,
+    #[schemars(length(min = 1))]
+    pub namespace: String,
     #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub name: String,
     #[schemars(length(min = 1))]
@@ -559,6 +596,12 @@ pub struct SandboxPoolStatus {
     /// capacity remains allocated until its complete footprint is proven absent.
     #[serde(default)]
     pub quarantined: u32,
+    /// Exact child `ClusterPool` proven composition-eligible for this Pool
+    /// generation. Management placement and ineligible child pools omit it.
+    /// This is discovery authority only: child `Ready` remains `False` until an
+    /// in-child certification and teardown receipt protocol exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_authority: Option<SandboxPlacementAuthority>,
     /// Restart-safe certification attempt for this exact Pool generation.
     ///
     /// The controller checkpoints object identities before crossing each
@@ -1062,6 +1105,7 @@ mod tests {
             ready: 3,
             allocated: 2,
             quarantined: 1,
+            placement_authority: None,
             certification: None,
             conditions: vec![],
         })
@@ -1514,6 +1558,55 @@ mod tests {
                     .iter()
                     .any(|validation| validation["message"] == message),
                 "missing root validation: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_authority_schema_is_exact_child_only_and_immutable() {
+        let pool = serde_json::to_value(SandboxPool::crd()).unwrap();
+        let lease = serde_json::to_value(SandboxLease::crd()).unwrap();
+        let pool_root = &pool["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let lease_root = &lease["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let pool_authority = &pool_root["properties"]["status"]["properties"]["placementAuthority"];
+        let lease_authority = &lease_root["properties"]["spec"]["properties"]["placementAuthority"];
+
+        for authority in [pool_authority, lease_authority] {
+            let required = authority["required"].as_array().unwrap();
+            for field in [
+                "apiVersion",
+                "kind",
+                "namespace",
+                "name",
+                "uid",
+                "generation",
+            ] {
+                assert!(required.iter().any(|required| required == field));
+            }
+            assert_eq!(authority["properties"]["generation"]["minimum"], 1.0);
+        }
+
+        let pool_validations = pool_root["x-kubernetes-validations"].as_array().unwrap();
+        for message in [
+            "placementAuthority must identify the exact same-namespace child ClusterPool",
+            "placementAuthority is published only with current-generation CompositionEligible status",
+        ] {
+            assert!(
+                pool_validations
+                    .iter()
+                    .any(|validation| validation["message"] == message)
+            );
+        }
+        let lease_validations = lease_root["x-kubernetes-validations"].as_array().unwrap();
+        for message in [
+            "spec.placementAuthority is immutable",
+            "spec.placementAuthority must identify a same-namespace ClusterPool",
+            "resolved placement must match the immutable admission placementAuthority",
+        ] {
+            assert!(
+                lease_validations
+                    .iter()
+                    .any(|validation| validation["message"] == message)
             );
         }
     }

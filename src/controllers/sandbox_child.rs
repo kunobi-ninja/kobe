@@ -28,7 +28,7 @@ use kube::{Client, ResourceExt};
 
 use crate::crd::{
     CleanupMode, ClusterLease, ClusterLeaseSpec, ClusterPool, ClusterPoolPhase, Requester,
-    SandboxLease, SandboxObjectReference, SandboxPool,
+    SandboxLease, SandboxObjectReference, SandboxPlacement, SandboxPlacementAuthority, SandboxPool,
 };
 
 /// Grace added on top of provisioning and runtime, so the internal cluster
@@ -227,6 +227,60 @@ pub fn child_pool_is_composition_eligible(
         .ok_or(ChildPlacementError::InvalidDuration { field: "maxTtl" })?;
     child_lifetime_fits(cluster_pool, sandbox_pool, worst_ttl)?;
     Ok(())
+}
+
+/// Resolve the exact child `ClusterPool` identity proven eligible by this
+/// observation.
+///
+/// A name is only a lookup key. UID and generation are the authority copied by
+/// HTTP admission and later revalidated immediately before allocation.
+pub fn eligible_child_placement_authority(
+    sandbox_pool: &SandboxPool,
+    cluster_pool: &ClusterPool,
+    management_namespace: &str,
+) -> Result<SandboxPlacementAuthority, ChildPlacementError> {
+    let SandboxPlacement::ChildCluster { cluster_pool_ref } = &sandbox_pool.spec.placement else {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "SandboxPool does not request child placement",
+        });
+    };
+    if cluster_pool.name_any() != *cluster_pool_ref
+        || cluster_pool.namespace().as_deref() != Some(management_namespace)
+        || cluster_pool.metadata.deletion_timestamp.is_some()
+    {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "pool name, namespace, or deletion state does not match the requested child placement",
+        });
+    }
+    child_pool_is_composition_eligible(sandbox_pool, cluster_pool)?;
+    Ok(SandboxPlacementAuthority {
+        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+        kind: "ClusterPool".into(),
+        namespace: management_namespace.into(),
+        name: cluster_pool.name_any(),
+        uid: cluster_pool
+            .uid()
+            .expect("eligibility requires a non-empty UID"),
+        generation: cluster_pool
+            .metadata
+            .generation
+            .expect("eligibility requires a generation"),
+    })
+}
+
+/// Revalidate an admission authority against one freshly read eligible pool.
+pub fn child_placement_authority_matches(
+    authority: &SandboxPlacementAuthority,
+    sandbox_pool: &SandboxPool,
+    cluster_pool: &ClusterPool,
+    management_namespace: &str,
+) -> Result<bool, ChildPlacementError> {
+    Ok(
+        eligible_child_placement_authority(sandbox_pool, cluster_pool, management_namespace)?
+            == *authority,
+    )
 }
 
 /// The internal lease's name, derived from the Sandbox lease it serves.

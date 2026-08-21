@@ -576,6 +576,7 @@ fn pool_status(
         ready,
         allocated,
         quarantined,
+        placement_authority: None,
         certification: pool
             .status
             .as_ref()
@@ -666,9 +667,10 @@ pub async fn reconcile_pool(
             Api::namespaced(ctx.client.clone(), &ctx.namespace);
         let child_result = async {
             let cluster_pool = cluster_pools.get(cluster_pool_ref).await?;
-            crate::controllers::sandbox_child::child_pool_is_composition_eligible(
+            let authority = crate::controllers::sandbox_child::eligible_child_placement_authority(
                 &pool,
                 &cluster_pool,
+                &ctx.namespace,
             )?;
             if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
                 crate::sandbox_runtime::validate_managed_child_pool(
@@ -679,22 +681,25 @@ pub async fn reconcile_pool(
                 .await
                 .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
             }
-            Ok::<(), SandboxPlacementError>(())
+            Ok::<_, SandboxPlacementError>(authority)
         }
         .await;
-        let (reason, message) = match child_result {
-            Ok(()) => (
+        let (reason, message, authority) = match child_result {
+            Ok(authority) => (
                 "CompositionEligible",
                 format!(
                     "ClusterPool {cluster_pool_ref} is eligible for verified composition, but Ready remains withheld until an equivalent in-child certification and teardown receipt protocol exists"
                 ),
+                Some(authority),
             ),
             Err(error) => (
                 "ChildPlacementUnavailable",
                 format!("Child placement certification is withheld: {error}"),
+                None,
             ),
         };
-        let status = pool_status(&pool, 0, allocated, quarantined, false, reason, &message)?;
+        let mut status = pool_status(&pool, 0, allocated, quarantined, false, reason, &message)?;
+        status.placement_authority = authority;
         if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
             debug!(pool = %name, "child SandboxPool status write lost a race");
             return Ok(Action::await_change());
@@ -2841,6 +2846,7 @@ fn current_outer_lease_authorizes_create(
     if current.uid() != expected.uid()
         || current.metadata.generation != expected.metadata.generation
         || current.spec.pool_ref != expected.spec.pool_ref
+        || current.spec.placement_authority != expected.spec.placement_authority
     {
         return Err(SandboxPlacementError::Invalid(format!(
             "SandboxLease {} changed identity before allocation",
@@ -2878,20 +2884,39 @@ async fn create_internal_cluster_lease_fenced(
     ctx: &SandboxContext,
     internal: &Api<crate::crd::ClusterLease>,
     desired: &crate::crd::ClusterLease,
+    placement_authority: &crate::crd::SandboxPlacementAuthority,
 ) -> Result<Option<crate::crd::ClusterLease>, SandboxPlacementError> {
     let leases: Api<SandboxLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let pools: Api<SandboxPool> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let fences: Api<k8s_openapi::api::coordination::v1::Lease> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let cluster_pools: Api<crate::crd::ClusterPool> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let attempt = async {
         let current = leases.get(&expected.name_any()).await?;
-        if !current_outer_lease_authorizes_create(&current, expected)?
-            || current_sandbox_pool_for_create(&current, &pools)
-                .await?
-                .is_none()
-            || !allocation_fence_is_absent_for_create(&fences, &current, &ctx.namespace).await?
-        {
+        if !current_outer_lease_authorizes_create(&current, expected)? {
             return Ok(None);
+        }
+        let Some(current_pool) = current_sandbox_pool_for_create(&current, &pools).await? else {
+            return Ok(None);
+        };
+        if !allocation_fence_is_absent_for_create(&fences, &current, &ctx.namespace).await? {
+            return Ok(None);
+        }
+        // This strong read is deliberately the last external observation before
+        // POST. A same-named ClusterPool recreated after HTTP admission is not
+        // the capacity that admission authorized.
+        let current_cluster_pool = cluster_pools.get(&placement_authority.name).await?;
+        if !crate::controllers::sandbox_child::child_placement_authority_matches(
+            placement_authority,
+            &current_pool,
+            &current_cluster_pool,
+            &ctx.namespace,
+        )? {
+            return Err(SandboxPlacementError::Invalid(format!(
+                "ClusterPool {} changed identity before child allocation",
+                placement_authority.name
+            )));
         }
         match internal.create(&PostParams::default(), desired).await {
             Ok(created) => Ok(Some(created)),
@@ -7055,6 +7080,16 @@ async fn compose_child_target(
     use crate::controllers::sandbox_child as child;
 
     let name = lease.name_any();
+    let placement_authority = lease.spec.placement_authority.as_ref().ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxLease {name} has no immutable child placementAuthority"
+        ))
+    })?;
+    if placement_authority.name != cluster_pool_ref {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxLease {name} placementAuthority does not match ClusterPool {cluster_pool_ref}"
+        )));
+    }
     let cluster_pools: Api<crate::crd::ClusterPool> =
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let cluster_pool = cluster_pools.get(cluster_pool_ref).await?;
@@ -7062,7 +7097,16 @@ async fn compose_child_target(
     // Backend capability first: a pool that cannot prove teardown must never
     // back an exclusive tenant cluster, and finding that out after allocating
     // one helps nobody.
-    child::child_pool_is_composition_eligible(pool, &cluster_pool)?;
+    if !child::child_placement_authority_matches(
+        placement_authority,
+        pool,
+        &cluster_pool,
+        &ctx.namespace,
+    )? {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "ClusterPool {cluster_pool_ref} no longer matches SandboxLease {name} placementAuthority"
+        )));
+    }
     if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
         crate::sandbox_runtime::validate_managed_child_pool(
             &ctx.client,
@@ -7102,7 +7146,15 @@ async fn compose_child_target(
                 .ok_or_else(|| {
                 SandboxPlacementError::Invalid(format!("lease {name} has no UID to own a child"))
             })?;
-            match create_internal_cluster_lease_fenced(lease, ctx, &internal, &composed).await? {
+            match create_internal_cluster_lease_fenced(
+                lease,
+                ctx,
+                &internal,
+                &composed,
+                placement_authority,
+            )
+            .await?
+            {
                 Some(created) => {
                     info!(lease = %name, cluster_lease = %internal_name, "composed child cluster lease behind final allocation fence");
                     created
@@ -7182,10 +7234,10 @@ async fn compose_child_target(
             cluster_pool: crate::crd::SandboxObjectReference {
                 api_version: "kobe.kunobi.ninja/v1alpha1".into(),
                 kind: "ClusterPool".into(),
-                namespace: Some(ctx.namespace.clone()),
-                name: cluster_pool.name_any(),
-                uid: cluster_pool.uid().unwrap_or_default(),
-                generation: cluster_pool.metadata.generation,
+                namespace: Some(placement_authority.namespace.clone()),
+                name: placement_authority.name.clone(),
+                uid: placement_authority.uid.clone(),
+                generation: Some(placement_authority.generation),
             },
         },
         &ctx.namespace,
@@ -8402,6 +8454,7 @@ pub(crate) mod tests {
                 ready: 0,
                 allocated: 0,
                 quarantined: 0,
+                placement_authority: None,
                 certification: None,
                 conditions: vec![SandboxCondition {
                     condition_type: POOL_READY_CONDITION.into(),
@@ -8571,6 +8624,7 @@ pub(crate) mod tests {
                     uid: POOL_UID.into(),
                     generation: POOL_GENERATION,
                 },
+                placement_authority: None,
                 ttl: "1h".into(),
                 alias: None,
                 requester,
@@ -9237,6 +9291,63 @@ pub(crate) mod tests {
                 .as_str()
                 .unwrap()
                 .contains("replicas=2/readyReplicas=1")
+        );
+    }
+
+    /// Child discovery publishes exact authority without claiming readiness.
+    #[tokio::test]
+    async fn child_pool_status_records_exact_cluster_pool_authority_fail_closed() {
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(LEASES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<SandboxLease>::new()),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CHILD_POOL_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(child_cluster_pool_json()))
+            .mount(&server)
+            .await;
+
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.placement = serde_json::from_value(serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "children"
+        }))
+        .unwrap();
+        pool.metadata.resource_version = Some("pool-rv".into());
+        Mock::given(method("PATCH"))
+            .and(path(POOL_STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&pool))
+            .mount(&server)
+            .await;
+
+        reconcile_pool(Arc::new(pool), ctx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let status = requests
+            .iter()
+            .find_map(|request| {
+                (request.method.as_str() == "PATCH" && request.url.path() == POOL_STATUS_PATH)
+                    .then(|| status_value_of(request))
+                    .flatten()
+            })
+            .expect("child pool status checkpoint");
+        assert_eq!(status["conditions"][0]["status"], "False");
+        assert_eq!(status["conditions"][0]["reason"], "CompositionEligible");
+        assert_eq!(status["ready"], 0);
+        assert_eq!(
+            status["placementAuthority"],
+            serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterPool",
+                "namespace": NS,
+                "name": "children",
+                "uid": "cluster-pool-uid",
+                "generation": 1
+            })
         );
     }
 
@@ -10053,8 +10164,22 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         let mut lease = admitted_lease();
+        lease.spec.placement_authority = Some(crate::crd::SandboxPlacementAuthority {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterPool".into(),
+            namespace: NS.into(),
+            name: "child-pool".into(),
+            uid: "child-pool-uid".into(),
+            generation: 1,
+        });
         lease.status.as_mut().unwrap().placement = None;
         lease.status.as_mut().unwrap().target = None;
+        Mock::given(method("GET"))
+            .and(path(LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .with_priority(1)
+            .mount(&server)
+            .await;
         let lifetime = crate::controllers::sandbox_child::required_child_lifetime(
             std::time::Duration::from_secs(600),
             std::time::Duration::from_secs(3600),
@@ -10113,6 +10238,75 @@ pub(crate) mod tests {
             checkpoint["target"]["childClusterLease"]["uid"],
             "child-lease-uid"
         );
+    }
+
+    /// Reusing the configured ClusterPool name after admission must fail before
+    /// the internal ClusterLease CREATE, even if the replacement is eligible.
+    #[tokio::test]
+    async fn child_pool_name_reuse_is_refused_by_the_final_pre_post_get() {
+        const CLUSTER_LEASES_PATH: &str =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases";
+        let (ctx, server) = test_context().await;
+        let mut original = child_cluster_pool_json();
+        original["metadata"]["name"] = "child-pool".into();
+        original["metadata"]["uid"] = "child-pool-uid".into();
+        let mut replacement = original.clone();
+        replacement["metadata"]["uid"] = "replacement-pool-uid".into();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let response_reads = Arc::clone(&reads);
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let body = if response_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    original.clone()
+                } else {
+                    replacement.clone()
+                };
+                ResponseTemplate::new(200).set_body_json(body)
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.placement = serde_json::from_value(serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "child-pool"
+        }))
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(POOL_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&pool))
+            .mount(&server)
+            .await;
+        let mut lease = admitted_lease();
+        lease.spec.placement_authority =
+            Some(child_placement_authority("child-pool", "child-pool-uid", 1));
+        lease.status.as_mut().unwrap().placement = None;
+        lease.status.as_mut().unwrap().target = None;
+        Mock::given(method("GET"))
+            .and(path(LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let error = match compose_child_target(&lease, &pool, "child-pool", &ctx).await {
+            Err(error) => error,
+            Ok(_) => panic!("same-named replacement must not compose"),
+        };
+        assert!(error.to_string().contains("changed identity"));
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(requests_to(&server, "POST", CLUSTER_LEASES_PATH).await, 0);
     }
 
     /// An unready claim is still an allocated identity. Record it before the
@@ -13224,8 +13418,25 @@ pub(crate) mod tests {
     // Child composition
     // -----------------------------------------------------------------------
 
+    fn child_placement_authority(
+        name: &str,
+        uid: &str,
+        generation: i64,
+    ) -> crate::crd::SandboxPlacementAuthority {
+        crate::crd::SandboxPlacementAuthority {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterPool".into(),
+            namespace: NS.into(),
+            name: name.into(),
+            uid: uid.into(),
+            generation,
+        }
+    }
+
     fn child_placed_lease(cluster_lease_uid: &str) -> SandboxLease {
         let mut lease = admitted_lease();
+        lease.spec.placement_authority =
+            Some(child_placement_authority("children", "cluster-pool-uid", 1));
         let status = lease.status.as_mut().unwrap();
         status.phase = crate::crd::SandboxLeasePhase::Ready;
         status.placement = Some(crate::crd::ResolvedSandboxPlacement::ChildCluster {

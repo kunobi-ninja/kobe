@@ -35,6 +35,42 @@ spec:
                 minLength: 1
                 nullable: true
                 type: string
+              placementAuthority:
+                description: |-
+                  Server-owned exact child `ClusterPool` identity copied from the admitted
+                  [`SandboxPoolStatus`]. It is absent for management placement and may not
+                  be added, removed, or changed after the `SandboxLease` CREATE.
+                nullable: true
+                properties:
+                  apiVersion:
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  kind:
+                    minLength: 1
+                    type: string
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  namespace:
+                    minLength: 1
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - generation
+                - kind
+                - name
+                - namespace
+                - uid
+                type: object
               poolRef:
                 description: |-
                   Exact SandboxPool admitted by Kobe. UID and generation fence pool
@@ -658,6 +694,12 @@ spec:
           rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.placement) && self.status.placement.type == ''childCluster'')'
         - message: a child teardown receipt acknowledgement requires FootprintAbsent=True in the same checkpoint
           rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
+        - message: spec.placementAuthority is immutable
+          rule: '!has(oldSelf.spec.placementAuthority) ? !has(self.spec.placementAuthority) : (has(self.spec.placementAuthority) && self.spec.placementAuthority == oldSelf.spec.placementAuthority)'
+        - message: spec.placementAuthority must identify a same-namespace ClusterPool
+          rule: '!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.spec.placementAuthority.kind == ''ClusterPool'' && self.spec.placementAuthority.namespace == self.metadata.namespace)'
+        - message: resolved placement must match the immutable admission placementAuthority
+          rule: '!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == ''management'' && !has(self.spec.placementAuthority)) || (self.status.placement.type == ''childCluster'' && has(self.spec.placementAuthority) && self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))'
     served: true
     storage: true
     subresources:
