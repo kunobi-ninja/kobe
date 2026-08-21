@@ -10,4 +10,6 @@ COPY --from=runner /kobe-runner /kobe-runner
 
 RUN test -x /kobe-runner
 
+USER 65532:65532
+
 CMD ["/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"]

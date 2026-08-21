@@ -73,6 +73,11 @@ test("the conformance manifest contains two exact placements and a pullable runn
   expect(pools).toContain("name: e2e-other-token");
 });
 
+test("the Sandbox fixture runs as the restricted workload identity", async () => {
+  const dockerfile = await Bun.file("docker/sandbox-e2e.Dockerfile").text();
+  expect(dockerfile).toContain("USER 65532:65532");
+});
+
 // ---------------------------------------------------------------------------
 // Conformance harness (#138)
 // ---------------------------------------------------------------------------
