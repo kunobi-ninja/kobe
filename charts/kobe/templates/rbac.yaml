@@ -133,6 +133,17 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Runtime certification follows the exact Deployment -> ReplicaSet -> Pod
+  # ownership chain. Read-only is sufficient; Kobe never scales or adopts the
+  # upstream Agent Sandbox controller rollout.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  # A ready webhook Service is authoritative only when every EndpointSlice
+  # targetRef names one exact pinned controller Pod from that rollout.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
   # PodDisruptionBudgets — the k3s backend creates a PDB for HA control
   # planes (servers>1) and deletes it on every recycle. Without these verbs
   # the recycle loop's `delete()` fails with 403 Forbidden (RBAC is checked

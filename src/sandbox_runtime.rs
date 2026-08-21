@@ -25,6 +25,7 @@
 //! [Agent Sandbox]: https://github.com/kubernetes-sigs/agent-sandbox
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How the upstream Agent Sandbox runtime reaches a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -215,11 +216,40 @@ pub fn crd_is_compatible(
     })
 }
 
+fn crd_conversion_is_compatible(
+    crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+) -> bool {
+    let Some(conversion) = crd.spec.conversion.as_ref() else {
+        return false;
+    };
+    let Some(webhook) = conversion.webhook.as_ref() else {
+        return false;
+    };
+    let Some(config) = webhook.client_config.as_ref() else {
+        return false;
+    };
+    let Some(service) = config.service.as_ref() else {
+        return false;
+    };
+    conversion.strategy == "Webhook"
+        && config.url.is_none()
+        && config
+            .ca_bundle
+            .as_ref()
+            .is_some_and(|bundle| !bundle.0.is_empty())
+        && service.name == "agent-sandbox-webhook-service"
+        && service.namespace == AGENT_SANDBOX_SYSTEM_NAMESPACE
+        && service.path.as_deref() == Some("/convert")
+        && service.port.is_none_or(|port| port == 443)
+        && webhook.conversion_review_versions == ["v1".to_string(), "v1beta1".to_string()]
+}
+
 /// Validate that a compatible operator-installed runtime is present.
 ///
-/// Every required CRD must be established and serve the pinned version. The
-/// first failure is returned rather than a collected list: an operator fixes
-/// these one at a time, and the first one usually explains the rest.
+/// Every required CRD must be established, serve the pinned version, and use
+/// the exact TLS-backed conversion webhook installed by the pinned release.
+/// The first failure is returned rather than a collected list: an operator
+/// fixes these one at a time, and the first one usually explains the rest.
 pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), AgentSandboxUnusable> {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::api::Api;
@@ -249,6 +279,15 @@ pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), Agen
             })
             .unwrap_or_default();
         crd_is_compatible(name, expected_api_version, established, &served)?;
+        if observed
+            .as_ref()
+            .is_none_or(|crd| !crd_conversion_is_compatible(crd))
+        {
+            return Err(component_unhealthy(
+                "crd_conversion",
+                format!("CRD {name} does not use the exact trusted conversion webhook"),
+            ));
+        }
     }
     Ok(())
 }
@@ -279,17 +318,171 @@ fn component_unhealthy(component: &'static str, reason: impl Into<String>) -> Ag
     }
 }
 
+/// Require one sole controller owner with the exact immutable identity.
+///
+/// Kubernetes permits several non-controller owners, but at most one owner is
+/// authoritative for reconciliation. Ambiguous or name-reused controller
+/// ownership therefore fails closed.
+fn exact_controller_uid(
+    metadata: &kube::api::ObjectMeta,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+    uid: &str,
+) -> bool {
+    let mut controllers = metadata
+        .owner_references
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|owner| owner.controller == Some(true));
+    let Some(owner) = controllers.next() else {
+        return false;
+    };
+    controllers.next().is_none()
+        && owner.api_version == api_version
+        && owner.kind == kind
+        && owner.name == name
+        && owner.uid == uid
+}
+
+fn deployment_rollout_is_converged(
+    status: &k8s_openapi::api::apps::v1::DeploymentStatus,
+    desired_replicas: i32,
+) -> bool {
+    status.replicas.unwrap_or_default() == desired_replicas
+        && status.updated_replicas.unwrap_or_default() == desired_replicas
+        && status.ready_replicas.unwrap_or_default() == desired_replicas
+        && status.available_replicas.unwrap_or_default() == desired_replicas
+        && status.unavailable_replicas.unwrap_or_default() == 0
+}
+
+fn exact_webhook_service_uid(
+    service: &k8s_openapi::api::core::v1::Service,
+    selector_labels: &BTreeMap<String, String>,
+) -> Result<String, AgentSandboxUnusable> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+    if service.metadata.deletion_timestamp.is_some() {
+        return Err(component_unhealthy(
+            "webhook_service",
+            "Service is deleting",
+        ));
+    }
+    let uid = service
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| component_unhealthy("webhook_service", "UID is missing"))?;
+    let spec = service
+        .spec
+        .as_ref()
+        .ok_or_else(|| component_unhealthy("webhook_service", "spec is missing"))?;
+    if spec.selector.as_ref() != Some(selector_labels) {
+        return Err(component_unhealthy(
+            "webhook_service",
+            "selector does not exactly match the controller Deployment",
+        ));
+    }
+    let ports = spec
+        .ports
+        .as_ref()
+        .filter(|ports| ports.len() == 1)
+        .ok_or_else(|| {
+            component_unhealthy(
+                "webhook_service",
+                "expected exactly one webhook Service port",
+            )
+        })?;
+    let port = &ports[0];
+    if port.name.as_deref() != Some("webhook")
+        || port.port != 443
+        || port.protocol.as_deref() != Some("TCP")
+        || port.target_port != Some(IntOrString::Int(9443))
+    {
+        return Err(component_unhealthy(
+            "webhook_service",
+            "webhook port must be TCP 443 targeting 9443",
+        ));
+    }
+    Ok(uid.to_string())
+}
+
+fn endpoint_slices_cover_exact_pods(
+    slices: &[k8s_openapi::api::discovery::v1::EndpointSlice],
+    service_uid: &str,
+    pinned_pod_uids: &BTreeSet<String>,
+) -> bool {
+    if slices.is_empty() || pinned_pod_uids.is_empty() {
+        return false;
+    }
+
+    let mut endpoint_pod_uids = BTreeSet::new();
+    for slice in slices {
+        if slice.metadata.deletion_timestamp.is_some()
+            || !exact_controller_uid(
+                &slice.metadata,
+                "v1",
+                "Service",
+                "agent-sandbox-webhook-service",
+                service_uid,
+            )
+        {
+            return false;
+        }
+        let Some(ports) = slice.ports.as_ref().filter(|ports| ports.len() == 1) else {
+            return false;
+        };
+        let port = &ports[0];
+        if port.name.as_deref() != Some("webhook")
+            || port.port != Some(9443)
+            || port.protocol.as_deref() != Some("TCP")
+        {
+            return false;
+        }
+        if slice.endpoints.is_empty() {
+            return false;
+        }
+        for endpoint in &slice.endpoints {
+            let Some(target) = endpoint.target_ref.as_ref() else {
+                return false;
+            };
+            let Some(uid) = target
+                .uid
+                .as_ref()
+                .filter(|uid| pinned_pod_uids.contains(*uid))
+            else {
+                return false;
+            };
+            if endpoint.conditions.as_ref().is_none_or(|conditions| {
+                conditions.ready != Some(true) || conditions.terminating == Some(true)
+            }) || target.api_version.as_deref() != Some("v1")
+                || target.kind.as_deref() != Some("Pod")
+                || target.namespace.as_deref() != Some(AGENT_SANDBOX_SYSTEM_NAMESPACE)
+                || target.name.as_deref().is_none_or(str::is_empty)
+                || !endpoint_pod_uids.insert(uid.clone())
+            {
+                return false;
+            }
+        }
+    }
+    endpoint_pod_uids == *pinned_pod_uids
+}
+
 /// Validate the pinned controller, conversion webhook and running image.
 ///
 /// CRD presence alone is not a runtime signal. This additionally requires the
-/// v0.5.4 controller Deployment to have observed its current generation, an
-/// available Ready Pod whose runtime image ID matches the pinned release, the
-/// webhook TLS Secret, and a ready webhook endpoint.
+/// v0.5.4 Deployment and its single current ReplicaSet to have converged, every
+/// selected Pod to be exact-owned, Ready, and running the pinned image, and the
+/// exact webhook Service to route only to those Pod UIDs through owned
+/// EndpointSlices. The webhook TLS Secret must also contain all required keys.
 pub async fn validate_runtime_components(
     client: &kube::Client,
 ) -> Result<(), AgentSandboxUnusable> {
-    use k8s_openapi::api::apps::v1::Deployment;
-    use k8s_openapi::api::core::v1::{Endpoints, Pod, Secret};
+    use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
+    use k8s_openapi::api::core::v1::{Pod, Secret, Service};
+    use k8s_openapi::api::discovery::v1::EndpointSlice;
     use kube::api::{Api, ListParams};
     use kube::runtime::reflector::ObjectRef;
 
@@ -301,6 +494,18 @@ pub async fn validate_runtime_components(
         .get("agent-sandbox-controller")
         .await
         .map_err(|error| component_unhealthy("controller_deployment", error.to_string()))?;
+    let deployment_uid = deployment
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| component_unhealthy("controller_deployment", "UID is missing"))?;
+    if deployment.metadata.deletion_timestamp.is_some() {
+        return Err(component_unhealthy(
+            "controller_deployment",
+            "Deployment is deleting",
+        ));
+    }
     let desired_generation = deployment.metadata.generation.unwrap_or_default();
     let status = deployment.status.as_ref().ok_or_else(|| {
         component_unhealthy("controller_deployment", "status has not been published")
@@ -320,24 +525,53 @@ pub async fn validate_runtime_components(
         .and_then(|spec| spec.replicas)
         .unwrap_or(1)
         .max(1);
-    if status.available_replicas.unwrap_or_default() < desired_replicas {
+    if !deployment_rollout_is_converged(status, desired_replicas) {
         return Err(component_unhealthy(
             "controller_deployment",
             format!(
-                "only {} of {desired_replicas} replicas are available",
-                status.available_replicas.unwrap_or_default()
+                "rollout has replicas={}/updated={}/ready={}/available={}/unavailable={}, expected {desired_replicas} fully converged replicas",
+                status.replicas.unwrap_or_default(),
+                status.updated_replicas.unwrap_or_default(),
+                status.ready_replicas.unwrap_or_default(),
+                status.available_replicas.unwrap_or_default(),
+                status.unavailable_replicas.unwrap_or_default(),
             ),
         ));
     }
-    let controller = deployment
+    let deployment_spec = deployment.spec.as_ref().ok_or_else(|| {
+        component_unhealthy("controller_deployment", "Deployment spec is missing")
+    })?;
+    let selector_labels = deployment_spec
+        .selector
+        .match_labels
+        .as_ref()
+        .filter(|labels| !labels.is_empty())
+        .ok_or_else(|| {
+            component_unhealthy(
+                "controller_deployment",
+                "Deployment selector has no exact matchLabels",
+            )
+        })?;
+    if deployment_spec
+        .selector
+        .match_expressions
+        .as_ref()
+        .is_some_and(|expressions| !expressions.is_empty())
+    {
+        return Err(component_unhealthy(
+            "controller_deployment",
+            "Deployment selector uses unsupported matchExpressions",
+        ));
+    }
+    let deployment_pod_spec = deployment_spec
+        .template
         .spec
         .as_ref()
-        .and_then(|spec| spec.template.spec.as_ref())
-        .and_then(|spec| {
-            spec.containers
-                .iter()
-                .find(|container| container.name == "agent-sandbox-controller")
-        })
+        .ok_or_else(|| component_unhealthy("controller_deployment", "Pod spec is missing"))?;
+    let controller = deployment_pod_spec
+        .containers
+        .iter()
+        .find(|container| container.name == "agent-sandbox-controller")
         .ok_or_else(|| {
             component_unhealthy(
                 "controller_deployment",
@@ -362,12 +596,83 @@ pub async fn validate_runtime_components(
         ));
     }
 
+    let selector = selector_labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let replica_sets: Api<ReplicaSet> =
+        Api::namespaced(client.clone(), AGENT_SANDBOX_SYSTEM_NAMESPACE);
+    let replica_sets = replica_sets
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .map_err(|error| component_unhealthy("controller_replicaset", error.to_string()))?;
+    let mut current_replica_sets = replica_sets.iter().filter(|replica_set| {
+        let spec = replica_set.spec.as_ref();
+        let status = replica_set.status.as_ref();
+        replica_set.metadata.deletion_timestamp.is_none()
+            && exact_controller_uid(
+                &replica_set.metadata,
+                "apps/v1",
+                "Deployment",
+                "agent-sandbox-controller",
+                deployment_uid,
+            )
+            && spec.and_then(|spec| spec.replicas) == Some(desired_replicas)
+            && spec
+                .and_then(|spec| spec.template.as_ref())
+                .and_then(|template| template.spec.as_ref())
+                == Some(deployment_pod_spec)
+            && selector_labels.iter().all(|(key, value)| {
+                spec.and_then(|spec| spec.template.as_ref())
+                    .and_then(|template| template.metadata.as_ref())
+                    .and_then(|metadata| metadata.labels.as_ref())
+                    .and_then(|labels| labels.get(key))
+                    == Some(value)
+            })
+            && status.is_some_and(|status| {
+                status.observed_generation == replica_set.metadata.generation
+                    && status.replicas == desired_replicas
+                    && status.fully_labeled_replicas.unwrap_or_default() == desired_replicas
+                    && status.ready_replicas.unwrap_or_default() == desired_replicas
+                    && status.available_replicas.unwrap_or_default() == desired_replicas
+            })
+    });
+    let Some(current_replica_set) = current_replica_sets.next() else {
+        return Err(component_unhealthy(
+            "controller_replicaset",
+            "no exact Deployment-owned ReplicaSet has fully converged",
+        ));
+    };
+    if current_replica_sets.next().is_some() {
+        return Err(component_unhealthy(
+            "controller_replicaset",
+            "more than one active ReplicaSet matches the current Deployment template",
+        ));
+    }
+    let current_replica_set_uid = current_replica_set
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| component_unhealthy("controller_replicaset", "UID is missing"))?;
+
     let pods: Api<Pod> = Api::namespaced(client.clone(), AGENT_SANDBOX_SYSTEM_NAMESPACE);
     let pods = pods
-        .list(&ListParams::default().labels("app=agent-sandbox-controller"))
+        .list(&ListParams::default().labels(&selector))
         .await
         .map_err(|error| component_unhealthy("controller_pod", error.to_string()))?;
-    let pinned_ready_pod = pods.iter().any(|pod| {
+    if pods.items.len() != usize::try_from(desired_replicas).unwrap_or(usize::MAX) {
+        return Err(component_unhealthy(
+            "controller_pod",
+            format!(
+                "observed {} matching Pods, expected exactly {desired_replicas}",
+                pods.items.len()
+            ),
+        ));
+    }
+    let mut pinned_pod_uids = BTreeSet::new();
+    let all_pods_pinned_and_ready = pods.iter().all(|pod| {
         let ready = pod
             .status
             .as_ref()
@@ -389,9 +694,37 @@ pub async fn validate_runtime_components(
             .is_some_and(|status| {
                 status.ready && observed_controller_image_is_pinned(&status.image_id)
             });
-        ready && pinned
+        let owned = exact_controller_uid(
+            &pod.metadata,
+            "apps/v1",
+            "ReplicaSet",
+            &current_replica_set
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_default(),
+            current_replica_set_uid,
+        );
+        let uid = pod
+            .metadata
+            .uid
+            .as_ref()
+            .filter(|uid| !uid.is_empty())
+            .cloned();
+        if ready
+            && pinned
+            && owned
+            && pod.metadata.deletion_timestamp.is_none()
+            && let Some(uid) = uid
+        {
+            pinned_pod_uids.insert(uid);
+            return true;
+        }
+        false
     });
-    if !pinned_ready_pod {
+    if !all_pods_pinned_and_ready
+        || pinned_pod_uids.len() != usize::try_from(desired_replicas).unwrap_or(usize::MAX)
+    {
         let observed = pods
             .iter()
             .map(|pod| ObjectRef::from_obj(pod).name)
@@ -399,7 +732,9 @@ pub async fn validate_runtime_components(
             .join(",");
         return Err(component_unhealthy(
             "controller_pod",
-            format!("no Ready Pod runs a pinned image (observed: {observed})"),
+            format!(
+                "not every current ReplicaSet Pod is Ready, exact-owned and pinned (observed: {observed})"
+            ),
         ));
     }
 
@@ -421,24 +756,27 @@ pub async fn validate_runtime_components(
         }
     }
 
-    let endpoints: Api<Endpoints> = Api::namespaced(client.clone(), AGENT_SANDBOX_SYSTEM_NAMESPACE);
-    let webhook = endpoints
+    let services: Api<Service> = Api::namespaced(client.clone(), AGENT_SANDBOX_SYSTEM_NAMESPACE);
+    let webhook_service = services
         .get("agent-sandbox-webhook-service")
         .await
+        .map_err(|error| component_unhealthy("webhook_service", error.to_string()))?;
+    let webhook_service_uid = exact_webhook_service_uid(&webhook_service, selector_labels)?;
+
+    let endpoint_slices: Api<EndpointSlice> =
+        Api::namespaced(client.clone(), AGENT_SANDBOX_SYSTEM_NAMESPACE);
+    let webhook_slices = endpoint_slices
+        .list(
+            &ListParams::default()
+                .labels("kubernetes.io/service-name=agent-sandbox-webhook-service"),
+        )
+        .await
         .map_err(|error| component_unhealthy("webhook_endpoint", error.to_string()))?;
-    let ready = webhook.subsets.as_ref().is_some_and(|subsets| {
-        subsets.iter().any(|subset| {
-            subset
-                .addresses
-                .as_ref()
-                .is_some_and(|addresses| !addresses.is_empty())
-                && subset.ports.as_ref().is_some_and(|ports| {
-                    ports
-                        .iter()
-                        .any(|port| port.port == 9443 || port.name.as_deref() == Some("webhook"))
-                })
-        })
-    });
+    let ready = endpoint_slices_cover_exact_pods(
+        &webhook_slices.items,
+        &webhook_service_uid,
+        &pinned_pod_uids,
+    );
     if !ready {
         return Err(component_unhealthy(
             "webhook_endpoint",
@@ -1045,6 +1383,218 @@ mod tests {
         assert!(!observed_controller_image_is_pinned("sha256:foreign"));
     }
 
+    #[test]
+    fn controller_rollout_requires_every_replica_to_be_current_and_ready() {
+        let mut status: k8s_openapi::api::apps::v1::DeploymentStatus =
+            serde_json::from_value(serde_json::json!({
+                "replicas": 2,
+                "updatedReplicas": 2,
+                "readyReplicas": 2,
+                "availableReplicas": 2,
+                "unavailableReplicas": 0
+            }))
+            .expect("DeploymentStatus");
+        assert!(deployment_rollout_is_converged(&status, 2));
+
+        status.updated_replicas = Some(1);
+        assert!(!deployment_rollout_is_converged(&status, 2));
+        status.updated_replicas = Some(2);
+        status.unavailable_replicas = Some(1);
+        assert!(!deployment_rollout_is_converged(&status, 2));
+    }
+
+    #[test]
+    fn crd_conversion_requires_the_exact_tls_webhook() {
+        let exact: k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "sandboxclaims.extensions.agents.x-k8s.io" },
+                "spec": {
+                    "group": "extensions.agents.x-k8s.io",
+                    "scope": "Namespaced",
+                    "names": {
+                        "plural": "sandboxclaims",
+                        "singular": "sandboxclaim",
+                        "kind": "SandboxClaim",
+                        "listKind": "SandboxClaimList"
+                    },
+                    "versions": [{ "name": "v1beta1", "served": true, "storage": true }],
+                    "conversion": {
+                        "strategy": "Webhook",
+                        "webhook": {
+                            "clientConfig": {
+                                "caBundle": "Y2E=",
+                                "service": {
+                                    "name": "agent-sandbox-webhook-service",
+                                    "namespace": AGENT_SANDBOX_SYSTEM_NAMESPACE,
+                                    "path": "/convert",
+                                    "port": 443
+                                }
+                            },
+                            "conversionReviewVersions": ["v1", "v1beta1"]
+                        }
+                    }
+                }
+            }))
+            .expect("CRD");
+        assert!(crd_conversion_is_compatible(&exact));
+
+        let mut replaced_service = exact.clone();
+        replaced_service
+            .spec
+            .conversion
+            .as_mut()
+            .unwrap()
+            .webhook
+            .as_mut()
+            .unwrap()
+            .client_config
+            .as_mut()
+            .unwrap()
+            .service
+            .as_mut()
+            .unwrap()
+            .name = "replacement-webhook".to_string();
+        assert!(!crd_conversion_is_compatible(&replaced_service));
+
+        let mut untrusted = exact;
+        untrusted
+            .spec
+            .conversion
+            .as_mut()
+            .unwrap()
+            .webhook
+            .as_mut()
+            .unwrap()
+            .client_config
+            .as_mut()
+            .unwrap()
+            .ca_bundle = None;
+        assert!(!crd_conversion_is_compatible(&untrusted));
+    }
+
+    #[test]
+    fn webhook_endpoints_require_exact_service_and_pod_uids() {
+        let selector = [("app".to_string(), "agent-sandbox-controller".to_string())]
+            .into_iter()
+            .collect();
+        let service: k8s_openapi::api::core::v1::Service =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "agent-sandbox-webhook-service",
+                    "namespace": AGENT_SANDBOX_SYSTEM_NAMESPACE,
+                    "uid": "service-uid"
+                },
+                "spec": {
+                    "selector": { "app": "agent-sandbox-controller" },
+                    "ports": [{
+                        "name": "webhook",
+                        "port": 443,
+                        "protocol": "TCP",
+                        "targetPort": 9443
+                    }]
+                }
+            }))
+            .expect("Service");
+        let service_uid =
+            exact_webhook_service_uid(&service, &selector).expect("exact webhook Service");
+        let exact_slice: k8s_openapi::api::discovery::v1::EndpointSlice =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": "agent-sandbox-webhook-service-a",
+                    "namespace": AGENT_SANDBOX_SYSTEM_NAMESPACE,
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "Service",
+                        "name": "agent-sandbox-webhook-service",
+                        "uid": "service-uid",
+                        "controller": true
+                    }]
+                },
+                "addressType": "IPv4",
+                "ports": [{ "name": "webhook", "port": 9443, "protocol": "TCP" }],
+                "endpoints": [{
+                    "addresses": ["10.0.0.2"],
+                    "conditions": { "ready": true, "terminating": false },
+                    "targetRef": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "agent-sandbox-controller-current",
+                        "namespace": AGENT_SANDBOX_SYSTEM_NAMESPACE,
+                        "uid": "pod-uid"
+                    }
+                }]
+            }))
+            .expect("EndpointSlice");
+        let pod_uids = ["pod-uid".to_string()].into_iter().collect();
+        assert!(endpoint_slices_cover_exact_pods(
+            std::slice::from_ref(&exact_slice),
+            &service_uid,
+            &pod_uids
+        ));
+
+        let mut ambiguous_owner = exact_slice.clone();
+        ambiguous_owner
+            .metadata
+            .owner_references
+            .as_mut()
+            .unwrap()
+            .push(
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "v1".to_string(),
+                    kind: "Service".to_string(),
+                    name: "other-service".to_string(),
+                    uid: "other-service-uid".to_string(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                },
+            );
+        assert!(!endpoint_slices_cover_exact_pods(
+            &[ambiguous_owner],
+            &service_uid,
+            &pod_uids
+        ));
+
+        let mut replaced_service = exact_slice.clone();
+        replaced_service.metadata.owner_references.as_mut().unwrap()[0].uid =
+            "replacement-service".to_string();
+        assert!(!endpoint_slices_cover_exact_pods(
+            &[replaced_service],
+            &service_uid,
+            &pod_uids
+        ));
+
+        let mut replaced_pod = exact_slice;
+        replaced_pod.endpoints[0].target_ref.as_mut().unwrap().uid =
+            Some("replacement-pod".to_string());
+        assert!(!endpoint_slices_cover_exact_pods(
+            &[replaced_pod],
+            &service_uid,
+            &pod_uids
+        ));
+    }
+
+    #[test]
+    fn runtime_rollout_observation_is_read_only_in_the_chart() {
+        let chart = include_str!("../charts/kobe/templates/rbac.yaml");
+        assert!(
+            chart.contains(
+                "resources: [\"replicasets\"]\n    verbs: [\"get\", \"list\", \"watch\"]"
+            )
+        );
+        assert!(chart.contains(
+            "resources: [\"endpointslices\"]\n    verbs: [\"get\", \"list\", \"watch\"]"
+        ));
+        assert!(!chart.contains(
+            "resources: [\"replicasets\"]\n    verbs: [\"get\", \"list\", \"watch\", \"patch\"]"
+        ));
+    }
+
     /// A runtime serving a different version must be refused, not accepted
     /// because the CRD name matched.
     ///
@@ -1086,7 +1636,7 @@ mod tests {
         assert_eq!(err.reason_code(), "crd_missing");
     }
 
-    /// All three CRDs are required. A runtime with claims but no warm pools
+    /// All four CRDs are required. A runtime with claims but no warm pools
     /// would pass a laxer check and then fail to serve.
     #[test]
     fn every_consumed_crd_is_required_at_the_version_it_is_consumed_at() {
