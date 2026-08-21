@@ -348,9 +348,9 @@ jobs:
   # (name suffixed by backend) and always tears it down. `fail-fast: false` so
   # one backend's failure doesn't mask the others.
   #
-  # PHASE 2 (#10): the k3s leg — the production backend — also runs on every
-  # push to main and on release tags, so a conformance regression is caught
-  # before (main) or at (tag) the release boundary instead of a day later.
+  # PHASE 2 (#10): the k3s leg — the production backend — runs on every PR,
+  # push to main and release tag, so a conformance regression is caught before
+  # merge and again at the release boundary instead of a day later.
   # The full matrix (k3s + both vkobe datastores) stays nightly + manual; the
   # vkobe legs run the same gate across etcd + kine/sqlite, vcluster runs
   # nightly against the upstream loft-sh chart (#31), and k0s joins with the
@@ -367,12 +367,13 @@ jobs:
   # like `docker-dry-run`, this needs the host Docker socket for kind + buildx.
   conformance:
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      ${{ github.event_name == 'pull_request'
+          || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
           || (github.event_name == 'push'
               && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) }}
     needs: [checks]
     runs-on: kunobi-runners
-    timeout-minutes: 45
+    timeout-minutes: 180
     # The vkobe backend is ON HOLD (see docs/kobe-docs/how-it-works/
     # runtime-strategy.mdx) and its legs currently fail on a real behavior
     # tracked in #36 (pool creates no members in the kind harness). Keep them
@@ -383,9 +384,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # k3s-only on push (fast feedback on the production backend); the full
-        # matrix nightly / on manual dispatch.
-        backend: ${{ fromJSON(github.event_name == 'push' && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine", "vcluster", "k0s"]') }}
+        # k3s-only on PR/push (fast feedback on the production backend); the
+        # full backend matrix remains nightly / manual.
+        backend: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine", "vcluster", "k0s"]') }}
+    env:
+      E2E_CLUSTER: e2e-${{ github.run_id }}-${{ matrix.backend }}
+      KOBE_ENDPOINT: http://127.0.0.1:8080
+      KOBE_TOKEN: e2e-dev-token
+      KOBE_TOKEN_OTHER: e2e-other-token
+      KOBE_SANDBOX_POOL_MANAGEMENT: e2e-sandbox-management-trusted
+      KOBE_SANDBOX_POOL_CHILD: e2e-sandbox-child-k3s-trusted
+      KOBE_SANDBOX_HARNESS: bun run ./hack/e2e.ts
+      KOBE_BIN: ${{ github.workspace }}/target/debug/kobe
     steps:
       - uses: actions/checkout@v7
 
@@ -416,15 +426,22 @@ jobs:
         # every pool is applied regardless. Scale-to-zero pools provision only
         # in their own leg, so pre-loading their images in every leg would be a
         # pull each other leg never uses.
-        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}-${{ matrix.backend }} --backend ${{ matrix.backend }}
+        run: |
+          SANDBOX_ARGS=()
+          if [ "${{ matrix.backend }}" = k3s ]; then
+            SANDBOX_ARGS+=(--sandbox-conformance)
+          fi
+          mise exec -- bun run ./hack/e2e.ts up \
+            --cluster "$E2E_CLUSTER" \
+            --backend "${{ matrix.backend }}" \
+            "${SANDBOX_ARGS[@]}"
 
       # The smoke recipes differ by backend (k3s takes the cluster name; the
       # vkobe recipes target their pool against the current kind context).
       - name: Run the ${{ matrix.backend }} conformance smoke gate
         run: |
-          CLUSTER=e2e-${{ github.run_id }}-${{ matrix.backend }}
           case "${{ matrix.backend }}" in
-            k3s)        mise exec -- just test-smoke-k3s "$CLUSTER" ;;
+            k3s)        mise exec -- just test-smoke-k3s "$E2E_CLUSTER" ;;
             vkobe-etcd) mise exec -- just test-smoke-vkobe ;;
             vkobe-kine) mise exec -- just test-smoke-vkobe-kine ;;
             vcluster)   mise exec -- just test-smoke-vcluster ;;
@@ -435,11 +452,11 @@ jobs:
       - name: Diagnostics on failure
         if: failure()
         run: |
-          CTX=kind-e2e-${{ github.run_id }}-${{ matrix.backend }}
-          kubectl --context "$CTX" get pods,clusterinstances,clusterpools -A -o wide || true
+          CTX=kind-$E2E_CLUSTER
+          kubectl --context "$CTX" get pods,clusterinstances,clusterpools,sandboxpools,sandboxleases -A -o wide || true
           kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 200 --all-containers || true
           mkdir -p /tmp/kind-logs
-          mise exec -- kind export logs /tmp/kind-logs --name e2e-${{ github.run_id }}-${{ matrix.backend }} || true
+          mise exec -- kind export logs /tmp/kind-logs --name "$E2E_CLUSTER" || true
 
       - name: Upload kind logs
         if: failure()
@@ -454,24 +471,23 @@ jobs:
       # backends have nothing to compare against and would report a skip that
       # reads as a pass.
       #
-      # Skipped LOUDLY when the harness has not published a Sandbox endpoint,
-      # rather than failing the whole e2e run for an environment that predates
-      # the Sandbox pools.
       - name: Sandbox conformance (management + child)
         if: matrix.backend == 'k3s'
-        env:
-          KOBE_SANDBOX_E2E: "1"
         run: |
-          if [ -z "${KOBE_ENDPOINT:-}" ] || [ -z "${KOBE_SANDBOX_POOL_CHILD:-}" ]; then
-            echo "::warning title=Sandbox conformance skipped::no Sandbox endpoint or child pool configured for this environment (#76)"
-            exit 0
+          mise exec -- cargo build -p kobectl --bin kobe
+          mise exec -- bun run ./hack/e2e.ts sandbox-conformance-preflight \
+            --cluster "$E2E_CLUSTER" \
+            --timeout 900
+          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            mise exec -- just test-sandbox-conformance
+          else
+            mise exec -- just test-sandbox-conformance-pr
           fi
-          mise exec -- just test-sandbox-conformance
 
       # Always tear down so kind clusters never leak on the persistent runner.
       - name: Tear down the e2e harness
         if: always()
-        run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}-${{ matrix.backend }}
+        run: mise exec -- bun run ./hack/e2e.ts down --cluster "$E2E_CLUSTER"
 
   publish:
     # Pushes the operator/sync container images. On a RELEASE TAG, gate the image
@@ -482,9 +498,9 @@ jobs:
     # The REF gate is load-bearing: this job used to key only off
     # `event_name != 'pull_request'`, so `workflow_dispatch` on ANY branch
     # published from that branch. Dispatch is the documented way to exercise
-    # conformance (which never runs on pull_request) before merging a backend
-    # change — so validating a branch silently republished the shared tags from
-    # unmerged code. Validation and publication are now separate concerns:
+    # the full backend and exhaustive Sandbox matrices before merging a backend
+    # change — so validating a branch must not republish shared tags from
+    # unmerged code. Validation and publication are separate concerns:
     # dispatch a branch to test it, and only main / a release tag ships.
     # Dispatch on main still publishes, which is the remedy for tags left
     # pointing somewhere wrong.

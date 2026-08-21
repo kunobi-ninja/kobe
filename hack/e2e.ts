@@ -12,6 +12,14 @@ const STATE_FILE = `${process.cwd()}/.tmp/e2e-state.json`;
 const DEMO_TOKEN = "e2e-dev-token";
 const DEMO_TOKEN_SECRET = "e2e-local-token";
 const DEMO_POLICY = "e2e-local-token";
+const DEMO_OTHER_TOKEN = "e2e-other-token";
+const DEMO_OTHER_TOKEN_SECRET = "e2e-other-token";
+const DEMO_OTHER_POLICY = "e2e-other-token";
+const DEMO_SANDBOX_POOL_MANAGEMENT = "e2e-sandbox-management-trusted";
+const DEMO_SANDBOX_POOL_CHILD = "e2e-sandbox-child-k3s-trusted";
+const DEMO_SANDBOX_BOOTSTRAP = "agent-sandbox-v0-5-4";
+const SANDBOX_REGISTRY_IMAGE = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
+const SANDBOX_REGISTRY_LABEL = "kobe.kunobi.ninja/e2e-sandbox-registry";
 const DEMO_K0S_POOL = "e2e-k0s";
 const DEMO_K0S_VERSION = "v1.35.1+k0s.0";
 // k0s guest image the k0s backend launches for DEMO_K0S_VERSION.
@@ -73,6 +81,7 @@ const OPERATOR_LEADER_LEASE = "kobe-operator";
 // (SANDBOX_RESERVATION_LEASE_UID_LABEL in src/api/sandbox.rs). `reap-lease`
 // needs it because a quarantined lease's reservations outlive the lease.
 const SANDBOX_LEASE_UID_LABEL = "kobe.kunobi.ninja/sandbox-lease-uid";
+const SANDBOX_LEDGER_NAMESPACE_LABEL = "kobe.kunobi.ninja/sandbox-ledger=true";
 // Label every backend stamps on the resources of one child cluster
 // (`cluster_labels` in src/backend/k3s.rs and its k0s/vkobe siblings). It is
 // how `inject-failure --kind=child-api-unreachable` finds the Service in front
@@ -114,6 +123,7 @@ const FINGERPRINT_INPUTS = [
 const COMMANDS = [
   "up",
   "down",
+  "sandbox-conformance-preflight",
   "restart-operator",
   "inject-failure",
   "clear-failure",
@@ -149,6 +159,9 @@ type Args = {
   /// known. Only used to decide which guest images are worth pre-loading —
   /// every pool is still applied regardless.
   backend?: string;
+  /// Provision the managed runtime, two identities, both Sandbox placements,
+  /// and the private workload image needed by the #76 live gate.
+  sandboxConformance: boolean;
   /// kubectl context to drive. Defaults to the kind context for `--cluster`,
   /// which is what `up` creates; overridable so the same subcommands work
   /// against a CI cluster that kind did not build.
@@ -184,7 +197,17 @@ type E2eState = {
   namespace: string;
   release: string;
   imageTag: string;
+  endpoint: string;
   fingerprint: string;
+  backend?: string;
+  sandboxConformance: boolean;
+  sandboxFixture?: SandboxFixture;
+};
+
+export type SandboxFixture = {
+  imageRef: string;
+  registrySource: string;
+  mirrorEndpoint: string;
 };
 
 const toolCache = new Map<string, string>();
@@ -300,7 +323,7 @@ function loadState(): E2eState | null {
   }
 }
 
-async function saveState(args: Args, fingerprint: string): Promise<void> {
+async function saveState(args: Args, fingerprint: string, sandboxFixture?: SandboxFixture): Promise<void> {
   await runCommand(["mkdir", "-p", `${process.cwd()}/.tmp`], {
     step: "failed to create temp directory for e2e state",
   });
@@ -312,7 +335,11 @@ async function saveState(args: Args, fingerprint: string): Promise<void> {
         namespace: args.namespace,
         release: args.release,
         imageTag: args.imageTag,
+        endpoint: args.endpoint,
         fingerprint,
+        backend: args.backend,
+        sandboxConformance: args.sandboxConformance,
+        sandboxFixture,
       } satisfies E2eState,
       null,
       2,
@@ -326,6 +353,10 @@ function clearStateFiles(): void {
 }
 
 function canReuseExistingEnvironment(args: Args, fingerprint: string): boolean {
+  // The conformance image is served by a run-owned registry outside Kind.
+  // Re-observe and republish it on every `up`; a stale state file cannot prove
+  // that a fresh child cluster can still pull the fixture.
+  if (args.sandboxConformance) return false;
   const state = loadState();
   if (!state) return false;
 
@@ -334,7 +365,10 @@ function canReuseExistingEnvironment(args: Args, fingerprint: string): boolean {
     state.namespace === args.namespace &&
     state.release === args.release &&
     state.imageTag === args.imageTag &&
-    state.fingerprint === fingerprint
+    state.endpoint === args.endpoint &&
+    state.fingerprint === fingerprint &&
+    state.backend === args.backend &&
+    state.sandboxConformance === args.sandboxConformance
   );
 }
 
@@ -349,11 +383,12 @@ function isFailureKind(token: string): token is FailureKind {
 export function parseArgs(argv: string[]): Args {
   const args = {
     command: "up" as const,
-    cluster: DEFAULT_CLUSTER,
+    cluster: process.env.E2E_CLUSTER ?? DEFAULT_CLUSTER,
     namespace: DEFAULT_NAMESPACE,
     release: DEFAULT_RELEASE,
     imageTag: DEFAULT_IMAGE_TAG,
-    endpoint: LOCAL_ENDPOINT,
+    endpoint: process.env.KOBE_ENDPOINT ?? LOCAL_ENDPOINT,
+    sandboxConformance: false,
     timeoutSeconds: 300,
     failure: "teardown-unverifiable" as const,
     revocation: {},
@@ -408,6 +443,10 @@ export function parseArgs(argv: string[]): Args {
     if (token === "--backend" && next) {
       args.backend = next;
       i += 1;
+      continue;
+    }
+    if (token === "--sandbox-conformance") {
+      args.sandboxConformance = true;
       continue;
     }
     if (token === "--kube-context" && next) {
@@ -517,9 +556,11 @@ function parsePositiveInt(value: string, name: string, options?: { allowZero?: b
 function printHelpAndExit(): never {
   info("Usage:");
   info(
-    "  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG] [--backend NAME]",
+    "  bun run ./hack/e2e.ts up [--cluster NAME] [--namespace NS] [--release NAME] [--image-tag TAG] [--backend NAME] [--sandbox-conformance]",
   );
   info("  bun run ./hack/e2e.ts down [--cluster NAME]");
+  info("  bun run ./hack/e2e.ts sandbox-conformance-preflight [--cluster NAME] [--timeout SECONDS]");
+  info("      Fail unless `up --sandbox-conformance` created and certified both live placements.");
   info("");
   info("Conformance harness (#138) — disturbs the target so #76's matrix can be run.");
   info("All of these accept [--cluster NAME] [--namespace NS] [--release NAME]");
@@ -536,8 +577,8 @@ function printHelpAndExit(): never {
   info("      child-api-unreachable needs --instance, or --lease to resolve one from the CR.");
   info("");
   info("  bun run ./hack/e2e.ts reap-lease --lease ID");
-  info("      Delete a SandboxLease and its admission reservations. Quarantine has no API exit;");
-  info("      without this a quarantine scenario withholds capacity from every scenario after it.");
+  info("      Trigger a repaired quarantine's evidence retry, require its protected ledger empty,");
+  info("      then delete the clean record. No reservation is removed ahead of teardown proof.");
   info("");
   info("  bun run ./hack/e2e.ts attach-pty --lease ID [--send KEYS]... [--expect TEXT] [--expect-exit N]");
   info("                                   [--kobe PATH] [--settle MS] [--send-delay MS] [-- ARGV...]");
@@ -587,14 +628,124 @@ nodes:
   });
 }
 
-async function buildImages(imageTag: string): Promise<void> {
+function sandboxRegistryContainer(cluster: string): string {
+  const suffix = createHash("sha256").update(cluster).digest("hex").slice(0, 12);
+  return `kobe-e2e-registry-${suffix}`;
+}
+
+async function dockerInspect(container: string, format: string): Promise<string | undefined> {
+  const result = await runCommand(["docker", "inspect", "--format", format, container], {
+    allowFailure: true,
+  });
+  if (result.exitCode !== 0) return undefined;
+  return result.stdout.trim();
+}
+
+async function waitForRegistry(endpoint: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastError = "no response";
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${endpoint}/v2/`, { signal: AbortSignal.timeout(1_000) });
+      if (response.ok) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    // This is readiness polling, not a guessed startup delay: every iteration
+    // observes the registry endpoint and the bound ends in a concrete error.
+    await Bun.sleep(100);
+  }
+  throw new Error(`sandbox fixture registry at ${endpoint} did not become ready: ${lastError}`);
+}
+
+async function ensureSandboxRegistry(cluster: string, imageTag: string): Promise<SandboxFixture> {
+  const container = sandboxRegistryContainer(cluster);
+  const owner = await dockerInspect(container, `{{ index .Config.Labels "${SANDBOX_REGISTRY_LABEL}" }}`);
+  if (owner !== undefined && owner !== cluster) {
+    throw new Error(
+      `refusing to reuse Docker container '${container}': expected ${SANDBOX_REGISTRY_LABEL}=${cluster}, got ${owner || "no ownership label"}`,
+    );
+  }
+
+  if (owner === undefined) {
+    step(`Starting Sandbox fixture registry '${container}'`);
+    await runCommand([
+      "docker",
+      "run",
+      "-d",
+      "--name",
+      container,
+      "--label",
+      `${SANDBOX_REGISTRY_LABEL}=${cluster}`,
+      "-p",
+      "127.0.0.1::5000",
+      SANDBOX_REGISTRY_IMAGE,
+    ], { step: "failed to start Sandbox fixture registry" });
+  } else if ((await dockerInspect(container, "{{.State.Running}}")) !== "true") {
+    await runCommand(["docker", "start", container], {
+      step: `failed to restart Sandbox fixture registry '${container}'`,
+    });
+  }
+
+  const kindIpBefore = await dockerInspect(container, `{{ with index .NetworkSettings.Networks "kind" }}{{ .IPAddress }}{{ end }}`);
+  if (!kindIpBefore) {
+    await runCommand(["docker", "network", "connect", "kind", container], {
+      step: `failed to connect Sandbox fixture registry '${container}' to the kind network`,
+    });
+  }
+
+  const portResult = await runCommand(["docker", "port", container, "5000/tcp"], {
+    step: "failed to resolve Sandbox fixture registry host port",
+  });
+  const hostPort = portResult.stdout.trim().split(":").pop();
+  const kindIp = await dockerInspect(container, `{{ (index .NetworkSettings.Networks "kind").IPAddress }}`);
+  if (!hostPort || !/^\d+$/.test(hostPort) || !kindIp) {
+    throw new Error(`Sandbox fixture registry '${container}' has no usable host port or kind-network address`);
+  }
+
+  const registrySource = `127.0.0.1:${hostPort}`;
+  await waitForRegistry(`http://${registrySource}`);
+  return {
+    imageRef: `${registrySource}/kobe-sandbox-e2e:${imageTag}`,
+    registrySource,
+    mirrorEndpoint: `http://${kindIp}:5000`,
+  };
+}
+
+async function removeSandboxRegistry(cluster: string): Promise<void> {
+  const container = sandboxRegistryContainer(cluster);
+  const owner = await dockerInspect(container, `{{ index .Config.Labels "${SANDBOX_REGISTRY_LABEL}" }}`);
+  if (owner === undefined) return;
+  if (owner !== cluster) {
+    throw new Error(
+      `refusing to remove Docker container '${container}': expected ${SANDBOX_REGISTRY_LABEL}=${cluster}, got ${owner || "no ownership label"}`,
+    );
+  }
+  step(`Removing Sandbox fixture registry '${container}'`);
+  await runCommand(["docker", "rm", "-f", container], {
+    step: `failed to remove Sandbox fixture registry '${container}'`,
+  });
+}
+
+async function buildImages(imageTag: string, sandboxFixture?: SandboxFixture): Promise<void> {
   step(`Building local images (tag=${imageTag}, platform=${nativePlatform()})`);
-  await runCommand(["docker", "buildx", "bake", "-f", "docker-bake.hcl", "--load"], {
+  const targets = sandboxFixture ? ["default", "sandbox-e2e"] : [];
+  await runCommand(["docker", "buildx", "bake", "-f", "docker-bake.hcl", ...targets, "--load"], {
     env: {
       IMAGE_TAG: imageTag,
       PLATFORM: nativePlatform(),
+      ...(sandboxFixture ? { SANDBOX_E2E_IMAGE: sandboxFixture.imageRef } : {}),
     },
     step: "failed to build local images",
+    stream: true,
+  });
+}
+
+async function pushSandboxFixture(fixture: SandboxFixture): Promise<void> {
+  step(`Publishing Sandbox fixture ${fixture.imageRef} to the run-owned registry`);
+  await runCommand(["docker", "push", fixture.imageRef], {
+    step: `failed to publish Sandbox fixture '${fixture.imageRef}'`,
     stream: true,
   });
 }
@@ -608,7 +759,7 @@ async function recreateTempDir(): Promise<void> {
   });
 }
 
-async function saveImages(imageTag: string): Promise<void> {
+async function saveImages(imageTag: string, sandboxFixture?: SandboxFixture): Promise<void> {
   await recreateTempDir();
   step(`Saving local images to ${TEMP_DIR}`);
   await runCommand(["docker", "save", `zondax/kobe-operator:${imageTag}`, "-o", `${TEMP_DIR}/kobe-operator.tar`], {
@@ -617,6 +768,11 @@ async function saveImages(imageTag: string): Promise<void> {
   await runCommand(["docker", "save", `zondax/kobe-sync:${imageTag}`, "-o", `${TEMP_DIR}/kobe-sync.tar`], {
     step: "failed to save kobe-sync image archive",
   });
+  if (sandboxFixture) {
+    await runCommand(["docker", "save", sandboxFixture.imageRef, "-o", `${TEMP_DIR}/sandbox-e2e.tar`], {
+      step: "failed to save Sandbox fixture image archive",
+    });
+  }
 }
 
 async function kindNodes(cluster: string): Promise<string[]> {
@@ -716,17 +872,24 @@ async function loadImagesIntoKind(
   cluster: string,
   imageTag: string,
   backend?: string,
+  sandboxFixture?: SandboxFixture,
 ): Promise<void> {
   step(`Loading images into kind cluster '${cluster}'`);
-  await saveImages(imageTag);
+  await saveImages(imageTag, sandboxFixture);
 
   const nodes = await kindNodes(cluster);
   info(`  - nodes: ${nodes.join(", ")}`);
   for (const node of nodes) {
     await importArchiveToNode(cluster, node, `${TEMP_DIR}/kobe-operator.tar`);
     await importArchiveToNode(cluster, node, `${TEMP_DIR}/kobe-sync.tar`);
+    if (sandboxFixture) {
+      await importArchiveToNode(cluster, node, `${TEMP_DIR}/sandbox-e2e.tar`);
+    }
     await verifyImageInNode(node, `zondax/kobe-operator:${imageTag}`);
     await verifyImageInNode(node, `zondax/kobe-sync:${imageTag}`);
+    if (sandboxFixture) {
+      await verifyImageInNode(node, sandboxFixture.imageRef);
+    }
   }
 
   // Pre-load guest backend images so a leased/warmed instance doesn't have to
@@ -778,7 +941,7 @@ async function installChart(args: Args): Promise<void> {
   );
   const helm = await resolveTool("helm");
   const rolloutNonce = Date.now().toString();
-  await runCommand([
+  const command = [
     helm,
     "upgrade",
     "--install",
@@ -811,13 +974,102 @@ async function installChart(args: Args): Promise<void> {
     `kobeSync.image.tag=${args.imageTag}`,
     "--set-string",
     `podAnnotations.e2e-rollout=${rolloutNonce}`,
-  ], {
+  ];
+  if (args.sandboxConformance) {
+    command.push("--set", "agentSandbox.mode=managed");
+  }
+  await runCommand(command, {
     step: `failed to install Helm release '${args.release}'`,
     stream: true,
   });
 }
 
-function bootstrapManifest(namespace: string): string {
+export function sandboxConformanceManifest(namespace: string, fixture: SandboxFixture): string {
+  const poolSpec = (placement: string) => `spec:
+  warmCapacity: 1
+  defaultTtl: "10m"
+  maxTtl: "20m"
+  provisioningTimeout: "5m"
+  placement:
+${placement}
+  template:
+    defaultContainer: workspace
+    runnerPath: /kobe-runner
+    containers:
+      - name: workspace
+        image: ${fixture.imageRef}
+        command: ["/bin/sh", "-c"]
+        args: ["trap 'exit 0' TERM INT; while :; do sleep 3600; done"]
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+            ephemeralStorage: "64Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+            ephemeralStorage: "512Mi"
+    exposedPorts:
+      - name: http
+        container: workspace
+        port: 8080
+  # Kind and its nested k3s child intentionally use the ordinary runtime. The
+  # trusted tier makes that limitation explicit and never claims gVisor/Kata.
+  isolation:
+    tier: trusted-runc
+  readiness:
+    canary:
+      argv: ["/bin/sh", "-c", "test -x /kobe-runner"]
+      timeout: "30s"`;
+
+  return `apiVersion: v1
+kind: Secret
+metadata:
+  name: ${DEMO_OTHER_TOKEN_SECRET}
+  namespace: ${namespace}
+stringData:
+  token: ${DEMO_OTHER_TOKEN}
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: ${DEMO_OTHER_POLICY}
+  namespace: ${namespace}
+spec:
+  auth:
+    token:
+      secretRef: ${DEMO_OTHER_TOKEN_SECRET}
+  rules:
+    - pools: []
+      maxTtl: "1h"
+      maxConcurrentLeases: 0
+      maxExtensions: 0
+      sandbox:
+        pools: ["${DEMO_SANDBOX_POOL_MANAGEMENT}", "${DEMO_SANDBOX_POOL_CHILD}"]
+        verbs: ["lease", "exec", "logs", "port-forward", "release"]
+        maxTtl: "20m"
+        maxConcurrentLeases: 4
+        resourceCeiling:
+          maxCpu: "1"
+          maxMemory: "512Mi"
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: SandboxPool
+metadata:
+  name: ${DEMO_SANDBOX_POOL_MANAGEMENT}
+  namespace: ${namespace}
+${poolSpec("    type: management")}
+---
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: SandboxPool
+metadata:
+  name: ${DEMO_SANDBOX_POOL_CHILD}
+  namespace: ${namespace}
+${poolSpec(`    type: childCluster\n    clusterPoolRef: ${DEMO_K3S_POOL}`)}
+`;
+}
+
+export function bootstrapManifest(namespace: string, sandboxFixture?: SandboxFixture): string {
   return `apiVersion: v1
 kind: Secret
 metadata:
@@ -840,7 +1092,15 @@ spec:
       maxTtl: "2h"
       maxConcurrentLeases: 10
       maxExtensions: 5
----
+${sandboxFixture ? `      sandbox:
+        pools: ["${DEMO_SANDBOX_POOL_MANAGEMENT}", "${DEMO_SANDBOX_POOL_CHILD}"]
+        verbs: ["lease", "exec", "logs", "port-forward", "release"]
+        maxTtl: "20m"
+        maxConcurrentLeases: 4
+        resourceCeiling:
+          maxCpu: "1"
+          maxMemory: "512Mi"
+` : ""}---
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
 metadata:
@@ -881,9 +1141,9 @@ spec:
 # Single-server k3s pool for the provision→Ready→recycle CI smoke gate.
 # Modeled on deploy/profiles/e2e-direct-k3s.yaml but with the shared-Postgres
 # backend.datastore block dropped (the kunobi-postgres secret doesn't exist in
-# kind) so each k3s instance uses embedded SQLite, and no bootstraps block (a
-# bare k3s keeps memory ~1Gi and provisioning fast). scaling.minReady=1 warms
-# exactly one member automatically.
+# kind) so each k3s instance uses embedded SQLite. Ordinary e2e keeps it bare;
+# --sandbox-conformance adds the chart's pinned runtime bootstrap and the
+# run-owned fixture registry mirror. scaling.minReady=1 warms one member.
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
 metadata:
@@ -898,7 +1158,12 @@ spec:
     version: "${DEMO_K3S_VERSION}"
     servers: 1
     agents: 0
-  healthCheck:
+${sandboxFixture ? `    registryMirrors:
+      "${sandboxFixture.registrySource}":
+        - "${sandboxFixture.mirrorEndpoint}"
+  bootstraps:
+    - name: ${DEMO_SANDBOX_BOOTSTRAP}
+` : ""}  healthCheck:
     intervalSeconds: 30
     failureThreshold: 3
   scaling:
@@ -912,7 +1177,7 @@ spec:
       cpu: "1"
       memory: "1Gi"
 ---
-apiVersion: apps/v1
+${sandboxFixture ? `${sandboxConformanceManifest(namespace, sandboxFixture)}---\n` : ""}apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${DEMO_VKOBE_ETCD_BACKEND}
@@ -1321,7 +1586,11 @@ spec:
 `;
 }
 
-async function bootstrapLocalResources(cluster: string, namespace: string): Promise<void> {
+async function bootstrapLocalResources(
+  cluster: string,
+  namespace: string,
+  sandboxFixture?: SandboxFixture,
+): Promise<void> {
   step("Bootstrapping local demo token and pool");
   await runCommand(
     [
@@ -1378,7 +1647,7 @@ kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BAC
   );
   await runCommand(
     ["/bin/sh", "-lc", `cat <<'EOF' | kubectl --context ${kubeContext(cluster)} apply -f -
-${bootstrapManifest(namespace)}EOF`],
+${bootstrapManifest(namespace, sandboxFixture)}EOF`],
     {
       step: "failed to apply local demo token/policy/pool",
     },
@@ -1438,21 +1707,198 @@ async function up(args: Args): Promise<void> {
   }
 
   await ensureCluster(args.cluster);
-  await buildImages(args.imageTag);
-  await loadImagesIntoKind(args.cluster, args.imageTag, args.backend);
+  const sandboxFixture = args.sandboxConformance
+    ? await ensureSandboxRegistry(args.cluster, args.imageTag)
+    : undefined;
+  await buildImages(args.imageTag, sandboxFixture);
+  if (sandboxFixture) {
+    await pushSandboxFixture(sandboxFixture);
+  }
+  await loadImagesIntoKind(args.cluster, args.imageTag, args.backend, sandboxFixture);
   await prepareHelm();
   await runCommand(["/bin/sh", "-lc", `kubectl --context ${kubeContext(args.cluster)} create namespace ${args.namespace} --dry-run=client -o yaml | kubectl --context ${kubeContext(args.cluster)} apply -f -`], {
     step: `failed to ensure namespace '${args.namespace}'`,
   });
   await installChart(args);
-  await bootstrapLocalResources(args.cluster, args.namespace);
+  await bootstrapLocalResources(args.cluster, args.namespace, sandboxFixture);
   await writeLocalCliConfig();
-  await saveState(args, fingerprint);
+  await saveState(args, fingerprint, sandboxFixture);
   await printContext(args.cluster, args.namespace);
+}
+
+type ConformanceObject = {
+  metadata?: { generation?: number };
+  spec?: Record<string, unknown>;
+  status?: {
+    observedGeneration?: number;
+    conditions?: Array<{
+      type?: string;
+      status?: string;
+      observedGeneration?: number;
+      reason?: string;
+      message?: string;
+    }>;
+  };
+};
+
+function requireConformance(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(`Sandbox conformance preflight: ${message}`);
+}
+
+function assertSandboxPolicy(policy: ConformanceObject, name: string): void {
+  const rules = policy.spec?.rules;
+  requireConformance(Array.isArray(rules), `AccessPolicy/${name} has no rules`);
+  const requiredPools = [DEMO_SANDBOX_POOL_MANAGEMENT, DEMO_SANDBOX_POOL_CHILD];
+  const requiredVerbs = ["lease", "exec", "logs", "port-forward", "release"];
+  const grant = rules.find((candidate) => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const sandbox = (candidate as Record<string, unknown>).sandbox;
+    if (!sandbox || typeof sandbox !== "object") return false;
+    const fields = sandbox as Record<string, unknown>;
+    return requiredPools.every((pool) => Array.isArray(fields.pools) && fields.pools.includes(pool))
+      && requiredVerbs.every((verb) => Array.isArray(fields.verbs) && fields.verbs.includes(verb));
+  });
+  requireConformance(grant, `AccessPolicy/${name} lacks the complete two-pool Sandbox grant`);
+}
+
+function assertCertifiedPool(pool: ConformanceObject, name: string): void {
+  const generation = pool.metadata?.generation;
+  requireConformance(generation !== undefined, `SandboxPool/${name} has no generation`);
+  requireConformance(
+    pool.status?.observedGeneration === generation,
+    `SandboxPool/${name} status is stale (observed ${pool.status?.observedGeneration ?? "none"}, current ${generation})`,
+  );
+  const ready = (pool.status?.conditions ?? []).filter((condition) => condition.type === "Ready");
+  requireConformance(ready.length === 1, `SandboxPool/${name} must have exactly one Ready condition`);
+  requireConformance(
+    ready[0].status === "True" && ready[0].observedGeneration === generation,
+    `SandboxPool/${name} is not currently certified: ${ready[0].reason ?? "unknown"}: ${ready[0].message ?? ""}`,
+  );
+}
+
+/// Privileged setup evidence for #76, deliberately separate from the public
+/// contract suite. It proves the harness created the exact two identities,
+/// managed runtime, receipt-capable child pool, and both current-generation
+/// SandboxPool certifications before any caller assertion is allowed to run.
+async function sandboxConformancePreflight(args: Args): Promise<void> {
+  const state = loadState();
+  requireConformance(state, "no e2e state exists; run `up --sandbox-conformance` first");
+  requireConformance(state.cluster === args.cluster, `state belongs to cluster '${state.cluster}', not '${args.cluster}'`);
+  requireConformance(state.endpoint === args.endpoint, `state belongs to endpoint '${state.endpoint}', not '${args.endpoint}'`);
+  requireConformance(state.sandboxConformance, "environment was not created with --sandbox-conformance");
+  requireConformance(state.sandboxFixture, "environment did not record a Sandbox workload fixture");
+  requireConformance(
+    /^127\.0\.0\.1:\d+$/.test(state.sandboxFixture.registrySource),
+    `fixture registry source is not loopback-only: '${state.sandboxFixture.registrySource}'`,
+  );
+  requireConformance(
+    state.sandboxFixture.imageRef.startsWith(`${state.sandboxFixture.registrySource}/kobe-sandbox-e2e:`),
+    `fixture image '${state.sandboxFixture.imageRef}' does not belong to the run-owned registry`,
+  );
+  await waitForRegistry(`http://${state.sandboxFixture.registrySource}`);
+  await runCommand(["docker", "manifest", "inspect", "--insecure", state.sandboxFixture.imageRef], {
+    step: `run-owned registry no longer contains '${state.sandboxFixture.imageRef}'`,
+  });
+  await waitForEndpointServing(args);
+
+  step("Verifying exact Sandbox conformance fixtures");
+  for (const [resource, name] of [
+    ["secret", DEMO_TOKEN_SECRET],
+    ["secret", DEMO_OTHER_TOKEN_SECRET],
+    ["bootstrapconfig.kobe.kunobi.ninja", DEMO_SANDBOX_BOOTSTRAP],
+  ]) {
+    await kubectl(args, ["get", resource, name, "-n", args.namespace], {
+      step: `required fixture ${resource}/${name} is absent`,
+    });
+  }
+
+  const clusterPool = await kubectlJson<ConformanceObject>(args, [
+    "get", "clusterpool.kobe.kunobi.ninja", DEMO_K3S_POOL, "-n", args.namespace,
+  ]);
+  const clusterSpec = clusterPool.spec ?? {};
+  const backend = clusterSpec.backend as Record<string, unknown> | undefined;
+  requireConformance(backend?.type === "k3s", `ClusterPool/${DEMO_K3S_POOL} is not a receipt-capable k3s backend`);
+  requireConformance(clusterSpec.diagnostics === undefined, `ClusterPool/${DEMO_K3S_POOL} enables unreceipted diagnostics`);
+  const bootstraps = clusterSpec.bootstraps;
+  requireConformance(
+    Array.isArray(bootstraps)
+      && bootstraps.some((entry) => entry && typeof entry === "object" && (entry as Record<string, unknown>).name === DEMO_SANDBOX_BOOTSTRAP),
+    `ClusterPool/${DEMO_K3S_POOL} does not name BootstrapConfig/${DEMO_SANDBOX_BOOTSTRAP}`,
+  );
+  const cluster = clusterSpec.cluster as Record<string, unknown> | undefined;
+  requireConformance(cluster?.kubeletSharedMount === undefined, `ClusterPool/${DEMO_K3S_POOL} exposes an unreceipted kubelet mount`);
+  const mirrors = cluster?.registryMirrors as Record<string, unknown> | undefined;
+  requireConformance(
+    Array.isArray(mirrors?.[state.sandboxFixture.registrySource])
+      && (mirrors?.[state.sandboxFixture.registrySource] as unknown[]).includes(state.sandboxFixture.mirrorEndpoint),
+    `ClusterPool/${DEMO_K3S_POOL} does not route '${state.sandboxFixture.registrySource}' through the run-owned registry`,
+  );
+
+  for (const [policyName, secretName] of [
+    [DEMO_POLICY, DEMO_TOKEN_SECRET],
+    [DEMO_OTHER_POLICY, DEMO_OTHER_TOKEN_SECRET],
+  ] as const) {
+    const policy = await kubectlJson<ConformanceObject>(args, [
+      "get", "accesspolicy.kobe.kunobi.ninja", policyName, "-n", args.namespace,
+    ]);
+    const auth = policy.spec?.auth as Record<string, unknown> | undefined;
+    const tokenAuth = auth?.token as Record<string, unknown> | undefined;
+    requireConformance(tokenAuth?.secretRef === secretName, `AccessPolicy/${policyName} does not reference Secret/${secretName}`);
+    assertSandboxPolicy(policy, policyName);
+  }
+
+  for (const [name, placement] of [
+    [DEMO_SANDBOX_POOL_MANAGEMENT, "management"],
+    [DEMO_SANDBOX_POOL_CHILD, "childCluster"],
+  ] as const) {
+    const pool = await kubectlJson<ConformanceObject>(args, [
+      "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+    ]);
+    const actualPlacement = pool.spec?.placement as Record<string, unknown> | undefined;
+    const template = pool.spec?.template as Record<string, unknown> | undefined;
+    const containers = template?.containers;
+    requireConformance(actualPlacement?.type === placement, `SandboxPool/${name} has placement ${String(actualPlacement?.type)}, expected ${placement}`);
+    if (placement === "childCluster") {
+      requireConformance(actualPlacement.clusterPoolRef === DEMO_K3S_POOL, `SandboxPool/${name} does not target ClusterPool/${DEMO_K3S_POOL}`);
+    }
+    requireConformance(template?.runnerPath === "/kobe-runner", `SandboxPool/${name} does not enable durable execution`);
+    requireConformance(
+      Array.isArray(containers)
+        && containers.some((container) => container && typeof container === "object" && (container as Record<string, unknown>).image === state.sandboxFixture?.imageRef),
+      `SandboxPool/${name} does not use the run-owned fixture image`,
+    );
+    const ready = (pool.status?.conditions ?? []).find((condition) => condition.type === "Ready");
+    if (ready?.status === "False" && ready.message?.includes("not implemented")) {
+      throw new Error(
+        `Sandbox conformance preflight: SandboxPool/${name} reports an unresolved certification implementation: ${ready.message}`,
+      );
+    }
+  }
+
+  await kubectl(args, [
+    "rollout", "status", "deployment/agent-sandbox-controller", "-n", "agent-sandbox-system", `--timeout=${args.timeoutSeconds}s`,
+  ], { step: "managed Agent Sandbox controller did not become available" });
+  await kubectl(args, [
+    "wait", `clusterpool.kobe.kunobi.ninja/${DEMO_K3S_POOL}`, "-n", args.namespace,
+    "--for=jsonpath={.status.ready}=1", `--timeout=${args.timeoutSeconds}s`,
+  ], { step: `ClusterPool/${DEMO_K3S_POOL} did not retain one Ready child fixture` });
+
+  for (const name of [DEMO_SANDBOX_POOL_MANAGEMENT, DEMO_SANDBOX_POOL_CHILD]) {
+    await kubectl(args, [
+      "wait", `sandboxpool.kobe.kunobi.ninja/${name}`, "-n", args.namespace,
+      "--for=condition=Ready", `--timeout=${args.timeoutSeconds}s`,
+    ], { step: `SandboxPool/${name} never obtained current runtime/policy/network/canary certification` });
+    const current = await kubectlJson<ConformanceObject>(args, [
+      "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+    ]);
+    assertCertifiedPool(current, name);
+  }
+  step("Both Sandbox placements and both caller policies are certified");
 }
 
 async function down(args: Args): Promise<void> {
   await ensureMiseTools();
+  await removeSandboxRegistry(args.cluster);
   if (!(await clusterExists(args.cluster))) {
     clearStateFiles();
     info(`kind cluster '${args.cluster}' does not exist`);
@@ -2095,7 +2541,9 @@ async function clearFailure(args: Args): Promise<void> {
 ///
 /// So the exit exists here, in the harness, and nowhere in the API. That is the
 /// point: the "operator intervention" quarantine requires is exactly what this
-/// is, performed against the cluster rather than through the contract.
+/// is, performed against the cluster rather than through the contract. It only
+/// wakes the controller and verifies its proof-first cleanup; it never deletes
+/// protected reservations itself.
 async function reapLease(args: Args): Promise<void> {
   if (!args.lease) {
     throw new Error("reap-lease needs --lease <id>");
@@ -2107,20 +2555,73 @@ async function reapLease(args: Args): Promise<void> {
   }
 
   const uid = lease.metadata?.uid;
-  if (uid) {
-    step(`Deleting admission reservations for lease uid ${uid}`);
-    await kubectl(
-      args,
-      [
-        "delete",
-        "lease.coordination.k8s.io",
-        "-n",
-        args.namespace,
-        "-l",
-        `${SANDBOX_LEASE_UID_LABEL}=${uid}`,
-        "--ignore-not-found",
-      ],
-      { step: "failed to delete admission reservations" },
+  if (!uid) throw new Error(`sandbox lease '${args.lease}' has no UID; refusing an unfenced reap`);
+
+  const ledgers = await kubectlJson<{ items?: Array<{ metadata?: { name?: string } }> }>(args, [
+    "get",
+    "namespace",
+    "-l",
+    SANDBOX_LEDGER_NAMESPACE_LABEL,
+  ]);
+  const ledgerNamespaces = (ledgers.items ?? []).flatMap((namespace) => namespace.metadata?.name ?? []);
+  if (ledgerNamespaces.length !== 1) {
+    throw new Error(
+      `expected exactly one ${SANDBOX_LEDGER_NAMESPACE_LABEL} namespace, found ${ledgerNamespaces.length}: ${ledgerNamespaces.join(", ")}`,
+    );
+  }
+
+  // Clearing the injected failure restores evidence, but a quarantined lease
+  // otherwise waits for its periodic retry. Touch metadata to enqueue it now;
+  // the controller must prove absence and release its own ledger objects in
+  // the safe order. The harness never impersonates the protected writer and
+  // never frees capacity ahead of that proof.
+  step(`Requesting an immediate evidence retry for sandbox lease '${args.lease}'`);
+  await kubectl(
+    args,
+    [
+      "annotate",
+      "sandboxleases.kobe.kunobi.ninja",
+      "-n",
+      args.namespace,
+      args.lease,
+      `kobe.kunobi.ninja/e2e-reap-at=${Date.now()}`,
+      "--overwrite",
+    ],
+    { step: `failed to enqueue sandbox lease '${args.lease}' for evidence retry` },
+  );
+
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  for (;;) {
+    const current = await readSandboxLease(args, args.lease);
+    if (!current) break;
+    const phase = current.status?.phase;
+    if (
+      (phase === "Released" || phase === "Expired")
+      && conditionIsTrue(current, "FootprintAbsent")
+      && conditionIsTrue(current, "CleanupVerified")
+    ) {
+      break;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `sandbox lease '${args.lease}' did not prove teardown after intervention (phase=${phase ?? "none"})`,
+      );
+    }
+    await Bun.sleep(1_000);
+  }
+
+  const remaining = await kubectlJson<{ items?: Array<{ metadata?: { name?: string } }> }>(args, [
+    "get",
+    "lease.coordination.k8s.io",
+    "-n",
+    ledgerNamespaces[0],
+    "-l",
+    `${SANDBOX_LEASE_UID_LABEL}=${uid}`,
+  ]);
+  const reservationNames = (remaining.items ?? []).flatMap((reservation) => reservation.metadata?.name ?? []);
+  if (reservationNames.length !== 0) {
+    throw new Error(
+      `sandbox lease '${args.lease}' settled but still owns admission reservations: ${reservationNames.join(", ")}`,
     );
   }
 
@@ -2354,6 +2855,9 @@ async function main() {
         return;
       case "down":
         await down(args);
+        return;
+      case "sandbox-conformance-preflight":
+        await sandboxConformancePreflight(args);
         return;
       case "restart-operator":
         await restartOperator(args);

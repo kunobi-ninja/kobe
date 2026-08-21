@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import {
+  bootstrapManifest,
   decodeKeystrokes,
   guestImagesForBackend,
   LEASE_STAGES,
@@ -8,6 +9,7 @@ import {
   parseArgs,
   ptyCommand,
   revokeVerb,
+  sandboxConformanceManifest,
 } from "./e2e";
 
 test("k3s only preloads the always-warm k3s guest image", () => {
@@ -23,6 +25,52 @@ test("k0s also preloads its on-demand guest image", () => {
     "rancher/k3s:v1.31.3-k3s1",
     "k0sproject/k0s:v1.35.1-k0s.0",
   ]);
+});
+
+test("Sandbox conformance mode is explicit and the CI cluster is inherited by every harness command", () => {
+  const previous = process.env.E2E_CLUSTER;
+  process.env.E2E_CLUSTER = "ci-owned-kind";
+  try {
+    const up = parseArgs(["up", "--backend", "k3s", "--sandbox-conformance"]);
+    const preflight = parseArgs(["sandbox-conformance-preflight"]);
+
+    expect(up.cluster).toBe("ci-owned-kind");
+    expect(up.sandboxConformance).toBe(true);
+    expect(preflight.cluster).toBe("ci-owned-kind");
+  } finally {
+    if (previous === undefined) delete process.env.E2E_CLUSTER;
+    else process.env.E2E_CLUSTER = previous;
+  }
+});
+
+test("the ordinary e2e manifest does not silently enable Sandbox fixtures", () => {
+  const manifest = bootstrapManifest("kobe-system");
+
+  expect(manifest).not.toContain("kind: SandboxPool");
+  expect(manifest).not.toContain("agent-sandbox-v0-5-4");
+  expect(manifest).not.toContain("e2e-other-token");
+});
+
+test("the conformance manifest contains two exact placements and a pullable runner fixture", () => {
+  const fixture = {
+    imageRef: "127.0.0.1:32001/kobe-sandbox-e2e:test",
+    registrySource: "127.0.0.1:32001",
+    mirrorEndpoint: "http://172.19.0.9:5000",
+  };
+  const manifest = bootstrapManifest("kobe-system", fixture);
+  const pools = sandboxConformanceManifest("kobe-system", fixture);
+
+  expect(manifest.match(/^kind: SandboxPool$/gm)).toHaveLength(2);
+  expect(manifest).toContain("name: agent-sandbox-v0-5-4");
+  expect(manifest).toContain('"127.0.0.1:32001":');
+  expect(manifest).toContain('"http://172.19.0.9:5000"');
+  expect(pools).toContain("type: management");
+  expect(pools).toContain("type: childCluster");
+  expect(pools).toContain("clusterPoolRef: e2e-k3s");
+  expect(pools).toContain("runnerPath: /kobe-runner");
+  expect(pools).toContain("image: 127.0.0.1:32001/kobe-sandbox-e2e:test");
+  expect(pools).toContain('verbs: ["lease", "exec", "logs", "port-forward", "release"]');
+  expect(pools).toContain("name: e2e-other-token");
 });
 
 // ---------------------------------------------------------------------------

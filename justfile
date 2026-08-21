@@ -126,6 +126,23 @@ test-smoke-k3s cluster='e2e-kobe' *args:
 test-sandbox-conformance:
     @KOBE_SANDBOX_E2E=1 KOBE_SANDBOX_HARNESS="${KOBE_SANDBOX_HARNESS:-bun run ./hack/e2e.ts}" cargo test --test sandbox_conformance -- --ignored --test-threads=1
 
+# Required PR subset. Each selected scenario still runs unchanged against both
+# placements; the exhaustive 17-scenario matrix above remains the
+# nightly/manual gate. Keeping the selection here (instead of adding a second
+# implementation) prevents the fast and exhaustive contracts from drifting.
+[group('test')]
+test-sandbox-conformance-pr:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export KOBE_SANDBOX_E2E=1
+    export KOBE_SANDBOX_HARNESS="${KOBE_SANDBOX_HARNESS:-bun run ./hack/e2e.ts}"
+    for scenario in \
+      an_execution_returns_the_exact_remote_exit_code \
+      another_identity_can_neither_see_nor_use_the_lease \
+      release_rejects_further_access; do
+      cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --test-threads=1
+    done
+
 # Local e2e environment entrypoint
 [group('dev')]
 e2e *args:

@@ -35,6 +35,12 @@ variable "LOCAL_CACHE_ROOT" {
   default = ".tmp/buildx-cache"
 }
 
+# Exact local-registry reference selected by hack/e2e.ts. The fallback is only
+# a harmless local tag; this target is absent from every normal/publish group.
+variable "SANDBOX_E2E_IMAGE" {
+  default = "kobe-sandbox-e2e:local"
+}
+
 # Generate the tag array. Each tag means exactly ONE thing:
 #
 #   dev        moving; head of main (the `IMAGE_TAG` slot — also how a local
@@ -179,4 +185,23 @@ target "runner" {
 target "runner-push" {
   inherits = ["runner"]
   output   = ["type=registry"]
+}
+
+# =============================================================================
+# Sandbox conformance fixture
+#
+# Deliberately absent from both `default` and `push`: this combines the static
+# runner with a tiny shell userspace solely for live conformance. The harness
+# names an ephemeral local registry explicitly and builds this target itself.
+# =============================================================================
+target "sandbox-e2e" {
+  dockerfile = "docker/sandbox-e2e.Dockerfile"
+  context    = "."
+  contexts = {
+    runner = "target:runner"
+  }
+  platforms = [PLATFORM]
+  tags       = [SANDBOX_E2E_IMAGE]
+  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/sandbox-e2e"]
+  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/sandbox-e2e,mode=max"]
 }

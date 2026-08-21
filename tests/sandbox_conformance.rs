@@ -519,8 +519,8 @@ both_placements!(
             "a failing command is not a failed request: {failed}"
         );
         anyhow::ensure!(
-            failed["state"] == "Failed",
-            "a non-zero exit must be Failed, not an error: {failed}"
+            failed["state"] == "Failed" && failed["exitCode"] == 3,
+            "a non-zero exit must preserve its exact code and be Failed, not an error: {failed}"
         );
 
         // stdout and stderr stay apart. A consumer that cannot tell a tool's
@@ -1115,7 +1115,14 @@ both_placements!(
         // next scenario would queue behind capacity it cannot see and fail for
         // a reason it does not assert.
         let cleared = harness(&["clear-failure", "--kind", "teardown-unverifiable"]).await;
-        let reaped = harness(&["reap-lease", "--lease", &sandbox.id]).await;
+        let reaped = harness(&[
+            "reap-lease",
+            "--lease",
+            &sandbox.id,
+            "--timeout",
+            "600",
+        ])
+        .await;
 
         observed?;
         cleared?;
