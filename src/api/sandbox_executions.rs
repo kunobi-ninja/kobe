@@ -1317,6 +1317,20 @@ async fn cleanup_lease_executions_inner(
     // into the next destructive operation.
     if let Some(entry) = manifest.first() {
         let Some(execution) = owned.remove(&entry.name) else {
+            if !entry.active {
+                return match crate::sandbox_access_ledger::retire_inactive_execution(
+                    management_client,
+                    ledger_namespace,
+                    lease,
+                    entry,
+                )
+                .await
+                {
+                    Ok(true) => ExecutionCleanupOutcome::Checkpointed,
+                    Ok(false) => ExecutionCleanupOutcome::Retry,
+                    Err(_) => ExecutionCleanupOutcome::Retry,
+                };
+            }
             if entry.execution_uid.is_some() {
                 return ExecutionCleanupOutcome::Quarantine("bound_execution_missing");
             }

@@ -3174,6 +3174,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                 &created,
                 &provisioning_deadline,
                 None,
+                None,
                 &state.shutdown,
             )
             .await
@@ -3218,21 +3219,75 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
     // unable to enter teardown when the protected ledger quota is full, while
     // lazy creation in teardown would make cleanup depend on allocating the
     // very resource whose exhaustion cleanup must relieve.
-    let access_gate = match crate::sandbox_access_ledger::prepare_open_gate(
-        &state.client,
-        &state.sandbox_reservation_namespace,
-        &created,
+    let access_gate = match await_admission_stage_until(
+        active_admission_deadline,
+        &state.shutdown,
+        crate::sandbox_access_ledger::prepare_open_gate(
+            &state.client,
+            &state.sandbox_reservation_namespace,
+            &created,
+        ),
     )
     .await
     {
-        Ok(reference) => reference,
-        Err(err) => {
-            if let Err(cleanup_err) =
-                delete_exact_pending_lease(&leases, &reservations, &created).await
+        Ok(Ok(reference)) => reference,
+        Ok(Err(err)) => {
+            if let Err(cleanup_err) = delete_exact_pending_lease_until(
+                &leases,
+                &reservations,
+                &created,
+                active_admission_deadline,
+                &state.shutdown,
+            )
+            .await
             {
                 error!(error = %cleanup_err, "Failed to remove Sandbox lease after access-gate preparation failure");
+                if matches!(
+                    cleanup_err,
+                    SandboxLeaseMutationError::AdmissionDeadlineExceeded
+                        | SandboxLeaseMutationError::AdmissionShuttingDown
+                ) {
+                    return sandbox_admission_pending(
+                        lease_id,
+                        request.pool,
+                        effective_ttl,
+                        was_clamped,
+                        request.alias,
+                        provisioning_deadline,
+                    );
+                }
             }
             return sandbox_infra_error("Failed to prepare Sandbox access gate", err);
+        }
+        Err(bound) => {
+            match resolve_timed_out_admission(
+                &leases,
+                &reservations,
+                &created,
+                &provisioning_deadline,
+                None,
+                None,
+                &state.shutdown,
+            )
+            .await
+            {
+                AdmissionResolution::Cancelled => {
+                    return sandbox_infra_error(
+                        "Sandbox access-gate preparation was interrupted",
+                        bound,
+                    );
+                }
+                AdmissionResolution::Admitted | AdmissionResolution::HandedOff => {
+                    return sandbox_admission_pending(
+                        lease_id,
+                        request.pool,
+                        effective_ttl,
+                        was_clamped,
+                        request.alias,
+                        provisioning_deadline,
+                    );
+                }
+            }
         }
     };
 
@@ -3326,6 +3381,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                 &created,
                 &provisioning_deadline,
                 None,
+                Some(&access_gate),
                 &state.shutdown,
             )
             .await
@@ -3387,6 +3443,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                 &created,
                 &provisioning_deadline,
                 Some(&admission_reservations),
+                Some(&access_gate),
                 &state.shutdown,
             )
             .await
@@ -3457,6 +3514,7 @@ async fn create_sandbox_lease_until<B: ClusterBackend>(
                     &created,
                     &provisioning_deadline,
                     Some(&admission_reservations),
+                    Some(&access_gate),
                     &state.shutdown,
                 )
                 .await
@@ -4492,6 +4550,7 @@ async fn resolve_timed_out_admission(
     lease: &SandboxLease,
     expected_provisioning_deadline: &str,
     expected_reservations: Option<&[AdmissionReservation]>,
+    expected_access_gate: Option<&crate::sandbox_access_ledger::AccessGateReference>,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> AdmissionResolution {
     let resolution_deadline = tokio::time::Instant::now()
@@ -4502,6 +4561,7 @@ async fn resolve_timed_out_admission(
         lease,
         expected_provisioning_deadline,
         expected_reservations,
+        expected_access_gate,
         shutdown,
         resolution_deadline,
     )
@@ -4514,6 +4574,7 @@ async fn resolve_timed_out_admission_until(
     lease: &SandboxLease,
     expected_provisioning_deadline: &str,
     expected_reservations: Option<&[AdmissionReservation]>,
+    expected_access_gate: Option<&crate::sandbox_access_ledger::AccessGateReference>,
     shutdown: &tokio_util::sync::CancellationToken,
     resolution_deadline: tokio::time::Instant,
 ) -> AdmissionResolution {
@@ -4586,6 +4647,12 @@ async fn resolve_timed_out_admission_until(
                     return Err(SandboxLeaseMutationError::ReservationProvenanceChanged(
                         "timed-out admission committed different reservation provenance".into(),
                     ));
+                }
+                if let Some(expected_access_gate) = expected_access_gate
+                    && crate::sandbox_access_ledger::persisted_gate_reference(&admitted)?
+                        != *expected_access_gate
+                {
+                    return Err(SandboxLeaseMutationError::AccessGateProvenanceChanged);
                 }
                 Ok(())
             });
@@ -8415,6 +8482,7 @@ mod tests {
                 &expected,
                 deadline,
                 Some(&admission_reservations),
+                None,
                 &shutdown,
             ),
         )
@@ -8486,6 +8554,7 @@ mod tests {
                 &expected,
                 deadline,
                 Some(&admission_reservations),
+                None,
                 &shutdown,
             ),
         )
@@ -8570,6 +8639,7 @@ mod tests {
                 &reservations,
                 &expected,
                 deadline,
+                None,
                 None,
                 &shutdown,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(120),
@@ -8803,6 +8873,12 @@ mod tests {
         };
         let persisted =
             encoded_reservation_provenance(&parent, std::slice::from_ref(&reservation)).unwrap();
+        let access_gate = crate::sandbox_access_ledger::AccessGateReference {
+            name: "sandbox-access-sandbox-pending-uid".into(),
+            uid: "access-gate-uid".into(),
+        };
+        let gate_provenance =
+            crate::sandbox_access_ledger::encode_gate_reference(&access_gate).unwrap();
         let patch_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let allow_commit = Arc::new(tokio::sync::Notify::new());
         let patch_state = Arc::clone(&parent_state);
@@ -8815,6 +8891,7 @@ mod tests {
                 let state = Arc::clone(&patch_state);
                 let signal = Arc::clone(&commit_signal);
                 let persisted = persisted.clone();
+                let gate_provenance = gate_provenance.clone();
                 tokio::spawn(async move {
                     signal.notified().await;
                     let mut parent = state.lock().unwrap();
@@ -8822,6 +8899,9 @@ mod tests {
                         serde_json::json!(SANDBOX_ADMISSION_ADMITTED);
                     parent["metadata"]["annotations"][SANDBOX_RESERVATIONS_ANNOTATION] =
                         serde_json::json!(persisted);
+                    parent["metadata"]["annotations"]
+                        [crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION] =
+                        serde_json::json!(gate_provenance);
                     parent["metadata"]["resourceVersion"] = serde_json::json!("2");
                 });
                 // Model a committed PATCH whose response is lost. The delay
@@ -8851,6 +8931,7 @@ mod tests {
                 &admit_reservations,
                 &admit_parent,
                 &[admit_reservation],
+                &access_gate,
             )
             .await
         });
@@ -9173,6 +9254,71 @@ mod tests {
                 && !(request.method.as_str() == "POST"
                     && request.url.path().contains("coordination.k8s.io"))
         }));
+    }
+
+    /// The access gate is part of admission, so its CREATE shares the same
+    /// absolute deadline and shutdown handoff as every other post-parent stage.
+    /// A lost gate response must not pin graceful shutdown or return a retryable
+    /// 503 while the durable parent is still owned by the admission reaper.
+    #[tokio::test]
+    async fn shutdown_during_access_gate_create_returns_pending_handle() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let parent = mount_create_api(&server, true, false).await;
+        let state = test_state(&server);
+        let trigger = state.shutdown.clone();
+        Mock::given(method("POST"))
+            .and(path(
+                "/apis/coordination.k8s.io/v1/namespaces/sandbox-ledger/leases",
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                trigger.cancel();
+                ResponseTemplate::new(201)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({}))
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_sandbox_lease_until::<crate::testutil::MockBackend>(
+                state,
+                identity(),
+                CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: Some("1h".into()),
+                    alias: None,
+                },
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("shutdown must hand off a stalled access-gate CREATE");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "admission_pending");
+        assert_eq!(body["retry"], false);
+        assert!(parent.lock().unwrap().is_some());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && request.url.path().contains("coordination.k8s.io")
+                })
+                .count(),
+            1,
+            "reservation admission must not start after gate handoff"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "DELETE")
+        );
     }
 
     /// Cleanup after a malformed CREATE response shares the original absolute

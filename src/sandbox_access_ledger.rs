@@ -1258,11 +1258,12 @@ pub async fn expire_unbound_execution(
     Err(AccessLedgerError::Contended)
 }
 
-/// Retire a pre-CREATE reservation after the gate is closed.
+/// Remove a pre-CREATE reservation after the gate is closed.
 ///
 /// Only an entry with no bound Kubernetes UID qualifies. Once closed, binding
-/// and spawning are impossible; a bound record disappearing is instead lost
-/// evidence about a command that may have run and must fail closed.
+/// and spawning are impossible, so removing the exact name/digest/Pod row is
+/// the durable teardown checkpoint. Leaving an inactive row behind would make
+/// the next cleanup pass loop forever on a manifest entry with no record.
 pub async fn retire_unbound_execution(
     client: &Client,
     ledger_namespace: &str,
@@ -1282,17 +1283,62 @@ pub async fn retire_unbound_execution(
             .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
         let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
         let entry = entries
-            .get_mut(execution_name)
+            .get(execution_name)
             .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
         if entry.execution_uid.is_some() {
             return Err(AccessLedgerError::Invalid("bound execution is missing"));
         }
-        if !entry.active {
-            return Ok(());
-        }
-        entry.active = false;
+        entries.remove(execution_name);
         match patch_execution_entries(&api, &gate, &previous, &entries).await {
             Ok(_) => return Ok(()),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Remove one inactive manifest row after its exact execution CR is absent.
+///
+/// `active=false` is the durable proof that runner termination or exact target
+/// destruction completed. The complete entry is compared before the CAS, so a
+/// same-named key or UID replacement cannot be retired as somebody else's
+/// evidence.
+pub async fn retire_inactive_execution(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    expected: &ExecutionManifestEntry,
+) -> Result<bool, AccessLedgerError> {
+    if expected.active {
+        return Err(AccessLedgerError::Invalid("active execution reservation"));
+    }
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(CLOSED) {
+            return Err(AccessLedgerError::Invalid("execution gate is not closed"));
+        }
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let Some(entry) = entries.get(&expected.name) else {
+            return Ok(false);
+        };
+        if entry.active
+            || entry.request_digest != expected.request_digest
+            || entry.pod_uid != expected.pod_uid
+            || entry.reserved_at != expected.reserved_at
+            || entry.execution_uid != expected.execution_uid
+        {
+            return Err(AccessLedgerError::Invalid("execution reservation identity"));
+        }
+        entries.remove(&expected.name);
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(true),
             Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
             Err(error) => return Err(error),
         }
@@ -2665,6 +2711,96 @@ mod tests {
             entries["execution-a"].execution_uid.as_deref(),
             Some("execution-uid")
         );
+    }
+
+    /// Teardown must remove each durable manifest row, not merely mark it
+    /// inactive. Otherwise the next pass sees a missing bound record and
+    /// quarantines, while an unbound inactive row loops forever.
+    #[tokio::test]
+    async fn teardown_retires_each_execution_manifest_row() {
+        async fn assert_row_removed(execution_uid: Option<&str>) {
+            let server = MockServer::start().await;
+            let client = mock_client(&server);
+            let gate = gate_name("sandbox-uid");
+            let gate_path = format!("/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{gate}");
+            let entry = ExecutionEntry {
+                request_digest: "d".repeat(64),
+                pod_uid: "pod-uid".into(),
+                reserved_at: "2026-08-20T00:00:00Z".into(),
+                execution_uid: execution_uid.map(str::to_string),
+                active: execution_uid.is_none(),
+            };
+            let existing = BTreeMap::from([("execution-a".to_string(), entry.clone())]);
+            let object = lease_object(
+                &gate,
+                "gate-uid",
+                "1",
+                BTreeMap::from([
+                    (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                    (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                    (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+                ]),
+                BTreeMap::from([
+                    (STATE_ANNOTATION.into(), CLOSED.into()),
+                    (ENTRIES_ANNOTATION.into(), "{}".into()),
+                    (
+                        EXECUTIONS_ANNOTATION.into(),
+                        serde_json::to_string(&existing).unwrap(),
+                    ),
+                ]),
+            );
+            Mock::given(method("GET"))
+                .and(path(&gate_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(object.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(&gate_path))
+                .respond_with(PatchedExecutionLease { object })
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            if let Some(execution_uid) = execution_uid {
+                assert!(
+                    retire_inactive_execution(
+                        &client,
+                        "ledger",
+                        &sandbox_lease(),
+                        &ExecutionManifestEntry {
+                            name: "execution-a".into(),
+                            request_digest: entry.request_digest,
+                            pod_uid: entry.pod_uid,
+                            reserved_at: entry.reserved_at,
+                            execution_uid: Some(execution_uid.into()),
+                            active: false,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                );
+            } else {
+                retire_unbound_execution(&client, "ledger", &sandbox_lease(), "execution-a")
+                    .await
+                    .unwrap();
+            }
+
+            let request = server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|request| request.method.as_str() == "PATCH")
+                .expect("manifest retirement CAS");
+            let patch: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(patch[0]["value"], "gate-uid");
+            assert_eq!(patch[1]["value"], "1");
+            assert_eq!(patch[3]["value"], "{}");
+        }
+
+        assert_row_removed(None).await;
+        assert_row_removed(Some("execution-uid")).await;
     }
 
     #[test]
