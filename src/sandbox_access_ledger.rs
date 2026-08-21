@@ -99,9 +99,11 @@ struct PrincipalEntry {
 /// durable tombstone: neither a clock nor a 404 may retire it because a CREATE
 /// request whose response was lost can still land. Only an exact object UID or
 /// a definitive API rejection moves that state forward. `active` is the
-/// process-count slot and is retired only after a terminal runner verdict (or a
-/// proof that no runner was ever started). Entries remain until lease teardown,
-/// bounding retained history independently of how quickly commands finish.
+/// process-count slot and is retired only before Kobe crosses `startedAt`, or
+/// after destruction proves the exact target absent. Runner verdicts are not
+/// absence proof because the workload can forge their spool. Entries remain
+/// until lease teardown, bounding retained history independently of how quickly
+/// commands finish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExecutionEntry {
@@ -214,8 +216,7 @@ fn execution_can_release_active_capacity(
     started: bool,
     process_absence_proven: bool,
 ) -> bool {
-    state.is_terminal()
-        && (state != crate::crd::ExecutionState::Unknown || !started || process_absence_proven)
+    state.is_terminal() && (!started || process_absence_proven)
 }
 
 /// Immutable, non-secret handle persisted atomically with Sandbox admission.
@@ -1162,8 +1163,9 @@ pub async fn bind_execution_capacity(
 /// The lifetime entry remains, so finishing quickly cannot bypass the
 /// per-Sandbox history/disk bound with a stream of new idempotency keys.
 /// `process_absence_proven` is reserved for teardown after an exact target
-/// destruction receipt; ordinary reapers must leave it false so an `Unknown`
-/// runner verdict cannot release capacity while a process may still exist.
+/// destruction receipt. The runner spool is writable by the workload UID, so
+/// no runner report—including a plausible terminal one—may release capacity
+/// for a command that crossed the Kubernetes `startedAt` checkpoint.
 pub async fn complete_execution_capacity(
     client: &Client,
     ledger_namespace: &str,
@@ -1369,8 +1371,8 @@ pub async fn retire_rejected_execution(
 
 /// Remove one inactive manifest row after its exact execution CR is absent.
 ///
-/// `active=false` is the durable proof that runner termination, exact target
-/// destruction, or a definitive pre-CREATE rejection completed. A `Creating`
+/// `active=false` is the durable proof that exact target destruction or a
+/// definitive pre-spawn rejection completed. A `Creating`
 /// tombstone is never eligible: its request may still land. The complete entry
 /// is compared before the CAS, so a same-named key or UID replacement cannot be
 /// retired as somebody else's evidence.
@@ -2589,9 +2591,9 @@ mod tests {
         );
     }
 
-    /// `Unknown` is an information state, not proof that a process group is
-    /// gone. A command that reached Running holds its active slot until runner
-    /// cancellation or target destruction supplies that missing proof.
+    /// A runner verdict is tenant-controlled evidence, not proof that a process
+    /// group is gone. Every command that reached Running holds its active slot
+    /// until destruction of the exact target supplies that proof.
     #[test]
     fn unknown_running_execution_keeps_its_active_capacity() {
         use crate::crd::ExecutionState;
@@ -2622,7 +2624,8 @@ mod tests {
             ExecutionState::Cancelled,
             ExecutionState::TimedOut,
         ] {
-            assert!(execution_can_release_active_capacity(settled, true, false));
+            assert!(!execution_can_release_active_capacity(settled, true, false));
+            assert!(execution_can_release_active_capacity(settled, true, true));
         }
     }
 

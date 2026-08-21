@@ -77,12 +77,13 @@ test("the conformance manifest contains two exact placements and a pullable runn
   expect(pools).toContain("name: e2e-other-token");
 });
 
-test("the Sandbox fixture provisions and exercises the default runner spool as its restricted identity", async () => {
-  const dockerfile = await Bun.file("docker/sandbox-e2e.Dockerfile").text();
+test("the published runner artifact proves the default spool under its restricted identity", async () => {
+  const dockerfile = await Bun.file("docker/runner.Dockerfile").text();
   expect(dockerfile).toContain("install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions");
   expect(dockerfile).toContain("USER 65532:65532");
   expect(dockerfile).toContain("/kobe-runner start");
   expect(dockerfile).not.toContain("/kobe-runner --state-dir");
+  expect(dockerfile).toContain("COPY --from=smoke /kobe-runner /kobe-runner");
 });
 
 test("the conformance preflight reports durable pool blockers without waiting for timeout", () => {

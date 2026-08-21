@@ -294,19 +294,11 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // spend an idempotency key on something the target must reject.
     let candidate_execution =
         crate::crd::execution_name(&target.lease_uid, &requested.idempotency_key);
-    let candidate_digest = crate::crd::request_digest(
-        &requested.argv,
-        requested.cwd.as_deref(),
-        &requested.timeout,
-        &container,
-        requested.detached,
-    );
     let candidate_start = crate::api::sandbox_runner::start_request(
         &candidate_execution,
         &requested.argv,
         requested.cwd.as_deref(),
         initial_timeout,
-        Some(&candidate_digest),
     );
     if crate::api::sandbox_runner::start_line(&candidate_start).is_err() {
         return execution_denied(
@@ -351,9 +343,9 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     let (reserved, fresh) = match reservation {
         // Somebody already reserved this exact request. Detached callers keep
         // the handle/poll contract. Wait callers resume observing the same
-        // runner record below. Only an exact target-side NotFound may complete a
-        // missing reservation; a lost response must not turn retained output
-        // into an empty successful result.
+        // runner record below. No retry ever calls `start` again after Kobe's
+        // Running checkpoint: the workload owns the runner spool and can make a
+        // live reservation look absent.
         executions::Reservation::AlreadyExists(existing) => {
             info!(
                 principal = %identity.identity,
@@ -475,26 +467,8 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     };
 
     if !fresh {
-        // Recovery may happen well after Kobe's Running checkpoint. Shorten the
-        // target-side runtime against the lease as it exists now; the durable
-        // request digest lets concurrent identical retries choose slightly
-        // different remaining seconds without becoming different commands.
-        let recovery_timeout =
-            match executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now()) {
-                Ok(timeout) => timeout,
-                Err(error) => return execution_denied(&identity, &id, &error),
-            };
         return resume_wait_with_runner(
-            &state,
-            &identity,
-            &id,
-            &target,
-            &container,
-            &requested,
-            &reserved,
-            &scoped,
-            recovery_timeout,
-            revoked,
+            &state, &identity, &id, &target, &container, &reserved, &scoped, revoked,
         )
         .await;
     }
@@ -519,9 +493,10 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         }
     };
 
-    // Marked Running before the runner sees the request. A retry may complete
-    // the missing target reservation only when this exact target proves it has
-    // no record; every other retry observes the existing one.
+    // Marked Running before the runner sees the request. This checkpoint spends
+    // spawn authority permanently: a retry may observe the runner, but never
+    // call `start` again. The workload shares the runner UID and can remove or
+    // replace its spool, so target-side NotFound is not a no-spawn proof.
     if executions::mark_running(&state.client, &state.namespace, &reserved, timeout)
         .await
         .is_err()
@@ -605,7 +580,6 @@ async fn run_with_runner<B: ClusterBackend>(
         &requested.argv,
         requested.cwd.as_deref(),
         timeout,
-        Some(&reserved.spec.request_digest),
     );
     let runner_crash = if executions::crash_requested(
         executions::ExecutionCrashWindow::BeforeSpawn,
@@ -705,13 +679,12 @@ async fn run_with_runner<B: ClusterBackend>(
 
 /// Resume a runner-managed request after its first HTTP response was lost.
 ///
-/// The durable record and runner id are reused exactly. A `Running` record
-/// normally resumes polling. The sole exception is `NotFound` from the exact
-/// recorded target: that proves Kobe crashed after its Running checkpoint but
-/// before target-side reservation, so replaying the identical validated request
-/// completes the missing reservation without duplicating a command. A terminal
-/// record reads retained streams so retrying cannot turn real output into empty
-/// output.
+/// The durable record and runner id are reused exactly, but spawn authority is
+/// not. A `Running` record resumes polling. Missing, corrupt, or unreadable
+/// runner state settles as `Unknown`: the workload owns that state directory,
+/// so none of those observations can prove the first `start` was never handled.
+/// A terminal record reads retained streams so retrying cannot turn real output
+/// into empty successful output.
 #[allow(clippy::too_many_arguments)]
 async fn resume_wait_with_runner<B: ClusterBackend>(
     state: &AppState<B>,
@@ -719,10 +692,8 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     id: &str,
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
-    requested: &crate::api::sandbox_executions::ExecutionRequest,
     record: &crate::crd::SandboxExecution,
     scoped: &kube::Client,
-    recovery_timeout: std::time::Duration,
     revoked: tokio_util::sync::CancellationToken,
 ) -> Response {
     use crate::api::sandbox_runner as runner;
@@ -774,26 +745,18 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     .await;
     let report = match polled {
         Some(Ok(report)) => report,
-        Some(Err(runner::RunnerCallFailure::Refused(
-            kobe_runner::protocol::RunnerErrorCode::NotFound,
-        ))) => {
-            // The exact target has no reservation, so no supervisor or command
-            // can belong to this id. The Kubernetes digest already proved this
-            // is the same request; target-side reserve-before-spawn now supplies
-            // the second half of the idempotency fence.
-            return run_with_runner(
-                state,
-                identity,
-                id,
-                target,
-                container,
-                requested,
+        Some(Err(failure)) if failure.state_unverifiable() => {
+            let durable = crate::api::sandbox_executions::record_terminal(
+                &state.client,
+                &state.namespace,
                 record,
-                scoped,
-                recovery_timeout,
-                revoked,
+                ExecutionState::Unknown,
+                None,
+                failure.reason_code(),
             )
-            .await;
+            .await
+            .unwrap_or_else(|| record.clone());
+            return (StatusCode::OK, Json(execution_response(&durable, None))).into_response();
         }
         Some(Err(failure)) => {
             return sandbox_error(failure.http_status(), failure.to_string(), None);
@@ -972,16 +935,16 @@ async fn wait_output_response<B: ClusterBackend>(
     .await;
     let output = match output {
         Some(Ok(output)) => output,
-        Some(Err(runner::RunnerCallFailure::Refused(
-            kobe_runner::protocol::RunnerErrorCode::NotFound,
-        ))) if record
-            .status
-            .as_ref()
-            .is_some_and(|status| status.state == crate::crd::ExecutionState::Unknown) =>
+        Some(Err(failure))
+            if failure.state_unverifiable()
+                && record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.state == crate::crd::ExecutionState::Unknown) =>
         {
             // The durable state already says nobody can verify the outcome,
-            // and the exact runner confirms it has no retained record. Return
-            // that stable answer; the runner's private 404 is not the public
+            // and the runner has no usable retained record. Return that stable
+            // answer; tenant-controlled missing/corrupt state is not the public
             // identity of this execution.
             return (StatusCode::OK, Json(execution_response(record, None))).into_response();
         }
@@ -1182,7 +1145,6 @@ async fn reconcile_runner<B: ClusterBackend>(
 ) -> crate::crd::SandboxExecution {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
-    use kobe_runner::protocol::RunnerErrorCode;
 
     let current = record
         .status
@@ -1204,13 +1166,11 @@ async fn reconcile_runner<B: ClusterBackend>(
 
     let outcome = match polled {
         Ok(report) => runner::outcome_from_report(&report),
-        Err(runner::RunnerCallFailure::Refused(RunnerErrorCode::NotFound)) => {
-            runner::RunnerOutcome {
-                state: crate::crd::ExecutionState::Unknown,
-                exit_code: None,
-                reason: "runner_forgot_execution".into(),
-            }
-        }
+        Err(failure) if failure.state_unverifiable() => runner::RunnerOutcome {
+            state: crate::crd::ExecutionState::Unknown,
+            exit_code: None,
+            reason: failure.reason_code().into(),
+        },
         // Nothing was learned. The record keeps saying `Running`; wall clock is
         // not evidence that the process group stopped.
         Err(_) => return record.clone(),

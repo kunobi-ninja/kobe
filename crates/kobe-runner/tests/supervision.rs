@@ -365,7 +365,6 @@ fn a_reserved_command_whose_starter_crashed_is_never_spawned() {
         first.reason.as_deref(),
         Some(kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED)
     );
-    assert!(first.process_absence_proven());
     let second = report_of(start(&scratch, "sbxe-before-spawn", &argv, 30, 4096));
     assert_eq!(second, first, "the recovered Unknown must be stable");
     assert!(!ledger.exists(), "the pre-spawn command ran");
@@ -457,7 +456,6 @@ fn a_lost_supervisor_is_unknown_without_process_absence_proof() {
         unknown.reason.as_deref(),
         Some(kobe_runner::protocol::reason::SUPERVISOR_LOST)
     );
-    assert!(!unknown.process_absence_proven());
     assert!(
         alive(command_pid),
         "Unknown must not claim the command vanished"
@@ -466,6 +464,145 @@ fn a_lost_supervisor_is_unknown_without_process_absence_proof() {
     // SAFETY: the command is its own session/process-group leader by contract.
     unsafe { libc::kill(-command_pid, libc::SIGKILL) };
     assert_process_gone(command_pid);
+}
+
+/// The workload UID can make a live execution look absent.
+///
+/// This is why Kobe must never translate runner `NotFound` into fresh spawn
+/// authority after its own Running checkpoint. The process and side effect
+/// remain while both an unlinked state file and a renamed reservation make the
+/// control verb unable to observe them.
+#[test]
+fn unlinking_and_renaming_spool_never_make_a_live_process_absent() {
+    let scratch = Scratch::new();
+    let ledger = scratch.path().join("tamper-missing-ledger");
+    let pidfile = scratch.path().join("tamper-missing.pid");
+    let script = format!(
+        "echo ran >> {}; echo $$ > {}; sleep 60",
+        ledger.display(),
+        pidfile.display()
+    );
+    let report = report_of(start(
+        &scratch,
+        "sbxe-tamper-missing",
+        &["/bin/sh", "-c", &script],
+        60,
+        4096,
+    ));
+    assert_eq!(report.state, RunnerState::Running);
+    let command_pid = wait_for_pid(&pidfile);
+    let spool = scratch.path().join("spool/sbxe-tamper-missing");
+
+    std::fs::remove_file(spool.join("state.json")).unwrap();
+    assert!(matches!(
+        status(&scratch, "sbxe-tamper-missing"),
+        Reply::Error {
+            code: kobe_runner::protocol::RunnerErrorCode::NotFound
+        }
+    ));
+    assert!(
+        alive(command_pid),
+        "unlinking state did not stop the command"
+    );
+
+    std::fs::rename(&spool, scratch.path().join("spool/hidden-by-workload")).unwrap();
+    assert!(matches!(
+        status(&scratch, "sbxe-tamper-missing"),
+        Reply::Error {
+            code: kobe_runner::protocol::RunnerErrorCode::NotFound
+        }
+    ));
+    assert!(
+        alive(command_pid),
+        "NotFound coexists with the live command"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ledger)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "observation of missing state must not manufacture another spawn"
+    );
+
+    // SAFETY: the pid came from this test's private command session.
+    unsafe { libc::kill(-command_pid, libc::SIGKILL) };
+    assert_process_gone(command_pid);
+}
+
+/// Request, state, logs, locks, and cancellation are all workload-writable.
+///
+/// A forged terminal reply can coexist with the original live process. The
+/// runner still honours a forged cancel marker because it shares this control
+/// directory, but Kobe must treat neither observation as process-absence proof;
+/// only destruction of the exact target has that authority.
+#[test]
+fn forged_spool_terminal_and_cancel_can_coexist_with_the_original_process() {
+    let scratch = Scratch::new();
+    let ledger = scratch.path().join("tamper-forged-ledger");
+    let pidfile = scratch.path().join("tamper-forged.pid");
+    let script = format!(
+        "echo ran >> {}; echo $$ > {}; sleep 60",
+        ledger.display(),
+        pidfile.display()
+    );
+    report_of(start(
+        &scratch,
+        "sbxe-tamper-forged",
+        &["/bin/sh", "-c", &script],
+        60,
+        4096,
+    ));
+    let command_pid = wait_for_pid(&pidfile);
+    let spool = scratch.path().join("spool/sbxe-tamper-forged");
+
+    std::fs::write(
+        spool.join("request.json"),
+        br#"{"protocol":1,"id":"sbxe-tamper-forged","argv":["/bin/false"],"timeoutSeconds":1,"maxOutputBytes":1}"#,
+    )
+    .unwrap();
+    std::fs::remove_file(spool.join("state.lock")).unwrap();
+    std::fs::File::create(spool.join("state.lock")).unwrap();
+    std::fs::write(
+        spool.join("state.json"),
+        serde_json::to_vec(&ExecutionReport {
+            id: "sbxe-tamper-forged".into(),
+            state: RunnerState::Succeeded,
+            exit_code: Some(0),
+            reason: Some(kobe_runner::protocol::reason::COMPLETED.into()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(spool.join("stdout.log"), b"forged-output\n").unwrap();
+
+    let forged = report_of(status(&scratch, "sbxe-tamper-forged"));
+    assert_eq!(forged.state, RunnerState::Succeeded);
+    assert_eq!(forged.exit_code, Some(0));
+    assert_eq!(
+        read_stream(&scratch, "sbxe-tamper-forged", "stdout"),
+        b"forged-output\n"
+    );
+    assert!(
+        alive(command_pid),
+        "a forged terminal report is not process absence"
+    );
+
+    std::fs::File::create(spool.join("cancel")).unwrap();
+    assert_process_gone(command_pid);
+    let retained = report_of(status(&scratch, "sbxe-tamper-forged"));
+    assert_eq!(
+        retained, forged,
+        "the workload-forged terminal remains indistinguishable from a runner outcome"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ledger)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 /// A different command under a used id is refused, never run.

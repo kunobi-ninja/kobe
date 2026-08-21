@@ -27,9 +27,9 @@ use serde::{Deserialize, Serialize};
 
 /// The version both sides must agree on.
 ///
-/// Bumped only for a change that an older peer would MISREAD — a removed
-/// field, a re-used name with new meaning. Additive optional fields do not bump
-/// it, because an older peer ignoring a field it never knew about is safe.
+/// Bumped for every wire-shape change. Requests deliberately deny unknown
+/// fields, so even an additive optional field would make a newer Kobe unable to
+/// start commands through an older runner unless a new version were negotiated.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Longest an execution id may be, and the only shape one may take.
@@ -130,15 +130,6 @@ pub struct StartRequest {
     /// Kobe's own execution id. The runner treats it as an opaque key and
     /// never as a path fragment until [`is_valid_id`] has accepted it.
     pub id: String,
-    /// Digest of the durable Kobe request that authorised this target call.
-    ///
-    /// Optional for direct/older runner clients. When present on both attempts,
-    /// it lets a retry use a shorter lease-bounded runtime without turning the
-    /// same durable request into a conflict. The runner still compares argv,
-    /// cwd, and retention independently, so a process in the workload cannot
-    /// forge this field to replace a reserved command.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_digest: Option<String>,
     /// Executed directly. There is no shell anywhere in this contract: a shell
     /// would make quoting the security boundary, and the boundary is a tenant's
     /// own untrusted input.
@@ -158,19 +149,14 @@ impl StartRequest {
     /// Whether two requests are the same command.
     ///
     /// Compares everything that identifies what runs, and deliberately excludes
-    /// the id — a retry carries the same id anyway. Two Kobe-authored attempts
-    /// may differ only in their decreasing lease-bounded timeout when their
-    /// durable request digest agrees; direct/older clients remain byte-strict on
-    /// timeout as well.
+    /// the id — a retry carries the same id anyway. Timeout remains part of the
+    /// v1 identity: changing it would require either a negotiated protocol or a
+    /// second authority that an older runner understands.
     pub fn same_command(&self, other: &Self) -> bool {
-        let same_timeout_authority = match (&self.request_digest, &other.request_digest) {
-            (Some(left), Some(right)) => left == right,
-            _ => self.timeout_seconds == other.timeout_seconds,
-        };
         self.argv == other.argv
             && self.cwd == other.cwd
+            && self.timeout_seconds == other.timeout_seconds
             && self.max_output_bytes == other.max_output_bytes
-            && same_timeout_authority
     }
 }
 
@@ -241,34 +227,6 @@ pub struct ExecutionReport {
     pub stdout_truncated: bool,
     #[serde(default)]
     pub stderr_truncated: bool,
-}
-
-impl ExecutionReport {
-    /// Whether this exact runner report proves the command process group is
-    /// absent, including reservations that never reached a spawn.
-    ///
-    /// Most terminal states are written only after the supervisor has reaped
-    /// the group. `Unknown` is deliberately stricter: only setup failures that
-    /// occur before a command exists are absence proofs. A lost supervisor or
-    /// unobserved outcome remains uncertain and must keep lease capacity held.
-    pub fn process_absence_proven(&self) -> bool {
-        match self.state {
-            RunnerState::Running => false,
-            RunnerState::Succeeded => self.exit_code == Some(0),
-            RunnerState::Failed => {
-                self.exit_code.is_some_and(|code| code != 0) || self.signal.is_some()
-            }
-            RunnerState::Cancelled | RunnerState::TimedOut => true,
-            RunnerState::Unknown => matches!(
-                self.reason.as_deref(),
-                Some(
-                    reason::SPAWN_FAILED
-                        | reason::SUPERVISOR_NOT_STARTED
-                        | reason::SUPERVISOR_SETUP_FAILED
-                )
-            ),
-        }
-    }
 }
 
 /// Which stream a log read addresses.
@@ -459,81 +417,6 @@ mod tests {
         assert_eq!(report.exit_code, None);
     }
 
-    /// `Unknown` releases nothing unless its reason proves the command process
-    /// never existed. Terminal supervisor outcomes, by contrast, are written
-    /// only after the whole process group is absent.
-    #[test]
-    fn only_exact_runner_outcomes_prove_process_absence() {
-        for mut report in [
-            ExecutionReport {
-                state: RunnerState::Succeeded,
-                exit_code: Some(0),
-                ..Default::default()
-            },
-            ExecutionReport {
-                state: RunnerState::Failed,
-                exit_code: Some(7),
-                ..Default::default()
-            },
-            ExecutionReport {
-                state: RunnerState::Cancelled,
-                ..Default::default()
-            },
-            ExecutionReport {
-                state: RunnerState::TimedOut,
-                ..Default::default()
-            },
-        ] {
-            assert!(report.process_absence_proven());
-            if matches!(report.state, RunnerState::Succeeded | RunnerState::Failed) {
-                report.exit_code = None;
-                assert!(
-                    !report.process_absence_proven(),
-                    "an outcome without its required exit evidence proves nothing"
-                );
-            }
-        }
-        for reason in [
-            reason::SPAWN_FAILED,
-            reason::SUPERVISOR_NOT_STARTED,
-            reason::SUPERVISOR_SETUP_FAILED,
-        ] {
-            assert!(
-                ExecutionReport {
-                    state: RunnerState::Unknown,
-                    reason: Some(reason.into()),
-                    ..Default::default()
-                }
-                .process_absence_proven()
-            );
-        }
-        assert!(
-            ExecutionReport {
-                state: RunnerState::Failed,
-                signal: Some(9),
-                ..Default::default()
-            }
-            .process_absence_proven()
-        );
-        for reason in [reason::SUPERVISOR_LOST, reason::OUTCOME_UNOBSERVED] {
-            assert!(
-                !ExecutionReport {
-                    state: RunnerState::Unknown,
-                    reason: Some(reason.into()),
-                    ..Default::default()
-                }
-                .process_absence_proven()
-            );
-        }
-        assert!(
-            !ExecutionReport {
-                state: RunnerState::Running,
-                ..Default::default()
-            }
-            .process_absence_proven()
-        );
-    }
-
     /// Two requests are the same command only if everything that changes what
     /// runs agrees.
     ///
@@ -545,7 +428,6 @@ mod tests {
         let base = StartRequest {
             protocol: PROTOCOL_VERSION,
             id: "sbxe-1".into(),
-            request_digest: None,
             argv: vec!["/agent".into(), "run".into()],
             cwd: Some("/work".into()),
             timeout_seconds: 60,
@@ -574,17 +456,6 @@ mod tests {
                 "{other:?} must not count as the same command"
             );
         }
-
-        // Kobe's durable digest already includes the public timeout. Its retry
-        // may shorten the target-side runtime as lease TTL elapses without
-        // becoming a different command or creating another spawn authority.
-        let mut durable = base.clone();
-        durable.request_digest = Some("a".repeat(64));
-        let mut shorter = durable.clone();
-        shorter.timeout_seconds = 30;
-        assert!(durable.same_command(&shorter));
-        shorter.request_digest = Some("b".repeat(64));
-        assert!(!durable.same_command(&shorter));
     }
 
     /// stdout and stderr never share a file.
@@ -616,7 +487,6 @@ mod tests {
         let request = StartRequest {
             protocol: PROTOCOL_VERSION,
             id: "sbxe-1".into(),
-            request_digest: None,
             argv: vec!["/agent".into(), "--token".into(), "s3cret".into()],
             cwd: None,
             timeout_seconds: 5,
@@ -635,6 +505,53 @@ mod tests {
             )
             .is_err(),
             "an unrecognised field must not be ignored"
+        );
+    }
+
+    /// Protocol v1 is byte-shape compatible in both rollout directions.
+    ///
+    /// The frozen peer below deliberately denies unknown fields, just as the
+    /// released runner does. This catches the tempting but incompatible change
+    /// of adding an optional field that a new Kobe would always emit.
+    #[test]
+    fn protocol_v1_start_requests_are_old_new_compatible() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct ReleasedV1StartRequest {
+            protocol: u32,
+            id: String,
+            argv: Vec<String>,
+            #[serde(default)]
+            cwd: Option<String>,
+            timeout_seconds: u64,
+            max_output_bytes: u64,
+        }
+
+        let current = StartRequest {
+            protocol: PROTOCOL_VERSION,
+            id: "sbxe-compatible".into(),
+            argv: vec!["/agent".into(), "run".into()],
+            cwd: Some("/work".into()),
+            timeout_seconds: 60,
+            max_output_bytes: 1024,
+        };
+        let emitted = serde_json::to_string(&current).unwrap();
+        let released: ReleasedV1StartRequest = serde_json::from_str(&emitted)
+            .expect("a released deny-unknown-fields v1 runner must accept new Kobe JSON");
+        assert_eq!(released.protocol, PROTOCOL_VERSION);
+        assert_eq!(released.id, current.id);
+        assert_eq!(released.argv, current.argv);
+        assert_eq!(released.cwd, current.cwd);
+        assert_eq!(released.timeout_seconds, current.timeout_seconds);
+        assert_eq!(released.max_output_bytes, current.max_output_bytes);
+
+        let released_json = r#"{"protocol":1,"id":"sbxe-compatible","argv":["/agent","run"],"cwd":"/work","timeoutSeconds":60,"maxOutputBytes":1024}"#;
+        let read_by_current: StartRequest = serde_json::from_str(released_json)
+            .expect("the current runner must accept released v1 Kobe JSON");
+        assert_eq!(read_by_current, current);
+        assert!(
+            !emitted.contains("requestDigest"),
+            "v1 must not grow a field an older strict runner rejects: {emitted}"
         );
     }
 }

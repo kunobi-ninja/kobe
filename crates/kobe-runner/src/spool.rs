@@ -19,6 +19,14 @@
 //! It lives on the container's own filesystem and dies with the Sandbox. #82
 //! ends history with the lease: output that outlived its Pod would describe a
 //! workload nobody can inspect, from a filesystem nobody is cleaning up.
+//!
+//! # Trust boundary
+//!
+//! The runner and workload share a UID, so the workload can unlink, rename, or
+//! forge every file below this root. The spool prevents duplicate supervisors
+//! under honest operation, but is not security authority. Kobe spends spawn
+//! authority at its own `startedAt` checkpoint and never recovers it from a
+//! missing spool; started capacity retires only after exact target destruction.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -48,8 +56,8 @@ pub enum SpoolError {
     Conflict(Box<StartRequest>),
     Io(std::io::Error),
     /// A file exists but does not parse. Distinct from `NotFound`, because the
-    /// honest answer to "what happened" differs: absent means never started,
-    /// corrupt means nobody can say.
+    /// observable answer differs. Neither is proof about the process: the
+    /// workload UID can manufacture both observations.
     Corrupt,
 }
 
@@ -111,10 +119,10 @@ impl Spool {
 
     /// Reserve one id, atomically, before anything is spawned.
     ///
-    /// The same request twice is a retry and reserves nothing new. A different
-    /// request under the same id is a conflict rather than a second execution:
-    /// silently running it would give the caller two commands where they asked
-    /// for one.
+    /// The same request twice is a retry and reserves nothing new while the
+    /// reservation remains intact. A different request under the same id is a
+    /// conflict rather than a second execution. Kobe never relies on this
+    /// tenant-writable directory to restore spawn authority after `startedAt`.
     pub fn reserve(&self, request: &StartRequest) -> Result<Reservation, SpoolError> {
         let target = self.dir(&request.id)?;
         std::fs::create_dir_all(&self.root)?;
@@ -458,7 +466,6 @@ mod tests {
         StartRequest {
             protocol: PROTOCOL_VERSION,
             id: id.into(),
-            request_digest: None,
             argv: argv.iter().map(|argument| argument.to_string()).collect(),
             cwd: None,
             timeout_seconds: 60,

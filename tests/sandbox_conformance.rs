@@ -1492,10 +1492,10 @@ both_placements!(
 
 both_placements!(
     /// Kobe may die after its durable Running checkpoint but before the target
-    /// runner sees `start`. `NotFound` from that same recorded target proves the
-    /// target reservation never existed, so the identical retry may safely
-    /// complete it and must still run the command exactly once.
-    crash_after_running_before_target_reservation_recovers_or_tears_down_safely,
+    /// runner sees `start`. The workload can also remove the runner spool, so
+    /// `NotFound` cannot restore spawn authority. The exact retry must settle
+    /// one stable Unknown, run nothing, and still permit target destruction.
+    crash_after_running_before_target_reservation_is_unknown_and_never_started,
     |placement| async move {
         const WINDOW: &str = "execution-after-running-before-target-reservation";
         const KEY: &str = "conformance-crash-before-target-reservation";
@@ -1503,7 +1503,7 @@ both_placements!(
         sandbox.wait_ready(Duration::from_secs(600)).await?;
 
         let marker = format!("/tmp/kobe-before-target-reservation-{}", nonce(placement));
-        let script = format!("echo x >> {marker}; echo recovered-target-reservation");
+        let script = format!("echo x >> {marker}; echo must-not-run");
         let argv = ["/bin/sh", "-c", script.as_str()];
 
         inject_execution_crash(WINDOW, &sandbox.id, KEY).await?;
@@ -1515,13 +1515,12 @@ both_placements!(
         let (status, first) = sandbox.exec(&argv, KEY).await?;
         anyhow::ensure!(status.is_success(), "pre-target retry failed: {first}");
         anyhow::ensure!(
-            first["state"] == "Succeeded"
-                && first["exitCode"] == 0
-                && first["stdout"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("recovered-target-reservation"),
-            "pre-target retry did not recover the original request: {first}"
+            first["state"] == "Unknown"
+                && first["reason"] == "runner_forgot_execution"
+                && first["exitCode"].is_null()
+                && first["stdout"] == ""
+                && first["stderr"] == "",
+            "pre-target retry did not fail closed to the exact Unknown: {first}"
         );
         let (second_status, second) = sandbox.exec(&argv, KEY).await?;
         anyhow::ensure!(
@@ -1533,29 +1532,8 @@ both_placements!(
             sandbox
                 .marker_count(&marker, "conformance-before-target-reservation-count")
                 .await?
-                == 1,
-            "the recovered pre-target command did not run exactly once"
-        );
-
-        // Exercise the same boundary without an API retry. Release must treat
-        // NotFound from this exact target as proof that no runner reservation or
-        // process exists; quarantining here would strand both lease and slot.
-        const ABANDONED_KEY: &str = "conformance-crash-before-target-release";
-        let abandoned_marker =
-            format!("/tmp/kobe-before-target-release-{}", nonce(placement));
-        let abandoned_script = format!("echo x >> {abandoned_marker}");
-        let abandoned_argv = ["/bin/sh", "-c", abandoned_script.as_str()];
-        inject_execution_crash(WINDOW, &sandbox.id, ABANDONED_KEY).await?;
-        let abandoned = sandbox.exec(&abandoned_argv, ABANDONED_KEY).await;
-        let cleared = clear_execution_crash(WINDOW).await;
-        interrupted_request(&abandoned, WINDOW)?;
-        cleared?;
-        anyhow::ensure!(
-            sandbox
-                .marker_count(&abandoned_marker, "conformance-before-target-release-count")
-                .await?
                 == 0,
-            "the abandoned pre-target command ran without a target reservation"
+            "the command ran after NotFound restored no spawn authority"
         );
 
         sandbox.release().await

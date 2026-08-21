@@ -55,6 +55,28 @@ RUN cargo build --release --locked \
     # would only show up on somebody else's base image.
     && ! ldd /kobe-runner 2>/dev/null | grep -q "=>"
 
+# Exercise the exact binary copied into the published scratch image. The
+# writable directory is a consumer prerequisite, not a trust boundary: Kobe
+# treats all runner state as workload-controlled and never restores spawn
+# authority from it.
+FROM alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 AS smoke
+
+COPY --from=build /kobe-runner /kobe-runner
+
+RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
+
+USER 65532:65532
+
+RUN printf '%s\n' '{"protocol":1,"id":"sbxe-image-smoke","argv":["/bin/true"],"timeoutSeconds":30,"maxOutputBytes":1024}' \
+      | /kobe-runner start \
+    && attempts=0 \
+    && until /kobe-runner status --id sbxe-image-smoke | grep -q '"state":"succeeded"'; do \
+         attempts=$((attempts + 1)); \
+         test "$attempts" -lt 100; \
+         sleep 0.05; \
+       done \
+    && rm -rf /var/run/kobe/executions/sbxe-image-smoke
+
 # =============================================================================
 # Nothing but the binary. There is no shell in this image on purpose: the
 # runner contract has no shell anywhere in it, and an image that shipped one
@@ -73,6 +95,6 @@ LABEL org.opencontainers.image.title="kobe-runner"
 LABEL org.opencontainers.image.description="Kobe Sandbox execution supervisor, for copying into a Sandbox image"
 LABEL org.opencontainers.image.source="https://github.com/kunobi-ninja/kobe"
 
-COPY --from=build /kobe-runner /kobe-runner
+COPY --from=smoke /kobe-runner /kobe-runner
 
 ENTRYPOINT ["/kobe-runner"]

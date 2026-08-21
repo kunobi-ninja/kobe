@@ -97,6 +97,16 @@ impl RunnerCallFailure {
         }
     }
 
+    /// Whether the runner answered (or produced bytes) but its retained state
+    /// cannot be trusted as a usable observation.
+    ///
+    /// Transport loss may be transient and leaves a Running record alone.
+    /// Missing, corrupt, or refused state is durable uncertainty instead. It
+    /// must settle as `Unknown`, never authorize another `start`.
+    pub fn state_unverifiable(&self) -> bool {
+        !matches!(self, Self::Unreachable)
+    }
+
     /// What the caller is told.
     ///
     /// Never 500: none of these mean Kobe is broken, and a caller retrying a
@@ -213,12 +223,10 @@ pub fn start_request(
     argv: &[String],
     cwd: Option<&str>,
     timeout: std::time::Duration,
-    request_digest: Option<&str>,
 ) -> StartRequest {
     StartRequest {
         protocol: PROTOCOL_VERSION,
         id: id.to_string(),
-        request_digest: request_digest.map(str::to_string),
         argv: argv.to_vec(),
         cwd: cwd.map(str::to_string),
         // Rounded up, never down: a request for one and a half seconds that
@@ -649,7 +657,6 @@ mod tests {
             &["/agent".into(), "--token".into(), "s3cret".into()],
             Some("/work"),
             std::time::Duration::from_secs(60),
-            None,
         );
         let line = String::from_utf8(start_line(&request).unwrap()).unwrap();
         assert!(line.contains("s3cret"), "the command travels on stdin");
@@ -828,7 +835,6 @@ mod tests {
             &[String::new()],
             None,
             std::time::Duration::from_secs(1),
-            None,
         );
         let base = start_line(&request).unwrap().len();
         request.argv[0] = "x".repeat(MAX_REQUEST_BYTES - base);
@@ -1047,7 +1053,7 @@ mod tests {
     #[test]
     fn a_timeout_is_never_rounded_down() {
         let seconds = |timeout: std::time::Duration| {
-            start_request("sbxe-1", &["/agent".into()], None, timeout, None).timeout_seconds
+            start_request("sbxe-1", &["/agent".into()], None, timeout).timeout_seconds
         };
 
         assert_eq!(seconds(std::time::Duration::from_secs(60)), 60);
@@ -1071,7 +1077,6 @@ mod tests {
             &["/agent".into()],
             None,
             std::time::Duration::from_secs(60),
-            None,
         );
         assert_eq!(
             request.max_output_bytes,

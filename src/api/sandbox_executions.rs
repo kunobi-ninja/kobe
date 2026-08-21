@@ -11,12 +11,12 @@
 //! trace that anything ran, so the retry runs it again. For an agent calling
 //! `terraform apply`, running twice is far worse than failing.
 //!
-//! Reserving first inverts that. A crash after the reservation leaves a record
-//! that says "this may have run". A retry normally observes the same target-side
-//! reservation; if the exact target instead proves it has no reservation, Kobe
-//! knows its own crash preceded the target call and may safely complete that
-//! missing step. Either way the runner permits at most one spawn. The cost is
-//! that some executions end in `Unknown` — the honest answer #82 asks for.
+//! Reserving first inverts that. Kobe then writes `startedAt` before its one and
+//! only runner `start` call. A crash anywhere afterward leaves a record that
+//! says "this may have run"; no retry receives spawn authority. Missing runner
+//! state cannot narrow that answer because the workload UID can remove it. The
+//! cost is that some executions end in `Unknown` — the honest answer #82 asks
+//! for.
 //!
 //! # Capacity and identity are both reserved before spawn
 //!
@@ -30,9 +30,10 @@
 //!
 //! Kobe first reserves the caller's key in its own API so an operator restart
 //! cannot forget it. `kobe-runner` then reserves the same derived execution id
-//! inside the exact target before spawning. The API object is the durable
-//! cross-restart authority; the target spool is what makes a lost runner-start
-//! response idempotent without trusting a long-lived exec connection.
+//! inside the exact target before spawning. That second reservation prevents
+//! duplicate supervisors during an intact call, but is not trusted recovery
+//! state: runner and workload share a UID. The API object's `startedAt` is the
+//! durable cross-restart fence that permanently spends spawn authority.
 
 use kube::ResourceExt;
 use kube::api::{
@@ -284,8 +285,8 @@ pub enum Reservation {
     /// This request reserved the key. It may now spawn — and nothing else will.
     Reserved(Box<SandboxExecution>),
     /// The same request already reserved it. Return the original without new
-    /// spawn authority. The caller may only complete a missing target-side
-    /// reservation when that exact target answers `NotFound`.
+    /// spawn authority. Runner `NotFound` cannot change that: the workload can
+    /// remove a reservation while its original process remains alive.
     AlreadyExists(Box<SandboxExecution>),
     /// Capacity is durable and the exact CREATE/bind resolver owns the request,
     /// but this HTTP task reached its absolute deadline or process shutdown.
@@ -747,8 +748,7 @@ pub fn queued_verdict_due(
 ///
 /// Written BEFORE the target reservation and spawn. It consumes fresh spawn
 /// authority permanently. If this process disappears before the target call,
-/// only `NotFound` from the exact recorded target permits an identical retry to
-/// complete that missing reservation.
+/// a retry settles the record `Unknown`; it never calls `start` again.
 pub async fn mark_running(
     client: &kube::Client,
     namespace: &str,
@@ -1188,13 +1188,15 @@ async fn complete_capacity_for_record(
     ledger_namespace: &str,
     execution: &SandboxExecution,
 ) {
-    if execution.status.as_ref().is_some_and(|status| {
-        status.state == ExecutionState::Unknown && status.started_at.is_some()
-    }) {
-        // Unknown says only that the verdict disappeared. It does not prove
-        // the runner killed the process group, so this slot remains active
-        // until lease cleanup obtains process-absence proof from the runner or
-        // from destruction of the exact target.
+    if execution
+        .status
+        .as_ref()
+        .is_some_and(|status| status.started_at.is_some())
+    {
+        // The runner spool is writable by the workload UID. Even an exact-
+        // looking Succeeded/Failed/Cancelled report can be forged while the
+        // original process remains, so ordinary reaping never treats it as an
+        // absence proof. Exact target destruction retires the slot later.
         return;
     }
     let Some(lease_name) = execution.spec.lease_name.as_deref() else {
@@ -1231,49 +1233,25 @@ pub enum ExecutionCleanupOutcome {
     Clean,
     /// One durable mutation landed; re-list before doing anything destructive.
     Checkpointed,
-    /// The exact runner outcome is terminal but cannot prove its process group
-    /// absent. Keep the `Unknown` record and capacity, destroy the exact target,
-    /// then call [`cleanup_lease_executions_after_target_absence`] to retire it
-    /// against the stronger absence proof.
+    /// A started execution has a stable outcome (possibly `Unknown`) but no
+    /// trusted proof that its process group is absent. Keep the record and
+    /// capacity, destroy the exact target, then call
+    /// [`cleanup_lease_executions_after_target_absence`] to retire it.
     AwaitTargetDestruction,
     Retry,
     Quarantine(&'static str),
 }
 
-/// Whether reachable cleanup must defer retirement until exact target absence.
+/// Whether a terminal runner report for a started execution requires target
+/// destruction before capacity retirement.
 ///
-/// `Unknown` remains the execution verdict; this predicate does not reinterpret
-/// it as cancellation. It only decides which proof may release the process slot.
+/// The workload and runner share a UID, so the workload can replace every
+/// spool file. Reports remain useful as caller-visible outcomes, but none of
+/// them is process-absence authority.
 fn runner_report_requires_target_destruction(
     report: &kobe_runner::protocol::ExecutionReport,
 ) -> bool {
-    report.state.is_terminal() && !report.process_absence_proven()
-}
-
-/// Whether a durable Kobe outcome already proves teardown must use target
-/// destruction when the runner can no longer answer.
-///
-/// This is the restart checkpoint for management placement. The first
-/// reachable cleanup persists `Unknown` before returning
-/// [`ExecutionCleanupOutcome::AwaitTargetDestruction`]. Once Claim deletion has
-/// started, the Pod may disappear before the next pass can call the runner;
-/// reclassifying that transport loss as an ordinary retry would prevent the
-/// controller from ever observing Claim absence. Known no-spawn reasons remain
-/// process-absence proof and do not need this fallback.
-fn terminal_status_requires_target_destruction(execution: &SandboxExecution) -> bool {
-    let Some(status) = execution.status.as_ref() else {
-        return false;
-    };
-    status.state == ExecutionState::Unknown
-        && status.started_at.is_some()
-        && !matches!(
-            status.reason.as_deref(),
-            Some(
-                kobe_runner::protocol::reason::SPAWN_FAILED
-                    | kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED
-                    | kobe_runner::protocol::reason::SUPERVISOR_SETUP_FAILED
-            )
-        )
+    report.state.is_terminal()
 }
 
 fn cleanup_target(
@@ -1538,8 +1516,7 @@ async fn cleanup_lease_executions_inner(
     require_empty_manifest: bool,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> ExecutionCleanupOutcome {
-    use crate::api::sandbox_runner::{self as runner, RunnerCallFailure};
-    use kobe_runner::protocol::RunnerErrorCode;
+    use crate::api::sandbox_runner as runner;
 
     let manifest = match crate::sandbox_access_ledger::execution_manifest(
         management_client,
@@ -1732,7 +1709,7 @@ async fn cleanup_lease_executions_inner(
                     if !outcome.state.is_terminal() {
                         return ExecutionCleanupOutcome::Retry;
                     }
-                    process_absence_proven = !runner_report_requires_target_destruction(&report);
+                    debug_assert!(runner_report_requires_target_destruction(&report));
                     record_terminal(
                         management_client,
                         execution_namespace,
@@ -1743,38 +1720,23 @@ async fn cleanup_lease_executions_inner(
                     )
                     .await;
                 }
-                Err(RunnerCallFailure::Unreachable) => {
-                    if terminal_status_requires_target_destruction(&execution) {
-                        // Target destruction may already be in flight. Keep the
-                        // stable Unknown and its slot, but let the caller reach
-                        // the exact UID/receipt-backed absence observation.
-                        return ExecutionCleanupOutcome::AwaitTargetDestruction;
-                    }
-                    return ExecutionCleanupOutcome::Retry;
-                }
-                Err(RunnerCallFailure::Refused(RunnerErrorCode::NotFound)) => {
-                    // This is the exact recorded Pod UID and runner path. No
-                    // reservation means Kobe died before target-side start, so
-                    // there is no process group to cancel. Preserve an already
-                    // terminal outcome; otherwise make the no-supervisor result
-                    // durable before retiring capacity.
-                    process_absence_proven = true;
-                    if !state.is_terminal() {
-                        record_terminal(
-                            management_client,
-                            execution_namespace,
-                            &execution,
-                            ExecutionState::Unknown,
-                            None,
-                            kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED,
-                        )
-                        .await;
-                    }
-                }
-                Err(_) => {
-                    return ExecutionCleanupOutcome::Quarantine("execution_runner_unverifiable");
+                Err(failure) => {
+                    // Missing, corrupt, and unreachable runner state are all
+                    // tenant-controlled observations. Make the uncertainty
+                    // durable, but never turn it into permission to retire the
+                    // slot or reuse this id's spawn authority.
+                    record_terminal(
+                        management_client,
+                        execution_namespace,
+                        &execution,
+                        ExecutionState::Unknown,
+                        None,
+                        failure.reason_code(),
+                    )
+                    .await;
                 }
             }
+            process_absence_proven = false;
             let Some(refreshed) = refresh(management_client, execution_namespace, &execution).await
             else {
                 return ExecutionCleanupOutcome::Retry;
@@ -1816,9 +1778,9 @@ async fn cleanup_lease_executions_inner(
         }
 
         if !process_absence_proven {
-            // Preserve the exact Unknown verdict and its active capacity. The
-            // caller must advance target destruction; its UID/receipt-backed
-            // absence proof is what makes retirement safe on a later pass.
+            // Preserve the stable verdict and active capacity. The caller must
+            // advance target destruction; its UID/receipt-backed absence proof
+            // is what makes retirement safe on a later pass.
             return ExecutionCleanupOutcome::AwaitTargetDestruction;
         }
 
@@ -1864,51 +1826,45 @@ mod tests {
         }
     }
 
-    /// Losing the supervisor is terminal evidence about the verdict, not proof
-    /// that its process group vanished. Reachable cleanup must therefore advance
-    /// target destruction, while a reservation that never spawned may retire
-    /// without destroying an otherwise healthy Sandbox.
+    /// No runner report for a started command is process-absence authority.
+    ///
+    /// The workload UID can replace state/log/lock/cancel files, so even a
+    /// plausible successful, cancelled, or pre-spawn report must retain
+    /// capacity until exact target destruction.
     #[test]
-    fn supervisor_lost_waits_for_target_destruction_before_retirement() {
-        let report = |reason: &str| kobe_runner::protocol::ExecutionReport {
-            id: "sbxe-1".into(),
-            state: kobe_runner::protocol::RunnerState::Unknown,
-            reason: Some(reason.into()),
-            ..Default::default()
-        };
-        assert!(runner_report_requires_target_destruction(&report(
-            kobe_runner::protocol::reason::SUPERVISOR_LOST
-        )));
-        assert!(!runner_report_requires_target_destruction(&report(
-            kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED
-        )));
+    fn every_terminal_runner_report_waits_for_target_destruction() {
+        use kobe_runner::protocol::{ExecutionReport, RunnerState};
 
-        let mut execution = build_execution_record(
-            "kobe-system",
-            "execution-a",
-            &lease(),
-            &target(),
-            &request(),
-            &"d".repeat(64),
-            recorded_target("workspace"),
-        );
-        execution.status = Some(crate::crd::SandboxExecutionStatus {
-            state: ExecutionState::Unknown,
-            started_at: Some("2026-08-21T00:00:00Z".into()),
-            reason: Some(kobe_runner::protocol::reason::SUPERVISOR_LOST.into()),
-            ..Default::default()
-        });
-        assert!(terminal_status_requires_target_destruction(&execution));
-
-        // A lost HTTP acknowledgement is stable Unknown too. If target
-        // destruction makes the runner unreachable on a later pass, teardown
-        // must still advance rather than deadlock ahead of its absence proof.
-        execution.status.as_mut().unwrap().reason = Some("runner_unreachable".into());
-        assert!(terminal_status_requires_target_destruction(&execution));
-
-        execution.status.as_mut().unwrap().reason =
-            Some(kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED.into());
-        assert!(!terminal_status_requires_target_destruction(&execution));
+        for report in [
+            ExecutionReport {
+                id: "sbxe-1".into(),
+                state: RunnerState::Succeeded,
+                exit_code: Some(0),
+                reason: Some(kobe_runner::protocol::reason::COMPLETED.into()),
+                ..Default::default()
+            },
+            ExecutionReport {
+                id: "sbxe-1".into(),
+                state: RunnerState::Cancelled,
+                reason: Some(kobe_runner::protocol::reason::CANCELLED.into()),
+                ..Default::default()
+            },
+            ExecutionReport {
+                id: "sbxe-1".into(),
+                state: RunnerState::Unknown,
+                reason: Some(kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED.into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(runner_report_requires_target_destruction(&report));
+        }
+        assert!(!runner_report_requires_target_destruction(
+            &ExecutionReport {
+                id: "sbxe-1".into(),
+                state: RunnerState::Running,
+                ..Default::default()
+            }
+        ));
     }
 
     fn request() -> ExecutionRequest {

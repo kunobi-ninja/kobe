@@ -40,8 +40,9 @@ use kobe_runner::supervisor;
 #[derive(Parser)]
 #[command(name = "kobe-runner", about = "Supervise one Kobe Sandbox execution")]
 struct Cli {
-    /// Where executions are spooled. Owned by the runner: Kobe never names a
-    /// path inside somebody else's container.
+    /// Where executions are spooled. Kobe never names a path inside somebody
+    /// else's container and never treats this workload-writable path as
+    /// security authority.
     #[arg(long, default_value = spool::DEFAULT_STATE_DIR, global = true)]
     state_dir: String,
 
@@ -145,8 +146,9 @@ fn error(code: RunnerErrorCode) -> Reply {
 /// Reserve an id and start supervising it.
 ///
 /// Reservation happens before the supervisor exists, and the supervisor is
-/// spawned exactly once per reservation. A retry of the same request finds the
-/// reservation and reports it; it never spawns a second command.
+/// spawned exactly once per intact reservation. A retry that finds the same
+/// reservation reports it and spawns nothing. Kobe itself never retries this
+/// verb after its Running checkpoint because the workload can remove the spool.
 fn start(
     spool: &Spool,
     state_dir: &str,
@@ -233,14 +235,6 @@ fn validate(request: &StartRequest) -> Result<(), RunnerErrorCode> {
         return Err(RunnerErrorCode::InvalidRequest);
     }
     if !is_valid_id(&request.id) {
-        return Err(RunnerErrorCode::InvalidRequest);
-    }
-    if request.request_digest.as_deref().is_some_and(|digest| {
-        digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
         return Err(RunnerErrorCode::InvalidRequest);
     }
     if request.argv.is_empty() || request.argv.iter().any(String::is_empty) {
@@ -473,7 +467,6 @@ mod tests {
         StartRequest {
             protocol: PROTOCOL_VERSION,
             id: "sbxe-1".into(),
-            request_digest: None,
             argv: vec!["/agent".into(), "run".into()],
             cwd: Some("/work".into()),
             timeout_seconds: 60,
@@ -542,10 +535,6 @@ mod tests {
         assert!(with(&|r| r.argv = vec![String::new()]).is_err());
         assert!(with(&|r| r.argv = vec!["/bin/sh".into(), "\0".into()]).is_err());
         assert!(with(&|r| r.id = "../escape".into()).is_err());
-        assert!(with(&|r| r.request_digest = Some("a".repeat(64))).is_ok());
-        assert!(with(&|r| r.request_digest = Some("A".repeat(64))).is_err());
-        assert!(with(&|r| r.request_digest = Some("a".repeat(63))).is_err());
-
         for bad in ["", "work", "./work", "/work\0/etc"] {
             assert!(
                 with(&|r| r.cwd = Some(bad.to_string())).is_err(),
