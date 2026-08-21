@@ -5995,9 +5995,27 @@ async fn authoritative_child_receipt_matches(
     let evidence_api: Api<crate::crd::VerifiedTeardownEvidence> =
         Api::namespaced(client.clone(), namespace);
     let evidence = evidence_api.get(&reference.name).await?;
+    let expected_labels =
+        crate::crd::verified_teardown_evidence_labels(&lease_uid, &receipt.attempt_id);
+    let labels_match = expected_labels.iter().all(|(key, value)| {
+        evidence
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|live| live.get(key))
+            == Some(value)
+    });
     let identity_matches = evidence.uid().as_deref() == Some(reference.uid.as_str())
         && evidence.metadata.generation == Some(reference.generation)
-        && evidence.resource_version().as_deref() == Some(reference.resource_version.as_str());
+        && evidence.resource_version().as_deref() == Some(reference.resource_version.as_str())
+        && evidence.namespace().as_deref() == Some(namespace)
+        && evidence.metadata.deletion_timestamp.is_none()
+        && evidence
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_none_or(|owners| owners.is_empty())
+        && labels_match;
     let content_matches = evidence.spec.lease.name == lease.name_any()
         && evidence.spec.lease.uid.as_deref() == Some(lease_uid.as_str())
         && evidence.spec.attempt_id == receipt.attempt_id
@@ -13956,6 +13974,12 @@ pub(crate) mod tests {
 
     async fn mount_child_evidence(server: &MockServer, receipt: &serde_json::Value) {
         let reference = child_evidence_reference(receipt);
+        let labels = crate::crd::verified_teardown_evidence_labels(
+            "child-lease-uid",
+            receipt["attemptId"]
+                .as_str()
+                .expect("receipt fixture has attempt"),
+        );
         let evidence = serde_json::json!({
             "apiVersion": "kobe.kunobi.ninja/v1alpha1",
             "kind": "VerifiedTeardownEvidence",
@@ -13965,6 +13989,7 @@ pub(crate) mod tests {
                 "uid": reference.uid,
                 "generation": reference.generation,
                 "resourceVersion": reference.resource_version,
+                "labels": labels,
             },
             "spec": {
                 "lease": { "name": "kobe-sbx-sbx-1", "uid": "child-lease-uid" },

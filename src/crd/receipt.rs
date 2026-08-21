@@ -13,6 +13,45 @@ use sha2::{Digest, Sha256};
 
 use crate::crd::{KubernetesResourceIdentity, ResourceRef, TeardownReceipt};
 
+/// Label proving which exact lease UID feeds a deterministic evidence name.
+pub const TEARDOWN_EVIDENCE_LEASE_DIGEST_LABEL: &str = "kobe.kunobi.ninja/teardown-lease-digest";
+/// Label proving which exact attempt nonce feeds a deterministic evidence name.
+pub const TEARDOWN_EVIDENCE_ATTEMPT_DIGEST_LABEL: &str =
+    "kobe.kunobi.ninja/teardown-attempt-digest";
+/// Fixed producer label checked on create, restart adoption, and consumption.
+pub const TEARDOWN_EVIDENCE_PRODUCER_LABEL: &str = "kobe.kunobi.ninja/teardown-evidence-producer";
+
+/// Immutable identity labels for one deterministic evidence object.
+///
+/// Labels are consistency fences, not authentication on their own. The
+/// fail-closed admission policy supplies producer authentication; these hashes
+/// make a restart prove that an existing object still names the exact lease UID
+/// and attempt it is about without putting arbitrary input into label values.
+#[allow(dead_code)] // `crdgen` compiles this module without controller consumers.
+pub fn verified_teardown_evidence_labels(
+    lease_uid: &str,
+    attempt_id: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let digest = |domain: &str, value: &str| {
+        let digest = Sha256::digest(format!("{domain}\0{value}").as_bytes());
+        hex::encode(digest)[..40].to_string()
+    };
+    std::collections::BTreeMap::from([
+        (
+            TEARDOWN_EVIDENCE_LEASE_DIGEST_LABEL.into(),
+            digest("lease", lease_uid),
+        ),
+        (
+            TEARDOWN_EVIDENCE_ATTEMPT_DIGEST_LABEL.into(),
+            digest("attempt", attempt_id),
+        ),
+        (
+            TEARDOWN_EVIDENCE_PRODUCER_LABEL.into(),
+            "teardown-authority".into(),
+        ),
+    ])
+}
+
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, KubeSchema, PartialEq, Eq)]
 #[kube(
     group = "kobe.kunobi.ninja",
@@ -146,6 +185,26 @@ mod tests {
         assert_ne!(first, verified_teardown_evidence_name("uid-b", "attempt-a"));
         assert_ne!(first, verified_teardown_evidence_name("uid-a", "attempt-b"));
         assert!(first.len() <= 63);
+    }
+
+    #[test]
+    fn identity_labels_are_bounded_and_bind_both_inputs() {
+        let first = verified_teardown_evidence_labels("uid-a", "attempt-a");
+        let other_lease = verified_teardown_evidence_labels("uid-b", "attempt-a");
+        let other_attempt = verified_teardown_evidence_labels("uid-a", "attempt-b");
+        assert_ne!(
+            first[TEARDOWN_EVIDENCE_LEASE_DIGEST_LABEL],
+            other_lease[TEARDOWN_EVIDENCE_LEASE_DIGEST_LABEL]
+        );
+        assert_ne!(
+            first[TEARDOWN_EVIDENCE_ATTEMPT_DIGEST_LABEL],
+            other_attempt[TEARDOWN_EVIDENCE_ATTEMPT_DIGEST_LABEL]
+        );
+        assert!(first.values().all(|value| value.len() <= 63));
+        assert_eq!(
+            first[TEARDOWN_EVIDENCE_PRODUCER_LABEL],
+            "teardown-authority"
+        );
     }
 
     #[test]

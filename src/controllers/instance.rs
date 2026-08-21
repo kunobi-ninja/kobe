@@ -2650,12 +2650,21 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
             return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
         }
     };
+    let Some(persisted_receipt) = receipt_lease
+        .status
+        .as_ref()
+        .and_then(|status| status.teardown_receipt.as_ref())
+        .filter(|persisted| persisted_receipt_matches_retry(persisted, &receipt))
+    else {
+        warn!(instance = %name, "apiserver response omitted the exact persisted teardown receipt");
+        return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
+    };
 
     let expected = crate::crd::TeardownScope {
         lease: &binding.lease,
         instance: &manifest.instance,
         pool: &binding.pool,
-        backend_type: &receipt.backend_type,
+        backend_type: &persisted_receipt.backend_type,
         config_digest: &binding.backend.config_digest,
         instance_spec_digest: &binding.instance_spec_digest,
         creation_manifest_digest: &manifest_digest,
@@ -2667,8 +2676,10 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         instance_name: name,
         recorded_identities: &recorded_identities,
     };
-    if outcome != TeardownOutcome::Verified || !receipt.permits_release_for(&expected) {
-        let unproven: Vec<&str> = receipt
+    if persisted_receipt.outcome != TeardownOutcome::Verified
+        || !persisted_receipt.permits_release_for(&expected)
+    {
+        let unproven: Vec<&str> = persisted_receipt
             .checks
             .iter()
             .filter(|check| check.result == CheckResult::Unknown)
@@ -2684,9 +2695,14 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         );
     }
 
-    if let Err(error) =
-        mark_exact_lease_recycling_after_verified(ctx, &receipt_lease, binding, &receipt, namespace)
-            .await
+    if let Err(error) = mark_exact_lease_recycling_after_verified(
+        ctx,
+        &receipt_lease,
+        binding,
+        persisted_receipt,
+        namespace,
+    )
+    .await
     {
         warn!(instance = %name, error = %error, "could not publish verified lease transition; withholding instance deletion");
         return Some(Ok(Action::requeue(std::time::Duration::from_secs(15))));
@@ -2880,17 +2896,18 @@ async fn record_teardown_receipt<B: ClusterBackend>(
     let resource_version = lease
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("lease has no resourceVersion"))?;
-    let evidence = if receipt.outcome == TeardownOutcome::Verified {
-        Some(persist_verified_teardown_evidence(&ctx.client, namespace, receipt).await?)
+    let (persisted_receipt, evidence) = if receipt.outcome == TeardownOutcome::Verified {
+        let persisted = persist_verified_teardown_evidence(&ctx.client, namespace, receipt).await?;
+        (persisted.receipt, Some(persisted.reference))
     } else {
-        None
+        (receipt.clone(), None)
     };
     let mut operations = vec![
         serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
         serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
     ];
     if let Some(attempt_id) = expected_attempt {
-        if receipt.attempt_id != attempt_id {
+        if persisted_receipt.attempt_id != attempt_id {
             anyhow::bail!("terminal receipt changed the durable teardown attempt");
         }
         operations.push(serde_json::json!({
@@ -2904,22 +2921,22 @@ async fn record_teardown_receipt<B: ClusterBackend>(
             "value": attempt_id
         }));
     } else {
-        if receipt.outcome != TeardownOutcome::InProgress
-            || receipt.completed_at.is_some()
-            || receipt.attempt_id.trim().is_empty()
+        if persisted_receipt.outcome != TeardownOutcome::InProgress
+            || persisted_receipt.completed_at.is_some()
+            || persisted_receipt.attempt_id.trim().is_empty()
         {
             anyhow::bail!("a destructive attempt must begin as durable InProgress evidence");
         }
         operations.push(serde_json::json!({
             "op": "add",
             "path": "/status/teardownAttemptId",
-            "value": receipt.attempt_id
+            "value": persisted_receipt.attempt_id
         }));
     }
     operations.push(serde_json::json!({
         "op": "add",
         "path": "/status/teardownReceipt",
-        "value": receipt
+        "value": persisted_receipt
     }));
     if let Some(evidence) = evidence {
         operations.push(serde_json::json!({
@@ -2938,14 +2955,61 @@ async fn record_teardown_receipt<B: ClusterBackend>(
         .await?)
 }
 
+#[derive(Debug)]
+struct PersistedTeardownEvidence {
+    receipt: TeardownReceipt,
+    reference: TeardownEvidenceReference,
+}
+
+/// Whether an immutable receipt already created by this authority is the exact
+/// terminal observation being retried.
+///
+/// `completedAt` is the sole process-time value: a crash after evidence CREATE
+/// but before the lease status CAS may recompute it. Every capability fence and
+/// every observed check must remain byte-for-byte equal, and the already
+/// persisted timestamp must itself produce a valid acknowledgement token.
+fn persisted_receipt_matches_retry(persisted: &TeardownReceipt, retried: &TeardownReceipt) -> bool {
+    if persisted.acknowledgement_token().is_none() {
+        return false;
+    }
+    let mut normalized = persisted.clone();
+    normalized.completed_at = retried.completed_at.clone();
+    normalized == *retried
+}
+
+fn evidence_object_identity_matches(
+    evidence: &VerifiedTeardownEvidence,
+    expected_name: &str,
+    expected_namespace: &str,
+    expected_labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    evidence.name_any() == expected_name
+        && evidence.namespace().as_deref() == Some(expected_namespace)
+        && evidence.metadata.deletion_timestamp.is_none()
+        && evidence
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_none_or(|owners| owners.is_empty())
+        && expected_labels.iter().all(|(key, value)| {
+            evidence
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|live| live.get(key))
+                == Some(value)
+        })
+}
+
 /// Create the immutable, separately-authorized receipt record before mirroring
-/// it into mutable ClusterLease status. A 409 is adoptable only when the full
-/// spec is byte-for-byte the same evidence for the same exact lease attempt.
+/// it into mutable ClusterLease status. A 409 is adoptable only when immutable
+/// identity labels and the complete observation match; its already-persisted
+/// valid completion timestamp wins over a retry's recomputed timestamp.
 async fn persist_verified_teardown_evidence(
     client: &Client,
     namespace: &str,
     receipt: &TeardownReceipt,
-) -> Result<TeardownEvidenceReference, anyhow::Error> {
+) -> Result<PersistedTeardownEvidence, anyhow::Error> {
     if receipt.acknowledgement_token().is_none() {
         anyhow::bail!("only a complete verified receipt can become authority evidence");
     }
@@ -2964,31 +3028,51 @@ async fn persist_verified_teardown_evidence(
     let evidence_api: Api<VerifiedTeardownEvidence> = Api::namespaced(client.clone(), namespace);
     let mut desired = VerifiedTeardownEvidence::new(&name, spec.clone());
     desired.metadata.namespace = Some(namespace.to_string());
+    desired.metadata.labels = Some(crate::crd::verified_teardown_evidence_labels(
+        lease_uid,
+        &receipt.attempt_id,
+    ));
+    let expected_labels = desired
+        .metadata
+        .labels
+        .clone()
+        .expect("evidence identity labels were just assigned");
     let evidence = match evidence_api.create(&PostParams::default(), &desired).await {
         Ok(created) => created,
         Err(kube::Error::Api(error)) if error.code == 409 => {
             let existing = evidence_api.get(&name).await?;
-            if existing.spec != spec {
+            if !evidence_object_identity_matches(&existing, &name, namespace, &expected_labels)
+                || existing.spec.lease != spec.lease
+                || existing.spec.attempt_id != spec.attempt_id
+                || !persisted_receipt_matches_retry(&existing.spec.receipt, receipt)
+            {
                 anyhow::bail!("same-name teardown evidence has different immutable content");
             }
             existing
         }
         Err(error) => return Err(error.into()),
     };
-    if evidence.spec != spec {
+    if !evidence_object_identity_matches(&evidence, &name, namespace, &expected_labels)
+        || evidence.spec.lease != spec.lease
+        || evidence.spec.attempt_id != spec.attempt_id
+        || !persisted_receipt_matches_retry(&evidence.spec.receipt, receipt)
+    {
         anyhow::bail!("apiserver returned different teardown evidence content");
     }
-    Ok(TeardownEvidenceReference {
-        name: evidence.name_any(),
-        uid: evidence
-            .uid()
-            .filter(|uid| !uid.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("teardown evidence has no UID"))?,
-        generation: evidence.metadata.generation.unwrap_or_default(),
-        resource_version: evidence
-            .resource_version()
-            .filter(|rv| !rv.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("teardown evidence has no resourceVersion"))?,
+    Ok(PersistedTeardownEvidence {
+        receipt: evidence.spec.receipt.clone(),
+        reference: TeardownEvidenceReference {
+            name: evidence.name_any(),
+            uid: evidence
+                .uid()
+                .filter(|uid| !uid.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("teardown evidence has no UID"))?,
+            generation: evidence.metadata.generation.unwrap_or_default(),
+            resource_version: evidence
+                .resource_version()
+                .filter(|rv| !rv.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("teardown evidence has no resourceVersion"))?,
+        },
     })
 }
 
@@ -4222,6 +4306,168 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn evidence_create_then_lease_conflict_reuses_persisted_receipt_on_retry() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let persisted_receipt = teardown_surface_receipt(&binding);
+        let mut pending = persisted_receipt.clone();
+        pending.completed_at = None;
+        pending.checks.clear();
+        pending.outcome = TeardownOutcome::InProgress;
+        let lease = teardown_surface_lease(
+            LeasePhase::Recycling,
+            binding.lease.uid.as_deref().unwrap(),
+            &binding,
+            Some(&pending),
+        );
+        let evidence_name = crate::crd::verified_teardown_evidence_name(
+            binding.lease.uid.as_deref().unwrap(),
+            &persisted_receipt.attempt_id,
+        );
+        let mut evidence = VerifiedTeardownEvidence::new(
+            &evidence_name,
+            VerifiedTeardownEvidenceSpec {
+                lease: persisted_receipt.lease.clone(),
+                attempt_id: persisted_receipt.attempt_id.clone(),
+                receipt: persisted_receipt.clone(),
+            },
+        );
+        evidence.metadata.namespace = Some("test-ns".into());
+        evidence.metadata.uid = Some("evidence-uid".into());
+        evidence.metadata.generation = Some(1);
+        evidence.metadata.resource_version = Some("evidence-rv".into());
+        evidence.metadata.labels = Some(crate::crd::verified_teardown_evidence_labels(
+            binding.lease.uid.as_deref().unwrap(),
+            &persisted_receipt.attempt_id,
+        ));
+        let evidence_reference = TeardownEvidenceReference {
+            name: evidence_name.clone(),
+            uid: "evidence-uid".into(),
+            generation: 1,
+            resource_version: "evidence-rv".into(),
+        };
+        let evidence_collection =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/verifiedteardownevidence";
+        Mock::given(method("POST"))
+            .and(path(evidence_collection))
+            .respond_with(ResponseTemplate::new(201).set_body_json(&evidence))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(evidence_collection))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "AlreadyExists",
+                "code": 409
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{evidence_collection}/{evidence_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&evidence))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lease_status_path = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-surface/status";
+        Mock::given(method("PATCH"))
+            .and(path(lease_status_path))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut updated = lease.clone();
+        updated.metadata.resource_version = Some("44".into());
+        let updated_status = updated.status.as_mut().unwrap();
+        updated_status.teardown_receipt = Some(persisted_receipt.clone());
+        updated_status.teardown_evidence = Some(evidence_reference.clone());
+        Mock::given(method("PATCH"))
+            .and(path(lease_status_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&updated))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            record_teardown_receipt(
+                &ctx,
+                &lease,
+                &persisted_receipt,
+                "test-ns",
+                Some(&persisted_receipt.attempt_id),
+            )
+            .await
+            .is_err(),
+            "the first lease CAS must lose after evidence is durable"
+        );
+        let mut retry_lease = lease;
+        retry_lease.metadata.resource_version = Some("43".into());
+        let mut recomputed = persisted_receipt.clone();
+        recomputed.completed_at = Some("2026-01-01T00:02:00Z".into());
+        let converged = record_teardown_receipt(
+            &ctx,
+            &retry_lease,
+            &recomputed,
+            "test-ns",
+            Some(&recomputed.attempt_id),
+        )
+        .await
+        .expect("retry adopts immutable evidence and converges");
+        assert_eq!(
+            converged
+                .status
+                .as_ref()
+                .and_then(|status| status.teardown_receipt.as_ref()),
+            Some(&persisted_receipt)
+        );
+
+        let patches: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(patches.len(), 2);
+        let retry_receipt = patches[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["path"] == "/status/teardownReceipt")
+            .expect("retry patches the receipt");
+        assert_eq!(
+            retry_receipt["value"]["completedAt"],
+            persisted_receipt.completed_at.as_deref().unwrap()
+        );
+        assert_eq!(
+            patches[1]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|operation| operation["path"] == "/status/teardownEvidence")
+                .expect("retry patches the exact evidence reference")["value"],
+            serde_json::to_value(evidence_reference).unwrap()
+        );
     }
 
     #[tokio::test]
