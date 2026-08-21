@@ -1,13 +1,11 @@
 #!/usr/bin/env bun
 
 const chart = "charts/kobe";
-const releaseAsset = `${chart}/files/agent-sandbox-v0.5.6.yaml`;
+const releaseFixture = "hack/fixtures/agent-sandbox-v0.5.6.yaml";
 const releaseSha256 =
 	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
-const bootstrapSha256 =
-	"f38255d5aa7761dec45507683127066a1750fbedb1e3b6a56573901033d0110f";
-const pinnedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
+const taggedImage =
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
 const upstreamCrds = new Set([
 	"sandboxclaims.extensions.agents.x-k8s.io",
 	"sandboxes.agents.x-k8s.io",
@@ -44,6 +42,22 @@ async function helm(mode: string): Promise<string> {
 	]);
 	invariant(exitCode === 0, `helm template ${mode} failed: ${stderr}`);
 	return stdout;
+}
+
+async function helmRejects(mode: string): Promise<void> {
+	const process = Bun.spawn(
+		["helm", "template", "kobe", chart, "--set", `agentSandbox.mode=${mode}`],
+		{ stdout: "ignore", stderr: "pipe" },
+	);
+	const [stderr, exitCode] = await Promise.all([
+		new Response(process.stderr).text(),
+		process.exited,
+	]);
+	invariant(exitCode !== 0, `${mode} mode unexpectedly rendered`);
+	invariant(
+		stderr.includes("agentSandbox") && stderr.includes("mode"),
+		`${mode} mode error is not actionable`,
+	);
 }
 
 function parseDocuments(yaml: string): Record<string, unknown>[] {
@@ -89,166 +103,43 @@ function teardownFencePolicy(
 	});
 }
 
-function collectImages(value: unknown, images: string[] = []): string[] {
-	if (Array.isArray(value)) {
-		for (const item of value) collectImages(item, images);
-	} else if (value && typeof value === "object") {
-		for (const [key, item] of Object.entries(value)) {
-			if (key === "image" && typeof item === "string") images.push(item);
-			collectImages(item, images);
-		}
-	}
-	return images;
-}
+// -----------------------------------------------------------------------------
+// The pinned release fixture is the compatibility oracle for external mode and
+// the harness's operator-role install source. It must remain the exact
+// upstream v0.5.6 asset; the digest pin happens where it is applied.
+// -----------------------------------------------------------------------------
 
-const source = await Bun.file(releaseAsset).bytes();
+const source = await Bun.file(releaseFixture).text();
 invariant(
 	sha256(source) === releaseSha256,
-	"vendored release asset digest drifted",
+	"pinned release fixture digest drifted",
 );
-
-const [disabledYaml, managedYaml, externalYaml] = await Promise.all([
-	helm("disabled"),
-	helm("managed"),
-	helm("external"),
-]);
-const disabled = parseDocuments(disabledYaml);
-const managed = parseDocuments(managedYaml);
-const external = parseDocuments(externalYaml);
-
 invariant(
-	!teardownFencePolicy(disabled),
-	"disabled rendered the Sandbox teardown admission fence",
+	source.includes(taggedImage),
+	"pinned release fixture lost the upstream controller image",
 );
-for (const [mode, documents] of [
-	["managed", managed],
-	["external", external],
-] as const) {
-	const policy = teardownFencePolicy(documents);
-	invariant(policy, `${mode} omitted the Sandbox teardown admission fence`);
-	invariant(
-		annotations(policy)["helm.sh/resource-policy"] === "keep",
-		`${mode} teardown fence policy is not retained across uninstall`,
-	);
-	const policyName = String(metadata(policy).name);
-	const spec = policy.spec as Record<string, unknown>;
-	const constraints = spec.matchConstraints as Record<string, unknown>;
-	const rules = constraints.resourceRules as Record<string, unknown>[];
-	invariant(
-		rules.some(
-			(rule) =>
-				Array.isArray(rule.apiGroups) &&
-				rule.apiGroups.includes("agents.x-k8s.io") &&
-				Array.isArray(rule.resources) &&
-				rule.resources.includes("sandboxes"),
-		),
-		`${mode} fence does not cover Sandbox CREATE`,
-	);
-	invariant(
-		rules.some(
-			(rule) =>
-				Array.isArray(rule.apiGroups) &&
-				rule.apiGroups.includes("") &&
-				Array.isArray(rule.resources) &&
-				["pods", "services", "persistentvolumeclaims"].every((resource) =>
-					rule.resources.includes(resource),
-				),
-		),
-		`${mode} fence does not cover every Sandbox descendant`,
-	);
-	const validations = spec.validations as Record<string, unknown>[];
-	invariant(
-		validations.some((validation) =>
-			String(validation.expression).includes(
-				"string(owner.uid) in params.data",
-			),
-		),
-		`${mode} fence is not keyed by exact controller-owner UID`,
-	);
-	const binding = objectNamed(
-		documents,
-		"ValidatingAdmissionPolicyBinding",
-		policyName,
-	);
-	invariant(binding, `${mode} omitted the teardown-fence binding`);
-	invariant(
-		annotations(binding)["helm.sh/resource-policy"] === "keep",
-		`${mode} teardown fence binding is not retained across uninstall`,
-	);
-	const bindingSpec = binding.spec as Record<string, unknown>;
-	const paramRef = bindingSpec.paramRef as Record<string, unknown>;
-	invariant(
-		paramRef.namespace === undefined,
-		`${mode} fence is not scoped to each admitted object's namespace`,
-	);
-	invariant(
-		paramRef.parameterNotFoundAction === "Allow",
-		`${mode} fence would block steady-state creation without a parameter`,
-	);
-	const selector = paramRef.selector as Record<string, unknown>;
-	const matchLabels = selector.matchLabels as Record<string, unknown>;
-	invariant(
-		matchLabels["kobe.kunobi.ninja/sandbox-teardown-fence"] === "true",
-		`${mode} binding does not select exact teardown fences`,
-	);
-}
 
-for (const [mode, documents] of [
-	["disabled", disabled],
-	["external", external],
-] as const) {
-	invariant(
-		!objectNamed(documents, "Deployment", "agent-sandbox-controller"),
-		`${mode} rendered the upstream controller`,
-	);
-	invariant(
-		!objectNamed(documents, "BootstrapConfig", "agent-sandbox-v0-5-6"),
-		`${mode} rendered the managed child bootstrap`,
-	);
-	invariant(
-		!documents.some(
-			(document) =>
-				document.kind === "CustomResourceDefinition" &&
-				upstreamCrds.has(String(metadata(document).name)),
-		),
-		`${mode} rendered upstream CRDs`,
-	);
-}
-
-const managedCrds = managed.filter(
+const fixtureDocuments = parseDocuments(source);
+const fixtureCrds = fixtureDocuments.filter(
 	(document) =>
 		document.kind === "CustomResourceDefinition" &&
 		upstreamCrds.has(String(metadata(document).name)),
 );
 invariant(
-	managedCrds.length === 4,
-	`managed rendered ${managedCrds.length} upstream CRDs`,
+	fixtureCrds.length === 4,
+	`fixture contains ${fixtureCrds.length} upstream CRDs, expected 4`,
 );
-for (const crd of managedCrds) {
-	const annotations = (metadata(crd).annotations ?? {}) as Record<
-		string,
-		unknown
-	>;
-	invariant(
-		annotations["helm.sh/resource-policy"] === "keep",
-		"managed CRD is not retained",
-	);
-	invariant(
-		annotations["kobe.kunobi.ninja/source-sha256"] === releaseSha256,
-		"managed CRD lost release provenance",
-	);
-}
 
-const warmPoolCrd = managedCrds.find(
+const warmPoolCrd = fixtureCrds.find(
 	(crd) => metadata(crd).name === "sandboxwarmpools.extensions.agents.x-k8s.io",
 );
-invariant(warmPoolCrd, "managed WarmPool CRD is missing");
+invariant(warmPoolCrd, "fixture WarmPool CRD is missing");
 const warmPoolVersions = (warmPoolCrd.spec as Record<string, unknown>)
 	.versions as Array<Record<string, unknown>>;
 const warmPoolV1Beta1 = warmPoolVersions.find(
 	(version) => version.name === "v1beta1" && version.served === true,
 );
-invariant(warmPoolV1Beta1, "managed WarmPool v1beta1 schema is missing");
+invariant(warmPoolV1Beta1, "fixture WarmPool v1beta1 schema is missing");
 const warmPoolSchema = warmPoolV1Beta1.schema as Record<string, unknown>;
 const warmPoolRoot = warmPoolSchema.openAPIV3Schema as Record<string, unknown>;
 const warmPoolProperties = warmPoolRoot.properties as Record<string, unknown>;
@@ -263,66 +154,130 @@ invariant(
 	observedGeneration.type === "integer" &&
 		observedGeneration.format === "int64" &&
 		observedGeneration.minimum === 0,
-	"managed WarmPool CRD lacks v0.5.6 status.observedGeneration",
-);
-
-const controller = objectNamed(
-	managed,
-	"Deployment",
-	"agent-sandbox-controller",
-);
-invariant(controller, "managed did not render the controller Deployment");
-const images = collectImages(controller);
-invariant(
-	images.length === 1 && images[0] === pinnedImage,
-	"controller image is not immutable",
-);
-
-const bootstrap = objectNamed(
-	managed,
-	"BootstrapConfig",
-	"agent-sandbox-v0-5-6",
-);
-invariant(bootstrap, "managed did not render the child BootstrapConfig");
-const bootstrapSpec = bootstrap.spec as Record<string, unknown>;
-const files = bootstrapSpec.files as Record<string, unknown>;
-const bootstrapManifest = files["agent-sandbox-v0.5.6.yaml"];
-invariant(
-	typeof bootstrapManifest === "string",
-	"child bootstrap manifest is missing",
-);
-invariant(
-	sha256(bootstrapManifest) === bootstrapSha256,
-	"child bootstrap digest drifted",
-);
-invariant(
-	bootstrapManifest.includes(pinnedImage),
-	"child bootstrap does not use the pinned image",
-);
-invariant(
-	!bootstrapManifest.includes(":v0.5.6"),
-	"child bootstrap kept the mutable image tag",
+	"fixture WarmPool CRD lacks v0.5.6 status.observedGeneration",
 );
 
 invariant(
-	!managed.some((document) =>
+	!fixtureDocuments.some((document) =>
 		`${String(document.kind)} ${String(metadata(document).name)}`
 			.toLowerCase()
 			.includes("router"),
 	),
-	"managed rendered an Agent Sandbox Router resource",
+	"fixture contains an Agent Sandbox Router resource",
 );
 
-const invalid = Bun.spawn(
-	["helm", "template", "kobe", chart, "--set", "agentSandbox.mode=invalid"],
-	{ stdout: "ignore", stderr: "pipe" },
-);
-const invalidStderr = new Response(invalid.stderr).text();
-invariant((await invalid.exited) !== 0, "invalid mode unexpectedly rendered");
+// -----------------------------------------------------------------------------
+// The chart owns no part of the runtime. Neither mode may render upstream
+// objects, and the retired managed mode must fail values validation instead of
+// silently rendering nothing.
+// -----------------------------------------------------------------------------
+
+const [disabledYaml, externalYaml] = await Promise.all([
+	helm("disabled"),
+	helm("external"),
+]);
+const disabled = parseDocuments(disabledYaml);
+const external = parseDocuments(externalYaml);
+
+for (const [mode, documents] of [
+	["disabled", disabled],
+	["external", external],
+] as const) {
+	invariant(
+		!objectNamed(documents, "Deployment", "agent-sandbox-controller"),
+		`${mode} rendered the upstream controller`,
+	);
+	invariant(
+		!objectNamed(documents, "BootstrapConfig", "agent-sandbox-v0-5-6"),
+		`${mode} rendered a child runtime bootstrap`,
+	);
+	invariant(
+		!documents.some(
+			(document) =>
+				document.kind === "CustomResourceDefinition" &&
+				upstreamCrds.has(String(metadata(document).name)),
+		),
+		`${mode} rendered upstream CRDs`,
+	);
+}
+
+await helmRejects("managed");
+await helmRejects("invalid");
+
+// -----------------------------------------------------------------------------
+// The teardown admission fence is Kobe's own policy and must ship with the
+// enabled mode only.
+// -----------------------------------------------------------------------------
+
 invariant(
-	(await invalidStderr).includes("agentSandbox") &&
-		(await invalidStderr).includes("mode"),
-	"invalid mode error is not actionable",
+	!teardownFencePolicy(disabled),
+	"disabled rendered the Sandbox teardown admission fence",
 );
 
-console.log("Agent Sandbox Helm modes and pinned artifacts are valid");
+const policy = teardownFencePolicy(external);
+invariant(policy, "external omitted the Sandbox teardown admission fence");
+invariant(
+	annotations(policy)["helm.sh/resource-policy"] === "keep",
+	"external teardown fence policy is not retained across uninstall",
+);
+const policyName = String(metadata(policy).name);
+const spec = policy.spec as Record<string, unknown>;
+const constraints = spec.matchConstraints as Record<string, unknown>;
+const rules = constraints.resourceRules as Record<string, unknown>[];
+invariant(
+	rules.some(
+		(rule) =>
+			Array.isArray(rule.apiGroups) &&
+			rule.apiGroups.includes("agents.x-k8s.io") &&
+			Array.isArray(rule.resources) &&
+			rule.resources.includes("sandboxes"),
+	),
+	"external fence does not cover Sandbox CREATE",
+);
+invariant(
+	rules.some(
+		(rule) =>
+			Array.isArray(rule.apiGroups) &&
+			rule.apiGroups.includes("") &&
+			Array.isArray(rule.resources) &&
+			["pods", "services", "persistentvolumeclaims"].every((resource) =>
+				rule.resources.includes(resource),
+			),
+	),
+	"external fence does not cover every Sandbox descendant",
+);
+const validations = spec.validations as Record<string, unknown>[];
+invariant(
+	validations.some((validation) =>
+		String(validation.expression).includes("string(owner.uid) in params.data"),
+	),
+	"external fence is not keyed by exact controller-owner UID",
+);
+const binding = objectNamed(
+	external,
+	"ValidatingAdmissionPolicyBinding",
+	policyName,
+);
+invariant(binding, "external omitted the teardown-fence binding");
+invariant(
+	annotations(binding)["helm.sh/resource-policy"] === "keep",
+	"external teardown fence binding is not retained across uninstall",
+);
+const bindingSpec = binding.spec as Record<string, unknown>;
+const paramRef = bindingSpec.paramRef as Record<string, unknown>;
+invariant(
+	paramRef.namespace === undefined,
+	"external fence is not scoped to each admitted object's namespace",
+);
+invariant(
+	paramRef.parameterNotFoundAction === "Allow",
+	"external fence would block steady-state creation without a parameter",
+);
+const selector = paramRef.selector as Record<string, unknown>;
+const matchLabels = selector.matchLabels as Record<string, unknown>;
+invariant(
+	matchLabels["kobe.kunobi.ninja/sandbox-teardown-fence"] === "true",
+	"external binding does not select exact teardown fences",
+);
+
+console.log("Agent Sandbox Helm modes and the pinned release fixture are valid");

@@ -67,10 +67,6 @@ pub struct SandboxContext {
     /// unit tests may disable it and exercise the barrier through its own
     /// API-server CAS suite instead of duplicating every teardown fixture.
     access_ledger_enabled: bool,
-    /// Installation ownership selected at process startup. Child composition
-    /// uses it to require the pinned built-in bootstrap only in managed mode;
-    /// external mode never installs or adopts runtime infrastructure.
-    pub runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
     /// Whether this process may create or advance Sandbox workload placement.
     /// Disabled-mode controllers set this false but still reconcile every
     /// admitted lease through verified teardown.
@@ -407,6 +403,25 @@ async fn observe_management_pool(
             expected_owner.3
         )));
     }
+    let owner = pool.controller_owner_ref(&()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxPool {} cannot own its upstream objects",
+            pool.name_any()
+        ))
+    })?;
+    let desired_template = build_sandbox_template(
+        &template_name(&pool.name_any()),
+        &ctx.namespace,
+        &pool.spec,
+        Some(&owner),
+    )?;
+    if template.data.get("spec") != desired_template.data.get("spec") {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxTemplate {} spec does not match SandboxPool {}",
+            template.name_any(),
+            pool.name_any()
+        )));
+    }
 
     let warm_pool_api: Api<DynamicObject> = Api::namespaced_with(
         ctx.client.clone(),
@@ -428,6 +443,20 @@ async fn observe_management_pool(
             warm_pool_name(&pool.name_any()),
             pool.name_any(),
             expected_owner.3
+        )));
+    }
+    let desired_warm_pool = build_sandbox_warm_pool(
+        &warm_pool_name(&pool.name_any()),
+        &ctx.namespace,
+        &template_name(&pool.name_any()),
+        pool.spec.warm_capacity,
+        Some(&owner),
+    )?;
+    if warm_pool.data.get("spec") != desired_warm_pool.data.get("spec") {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxWarmPool {} spec does not match SandboxPool {}",
+            warm_pool.name_any(),
+            pool.name_any()
         )));
     }
 
@@ -453,6 +482,22 @@ async fn observe_management_pool(
                 ))
             })
     };
+    let warm_pool_generation = warm_pool.metadata.generation.ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "SandboxWarmPool {} has no generation",
+            warm_pool.name_any()
+        ))
+    })?;
+    if status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_i64)
+        != Some(warm_pool_generation)
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxWarmPool {} has not observed generation {warm_pool_generation}",
+            warm_pool.name_any()
+        )));
+    }
     let observation = WarmPoolObservation {
         replicas: count("replicas")?,
         ready_replicas: count("readyReplicas")?,
@@ -672,15 +717,6 @@ pub async fn reconcile_pool(
                 &cluster_pool,
                 &ctx.namespace,
             )?;
-            if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
-                crate::sandbox_runtime::validate_managed_child_pool(
-                    &ctx.client,
-                    &ctx.namespace,
-                    &cluster_pool,
-                )
-                .await
-                .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-            }
             Ok::<_, SandboxPlacementError>(authority)
         }
         .await;
@@ -6429,32 +6465,12 @@ async fn quarantine_lease(
 pub(crate) const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
 /// Durable latch proving the lease-owned workload is gone before quota moves.
 const FOOTPRINT_ABSENT_CONDITION: &str = "FootprintAbsent";
-/// Durable proof that this exact child composition passed the pinned runtime
-/// health and real Claim certification before tenant objects were created.
-const CHILD_RUNTIME_CERTIFIED_CONDITION: &str = "ChildRuntimeCertified";
 /// Durable record that the pool's canary already ran and passed.
 ///
 /// Durable rather than in-memory because the alternative is running an
 /// administrator's command inside a live tenant workload again after every
 /// controller restart.
 const READINESS_CANARY_CONDITION: &str = "ReadinessCanary";
-
-fn child_runtime_certified(
-    status: Option<&crate::crd::SandboxLeaseStatus>,
-    generation: Option<i64>,
-) -> bool {
-    let Some(generation) = generation else {
-        return false;
-    };
-    status.is_some_and(|status| {
-        status.conditions.iter().any(|condition| {
-            condition.condition_type == CHILD_RUNTIME_CERTIFIED_CONDITION
-                && condition.status == crate::crd::SandboxConditionStatus::True
-                && condition.reason == "AgentSandboxV0_5_6"
-                && condition.observed_generation == Some(generation)
-        })
-    })
-}
 
 /// Whether the readiness canary has already been observed to pass.
 fn canary_already_passed(status: &crate::crd::SandboxLeaseStatus) -> bool {
@@ -7107,16 +7123,6 @@ async fn compose_child_target(
             "ClusterPool {cluster_pool_ref} no longer matches SandboxLease {name} placementAuthority"
         )));
     }
-    if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
-        crate::sandbox_runtime::validate_managed_child_pool(
-            &ctx.client,
-            &ctx.namespace,
-            &cluster_pool,
-        )
-        .await
-        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
-    }
-
     let runtime_ttl = crate::pool::parse_duration(&lease.spec.ttl)
         .and_then(|ttl| ttl.to_std().ok())
         .ok_or_else(|| {
@@ -7452,45 +7458,18 @@ async fn compose_child_target(
             cluster: binding.binding.instance.name.clone(),
         })?;
 
+    // The child installation is operator-authored (for example through a
+    // generic ClusterPool BootstrapConfig). Validate only its consumed APIs
+    // before writing any Sandbox object; no built-in install or sacrificial
+    // Claim is created here.
+    child::validate_child_runtime(&child_client, &binding.binding.instance.name).await?;
+
     let target_namespace = ensure_child_namespace(&child_client, &name, &lease_uid).await?;
     let namespace_owner = target_namespace.controller_owner_ref(&()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!(
             "namespace {CHILD_SANDBOX_NAMESPACE} has no UID to own child Sandbox objects"
         ))
     })?;
-
-    let runtime_certified =
-        child_runtime_certified(lease.status.as_ref(), lease.metadata.generation);
-    if !runtime_certified {
-        // Managed pools install the exact built-in bundle during cluster
-        // bootstrap; external pools bring their own. Both must prove the same
-        // running image, webhook and real Claim lifecycle before tenant objects.
-        child::validate_child_runtime(
-            &child_client,
-            &binding.binding.instance.name,
-            CHILD_SANDBOX_NAMESPACE,
-            &namespace_owner,
-        )
-        .await?;
-
-        // A real canary can take minutes. Persist the exact-generation proof so
-        // ordinary provisioning reconciles do not create/delete it repeatedly.
-        let mut next = lease.status.clone().unwrap_or_default();
-        next.conditions = with_condition_for_status(
-            &next,
-            lease.metadata.generation,
-            CHILD_RUNTIME_CERTIFIED_CONDITION,
-            crate::crd::SandboxConditionStatus::True,
-            "AgentSandboxV0_5_6",
-            "pinned child Agent Sandbox controller, webhook and Claim lifecycle certified",
-        );
-        if patch_lease_status_fenced(ctx, lease, &next).await? {
-            debug!(lease = %name, "recorded child runtime certification");
-        } else {
-            debug!(lease = %name, "child runtime certification write lost a status race");
-        }
-        return Ok(ChildTarget::Pending(Action::await_change()));
-    }
 
     // The pool's template and warm pool have to exist inside the child; nothing
     // else reconciles them there.
@@ -7777,7 +7756,6 @@ pub async fn run_sandbox_controller(
         reservation_namespace: reservation_namespace.to_string(),
         shutdown: shutdown.clone(),
         access_ledger_enabled: true,
-        runtime_mode,
         placement_enabled,
     });
 
@@ -8088,193 +8066,6 @@ pub(crate) mod tests {
                 .mount(server)
                 .await;
         }
-
-        let labels = serde_json::json!({ "app": "agent-sandbox-controller" });
-        let pod_spec = serde_json::json!({
-            "containers": [{
-                "name": "agent-sandbox-controller",
-                "image": crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE,
-                "args": ["--extensions"]
-            }]
-        });
-        Mock::given(method("GET"))
-            .and(path("/apis/apps/v1/namespaces/agent-sandbox-system/deployments/agent-sandbox-controller"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "apps/v1",
-                "kind": "Deployment",
-                "metadata": {
-                    "name": "agent-sandbox-controller",
-                    "namespace": "agent-sandbox-system",
-                    "uid": "runtime-deployment-uid",
-                    "generation": 1
-                },
-                "spec": {
-                    "replicas": 1,
-                    "selector": { "matchLabels": labels },
-                    "template": { "metadata": { "labels": labels }, "spec": pod_spec }
-                },
-                "status": {
-                    "observedGeneration": 1,
-                    "replicas": 1,
-                    "updatedReplicas": 1,
-                    "readyReplicas": 1,
-                    "availableReplicas": 1,
-                    "unavailableReplicas": 0
-                }
-            })))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/apps/v1/namespaces/agent-sandbox-system/replicasets",
-            ))
-            .and(query_param("labelSelector", "app=agent-sandbox-controller"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "apps/v1",
-                "kind": "ReplicaSetList",
-                "metadata": {},
-                "items": [{
-                    "apiVersion": "apps/v1",
-                    "kind": "ReplicaSet",
-                    "metadata": {
-                        "name": "agent-sandbox-controller-rs",
-                        "namespace": "agent-sandbox-system",
-                        "uid": "runtime-rs-uid",
-                        "generation": 1,
-                        "ownerReferences": [{
-                            "apiVersion": "apps/v1",
-                            "kind": "Deployment",
-                            "name": "agent-sandbox-controller",
-                            "uid": "runtime-deployment-uid",
-                            "controller": true
-                        }]
-                    },
-                    "spec": {
-                        "replicas": 1,
-                        "selector": { "matchLabels": labels },
-                        "template": { "metadata": { "labels": labels }, "spec": pod_spec }
-                    },
-                    "status": {
-                        "observedGeneration": 1,
-                        "replicas": 1,
-                        "fullyLabeledReplicas": 1,
-                        "readyReplicas": 1,
-                        "availableReplicas": 1
-                    }
-                }]
-            })))
-            .mount(server)
-            .await;
-        let digest = crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE_DIGESTS[0];
-        Mock::given(method("GET"))
-            .and(path("/api/v1/namespaces/agent-sandbox-system/pods"))
-            .and(query_param("labelSelector", "app=agent-sandbox-controller"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "PodList",
-                "metadata": {},
-                "items": [{
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "metadata": {
-                        "name": "agent-sandbox-controller-pod",
-                        "namespace": "agent-sandbox-system",
-                        "uid": "runtime-pod-uid",
-                        "ownerReferences": [{
-                            "apiVersion": "apps/v1",
-                            "kind": "ReplicaSet",
-                            "name": "agent-sandbox-controller-rs",
-                            "uid": "runtime-rs-uid",
-                            "controller": true
-                        }]
-                    },
-                    "spec": pod_spec,
-                    "status": {
-                        "conditions": [{ "type": "Ready", "status": "True" }],
-                        "containerStatuses": [{
-                            "name": "agent-sandbox-controller",
-                            "image": crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE,
-                            "imageID": format!("registry.k8s.io/controller@{digest}"),
-                            "ready": true,
-                            "restartCount": 0,
-                            "started": true,
-                            "state": { "running": {} }
-                        }]
-                    }
-                }]
-            })))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/namespaces/agent-sandbox-system/secrets/agent-sandbox-webhook-certs"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": { "name": "agent-sandbox-webhook-certs", "namespace": "agent-sandbox-system" },
-                "data": { "ca.crt": "AQ==", "tls.crt": "AQ==", "tls.key": "AQ==" }
-            })))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/namespaces/agent-sandbox-system/services/agent-sandbox-webhook-service"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Service",
-                "metadata": {
-                    "name": "agent-sandbox-webhook-service",
-                    "namespace": "agent-sandbox-system",
-                    "uid": "runtime-service-uid"
-                },
-                "spec": {
-                    "selector": labels,
-                    "ports": [{ "name": "webhook", "port": 443, "protocol": "TCP", "targetPort": 9443 }]
-                }
-            })))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/discovery.k8s.io/v1/namespaces/agent-sandbox-system/endpointslices",
-            ))
-            .and(query_param(
-                "labelSelector",
-                "kubernetes.io/service-name=agent-sandbox-webhook-service",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "apiVersion": "discovery.k8s.io/v1",
-                "kind": "EndpointSliceList",
-                "metadata": {},
-                "items": [{
-                    "apiVersion": "discovery.k8s.io/v1",
-                    "kind": "EndpointSlice",
-                    "metadata": {
-                        "name": "agent-sandbox-webhook",
-                        "namespace": "agent-sandbox-system",
-                        "ownerReferences": [{
-                            "apiVersion": "v1",
-                            "kind": "Service",
-                            "name": "agent-sandbox-webhook-service",
-                            "uid": "runtime-service-uid",
-                            "controller": true
-                        }]
-                    },
-                    "addressType": "IPv4",
-                    "ports": [{ "name": "webhook", "port": 9443, "protocol": "TCP" }],
-                    "endpoints": [{
-                        "addresses": ["10.0.0.10"],
-                        "conditions": { "ready": true, "terminating": false },
-                        "targetRef": {
-                            "apiVersion": "v1",
-                            "kind": "Pod",
-                            "namespace": "agent-sandbox-system",
-                            "name": "agent-sandbox-controller-pod",
-                            "uid": "runtime-pod-uid"
-                        }
-                    }]
-                }]
-            })))
-            .mount(server)
-            .await;
     }
 
     async fn test_context() -> (Arc<SandboxContext>, MockServer) {
@@ -8286,7 +8077,6 @@ pub(crate) mod tests {
             reservation_namespace: NS.to_string(),
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
-            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
             placement_enabled: true,
         });
         mount_healthy_runtime(&server).await;
@@ -8379,24 +8169,6 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         (ctx, server)
-    }
-
-    #[test]
-    fn child_runtime_certification_is_versioned_and_generation_bound() {
-        let mut status = SandboxLeaseStatus::default();
-        status.conditions.push(crate::crd::SandboxCondition {
-            condition_type: CHILD_RUNTIME_CERTIFIED_CONDITION.to_string(),
-            status: crate::crd::SandboxConditionStatus::True,
-            reason: "AgentSandboxV0_5_6".to_string(),
-            observed_generation: Some(3),
-            ..Default::default()
-        });
-
-        assert!(child_runtime_certified(Some(&status), Some(3)));
-        assert!(!child_runtime_certified(Some(&status), Some(4)));
-        assert!(!child_runtime_certified(Some(&status), None));
-        status.conditions[0].reason = "AgentSandboxV0_5_3".to_string();
-        assert!(!child_runtime_certified(Some(&status), Some(3)));
     }
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
@@ -9154,11 +8926,13 @@ pub(crate) mod tests {
             reservation_namespace: NS.into(),
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
-            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
             placement_enabled: true,
         });
 
-        let upstream = |kind: &str, uid: &str, resource_version: &str, status| {
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.warm_capacity = 2;
+        let pool_owner = pool.controller_owner_ref(&()).unwrap();
+        let upstream = |kind: &str, uid: &str, resource_version: &str, spec, status| {
             serde_json::json!({
                 "apiVersion": AGENT_SANDBOX_API_VERSION,
                 "kind": kind,
@@ -9167,6 +8941,7 @@ pub(crate) mod tests {
                     "namespace": NS,
                     "uid": uid,
                     "resourceVersion": resource_version,
+                    "generation": 1,
                     "ownerReferences": [{
                         "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                         "kind": "SandboxPool",
@@ -9175,6 +8950,7 @@ pub(crate) mod tests {
                         "controller": true
                     }]
                 },
+                "spec": spec,
                 "status": status
             })
         };
@@ -9182,13 +8958,31 @@ pub(crate) mod tests {
             SANDBOX_TEMPLATE_KIND,
             "template-uid",
             "template-rv",
+            build_sandbox_template("kobe-agents", NS, &pool.spec, Some(&pool_owner))
+                .unwrap()
+                .data
+                .get("spec")
+                .cloned()
+                .unwrap(),
             serde_json::json!({}),
         );
         let warm_pool = upstream(
             SANDBOX_WARM_POOL_KIND,
             "warm-pool-uid",
             "warm-pool-rv",
-            serde_json::json!({ "replicas": 2, "readyReplicas": 1 }),
+            build_sandbox_warm_pool(
+                "kobe-agents",
+                NS,
+                "kobe-agents",
+                pool.spec.warm_capacity,
+                Some(&pool_owner),
+            )
+            .unwrap()
+            .data
+            .get("spec")
+            .cloned()
+            .unwrap(),
+            serde_json::json!({ "replicas": 2, "readyReplicas": 1, "observedGeneration": 1 }),
         );
         for (target, body) in [(TEMPLATE_PATH, template), (WARM_POOL_PATH, warm_pool)] {
             Mock::given(method("GET"))

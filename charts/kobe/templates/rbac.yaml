@@ -67,10 +67,9 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxexecutions", "sandboxexecutions/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
-  # Upstream Agent Sandbox objects created by placement and certification.
-  # Managed mode installs the pinned CRDs/controller; external mode leaves the
-  # installation operator-owned. In both modes Kobe mutates only its own
-  # exact-provenance objects. `delete` is required for canary and lease cleanup.
+  # Upstream objects for real SandboxPool/SandboxLease placement. Agent Sandbox
+  # itself is operator-installed; Kobe mutates only exact-provenance product
+  # objects. `delete` is required for tenant lease cleanup, not validation.
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -133,17 +132,6 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Runtime certification follows the exact Deployment -> ReplicaSet -> Pod
-  # ownership chain. Read-only is sufficient; Kobe never scales or adopts the
-  # upstream Agent Sandbox controller rollout.
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["get", "list", "watch"]
-  # A ready webhook Service is authoritative only when every EndpointSlice
-  # targetRef names one exact pinned controller Pod from that rollout.
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
   # PodDisruptionBudgets — the k3s backend creates a PDB for HA control
   # planes (servers>1) and deletes it on every recycle. Without these verbs
   # the recycle loop's `delete()` fails with 403 Forbidden (RBAC is checked

@@ -15,10 +15,10 @@
 //! kubeconfig is read from controller-authorised storage into memory and never
 //! written to status, an API response, a log line, or an event.
 //!
-//! In managed mode the selected ClusterPool must use Kobe's immutable v0.5.6
-//! BootstrapConfig. External mode leaves installation to the pool. Either way,
-//! Kobe certifies the running controller, webhook and a real child-local Claim
-//! before creating the tenant pool objects.
+//! The operator provides Agent Sandbox v0.5.6 through a generic, explicitly
+//! referenced `BootstrapConfig` or another external provisioning mechanism.
+//! Kobe performs read-only API compatibility checks before creating tenant
+//! pool objects; it does not ship or inject a privileged runtime installer.
 
 use std::time::Duration;
 
@@ -109,8 +109,7 @@ pub enum ChildPlacementError {
     InvalidDuration { field: &'static str },
     #[error(
         "child cluster {cluster} does not serve a compatible Agent Sandbox runtime ({reason}). \
-         Use Kobe's pinned BootstrapConfig in managed mode, or configure the external \
-         ClusterPool installation to provide it."
+         Configure the operator-owned ClusterPool bootstrap or image to install Agent Sandbox v0.5.6."
     )]
     ChildRuntimeUnusable { cluster: String, reason: String },
     #[error("child cluster {cluster} has an unusable checkpointed kubeconfig Secret")]
@@ -663,24 +662,12 @@ pub fn child_provenance(
     }
 }
 
-/// Certify the child runtime under the exact lease-owned child Namespace.
-///
-/// The Namespace owner makes the deterministic canary crash-recoverable
-/// without leaking a cross-cluster owner reference. This applies the same
-/// controller/webhook/image and real Claim proof as management startup.
+/// Validate the operator-installed child runtime without mutating it.
 pub async fn validate_child_runtime(
     child: &Client,
     cluster: &str,
-    namespace: &str,
-    owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> Result<(), ChildPlacementError> {
-    crate::sandbox_runtime::validate_runtime_components(child)
-        .await
-        .map_err(|reason| ChildPlacementError::ChildRuntimeUnusable {
-            cluster: cluster.to_string(),
-            reason: reason.reason_code().to_string(),
-        })?;
-    crate::sandbox_runtime::run_runtime_canary_owned(child, namespace, owner)
+    crate::sandbox_runtime::validate_external_runtime(child)
         .await
         .map_err(|reason| ChildPlacementError::ChildRuntimeUnusable {
             cluster: cluster.to_string(),

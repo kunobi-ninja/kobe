@@ -18,6 +18,19 @@ const DEMO_OTHER_POLICY = "e2e-other-token";
 const DEMO_SANDBOX_POOL_MANAGEMENT = "e2e-sandbox-management-trusted";
 const DEMO_SANDBOX_POOL_CHILD = "e2e-sandbox-child-k3s-trusted";
 const DEMO_SANDBOX_BOOTSTRAP = "agent-sandbox-v0-5-6";
+// Kobe's external mode installs nothing: the harness plays the operator and
+// applies the pinned upstream release itself, to the management cluster
+// directly and to child clusters through an ordinary BootstrapConfig.
+const SANDBOX_RUNTIME_FIXTURE = "hack/fixtures/agent-sandbox-v0.5.6.yaml";
+const SANDBOX_RUNTIME_SHA256 = "1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
+const SANDBOX_RUNTIME_TAGGED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
+const SANDBOX_RUNTIME_PINNED_IMAGE = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
+const SANDBOX_RUNTIME_CRDS = [
+  "sandboxclaims.extensions.agents.x-k8s.io",
+  "sandboxes.agents.x-k8s.io",
+  "sandboxtemplates.extensions.agents.x-k8s.io",
+  "sandboxwarmpools.extensions.agents.x-k8s.io",
+];
 const SANDBOX_REGISTRY_IMAGE = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
 const SANDBOX_REGISTRY_LABEL = "kobe.kunobi.ninja/e2e-sandbox-registry";
 const DEMO_K0S_POOL = "e2e-k0s";
@@ -1036,12 +1049,73 @@ async function installChart(args: Args): Promise<void> {
     `podAnnotations.e2e-rollout=${rolloutNonce}`,
   ];
   if (args.sandboxConformance) {
-    command.push("--set", "agentSandbox.mode=managed");
+    command.push("--set", "agentSandbox.mode=external");
   }
   await runCommand(command, {
     step: `failed to install Helm release '${args.release}'`,
     stream: true,
   });
+}
+
+function pinnedSandboxRuntime(): string {
+  const source = readFileSync(SANDBOX_RUNTIME_FIXTURE, "utf8");
+  const digest = new Bun.CryptoHasher("sha256").update(source).digest("hex");
+  if (digest !== SANDBOX_RUNTIME_SHA256) {
+    throw new Error(`pinned Agent Sandbox release fixture digest drifted: ${digest}`);
+  }
+  const pinned = source.replaceAll(SANDBOX_RUNTIME_TAGGED_IMAGE, SANDBOX_RUNTIME_PINNED_IMAGE);
+  if (!pinned.includes(SANDBOX_RUNTIME_PINNED_IMAGE) || pinned.includes(SANDBOX_RUNTIME_TAGGED_IMAGE)) {
+    throw new Error("pinned Agent Sandbox runtime image was not pinned to its digest");
+  }
+  return pinned;
+}
+
+// Kobe's startup validation is read-only and fails closed, so the operator
+// install must be complete before the chart deploys the operator.
+async function installSandboxRuntime(cluster: string): Promise<void> {
+  step("Installing the pinned Agent Sandbox runtime (operator role)");
+  const manifestPath = `${process.env.RUNNER_TEMP ?? "/tmp"}/kobe-e2e-agent-sandbox-runtime.yaml`;
+  await Bun.write(manifestPath, pinnedSandboxRuntime());
+  try {
+    await runCommand(
+      ["kubectl", "--context", kubeContext(cluster), "apply", "--server-side", "--field-manager=kobe-e2e-operator", "-f", manifestPath],
+      { step: "failed to install the pinned Agent Sandbox runtime" },
+    );
+  } finally {
+    rmSync(manifestPath, { force: true });
+  }
+  for (const crd of SANDBOX_RUNTIME_CRDS) {
+    await runCommand(
+      ["kubectl", "--context", kubeContext(cluster), "wait", "--for=condition=Established", `crd/${crd}`, "--timeout=90s"],
+      { step: `Agent Sandbox CRD ${crd} did not establish` },
+    );
+  }
+  await runCommand(
+    ["kubectl", "--context", kubeContext(cluster), "wait", "--for=condition=Available", "deployment/agent-sandbox-controller", "-n", "agent-sandbox-system", "--timeout=180s"],
+    { step: "Agent Sandbox controller did not become Available" },
+  );
+}
+
+// Child clusters receive the same pinned release through a generic
+// operator-authored BootstrapConfig that the k3s ClusterPool names explicitly.
+async function applySandboxBootstrap(cluster: string, namespace: string): Promise<void> {
+  step(`Publishing operator BootstrapConfig ${DEMO_SANDBOX_BOOTSTRAP}`);
+  const bootstrap = {
+    apiVersion: "kobe.kunobi.ninja/v1alpha1",
+    kind: "BootstrapConfig",
+    metadata: { name: DEMO_SANDBOX_BOOTSTRAP, namespace },
+    spec: { files: { "agent-sandbox-v0.5.6.yaml": pinnedSandboxRuntime() } },
+  };
+  const manifestPath = `${process.env.RUNNER_TEMP ?? "/tmp"}/kobe-e2e-agent-sandbox-bootstrap.json`;
+  await Bun.write(manifestPath, JSON.stringify(bootstrap));
+  try {
+    await runCommand(
+      ["kubectl", "--context", kubeContext(cluster), "apply", "--server-side", "--field-manager=kobe-e2e-operator", "-f", manifestPath],
+      { step: `failed to publish BootstrapConfig ${DEMO_SANDBOX_BOOTSTRAP}` },
+    );
+  } finally {
+    rmSync(manifestPath, { force: true });
+  }
 }
 
 export function sandboxConformanceManifest(namespace: string, fixture: SandboxFixture): string {
@@ -1202,8 +1276,8 @@ spec:
 # Modeled on deploy/profiles/e2e-direct-k3s.yaml but with the shared-Postgres
 # backend.datastore block dropped (the kunobi-postgres secret doesn't exist in
 # kind) so each k3s instance uses embedded SQLite. Ordinary e2e keeps it bare;
-# --sandbox-conformance adds the chart's pinned runtime bootstrap and the
-# run-owned fixture registry mirror. scaling.minReady=1 warms one member.
+# --sandbox-conformance adds the operator-published pinned runtime bootstrap
+# and the run-owned fixture registry mirror. scaling.minReady=1 warms one member.
 apiVersion: kobe.kunobi.ninja/v1alpha1
 kind: ClusterPool
 metadata:
@@ -1696,7 +1770,7 @@ for ns in $(kubectl --context "$CTX" get namespace -l kobe.kunobi.ninja/backend=
   kubectl --context "$CTX" delete namespace "$ns" --ignore-not-found >/dev/null 2>&1 || true
 done
 kubectl --context "$CTX" delete clusterpool.kobe.kunobi.ninja -n ${namespace} ${DEMO_K0S_POOL} ${DEMO_K3S_POOL} ${DEMO_VKOBE_ETCD_POOL} ${DEMO_VKOBE_BOOTSTRAP_POOL} ${DEMO_VKOBE_KINE_POOL} ${DEMO_VKOBE_KINE_BOOTSTRAP_POOL} ${DEMO_VCLUSTER_POOL} ${DEMO_VCLUSTER_BOOTSTRAP_POOL} --ignore-not-found >/dev/null 2>&1 || true
-kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} --ignore-not-found >/dev/null 2>&1 || true
+kubectl --context "$CTX" delete bootstrapconfig.kobe.kunobi.ninja -n ${namespace} ${DEMO_BOOTSTRAP_CONFIG} ${DEMO_SANDBOX_BOOTSTRAP} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete kobestore.kobe.kunobi.ninja -n ${namespace} ${DEMO_VKOBE_ETCD_STORE} ${DEMO_VKOBE_KINE_STORE} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete service -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true
 kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BACKEND} ${DEMO_VKOBE_KINE_BACKEND} --ignore-not-found >/dev/null 2>&1 || true`,
@@ -1705,6 +1779,9 @@ kubectl --context "$CTX" delete deployment -n ${namespace} ${DEMO_VKOBE_ETCD_BAC
       step: "failed to clean up existing local demo pool resources",
     },
   );
+  if (sandboxFixture) {
+    await applySandboxBootstrap(cluster, namespace);
+  }
   await runCommand(
     ["/bin/sh", "-lc", `cat <<'EOF' | kubectl --context ${kubeContext(cluster)} apply -f -
 ${bootstrapManifest(namespace, sandboxFixture)}EOF`],
@@ -1784,6 +1861,9 @@ async function up(args: Args): Promise<void> {
   await runCommand(["/bin/sh", "-lc", `kubectl --context ${kubeContext(args.cluster)} create namespace ${args.namespace} --dry-run=client -o yaml | kubectl --context ${kubeContext(args.cluster)} apply -f -`], {
     step: `failed to ensure namespace '${args.namespace}'`,
   });
+  if (sandboxFixture) {
+    await installSandboxRuntime(args.cluster);
+  }
   await installChart(args);
   await bootstrapLocalResources(args.cluster, args.namespace, sandboxFixture);
   await writeLocalCliConfig();

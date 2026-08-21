@@ -1,15 +1,17 @@
-// Live contract for Kobe's pinned Agent Sandbox v0.5.6 managed runtime and
-// the supported v0.5.4 -> v0.5.6 rolling upgrade with a live warm Claim.
+// Live contract for the pinned Agent Sandbox v0.5.6 release Kobe's external
+// mode consumes, including the supported operator-side v0.5.4 -> v0.5.6
+// rolling upgrade with a live warm Claim. Kobe does not install this runtime;
+// the harness plays the operator and installs the pinned fixture itself.
 //
 // This test deliberately owns its whole Kind cluster. It never accepts an
 // arbitrary kubectl context, and it refuses an existing cluster name before
 // creation, so cleanup cannot delete resources belonging to another run.
 
-const chart = "charts/kobe";
+const releaseFixture = "hack/fixtures/agent-sandbox-v0.5.6.yaml";
 const releaseSha256 =
 	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
-const bootstrapSha256 =
-	"f38255d5aa7761dec45507683127066a1750fbedb1e3b6a56573901033d0110f";
+const taggedImage =
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6";
 const pinnedImage =
 	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
 const pinnedImageDigests = new Set([
@@ -195,20 +197,18 @@ function nestedRecord(value: unknown): Record<string, unknown> {
 	return value as Record<string, unknown>;
 }
 
-async function renderManagedRuntime(): Promise<string> {
-	const { stdout } = await run([
-		"helm",
-		"template",
-		"kobe",
-		chart,
-		"--namespace",
-		"kobe-system",
-		"--set",
-		"agentSandbox.mode=managed",
-		"--show-only",
-		"templates/agent-sandbox-runtime.yaml",
-	]);
-	return stdout;
+async function pinnedRuntime(): Promise<string> {
+	const source = await Bun.file(releaseFixture).text();
+	invariant(
+		sha256(source) === releaseSha256,
+		"pinned release fixture digest drifted",
+	);
+	const pinned = source.replaceAll(taggedImage, pinnedImage);
+	invariant(
+		pinned.includes(pinnedImage) && !pinned.includes(taggedImage),
+		"v0.5.6 runtime image was not pinned",
+	);
+	return pinned;
 }
 
 async function applyRuntime(rendered: string): Promise<void> {
@@ -266,78 +266,11 @@ async function installPreviousRuntime(): Promise<void> {
 		"v0.5.4 runtime image was not pinned",
 	);
 	await applyRuntime(pinned);
-	info("installed the exact former v0.5.4 managed runtime");
+	info("installed the exact former v0.5.4 runtime");
 }
 
 async function installRuntime(): Promise<void> {
-	const rendered = await renderManagedRuntime();
-	invariant(
-		rendered.includes(pinnedImage),
-		"rendered runtime lost the pinned image",
-	);
-	await applyRuntime(rendered);
-}
-
-async function verifyChildBootstrap(): Promise<void> {
-	await kubectl(
-		[
-			"apply",
-			"--server-side",
-			"--field-manager=kobe-runtime-contract",
-			"-f",
-			"-",
-		],
-		{ stdin: await Bun.file(`${chart}/crds/bootstrapconfigs.yaml`).text() },
-	);
-	await kubectl([
-		"wait",
-		"--for=condition=Established",
-		"crd/bootstrapconfigs.kobe.kunobi.ninja",
-		"--timeout=60s",
-	]);
-	await kubectl(["create", "namespace", "kobe-system"]);
-	const { stdout: rendered } = await run([
-		"helm",
-		"template",
-		"kobe",
-		chart,
-		"--namespace",
-		"kobe-system",
-		"--set",
-		"agentSandbox.mode=managed",
-		"--show-only",
-		"templates/bootstrap-agent-sandbox.yaml",
-	]);
-	for (let attempt = 0; attempt < 2; attempt += 1) {
-		await kubectl(
-			[
-				"apply",
-				"--server-side",
-				"--field-manager=kobe-runtime-contract",
-				"-f",
-				"-",
-			],
-			{ stdin: rendered },
-		);
-	}
-	const bootstrap = await getObject(
-		"bootstrapconfigs.kobe.kunobi.ninja",
-		"agent-sandbox-v0-5-6",
-		"kobe-system",
-	);
-	invariant(bootstrap, "managed child BootstrapConfig is missing");
-	const files = nestedRecord(nestedRecord(bootstrap.spec).files);
-	const manifest = files["agent-sandbox-v0.5.6.yaml"];
-	invariant(typeof manifest === "string", "managed child manifest is missing");
-	invariant(
-		sha256(manifest) === bootstrapSha256,
-		"managed child manifest digest drifted",
-	);
-	invariant(
-		manifest.includes(pinnedImage),
-		"managed child manifest image is not pinned",
-	);
-	info("same pinned child BootstrapConfig survives an idempotent retry");
+	await applyRuntime(await pinnedRuntime());
 }
 
 async function verifyRuntime(): Promise<void> {
@@ -905,7 +838,6 @@ async function contract(): Promise<void> {
 	await verifyRuntime();
 	await verifyUpgradePreserved(upgradeFootprint);
 	await cleanupUpgradeCanary(upgradeFootprint);
-	await verifyChildBootstrap();
 	await createAndDeleteCanary();
 }
 
@@ -966,4 +898,4 @@ if (creationStarted) {
 }
 
 if (failure) throw failure;
-console.log("Agent Sandbox v0.5.6 managed runtime contract passed");
+console.log("Agent Sandbox v0.5.6 pinned runtime contract passed");

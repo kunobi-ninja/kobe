@@ -319,7 +319,7 @@ pub(super) fn certification_fingerprint(
         },
         "runtime": {
             "release": REQUIRED_POOL_ACK_RELEASE,
-            "controllerImage": crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE,
+            "apiVersion": crate::sandbox_runtime::REQUIRED_AGENT_SANDBOX_API_VERSION,
         },
         "probe": &pool.spec.readiness,
         "isolation": &pool.spec.isolation,
@@ -1081,9 +1081,9 @@ async fn validate_management_population(
             "gVisor and Kata remain unqualified until isolation issue #14 is closed".into(),
         );
     }
-    crate::sandbox_runtime::validate_runtime_components(client)
+    crate::sandbox_runtime::validate_external_runtime(client)
         .await
-        .map_err(|error| format!("runtime components are not certified: {error}"))?;
+        .map_err(|error| format!("runtime APIs are not compatible: {error}"))?;
 
     let (template_uid, warm_pool_uid) = validate_pool_objects(
         pool,
@@ -1448,9 +1448,9 @@ pub async fn reconcile_management_pool_certification(
                 "gVisor and Kata remain unqualified until isolation issue #14 is closed".into(),
             );
         }
-        crate::sandbox_runtime::validate_runtime_components(client)
+        crate::sandbox_runtime::validate_external_runtime(client)
             .await
-            .map_err(|error| format!("runtime components are not certified: {error}"))?;
+            .map_err(|error| format!("runtime APIs are not compatible: {error}"))?;
         let current = existing.as_ref().expect("reduced validation has status");
         validate_pool_object_identity(
             pool,

@@ -121,19 +121,13 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
     let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
-    let pod_name = std::env::var("POD_NAME").unwrap_or_default();
 
-    // Do not bind the HTTP listener until every replica has certified the
-    // pinned controller, webhook and a real Pod-owned Claim lifecycle. This is
-    // intentionally stronger than CRD discovery: a wedged controller or a
-    // broken webhook must make the whole Sandbox surface fail closed.
+    // External mode is operator-owned. Before mounting Sandbox routes, perform
+    // only read-only API/schema compatibility checks; startup must never create
+    // a sacrificial Claim or assume one particular controller deployment.
     if agent_sandbox_mode.enabled() {
-        if pod_name.is_empty() {
-            error!("POD_NAME is required for the crash-safe Agent Sandbox runtime canary");
-            std::process::exit(1);
-        }
-        match sandbox_runtime::wait_for_runtime(&client, &pod_namespace, &pod_name).await {
-            Ok(()) => info!(?agent_sandbox_mode, "Agent Sandbox runtime certified"),
+        match sandbox_runtime::validate_external_runtime(&client).await {
+            Ok(()) => info!(?agent_sandbox_mode, "Agent Sandbox APIs validated"),
             Err(err) => {
                 error!(reason = err.reason_code(), "{err}");
                 std::process::exit(1);
@@ -467,8 +461,8 @@ async fn main() -> anyhow::Result<()> {
         }))
     };
 
-    // The lifecycle controller always runs. Managed and External enable
-    // placement after runtime validation; Disabled is cleanup-only and drains
+    // The lifecycle controller always runs. External enables placement after
+    // read-only runtime validation; Disabled is cleanup-only and drains
     // every lease admitted by the previous configuration.
     let sandbox_client = client.clone();
     let sandbox_ns = namespace.clone();

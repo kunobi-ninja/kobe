@@ -96,16 +96,11 @@ containerSecurityContext:
 #             Sandbox API is served, so an upgrade never starts depending on a
 #             runtime you have not installed.
 #
-#   external  You install and own the runtime; kobe validates that the required
-#             APIs/controller/webhook are the pinned release and owns none of
-#             that installation.
-#
-#   managed   Kobe installs the official Agent Sandbox v0.5.6 core + extensions
-#             release with an immutable controller-image digest. The four
-#             upstream CRDs are retained on uninstall; controllers/RBAC are
-#             removed. A same-release BootstrapConfig is also installed for
-#             child ClusterPools. Existing externally-owned resources make the
-#             Helm install fail instead of being adopted.
+#   external  You install and upgrade Agent Sandbox v0.5.6 before enabling this
+#             mode. Kobe owns none of that installation and performs read-only
+#             API/schema compatibility checks. Child clusters may use a generic
+#             operator-authored BootstrapConfig explicitly referenced by their
+#             ClusterPool; Kobe does not ship or inject an installer.
 agentSandbox:
   mode: disabled
   # Aggregate object ceiling across every caller. This namespace contains only
