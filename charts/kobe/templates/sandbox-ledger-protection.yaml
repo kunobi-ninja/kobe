@@ -27,11 +27,17 @@ metadata:
 spec:
   failurePolicy: Fail
   matchConstraints:
+    # Spell out the API-server defaults because startup validates the stored,
+    # defaulted object rather than the pre-admission Helm payload.
+    matchPolicy: Equivalent
+    namespaceSelector: {}
+    objectSelector: {}
     resourceRules:
       - apiGroups: ["coordination.k8s.io"]
         apiVersions: ["v1"]
         resources: ["leases"]
         operations: ["CREATE", "UPDATE", "DELETE"]
+        scope: "*"
   matchConditions:
     - name: only-sandbox-ledger-namespace
       expression: 'request.namespace == {{ $ledgerNamespace | quote }}'

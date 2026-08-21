@@ -301,6 +301,7 @@ fn validate_objects(
         && rule.resources.as_deref() == Some(&["leases".into()][..])
         && rule.operations.as_deref()
             == Some(&["CREATE".into(), "UPDATE".into(), "DELETE".into()][..])
+        && rule.scope.as_deref() == Some("*")
         && rule
             .resource_names
             .as_deref()
@@ -311,8 +312,9 @@ fn validate_objects(
             .as_deref()
             .unwrap_or_default()
             .is_empty()
-        && constraints.namespace_selector.is_none()
-        && constraints.object_selector.is_none();
+        && constraints.match_policy.as_deref() == Some("Equivalent")
+        && constraints.namespace_selector.as_ref() == Some(&Default::default())
+        && constraints.object_selector.as_ref() == Some(&Default::default());
     let expected_match = format!("request.namespace == \"{namespace}\"");
     let exact_match = matches!(spec.match_conditions.as_deref(), Some([condition])
         if condition.name == "only-sandbox-ledger-namespace"
@@ -430,10 +432,16 @@ mod tests {
                 "metadata":{"name":"policy","generation":1},
                 "spec":{
                     "failurePolicy":"Fail",
-                    "matchConstraints":{"resourceRules":[{
-                        "apiGroups":["coordination.k8s.io"], "apiVersions":["v1"],
-                        "resources":["leases"], "operations":["CREATE","UPDATE","DELETE"]
-                    }]},
+                    "matchConstraints":{
+                        "matchPolicy":"Equivalent",
+                        "namespaceSelector":{},
+                        "objectSelector":{},
+                        "resourceRules":[{
+                            "apiGroups":["coordination.k8s.io"], "apiVersions":["v1"],
+                            "resources":["leases"], "operations":["CREATE","UPDATE","DELETE"],
+                            "scope":"*"
+                        }]
+                    },
                     "matchConditions":[{"name":"only-sandbox-ledger-namespace","expression":"request.namespace == \"ledger\""}],
                     "validations":[
                         {"expression":"request.userInfo.username == \"system:serviceaccount:kobe:kobe\""},
@@ -527,6 +535,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_the_api_servers_exact_defaulted_match_scope_is_accepted() {
+        let (namespace, quota, mut policy, binding) = objects();
+        let constraints = policy
+            .spec
+            .as_mut()
+            .unwrap()
+            .match_constraints
+            .as_mut()
+            .unwrap();
+        constraints.namespace_selector = None;
+
+        assert!(matches!(
+            validate_objects(
+                &namespace,
+                &quota,
+                &policy,
+                &binding,
+                "ledger",
+                "policy",
+                "system:serviceaccount:kobe:kobe",
+                4096
+            ),
+            Err(SandboxLedgerError::Invalid(
+                "ValidatingAdmissionPolicy.resourceRules"
+            ))
+        ));
     }
 
     #[test]
