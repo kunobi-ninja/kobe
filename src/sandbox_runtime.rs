@@ -505,9 +505,16 @@ fn endpoint_slices_cover_exact_pods(
             else {
                 return false;
             };
+            // Kubernetes' EndpointSlice controller omits apiVersion from Pod
+            // targetRefs. Accept that canonical omission, but reject an
+            // explicitly different API so a forged reference cannot widen the
+            // exact Pod UID check below.
             if endpoint.conditions.as_ref().is_none_or(|conditions| {
                 conditions.ready != Some(true) || conditions.terminating == Some(true)
-            }) || target.api_version.as_deref() != Some("v1")
+            }) || target
+                .api_version
+                .as_deref()
+                .is_some_and(|version| version != "v1")
                 || target.kind.as_deref() != Some("Pod")
                 || target.namespace.as_deref() != Some(AGENT_SANDBOX_SYSTEM_NAMESPACE)
                 || target.name.as_deref().is_none_or(str::is_empty)
@@ -1269,13 +1276,16 @@ pub async fn run_runtime_canary(
 /// missing-Deployment observation is not a terminal configuration error. The
 /// whole install/health/canary sequence is nevertheless bounded to five
 /// minutes; each observation has its own short timeout so an unresponsive API
-/// request cannot consume that budget invisibly.
+/// request cannot consume that budget invisibly. Each distinct failure is
+/// logged once while the runtime converges, so a Helm timeout retains the
+/// actual component that failed rather than only reporting an unready Pod.
 pub async fn wait_for_runtime(
     client: &kube::Client,
     pod_namespace: &str,
     pod_name: &str,
 ) -> Result<(), AgentSandboxUnusable> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut last_reported_error = None;
     loop {
         let last_error = match tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -1287,6 +1297,15 @@ pub async fn wait_for_runtime(
             Ok(Err(error)) => error,
             Err(_) => component_unhealthy("kubernetes_api", "health read exceeded 15s"),
         };
+        let rendered = last_error.to_string();
+        if last_reported_error.as_deref() != Some(rendered.as_str()) {
+            tracing::warn!(
+                reason = last_error.reason_code(),
+                error = %last_error,
+                "Agent Sandbox runtime certification is waiting"
+            );
+            last_reported_error = Some(rendered);
+        }
         if tokio::time::Instant::now() >= deadline {
             return Err(last_error);
         }
@@ -1647,7 +1666,6 @@ mod tests {
                     "addresses": ["10.0.0.2"],
                     "conditions": { "ready": true, "terminating": false },
                     "targetRef": {
-                        "apiVersion": "v1",
                         "kind": "Pod",
                         "name": "agent-sandbox-controller-current",
                         "namespace": AGENT_SANDBOX_SYSTEM_NAMESPACE,
@@ -1690,6 +1708,18 @@ mod tests {
             "replacement-service".to_string();
         assert!(!endpoint_slices_cover_exact_pods(
             &[replaced_service],
+            &service_uid,
+            &pod_uids
+        ));
+
+        let mut wrong_target_api = exact_slice.clone();
+        wrong_target_api.endpoints[0]
+            .target_ref
+            .as_mut()
+            .unwrap()
+            .api_version = Some("apps/v1".to_string());
+        assert!(!endpoint_slices_cover_exact_pods(
+            &[wrong_target_api],
             &service_uid,
             &pod_uids
         ));
