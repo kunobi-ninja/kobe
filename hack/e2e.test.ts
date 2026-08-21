@@ -13,6 +13,7 @@ import {
   resizablePtyCommand,
   revokeVerb,
   sandboxConformanceManifest,
+  sandboxPoolCertificationBlocker,
 } from "./e2e";
 
 test("k3s only preloads the always-warm k3s guest image", () => {
@@ -79,6 +80,25 @@ test("the conformance manifest contains two exact placements and a pullable runn
 test("the Sandbox fixture runs as the restricted workload identity", async () => {
   const dockerfile = await Bun.file("docker/sandbox-e2e.Dockerfile").text();
   expect(dockerfile).toContain("USER 65532:65532");
+});
+
+test("the conformance preflight reports durable pool blockers without waiting for timeout", () => {
+  const pool = (reason: string, message: string, observedGeneration = 7) => ({
+    metadata: { generation: 7 },
+    status: {
+      observedGeneration,
+      conditions: [{ type: "Ready", status: "False", observedGeneration, reason, message }],
+    },
+  });
+
+  expect(sandboxPoolCertificationBlocker(pool("CleanupBlocked", "approval required"), "management"))
+    .toBe("SandboxPool/management is fail-closed at CleanupBlocked: approval required");
+  expect(sandboxPoolCertificationBlocker(pool("CompositionEligible", "child receipt missing"), "child"))
+    .toBe("SandboxPool/child is fail-closed at CompositionEligible: child receipt missing");
+  expect(sandboxPoolCertificationBlocker(pool("CanaryRunning", "still reconciling"), "management"))
+    .toBeUndefined();
+  expect(sandboxPoolCertificationBlocker(pool("CleanupBlocked", "stale", 6), "management"))
+    .toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------

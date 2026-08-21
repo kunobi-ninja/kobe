@@ -1841,6 +1841,51 @@ function assertCertifiedPool(pool: ConformanceObject, name: string): void {
   );
 }
 
+/// Return the current-generation pool condition that cannot converge without
+/// an explicit product/protocol change.
+///
+/// Most `Ready=False` reasons are ordinary certification progress and must be
+/// allowed to reconcile. `CleanupBlocked` and `CompositionEligible` are
+/// deliberately terminal, fail-closed boundaries: waiting the full CI timeout
+/// cannot change either one and hides the exact reason maintainers need.
+export function sandboxPoolCertificationBlocker(
+  pool: ConformanceObject,
+  name: string,
+): string | undefined {
+  const generation = pool.metadata?.generation;
+  const ready = (pool.status?.conditions ?? []).find((condition) => condition.type === "Ready");
+  if (
+    generation === undefined
+    || pool.status?.observedGeneration !== generation
+    || ready?.observedGeneration !== generation
+    || ready.status !== "False"
+    || !["CleanupBlocked", "CompositionEligible"].includes(ready.reason ?? "")
+  ) {
+    return undefined;
+  }
+  return `SandboxPool/${name} is fail-closed at ${ready.reason}: ${ready.message ?? "no detail"}`;
+}
+
+async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let lastError = `SandboxPool/${name} has not reported certification`;
+  while (Date.now() < deadline) {
+    const current = await kubectlJson<ConformanceObject>(args, [
+      "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+    ]);
+    const blocker = sandboxPoolCertificationBlocker(current, name);
+    requireConformance(blocker === undefined, blocker ?? "unreachable certification blocker");
+    try {
+      assertCertifiedPool(current, name);
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    await Bun.sleep(1_000);
+  }
+  throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
+}
+
 /// Privileged setup evidence for #76, deliberately separate from the public
 /// contract suite. It proves the harness created the exact two identities,
 /// managed runtime, receipt-capable child pool, and both current-generation
@@ -1949,14 +1994,7 @@ async function sandboxConformancePreflight(args: Args): Promise<void> {
   ], { step: `ClusterPool/${DEMO_K3S_POOL} did not retain one Ready child fixture` });
 
   for (const name of [DEMO_SANDBOX_POOL_MANAGEMENT, DEMO_SANDBOX_POOL_CHILD]) {
-    await kubectl(args, [
-      "wait", `sandboxpool.kobe.kunobi.ninja/${name}`, "-n", args.namespace,
-      "--for=condition=Ready", `--timeout=${args.timeoutSeconds}s`,
-    ], { step: `SandboxPool/${name} never obtained current runtime/policy/network/canary certification` });
-    const current = await kubectlJson<ConformanceObject>(args, [
-      "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
-    ]);
-    assertCertifiedPool(current, name);
+    await waitForCertifiedPool(args, name);
   }
   step("Both Sandbox placements and both caller policies are certified");
 }
