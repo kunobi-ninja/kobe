@@ -74,7 +74,10 @@ pause it. A Kobe chart upgrade is the supported way to move to a later pinned
 runtime release.
 
 Agent Sandbox does not install gVisor, Kata, node runtimes, or RuntimeClasses.
-Install the RuntimeClass selected by each SandboxPool before admitting leases.
+This release certifies only `trusted-runc`, for trusted workloads. The `gvisor`
+and `kata` schema values are reserved for a future isolation qualification
+under issue #14; selecting either keeps the pool `Ready=False` even when the
+named RuntimeClass exists. Kobe never downgrades either tier silently to runc.
 
 ## Example
 
@@ -112,8 +115,7 @@ spec:
         container: workspace
         port: 8080
   isolation:
-    tier: gvisor
-    runtimeClassName: gvisor
+    tier: trusted-runc
   readiness:
     canary:
       argv: ["/usr/local/bin/agent", "healthcheck"]
@@ -217,9 +219,10 @@ placement:
   clusterPoolRef: ci-sandbox
 ```
 
-Isolation tier `trusted-runc` must omit `runtimeClassName`. Hardened tiers
-`gvisor` and `kata` require the exact administrator-selected RuntimeClass name.
-Lease callers cannot override either placement or isolation.
+Isolation tier `trusted-runc` must omit `runtimeClassName`. Reserved tiers
+`gvisor` and `kata` require the exact administrator-selected RuntimeClass name,
+but remain ineligible until issue #14 qualifies their complete runtime and node
+contract. Lease callers cannot override either placement or isolation.
 
 See the [API reference](/docs/api/reference#sandbox-leases) for lease operations
 and [authentication and authorization](/docs/auth/overview) for Sandbox policy
