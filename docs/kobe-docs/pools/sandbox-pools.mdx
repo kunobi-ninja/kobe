@@ -111,7 +111,11 @@ spec:
 
 Every container must declare CPU, memory, and ephemeral-storage requests and
 limits. `defaultContainer` and each exposed port must refer to a declared
-container. Canary `argv` is executed directly, without an implicit shell.
+container. Kobe runs every Sandbox container as UID/GID `65532`, drops all
+Linux capabilities, disables privilege escalation, and applies the
+`RuntimeDefault` seccomp profile. Images must therefore work as that non-root
+user and must not require writable root-owned paths. Canary `argv` is executed
+directly, without an implicit shell.
 
 ## Admission ledger namespace
 

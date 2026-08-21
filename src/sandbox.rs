@@ -12,7 +12,10 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use k8s_openapi::api::core::v1::{Container, ContainerPort, PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{
+    Capabilities, Container, ContainerPort, PodSecurityContext, PodSpec, ResourceRequirements,
+    SeccompProfile, SecurityContext,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
@@ -138,8 +141,12 @@ pub enum SandboxPoolReadinessError {
 ///
 /// The projection is intentionally closed: it emits only declared containers,
 /// CPU/memory/ephemeral-storage resources, TCP ports, the administrator's
-/// RuntimeClass, and fixed secure policies. It cannot emit PVC templates,
-/// environment values, service accounts, arbitrary volumes, or caller metadata.
+/// RuntimeClass, and fixed Restricted-profile-compatible Pod/container
+/// security contexts. Every workload runs as Kobe's non-root UID/GID 65532,
+/// drops all capabilities, disables privilege escalation and service-account
+/// token/service-link injection, and uses RuntimeDefault seccomp. It cannot
+/// emit PVC templates, environment values, service accounts, arbitrary
+/// volumes, or caller metadata.
 pub fn build_sandbox_template(
     name: &str,
     namespace: &str,
@@ -174,6 +181,16 @@ pub fn build_sandbox_template(
                 args: (!container.args.is_empty()).then(|| container.args.clone()),
                 ports: (!ports.is_empty()).then_some(ports),
                 resources: Some(to_k8s_resources(&container.resources)),
+                security_context: Some(SecurityContext {
+                    allow_privilege_escalation: Some(false),
+                    capabilities: Some(Capabilities {
+                        drop: Some(vec!["ALL".to_string()]),
+                        ..Capabilities::default()
+                    }),
+                    privileged: Some(false),
+                    run_as_non_root: Some(true),
+                    ..SecurityContext::default()
+                }),
                 ..Default::default()
             }
         })
@@ -182,8 +199,19 @@ pub fn build_sandbox_template(
     let pod_spec = PodSpec {
         automount_service_account_token: Some(false),
         containers,
+        enable_service_links: Some(false),
         restart_policy: Some("Never".to_string()),
         runtime_class_name: pool.isolation.runtime_class_name().map(ToString::to_string),
+        security_context: Some(PodSecurityContext {
+            run_as_group: Some(65_532),
+            run_as_non_root: Some(true),
+            run_as_user: Some(65_532),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                ..SeccompProfile::default()
+            }),
+            ..PodSecurityContext::default()
+        }),
         ..Default::default()
     };
     let pod_spec = serde_json::to_value(pod_spec)?;
@@ -1463,6 +1491,35 @@ mod tests {
         assert_eq!(
             value["spec"]["podTemplate"]["spec"]["automountServiceAccountToken"],
             false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["enableServiceLinks"],
+            false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsUser"],
+            65_532
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsGroup"],
+            65_532
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsNonRoot"],
+            true
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["seccompProfile"]["type"],
+            "RuntimeDefault"
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["securityContext"]["capabilities"]
+                ["drop"],
+            serde_json::json!(["ALL"])
         );
         assert_eq!(value["spec"]["envVarsInjectionPolicy"], "Disallowed");
         assert_eq!(value["spec"]["volumeClaimTemplatesPolicy"], "Disallowed");
