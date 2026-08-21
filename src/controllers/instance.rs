@@ -27,7 +27,8 @@ use crate::crd::{
     ClusterInstanceNetwork, ClusterInstancePhase, ClusterInstanceStatus, ClusterLease, ClusterPool,
     HealthCheckConfig, LeasePhase, ReadinessGate, SnapshotConfig,
     TEARDOWN_CREATION_MANIFEST_SCHEMA_VERSION, TEARDOWN_RECEIPT_SCHEMA_VERSION,
-    TeardownCreationManifest, TeardownOutcome, TeardownReceipt,
+    TeardownCreationManifest, TeardownEvidenceReference, TeardownOutcome, TeardownReceipt,
+    VerifiedTeardownEvidence, VerifiedTeardownEvidenceSpec,
 };
 use crate::velero::VeleroCoordinator;
 
@@ -40,6 +41,10 @@ use crate::velero::VeleroCoordinator;
 /// immediately and `K3sBackend::delete()` / `K0sBackend::delete()`
 /// never runs — leaking the entire backend resource set (see #95).
 const INSTANCE_FINALIZER: &str = "kobe.kunobi.ninja/instance-cleanup";
+
+fn receipt_authority_is_separate() -> bool {
+    crate::receipt_authority::is_separate()
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Metrics helpers
@@ -194,6 +199,227 @@ pub async fn run_instance_controller<B: ClusterBackend + Clone + 'static>(
             info!("Instance controller shutting down");
         },
     }
+}
+
+/// Run only the read/attest side of verified teardown under the dedicated
+/// authority identity. This controller never creates or deletes workloads. It
+/// seals creation manifests from live observations, persists the attempt nonce
+/// before the general lifecycle controller may delete, re-observes the complete
+/// manifest as absent, and only then creates immutable evidence.
+pub async fn run_receipt_authority_controller<B: ClusterBackend + Clone + 'static>(
+    client: Client,
+    namespace: &str,
+    backend: B,
+    factory: Option<BackendFactory>,
+    shutdown: CancellationToken,
+) {
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let ctx = Arc::new(InstanceContext {
+        client,
+        backend,
+        namespace: namespace.to_string(),
+        factory,
+        velero: None,
+    });
+    info!("Starting isolated teardown receipt authority");
+    let controller = Controller::new(instances, Config::default())
+        .run(
+            reconcile_receipt_authority,
+            receipt_authority_error_policy,
+            ctx,
+        )
+        .for_each(|result| async move {
+            if let Err(error) = result {
+                debug!(?error, "receipt authority reconciliation error");
+            }
+        });
+    tokio::select! {
+        _ = controller => {},
+        _ = shutdown.cancelled() => info!("Teardown receipt authority shutting down"),
+    }
+}
+
+async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
+    instance: Arc<ClusterInstance>,
+    ctx: Arc<InstanceContext<B>>,
+) -> Result<Action, InstanceError> {
+    let namespace = instance
+        .namespace()
+        .unwrap_or_else(|| ctx.namespace.clone());
+    let name = instance.name_any();
+    let status = instance.status.clone().unwrap_or_default();
+    let config = resolve_instance_config(
+        &ctx.client,
+        &instance,
+        &namespace,
+        instance.metadata.deletion_timestamp.is_some(),
+    )
+    .await?;
+    let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &namespace);
+
+    if status.creation_manifest.is_none() {
+        match capture_creation_manifest(&ctx, &config, &instance, &namespace).await {
+            Ok(Some(manifest)) => {
+                persist_creation_manifest_once(&instances, &instance, &manifest).await?;
+                return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                debug!(instance = %name, error = %error, "creation manifest not ready for authority sealing");
+            }
+        }
+    }
+
+    let status = instance.status.clone().unwrap_or_default();
+    if status.creation_manifest.is_some() && status.teardown_identities.is_empty() {
+        capture_teardown_identities_once(&ctx, &instance, &name, &namespace, &status).await;
+    }
+    let Some(binding) = status.binding.as_ref() else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+    if binding.cleanup_mode != CleanupMode::VerifiedDestroy
+        || !matches!(
+            status.phase,
+            ClusterInstancePhase::Recycling | ClusterInstancePhase::Quarantined
+        )
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    }
+    let Some(manifest) = status.creation_manifest.as_ref() else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+    };
+    let manifest_digest = manifest
+        .digest()
+        .map_err(|reason| InstanceError::Lifecycle(anyhow::anyhow!(reason.to_string())))?;
+    if manifest.instance.name != binding.instance.name
+        || manifest.instance.uid.as_deref() != Some(binding.instance.uid.as_str())
+        || binding.creation_manifest.as_ref() != Some(manifest)
+        || binding.creation_manifest_digest.as_deref() != Some(manifest_digest.as_str())
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    }
+
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &namespace);
+    let lease = leases.get(&binding.lease.name).await?;
+    if !lease_uid_matches_binding(&lease, binding) {
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    }
+    let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
+    let pending = match lease
+        .status
+        .as_ref()
+        .and_then(|lease_status| lease_status.teardown_receipt.as_ref())
+    {
+        Some(receipt)
+            if receipt.outcome == TeardownOutcome::Verified
+                && lease
+                    .status
+                    .as_ref()
+                    .and_then(|lease_status| lease_status.teardown_evidence.as_ref())
+                    .is_some() =>
+        {
+            return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+        }
+        Some(receipt)
+            if receipt.outcome == TeardownOutcome::InProgress
+                && lease
+                    .status
+                    .as_ref()
+                    .and_then(|lease_status| lease_status.teardown_attempt_id.as_deref())
+                    == Some(receipt.attempt_id.as_str())
+                && pending_receipt_matches(
+                    receipt,
+                    binding,
+                    &manifest.instance,
+                    &manifest_digest,
+                ) =>
+        {
+            receipt.clone()
+        }
+        Some(_) => return Ok(Action::requeue(std::time::Duration::from_secs(30))),
+        None => {
+            let pending = TeardownReceipt {
+                schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                lease: binding.lease.clone(),
+                instance: manifest.instance.clone(),
+                pool: binding.pool.clone(),
+                backend_type: backend_type.clone(),
+                config_digest: binding.backend.config_digest.clone(),
+                instance_spec_digest: binding.instance_spec_digest.clone(),
+                creation_manifest_digest: manifest_digest.clone(),
+                cleanup_mode: binding.cleanup_mode,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: None,
+                checks: Vec::new(),
+                retry_count: 0,
+                outcome: TeardownOutcome::InProgress,
+            };
+            record_teardown_receipt(&ctx, &lease, &pending, &namespace, None).await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(2)));
+        }
+    };
+
+    let Some(backend) = resolve_verified_backend(&ctx, &instance).await else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+    let mut checks = match backend
+        .verify_absent_manifest(&name, &namespace, manifest, &pending.attempt_id)
+        .await
+    {
+        Ok(checks) => checks,
+        Err(_) => return Ok(Action::requeue(std::time::Duration::from_secs(30))),
+    };
+    let Some(connect_token) = binding.connect_token.as_ref() else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    };
+    checks.push(
+        crate::api::connect::observe_lease_connect_token_absent(
+            &ctx.client,
+            &namespace,
+            &binding.lease.name,
+            connect_token,
+        )
+        .await,
+    );
+    if TeardownReceipt::outcome_for(&checks) != TeardownOutcome::Verified {
+        return Ok(Action::requeue(std::time::Duration::from_secs(10)));
+    }
+    let receipt = TeardownReceipt {
+        schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
+        attempt_id: pending.attempt_id.clone(),
+        lease: pending.lease.clone(),
+        instance: pending.instance.clone(),
+        pool: pending.pool.clone(),
+        backend_type: pending.backend_type.clone(),
+        config_digest: pending.config_digest.clone(),
+        instance_spec_digest: pending.instance_spec_digest.clone(),
+        creation_manifest_digest: pending.creation_manifest_digest.clone(),
+        cleanup_mode: pending.cleanup_mode,
+        started_at: pending.started_at.clone(),
+        completed_at: Some(completion_after(&pending.started_at)),
+        checks,
+        retry_count: pending.retry_count,
+        outcome: TeardownOutcome::Verified,
+    };
+    record_teardown_receipt(
+        &ctx,
+        &lease,
+        &receipt,
+        &namespace,
+        Some(&pending.attempt_id),
+    )
+    .await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(2)))
+}
+
+fn receipt_authority_error_policy<B: ClusterBackend>(
+    _instance: Arc<ClusterInstance>,
+    error: &InstanceError,
+    _ctx: Arc<InstanceContext<B>>,
+) -> Action {
+    warn!(%error, "teardown receipt authority reconcile failed");
+    Action::requeue(std::time::Duration::from_secs(15))
 }
 
 #[tracing::instrument(skip_all, fields(instance = %instance.name_any()))]
@@ -403,21 +629,26 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                     // Failure is honest ineligibility for VerifiedDestroy, not a
                     // reason to break ordinary Standard-mode pools; a later
                     // Creating/Ready reconcile retries the capture.
-                    match capture_creation_manifest(&ctx, &config, &instance, &ns).await {
-                        Ok(Some(manifest)) => {
-                            if let Err(error) =
-                                persist_creation_manifest_once(&instances_api, &instance, &manifest)
-                                    .await
-                            {
-                                warn!(instance = %name, error = %error, "could not persist creation manifest; will retry");
+                    if !receipt_authority_is_separate() {
+                        match capture_creation_manifest(&ctx, &config, &instance, &ns).await {
+                            Ok(Some(manifest)) => {
+                                if let Err(error) = persist_creation_manifest_once(
+                                    &instances_api,
+                                    &instance,
+                                    &manifest,
+                                )
+                                .await
+                                {
+                                    warn!(instance = %name, error = %error, "could not persist creation manifest; will retry");
+                                }
                             }
+                            Ok(None) => {}
+                            Err(error) => warn!(
+                                instance = %name,
+                                error = %format!("{error:#}"),
+                                "creation footprint is not fully observable; verified teardown remains ineligible"
+                            ),
                         }
-                        Ok(None) => {}
-                        Err(error) => warn!(
-                            instance = %name,
-                            error = %format!("{error:#}"),
-                            "creation footprint is not fully observable; verified teardown remains ineligible"
-                        ),
                     }
                     patch_instance_status(
                         &instances_api,
@@ -470,7 +701,8 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Creating if status.provisioned => {
-            if status.creation_manifest.is_none()
+            if !receipt_authority_is_separate()
+                && status.creation_manifest.is_none()
                 && let Ok(Some(manifest)) =
                     capture_creation_manifest(&ctx, &config, &instance, &ns).await
                 && persist_creation_manifest_once(&instances_api, &instance, &manifest)
@@ -792,7 +1024,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             }
         }
         ClusterInstancePhase::Ready => {
-            if status.creation_manifest.is_none() {
+            if !receipt_authority_is_separate() && status.creation_manifest.is_none() {
                 match capture_creation_manifest(&ctx, &config, &instance, &ns).await {
                     Ok(Some(manifest)) => {
                         if persist_creation_manifest_once(&instances_api, &instance, &manifest)
@@ -814,7 +1046,9 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             // healthy. Doing this at teardown would let the teardown path
             // choose its own scope; recorded here, a later receipt has to
             // account for what was captured long before it ran.
-            capture_teardown_identities_once(&ctx, &instance, &name, &ns, &status).await;
+            if !receipt_authority_is_separate() {
+                capture_teardown_identities_once(&ctx, &instance, &name, &ns, &status).await;
+            }
             let next =
                 evaluate_ready_instance(&ctx, &config, &instance, &name, &ns, &status).await?;
             Ok(next)
@@ -2301,6 +2535,10 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
                     .await,
             );
         }
+        None if receipt_authority_is_separate() => {
+            debug!(instance = %name, "waiting for isolated authority to persist teardown attempt");
+            return Some(Ok(Action::requeue(std::time::Duration::from_secs(5))));
+        }
         None => {
             let receipt = TeardownReceipt {
                 schema_version: TEARDOWN_RECEIPT_SCHEMA_VERSION,
@@ -2367,6 +2605,13 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
         }
     };
     checks.push(connect_check);
+
+    if receipt_authority_is_separate() {
+        // These destructive-side checks are not authority. The isolated,
+        // read-only controller independently re-observes the sealed manifest
+        // and exact token UID before it publishes terminal evidence.
+        return Some(Ok(Action::requeue(std::time::Duration::from_secs(5))));
+    }
 
     let outcome = TeardownReceipt::outcome_for(&checks);
     let receipt = TeardownReceipt {
@@ -2635,6 +2880,11 @@ async fn record_teardown_receipt<B: ClusterBackend>(
     let resource_version = lease
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("lease has no resourceVersion"))?;
+    let evidence = if receipt.outcome == TeardownOutcome::Verified {
+        Some(persist_verified_teardown_evidence(&ctx.client, namespace, receipt).await?)
+    } else {
+        None
+    };
     let mut operations = vec![
         serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
         serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
@@ -2671,6 +2921,13 @@ async fn record_teardown_receipt<B: ClusterBackend>(
         "path": "/status/teardownReceipt",
         "value": receipt
     }));
+    if let Some(evidence) = evidence {
+        operations.push(serde_json::json!({
+            "op": "add",
+            "path": "/status/teardownEvidence",
+            "value": evidence
+        }));
+    }
     let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(operations));
     Ok(leases
         .patch_status(
@@ -2679,6 +2936,60 @@ async fn record_teardown_receipt<B: ClusterBackend>(
             &Patch::<()>::Json(patch),
         )
         .await?)
+}
+
+/// Create the immutable, separately-authorized receipt record before mirroring
+/// it into mutable ClusterLease status. A 409 is adoptable only when the full
+/// spec is byte-for-byte the same evidence for the same exact lease attempt.
+async fn persist_verified_teardown_evidence(
+    client: &Client,
+    namespace: &str,
+    receipt: &TeardownReceipt,
+) -> Result<TeardownEvidenceReference, anyhow::Error> {
+    if receipt.acknowledgement_token().is_none() {
+        anyhow::bail!("only a complete verified receipt can become authority evidence");
+    }
+    let lease_uid = receipt
+        .lease
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("verified receipt has no lease UID"))?;
+    let name = crate::crd::verified_teardown_evidence_name(lease_uid, &receipt.attempt_id);
+    let spec = VerifiedTeardownEvidenceSpec {
+        lease: receipt.lease.clone(),
+        attempt_id: receipt.attempt_id.clone(),
+        receipt: receipt.clone(),
+    };
+    let evidence_api: Api<VerifiedTeardownEvidence> = Api::namespaced(client.clone(), namespace);
+    let mut desired = VerifiedTeardownEvidence::new(&name, spec.clone());
+    desired.metadata.namespace = Some(namespace.to_string());
+    let evidence = match evidence_api.create(&PostParams::default(), &desired).await {
+        Ok(created) => created,
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            let existing = evidence_api.get(&name).await?;
+            if existing.spec != spec {
+                anyhow::bail!("same-name teardown evidence has different immutable content");
+            }
+            existing
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if evidence.spec != spec {
+        anyhow::bail!("apiserver returned different teardown evidence content");
+    }
+    Ok(TeardownEvidenceReference {
+        name: evidence.name_any(),
+        uid: evidence
+            .uid()
+            .filter(|uid| !uid.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("teardown evidence has no UID"))?,
+        generation: evidence.metadata.generation.unwrap_or_default(),
+        resource_version: evidence
+            .resource_version()
+            .filter(|rv| !rv.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("teardown evidence has no resourceVersion"))?,
+    })
 }
 
 async fn mark_exact_lease_quarantined<B: ClusterBackend>(

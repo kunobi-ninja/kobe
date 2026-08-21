@@ -4455,6 +4455,51 @@ impl ClusterBackend for K3sBackend {
         Ok(checks)
     }
 
+    async fn verify_absent_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        if manifest.validate().is_err()
+            || manifest.instance.name != name
+            || manifest.namespace != namespace
+        {
+            return Ok(manifest
+                .required_subjects()
+                .into_iter()
+                .map(|subject| TeardownCheck {
+                    subject,
+                    result: CheckResult::Unknown,
+                    reason: Some("creation_manifest_invalid".into()),
+                    verified: Vec::new(),
+                })
+                .collect());
+        }
+        let bound_volumes = Ok(manifest
+            .storage
+            .iter()
+            .map(|volume| volume.pv.name.clone())
+            .collect());
+        let observed = Ok(());
+        let mut checks = Vec::new();
+        for subject in manifest.required_subjects() {
+            checks.push(
+                self.verify_subject_absent(
+                    name,
+                    namespace,
+                    subject,
+                    &bound_volumes,
+                    &observed,
+                    Some((manifest, attempt_id)),
+                )
+                .await,
+            );
+        }
+        Ok(checks)
+    }
+
     #[tracing::instrument(skip(self), fields(cluster = name, namespace))]
     async fn check_health(&self, name: &str, namespace: &str) -> Result<bool> {
         check_virtual_health(&self.client, name, namespace).await

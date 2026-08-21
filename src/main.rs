@@ -7,6 +7,7 @@ mod lease_binding;
 mod metrics;
 pub mod pki;
 mod pool;
+mod receipt_authority;
 mod sandbox;
 mod sandbox_access_ledger;
 mod sandbox_ledger;
@@ -65,6 +66,38 @@ const fn sandbox_controller_startup(
     }
 }
 
+/// Which independently-authorized Kobe surface this process serves.
+///
+/// `ControlPlane` retains the complete ordinary lifecycle graph. Only proof
+/// production moves to `TeardownAuthority`; moving instance or lease lifecycle
+/// there would silently stop allocation and cleanup when the chart uses the
+/// split deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessRole {
+    /// Backward-compatible direct deployment: all controllers in one process.
+    All,
+    /// API, placement, and ordinary lifecycle controllers. It cannot write
+    /// authoritative teardown evidence in the Helm deployment.
+    ControlPlane,
+    /// Isolated read/attest authority for teardown attempts, manifests,
+    /// receipts, and causal consumer acknowledgements.
+    TeardownAuthority,
+}
+
+impl ProcessRole {
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("KOBE_PROCESS_ROLE")
+            .unwrap_or_else(|_| "all".into())
+            .as_str()
+        {
+            "all" => Ok(Self::All),
+            "control-plane" => Ok(Self::ControlPlane),
+            "teardown-authority" => Ok(Self::TeardownAuthority),
+            value => anyhow::bail!("unsupported KOBE_PROCESS_ROLE {value:?}"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the rustls crypto provider before any TLS usage.
@@ -103,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
         commit = build_commit,
         "Starting kobe-operator"
     );
+    let process_role = ProcessRole::from_env()?;
+    info!(?process_role, "Kobe process role");
 
     // Refuse an unimplemented or unrecognised Agent Sandbox mode at STARTUP.
     // Deferring it to the first Sandbox request would leave a cluster running
@@ -212,6 +247,14 @@ async fn main() -> anyhow::Result<()> {
     let ssh_namespace =
         std::env::var("KOBE_SSH_NAMESPACE").unwrap_or_else(|_| "kobe-system".to_string());
     let authenticator = Arc::new(JwtAuthenticator::new(ssh_namespace));
+
+    if process_role == ProcessRole::TeardownAuthority {
+        let result =
+            run_teardown_authority(client, namespace, pod_namespace, backend, factory, shutdown)
+                .await;
+        telemetry::shutdown(_otel_provider);
+        return result;
+    }
 
     let sandbox_serving_replica = if agent_sandbox_mode.enabled() {
         let replica = crate::sandbox_access_ledger::ServingReplica {
@@ -389,6 +432,9 @@ async fn main() -> anyhow::Result<()> {
     let instance_backend = backend.clone();
     let instance_factory = factory.clone();
     let instance_velero = velero.clone();
+    // Lifecycle ownership never moves to the proof authority. Both `all` and
+    // `control-plane` supervise this loop; the authority process returned
+    // before reaching this point.
     let instance_handle = tokio::spawn(async move {
         controllers::instance::run_instance_controller(
             instance_client,
@@ -645,6 +691,101 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run only teardown evidence producers under their own Kubernetes identity.
+///
+/// Ordinary lifecycle controllers stay outside this process. The separate
+/// ServiceAccount is the only identity admitted to create immutable
+/// `VerifiedTeardownEvidence` records or change protected attempt,
+/// receipt/manifest, and acknowledgement fields, so compromising an unrelated
+/// Kobe controller cannot mint cleanup proof merely because RBAC cannot filter
+/// individual status fields.
+async fn run_teardown_authority(
+    client: Client,
+    namespace: String,
+    authority_namespace: String,
+    backend: BackendDispatch,
+    factory: BackendFactory,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let expected_username = std::env::var("KOBE_TEARDOWN_AUTHORITY_USERNAME")
+        .map_err(|_| anyhow::anyhow!("KOBE_TEARDOWN_AUTHORITY_USERNAME is required"))?;
+    let policy_name = std::env::var("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME")
+        .map_err(|_| anyhow::anyhow!("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME is required"))?;
+    receipt_authority::validate(&client, &policy_name, &expected_username).await?;
+
+    let leader_election = kunobi_ha::leader::LeaderElection::builder(
+        client.clone(),
+        // Keep this identity's only create/update/delete permission outside
+        // the operator namespace. The authority namespace is dedicated to its
+        // ServiceAccount and pod, so its election Lease cannot overlap the
+        // general control plane's coordination objects.
+        &authority_namespace,
+        "kobe-teardown-authority",
+    )
+    .build();
+    let leader_guard = leader_election.acquire().await?;
+    let authority_client = client.clone();
+    let authority_namespace = namespace.clone();
+    let receipt_shutdown = shutdown.clone();
+    let receipt_handle = tokio::spawn(async move {
+        controllers::instance::run_receipt_authority_controller(
+            authority_client,
+            &authority_namespace,
+            backend,
+            Some(factory),
+            receipt_shutdown,
+        )
+        .await;
+    });
+
+    let release_client = client.clone();
+    let release_namespace = namespace.clone();
+    let release_shutdown = shutdown.clone();
+    let release_handle = tokio::spawn(async move {
+        controllers::lease::run_release_authority_controller(
+            release_client,
+            &release_namespace,
+            release_shutdown,
+        )
+        .await;
+    });
+
+    let ack_client = client;
+    let ack_namespace = namespace.clone();
+    let ack_shutdown = shutdown.clone();
+    let ack_handle = tokio::spawn(async move {
+        controllers::sandbox::run_receipt_ack_authority_controller(
+            ack_client,
+            &ack_namespace,
+            ack_shutdown,
+        )
+        .await;
+    });
+
+    let supervisor_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            result = receipt_handle => match result {
+                Ok(()) => warn!("Teardown receipt authority controller exited unexpectedly"),
+                Err(error) => error!(%error, "Teardown receipt authority controller panicked"),
+            },
+            result = release_handle => match result {
+                Ok(()) => warn!("Release-attempt authority controller exited unexpectedly"),
+                Err(error) => error!(%error, "Release-attempt authority controller panicked"),
+            },
+            result = ack_handle => match result {
+                Ok(()) => warn!("Teardown ACK authority controller exited unexpectedly"),
+                Err(error) => error!(%error, "Teardown ACK authority controller panicked"),
+            },
+        }
+        supervisor_shutdown.cancel();
+    });
+
+    info!("Teardown authority controllers started");
+    shutdown_signal(leader_guard, shutdown).await;
+    Ok(())
+}
+
 /// Acquire leadership while proving a pre-leader critical task stays alive.
 ///
 /// Every replica can wait indefinitely for the leader Lease, so merely keeping
@@ -767,6 +908,7 @@ async fn wait_for_crds(client: &Client) -> anyhow::Result<()> {
         "clusterpools.kobe.kunobi.ninja",
         "clusterleases.kobe.kunobi.ninja",
         "clusterinstances.kobe.kunobi.ninja",
+        "verifiedteardownevidence.kobe.kunobi.ninja",
         "accesspolicies.kobe.kunobi.ninja",
         "bootstrapconfigs.kobe.kunobi.ninja",
         "kobestores.kobe.kunobi.ninja",

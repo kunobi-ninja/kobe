@@ -15,8 +15,9 @@ use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
     BackendProvenance, BoundInstanceRef, CleanupMode, ClusterInstance, ClusterInstancePhase,
     ClusterLease, ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase,
-    ClusterPoolStatus, LeaseBinding, LeasePhase, ResourceRef, SandboxPlacementAuthority,
-    TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION, TEARDOWN_RECEIPT_RETENTION_FINALIZER,
+    ClusterPoolStatus, ConnectTokenCreation, ConnectTokenCreationPhase, LeaseBinding, LeasePhase,
+    ResourceRef, SandboxPlacementAuthority, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
+    TEARDOWN_RECEIPT_RETENTION_FINALIZER, TeardownAcknowledgedProofKind,
     UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
 };
 use crate::diagnostics;
@@ -172,7 +173,6 @@ async fn sandbox_composition_allocation_gate(
         .labels()
         .get("app.kubernetes.io/managed-by")
         .is_none_or(|value| value != crate::sandbox::KOBE_MANAGED_BY)
-        || lease.spec.requester.identity != "kobe-operator"
         || lease.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
     {
         return SandboxCompositionGate::Invalid;
@@ -212,6 +212,11 @@ async fn sandbox_composition_allocation_gate(
     let Some(outer_uid) = labelled_uid.or(legacy_uid) else {
         return SandboxCompositionGate::Invalid;
     };
+    if lease.spec.requester.identity.as_str() != outer_uid.as_str()
+        && lease.spec.requester.identity != "kobe-operator"
+    {
+        return SandboxCompositionGate::Invalid;
+    }
 
     let identity = SandboxCompositionIdentity {
         outer_name: outer_name.clone(),
@@ -491,6 +496,10 @@ async fn quarantine_invalid_sandbox_composition(
     }
 }
 
+const CONNECT_TOKEN_CREATE_FENCE_ANNOTATION: &str =
+    "kobe.kunobi.ninja/connect-token-binding-before-create-v1";
+const ALLOCATION_ABSENT_CONDITION: &str = "AllocationAbsent";
+
 /// Shared state for the lease controller.
 pub struct LeaseContext<B: ClusterBackend> {
     pub client: Client,
@@ -607,6 +616,297 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     }
 }
 
+#[derive(Clone)]
+struct ReleaseAuthorityContext {
+    client: Client,
+    namespace: String,
+}
+
+/// Run the read/attest half of terminal lease handling under the dedicated
+/// teardown-authority identity.
+///
+/// This controller never creates or deletes a connect token, backend object,
+/// or `ClusterInstance`. It persists the attempt nonce that opens the general
+/// lifecycle controller's deletion gate, and it certifies `NeverBound` only
+/// after re-observing the complete lease namespace with that same attempt.
+pub async fn run_release_authority_controller(
+    client: Client,
+    namespace: &str,
+    shutdown: CancellationToken,
+) {
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let context = Arc::new(ReleaseAuthorityContext {
+        client,
+        namespace: namespace.to_string(),
+    });
+    info!("Starting isolated release-attempt authority");
+    let controller = Controller::new(leases, Config::default())
+        .run(
+            reconcile_release_authority,
+            release_authority_error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            if let Err(error) = result {
+                debug!(?error, "release authority reconciliation error");
+            }
+        });
+    tokio::select! {
+        _ = controller => {},
+        _ = shutdown.cancelled() => info!("Release-attempt authority shutting down"),
+    }
+}
+
+async fn reconcile_release_authority(
+    lease: Arc<ClusterLease>,
+    ctx: Arc<ReleaseAuthorityContext>,
+) -> Result<Action, LeaseError> {
+    let status = lease.status.clone().unwrap_or_default();
+
+    if lease.spec.cleanup_mode != Some(CleanupMode::VerifiedDestroy)
+        || !matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
+        || lease.metadata.deletion_timestamp.is_some()
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+    if lease
+        .annotations()
+        .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+        .map(String::as_str)
+        != Some("true")
+        || !lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let attempt = match status.teardown_attempt_id.as_deref() {
+        Some(attempt) if !attempt.trim().is_empty() => attempt,
+        Some(_) => {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "terminal lease carries an empty teardown attempt"
+            )));
+        }
+        None if status.teardown_receipt.is_some()
+            || status.unbound_release_verified_at.is_some() =>
+        {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "terminal lease carries proof without a durable attempt"
+            )));
+        }
+        None => {
+            persist_authority_teardown_attempt(&leases, &lease, &status).await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+        }
+    };
+
+    if unbound_release_proof_is_complete(&status) || status.teardown_receipt.is_some() {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+    let Some(verified_at) =
+        authority_never_bound_observation(&ctx.client, &ctx.namespace, &lease).await?
+    else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    };
+    record_authority_unbound_release_proof(&leases, &lease, &status, attempt, &verified_at).await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(1)))
+}
+
+async fn persist_authority_teardown_attempt(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> Result<(), LeaseError> {
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let attempt = uuid::Uuid::new_v4().to_string();
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "add", "path": "/status/teardownAttemptId", "value": attempt }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Return an authority timestamp only when the exact terminal attempt cannot
+/// have a reciprocal instance allocation and its create-capable token name is
+/// closed. A missing candidate after a binding intent is ambiguous: it may
+/// have been bound and deleted, so it is never `NeverBound` evidence.
+async fn authority_never_bound_observation(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+) -> Result<Option<String>, LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    if status.cluster_name.is_some() || status.binding.is_some() {
+        return Ok(None);
+    }
+    let verified_at = match status.connect_token_creation.as_ref() {
+        Some(creation)
+            if creation.phase == ConnectTokenCreationPhase::Closed
+                && creation.verified_absent_at.is_some() =>
+        {
+            let verified_at = creation
+                .verified_absent_at
+                .as_ref()
+                .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+                .cloned();
+            let Some(verified_at) = verified_at else {
+                return Ok(None);
+            };
+            if let Some(identity) = creation.identity.as_ref() {
+                let check = crate::api::connect::observe_lease_connect_token_absent(
+                    client,
+                    namespace,
+                    &lease.name_any(),
+                    identity,
+                )
+                .await;
+                if check.result != crate::crd::CheckResult::Verified {
+                    return Ok(None);
+                }
+            } else if !deterministic_connect_token_name_is_absent(
+                client,
+                namespace,
+                &lease.name_any(),
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            verified_at
+        }
+        // No creator state plus no binding is the durable pre-allocation
+        // checkpoint: this protocol never permits a Secret POST before both
+        // values exist in one status write.
+        None if status.binding.is_none() => {
+            if !deterministic_connect_token_name_is_absent(client, namespace, &lease.name_any())
+                .await?
+            {
+                return Ok(None);
+            }
+            chrono::Utc::now().to_rfc3339()
+        }
+        _ => return Ok(None),
+    };
+
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let all = instances.list(&ListParams::default()).await?;
+    let lease_uid = lease_uid_for(lease)?;
+    if all.iter().any(|instance| {
+        instance.status.as_ref().is_some_and(|instance_status| {
+            instance_status.binding.as_ref().is_some_and(|binding| {
+                binding.lease.name == lease.name_any()
+                    && binding.lease.uid.as_deref() == Some(lease_uid)
+            }) || instance_status.lease_ref.as_ref().is_some_and(|reference| {
+                reference.name == lease.name_any() && reference.uid.as_deref() == Some(lease_uid)
+            })
+        })
+    }) {
+        return Ok(None);
+    }
+
+    Ok(Some(verified_at))
+}
+
+async fn deterministic_connect_token_name_is_absent(
+    client: &Client,
+    namespace: &str,
+    lease_name: &str,
+) -> Result<bool, LeaseError> {
+    let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+        Api::namespaced(client.clone(), namespace);
+    match secrets
+        .get(&crate::api::connect::connect_secret_name(lease_name))
+        .await
+    {
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn record_authority_unbound_release_proof(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+    attempt: &str,
+    verified_at: &str,
+) -> Result<(), LeaseError> {
+    if status.teardown_attempt_id.as_deref() != Some(attempt)
+        || status.cluster_name.is_some()
+        || status.binding.is_some()
+        || status.teardown_receipt.is_some()
+    {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "NeverBound proof lost its exact release attempt"
+        )));
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut conditions: Vec<_> = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type != ALLOCATION_ABSENT_CONDITION)
+        .cloned()
+        .collect();
+    conditions.push(ClusterLeaseCondition {
+        condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+        status: "True".into(),
+        reason: "NeverBound".into(),
+        message: format!("release attempt {attempt} proved no reciprocal allocation existed"),
+        last_transition_time: Some(verified_at.to_string()),
+    });
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "test", "path": "/status/teardownAttemptId", "value": attempt },
+        { "op": "add", "path": "/status/unboundReleaseVerifiedAt", "value": verified_at },
+        { "op": "add", "path": "/status/conditions", "value": conditions }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn release_authority_error_policy(
+    _lease: Arc<ClusterLease>,
+    error: &LeaseError,
+    _ctx: Arc<ReleaseAuthorityContext>,
+) -> Action {
+    warn!(%error, "release authority reconcile failed");
+    Action::requeue(std::time::Duration::from_secs(15))
+}
+
 /// Rebuild priority queues from existing Pending ClusterLease CRDs.
 async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
@@ -715,73 +1015,10 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
     let status = lease.status.clone().unwrap_or_default();
 
-    // A direct Kubernetes DELETE can race the bind path. The receipt-retention
-    // finalizer is installed before reservation, so it also owns this edge:
-    // never bind a terminating lease and never remove the finalizer until a
-    // pre-intent connect token is observed absent.
-    if lease.metadata.deletion_timestamp.is_some()
-        && lease
-            .finalizers()
-            .iter()
-            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
-    {
-        if matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
-            && (status.binding.is_some() || status.cluster_name.is_some())
-        {
-            let uid = lease_uid_for(&lease)?;
-            let rv = lease
-                .resource_version()
-                .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
-            let patch = json_patch(serde_json::json!([
-                { "op": "test", "path": "/metadata/uid", "value": uid },
-                { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-                { "op": "test", "path": "/status/phase", "value": status.phase },
-                { "op": "add", "path": "/status/phase", "value": "Released" }
-            ]));
-            leases_api
-                .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
-                .await?;
-            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
-        }
-        if status.binding.is_none()
-            && status.cluster_name.is_none()
-            && status.teardown_receipt.is_none()
-        {
-            if !checkpoint_unbound_release_attempt(&leases_api, &lease, &status).await? {
-                return Ok(Action::await_change());
-            }
-            crate::api::connect::delete_unbound_lease_connect_token_verified(
-                &ctx.client,
-                &ns,
-                &name,
-                lease_uid_for(&lease)?,
-            )
-            .await
-            .map_err(LeaseError::Lifecycle)?;
-            if !unbound_release_proof_is_complete(&status) {
-                record_unbound_release_proof(&leases_api, &lease, &status).await?;
-                return Ok(Action::await_change());
-            }
-            if sandbox_composition_requires_outer_retirement(&lease) {
-                let proof = unbound_release_acknowledgement_token(&status)
-                    .expect("complete NeverBound proof has an attempt-bound token");
-                let acknowledged = lease
-                    .annotations()
-                    .get(UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
-                    == Some(&proof);
-                if !acknowledged && !stale_sandbox_composition_was_rejected(&lease) {
-                    debug!(lease = %name, "retaining deleting NeverBound handle until the outer Sandbox ACKs proof");
-                    return Ok(Action::requeue(std::time::Duration::from_secs(300)));
-                }
-            }
-            remove_receipt_retention_finalizer(&ctx.client, &ns, &lease).await?;
-            return Ok(Action::await_change());
-        }
-    }
-
-    // This consumer-side gate must run before legacy backfill, queue writes or
-    // binding intent. A POST can commit after its creator was cancelled, and
-    // two operator replicas may reconcile the same object concurrently.
+    // A delayed Sandbox composition POST must be fenced before this
+    // controller performs *any* metadata upgrade on the handle. Otherwise a
+    // stale object can consume the receipt-finalizer upgrade pass and defer
+    // its allocation fence to a later reconcile.
     if status.phase == LeasePhase::Pending {
         match sandbox_composition_allocation_gate(&ctx.client, &ns, &lease).await {
             SandboxCompositionGate::NotComposition | SandboxCompositionGate::Authorized(_) => {}
@@ -812,6 +1049,70 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 return quarantine_invalid_sandbox_composition(&leases_api, &lease).await;
             }
+        }
+    }
+
+    // Verified handles carry the release protocol from their first observed
+    // Pending state, not from the later allocation attempt. Internal Sandbox
+    // compositions install both at CREATE time; this is the idempotent upgrade
+    // path for older exact handles.
+    if lease.metadata.deletion_timestamp.is_none()
+        && status.phase == LeasePhase::Pending
+        && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+        && (!lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+            || lease
+                .annotations()
+                .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+                .map(String::as_str)
+                != Some("true"))
+    {
+        ensure_receipt_retention_finalizer(&ctx.client, &ns, &lease).await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+    }
+
+    // A direct Kubernetes DELETE can race the bind path. The receipt-retention
+    // finalizer is installed before reservation, so it also owns this edge:
+    // never bind a terminating lease and never remove the finalizer until a
+    // pre-intent connect token is observed absent.
+    if lease.metadata.deletion_timestamp.is_some()
+        && lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        if matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
+            && ((status.binding.is_some() || status.cluster_name.is_some())
+                || requires_attempt_bound_token_deletion(&lease))
+        {
+            let uid = lease_uid_for(&lease)?;
+            let rv = lease
+                .resource_version()
+                .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+            let patch = json_patch(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": uid },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+                { "op": "test", "path": "/status/phase", "value": status.phase },
+                { "op": "add", "path": "/status/phase", "value": "Released" }
+            ]));
+            leases_api
+                .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
+                .await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+        }
+        if status.binding.is_none()
+            && status.cluster_name.is_none()
+            && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+            && !requires_attempt_bound_token_deletion(&lease)
+        {
+            // A deleting legacy handle without the create-before-bind fence
+            // cannot exclude an already-dispatched token or reservation POST.
+            // Retain it; manufacturing NeverBound here would turn a 404 into
+            // authority while a delayed create may still commit.
+            warn!(lease = %name, "retaining legacy verified handle without creation fence");
+            return Ok(Action::requeue(std::time::Duration::from_secs(300)));
         }
     }
 
@@ -1075,8 +1376,166 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
             remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
-            let Some(lease_uid) = lease.metadata.uid.as_deref() else {
-                mark_binding_unverified(&leases_api, &lease, "lease_uid_missing").await?;
+            let mut terminal_lease = (*lease).clone();
+            let mut terminal_status = status.clone();
+            let verified_cleanup = requires_attempt_bound_token_deletion(&terminal_lease);
+
+            if verified_cleanup {
+                if terminal_lease
+                    .annotations()
+                    .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+                    .map(String::as_str)
+                    != Some("true")
+                {
+                    mark_binding_unverified(
+                        &leases_api,
+                        &terminal_lease,
+                        "connect_token_create_protocol_unverified",
+                    )
+                    .await?;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                }
+
+                // This nonce must be durable before token deletion, absence
+                // lookup, or NeverBound classification. A retry reuses it.
+                if ensure_unbound_release_attempt(&leases_api, &terminal_lease, &terminal_status)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                }
+
+                if let Some(binding) = terminal_status.binding.clone() {
+                    let Some((closed_lease, closed_binding)) =
+                        close_terminal_connect_token_creation(
+                            &ctx.client,
+                            &ns,
+                            &terminal_lease,
+                            &terminal_status,
+                            &binding,
+                        )
+                        .await?
+                    else {
+                        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                    };
+                    terminal_lease = closed_lease;
+                    terminal_status = terminal_lease.status.clone().unwrap_or_default();
+
+                    // A persisted binding intent is never `NeverBound` proof.
+                    // A stale allocator may already have passed its final
+                    // lease-side check, so adopt the exact candidate into the
+                    // reciprocal teardown path. Competing patches converge on
+                    // the same binding; any different subject fails closed.
+                    if reserve_binding_instance_after_lease_fence(&ctx.client, &ns, &closed_binding)
+                        .await?
+                        != ReservationOutcome::Reserved
+                    {
+                        mark_binding_unverified(
+                            &leases_api,
+                            &terminal_lease,
+                            "binding_intent_could_not_be_adopted_for_teardown",
+                        )
+                        .await?;
+                        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                    }
+                }
+
+                if unbound_release_proof_is_complete(&terminal_status) {
+                    if !unbound_release_proof_acknowledged(&terminal_lease, &terminal_status) {
+                        debug!(lease = %name, "retaining NeverBound proof until its exact attempt is acknowledged");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                    }
+
+                    info!(lease = %name, phase = %phase, "Retiring acknowledged NeverBound lease");
+                    crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+                        .with_label_values(&[
+                            terminal_lease.spec.pool_ref.as_str(),
+                            phase.to_string().as_str(),
+                        ])
+                        .inc();
+                    let terminal_lease =
+                        remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                            .await?;
+                    delete_lease_crd(&leases_api, &terminal_lease).await;
+                    return Ok(Action::await_change());
+                }
+
+                if terminal_status.binding.is_none() && terminal_status.cluster_name.is_none() {
+                    let creator_closed = terminal_status
+                        .connect_token_creation
+                        .as_ref()
+                        .is_none_or(|creation| {
+                            creation.phase == ConnectTokenCreationPhase::Closed
+                                && creation.verified_absent_at.is_some()
+                        });
+                    if !creator_closed {
+                        mark_binding_unverified(
+                            &leases_api,
+                            &terminal_lease,
+                            "unbound_token_creator_not_closed",
+                        )
+                        .await?;
+                        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                    }
+
+                    if !unbound_release_proof_is_complete(&terminal_status) {
+                        // Handles created before the new protocol may carry an
+                        // owner-fenced token with no binding. The release
+                        // attempt above is already durable; delete its exact
+                        // live UID and observe 404 before recording proof.
+                        if terminal_status.connect_token_creation.is_none() {
+                            crate::api::connect::delete_unbound_lease_connect_token_verified(
+                                &ctx.client,
+                                &ns,
+                                &name,
+                                lease_uid_for(&terminal_lease)?,
+                            )
+                            .await
+                            .map_err(LeaseError::Lifecycle)?;
+                        }
+                        let attempt = terminal_status
+                            .teardown_attempt_id
+                            .as_deref()
+                            .expect("durable attempt checked above");
+                        let verified_at = terminal_status
+                            .connect_token_creation
+                            .as_ref()
+                            .and_then(|creation| creation.verified_absent_at.clone())
+                            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                        if !crate::receipt_authority::is_separate() {
+                            record_unbound_release_proof(
+                                &leases_api,
+                                &terminal_lease,
+                                &terminal_status,
+                                attempt,
+                                &verified_at,
+                            )
+                            .await?;
+                        }
+                        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                    }
+                    if !unbound_release_proof_acknowledged(&terminal_lease, &terminal_status) {
+                        debug!(lease = %name, "retaining NeverBound proof until its exact attempt is acknowledged");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+                    }
+
+                    info!(lease = %name, phase = %phase, "Retiring acknowledged NeverBound lease");
+                    crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+                        .with_label_values(&[
+                            terminal_lease.spec.pool_ref.as_str(),
+                            phase.to_string().as_str(),
+                        ])
+                        .inc();
+                    let terminal_lease =
+                        remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                            .await?;
+                    delete_lease_crd(&leases_api, &terminal_lease).await;
+                    return Ok(Action::await_change());
+                }
+            }
+
+            let Some(lease_uid) = terminal_lease.metadata.uid.as_deref() else {
+                mark_binding_unverified(&leases_api, &terminal_lease, "lease_uid_missing").await?;
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             };
 
@@ -1086,7 +1545,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             // immutable `binding.connectToken` UID and records the observed
             // absence in the same attempt's receipt. Deleting here would make
             // that evidence post-hoc and could launder a same-name replacement.
-            let token_delete_result = if requires_attempt_bound_token_deletion(&lease) {
+            let token_delete_result = if verified_cleanup {
                 Ok(())
             } else {
                 crate::api::connect::delete_lease_connect_token(&ctx.client, &ns, &name, lease_uid)
@@ -1094,64 +1553,6 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             };
             if let Err(error) = &token_delete_result {
                 warn!(lease = %name, "connect-token delete failed: {error:#}");
-            }
-
-            // A composition-only lease that reached a terminal phase before
-            // binding never owned a cluster. That absence is useful proof to
-            // the outer SandboxLease, but deleting this handle immediately
-            // would erase it before the outer controller can checkpoint it.
-            // Persist an explicit NeverBound proof and retain the exact handle
-            // until the outer lease ACKs this exact timestamp.
-            if lease.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
-                && lease.spec.requester.requester_type == "kobe:sandbox-composition"
-                && lease.spec.requester.identity == "kobe-operator"
-                && status.binding.is_none()
-                && status.cluster_name.is_none()
-                && status.teardown_receipt.is_none()
-            {
-                if !checkpoint_unbound_release_attempt(&leases_api, &lease, &status).await? {
-                    return Ok(Action::await_change());
-                }
-                if let Err(error) =
-                    crate::api::connect::delete_unbound_lease_connect_token_verified(
-                        &ctx.client,
-                        &ns,
-                        &name,
-                        lease_uid,
-                    )
-                    .await
-                {
-                    warn!(lease = %name, error = %error, "unbound verified connect-token absence is unproven");
-                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                }
-                if !unbound_release_proof_is_complete(&status) {
-                    record_unbound_release_proof(&leases_api, &lease, &status).await?;
-                    return Ok(Action::await_change());
-                }
-                let proof = unbound_release_acknowledgement_token(&status)
-                    .expect("complete NeverBound proof has an attempt-bound token");
-                if stale_sandbox_composition_was_rejected(&lease) {
-                    info!(lease = %name, "Retiring rejected stale NeverBound handle behind retention finalizer");
-                    return Ok(if delete_lease_crd(&leases_api, &lease).await {
-                        Action::await_change()
-                    } else {
-                        Action::requeue(std::time::Duration::from_secs(15))
-                    });
-                }
-                if lease
-                    .annotations()
-                    .get(UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
-                    .is_some_and(|ack| ack == &proof)
-                {
-                    // The outer controller installs/verifies the retention
-                    // fence before deleting. Older ACK writers did not, so
-                    // deleting here could erase the only proof during a
-                    // rolling upgrade.
-                    debug!(lease = %name, "retaining ACKed NeverBound proof for outer retirement");
-                    return Ok(Action::requeue(std::time::Duration::from_secs(300)));
-                }
-                debug!(lease = %name, "retaining terminal NeverBound proof until its composing Sandbox ACKs");
-                return Ok(Action::requeue(std::time::Duration::from_secs(300)));
             }
 
             let resolved = match crate::lease_binding::resolve_lease_binding(
@@ -1190,42 +1591,11 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // failures are transient. Both still fall through to the arm
                 // below and wait.
                 Err(BindingResolutionError::BindingMissing)
-                    if status.cluster_name.is_none()
-                        && !sandbox_composition_requires_outer_retirement(&lease)
-                        && !teardown_receipt_unconsumed(&lease, &status) =>
+                    if terminal_status.cluster_name.is_none()
+                        && !sandbox_composition_requires_outer_retirement(&terminal_lease)
+                        && !teardown_receipt_unconsumed(&terminal_lease, &terminal_status) =>
                 {
-                    if lease
-                        .spec
-                        .cleanup_mode
-                        .unwrap_or_default()
-                        .requires_receipt()
-                    {
-                        if !checkpoint_unbound_release_attempt(&leases_api, &lease, &status).await?
-                        {
-                            return Ok(Action::await_change());
-                        }
-                        // A verified lease can mint its connect token before
-                        // the reciprocal binding intent is durable. In that
-                        // narrow release race, DELETE acceptance above is not
-                        // proof: retain the lease until the exact owner-fenced
-                        // token is observed absent.
-                        if let Err(error) =
-                            crate::api::connect::delete_unbound_lease_connect_token_verified(
-                                &ctx.client,
-                                &ns,
-                                &name,
-                                lease_uid,
-                            )
-                            .await
-                        {
-                            warn!(lease = %name, error = %error, "unbound verified connect-token absence is unproven");
-                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                        }
-                        if !unbound_release_proof_is_complete(&status) {
-                            record_unbound_release_proof(&leases_api, &lease, &status).await?;
-                            return Ok(Action::await_change());
-                        }
-                    }
+                    debug_assert!(!verified_cleanup, "verified unbound path returned above");
                     info!(
                         lease = %name,
                         phase = %phase,
@@ -1233,20 +1603,22 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     );
                     crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
                         .with_label_values(&[
-                            lease.spec.pool_ref.as_str(),
+                            terminal_lease.spec.pool_ref.as_str(),
                             phase.to_string().as_str(),
                         ])
                         .inc();
-                    let lease =
-                        remove_receipt_retention_finalizer(&ctx.client, &ns, &lease).await?;
-                    return Ok(if delete_lease_crd(&leases_api, &lease).await {
+                    let terminal_lease =
+                        remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                            .await?;
+                    return Ok(if delete_lease_crd(&leases_api, &terminal_lease).await {
                         Action::await_change()
                     } else {
                         Action::requeue(std::time::Duration::from_secs(15))
                     });
                 }
                 Err(err) => {
-                    mark_binding_unverified(&leases_api, &lease, err.reason_code()).await?;
+                    mark_binding_unverified(&leases_api, &terminal_lease, err.reason_code())
+                        .await?;
                     return Ok(Action::requeue(std::time::Duration::from_secs(30)));
                 }
             };
@@ -1282,30 +1654,34 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             }
 
             if !mark_instance_recycling(&ctx.client, &ns, &resolved.binding).await? {
-                mark_binding_unverified(&leases_api, &lease, "instance_recycle_fence_failed")
-                    .await?;
+                mark_binding_unverified(
+                    &leases_api,
+                    &terminal_lease,
+                    "instance_recycle_fence_failed",
+                )
+                .await?;
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             }
 
-            let mut recycling_status = status.clone();
+            let mut recycling_status = terminal_status.clone();
             recycling_status.phase = LeasePhase::Recycling;
             if diag_url.is_some() {
                 recycling_status.diagnostics_url = diag_url;
             }
             let conditions = derive_lease_conditions(
                 &recycling_status,
-                &status.conditions,
+                &terminal_status.conditions,
                 None,
                 &chrono::Utc::now().to_rfc3339(),
             );
             recycling_status.conditions = conditions;
-            let lease_rv = lease
+            let lease_rv = terminal_lease
                 .resource_version()
                 .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
             let patch = json_patch(serde_json::json!([
                 { "op": "test", "path": "/metadata/uid", "value": lease_uid },
                 { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
-                { "op": "test", "path": "/status/phase", "value": status.phase },
+                { "op": "test", "path": "/status/phase", "value": terminal_status.phase },
                 { "op": "test", "path": "/status/binding", "value": resolved.binding },
                 { "op": "add", "path": "/status", "value": recycling_status }
             ]));
@@ -1696,8 +2072,11 @@ async fn finalize_binding<B: ClusterBackend>(
         message: None,
         conditions: Vec::new(),
         teardown_receipt: None,
-        unbound_release_verified_at: None,
+        teardown_evidence: None,
         teardown_attempt_id: None,
+        connect_token_creation: status.connect_token_creation.clone(),
+        unbound_release_verified_at: None,
+        teardown_acknowledgement: None,
     };
     new_status.conditions =
         derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
@@ -1800,7 +2179,7 @@ fn teardown_receipt_unconsumed(lease: &ClusterLease, status: &ClusterLeaseStatus
 
 fn sandbox_composition_requires_outer_retirement(lease: &ClusterLease) -> bool {
     lease.spec.requester.requester_type == "kobe:sandbox-composition"
-        && lease.spec.requester.identity == "kobe-operator"
+        && !lease.spec.requester.identity.is_empty()
         && lease.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
 }
 
@@ -1838,7 +2217,7 @@ fn stale_sandbox_composition_was_rejected(lease: &ClusterLease) -> bool {
             .get(crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL)
             .is_some_and(|value| value == "true")
         && lease.spec.requester.requester_type == "kobe:sandbox-composition"
-        && lease.spec.requester.identity == "kobe-operator"
+        && lease.spec.requester.identity == *outer_uid
         && lease.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
         && annotations
             .get(crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION)
@@ -1849,72 +2228,152 @@ fn stale_sandbox_composition_was_rejected(lease: &ClusterLease) -> bool {
         })
 }
 
-const ALLOCATION_ABSENT_CONDITION: &str = "AllocationAbsent";
-
-fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
-    unbound_release_acknowledgement_token(status).is_some()
-}
-
 /// Exact acknowledgement token for a terminal lease that never bound.
 ///
 /// Both the durable teardown attempt and its API-server-observed absence
 /// timestamp participate, so an acknowledgement from an earlier attempt
 /// cannot retire a later proof-bearing handle.
 pub(crate) fn unbound_release_acknowledgement_token(status: &ClusterLeaseStatus) -> Option<String> {
+    if !unbound_release_proof_is_complete(status) {
+        return None;
+    }
     let attempt = status
         .teardown_attempt_id
         .as_deref()
         .filter(|attempt| !attempt.trim().is_empty())?;
     let verified_at = status.unbound_release_verified_at.as_deref()?;
-    chrono::DateTime::parse_from_rfc3339(verified_at).ok()?;
+    Some(format!("{attempt}:{verified_at}"))
+}
+
+/// Acknowledgement is bound to the exact terminal receipt, not a boolean flag.
+/// The Sandbox consumer must first call `permits_release_for` with its trusted
+/// scope and then write this token; a stale attempt annotation never releases a
+/// newer receipt.
+fn teardown_receipt_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
     status
-        .conditions
-        .iter()
-        .any(|condition| {
+        .teardown_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.acknowledgement_token())
+        .zip(status.teardown_receipt.as_ref())
+        .is_some_and(|(expected, receipt)| {
+            if crate::receipt_authority::is_separate() {
+                return status.teardown_acknowledgement.as_ref().is_some_and(|ack| {
+                    ack.attempt_id == receipt.attempt_id
+                        && ack.proof.kind == TeardownAcknowledgedProofKind::Receipt
+                        && ack.proof.receipt_token.as_deref() == Some(expected.as_str())
+                        && ack.proof.evidence.as_ref().is_some_and(|evidence| {
+                            status.teardown_evidence.as_ref() == Some(evidence)
+                        })
+                });
+            }
+            lease
+                .annotations()
+                .get(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+                == Some(&expected)
+        })
+}
+
+/// A `NeverBound` proof is attempt-bound and may exist only after the
+/// create-capable token state is absent or durably Closed.
+fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
+    let attempt = status
+        .teardown_attempt_id
+        .as_deref()
+        .filter(|attempt| !attempt.trim().is_empty());
+    let verified_at = status
+        .unbound_release_verified_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    let creator_closed = status
+        .connect_token_creation
+        .as_ref()
+        .is_none_or(|creation| {
+            creation.phase == ConnectTokenCreationPhase::Closed
+                && creation.verified_absent_at.as_deref()
+                    == status.unbound_release_verified_at.as_deref()
+        });
+    attempt.is_some()
+        && verified_at.is_some()
+        && creator_closed
+        && status.binding.is_none()
+        && status.cluster_name.is_none()
+        && status.teardown_receipt.is_none()
+        && status.teardown_evidence.is_none()
+        && status.conditions.iter().any(|condition| {
             condition.condition_type == ALLOCATION_ABSENT_CONDITION
                 && condition.status == "True"
                 && condition.reason == "NeverBound"
+                && condition.message.contains(attempt.unwrap())
         })
-        .then(|| format!("{attempt}:{verified_at}"))
 }
 
-/// Persist the attempt nonce before any unbound connect-token DELETE.
-/// Returns `true` only when the caller's read already contained that durable
-/// checkpoint; a successful write ends the pass so deletion happens after a
-/// fresh API read.
-async fn checkpoint_unbound_release_attempt(
+fn unbound_release_proof_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
+    status.teardown_attempt_id.as_ref().is_some_and(|attempt| {
+        if crate::receipt_authority::is_separate() {
+            return status.teardown_acknowledgement.as_ref().is_some_and(|ack| {
+                ack.attempt_id == *attempt
+                    && ack.proof.kind == TeardownAcknowledgedProofKind::NeverBound
+                    && ack
+                        .proof
+                        .unbound_release_verified_at
+                        .as_ref()
+                        .is_some_and(|verified_at| {
+                            status.unbound_release_verified_at.as_ref() == Some(verified_at)
+                        })
+            });
+        }
+        lease
+            .annotations()
+            .get(UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
+            == Some(attempt)
+    })
+}
+
+/// Persist the release attempt before any token deletion or absence lookup.
+async fn ensure_unbound_release_attempt(
     leases: &Api<ClusterLease>,
     lease: &ClusterLease,
     status: &ClusterLeaseStatus,
-) -> Result<bool, LeaseError> {
-    if let Some(attempt) = status.teardown_attempt_id.as_deref() {
-        if attempt.trim().is_empty() {
-            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-                "unbound teardown attempt ID is empty"
-            )));
-        }
-        return Ok(true);
+) -> Result<Option<String>, LeaseError> {
+    if let Some(attempt) = status
+        .teardown_attempt_id
+        .as_ref()
+        .filter(|attempt| !attempt.trim().is_empty())
+    {
+        return Ok(Some(attempt.clone()));
+    }
+    if status.teardown_attempt_id.is_some() || status.teardown_receipt.is_some() {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "unbound release has malformed or conflicting teardown evidence"
+        )));
+    }
+    if crate::receipt_authority::is_separate() {
+        // Only the dedicated authority may open a destructive attempt in the
+        // split deployment. The lifecycle controller will requeue without
+        // issuing a DELETE until that exact nonce is visible.
+        return Ok(None);
     }
     let uid = lease_uid_for(lease)?;
     let resource_version = lease
         .resource_version()
-        .ok_or_else(|| anyhow::anyhow!("lease resourceVersion missing"))?;
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let attempt = uuid::Uuid::new_v4().to_string();
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
         { "op": "test", "path": "/status/phase", "value": status.phase },
-        { "op": "add", "path": "/status/teardownAttemptId", "value": uuid::Uuid::new_v4().to_string() }
+        { "op": "add", "path": "/status/teardownAttemptId", "value": attempt }
     ]));
     match leases
         .patch_status(
             &lease.name_any(),
             &PatchParams::default(),
-            &Patch::Json::<()>(patch),
+            &Patch::<()>::Json(patch),
         )
         .await
     {
-        Ok(_) => Ok(false),
-        Err(error) if optimistic_conflict(&error) => Ok(false),
+        Ok(_) => Ok(None),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -1923,32 +2382,22 @@ async fn record_unbound_release_proof(
     leases: &Api<ClusterLease>,
     lease: &ClusterLease,
     status: &ClusterLeaseStatus,
+    attempt: &str,
+    verified_at: &str,
 ) -> Result<(), LeaseError> {
-    let Some(uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
-        return Err(LeaseError::Lifecycle(anyhow::anyhow!("lease UID missing")));
-    };
-    let Some(resource_version) = lease.resource_version() else {
+    if status.teardown_attempt_id.as_deref() != Some(attempt)
+        || status.binding.is_some()
+        || status.cluster_name.is_some()
+        || status.teardown_receipt.is_some()
+    {
         return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-            "lease resourceVersion missing"
+            "NeverBound proof lost its exact release attempt"
         )));
-    };
-    let attempt = status
-        .teardown_attempt_id
-        .as_deref()
-        .filter(|attempt| !attempt.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("unbound teardown attempt was not checkpointed"))?;
-    let verified_at = status
-        .unbound_release_verified_at
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    let previous = status
-        .conditions
-        .iter()
-        .find(|condition| condition.condition_type == ALLOCATION_ABSENT_CONDITION);
-    let transition = previous
-        .filter(|condition| condition.status == "True" && condition.reason == "NeverBound")
-        .and_then(|condition| condition.last_transition_time.clone())
-        .unwrap_or_else(|| verified_at.clone());
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
     let mut conditions: Vec<_> = status
         .conditions
         .iter()
@@ -1959,10 +2408,8 @@ async fn record_unbound_release_proof(
         condition_type: ALLOCATION_ABSENT_CONDITION.into(),
         status: "True".into(),
         reason: "NeverBound".into(),
-        message: format!(
-            "Terminal lease never acquired a ClusterInstance binding in teardown attempt {attempt}"
-        ),
-        last_transition_time: Some(transition),
+        message: format!("release attempt {attempt} proved no binding was ever created"),
+        last_transition_time: Some(verified_at.to_string()),
     });
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
@@ -1976,7 +2423,7 @@ async fn record_unbound_release_proof(
         .patch_status(
             &lease.name_any(),
             &PatchParams::default(),
-            &Patch::Json::<()>(patch),
+            &Patch::<()>::Json(patch),
         )
         .await
     {
@@ -1986,21 +2433,180 @@ async fn record_unbound_release_proof(
     }
 }
 
-/// Acknowledgement is bound to the exact terminal receipt, not a boolean flag.
-/// The Sandbox consumer must first call `permits_release_for` with its trusted
-/// scope and then write this token; a stale attempt annotation never releases a
-/// newer receipt.
-fn teardown_receipt_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
-    status
-        .teardown_receipt
-        .as_ref()
-        .and_then(|receipt| receipt.acknowledgement_token())
-        .is_some_and(|expected| {
-            lease
-                .annotations()
-                .get(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
-                == Some(&expected)
-        })
+/// Close the only create-capable token attempt for a terminal verified lease.
+///
+/// Every destructive step is bound to the already-persisted teardown attempt.
+/// `Creating` is observation-only: a 404 is ambiguous and therefore never
+/// advances to `Closed`. `Closed` is reached only after either proving that the
+/// attempt was still `Prepared` (so no POST was permitted) or deleting an exact
+/// persisted Secret UID and observing its absence.
+async fn close_terminal_connect_token_creation(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+    binding: &LeaseBinding,
+) -> Result<Option<(ClusterLease, LeaseBinding)>, LeaseError> {
+    let creation = status.connect_token_creation.as_ref().ok_or_else(|| {
+        LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified terminal binding has no token creation checkpoint"
+        ))
+    })?;
+    let teardown_attempt = status
+        .teardown_attempt_id
+        .as_deref()
+        .filter(|attempt| !attempt.trim().is_empty())
+        .ok_or_else(|| {
+            LeaseError::Lifecycle(anyhow::anyhow!(
+                "terminal token close has no durable teardown attempt"
+            ))
+        })?;
+    if !matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
+        || status.binding.as_ref() != Some(binding)
+        || creation.attempt_id.trim().is_empty()
+    {
+        return Ok(None);
+    }
+
+    if creation.phase == ConnectTokenCreationPhase::Closed {
+        let verified_at = creation
+            .verified_absent_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        let identity_matches = match creation.identity.as_ref() {
+            Some(identity) => binding.connect_token.as_ref() == Some(identity),
+            None => binding.connect_token.is_none(),
+        };
+        if verified_at.is_none() || !identity_matches {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "Closed connect-token attempt lacks exact absence evidence"
+            )));
+        }
+        return Ok(Some((lease.clone(), binding.clone())));
+    }
+
+    let mut next_binding = binding.clone();
+    let mut next_creation = creation.clone();
+    let mut clear_unstarted_binding = false;
+    match creation.phase {
+        ConnectTokenCreationPhase::Prepared => {
+            if creation.identity.is_some() || binding.connect_token.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Prepared token attempt unexpectedly carries an identity"
+                )));
+            }
+            // The only code path allowed to POST first CASes Prepared to
+            // Creating while the lease is Pending. This terminal observation
+            // therefore proves no create was dispatched for this attempt.
+            next_creation.phase = ConnectTokenCreationPhase::Closed;
+            next_creation.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
+            // No reservation can be in flight before Creating, so this exact
+            // candidate was never exposed and does not need a backend receipt.
+            // Clear the intent in the same CAS that closes its creator; the
+            // authority can then issue attempt-bound NeverBound proof after
+            // independently observing the deterministic Secret and every
+            // reciprocal ClusterInstance absent.
+            clear_unstarted_binding = true;
+        }
+        ConnectTokenCreationPhase::Creating => {
+            if creation.identity.is_some() || binding.connect_token.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Creating token attempt unexpectedly carries an identity"
+                )));
+            }
+            let Some(identity) = crate::api::connect::observe_reserved_lease_connect_token(
+                client,
+                namespace,
+                lease,
+                &creation.attempt_id,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?
+            else {
+                // The original POST may still arrive. Never issue another POST
+                // and never certify absence from this 404.
+                return Ok(None);
+            };
+            next_binding.connect_token = Some(identity.clone());
+            next_creation.identity = Some(identity);
+            next_creation.phase = ConnectTokenCreationPhase::Closing;
+        }
+        ConnectTokenCreationPhase::Reserved | ConnectTokenCreationPhase::Ready => {
+            if creation.identity.as_ref() != binding.connect_token.as_ref()
+                || creation.identity.is_none()
+            {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "reserved token identity differs from the binding"
+                )));
+            }
+            next_creation.phase = ConnectTokenCreationPhase::Closing;
+        }
+        ConnectTokenCreationPhase::Closing => {
+            let identity = creation.identity.as_ref().ok_or_else(|| {
+                LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Closing token attempt has no exact identity"
+                ))
+            })?;
+            if binding.connect_token.as_ref() != Some(identity) {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Closing token identity differs from the binding"
+                )));
+            }
+            let check = crate::api::connect::delete_lease_connect_token_verified(
+                client,
+                namespace,
+                &binding.lease.name,
+                lease_uid_for(lease)?,
+                identity,
+            )
+            .await;
+            if check.result != crate::crd::CheckResult::Verified {
+                return Ok(None);
+            }
+            next_creation.phase = ConnectTokenCreationPhase::Closed;
+            next_creation.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        ConnectTokenCreationPhase::Closed => unreachable!("handled above"),
+    }
+
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
+        serde_json::json!({ "op": "test", "path": "/status/phase", "value": status.phase }),
+        serde_json::json!({ "op": "test", "path": "/status/teardownAttemptId", "value": teardown_attempt }),
+        serde_json::json!({ "op": "test", "path": "/status/binding", "value": binding }),
+        serde_json::json!({ "op": "test", "path": "/status/connectTokenCreation", "value": creation }),
+    ];
+    if clear_unstarted_binding {
+        operations.push(serde_json::json!({
+            "op": "remove", "path": "/status/binding"
+        }));
+    } else {
+        operations.push(serde_json::json!({
+            "op": "add", "path": "/status/binding", "value": next_binding
+        }));
+    }
+    operations.push(serde_json::json!({
+        "op": "add", "path": "/status/connectTokenCreation", "value": next_creation
+    }));
+    let patch = json_patch(serde_json::Value::Array(operations));
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(None),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn remove_receipt_retention_finalizer(
@@ -2215,10 +2821,14 @@ async fn ensure_receipt_retention_finalizer(
         .cleanup_mode
         .unwrap_or_default()
         .requires_receipt()
-        || lease
+        || (lease
             .finalizers()
             .iter()
             .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+            && lease
+                .annotations()
+                .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+                .is_some_and(|value| value == "true"))
     {
         return Ok(lease.clone());
     }
@@ -2232,11 +2842,19 @@ async fn ensure_receipt_retention_finalizer(
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
     let mut finalizers = lease.finalizers().to_vec();
-    finalizers.push(TEARDOWN_RECEIPT_RETENTION_FINALIZER.to_string());
+    if !finalizers
+        .iter()
+        .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        finalizers.push(TEARDOWN_RECEIPT_RETENTION_FINALIZER.to_string());
+    }
+    let mut annotations = lease.annotations().clone();
+    annotations.insert(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION.into(), "true".into());
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers },
+        { "op": "add", "path": "/metadata/annotations", "value": annotations }
     ]));
     let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
     Ok(leases
@@ -2293,6 +2911,262 @@ async fn validate_binding_eligibility(
         .await
 }
 
+/// Finish the create-capable part of a verified connect-token footprint.
+///
+/// The lease-side binding and `Prepared` attempt are durable first. This
+/// function persists `Creating` and permits exactly one empty-Secret `POST` in
+/// the same call. A later reconcile that observes `Creating` only observes the
+/// original request; it never retries the `POST`. Once the exact UID is
+/// durable, activation is a patch, so terminal release can close the creator,
+/// delete that UID, and prove absence without a delayed create repopulating the
+/// name.
+async fn complete_connect_token_creation(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<Option<(ClusterLease, LeaseBinding)>, LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let Some(mut creation) = status.connect_token_creation.clone() else {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding has no durable connect-token creation attempt"
+        )));
+    };
+    if status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || creation.attempt_id.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    let lease_uid = lease_uid_for(lease)?.to_string();
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+
+    let (lease, binding, creation) = match creation.phase {
+        ConnectTokenCreationPhase::Prepared => {
+            if binding.connect_token.is_some() || creation.identity.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Prepared connect-token attempt already carries an identity"
+                )));
+            }
+            let observed_rv = lease
+                .resource_version()
+                .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+            let prepared_creation = creation.clone();
+            creation.phase = ConnectTokenCreationPhase::Creating;
+            let patch = json_patch(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": observed_rv },
+                { "op": "test", "path": "/status/phase", "value": "Pending" },
+                { "op": "test", "path": "/status/binding", "value": binding },
+                { "op": "test", "path": "/status/connectTokenCreation", "value": prepared_creation },
+                { "op": "add", "path": "/status/connectTokenCreation", "value": creation }
+            ]));
+            let dispatched = match leases
+                .patch_status(
+                    &binding.lease.name,
+                    &PatchParams::default(),
+                    &Patch::<()>::Json(patch),
+                )
+                .await
+            {
+                Ok(dispatched) => dispatched,
+                Err(error) if optimistic_conflict(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let dispatched_creation = dispatched
+                .status
+                .as_ref()
+                .and_then(|status| status.connect_token_creation.clone())
+                .ok_or_else(|| {
+                    LeaseError::Lifecycle(anyhow::anyhow!(
+                        "dispatched connect-token attempt disappeared"
+                    ))
+                })?;
+            if dispatched_creation.phase != ConnectTokenCreationPhase::Creating {
+                return Ok(None);
+            }
+            let identity = crate::api::connect::reserve_lease_connect_token(
+                client,
+                namespace,
+                &dispatched,
+                &dispatched_creation.attempt_id,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?;
+            let Some(sealed) = persist_reserved_connect_token(
+                client,
+                namespace,
+                &dispatched,
+                binding,
+                &dispatched_creation,
+                identity,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            sealed
+        }
+        ConnectTokenCreationPhase::Creating => {
+            if binding.connect_token.is_some() || creation.identity.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Creating connect-token attempt already carries an identity"
+                )));
+            }
+            let Some(identity) = crate::api::connect::observe_reserved_lease_connect_token(
+                client,
+                namespace,
+                lease,
+                &creation.attempt_id,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?
+            else {
+                // The original POST may still be in flight. Retrying it would
+                // reopen the create name after terminal teardown, so ambiguity
+                // is retained and NeverBound remains impossible.
+                return Ok(None);
+            };
+            let Some(sealed) = persist_reserved_connect_token(
+                client, namespace, lease, binding, &creation, identity,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            sealed
+        }
+        ConnectTokenCreationPhase::Reserved | ConnectTokenCreationPhase::Ready => {
+            if binding.connect_token.as_ref() != creation.identity.as_ref() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "connect-token binding and creation identities differ"
+                )));
+            }
+            (lease.clone(), binding.clone(), creation)
+        }
+        ConnectTokenCreationPhase::Closing => {
+            close_abandoned_pending_binding(client, namespace, lease, binding).await?;
+            return Ok(None);
+        }
+        ConnectTokenCreationPhase::Closed => {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "Closed token attempt still carries a binding intent"
+            )));
+        }
+    };
+
+    if creation.phase == ConnectTokenCreationPhase::Ready {
+        crate::api::connect::ensure_lease_connect_token(client, namespace, &lease, &binding)
+            .await
+            .map_err(LeaseError::Lifecycle)?;
+        return Ok(Some((lease, binding)));
+    }
+
+    crate::api::connect::activate_reserved_lease_connect_token(
+        client,
+        namespace,
+        &binding.lease.name,
+        &lease_uid,
+        &binding,
+        &creation.attempt_id,
+    )
+    .await
+    .map_err(LeaseError::Lifecycle)?;
+
+    let current = leases.get(&binding.lease.name).await?;
+    let current_status = current.status.as_ref().cloned().unwrap_or_default();
+    let Some(mut current_creation) = current_status.connect_token_creation.clone() else {
+        return Ok(None);
+    };
+    if current.metadata.uid.as_deref() != Some(lease_uid.as_str())
+        || current_status.phase != LeasePhase::Pending
+        || current_status.binding.as_ref() != Some(&binding)
+        || current_creation != creation
+    {
+        return Ok(None);
+    }
+    let resource_version = current
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    current_creation.phase = ConnectTokenCreationPhase::Ready;
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+        { "op": "add", "path": "/status/connectTokenCreation", "value": current_creation }
+    ]));
+    match leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(ready) => Ok(Some((ready, binding))),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn persist_reserved_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+    creation: &ConnectTokenCreation,
+    identity: crate::crd::KubernetesResourceIdentity,
+) -> Result<Option<(ClusterLease, LeaseBinding, ConnectTokenCreation)>, LeaseError> {
+    if creation.phase != ConnectTokenCreationPhase::Creating
+        || creation.identity.is_some()
+        || binding.connect_token.is_some()
+    {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "only an unresolved Creating attempt can persist a token UID"
+        )));
+    }
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    if status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || status.connect_token_creation.as_ref() != Some(creation)
+    {
+        return Ok(None);
+    }
+    let lease_uid = lease_uid_for(lease)?;
+    let observed_rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut sealed_binding = binding.clone();
+    sealed_binding.connect_token = Some(identity.clone());
+    let mut sealed_creation = creation.clone();
+    sealed_creation.phase = ConnectTokenCreationPhase::Reserved;
+    sealed_creation.identity = Some(identity);
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": observed_rv },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+        { "op": "add", "path": "/status/binding", "value": sealed_binding },
+        { "op": "add", "path": "/status/connectTokenCreation", "value": sealed_creation }
+    ]));
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    match leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(sealed) => Ok(Some((sealed, sealed_binding, sealed_creation))),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn reserve_ready_instance(
     client: &Client,
     namespace: &str,
@@ -2318,14 +3192,14 @@ async fn reserve_ready_instance(
         {
             return Ok(None);
         }
-        if binding.cleanup_mode.requires_receipt()
-            && let Err(error) =
-                crate::api::connect::ensure_lease_connect_token(client, namespace, &lease, &binding)
-                    .await
-        {
-            warn!(lease = %lease.name_any(), error = %error, "Cannot resume verified reservation with a changed connect-token footprint");
-            return Ok(None);
-        }
+        let (lease, binding) = if binding.cleanup_mode.requires_receipt() {
+            match complete_connect_token_creation(client, namespace, &lease, &binding).await? {
+                Some(ready) => ready,
+                None => return Ok(None),
+            }
+        } else {
+            (lease.clone(), binding)
+        };
         return match reserve_binding_instance(client, namespace, &binding).await? {
             ReservationOutcome::Reserved => Ok(Some(binding)),
             ReservationOutcome::Occupied => {
@@ -2411,27 +3285,32 @@ async fn reserve_ready_instance(
             warn!(lease = %lease.name_any(), "Refusing binding intent whose pool differs from the outer Sandbox authority");
             return Ok(None);
         }
-        if binding.cleanup_mode.requires_receipt() {
-            let token_identity =
-                crate::api::connect::provision_lease_connect_token(client, namespace, &lease)
-                    .await
-                    .map_err(LeaseError::Lifecycle)?;
-            binding.connect_token = Some(token_identity);
-            // Read it back through the exact-footprint path. This catches a
-            // same-name replacement between create/get and the binding intent.
-            crate::api::connect::ensure_lease_connect_token(client, namespace, &lease, &binding)
-                .await
-                .map_err(LeaseError::Lifecycle)?;
-        }
-
         let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
-        let intent_patch = json_patch(serde_json::json!([
-            { "op": "test", "path": "/metadata/uid", "value": lease_uid },
-            { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
-            { "op": "test", "path": "/status/phase", "value": "Pending" },
-            { "op": "add", "path": "/status/binding", "value": binding }
-        ]));
-        match leases_api
+        let token_creation =
+            binding
+                .cleanup_mode
+                .requires_receipt()
+                .then(|| ConnectTokenCreation {
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                    phase: ConnectTokenCreationPhase::Prepared,
+                    identity: None,
+                    verified_absent_at: None,
+                });
+        let mut operations = vec![
+            serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid }),
+            serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv }),
+            serde_json::json!({ "op": "test", "path": "/status/phase", "value": "Pending" }),
+            serde_json::json!({ "op": "add", "path": "/status/binding", "value": binding }),
+        ];
+        if let Some(token_creation) = token_creation {
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": "/status/connectTokenCreation",
+                "value": token_creation
+            }));
+        }
+        let intent_patch = json_patch(serde_json::Value::Array(operations));
+        let intent_lease = match leases_api
             .patch_status(
                 &lease.name_any(),
                 &PatchParams::default(),
@@ -2439,9 +3318,18 @@ async fn reserve_ready_instance(
             )
             .await
         {
-            Ok(_) => {}
+            Ok(intent) => intent,
             Err(err) if optimistic_conflict(&err) => return Ok(None),
             Err(err) => return Err(err.into()),
+        };
+
+        if binding.cleanup_mode.requires_receipt() {
+            let Some((_, completed)) =
+                complete_connect_token_creation(client, namespace, &intent_lease, &binding).await?
+            else {
+                return Ok(None);
+            };
+            binding = completed;
         }
 
         match reserve_binding_instance(client, namespace, &binding).await? {
@@ -2498,6 +3386,51 @@ fn instance_carries_compatible_reservation(
 /// proof. Only a fresh read of the same name proving a foreign or already-held
 /// object returns [`ReservationOutcome::Occupied`]; absence remains retryable.
 async fn reserve_binding_instance(
+    client: &Client,
+    namespace: &str,
+    binding: &LeaseBinding,
+) -> Result<ReservationOutcome, LeaseError> {
+    // Close the stale-reconcile window at the last boundary before an instance
+    // status mutation. A token creator or allocator that read Pending before a
+    // concurrent release cannot reserve after that release has moved the lease
+    // or its creation state to Closing.
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let lease = match leases.get(&binding.lease.name).await {
+        Ok(lease) => lease,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok(ReservationOutcome::Retry);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let token_ready = !binding.cleanup_mode.requires_receipt()
+        || status
+            .connect_token_creation
+            .as_ref()
+            .is_some_and(|creation| {
+                creation.phase == ConnectTokenCreationPhase::Ready
+                    && creation.identity.as_ref() == binding.connect_token.as_ref()
+            });
+    if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref()
+        || lease.metadata.deletion_timestamp.is_some()
+        || status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || !token_ready
+    {
+        // A terminal transition or exact adopted intent is not evidence that
+        // another subject occupied the instance. Preserve the lease-side
+        // handle; the terminal controller will adopt it into teardown.
+        return Ok(ReservationOutcome::Retry);
+    }
+    reserve_binding_instance_after_lease_fence(client, namespace, binding).await
+}
+
+/// Reserve an instance after the caller has closed or validated the exact
+/// lease-side creator fence. The ordinary bind path must use
+/// [`reserve_binding_instance`]; terminal close uses this only to force an
+/// already-selected free instance into the teardown path, eliminating the
+/// `NeverBound` versus stale-reserve ambiguity.
+async fn reserve_binding_instance_after_lease_fence(
     client: &Client,
     namespace: &str,
     binding: &LeaseBinding,
@@ -2693,6 +3626,115 @@ async fn reserve_binding_instance(
     }
 }
 
+/// Close a connect-token attempt whose exact instance reservation lost.
+///
+/// `Closing` is persisted before deleting the exact Secret UID. A crash after
+/// deletion therefore resumes deletion/absence observation instead of trying
+/// to activate or recreate the credential. The final patch retains the Closed
+/// attempt while atomically removing its abandoned binding; only a later
+/// `Closed -> Prepared` transition may open a fresh attempt for a new
+/// candidate.
+async fn close_abandoned_pending_binding(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<(), LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let creation = status.connect_token_creation.as_ref().ok_or_else(|| {
+        LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding rollback has no token creation checkpoint"
+        ))
+    })?;
+    let identity = creation.identity.as_ref().ok_or_else(|| {
+        LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding rollback has no exact token identity"
+        ))
+    })?;
+    if status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || binding.connect_token.as_ref() != Some(identity)
+    {
+        return Ok(());
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+
+    if matches!(
+        creation.phase,
+        ConnectTokenCreationPhase::Reserved | ConnectTokenCreationPhase::Ready
+    ) {
+        let mut closing = creation.clone();
+        closing.phase = ConnectTokenCreationPhase::Closing;
+        let patch = json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "test", "path": "/status/phase", "value": "Pending" },
+            { "op": "test", "path": "/status/binding", "value": binding },
+            { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+            { "op": "add", "path": "/status/connectTokenCreation", "value": closing }
+        ]));
+        return match leases
+            .patch_status(
+                &binding.lease.name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if optimistic_conflict(&error) => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    if creation.phase != ConnectTokenCreationPhase::Closing {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding rollback did not enter Closing"
+        )));
+    }
+
+    let check = crate::api::connect::delete_lease_connect_token_verified(
+        client,
+        namespace,
+        &binding.lease.name,
+        uid,
+        identity,
+    )
+    .await;
+    if check.result != crate::crd::CheckResult::Verified {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "cannot clear a verified binding while its token footprint is unproven"
+        )));
+    }
+    let mut closed = creation.clone();
+    closed.phase = ConnectTokenCreationPhase::Closed;
+    closed.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+        { "op": "remove", "path": "/status/binding" },
+        { "op": "add", "path": "/status/connectTokenCreation", "value": closed }
+    ]));
+    match leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn clear_lease_binding_intent(
     client: &Client,
     namespace: &str,
@@ -2714,13 +3756,17 @@ async fn clear_lease_binding_intent(
     let rv = lease
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
-    let patch = json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "test", "path": "/status/phase", "value": "Pending" },
-        { "op": "test", "path": "/status/binding", "value": binding },
-        { "op": "remove", "path": "/status/binding" }
-    ]));
+    if binding.cleanup_mode.requires_receipt() {
+        return close_abandoned_pending_binding(client, namespace, &lease, binding).await;
+    }
+    let operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": rv }),
+        serde_json::json!({ "op": "test", "path": "/status/phase", "value": "Pending" }),
+        serde_json::json!({ "op": "test", "path": "/status/binding", "value": binding }),
+        serde_json::json!({ "op": "remove", "path": "/status/binding" }),
+    ];
+    let patch = json_patch(serde_json::Value::Array(operations));
     match leases_api
         .patch_status(
             &binding.lease.name,
@@ -3683,6 +4729,29 @@ mod tests {
         })
     }
 
+    fn exact_pending_lease_for_binding(binding: &LeaseBinding) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": binding.lease.name,
+                "namespace": "test-ns",
+                "uid": binding.lease.uid,
+                "resourceVersion": "10",
+                "generation": 1
+            },
+            "spec": {
+                "poolRef": "test-profile",
+                "ttl": "1h",
+                "requester": { "type": "test:admin", "identity": "user@test.com" }
+            },
+            "status": {
+                "phase": "Pending",
+                "binding": binding
+            }
+        })
+    }
+
     #[tokio::test]
     async fn two_competing_reservations_have_exactly_one_patch_winner() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3723,10 +4792,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let won = reserve_binding_instance(&client, "test-ns", &first)
+        let won = reserve_binding_instance_after_lease_fence(&client, "test-ns", &first)
             .await
             .unwrap();
-        let lost = reserve_binding_instance(&client, "test-ns", &second)
+        let lost = reserve_binding_instance_after_lease_fence(&client, "test-ns", &second)
             .await
             .unwrap();
         assert_eq!(won, ReservationOutcome::Reserved);
@@ -3766,6 +4835,16 @@ mod tests {
         let adopted = exact_instance_for_binding(Some(&binding), "Leased");
         let instance_path =
             "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_pending_lease_for_binding(&binding)),
+            )
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path(instance_path))
@@ -3811,6 +4890,16 @@ mod tests {
             "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
 
         Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_pending_lease_for_binding(&binding)),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
             .and(path(instance_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(recycling))
             .mount(&server)
@@ -3842,6 +4931,16 @@ mod tests {
         adopted["status"]["leaseRef"] = serde_json::Value::Null;
         let instance_path =
             "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_pending_lease_for_binding(&binding)),
+            )
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path(instance_path))
@@ -3964,6 +5063,14 @@ mod tests {
 
         let mut lease = make_test_lease("lease-a", "Pending");
         Arc::make_mut(&mut lease).status.as_mut().unwrap().binding = Some(binding.clone());
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .expect(1)
+            .mount(&server)
+            .await;
         let resumed = reserve_ready_instance(&client, "test-ns", &lease, None)
             .await
             .unwrap();
@@ -3971,8 +5078,8 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
             requests.len(),
-            2,
-            "replay may revalidate the exact instance but must not list or reserve another one"
+            3,
+            "replay may revalidate the exact lease and instance but must not list or reserve another one"
         );
     }
 
@@ -4071,7 +5178,7 @@ mod tests {
                 "ttl": "2h",
                 "requester": {
                     "type": "kobe:sandbox-composition",
-                    "identity": "kobe-operator"
+                    "identity": "late-outer-uid"
                 },
                 "priority": 1000,
                 "cleanupMode": "VerifiedDestroy"
@@ -4099,6 +5206,416 @@ mod tests {
             .unwrap()
             .remove(crate::sandbox::SANDBOX_LEASE_UID_LABEL);
         serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_creating_404_remains_ambiguous_and_emits_no_write() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        let mut lease = (*make_test_lease("lease-a", "Released")).clone();
+        lease.metadata.resource_version = Some("10".into());
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.cluster_name = None;
+        status.binding = Some(binding.clone());
+        status.teardown_attempt_id = Some("teardown-1".into());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Creating,
+            identity: None,
+            verified_absent_at: None,
+        });
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = close_terminal_connect_token_creation(
+            &client,
+            "test-ns",
+            &lease,
+            lease.status.as_ref().unwrap(),
+            &binding,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(!unbound_release_proof_is_complete(
+            lease.status.as_ref().unwrap()
+        ));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method != http::Method::POST
+                && request.method != http::Method::PATCH
+                && request.method != http::Method::DELETE
+        }));
+    }
+
+    #[tokio::test]
+    async fn terminal_prepared_closes_creator_and_clears_unstarted_binding_atomically() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        let mut lease = (*make_test_lease("lease-a", "Released")).clone();
+        lease.metadata.resource_version = Some("10".into());
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.cluster_name = None;
+        status.binding = Some(binding.clone());
+        status.teardown_attempt_id = Some("teardown-1".into());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Prepared,
+            identity: None,
+            verified_absent_at: None,
+        });
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            close_terminal_connect_token_creation(
+                &client,
+                "test-ns",
+                &lease,
+                lease.status.as_ref().unwrap(),
+                &binding,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "Prepared close must issue only its CAS");
+        let patch: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let operations = patch.as_array().unwrap();
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "remove" && operation["path"] == "/status/binding"
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["path"] == "/status/connectTokenCreation"
+                && operation["value"]["phase"] == "closed"
+                && operation["value"]["verifiedAbsentAt"].is_string()
+        }));
+    }
+
+    #[tokio::test]
+    async fn lost_reservation_persists_closing_before_token_delete() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let identity = crate::crd::KubernetesResourceIdentity {
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            namespace: Some("test-ns".into()),
+            name: "lease-a-connect-token".into(),
+            uid: "token-uid".into(),
+        };
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        binding.connect_token = Some(identity.clone());
+        let mut lease = (*make_test_lease("lease-a", "Pending")).clone();
+        lease.metadata.resource_version = Some("10".into());
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.binding = Some(binding.clone());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Ready,
+            identity: Some(identity),
+            verified_absent_at: None,
+        });
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        close_abandoned_pending_binding(&client, "test-ns", &lease, &binding)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method != http::Method::DELETE)
+        );
+        let patch: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(patch.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/connectTokenCreation"
+                && operation["value"]["phase"] == "closing"
+        }));
+    }
+
+    fn authority_unbound_lease() -> ClusterLease {
+        let mut lease = (*make_test_lease("lease-a", "Released")).clone();
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.cluster_name = None;
+        status.teardown_attempt_id = Some("teardown-1".into());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Closed,
+            identity: None,
+            verified_absent_at: Some("2026-01-01T00:00:00Z".into()),
+        });
+        lease
+    }
+
+    #[test]
+    fn never_bound_proof_rejects_a_late_binding_intent() {
+        let mut lease = authority_unbound_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.unbound_release_verified_at = Some("2026-01-01T00:00:00Z".into());
+        status.conditions.push(ClusterLeaseCondition {
+            condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+            status: "True".into(),
+            reason: "NeverBound".into(),
+            message: "release attempt teardown-1 proved no reciprocal allocation existed".into(),
+            last_transition_time: Some("2026-01-01T00:00:00Z".into()),
+        });
+        assert!(unbound_release_proof_is_complete(status));
+
+        status.binding = Some(exact_test_binding("lease-a", "lease-a-uid"));
+        assert!(
+            !unbound_release_proof_is_complete(status),
+            "a binding intent appearing after proof must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_authority_refuses_never_bound_when_any_reciprocal_instance_exists() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let lease = authority_unbound_lease();
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![exact_instance_for_binding(
+                    Some(&binding),
+                    "Leased",
+                )]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "a reciprocal binding must keep NeverBound fail-closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_authority_refuses_any_persisted_binding_intent() {
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        lease.status.as_mut().unwrap().binding = Some(exact_test_binding("lease-a", "lease-a-uid"));
+
+        assert!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "even an apparently uncommitted intent can race an in-flight instance reservation"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_authority_can_prove_pre_allocation_attempt_only_after_full_list() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        lease.status.as_mut().unwrap().connect_token_creation = None;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_authority_reuses_the_closed_creator_absence_timestamp() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let lease = authority_unbound_lease();
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "NeverBound must remain causally tied to the creator's exact Closed proof"
+        );
+    }
+
+    #[test]
+    fn receipt_acknowledgement_cannot_replay_an_old_attempt_or_boolean() {
+        let receipt = crate::crd::TeardownReceipt {
+            schema_version: crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION,
+            attempt_id: "attempt-1".into(),
+            lease: ResourceRef {
+                name: "lease-a".into(),
+                uid: Some("lease-a-uid".into()),
+            },
+            instance: ResourceRef {
+                name: "instance-a".into(),
+                uid: Some("instance-a-uid".into()),
+            },
+            pool: ResourceRef {
+                name: "pool-a".into(),
+                uid: Some("pool-a-uid".into()),
+            },
+            backend_type: "k3s".into(),
+            config_digest: "config".into(),
+            instance_spec_digest: "instance-spec".into(),
+            creation_manifest_digest: "manifest".into(),
+            cleanup_mode: crate::crd::CleanupMode::VerifiedDestroy,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:01:00Z".into()),
+            checks: vec![crate::crd::TeardownCheck {
+                subject: crate::crd::TeardownSubject::ServerStatefulSet,
+                result: crate::crd::CheckResult::Verified,
+                reason: None,
+                verified: vec!["exact-sts".into()],
+            }],
+            retry_count: 0,
+            outcome: crate::crd::TeardownOutcome::Verified,
+        };
+        let mut lease = (*make_test_lease("lease-a", "Recycling")).clone();
+        let mut status = lease.status.clone().unwrap_or_default();
+        status.teardown_receipt = Some(receipt.clone());
+
+        lease.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION.into(),
+            "true".into(),
+        )]));
+        assert!(!teardown_receipt_acknowledged(&lease, &status));
+
+        let token = receipt.acknowledgement_token().unwrap();
+        lease
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION.into(), token);
+        assert!(teardown_receipt_acknowledged(&lease, &status));
+
+        status.teardown_receipt.as_mut().unwrap().attempt_id = "attempt-2".into();
+        assert!(!teardown_receipt_acknowledged(&lease, &status));
     }
 
     fn closed_outer_sandbox(outer_name: &str) -> serde_json::Value {
@@ -4941,13 +6458,15 @@ mod tests {
             .await;
         let leases: Api<ClusterLease> = Api::namespaced(client, "test-ns");
         let status = lease.status.as_ref().unwrap();
+        let attempt = "attempt-1";
+        let verified_at = "2026-01-01T00:00:00Z";
 
         assert!(
-            record_unbound_release_proof(&leases, &lease, status)
+            record_unbound_release_proof(&leases, &lease, status, attempt, verified_at)
                 .await
                 .is_err()
         );
-        record_unbound_release_proof(&leases, &lease, status)
+        record_unbound_release_proof(&leases, &lease, status, attempt, verified_at)
             .await
             .expect("retry after a lost response");
 
@@ -5408,11 +6927,49 @@ mod tests {
             .mount(&server)
             .await;
 
+        let intent_response = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let intent_response_for_patch = intent_response.clone();
+        let lease_for_response = (*lease).clone();
         Mock::given(method("PATCH"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1/status",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("lease intent JSON Patch");
+                let binding = operations
+                    .as_array()
+                    .and_then(|operations| {
+                        operations.iter().find(|operation| {
+                            operation["op"] == "add" && operation["path"] == "/status/binding"
+                        })
+                    })
+                    .map(|operation| operation["value"].clone())
+                    .expect("intent patch carries binding");
+                let mut response = serde_json::to_value(&lease_for_response).unwrap();
+                response["metadata"]["resourceVersion"] = "11".into();
+                response["status"]["binding"] = binding;
+                *intent_response_for_patch.lock().unwrap() = Some(response.clone());
+                ResponseTemplate::new(200).set_body_json(response)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let intent_response_for_get = intent_response.clone();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1",
+            ))
+            .respond_with(move |_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(
+                    intent_response_for_get
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("intent PATCH precedes lease fence GET"),
+                )
+            })
+            .expect(1)
             .mount(&server)
             .await;
 

@@ -2216,7 +2216,8 @@ fn internal_handle_retention_fence_matches(
             finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
         })
         && current.spec.requester.requester_type == "kobe:sandbox-composition"
-        && current.spec.requester.identity == "kobe-operator"
+        && (current.spec.requester.identity == lease_uid
+            || current.spec.requester.identity == "kobe-operator")
         && current.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
 }
 
@@ -2789,7 +2790,27 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
             .as_ref()
             .and_then(|receipt| validated_retained_receipt_token(&handle, receipt));
         let receipt_verified = receipt_token.is_some();
+        let receipt_evidence_is_authoritative = match status.teardown_receipt.as_ref() {
+            Some(receipt) if crate::receipt_authority::is_separate() => {
+                authoritative_child_receipt_matches(client, namespace, &handle, receipt)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        };
         let receipt_acked = receipt_token.as_ref().is_some_and(|token| {
+            if crate::receipt_authority::is_separate() {
+                return status.teardown_acknowledgement.as_ref().is_some_and(|ack| {
+                    ack.consumer.kind == "SandboxLease"
+                        && ack.consumer.namespace.as_deref() == Some(namespace)
+                        && ack.consumer.name == *outer_name
+                        && ack.consumer.uid == *outer_uid
+                        && ack.proof.kind == crate::crd::TeardownAcknowledgedProofKind::Receipt
+                        && ack.proof.receipt_token.as_deref() == Some(token.as_str())
+                        && ack.proof.evidence.as_ref() == receipt_evidence_is_authoritative.as_ref()
+                });
+            }
             annotations.get(crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION) == Some(token)
         });
         let unbound_token =
@@ -2797,6 +2818,19 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
         let unbound_verified = unbound_child_release_is_proven(&handle, None);
         let unbound_acked = unbound_verified
             && unbound_token.as_ref().is_some_and(|token| {
+                if crate::receipt_authority::is_separate() {
+                    return status.teardown_acknowledgement.as_ref().is_some_and(|ack| {
+                        ack.consumer.kind == "SandboxLease"
+                            && ack.consumer.namespace.as_deref() == Some(namespace)
+                            && ack.consumer.name == *outer_name
+                            && ack.consumer.uid == *outer_uid
+                            && ack.proof.kind
+                                == crate::crd::TeardownAcknowledgedProofKind::NeverBound
+                            && status.teardown_attempt_id.as_ref() == Some(&ack.attempt_id)
+                            && ack.proof.unbound_release_verified_at
+                                == status.unbound_release_verified_at
+                    });
+                }
                 annotations.get(crate::crd::UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
                     == Some(token)
             });
@@ -2805,7 +2839,9 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
             == Some(outer_uid);
         let proof_is_consumable = receipt_acked
             || unbound_acked
-            || (stale_rejected && (receipt_verified || unbound_verified));
+            || (!crate::receipt_authority::is_separate()
+                && stale_rejected
+                && (receipt_verified || unbound_verified));
         let finalizers = handle.metadata.finalizers.clone().unwrap_or_default();
         if handle.name_any() != crate::controllers::sandbox_child::internal_lease_name(outer_name)
             || handle.namespace().as_deref() != Some(namespace)
@@ -2819,7 +2855,7 @@ pub(crate) async fn sweep_sandbox_allocation_tombstones(
                 .get("app.kubernetes.io/managed-by")
                 .is_none_or(|value| value != crate::sandbox::KOBE_MANAGED_BY)
             || handle.spec.requester.requester_type != "kobe:sandbox-composition"
-            || handle.spec.requester.identity != "kobe-operator"
+            || handle.spec.requester.identity != *outer_uid
             || handle.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
             || !retention_deadline_elapsed(
                 annotations,
@@ -4701,6 +4737,45 @@ async fn checkpoint_child_receipt_absence(
     Ok(Action::await_change())
 }
 
+/// Atomically persist the exact evidence identity and `FootprintAbsent` after
+/// execution cleanup, before asking the authority to acknowledge it.
+///
+/// Receipt bytes without the immutable evidence reference are not durable
+/// proof, while evidence without the same absence checkpoint could be replayed
+/// across a crash into a different capacity-release decision.
+async fn checkpoint_child_receipt_handoff(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    token: &str,
+    evidence: &crate::crd::TeardownEvidenceReference,
+) -> Result<bool, SandboxPlacementError> {
+    let status = lease.status.clone().unwrap_or_default();
+    let exact_handoff = status.child_teardown_receipt_acknowledgement.as_deref() == Some(token)
+        && status.child_teardown_evidence.as_ref() == Some(evidence);
+    if exact_handoff && footprint_absence_proven(&status) {
+        return Ok(true);
+    }
+    if !exact_handoff
+        && (status.child_teardown_receipt_acknowledgement.is_some()
+            || status.child_teardown_evidence.is_some()
+            || status.child_unbound_release_proof.is_some())
+    {
+        return Ok(false);
+    }
+    let mut next = status.clone();
+    next.child_teardown_receipt_acknowledgement = Some(token.to_string());
+    next.child_teardown_evidence = Some(evidence.clone());
+    next.conditions = with_condition_for_status(
+        &status,
+        lease.metadata.generation,
+        FOOTPRINT_ABSENT_CONDITION,
+        crate::crd::SandboxConditionStatus::True,
+        "ChildAuthorityEvidenceConsumed",
+        "Exact child teardown evidence and execution cleanup were verified",
+    );
+    patch_lease_status_fenced(ctx, lease, &next).await
+}
+
 /// Release the admission reservations and reach the terminal phase.
 ///
 /// Only ever called once the footprint has been *proven* absent — by an exact
@@ -5010,6 +5085,7 @@ enum ChildProofAcknowledgement {
     Receipt {
         receipt: Box<crate::crd::TeardownReceipt>,
         token: String,
+        evidence: crate::crd::TeardownEvidenceReference,
     },
     NeverBound {
         attempt_id: String,
@@ -5205,17 +5281,30 @@ async fn release_child_composition(
                     // its display name. Recover the reciprocal lease, instance,
                     // and pool tuple first, then checkpoint all identities in
                     // one outer-status write.
-                    let resolved = match crate::lease_binding::resolve_lease_binding(
-                        &ctx.client,
-                        &ctx.namespace,
-                        &reference.name,
-                        &reference.uid,
-                        crate::lease_binding::BindingResolveMode::Lifecycle,
-                    )
-                    .await
-                    {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
+                    let resolution = {
+                        let client = ctx.client.clone();
+                        let namespace = ctx.namespace.clone();
+                        let lease_name = reference.name.clone();
+                        let lease_uid = reference.uid.clone();
+                        // Resolution is read-only. Run it as its own task so
+                        // its three typed Kubernetes responses do not deepen
+                        // this already broad teardown poll frame; cancellation
+                        // can at worst leave harmless GETs in flight.
+                        tokio::spawn(async move {
+                            crate::lease_binding::resolve_lease_binding(
+                                &client,
+                                &namespace,
+                                &lease_name,
+                                &lease_uid,
+                                crate::lease_binding::BindingResolveMode::Lifecycle,
+                            )
+                            .await
+                        })
+                        .await
+                    };
+                    let resolved = match resolution {
+                        Ok(Ok(resolved)) => resolved,
+                        Ok(Err(error)) => {
                             warn!(lease = %name, reason = error.reason_code(), "unrecorded child binding is not reciprocally valid");
                             return quarantine_lease(
                                 lease,
@@ -5223,6 +5312,10 @@ async fn release_child_composition(
                                 "child_binding_identity_unverifiable",
                             )
                             .await;
+                        }
+                        Err(error) => {
+                            warn!(lease = %name, error = %error, "child binding resolver task did not complete");
+                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
                         }
                     };
                     if resolved.lease.metadata.generation != reference.generation {
@@ -5385,9 +5478,37 @@ async fn release_child_composition(
             let recorded_pool = recorded_child_pool(&status, &ctx.namespace);
             let child_status = current.status.clone().unwrap_or_default();
 
+            // Receipt status is only a mirror. Before consuming it, bind it to
+            // the immutable evidence object created by the isolated authority.
             if let Some(receipt) = child_status.teardown_receipt.as_ref() {
                 let Some(recorded_pool) = recorded_pool else {
                     return quarantine_lease(lease, ctx, "child_pool_provenance_invalid").await;
+                };
+                // Keep the immutable-evidence lookup off this already broad
+                // child teardown future. The controller is spawned on normal
+                // Tokio worker stacks, so adding proof checkpoints must not
+                // make stack size part of the lifecycle contract.
+                let evidence = match Box::pin(authoritative_child_receipt_matches(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &current,
+                    receipt,
+                ))
+                .await
+                {
+                    Ok(Some(evidence)) => evidence,
+                    Ok(None) => {
+                        return quarantine_lease(lease, ctx, "child_receipt_authority_unverified")
+                            .await;
+                    }
+                    Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+                        return quarantine_lease(lease, ctx, "child_receipt_authority_unavailable")
+                            .await;
+                    }
+                    Err(error) => {
+                        warn!(lease = %name, error = %error, "could not read authoritative teardown evidence");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                    }
                 };
                 let Some(token) = validated_child_receipt_token(
                     &current,
@@ -5398,25 +5519,48 @@ async fn release_child_composition(
                 ) else {
                     return quarantine_lease(lease, ctx, "child_receipt_does_not_match").await;
                 };
-                if status
-                    .child_teardown_receipt_acknowledgement
-                    .as_deref()
-                    .is_some_and(|checkpoint| checkpoint != token)
+                if status.child_teardown_receipt_acknowledgement.as_deref() != Some(token.as_str())
+                    || status.child_teardown_evidence.as_ref() != Some(&evidence)
                 {
-                    return quarantine_lease(lease, ctx, "child_receipt_acknowledgement_changed")
+                    if status.child_teardown_receipt_acknowledgement.is_some()
+                        || status.child_teardown_evidence.is_some()
+                        || status.child_unbound_release_proof.is_some()
+                    {
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            "child_receipt_acknowledgement_changed",
+                        )
                         .await;
+                    }
+                    if let Some(action) = cleanup_child_executions_after_proof(
+                        lease,
+                        ctx,
+                        ChildTargetAbsenceProof::VerifiedDestroyReceipt,
+                    )
+                    .await?
+                    {
+                        return Ok(action);
+                    }
+                    if !Box::pin(checkpoint_child_receipt_handoff(
+                        lease, ctx, &token, &evidence,
+                    ))
+                    .await?
+                    {
+                        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                    }
+                    info!(lease = %name, "child teardown receipt, evidence, and footprint absence checkpointed");
+                    return Ok(Action::await_change());
                 }
-                if let Some(action) = cleanup_child_executions_after_proof(
-                    lease,
-                    ctx,
-                    ChildTargetAbsenceProof::VerifiedDestroyReceipt,
-                )
-                .await?
+                if crate::receipt_authority::is_separate()
+                    && !child_receipt_authority_acknowledged(
+                        lease, &current, receipt, &token, &evidence,
+                    )
                 {
-                    return Ok(action);
+                    debug!(lease = %name, "waiting for receipt authority acknowledgement");
+                    return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                 }
-                info!(lease = %name, "child teardown receipt and execution cleanup verified");
-                return checkpoint_child_receipt_absence(lease, ctx, &token).await;
+                return Ok(Action::await_change());
             }
 
             // #80 could not prove the cluster's own teardown. A complete
@@ -5431,7 +5575,35 @@ async fn release_child_composition(
             // itself durable NeverBound proof. The ClusterLease controller
             // retains it until the outer FootprintAbsent checkpoint is ACKed.
             if child_status.binding.is_none() {
-                if unbound_child_release_is_proven(&current, recorded_instance) {
+                if let Some(proof) =
+                    validated_child_unbound_release_proof(&current, recorded_instance)
+                {
+                    if status.child_unbound_release_proof.as_ref() != Some(&proof) {
+                        if status.child_unbound_release_proof.is_some()
+                            || status.child_teardown_receipt_acknowledgement.is_some()
+                            || status.child_teardown_evidence.is_some()
+                        {
+                            return quarantine_lease(
+                                lease,
+                                ctx,
+                                "child_unbound_proof_checkpoint_changed",
+                            )
+                            .await;
+                        }
+                        let mut next = status.clone();
+                        next.child_unbound_release_proof = Some(proof.clone());
+                        if !patch_lease_status_fenced(ctx, lease, &next).await? {
+                            return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                        }
+                        info!(lease = %name, "child NeverBound proof checkpointed");
+                        return Ok(Action::await_change());
+                    }
+                    if crate::receipt_authority::is_separate()
+                        && !child_never_bound_authority_acknowledged(lease, &current, &proof)
+                    {
+                        debug!(lease = %name, "waiting for NeverBound authority acknowledgement");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                    }
                     if let Some(action) = cleanup_child_executions_after_proof(
                         lease,
                         ctx,
@@ -5459,234 +5631,10 @@ async fn release_child_composition(
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
             }
 
-            if !crate::controllers::sandbox_child::internal_lease_has_secret_uid_protocol(&current)
-            {
-                return quarantine_lease(lease, ctx, "child_kubeconfig_protocol_missing").await;
-            }
-
-            let Some(recorded_pool) = recorded_pool else {
-                return quarantine_lease(lease, ctx, "child_pool_provenance_invalid").await;
-            };
-
-            // A durable receipt/NeverBound proof above is self-contained and
-            // remains consumable after its ClusterPool is deleted or replaced.
-            // The live pool is an authorization prerequisite only while Kobe
-            // is about to initiate teardown of an actively bound allocation.
-            let cluster_pools: Api<crate::crd::ClusterPool> =
-                Api::namespaced(ctx.client.clone(), &ctx.namespace);
-            let live_pool = match cluster_pools.get(&recorded_pool.name).await {
-                Ok(pool) => pool,
-                Err(kube::Error::Api(error)) if error.code == 404 => {
-                    return quarantine_lease(lease, ctx, "child_pool_provenance_unavailable").await;
-                }
-                Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
-                    return quarantine_lease(lease, ctx, "child_pool_provenance_unverifiable")
-                        .await;
-                }
-                Err(error) => {
-                    warn!(lease = %name, error = %error, "could not validate recorded child pool");
-                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                }
-            };
-            if !live_child_pool_matches_recorded(&live_pool, recorded_pool) {
-                return quarantine_lease(lease, ctx, "child_pool_identity_changed").await;
-            }
-
-            // Resolve the reciprocal live lease/instance/pool tuple before
-            // release even when no Pod credential exists. Conditional
-            // credential cleanup must never be the thing that happens to
-            // validate allocation identity.
-            let resolved = match crate::lease_binding::resolve_lease_binding(
-                &ctx.client,
-                &ctx.namespace,
-                &recorded.name,
-                &recorded.uid,
-                crate::lease_binding::BindingResolveMode::Lifecycle,
-            )
+            Box::pin(release_bound_child_composition(
+                lease, ctx, &internal, &current, recorded,
+            ))
             .await
-            {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    warn!(lease = %name, reason = error.reason_code(), "child reciprocal binding is not valid for release");
-                    return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable")
-                        .await;
-                }
-            };
-            if !resolved_child_binding_matches_recorded(
-                &resolved,
-                &status,
-                &ctx.namespace,
-                recorded_instance.is_some(),
-            ) {
-                return quarantine_lease(lease, ctx, "child_binding_provenance_changed").await;
-            }
-
-            // Binding may win after the internal-handle checkpoint but before
-            // the next outer reconcile. Persist the exact validated instance
-            // before asking for release, otherwise the eventual receipt would
-            // have no durable UID to match.
-            if recorded_instance.is_none() {
-                let mut next = status.clone();
-                let Some(target) = next.target.as_mut() else {
-                    return quarantine_lease(lease, ctx, "child_target_provenance_missing").await;
-                };
-                if target.namespace != CHILD_SANDBOX_NAMESPACE {
-                    return quarantine_lease(lease, ctx, "child_target_namespace_changed").await;
-                }
-                target.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
-                    api_version: "kobe.kunobi.ninja/v1alpha1".into(),
-                    kind: "ClusterInstance".into(),
-                    namespace: Some(ctx.namespace.clone()),
-                    name: resolved.binding.instance.name.clone(),
-                    uid: resolved.binding.instance.uid.clone(),
-                    generation: Some(resolved.binding.instance.observed_generation),
-                });
-                if patch_lease_status_fenced(ctx, lease, &next).await? {
-                    info!(lease = %name, "recovered validated child instance provenance before teardown");
-                } else {
-                    debug!(lease = %name, "child instance recovery checkpoint lost a status race");
-                }
-                return Ok(Action::await_change());
-            }
-
-            let internal_release_started = matches!(
-                child_status.phase,
-                crate::crd::LeasePhase::Released
-                    | crate::crd::LeasePhase::Expired
-                    | crate::crd::LeasePhase::Recycling
-            );
-            if internal_release_started && status.child_teardown_mode.is_none() {
-                // An older process started destruction without durably proving
-                // which cleanup path it took. Do not reinterpret missing
-                // credentials as unreachability; only a later exact receipt can
-                // recover this quarantine through target-absence cleanup.
-                return quarantine_lease(lease, ctx, "child_teardown_mode_missing").await;
-            }
-
-            if status.child_teardown_mode.is_none() {
-                let Some(expected_instance) = recorded_instance else {
-                    return quarantine_lease(lease, ctx, "child_credential_target_unverifiable")
-                        .await;
-                };
-                let target = match status.target.as_ref() {
-                    Some(target)
-                        if target.namespace == CHILD_SANDBOX_NAMESPACE
-                            && resolved.binding.instance.name == expected_instance.name
-                            && resolved.binding.instance.uid == expected_instance.uid =>
-                    {
-                        target
-                    }
-                    _ => {
-                        return quarantine_lease(
-                            lease,
-                            ctx,
-                            "child_credential_target_unverifiable",
-                        )
-                        .await;
-                    }
-                };
-                match recorded_child_access(lease, ctx, expected_instance).await {
-                    RecordedChildAccess::Reachable(child_client) => {
-                        // Durable runner groups are retired before scoped
-                        // credentials, and both are proven clean before the
-                        // internal ClusterLease may enter release.
-                        if ctx.access_ledger_enabled {
-                            match crate::api::sandbox_executions::cleanup_lease_executions(
-                                &ctx.client,
-                                &ctx.namespace,
-                                &ctx.reservation_namespace,
-                                lease,
-                                &child_client,
-                                &ctx.shutdown,
-                            )
-                            .await
-                            {
-                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
-                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
-                                    return Ok(Action::await_change());
-                                }
-                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
-                                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                                }
-                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
-                                    return quarantine_lease(lease, ctx, reason).await;
-                                }
-                            }
-                        }
-
-                        if let Some(pod) = target.pod.as_ref() {
-                            let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
-                                return quarantine_lease(
-                                    lease,
-                                    ctx,
-                                    "child_credential_target_unverifiable",
-                                )
-                                .await;
-                            };
-                            if pod.name.is_empty() || pod.uid.is_empty() {
-                                return quarantine_lease(
-                                    lease,
-                                    ctx,
-                                    "child_credential_target_unverifiable",
-                                )
-                                .await;
-                            }
-                            match crate::api::sandbox_credentials::cleanup_scoped_identities(
-                                &child_client,
-                                &target.namespace,
-                                &lease_uid,
-                                &pod.name,
-                                &pod.uid,
-                            )
-                            .await
-                            {
-                                crate::api::sandbox_credentials::CredentialCleanupOutcome::Clean => {}
-                                crate::api::sandbox_credentials::CredentialCleanupOutcome::Retry => {
-                                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                                }
-                                crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
-                                    return quarantine_lease(
-                                        lease,
-                                        ctx,
-                                        "child_credential_cleanup_unverifiable",
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                        return checkpoint_child_teardown_mode(
-                            lease,
-                            ctx,
-                            crate::crd::SandboxChildTeardownMode::ReachableCleanupV1,
-                        )
-                        .await;
-                    }
-                    RecordedChildAccess::TransportUnreachable => {
-                        return checkpoint_child_teardown_mode(
-                            lease,
-                            ctx,
-                            crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1,
-                        )
-                        .await;
-                    }
-                    RecordedChildAccess::Retry(reason) => {
-                        debug!(lease = %name, reason, "child access classification will retry");
-                        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                    }
-                    RecordedChildAccess::Quarantine(reason) => {
-                        return quarantine_lease(lease, ctx, reason).await;
-                    }
-                }
-            }
-
-            // The exact cleanup interpretation is durable before this mutation.
-            // A reachable path has already retired executions/credentials; the
-            // fallback path can retire them only after the exact receipt.
-            if !internal_release_started {
-                request_child_release(&internal, &current).await?;
-            }
-            debug!(lease = %name, "waiting for the child teardown receipt");
-            Ok(Action::requeue(std::time::Duration::from_secs(30)))
         }
         // The recorded lease is gone, or a different object holds its name. Its
         // receipt went with it, so there is nothing left that can prove this
@@ -5705,6 +5653,356 @@ async fn release_child_composition(
             Ok(Action::requeue(std::time::Duration::from_secs(15)))
         }
     }
+}
+
+/// Validate and prepare an actively bound child allocation for release.
+///
+/// This state machine is kept separate from receipt/NeverBound consumption so
+/// each controller poll has a bounded stack frame. It still preserves the
+/// ordering invariant: reciprocal identity, child access cleanup, and the
+/// teardown-mode checkpoint all precede the release status mutation.
+async fn release_bound_child_composition(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    internal: &Api<crate::crd::ClusterLease>,
+    current: &crate::crd::ClusterLease,
+    recorded: &crate::crd::SandboxObjectReference,
+) -> Result<Action, SandboxPlacementError> {
+    let name = lease.name_any();
+    let status = lease.status.clone().unwrap_or_default();
+    let child_status = current.status.clone().unwrap_or_default();
+    let recorded_instance = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_instance.as_ref());
+
+    if !crate::controllers::sandbox_child::internal_lease_has_secret_uid_protocol(current) {
+        return quarantine_lease(lease, ctx, "child_kubeconfig_protocol_missing").await;
+    }
+
+    let Some(recorded_pool) = recorded_child_pool(&status, &ctx.namespace) else {
+        return quarantine_lease(lease, ctx, "child_pool_provenance_invalid").await;
+    };
+
+    // A durable receipt/NeverBound proof is self-contained. The live pool is
+    // required only while Kobe is about to initiate teardown of an actively
+    // bound allocation.
+    let cluster_pools: Api<crate::crd::ClusterPool> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let live_pool = match cluster_pools.get(&recorded_pool.name).await {
+        Ok(pool) => pool,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return quarantine_lease(lease, ctx, "child_pool_provenance_unavailable").await;
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return quarantine_lease(lease, ctx, "child_pool_provenance_unverifiable").await;
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "could not validate recorded child pool");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+    };
+    if !live_child_pool_matches_recorded(&live_pool, recorded_pool) {
+        return quarantine_lease(lease, ctx, "child_pool_identity_changed").await;
+    }
+
+    // Resolve the reciprocal live lease/instance/pool tuple before release,
+    // even when no Pod credential exists.
+    let resolution = {
+        let client = ctx.client.clone();
+        let namespace = ctx.namespace.clone();
+        let lease_name = recorded.name.clone();
+        let lease_uid = recorded.uid.clone();
+        // This task performs GET-only reciprocal resolution. Separating its
+        // typed response frame bounds the controller worker stack without
+        // allowing a detached task to mutate lifecycle state.
+        tokio::spawn(async move {
+            crate::lease_binding::resolve_lease_binding(
+                &client,
+                &namespace,
+                &lease_name,
+                &lease_uid,
+                crate::lease_binding::BindingResolveMode::Lifecycle,
+            )
+            .await
+        })
+        .await
+    };
+    let resolved = match resolution {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
+            warn!(lease = %name, reason = error.reason_code(), "child reciprocal binding is not valid for release");
+            return quarantine_lease(lease, ctx, "child_binding_identity_unverifiable").await;
+        }
+        Err(error) => {
+            warn!(lease = %name, error = %error, "child binding resolver task did not complete");
+            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+        }
+    };
+    if !resolved_child_binding_matches_recorded(
+        &resolved,
+        &status,
+        &ctx.namespace,
+        recorded_instance.is_some(),
+    ) {
+        return quarantine_lease(lease, ctx, "child_binding_provenance_changed").await;
+    }
+
+    // Binding may win after the handle checkpoint. Persist the exact validated
+    // instance before release so the eventual receipt has a durable UID to
+    // match.
+    if recorded_instance.is_none() {
+        let mut next = status.clone();
+        let Some(target) = next.target.as_mut() else {
+            return quarantine_lease(lease, ctx, "child_target_provenance_missing").await;
+        };
+        if target.namespace != CHILD_SANDBOX_NAMESPACE {
+            return quarantine_lease(lease, ctx, "child_target_namespace_changed").await;
+        }
+        target.child_cluster_instance = Some(crate::crd::SandboxObjectReference {
+            api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some(ctx.namespace.clone()),
+            name: resolved.binding.instance.name.clone(),
+            uid: resolved.binding.instance.uid.clone(),
+            generation: Some(resolved.binding.instance.observed_generation),
+        });
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            info!(lease = %name, "recovered validated child instance provenance before teardown");
+        } else {
+            debug!(lease = %name, "child instance recovery checkpoint lost a status race");
+        }
+        return Ok(Action::await_change());
+    }
+
+    let internal_release_started = matches!(
+        child_status.phase,
+        crate::crd::LeasePhase::Released
+            | crate::crd::LeasePhase::Expired
+            | crate::crd::LeasePhase::Recycling
+    );
+    if internal_release_started && status.child_teardown_mode.is_none() {
+        // Never reinterpret missing credentials after destruction started.
+        return quarantine_lease(lease, ctx, "child_teardown_mode_missing").await;
+    }
+
+    if status.child_teardown_mode.is_none() {
+        let Some(expected_instance) = recorded_instance else {
+            return quarantine_lease(lease, ctx, "child_credential_target_unverifiable").await;
+        };
+        let target = match status.target.as_ref() {
+            Some(target)
+                if target.namespace == CHILD_SANDBOX_NAMESPACE
+                    && resolved.binding.instance.name == expected_instance.name
+                    && resolved.binding.instance.uid == expected_instance.uid =>
+            {
+                target
+            }
+            _ => {
+                return quarantine_lease(lease, ctx, "child_credential_target_unverifiable").await;
+            }
+        };
+        match recorded_child_access(lease, ctx, expected_instance).await {
+            RecordedChildAccess::Reachable(child_client) => {
+                // Durable runner groups and scoped identities are retired
+                // before the internal lease may enter release.
+                if ctx.access_ledger_enabled {
+                    match crate::api::sandbox_executions::cleanup_lease_executions(
+                        &ctx.client,
+                        &ctx.namespace,
+                        &ctx.reservation_namespace,
+                        lease,
+                        &child_client,
+                        &ctx.shutdown,
+                    )
+                    .await
+                    {
+                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
+                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+                            return Ok(Action::await_change());
+                        }
+                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                        }
+                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(
+                            reason,
+                        ) => return quarantine_lease(lease, ctx, reason).await,
+                    }
+                }
+
+                if let Some(pod) = target.pod.as_ref() {
+                    let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            "child_credential_target_unverifiable",
+                        )
+                        .await;
+                    };
+                    if pod.name.is_empty() || pod.uid.is_empty() {
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            "child_credential_target_unverifiable",
+                        )
+                        .await;
+                    }
+                    match crate::api::sandbox_credentials::cleanup_scoped_identities(
+                        &child_client,
+                        &target.namespace,
+                        &lease_uid,
+                        &pod.name,
+                        &pod.uid,
+                    )
+                    .await
+                    {
+                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Clean => {}
+                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Retry => {
+                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                        }
+                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
+                            return quarantine_lease(
+                                lease,
+                                ctx,
+                                "child_credential_cleanup_unverifiable",
+                            )
+                            .await;
+                        }
+                    }
+                }
+                return checkpoint_child_teardown_mode(
+                    lease,
+                    ctx,
+                    crate::crd::SandboxChildTeardownMode::ReachableCleanupV1,
+                )
+                .await;
+            }
+            RecordedChildAccess::TransportUnreachable => {
+                return checkpoint_child_teardown_mode(
+                    lease,
+                    ctx,
+                    crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1,
+                )
+                .await;
+            }
+            RecordedChildAccess::Retry(reason) => {
+                debug!(lease = %name, reason, "child access classification will retry");
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+            RecordedChildAccess::Quarantine(reason) => {
+                return quarantine_lease(lease, ctx, reason).await;
+            }
+        }
+    }
+
+    // The exact cleanup interpretation is durable before this mutation.
+    if !internal_release_started {
+        request_child_release(internal, current).await?;
+    }
+    debug!(lease = %name, "waiting for the child teardown receipt");
+    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+}
+
+fn child_receipt_authority_acknowledged(
+    consumer: &SandboxLease,
+    child: &crate::crd::ClusterLease,
+    receipt: &crate::crd::TeardownReceipt,
+    token: &str,
+    evidence: &crate::crd::TeardownEvidenceReference,
+) -> bool {
+    let Some(consumer_uid) = consumer.uid() else {
+        return false;
+    };
+    child
+        .status
+        .as_ref()
+        .and_then(|status| status.teardown_acknowledgement.as_ref())
+        .is_some_and(|ack| {
+            ack.attempt_id == receipt.attempt_id
+                && ack.consumer.api_version == "kobe.kunobi.ninja/v1alpha1"
+                && ack.consumer.kind == "SandboxLease"
+                && ack.consumer.namespace == consumer.namespace()
+                && ack.consumer.name == consumer.name_any()
+                && ack.consumer.uid == consumer_uid
+                && ack.proof.kind == crate::crd::TeardownAcknowledgedProofKind::Receipt
+                && ack.proof.receipt_token.as_deref() == Some(token)
+                && ack.proof.evidence.as_ref() == Some(evidence)
+        })
+}
+
+fn validated_child_unbound_release_proof(
+    child: &crate::crd::ClusterLease,
+    recorded_instance: Option<&crate::crd::SandboxObjectReference>,
+) -> Option<crate::crd::ChildUnboundReleaseProof> {
+    if !unbound_child_release_is_proven(child, recorded_instance) {
+        return None;
+    }
+    let status = child.status.as_ref()?;
+    Some(crate::crd::ChildUnboundReleaseProof {
+        attempt_id: status.teardown_attempt_id.clone()?,
+        verified_at: status.unbound_release_verified_at.clone()?,
+    })
+}
+
+fn child_never_bound_authority_acknowledged(
+    consumer: &SandboxLease,
+    child: &crate::crd::ClusterLease,
+    proof: &crate::crd::ChildUnboundReleaseProof,
+) -> bool {
+    let Some(consumer_uid) = consumer.uid() else {
+        return false;
+    };
+    child
+        .status
+        .as_ref()
+        .and_then(|status| status.teardown_acknowledgement.as_ref())
+        .is_some_and(|ack| {
+            ack.attempt_id == proof.attempt_id
+                && ack.consumer.api_version == "kobe.kunobi.ninja/v1alpha1"
+                && ack.consumer.kind == "SandboxLease"
+                && ack.consumer.namespace == consumer.namespace()
+                && ack.consumer.name == consumer.name_any()
+                && ack.consumer.uid == consumer_uid
+                && ack.proof.kind == crate::crd::TeardownAcknowledgedProofKind::NeverBound
+                && ack.proof.unbound_release_verified_at.as_deref()
+                    == Some(proof.verified_at.as_str())
+        })
+}
+
+/// Require the immutable receipt object written by the isolated teardown
+/// authority. Exact CRD UID, generation and resourceVersion are all part of
+/// the handoff; mutable ClusterLease status is only a mirror.
+async fn authoritative_child_receipt_matches(
+    client: &Client,
+    namespace: &str,
+    lease: &crate::crd::ClusterLease,
+    receipt: &crate::crd::TeardownReceipt,
+) -> Result<Option<crate::crd::TeardownEvidenceReference>, kube::Error> {
+    let Some(status) = lease.status.as_ref() else {
+        return Ok(None);
+    };
+    let Some(reference) = status.teardown_evidence.as_ref() else {
+        return Ok(None);
+    };
+    let Some(lease_uid) = lease.uid().filter(|uid| !uid.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let expected_name =
+        crate::crd::verified_teardown_evidence_name(&lease_uid, &receipt.attempt_id);
+    if reference.name != expected_name || reference.generation < 1 {
+        return Ok(None);
+    }
+    let evidence_api: Api<crate::crd::VerifiedTeardownEvidence> =
+        Api::namespaced(client.clone(), namespace);
+    let evidence = evidence_api.get(&reference.name).await?;
+    let identity_matches = evidence.uid().as_deref() == Some(reference.uid.as_str())
+        && evidence.metadata.generation == Some(reference.generation)
+        && evidence.resource_version().as_deref() == Some(reference.resource_version.as_str());
+    let content_matches = evidence.spec.lease.name == lease.name_any()
+        && evidence.spec.lease.uid.as_deref() == Some(lease_uid.as_str())
+        && evidence.spec.attempt_id == receipt.attempt_id
+        && evidence.spec.receipt == *receipt;
+    Ok((identity_matches && content_matches).then(|| reference.clone()))
 }
 
 /// ACK and retire the receipt-bearing internal lease after evidence is durable.
@@ -5872,11 +6170,82 @@ async fn finish_child_release_after_proof(
             )
             .await;
         };
+        let evidence = match authoritative_child_receipt_matches(
+            &ctx.client,
+            &ctx.namespace,
+            &current,
+            receipt,
+        )
+        .await
+        {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) => {
+                return record_post_proof_cleanup_failure(
+                    lease,
+                    ctx,
+                    "ChildReceiptEvidenceChangedAfterCheckpoint",
+                    "Workload absence is proven, but immutable teardown evidence no longer validates",
+                    std::time::Duration::from_secs(300),
+                )
+                .await;
+            }
+            Err(error) => {
+                warn!(lease = %name, error = %error, "could not re-read immutable child teardown evidence");
+                return record_post_proof_cleanup_failure(
+                    lease,
+                    ctx,
+                    "ChildReceiptEvidenceReadRetry",
+                    "Workload absence is proven, but immutable teardown evidence must be re-read",
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
+            }
+        };
+        if status.child_teardown_receipt_acknowledgement.as_deref() != Some(token.as_str())
+            || status.child_teardown_evidence.as_ref() != Some(&evidence)
+        {
+            return record_post_proof_cleanup_failure(
+                lease,
+                ctx,
+                "ChildReceiptCheckpointChanged",
+                "Workload absence is proven, but its exact receipt checkpoint changed",
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        }
+        if crate::receipt_authority::is_separate()
+            && !child_receipt_authority_acknowledged(lease, &current, receipt, &token, &evidence)
+        {
+            return record_post_proof_cleanup_failure(
+                lease,
+                ctx,
+                "ChildReceiptAuthorityAckMissing",
+                "Workload absence is proven, but the isolated receipt acknowledgement is missing",
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+        }
         ChildProofAcknowledgement::Receipt {
             receipt: Box::new(receipt.clone()),
             token,
+            evidence,
         }
-    } else if unbound_child_release_is_proven(&current, recorded_instance) {
+    } else if let Some(checkpoint) =
+        validated_child_unbound_release_proof(&current, recorded_instance)
+    {
+        if status.child_unbound_release_proof.as_ref() != Some(&checkpoint)
+            || (crate::receipt_authority::is_separate()
+                && !child_never_bound_authority_acknowledged(lease, &current, &checkpoint))
+        {
+            return record_post_proof_cleanup_failure(
+                lease,
+                ctx,
+                "ChildNeverBoundCheckpointChanged",
+                "Workload absence is proven, but its attempt-bound NeverBound acknowledgement changed",
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        }
         let child_status = current
             .status
             .as_ref()
@@ -5977,6 +6346,27 @@ async fn finish_child_release_after_proof(
     }
 
     let ack_is_exact = |handle: &crate::crd::ClusterLease| {
+        if crate::receipt_authority::is_separate() {
+            return match &proof {
+                ChildProofAcknowledgement::Receipt {
+                    receipt,
+                    token,
+                    evidence,
+                } => child_receipt_authority_acknowledged(lease, handle, receipt, token, evidence),
+                ChildProofAcknowledgement::NeverBound {
+                    attempt_id,
+                    verified_at,
+                    ..
+                } => child_never_bound_authority_acknowledged(
+                    lease,
+                    handle,
+                    &crate::crd::ChildUnboundReleaseProof {
+                        attempt_id: attempt_id.clone(),
+                        verified_at: verified_at.clone(),
+                    },
+                ),
+            };
+        }
         handle
             .annotations()
             .get(proof.annotation())
@@ -6006,7 +6396,10 @@ async fn finish_child_release_after_proof(
         // it here after exact proof revalidation; the producer may remove that
         // finalizer only after observing this token. A stale-rejected Pending
         // handle already carries the equivalent exact outer-UID fence.
-        if !ack_is_exact(&current) && !stale_rejection_is_exact(&current) {
+        if !ack_is_exact(&current)
+            && !stale_rejection_is_exact(&current)
+            && !crate::receipt_authority::is_separate()
+        {
             let Some(_) = acknowledge_child_proof(&internal, &current, &proof).await? else {
                 return Ok(Action::requeue(std::time::Duration::from_secs(5)));
             };
@@ -6043,7 +6436,7 @@ async fn finish_child_release_after_proof(
         }
     }
 
-    if !ack_is_exact(&current) {
+    if !ack_is_exact(&current) && !crate::receipt_authority::is_separate() {
         let Some(updated) = acknowledge_child_proof(&internal, &current, &proof).await? else {
             debug!(lease = %name, "child proof ACK lost an object race");
             return Ok(Action::requeue(std::time::Duration::from_secs(5)));
@@ -7694,6 +8087,243 @@ fn lease_error_policy(
     _ctx: Arc<SandboxContext>,
 ) -> Action {
     warn!(error = %error, reason = error.reason_code(), "SandboxLease placement failed");
+    Action::requeue(std::time::Duration::from_secs(15))
+}
+
+#[derive(Clone)]
+struct ReceiptAckAuthorityContext {
+    client: Client,
+    namespace: String,
+}
+
+/// Watch durable Sandbox consumer checkpoints and publish producer ACKs under
+/// the dedicated teardown-authority identity.
+///
+/// The general lifecycle controller may copy a proof into the exact outer UID
+/// status, but it cannot acknowledge the child directly. This loop re-reads
+/// both objects and immutable evidence before writing the single receipt-gated
+/// exit acknowledged by the retained child handle.
+pub async fn run_receipt_ack_authority_controller(
+    client: Client,
+    namespace: &str,
+    shutdown: CancellationToken,
+) {
+    let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let context = Arc::new(ReceiptAckAuthorityContext {
+        client,
+        namespace: namespace.to_string(),
+    });
+    info!("Starting isolated teardown acknowledgement authority");
+    Controller::new(leases, Config::default())
+        .graceful_shutdown_on(async move { shutdown.cancelled().await })
+        .run(
+            reconcile_receipt_ack_authority,
+            receipt_ack_authority_error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            if let Err(error) = result {
+                error!(
+                    ?error,
+                    "receipt acknowledgement authority reconciliation error"
+                );
+            }
+        })
+        .await;
+}
+
+async fn reconcile_receipt_ack_authority(
+    consumer: Arc<SandboxLease>,
+    ctx: Arc<ReceiptAckAuthorityContext>,
+) -> Result<Action, SandboxPlacementError> {
+    let status = consumer.status.clone().unwrap_or_default();
+    let Some(recorded) = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_lease.as_ref())
+    else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    };
+    if recorded.namespace.as_deref() != Some(ctx.namespace.as_str())
+        || recorded.uid.trim().is_empty()
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+    let children: Api<crate::crd::ClusterLease> =
+        Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let child = match children.get(&recorded.name).await {
+        Ok(child) if composition_handle_matches_consumer(&child, &consumer, recorded) => child,
+        Ok(_) => {
+            return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let child_status = child.status.as_ref().cloned().unwrap_or_default();
+    let acknowledgement = if let (Some(token), Some(checkpoint), Some(receipt)) = (
+        status.child_teardown_receipt_acknowledgement.as_deref(),
+        status.child_teardown_evidence.as_ref(),
+        child_status.teardown_receipt.as_ref(),
+    ) {
+        let Some(authoritative) =
+            authoritative_child_receipt_matches(&ctx.client, &ctx.namespace, &child, receipt)
+                .await?
+        else {
+            return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        };
+        let Some(recorded_pool) = recorded_child_pool(&status, &ctx.namespace) else {
+            return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        };
+        let expected = validated_child_receipt_token(
+            &child,
+            receipt,
+            recorded,
+            status
+                .target
+                .as_ref()
+                .and_then(|target| target.child_cluster_instance.as_ref()),
+            recorded_pool,
+        );
+        if authoritative != *checkpoint || expected.as_deref() != Some(token) {
+            return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        }
+        crate::crd::TeardownAcknowledgement {
+            attempt_id: receipt.attempt_id.clone(),
+            consumer: sandbox_consumer_identity(&consumer)?,
+            proof: crate::crd::TeardownAcknowledgedProof::receipt(
+                token.to_string(),
+                checkpoint.clone(),
+            ),
+            acknowledged_at: chrono::Utc::now().to_rfc3339(),
+        }
+    } else if let Some(checkpoint) = status.child_unbound_release_proof.as_ref() {
+        if validated_child_unbound_release_proof(&child, None).as_ref() != Some(checkpoint) {
+            return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+        }
+        crate::crd::TeardownAcknowledgement {
+            attempt_id: checkpoint.attempt_id.clone(),
+            consumer: sandbox_consumer_identity(&consumer)?,
+            proof: crate::crd::TeardownAcknowledgedProof::never_bound(
+                checkpoint.verified_at.clone(),
+            ),
+            acknowledged_at: chrono::Utc::now().to_rfc3339(),
+        }
+    } else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    };
+
+    if let Some(existing) = child_status.teardown_acknowledgement.as_ref() {
+        if existing.attempt_id == acknowledgement.attempt_id
+            && existing.consumer == acknowledgement.consumer
+            && existing.proof == acknowledgement.proof
+        {
+            return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+        }
+        return Err(SandboxPlacementError::Invalid(
+            "child teardown acknowledgement changed after authority publication".into(),
+        ));
+    }
+    persist_authority_acknowledgement(&children, &child, &acknowledgement).await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(1)))
+}
+
+fn sandbox_consumer_identity(
+    consumer: &SandboxLease,
+) -> Result<crate::crd::KubernetesResourceIdentity, SandboxPlacementError> {
+    Ok(crate::crd::KubernetesResourceIdentity {
+        api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+        kind: "SandboxLease".into(),
+        namespace: consumer.namespace(),
+        name: consumer.name_any(),
+        uid: consumer.uid().ok_or_else(|| {
+            SandboxPlacementError::Invalid("SandboxLease consumer has no UID".into())
+        })?,
+    })
+}
+
+/// Authenticate an ownerless child handle without trusting mutable metadata as
+/// the root of authority. The outer UID is recorded in immutable requester
+/// spec; label and annotation are independent consistency checks.
+fn composition_handle_matches_consumer(
+    child: &crate::crd::ClusterLease,
+    consumer: &SandboxLease,
+    recorded: &crate::crd::SandboxObjectReference,
+) -> bool {
+    let Some(consumer_uid) = consumer.uid().filter(|uid| !uid.is_empty()) else {
+        return false;
+    };
+    child.uid().as_deref() == Some(recorded.uid.as_str())
+        && child.name_any() == recorded.name
+        && child.namespace() == recorded.namespace
+        && child.metadata.generation == recorded.generation
+        && crate::controllers::sandbox_child::internal_lease_is_for_sandbox(child, consumer)
+        && child.spec.requester.identity == consumer_uid
+        && child
+            .annotations()
+            .get(crate::controllers::sandbox_child::SANDBOX_COMPOSITION_NAME_ANNOTATION)
+            == Some(&consumer.name_any())
+}
+
+async fn persist_authority_acknowledgement(
+    leases: &Api<crate::crd::ClusterLease>,
+    lease: &crate::crd::ClusterLease,
+    acknowledgement: &crate::crd::TeardownAcknowledgement,
+) -> Result<(), SandboxPlacementError> {
+    let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
+        return Err(SandboxPlacementError::Invalid(
+            "child ClusterLease has no UID or resourceVersion for authority ACK".into(),
+        ));
+    };
+    let mut operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
+        serde_json::json!({ "op": "test", "path": "/status/teardownAttemptId", "value": acknowledgement.attempt_id }),
+    ];
+    match acknowledgement.proof.kind {
+        crate::crd::TeardownAcknowledgedProofKind::Receipt => {
+            operations.push(serde_json::json!({
+                "op": "test", "path": "/status/teardownReceipt",
+                "value": lease.status.as_ref().and_then(|status| status.teardown_receipt.as_ref())
+            }));
+            operations.push(serde_json::json!({
+                "op": "test", "path": "/status/teardownEvidence",
+                "value": acknowledgement.proof.evidence
+            }));
+        }
+        crate::crd::TeardownAcknowledgedProofKind::NeverBound => {
+            operations.push(serde_json::json!({
+                "op": "test", "path": "/status/unboundReleaseVerifiedAt",
+                "value": acknowledgement.proof.unbound_release_verified_at
+            }));
+        }
+    }
+    operations.push(serde_json::json!({
+        "op": "add", "path": "/status/teardownAcknowledgement", "value": acknowledgement
+    }));
+    let patch = crate::controllers::lease::json_patch(serde_json::Value::Array(operations));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn receipt_ack_authority_error_policy(
+    _lease: Arc<SandboxLease>,
+    error: &SandboxPlacementError,
+    _ctx: Arc<ReceiptAckAuthorityContext>,
+) -> Action {
+    warn!(%error, "teardown acknowledgement authority reconcile failed");
     Action::requeue(std::time::Duration::from_secs(15))
 }
 
@@ -12511,6 +13141,7 @@ pub(crate) mod tests {
         mount_teardown_scaffolding(&server).await;
         let receipt = verified_receipt("kobe-abc123", "child-instance-uid");
         let receipt_token = receipt_acknowledgement_token(&receipt);
+        let evidence = child_evidence_reference(&receipt);
         mount_child_handle_cleanup(&server, 1, Some(receipt)).await;
         let mut lease = child_placed_lease("child-lease-uid");
         {
@@ -12518,6 +13149,7 @@ pub(crate) mod tests {
             status.phase = crate::crd::SandboxLeasePhase::Releasing;
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
             status.child_teardown_receipt_acknowledgement = Some(receipt_token);
+            status.child_teardown_evidence = Some(evidence);
         }
         lease.status.as_mut().unwrap().conditions = with_condition(
             &lease,
@@ -12595,6 +13227,7 @@ pub(crate) mod tests {
         mount_teardown_scaffolding(&server).await;
         let receipt = verified_receipt("kobe-abc123", "child-instance-uid");
         let receipt_token = receipt_acknowledgement_token(&receipt);
+        let evidence = child_evidence_reference(&receipt);
         mount_child_handle_cleanup(&server, 1, Some(receipt)).await;
         Mock::given(method("GET"))
             .and(path(RESERVATIONS_PATH))
@@ -12613,6 +13246,7 @@ pub(crate) mod tests {
             status.phase = crate::crd::SandboxLeasePhase::Releasing;
             status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
             status.child_teardown_receipt_acknowledgement = Some(receipt_token);
+            status.child_teardown_evidence = Some(evidence);
         }
         lease.status.as_mut().unwrap().conditions = with_condition(
             &lease,
@@ -13306,6 +13940,48 @@ pub(crate) mod tests {
             .await;
     }
 
+    fn child_evidence_reference(
+        receipt: &serde_json::Value,
+    ) -> crate::crd::TeardownEvidenceReference {
+        let attempt = receipt["attemptId"]
+            .as_str()
+            .expect("receipt fixture has an attempt");
+        crate::crd::TeardownEvidenceReference {
+            name: crate::crd::verified_teardown_evidence_name("child-lease-uid", attempt),
+            uid: "child-evidence-uid".into(),
+            generation: 1,
+            resource_version: "evidence-rv-1".into(),
+        }
+    }
+
+    async fn mount_child_evidence(server: &MockServer, receipt: &serde_json::Value) {
+        let reference = child_evidence_reference(receipt);
+        let evidence = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "VerifiedTeardownEvidence",
+            "metadata": {
+                "name": reference.name,
+                "namespace": NS,
+                "uid": reference.uid,
+                "generation": reference.generation,
+                "resourceVersion": reference.resource_version,
+            },
+            "spec": {
+                "lease": { "name": "kobe-sbx-sbx-1", "uid": "child-lease-uid" },
+                "attemptId": receipt["attemptId"],
+                "receipt": receipt,
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/{NS}/verifiedteardownevidence/{}",
+                reference.name
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(evidence))
+            .mount(server)
+            .await;
+    }
+
     fn child_cluster_lease(
         uid: &str,
         phase: &str,
@@ -13318,6 +13994,8 @@ pub(crate) mod tests {
         }
         if let Some(receipt) = receipt {
             status["teardownAttemptId"] = receipt["attemptId"].clone();
+            status["teardownEvidence"] =
+                serde_json::to_value(child_evidence_reference(&receipt)).unwrap();
             status["teardownReceipt"] = receipt;
         }
         serde_json::json!({
@@ -13336,6 +14014,7 @@ pub(crate) mod tests {
                 },
                 "annotations": {
                     crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION: LEASE,
+                    crate::controllers::sandbox_child::SANDBOX_COMPOSITION_NAME_ANNOTATION: LEASE,
                     crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION:
                         (chrono::Utc::now() + chrono::Duration::days(8)).to_rfc3339(),
                     crate::controllers::sandbox_child::CHILD_KUBECONFIG_PROVENANCE_ANNOTATION:
@@ -13348,11 +14027,42 @@ pub(crate) mod tests {
             "spec": {
                 "poolRef": "children",
                 "ttl": "2h",
-                "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" },
+                "requester": { "type": "kobe:sandbox-composition", "identity": "lease-uid-1" },
                 "cleanupMode": "VerifiedDestroy",
             },
             "status": status,
         })
+    }
+
+    #[test]
+    fn receipt_authority_requires_immutable_outer_uid_and_exact_child_uid() {
+        let consumer = child_placed_lease("child-lease-uid");
+        let recorded = consumer
+            .status
+            .as_ref()
+            .and_then(|status| status.target.as_ref())
+            .and_then(|target| target.child_cluster_lease.as_ref())
+            .unwrap();
+        let exact: crate::crd::ClusterLease =
+            serde_json::from_value(child_cluster_lease("child-lease-uid", "Released", None))
+                .unwrap();
+        assert!(composition_handle_matches_consumer(
+            &exact, &consumer, recorded
+        ));
+
+        let mut mutable_metadata_forgery = exact.clone();
+        mutable_metadata_forgery.spec.requester.identity = "foreign-outer-uid".into();
+        assert!(
+            !composition_handle_matches_consumer(&mutable_metadata_forgery, &consumer, recorded),
+            "labels and annotations cannot replace immutable requester UID authority"
+        );
+
+        let mut replacement = recorded.clone();
+        replacement.uid = "same-name-replacement".into();
+        assert!(
+            !composition_handle_matches_consumer(&exact, &consumer, &replacement),
+            "a same-named replacement child cannot inherit an old consumer checkpoint"
+        );
     }
 
     fn child_creation_manifest() -> crate::crd::TeardownCreationManifest {
@@ -14076,6 +14786,7 @@ current-context: child
         };
         let mut visible = child_cluster_lease("child-lease-uid", phase, receipt.clone());
         let (ack_key, proof_value) = if let Some(receipt) = receipt.as_ref() {
+            mount_child_evidence(server, receipt).await;
             let receipt: crate::crd::TeardownReceipt =
                 serde_json::from_value(receipt.clone()).expect("receipt fixture parses");
             (
@@ -14093,7 +14804,7 @@ current-context: child
                 "type": "AllocationAbsent",
                 "status": "True",
                 "reason": "NeverBound",
-                "message": "no allocation was ever bound",
+                "message": format!("release attempt {attempt} proved no reciprocal allocation existed"),
                 "lastTransitionTime": proof,
             }]);
             (
@@ -14850,7 +15561,7 @@ current-context: child
             "type": "AllocationAbsent",
             "status": "True",
             "reason": "NeverBound",
-            "message": "no allocation was ever bound",
+            "message": format!("release attempt {attempt} proved no reciprocal allocation existed"),
             "lastTransitionTime": proof,
         }]);
         let mut acknowledged = never_bound.clone();
@@ -14872,7 +15583,9 @@ current-context: child
         Mock::given(method("GET"))
             .and(path(CLUSTER_LEASE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(never_bound.clone()))
-            .up_to_n_times(2)
+            // One read checkpoints the attempt-bound proof, one checkpoints
+            // FootprintAbsent, and one is revalidated before ACK+delete.
+            .up_to_n_times(3)
             .with_priority(2)
             .mount(&server)
             .await;
@@ -14908,7 +15621,7 @@ current-context: child
         status.placement = None;
         status.target = None;
 
-        for pass in 0..10 {
+        for pass in 0..12 {
             let before = server
                 .received_requests()
                 .await
@@ -15214,13 +15927,15 @@ current-context: child
         })
         .to_string();
         mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+        let receipt = verified_receipt("kobe-abc123", "child-instance-uid");
+        mount_child_evidence(&server, &receipt).await;
         Mock::given(method("GET"))
             .and(path(CLUSTER_LEASE_PATH))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(child_cluster_lease(
                     "child-lease-uid",
                     "Recycling",
-                    Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+                    Some(receipt),
                 )),
             )
             .mount(&server)
@@ -15290,6 +16005,11 @@ current-context: child
 
         let attempt = "never-bound-attempt-1";
         let proof = "2026-08-20T00:00:00Z";
+        lease.status.as_mut().unwrap().child_unbound_release_proof =
+            Some(crate::crd::ChildUnboundReleaseProof {
+                attempt_id: attempt.into(),
+                verified_at: proof.into(),
+            });
         let mut never_bound = child_cluster_lease("child-lease-uid", "Released", None);
         never_bound["status"]["teardownAttemptId"] = attempt.into();
         never_bound["status"]["unboundReleaseVerifiedAt"] = proof.into();
@@ -15297,7 +16017,7 @@ current-context: child
             "type": "AllocationAbsent",
             "status": "True",
             "reason": "NeverBound",
-            "message": "no allocation was ever bound",
+            "message": format!("release attempt {attempt} proved no reciprocal allocation existed"),
             "lastTransitionTime": proof,
         }]);
         Mock::given(method("GET"))
@@ -15385,6 +16105,10 @@ current-context: child
         status.phase = crate::crd::SandboxLeasePhase::Releasing;
         status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
         status.target.as_mut().unwrap().child_cluster_instance = None;
+        status.child_unbound_release_proof = Some(crate::crd::ChildUnboundReleaseProof {
+            attempt_id: "never-bound-attempt-1".into(),
+            verified_at: "2026-08-20T00:00:00Z".into(),
+        });
         status.conditions = with_condition_for_status(
             status,
             lease.metadata.generation,
@@ -15415,13 +16139,15 @@ current-context: child
     async fn a_receipt_for_another_instance_does_not_release_this_lease() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
+        let receipt = verified_receipt("kobe-later", "a-later-instance-uid");
+        mount_child_evidence(&server, &receipt).await;
         Mock::given(method("GET"))
             .and(path(CLUSTER_LEASE_PATH))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(child_cluster_lease(
                     "child-lease-uid",
                     "Recycling",
-                    Some(verified_receipt("kobe-later", "a-later-instance-uid")),
+                    Some(receipt),
                 )),
             )
             .mount(&server)

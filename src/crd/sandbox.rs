@@ -14,6 +14,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::TeardownEvidenceReference;
+
 /// Administrator-owned class of Agent Sandbox capacity.
 ///
 /// Root CRD CEL can couple the status generation markers to one another, but
@@ -482,6 +484,10 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status FootprintAbsent proof is immutable once recorded"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownReceiptAcknowledgement) || (has(self.status) && self.status != null && has(self.status.childTeardownReceiptAcknowledgement) && self.status.childTeardownReceiptAcknowledgement == oldSelf.status.childTeardownReceiptAcknowledgement)")
         .message("status.childTeardownReceiptAcknowledgement is immutable once recorded"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownEvidence) || (has(self.status) && self.status != null && has(self.status.childTeardownEvidence) && self.status.childTeardownEvidence == oldSelf.status.childTeardownEvidence)")
+        .message("status.childTeardownEvidence is immutable once recorded"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childUnboundReleaseProof) || (has(self.status) && self.status != null && has(self.status.childUnboundReleaseProof) && self.status.childUnboundReleaseProof == oldSelf.status.childUnboundReleaseProof)")
+        .message("status.childUnboundReleaseProof is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != 'FootprintAbsent' || (c.status == 'True' && has(self.status.releaseCause) && self.status.phase in ['Releasing', 'Released', 'Expired']))")
         .message("FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSecret) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret) && self.status.target.childClusterKubeconfigSecret == oldSelf.status.target.childClusterKubeconfigSecret)")
@@ -510,6 +516,10 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("child placement without placementAuthority may only preserve an exact legacy placement"),
     validation = Rule::new("!(has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == 'childCluster' && !has(oldSelf.spec.placementAuthority)) || (has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == 'childCluster' && !has(self.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)")
         .message("legacy child placement without placementAuthority may not be removed or changed"),
+    validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.childTeardownReceiptAcknowledgement) == has(self.status.childTeardownEvidence))")
+        .message("child receipt token and immutable evidence must be checkpointed together"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.childUnboundReleaseProof) || (!has(self.status.childTeardownReceiptAcknowledgement) && !has(self.status.childTeardownEvidence) && has(self.status.placement) && self.status.placement.type == 'childCluster')")
+        .message("NeverBound and receipt checkpoints are mutually exclusive and require child placement"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -810,6 +820,16 @@ pub struct SandboxLeaseStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(equal = 71), pattern("^sha256:[0-9a-f]{64}$"))]
     pub child_teardown_receipt_acknowledgement: Option<String>,
+    /// Exact immutable authority object copied in the same status checkpoint
+    /// as [`Self::child_teardown_receipt_acknowledgement`]. A hash alone is not
+    /// enough to release the producer's retained handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_teardown_evidence: Option<TeardownEvidenceReference>,
+    /// Attempt-bound proof used when the internal ClusterLease reached a
+    /// terminal phase before any reciprocal ClusterInstance binding existed.
+    /// It is copied before the receipt authority acknowledges the child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_unbound_release_proof: Option<ChildUnboundReleaseProof>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         length(max = 16),
@@ -846,6 +866,17 @@ pub enum SandboxChildTeardownMode {
     /// unreachable; execution records may be retired only after the exact
     /// verified-destroy receipt proves their target cluster absent.
     VerifiedDestroyFallbackV1,
+}
+
+/// Exact attempt checkpoint copied by the outer Sandbox before the receipt
+/// authority may acknowledge and retire a child handle that never bound.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChildUnboundReleaseProof {
+    #[schemars(length(min = 1))]
+    pub attempt_id: String,
+    #[schemars(extend("format" = "date-time"))]
+    pub verified_at: String,
 }
 
 /// Stable public phases. `Released` and `Expired` are clean terminal states;

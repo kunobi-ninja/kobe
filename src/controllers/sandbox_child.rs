@@ -31,6 +31,11 @@ use crate::crd::{
     SandboxLease, SandboxObjectReference, SandboxPlacement, SandboxPlacementAuthority, SandboxPool,
 };
 
+pub(crate) const SANDBOX_COMPOSITION_NAME_ANNOTATION: &str =
+    "kobe.kunobi.ninja/sandbox-composition-name";
+pub(crate) const CONNECT_TOKEN_CREATE_FENCE_ANNOTATION: &str =
+    "kobe.kunobi.ninja/connect-token-binding-before-create-v1";
+
 /// Grace added on top of provisioning and runtime, so the internal cluster
 /// cannot expire while its Sandbox is still being torn down.
 ///
@@ -412,6 +417,7 @@ pub fn build_internal_cluster_lease(
     lifetime: Duration,
 ) -> Option<ClusterLease> {
     let sandbox_uid = sandbox_lease.uid().filter(|uid| !uid.is_empty())?;
+    let requester = internal_requester(&sandbox_uid);
     Some(ClusterLease {
         metadata: ObjectMeta {
             name: Some(internal_lease_name(&sandbox_lease.name_any())),
@@ -424,7 +430,7 @@ pub fn build_internal_cluster_lease(
                     ),
                     (
                         crate::sandbox::SANDBOX_LEASE_UID_LABEL.to_string(),
-                        sandbox_uid,
+                        sandbox_uid.clone(),
                     ),
                     (CHILD_HANDLE_TOMBSTONE_LABEL.to_string(), "true".into()),
                 ]
@@ -445,17 +451,28 @@ pub fn build_internal_cluster_lease(
                         CHILD_KUBECONFIG_PROVENANCE_ANNOTATION.to_string(),
                         CHILD_KUBECONFIG_PROVENANCE_SECRET_UID_SHA256_V1.to_string(),
                     ),
+                    (
+                        SANDBOX_COMPOSITION_NAME_ANNOTATION.to_string(),
+                        sandbox_lease.name_any(),
+                    ),
+                    (
+                        CONNECT_TOKEN_CREATE_FENCE_ANNOTATION.to_string(),
+                        "true".into(),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
             ),
-            finalizers: Some(vec![CHILD_HANDLE_RETENTION_FINALIZER.to_string()]),
+            finalizers: Some(vec![
+                CHILD_HANDLE_RETENTION_FINALIZER.to_string(),
+                crate::crd::TEARDOWN_RECEIPT_RETENTION_FINALIZER.to_string(),
+            ]),
             ..Default::default()
         },
         spec: ClusterLeaseSpec {
             pool_ref: cluster_pool_ref.to_string(),
             ttl: format!("{}s", lifetime.as_secs()),
-            requester: internal_requester(),
+            requester,
             priority: default_internal_priority(),
             cleanup_mode: Some(CleanupMode::VerifiedDestroy),
         },
@@ -477,7 +494,6 @@ fn internal_lease_base_identity_is_for_sandbox(
             .get("app.kubernetes.io/managed-by")
             .is_some_and(|value| value == crate::sandbox::KOBE_MANAGED_BY)
         && internal.spec.requester.requester_type == "kobe:sandbox-composition"
-        && internal.spec.requester.identity == "kobe-operator"
         && internal.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
 }
 
@@ -510,14 +526,20 @@ pub(crate) fn internal_lease_ownership(
         .labels()
         .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL);
     let Some(owners) = internal.metadata.owner_references.as_ref() else {
-        return if uid_label == Some(&sandbox_uid) {
+        return if uid_label == Some(&sandbox_uid)
+            && (internal.spec.requester.identity == sandbox_uid
+                || internal.spec.requester.identity == "kobe-operator")
+        {
             InternalLeaseOwnership::Ownerless
         } else {
             InternalLeaseOwnership::Foreign
         };
     };
     if owners.is_empty() {
-        return if uid_label == Some(&sandbox_uid) {
+        return if uid_label == Some(&sandbox_uid)
+            && (internal.spec.requester.identity == sandbox_uid
+                || internal.spec.requester.identity == "kobe-operator")
+        {
             InternalLeaseOwnership::Ownerless
         } else {
             InternalLeaseOwnership::Foreign
@@ -533,6 +555,8 @@ pub(crate) fn internal_lease_ownership(
         // shape, or a partially migrated exact label, but never a conflicting
         // label from a same-named replacement outer lease.
         && uid_label.is_none_or(|value| value == &sandbox_uid)
+        && (internal.spec.requester.identity == "kobe-operator"
+            || internal.spec.requester.identity == sandbox_uid)
     {
         InternalLeaseOwnership::ExactLegacy
     } else {
@@ -597,10 +621,13 @@ pub fn internal_lease_matches_composition(
 /// would show up in their listings and read as theirs to release — and
 /// releasing it out from under a running Sandbox is precisely the operation
 /// this composition exists to prevent them performing.
-fn internal_requester() -> Requester {
+fn internal_requester(outer_uid: &str) -> Requester {
     Requester {
         requester_type: "kobe:sandbox-composition".to_string(),
-        identity: "kobe-operator".to_string(),
+        // This is the outer object's UID, not the tenant identity. It lives in
+        // immutable spec so the isolated authority can authenticate the exact
+        // consumer without trusting mutable labels or owner references.
+        identity: outer_uid.to_string(),
     }
 }
 
@@ -934,6 +961,7 @@ mod tests {
         // internal cluster in their listings and read as theirs to release.
         assert_ne!(lease.spec.requester.identity, "alice");
         assert!(lease.spec.requester.requester_type.starts_with("kobe:"));
+        assert_eq!(lease.spec.requester.identity, "lease-uid-1");
 
         assert_eq!(lease.spec.ttl, "5100s");
     }

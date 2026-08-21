@@ -12,6 +12,24 @@
       "required": ["repository"]
     },
     "replicas": { "type": "integer", "minimum": 1 },
+    "teardownAuthority": {
+      "type": "object",
+      "properties": {
+        "replicas": { "type": "integer", "minimum": 1 },
+        "imagePullSecrets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": { "name": { "type": "string", "minLength": 1 } },
+            "required": ["name"],
+            "additionalProperties": false
+          }
+        },
+        "postgresUrlSecretName": { "type": "string" }
+      },
+      "required": ["replicas", "imagePullSecrets", "postgresUrlSecretName"],
+      "additionalProperties": false
+    },
     "logLevel": { "type": "string" },
     "operatorNamespace": { "type": "string", "minLength": 1 },
     "agentSandbox": {

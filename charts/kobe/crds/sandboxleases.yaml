@@ -179,6 +179,32 @@ spec:
                 - name
                 - uid
                 type: object
+              childTeardownEvidence:
+                description: |-
+                  Exact immutable authority object copied in the same status checkpoint
+                  as [`Self::child_teardown_receipt_acknowledgement`]. A hash alone is not
+                  enough to release the producer's retained handle.
+                nullable: true
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  resourceVersion:
+                    minLength: 1
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - generation
+                - name
+                - resourceVersion
+                - uid
+                type: object
               childTeardownMode:
                 description: |-
                   Durable ordering proof selected before a bound child `ClusterLease` is
@@ -200,6 +226,23 @@ spec:
                 nullable: true
                 pattern: ^sha256:[0-9a-f]{64}$
                 type: string
+              childUnboundReleaseProof:
+                description: |-
+                  Attempt-bound proof used when the internal ClusterLease reached a
+                  terminal phase before any reciprocal ClusterInstance binding existed.
+                  It is copied before the receipt authority acknowledges the child.
+                nullable: true
+                properties:
+                  attemptId:
+                    minLength: 1
+                    type: string
+                  verifiedAt:
+                    format: date-time
+                    type: string
+                required:
+                - attemptId
+                - verifiedAt
+                type: object
               claimCleanupFence:
                 description: Durable management-Claim deletion fence understood by this controller.
                 enum:
@@ -791,6 +834,10 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True'') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
         - message: status.childTeardownReceiptAcknowledgement is immutable once recorded
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownReceiptAcknowledgement) || (has(self.status) && self.status != null && has(self.status.childTeardownReceiptAcknowledgement) && self.status.childTeardownReceiptAcknowledgement == oldSelf.status.childTeardownReceiptAcknowledgement)'
+        - message: status.childTeardownEvidence is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownEvidence) || (has(self.status) && self.status != null && has(self.status.childTeardownEvidence) && self.status.childTeardownEvidence == oldSelf.status.childTeardownEvidence)'
+        - message: status.childUnboundReleaseProof is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childUnboundReleaseProof) || (has(self.status) && self.status != null && has(self.status.childUnboundReleaseProof) && self.status.childUnboundReleaseProof == oldSelf.status.childUnboundReleaseProof)'
         - message: FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause
           rule: '!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != ''FootprintAbsent'' || (c.status == ''True'' && has(self.status.releaseCause) && self.status.phase in [''Releasing'', ''Released'', ''Expired'']))'
         - message: status.target.childClusterKubeconfigSecret is immutable once recorded
@@ -819,6 +866,10 @@ spec:
           rule: '!(has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == ''childCluster'' && !has(self.spec.placementAuthority)) || (has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == ''childCluster'' && !has(oldSelf.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)'
         - message: legacy child placement without placementAuthority may not be removed or changed
           rule: '!(has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == ''childCluster'' && !has(oldSelf.spec.placementAuthority)) || (has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == ''childCluster'' && !has(self.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)'
+        - message: child receipt token and immutable evidence must be checkpointed together
+          rule: '!has(self.status) || self.status == null || (has(self.status.childTeardownReceiptAcknowledgement) == has(self.status.childTeardownEvidence))'
+        - message: NeverBound and receipt checkpoints are mutually exclusive and require child placement
+          rule: '!has(self.status) || self.status == null || !has(self.status.childUnboundReleaseProof) || (!has(self.status.childTeardownReceiptAcknowledgement) && !has(self.status.childTeardownEvidence) && has(self.status.placement) && self.status.placement.type == ''childCluster'')'
     served: true
     storage: true
     subresources:

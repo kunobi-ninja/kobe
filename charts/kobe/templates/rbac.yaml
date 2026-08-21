@@ -13,6 +13,14 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+  namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
   name: {{ .Values.poolPublisherServiceAccount | default (printf "%s-pool-publisher" (include "kobe.fullname" .)) }}
   namespace: {{ .Release.Namespace }}
   labels:
@@ -46,6 +54,10 @@ rules:
   # Sandbox admission reads administrator-owned pool definitions.
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxpools"]
+    verbs: ["get", "list", "watch"]
+  # The control plane may authenticate evidence but cannot write it.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["verifiedteardownevidence"]
     verbs: ["get", "list", "watch"]
   # Pool reconciliation publishes exact allocation counts and a fail-closed
   # readiness certificate. Keep status authority separate from pool spec:

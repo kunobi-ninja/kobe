@@ -419,6 +419,37 @@ impl ClusterBackend for BackendDispatch {
         }
     }
 
+    async fn verify_absent_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        match self {
+            Self::K3s(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+        }
+    }
+
     async fn capture_teardown_identities(
         &self,
         name: &str,
@@ -806,6 +837,24 @@ pub trait ClusterBackend: Send + Sync {
     /// crash-safe tombstones and attempt-bound external evidence.
     #[allow(dead_code)]
     fn delete_verified_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
+    {
+        let _ = (name, namespace, manifest, attempt_id);
+        async { Err(VerifiedDestroyUnsupported) }
+    }
+
+    /// Re-observe the immutable manifest after a separate lifecycle controller
+    /// has issued deletion. This method is strictly read-only and is the trust
+    /// boundary used by the isolated receipt authority. `attempt_id` is the
+    /// immutable receipt attempt persisted before deletion, so external
+    /// evidence cannot be replayed from another teardown attempt.
+    #[allow(dead_code)]
+    fn verify_absent_manifest(
         &self,
         name: &str,
         namespace: &str,

@@ -179,6 +179,99 @@ const [disabledYaml, externalYaml] = await Promise.all([
 const disabled = parseDocuments(disabledYaml);
 const external = parseDocuments(externalYaml);
 
+// The proof process is structurally separate even when Agent Sandbox itself is
+// disabled. Admission/RBAC complete this boundary; these checks pin the pod,
+// namespace and identity contract that those controls refer to.
+const authority = objectNamed(
+	external,
+	"Deployment",
+	"kobe-teardown-authority",
+);
+invariant(authority, "chart omitted the teardown-authority Deployment");
+const authorityNamespace = String(metadata(authority).namespace ?? "");
+invariant(
+	authorityNamespace !== "" && authorityNamespace !== "kobe-system",
+	"teardown authority shares the general operator namespace",
+);
+invariant(
+	objectNamed(external, "Namespace", authorityNamespace),
+	"chart omitted the dedicated teardown-authority Namespace",
+);
+const authorityServiceAccount = objectNamed(
+	external,
+	"ServiceAccount",
+	"kobe-teardown-authority",
+);
+invariant(
+	authorityServiceAccount &&
+		metadata(authorityServiceAccount).namespace === authorityNamespace,
+	"teardown authority ServiceAccount is not in its dedicated namespace",
+);
+const authorityPod = ((authority.spec as Record<string, unknown>).template as Record<
+	string,
+	unknown
+>).spec as Record<string, unknown>;
+invariant(
+	authorityPod.serviceAccountName === "kobe-teardown-authority",
+	"teardown authority pod does not use the dedicated ServiceAccount",
+);
+const authorityContainer = (authorityPod.containers as Record<string, unknown>[])[0];
+const authorityEnv = new Map(
+	(authorityContainer.env as Record<string, unknown>[]).map((entry) => [
+		String(entry.name),
+		entry.value,
+	]),
+);
+invariant(
+	authorityEnv.get("KOBE_PROCESS_ROLE") === "teardown-authority" &&
+		authorityEnv.get("AGENT_SANDBOX_MODE") === "disabled",
+	"teardown authority can run general lifecycle or Sandbox placement",
+);
+
+const controlPlane = objectNamed(external, "Deployment", "kobe");
+invariant(controlPlane, "chart omitted the control-plane Deployment");
+const controlPlanePod = (((controlPlane.spec as Record<string, unknown>)
+	.template as Record<string, unknown>).spec ?? {}) as Record<string, unknown>;
+const controlPlaneContainer = (
+	controlPlanePod.containers as Record<string, unknown>[]
+)[0];
+const controlPlaneEnv = new Map(
+	(controlPlaneContainer.env as Record<string, unknown>[]).map((entry) => [
+		String(entry.name),
+		entry.value,
+	]),
+);
+invariant(
+	controlPlaneEnv.get("KOBE_PROCESS_ROLE") === "control-plane",
+	"general Deployment did not select the lifecycle-only process role",
+);
+
+const generalRole = objectNamed(external, "ClusterRole", "kobe");
+invariant(generalRole, "chart omitted the general control-plane ClusterRole");
+const generalRules = (generalRole.rules ?? []) as Record<string, unknown>[];
+invariant(
+	generalRules.every(
+		(rule) =>
+			!Array.isArray(rule.verbs) || !rule.verbs.includes("impersonate"),
+	),
+	"general control-plane identity can impersonate another Kubernetes identity",
+);
+const evidenceRule = generalRules.find(
+	(rule) =>
+		Array.isArray(rule.resources) &&
+		rule.resources.includes("verifiedteardownevidence"),
+);
+invariant(evidenceRule, "general control plane cannot authenticate teardown evidence");
+invariant(
+	Array.isArray(evidenceRule.verbs) &&
+		["get", "list", "watch"].every((verb) => evidenceRule.verbs.includes(verb)) &&
+		["create", "update", "patch", "delete"].every(
+			(verb) => !evidenceRule.verbs.includes(verb),
+		),
+	"general control plane can mutate teardown evidence",
+);
+
+
 for (const [mode, documents] of [
 	["disabled", disabled],
 	["external", external],

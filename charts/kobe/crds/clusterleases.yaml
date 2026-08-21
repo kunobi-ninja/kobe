@@ -626,6 +626,66 @@ spec:
                   - type
                   type: object
                 type: array
+              connectTokenCreation:
+                description: |-
+                  Crash-safe state machine for creation of the lease-scoped connect
+                  token. `Prepared` is persisted before the create-capable reconcile;
+                  `Creating` is then persisted immediately before the one permitted
+                  Secret `POST`.
+                  `Reserved` records the exact Secret UID and closes the create name;
+                  every later operation is an exact-UID `PATCH` or `DELETE`, never a
+                  second create. Terminal release may certify `NeverBound` only after the
+                  same attempt reaches `Closed` with an observed-absence timestamp.
+                nullable: true
+                properties:
+                  attemptId:
+                    minLength: 1
+                    type: string
+                  identity:
+                    description: |-
+                      Exact identity of one Kubernetes object in a creation manifest.
+
+                      Names are not identities: Kubernetes permits delete-and-recreate under the
+                      same name. A UID is therefore mandatory for every recorded object, and a
+                      receipt must account for the canonical identity rather than only its kind or
+                      display name.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        nullable: true
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  phase:
+                    description: Monotonic states for [`ConnectTokenCreation`].
+                    enum:
+                    - prepared
+                    - creating
+                    - reserved
+                    - ready
+                    - closing
+                    - closed
+                    type: string
+                  verifiedAbsentAt:
+                    format: date-time
+                    nullable: true
+                    type: string
+                required:
+                - attemptId
+                - phase
+                type: object
               diagnosticsUrl:
                 description: URL to the diagnostic bundle captured on release.
                 nullable: true
@@ -676,14 +736,137 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              teardownAcknowledgement:
+                description: |-
+                  Authority-owned proof that a distinct consumer durably checkpointed
+                  this exact receipt or `NeverBound` attempt. The lifecycle controller
+                  may remove the retention finalizer only when this value matches the
+                  currently retained proof.
+                nullable: true
+                properties:
+                  acknowledgedAt:
+                    format: date-time
+                    type: string
+                  attemptId:
+                    minLength: 1
+                    type: string
+                  consumer:
+                    description: |-
+                      Exact identity of one Kubernetes object in a creation manifest.
+
+                      Names are not identities: Kubernetes permits delete-and-recreate under the
+                      same name. A UID is therefore mandatory for every recorded object, and a
+                      receipt must account for the canonical identity rather than only its kind or
+                      display name.
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        nullable: true
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  proof:
+                    description: Exact proof copied by the consumer before an authority may acknowledge it.
+                    properties:
+                      evidence:
+                        description: Exact immutable evidence object checkpointed by a consumer before ACK.
+                        nullable: true
+                        properties:
+                          generation:
+                            format: int64
+                            minimum: 1.0
+                            type: integer
+                          name:
+                            minLength: 1
+                            type: string
+                          resourceVersion:
+                            minLength: 1
+                            type: string
+                          uid:
+                            minLength: 1
+                            type: string
+                        required:
+                        - generation
+                        - name
+                        - resourceVersion
+                        - uid
+                        type: object
+                      kind:
+                        description: |-
+                          Discriminator for [`TeardownAcknowledgedProof`]. The optional payload
+                          fields intentionally live in one structural object: Kubernetes CRD schemas
+                          cannot merge internally-tagged enum variants that give `kind` different
+                          enum constraints. The `ClusterLease` CEL rule enforces the exact payload
+                          for each variant.
+                        enum:
+                        - receipt
+                        - neverBound
+                        type: string
+                      receiptToken:
+                        maxLength: 71
+                        minLength: 71
+                        nullable: true
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      unboundReleaseVerifiedAt:
+                        format: date-time
+                        nullable: true
+                        type: string
+                    required:
+                    - kind
+                    type: object
+                required:
+                - acknowledgedAt
+                - attemptId
+                - consumer
+                - proof
+                type: object
               teardownAttemptId:
                 description: |-
                   Durable nonce written before the first destructive request. Kept
                   separate from the mutable InProgress-to-terminal receipt so consumers
                   can verify that the terminal record belongs to the exact attempt the
                   controller began, rather than trusting a nonce supplied by that record.
+                minLength: 1
                 nullable: true
                 type: string
+              teardownEvidence:
+                description: |-
+                  Exact immutable authority record corresponding to
+                  [`Self::teardown_receipt`]. Consumers never trust the status mirror
+                  without fetching this UID/generation/resourceVersion-fenced object.
+                nullable: true
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  resourceVersion:
+                    minLength: 1
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - generation
+                - name
+                - resourceVersion
+                - uid
+                type: object
               teardownReceipt:
                 description: |-
                   Durable proof that this lease's exact capacity was destroyed.
@@ -881,11 +1064,12 @@ spec:
                 type: object
               unboundReleaseVerifiedAt:
                 description: |-
-                  API-server-observed proof that a terminal lease never acquired a
-                  binding or even a display `clusterName`. `VerifiedDestroy` leases keep
-                  this proof-bearing handle until their composing Sandbox acknowledges it;
-                  otherwise the handle's 404 would erase the only evidence that there was
-                  no child cluster to destroy.
+                  API-server-observed proof that this exact terminal lease never acquired
+                  a reciprocal `ClusterInstance` binding. The proof is meaningful only
+                  with the same status' immutable [`Self::teardown_attempt_id`] and a
+                  `Closed` [`ConnectTokenCreation`]. It is retained until the composing
+                  Sandbox explicitly acknowledges that attempt.
+                format: date-time
                 nullable: true
                 type: string
             type: object
@@ -896,6 +1080,8 @@ spec:
         x-kubernetes-validations:
         - message: spec.cleanupMode is immutable, including implicit Standard
           rule: has(self.spec.cleanupMode) == has(oldSelf.spec.cleanupMode) && (!has(self.spec.cleanupMode) || self.spec.cleanupMode == oldSelf.spec.cleanupMode)
+        - message: spec.requester is immutable
+          rule: self.spec.requester == oldSelf.spec.requester
         - message: status.teardownAttemptId changes only when a new InProgress retry is durably begun
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAttemptId) || (has(self.status) && self.status != null && has(self.status.teardownAttemptId) && (self.status.teardownAttemptId == oldSelf.status.teardownAttemptId || (has(oldSelf.status.teardownReceipt) && oldSelf.status.teardownReceipt.outcome != ''inProgress'' && has(self.status.teardownReceipt) && self.status.teardownReceipt.outcome == ''inProgress'' && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId)))'
         - message: status.binding cleanupMode must match the immutable lease cleanup contract
@@ -904,6 +1090,18 @@ spec:
           rule: '!has(self.status) || self.status == null || !has(self.status.teardownReceipt) || (has(self.status.binding) && has(self.status.teardownAttemptId) && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId && self.status.teardownReceipt.cleanupMode == self.status.binding.cleanupMode)'
         - message: unbound release proof requires an attempt-bound NeverBound condition and no allocation identity
           rule: '!has(self.status) || self.status == null || !has(self.status.unboundReleaseVerifiedAt) || (has(self.status.teardownAttemptId) && !has(self.status.binding) && !has(self.status.clusterName) && !has(self.status.teardownReceipt) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''AllocationAbsent'' && c.status == ''True'' && c.reason == ''NeverBound''))'
+        - message: status.teardownAcknowledgement is immutable once authority records it
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAcknowledgement) || (has(self.status) && self.status != null && has(self.status.teardownAcknowledgement) && self.status.teardownAcknowledgement == oldSelf.status.teardownAcknowledgement)'
+        - message: status.teardownAcknowledgement proof payload must match its kind
+          rule: '!has(self.status) || self.status == null || !has(self.status.teardownAcknowledgement) || ((self.status.teardownAcknowledgement.proof.kind == ''receipt'' && has(self.status.teardownAcknowledgement.proof.receiptToken) && has(self.status.teardownAcknowledgement.proof.evidence) && !has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)) || (self.status.teardownAcknowledgement.proof.kind == ''neverBound'' && !has(self.status.teardownAcknowledgement.proof.receiptToken) && !has(self.status.teardownAcknowledgement.proof.evidence) && has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)))'
+        - message: status.connectTokenCreation attempt changes only after the prior attempt is Closed
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.attemptId == oldSelf.status.connectTokenCreation.attemptId || (oldSelf.status.connectTokenCreation.phase == ''closed'' && self.status.connectTokenCreation.phase == ''prepared'')))'
+        - message: status.connectTokenCreation phase transitions are monotonic
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.phase == oldSelf.status.connectTokenCreation.phase || (oldSelf.status.connectTokenCreation.phase == ''prepared'' && self.status.connectTokenCreation.phase in [''creating'', ''closed'']) || (oldSelf.status.connectTokenCreation.phase == ''creating'' && self.status.connectTokenCreation.phase in [''reserved'', ''closing'']) || (oldSelf.status.connectTokenCreation.phase == ''reserved'' && self.status.connectTokenCreation.phase in [''ready'', ''closing'']) || (oldSelf.status.connectTokenCreation.phase == ''ready'' && self.status.connectTokenCreation.phase == ''closing'') || (oldSelf.status.connectTokenCreation.phase == ''closing'' && self.status.connectTokenCreation.phase == ''closed'') || (oldSelf.status.connectTokenCreation.phase == ''closed'' && self.status.connectTokenCreation.phase == ''prepared'')))'
+        - message: status.connectTokenCreation payload must match its phase
+          rule: '!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || ((self.status.connectTokenCreation.phase in [''prepared'', ''creating''] && !has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase in [''reserved'', ''ready'', ''closing''] && has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase == ''closed'' && has(self.status.connectTokenCreation.verifiedAbsentAt)))'
+        - message: an open connect-token creator must match the durable binding intent
+          rule: '!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || self.status.connectTokenCreation.phase == ''closed'' || (has(self.status.binding) && (has(self.status.connectTokenCreation.identity) == has(self.status.binding.connectToken)) && (!has(self.status.connectTokenCreation.identity) || self.status.connectTokenCreation.identity == self.status.binding.connectToken))'
     served: true
     storage: true
     subresources:

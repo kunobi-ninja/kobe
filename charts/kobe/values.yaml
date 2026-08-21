@@ -63,6 +63,16 @@ serviceAccount:
   name: ""
   annotations: {}
 
+# Runs read-only teardown attestation and proof publication under a distinct
+# ServiceAccount and admission identity. Ordinary lifecycle remains in the
+# control-plane deployment.
+teardownAuthority:
+  replicas: 1
+  # Pull secrets and the optional PostgreSQL URL Secret must exist in the
+  # dedicated authority namespace, not in the release namespace.
+  imagePullSecrets: []
+  postgresUrlSecretName: ""
+
 poolServiceAccount: ""
 poolPublisherServiceAccount: ""
 

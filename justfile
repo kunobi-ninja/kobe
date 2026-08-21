@@ -169,6 +169,7 @@ build-crdgen:
     cargo run --bin crdgen -- clusterpools > charts/kobe/crds/clusterpools.yaml
     cargo run --bin crdgen -- clusterleases > charts/kobe/crds/clusterleases.yaml
     cargo run --bin crdgen -- clusterinstances > charts/kobe/crds/clusterinstances.yaml
+    cargo run --bin crdgen -- verifiedteardownevidence > charts/kobe/crds/verifiedteardownevidence.yaml
     cargo run --bin crdgen -- bootstrapconfigs > charts/kobe/crds/bootstrapconfigs.yaml
     cargo run --bin crdgen -- accesspolicies > charts/kobe/crds/accesspolicies.yaml
     cargo run --bin crdgen -- kobestores > charts/kobe/crds/kobestores.yaml

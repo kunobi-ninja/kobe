@@ -53,6 +53,31 @@ Service account name.
 {{- default (include "kobe.fullname" .) .Values.serviceAccount.name }}
 {{- end }}
 
+{{/* Receipt authority identity and pod selector are deliberately distinct. */}}
+{{- define "kobe.teardownAuthorityServiceAccountName" -}}
+{{- printf "%s-teardown-authority" (include "kobe.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "kobe.teardownAuthorityPolicyName" -}}
+{{- printf "%s-teardown-authority" (include "kobe.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+The proof identity lives outside every namespace the general controller may
+mutate. A release-derived hash prevents two equal release names in different
+namespaces from sharing the token-mint boundary.
+*/}}
+{{- define "kobe.teardownAuthorityNamespace" -}}
+{{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $prefix := printf "%s-teardown-authority" .Release.Name | trunc 46 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix ($identity | sha256sum | trunc 12) -}}
+{{- end }}
+
+{{- define "kobe.teardownAuthoritySelectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-teardown-authority" (include "kobe.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
 {{/*
 Dedicated namespace for the Sandbox admission CAS ledger. Release namespace
 and name are immutable Helm identity; the hash prevents cluster-scoped
