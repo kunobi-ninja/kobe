@@ -27,8 +27,8 @@ use kube::api::ObjectMeta;
 use kube::{Client, ResourceExt};
 
 use crate::crd::{
-    CleanupMode, ClusterLease, ClusterLeaseSpec, ClusterPool, Requester, SandboxLease,
-    SandboxObjectReference, SandboxPool,
+    CleanupMode, ClusterLease, ClusterLeaseSpec, ClusterPool, ClusterPoolPhase, Requester,
+    SandboxLease, SandboxObjectReference, SandboxPool,
 };
 
 /// Grace added on top of provisioning and runtime, so the internal cluster
@@ -115,6 +115,11 @@ pub enum ChildPlacementError {
     ChildRuntimeUnusable { cluster: String, reason: String },
     #[error("child cluster {cluster} has an unusable checkpointed kubeconfig Secret")]
     ChildCredentialUnusable { cluster: String },
+    #[error("ClusterPool {cluster_pool} cannot safely compose this SandboxPool ({reason})")]
+    CapacityUnavailable {
+        cluster_pool: String,
+        reason: &'static str,
+    },
 }
 
 impl ChildPlacementError {
@@ -127,8 +132,101 @@ impl ChildPlacementError {
             Self::InvalidDuration { .. } => "invalid_duration",
             Self::ChildRuntimeUnusable { .. } => "child_runtime_unusable",
             Self::ChildCredentialUnusable { .. } => "child_credential_unusable",
+            Self::CapacityUnavailable { .. } => "capacity_unavailable",
         }
     }
+}
+
+/// Prove a child pool may safely accept compositions before allocation.
+///
+/// This is deliberately not a capacity promise: an on-demand ClusterPool may
+/// be Idle with zero Ready members and concurrent compositions race for idle
+/// members. The internal [`ClusterLease`] is the only allocator. Certification
+/// proves static verified-destroy eligibility, complete object identity, no
+/// known unhealthy/quarantined footprint, and that the ClusterPool TTL ceiling
+/// covers the SandboxPool's worst permitted lifetime.
+pub fn child_pool_is_composition_eligible(
+    sandbox_pool: &SandboxPool,
+    cluster_pool: &ClusterPool,
+) -> Result<(), ChildPlacementError> {
+    child_pool_is_eligible(&sandbox_pool.name_any(), cluster_pool)?;
+    sandbox_pool
+        .spec
+        .validate()
+        .map_err(|_| ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "SandboxPool spec is invalid",
+        })?;
+    crate::sandbox::aggregate_resource_limits(&sandbox_pool.spec.template).map_err(|_| {
+        ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "SandboxPool resource quantities are invalid",
+        }
+    })?;
+    if crate::pool::parse_duration(&sandbox_pool.spec.readiness.canary.timeout)
+        .and_then(|duration| duration.to_std().ok())
+        .is_none_or(|duration| duration.is_zero())
+    {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "SandboxPool canary timeout is not a positive duration",
+        });
+    }
+    if !matches!(
+        sandbox_pool.spec.isolation,
+        crate::crd::SandboxIsolation::TrustedRunc {}
+    ) {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "gVisor and Kata isolation remain unqualified until issue #14 is closed",
+        });
+    }
+    if cluster_pool.uid().is_none_or(|uid| uid.is_empty())
+        || cluster_pool.metadata.generation.is_none()
+    {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "pool identity is incomplete",
+        });
+    }
+    let status =
+        cluster_pool
+            .status
+            .as_ref()
+            .ok_or_else(|| ChildPlacementError::CapacityUnavailable {
+                cluster_pool: cluster_pool.name_any(),
+                reason: "status is missing",
+            })?;
+    if status.quarantined != 0 {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "quarantined members are present",
+        });
+    }
+    if status.unhealthy != 0 {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "unhealthy members are present",
+        });
+    }
+    if !matches!(
+        status.phase,
+        Some(
+            ClusterPoolPhase::Healthy
+                | ClusterPoolPhase::ScalingUp
+                | ClusterPoolPhase::ScalingDown
+                | ClusterPoolPhase::Idle
+        )
+    ) {
+        return Err(ChildPlacementError::CapacityUnavailable {
+            cluster_pool: cluster_pool.name_any(),
+            reason: "pool is failing, backed off, or has no published phase",
+        });
+    }
+    let worst_ttl = parse_std_duration(&sandbox_pool.spec.max_ttl)
+        .ok_or(ChildPlacementError::InvalidDuration { field: "maxTtl" })?;
+    child_lifetime_fits(cluster_pool, sandbox_pool, worst_ttl)?;
+    Ok(())
 }
 
 /// The internal lease's name, derived from the Sandbox lease it serves.
@@ -560,6 +658,17 @@ mod tests {
         }
     }
 
+    fn healthy_cluster_pool() -> ClusterPool {
+        let mut pool = cluster_pool(BackendType::K3s, "10h");
+        pool.metadata.generation = Some(4);
+        pool.status = Some(crate::crd::ClusterPoolStatus {
+            phase: Some(ClusterPoolPhase::Healthy),
+            ready: 2,
+            ..Default::default()
+        });
+        pool
+    }
+
     fn backend_wire_name(backend: BackendType) -> String {
         serde_json::to_value(backend)
             .expect("backend serializes")
@@ -593,6 +702,64 @@ mod tests {
             );
             assert_eq!(error.reason_code(), "backend_unsupported");
         }
+    }
+
+    /// Child admission consumes only demonstrably clean idle capacity.
+    ///
+    /// A healthy-looking count cannot hide quarantine or unhealthy members,
+    /// and static k3s eligibility cannot substitute for current status.
+    #[test]
+    fn child_composition_requires_clean_bounded_pool_state() {
+        let sandbox_pool = SandboxPool {
+            metadata: ObjectMeta {
+                name: Some("agents".into()),
+                uid: Some("sandbox-pool-uid".into()),
+                generation: Some(3),
+                ..Default::default()
+            },
+            spec: serde_json::from_value(serde_json::json!({
+                "warmCapacity": 1,
+                "defaultTtl": "1h",
+                "maxTtl": "8h",
+                "provisioningTimeout": "10m",
+                "placement": { "type": "childCluster", "clusterPoolRef": "sandbox-children" },
+                "template": {
+                    "defaultContainer": "agent",
+                    "containers": [{
+                        "name": "agent",
+                        "image": "example.invalid/agent@sha256:abc",
+                        "command": ["/agent"],
+                        "resources": {
+                            "requests": { "cpu": "100m", "memory": "128Mi", "ephemeralStorage": "128Mi" },
+                            "limits": { "cpu": "1", "memory": "1Gi", "ephemeralStorage": "1Gi" }
+                        }
+                    }]
+                },
+                "isolation": { "tier": "trusted-runc" },
+                "readiness": { "canary": { "argv": ["/agent", "health"], "timeout": "30s" } }
+            }))
+            .unwrap(),
+            status: None,
+        };
+        let healthy = healthy_cluster_pool();
+        child_pool_is_composition_eligible(&sandbox_pool, &healthy).unwrap();
+
+        let mut degraded = healthy.clone();
+        degraded.status.as_mut().unwrap().quarantined = 1;
+        assert!(matches!(
+            child_pool_is_composition_eligible(&sandbox_pool, &degraded),
+            Err(ChildPlacementError::CapacityUnavailable { .. })
+        ));
+
+        let mut scaling = healthy.clone();
+        scaling.status.as_mut().unwrap().phase = Some(ClusterPoolPhase::ScalingUp);
+        assert!(child_pool_is_composition_eligible(&sandbox_pool, &scaling).is_ok());
+
+        let mut empty = healthy;
+        empty.status.as_mut().unwrap().phase = Some(ClusterPoolPhase::Idle);
+        empty.status.as_mut().unwrap().ready = 0;
+        child_pool_is_composition_eligible(&sandbox_pool, &empty)
+            .expect("an on-demand zero-ready pool remains composition-eligible");
     }
 
     /// The internal cluster must outlive the whole composition.

@@ -24,6 +24,12 @@ use thiserror::Error;
     shortname = "sp",
     status = "SandboxPoolStatus",
     namespaced,
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || !self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True') || (has(self.status.observedGeneration) && self.status.observedGeneration == self.metadata.generation && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'True' && has(c.observedGeneration) && c.observedGeneration == self.metadata.generation) && has(self.status.certification) && self.status.certification.phase == 'certified' && self.status.certification.observedGeneration == self.metadata.generation && has(self.status.certification.certifiedAt))")
+        .message("Ready=True requires a current-generation durable Certified receipt"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint != self.status.certification.fingerprint || (oldSelf.status.certification.sandboxTemplate == self.status.certification.sandboxTemplate && oldSelf.status.certification.sandboxWarmPool == self.status.certification.sandboxWarmPool && (!has(oldSelf.status.certification.sandboxClaim) || (has(self.status.certification.sandboxClaim) && oldSelf.status.certification.sandboxClaim == self.status.certification.sandboxClaim)) && (!has(oldSelf.status.certification.sandbox) || (has(self.status.certification.sandbox) && oldSelf.status.certification.sandbox == self.status.certification.sandbox)) && (!has(oldSelf.status.certification.pod) || (has(self.status.certification.pod) && oldSelf.status.certification.pod == self.status.certification.pod)) && (!has(oldSelf.status.certification.service) || (has(self.status.certification.service) && oldSelf.status.certification.service == self.status.certification.service)) && (!has(oldSelf.status.certification.persistentVolumeClaims) || (has(self.status.certification.persistentVolumeClaims) && oldSelf.status.certification.persistentVolumeClaims == self.status.certification.persistentVolumeClaims)) && (!has(oldSelf.status.certification.persistentVolumes) || (has(self.status.certification.persistentVolumes) && oldSelf.status.certification.persistentVolumes == self.status.certification.persistentVolumes)) && (!has(oldSelf.status.certification.baselineIdleSandboxUids) || (has(self.status.certification.baselineIdleSandboxUids) && oldSelf.status.certification.baselineIdleSandboxUids == self.status.certification.baselineIdleSandboxUids)) && (!has(oldSelf.status.certification.teardownFence) || (has(self.status.certification.teardownFence) && oldSelf.status.certification.teardownFence == self.status.certification.teardownFence)) && (!has(oldSelf.status.certification.drainGeneration) || (has(self.status.certification.drainGeneration) && oldSelf.status.certification.drainGeneration == self.status.certification.drainGeneration)) && (!has(oldSelf.status.certification.replenishGeneration) || (has(self.status.certification.replenishGeneration) && oldSelf.status.certification.replenishGeneration == self.status.certification.replenishGeneration)) && (!has(oldSelf.status.certification.canaryPassedAt) || (has(self.status.certification.canaryPassedAt) && oldSelf.status.certification.canaryPassedAt == self.status.certification.canaryPassedAt)) && (!has(oldSelf.status.certification.certifiedAt) || (has(self.status.certification.certifiedAt) && oldSelf.status.certification.certifiedAt == self.status.certification.certifiedAt)))))")
+        .message("exact certification references are immutable within one fingerprint"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == 'certified' || (oldSelf.status.certification.phase in ['initialized', 'cleanupBlocked'] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))")
+        .message("an active certification fingerprint cannot be abandoned before exact cleanup"),
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Allocated","type":"integer","jsonPath":".status.allocated"}"#,
     printcolumn = r#"{"name":"Quarantined","type":"integer","jsonPath":".status.quarantined"}"#,
@@ -434,7 +440,9 @@ pub struct SandboxReadinessRequirements {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxExecutionCanary {
-    /// Direct argv vector; no implicit shell expansion.
+    /// Direct argv vector; no implicit shell expansion. Certification may
+    /// execute this more than once after a controller crash or lost status
+    /// response, so the command must be idempotent and safe to retry.
     #[schemars(with = "Vec<NonEmptySandboxArgSchema>", length(min = 1, max = 64))]
     pub argv: Vec<String>,
     #[schemars(length(min = 1))]
@@ -551,6 +559,14 @@ pub struct SandboxPoolStatus {
     /// capacity remains allocated until its complete footprint is proven absent.
     #[serde(default)]
     pub quarantined: u32,
+    /// Restart-safe certification attempt for this exact Pool generation.
+    ///
+    /// The controller checkpoints object identities before crossing each
+    /// external side effect. A non-terminal attempt is deliberately retained:
+    /// abandoning its exact Claim or teardown fence would make a controller
+    /// restart capable of leaking capacity or admitting against stale proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certification: Option<SandboxPoolCertificationStatus>,
     /// Current-generation pool certification. `Ready=True` authorizes new
     /// leases; missing, stale, `False`, or `Unknown` conditions fail closed.
     /// Replica counters alone never authorize admission.
@@ -560,6 +576,111 @@ pub struct SandboxPoolStatus {
         extend("x-kubernetes-list-map-keys" = ["type"])
     )]
     pub conditions: Vec<SandboxCondition>,
+}
+
+/// Durable phase of one management-pool certification attempt.
+///
+/// `Certified` is the only phase that may accompany Pool `Ready=True`.
+/// `CleanupBlocked` is fail-closed and retains every exact reference needed to
+/// resume or investigate cleanup. Child placement does not use this state
+/// until an equivalent in-child receipt protocol exists.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxPoolCertificationPhase {
+    #[default]
+    Initialized,
+    ClaimCreated,
+    WorkloadCaptured,
+    CanaryPassed,
+    FenceInstalled,
+    DrainAcknowledged,
+    ClaimDeleting,
+    AbsenceProven,
+    Replenished,
+    FenceFinalizerRemoved,
+    FenceDeleting,
+    Certified,
+    CleanupBlocked,
+}
+
+/// Exact, non-secret evidence retained across pool certification reconciles.
+#[derive(Debug, Clone, Serialize, Deserialize, KubeSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[x_kube(
+    validation = Rule::new("self.phase in ['initialized', 'claimCreated', 'cleanupBlocked'] || (has(self.sandboxClaim) && has(self.sandbox) && has(self.pod))")
+        .message("workload and later certification phases require exact Claim, Sandbox and Pod references")
+)]
+#[x_kube(
+    validation = Rule::new("!(self.phase in ['fenceInstalled', 'drainAcknowledged', 'claimDeleting', 'absenceProven', 'replenished', 'fenceFinalizerRemoved', 'fenceDeleting', 'certified']) || has(self.teardownFence)")
+        .message("post-fence certification phases require the exact teardown fence reference")
+)]
+#[x_kube(
+    validation = Rule::new("!(self.phase in ['canaryPassed', 'fenceInstalled', 'drainAcknowledged', 'claimDeleting', 'absenceProven', 'replenished', 'fenceFinalizerRemoved', 'fenceDeleting', 'certified']) || has(self.canaryPassedAt)")
+        .message("post-canary certification phases require the durable canary timestamp")
+)]
+#[x_kube(
+    validation = Rule::new("self.phase != 'certified' || has(self.certifiedAt)")
+        .message("Certified requires a durable certification timestamp")
+)]
+#[x_kube(
+    validation = Rule::new("!(self.phase in ['drainAcknowledged', 'claimDeleting', 'absenceProven', 'replenished', 'fenceFinalizerRemoved', 'fenceDeleting', 'certified']) || has(self.drainGeneration)")
+        .message("drain acknowledgement and later phases require the exact WarmPool drain generation")
+)]
+#[x_kube(
+    validation = Rule::new("!(self.phase in ['replenished', 'fenceFinalizerRemoved', 'fenceDeleting', 'certified']) || has(self.replenishGeneration)")
+        .message("replenishment and terminal phases require the exact restored WarmPool generation")
+)]
+pub struct SandboxPoolCertificationStatus {
+    /// SHA-256 over the Pool UID/generation, exact Template/WarmPool identity,
+    /// pinned runtime version, and canonical canary requirements.
+    #[schemars(length(min = 64, max = 64), pattern("^[0-9a-f]{64}$"))]
+    pub fingerprint: String,
+    #[schemars(range(min = 1))]
+    pub observed_generation: i64,
+    pub phase: SandboxPoolCertificationPhase,
+    pub sandbox_template: SandboxObjectReference,
+    pub sandbox_warm_pool: SandboxObjectReference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_claim: Option<SandboxObjectReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxObjectReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<SandboxObjectReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<SandboxObjectReference>,
+    /// Exact PVC/PV identities seen before teardown. Empty means the closed
+    /// Pool template proved that no durable volumes can be created.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistent_volume_claims: Vec<SandboxObjectReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistent_volumes: Vec<SandboxObjectReference>,
+    /// Immutable parameter object for the teardown ValidatingAdmissionPolicy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_fence: Option<SandboxObjectReference>,
+    /// WarmPool-owned Sandbox UIDs present before the sacrificial Claim. Clean
+    /// replenishment must exclude the claimed Sandbox and preserve none of a
+    /// replaced generation's identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baseline_idle_sandbox_uids: Vec<String>,
+    /// WarmPool generation created by the post-fence scale-to-zero write. The
+    /// v0.5.6 `observedGeneration` ACK is meaningful only for this exact value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub drain_generation: Option<i64>,
+    /// WarmPool generation created when restoring the configured capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub replenish_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    pub canary_passed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    pub certified_at: Option<String>,
+    /// Human-readable fail-closed reason. In `CleanupBlocked`, this is the
+    /// exact causal proof that the controller could not obtain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
@@ -941,6 +1062,7 @@ mod tests {
             ready: 3,
             allocated: 2,
             quarantined: 1,
+            certification: None,
             conditions: vec![],
         })
         .unwrap();
@@ -954,6 +1076,62 @@ mod tests {
             })
         );
         assert!(encoded.get("observed_generation").is_none());
+    }
+
+    #[test]
+    fn pool_certification_wire_shape_is_crash_restart_safe() {
+        let reference = SandboxObjectReference {
+            api_version: "extensions.agents.x-k8s.io/v1beta1".into(),
+            kind: "SandboxTemplate".into(),
+            namespace: Some("kobe-system".into()),
+            name: "kobe-agents".into(),
+            uid: "template-uid".into(),
+            generation: Some(4),
+        };
+        let status = SandboxPoolCertificationStatus {
+            fingerprint: "a".repeat(64),
+            observed_generation: 7,
+            phase: SandboxPoolCertificationPhase::WorkloadCaptured,
+            sandbox_template: reference.clone(),
+            sandbox_warm_pool: SandboxObjectReference {
+                kind: "SandboxWarmPool".into(),
+                ..reference.clone()
+            },
+            sandbox_claim: Some(SandboxObjectReference {
+                kind: "SandboxClaim".into(),
+                uid: "claim-uid".into(),
+                ..reference.clone()
+            }),
+            sandbox: Some(SandboxObjectReference {
+                api_version: "agents.x-k8s.io/v1beta1".into(),
+                kind: "Sandbox".into(),
+                uid: "sandbox-uid".into(),
+                ..reference.clone()
+            }),
+            pod: Some(SandboxObjectReference {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                uid: "pod-uid".into(),
+                generation: None,
+                ..reference.clone()
+            }),
+            service: None,
+            persistent_volume_claims: vec![],
+            persistent_volumes: vec![],
+            teardown_fence: None,
+            baseline_idle_sandbox_uids: vec!["idle-uid".into()],
+            drain_generation: None,
+            replenish_generation: None,
+            canary_passed_at: None,
+            certified_at: None,
+            message: None,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["phase"], "workloadCaptured");
+        assert_eq!(
+            serde_json::from_value::<SandboxPoolCertificationStatus>(encoded).unwrap(),
+            status
+        );
     }
 
     #[test]
@@ -1132,6 +1310,118 @@ mod tests {
         }
         assert!(status.get("observedGeneration").is_some());
         assert!(status.get("observed_generation").is_none());
+        let certification = &status["certification"];
+        assert_eq!(certification["type"], "object");
+        assert_eq!(
+            certification["properties"]["fingerprint"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            certification["properties"]["phase"]["enum"],
+            serde_json::json!([
+                "initialized",
+                "claimCreated",
+                "workloadCaptured",
+                "canaryPassed",
+                "fenceInstalled",
+                "drainAcknowledged",
+                "claimDeleting",
+                "absenceProven",
+                "replenished",
+                "fenceFinalizerRemoved",
+                "fenceDeleting",
+                "certified",
+                "cleanupBlocked"
+            ])
+        );
+        assert_eq!(
+            certification["x-kubernetes-validations"]
+                .as_array()
+                .map(Vec::len),
+            Some(6)
+        );
+        let pool_validations =
+            pool["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["x-kubernetes-validations"]
+                .as_array()
+                .expect("SandboxPool root CEL validations");
+        assert!(pool_validations.iter().any(|validation| {
+            validation["message"]
+                == "Ready=True requires a current-generation durable Certified receipt"
+        }));
+        let ready_rule = pool_validations
+            .iter()
+            .find(|validation| {
+                validation["message"]
+                    == "Ready=True requires a current-generation durable Certified receipt"
+            })
+            .expect("Ready receipt CEL")["rule"]
+            .as_str()
+            .expect("CEL rule string");
+        assert!(ready_rule.contains("self.status.observedGeneration == self.metadata.generation"));
+        assert!(ready_rule.contains("c.observedGeneration == self.metadata.generation"));
+        assert!(
+            !pool_validations.iter().any(|validation| {
+                validation["message"]
+                    == "a Certified receipt requires the same-write current-generation Ready=True condition"
+            }),
+            "revoking Ready must remain writable while retaining the terminal receipt"
+        );
+        let immutable_references = pool_validations
+            .iter()
+            .find(|validation| {
+                validation["message"]
+                    == "exact certification references are immutable within one fingerprint"
+            })
+            .expect("exact-reference immutability CEL")["rule"]
+            .as_str()
+            .expect("CEL rule string");
+        for field in [
+            "sandboxClaim",
+            "sandbox",
+            "pod",
+            "service",
+            "persistentVolumeClaims",
+            "persistentVolumes",
+            "baselineIdleSandboxUids",
+            "teardownFence",
+            "drainGeneration",
+            "replenishGeneration",
+            "canaryPassedAt",
+            "certifiedAt",
+        ] {
+            assert!(
+                immutable_references.contains(field),
+                "exact-reference CEL omitted {field}"
+            );
+        }
+        let workload_reference_rule = certification["x-kubernetes-validations"]
+            .as_array()
+            .expect("certification CEL validations")
+            .iter()
+            .find(|validation| {
+                validation["message"]
+                    == "workload and later certification phases require exact Claim, Sandbox and Pod references"
+            })
+            .expect("workload-reference phase CEL")["rule"]
+            .as_str()
+            .expect("CEL rule string");
+        assert!(
+            workload_reference_rule.contains("'cleanupBlocked'"),
+            "an early durable CleanupBlocked checkpoint must not require workload refs"
+        );
+        let active_fingerprint_rule = pool_validations
+            .iter()
+            .find(|validation| {
+                validation["message"]
+                    == "an active certification fingerprint cannot be abandoned before exact cleanup"
+            })
+            .expect("active-fingerprint CEL")["rule"]
+            .as_str()
+            .expect("CEL rule string");
+        assert!(
+            active_fingerprint_rule.contains("['initialized', 'cleanupBlocked']"),
+            "a ref-less early blocker must be restartable after an administrator edit"
+        );
 
         assert_eq!(
             version["additionalPrinterColumns"],

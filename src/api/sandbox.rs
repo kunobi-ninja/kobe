@@ -6851,6 +6851,59 @@ mod tests {
                 "ready": 1,
                 "allocated": 0,
                 "quarantined": 0,
+                "certification": {
+                    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "observedGeneration": 1,
+                    "phase": "certified",
+                    "sandboxTemplate": {
+                        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                        "kind": "SandboxTemplate",
+                        "namespace": "test-ns",
+                        "name": "kobe-agent-small",
+                        "uid": "template-uid",
+                        "generation": 1
+                    },
+                    "sandboxWarmPool": {
+                        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                        "kind": "SandboxWarmPool",
+                        "namespace": "test-ns",
+                        "name": "kobe-agent-small",
+                        "uid": "warm-pool-uid",
+                        "generation": 3
+                    },
+                    "sandboxClaim": {
+                        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                        "kind": "SandboxClaim",
+                        "namespace": "test-ns",
+                        "name": "kobe-cert",
+                        "uid": "cert-claim-uid"
+                    },
+                    "sandbox": {
+                        "apiVersion": "agents.x-k8s.io/v1beta1",
+                        "kind": "Sandbox",
+                        "namespace": "test-ns",
+                        "name": "cert-sandbox",
+                        "uid": "cert-sandbox-uid"
+                    },
+                    "pod": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "namespace": "test-ns",
+                        "name": "cert-pod",
+                        "uid": "cert-pod-uid"
+                    },
+                    "teardownFence": {
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "namespace": "test-ns",
+                        "name": "retired-cert-fence",
+                        "uid": "cert-fence-uid"
+                    },
+                    "drainGeneration": 2,
+                    "replenishGeneration": 3,
+                    "canaryPassedAt": "2026-08-20T00:00:00Z",
+                    "certifiedAt": "2026-08-20T00:01:00Z"
+                },
                 "conditions": [{
                     "type": "Ready",
                     "status": "True",
@@ -7475,7 +7528,7 @@ mod tests {
     /// before the API creates even a pending SandboxLease.
     #[tokio::test]
     async fn admission_fails_closed_for_uncertified_pool_status() {
-        for variant in ["missing", "stale", "false"] {
+        for variant in ["missing", "stale", "false", "receiptless"] {
             let server = MockServer::start().await;
             mount_sandbox_crds(&server).await;
             let mut pool = pool_json();
@@ -7490,6 +7543,12 @@ mod tests {
                     pool["status"]["conditions"][0]["status"] = serde_json::json!("False");
                     pool["status"]["conditions"][0]["reason"] =
                         serde_json::json!("CertificationPending");
+                }
+                "receiptless" => {
+                    pool["status"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("certification");
                 }
                 _ => unreachable!(),
             }

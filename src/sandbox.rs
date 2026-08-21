@@ -59,8 +59,9 @@ const CORE_API_VERSION: &str = "v1";
 /// Capacity counters and an upstream WarmPool's `readyReplicas` are
 /// observations, not a safety certificate. A pool is admissible only when one
 /// `Ready=True` condition and the enclosing status were both derived from the
-/// pool's current generation. Missing, stale, duplicate, false, and unknown
-/// conditions all fail closed.
+/// pool's current generation and backed by the terminal durable certification
+/// receipt. Missing, stale, duplicate, false, unknown, or receipt-less status
+/// all fail closed.
 pub fn require_current_sandbox_pool_ready(
     pool: &SandboxPool,
 ) -> Result<(), SandboxPoolReadinessError> {
@@ -101,6 +102,23 @@ pub fn require_current_sandbox_pool_ready(
             reason: ready.reason.clone(),
         });
     }
+    let certification = status
+        .certification
+        .as_ref()
+        .ok_or(SandboxPoolReadinessError::MissingCertification)?;
+    if certification.observed_generation != generation {
+        return Err(SandboxPoolReadinessError::StaleCertification {
+            expected: generation,
+            observed: certification.observed_generation,
+        });
+    }
+    if certification.phase != crate::crd::SandboxPoolCertificationPhase::Certified
+        || certification.certified_at.is_none()
+    {
+        return Err(SandboxPoolReadinessError::IncompleteCertification {
+            phase: certification.phase,
+        });
+    }
     Ok(())
 }
 
@@ -133,6 +151,16 @@ pub enum SandboxPoolReadinessError {
     NotReady {
         status: SandboxConditionStatus,
         reason: String,
+    },
+    #[error("SandboxPool status has no durable certification receipt")]
+    MissingCertification,
+    #[error(
+        "SandboxPool certification observed generation {observed}, expected current generation {expected}"
+    )]
+    StaleCertification { expected: i64, observed: i64 },
+    #[error("SandboxPool certification phase is {phase:?}, expected Certified")]
+    IncompleteCertification {
+        phase: crate::crd::SandboxPoolCertificationPhase,
     },
 }
 
@@ -1367,6 +1395,43 @@ mod tests {
         }
     }
 
+    fn pool_certification(generation: i64) -> crate::crd::SandboxPoolCertificationStatus {
+        let object = |kind: &str, uid: &str| SandboxObjectReference {
+            api_version: if matches!(kind, "Pod" | "ConfigMap") {
+                "v1".into()
+            } else if kind == "Sandbox" {
+                "agents.x-k8s.io/v1beta1".into()
+            } else {
+                AGENT_SANDBOX_API_VERSION.into()
+            },
+            kind: kind.into(),
+            namespace: Some("targets".into()),
+            name: format!("cert-{}", kind.to_ascii_lowercase()),
+            uid: uid.into(),
+            generation: Some(1),
+        };
+        crate::crd::SandboxPoolCertificationStatus {
+            fingerprint: "a".repeat(64),
+            observed_generation: generation,
+            phase: crate::crd::SandboxPoolCertificationPhase::Certified,
+            sandbox_template: object("SandboxTemplate", "template-uid"),
+            sandbox_warm_pool: object("SandboxWarmPool", "warm-pool-uid"),
+            sandbox_claim: Some(object("SandboxClaim", "claim-uid")),
+            sandbox: Some(object("Sandbox", "sandbox-uid")),
+            pod: Some(object("Pod", "pod-uid")),
+            service: None,
+            persistent_volume_claims: vec![],
+            persistent_volumes: vec![],
+            teardown_fence: Some(object("ConfigMap", "fence-uid")),
+            baseline_idle_sandbox_uids: vec![],
+            drain_generation: Some(2),
+            replenish_generation: Some(3),
+            canary_passed_at: Some("2026-08-20T00:00:00Z".into()),
+            certified_at: Some("2026-08-20T00:01:00Z".into()),
+            message: None,
+        }
+    }
+
     /// Admission authority comes only from a current-generation Ready=True
     /// certificate; capacity counts and stale conditions cannot substitute.
     #[test]
@@ -1376,9 +1441,31 @@ mod tests {
             ready: 2,
             allocated: 1,
             quarantined: 0,
+            certification: Some(pool_certification(3)),
             conditions: vec![ready_condition(SandboxConditionStatus::True, Some(3))],
         }));
         assert_eq!(require_current_sandbox_pool_ready(&certified), Ok(()));
+
+        let mut receiptless = certified.clone();
+        receiptless.status.as_mut().unwrap().certification = None;
+        assert_eq!(
+            require_current_sandbox_pool_ready(&receiptless),
+            Err(SandboxPoolReadinessError::MissingCertification)
+        );
+
+        let mut stale_receipt = certified.clone();
+        stale_receipt
+            .status
+            .as_mut()
+            .unwrap()
+            .certification
+            .as_mut()
+            .unwrap()
+            .observed_generation = 2;
+        assert!(matches!(
+            require_current_sandbox_pool_ready(&stale_receipt),
+            Err(SandboxPoolReadinessError::StaleCertification { .. })
+        ));
 
         let missing_status = pool_resource(None);
         assert_eq!(

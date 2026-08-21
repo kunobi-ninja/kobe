@@ -354,10 +354,12 @@ async fn ensure_upstream_pool_objects(
 const POOL_READY_CONDITION: &str = "Ready";
 const POOL_CERTIFICATION_PENDING_REASON: &str = "CertificationPending";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct WarmPoolObservation {
     replicas: u32,
     ready_replicas: u32,
+    template: DynamicObject,
+    warm_pool: DynamicObject,
 }
 
 /// Observe the exact upstream objects that back one management pool.
@@ -454,11 +456,13 @@ async fn observe_management_pool(
     let observation = WarmPoolObservation {
         replicas: count("replicas")?,
         ready_replicas: count("readyReplicas")?,
+        template,
+        warm_pool,
     };
     if observation.ready_replicas > observation.replicas {
         return Err(SandboxPlacementError::Invalid(format!(
             "SandboxWarmPool {} reports readyReplicas greater than replicas",
-            warm_pool.name_any()
+            observation.warm_pool.name_any()
         )));
     }
     Ok(observation)
@@ -508,17 +512,17 @@ fn pool_allocation_counts(
     Ok((allocated, quarantined))
 }
 
-/// Build a current-generation, explicitly uncertified Pool status.
+/// Build one current-generation Pool readiness result.
 ///
-/// This delivery slice deliberately has no path to `Ready=True`. Upstream
-/// replica counts are useful operator telemetry, but the runtime, policy,
-/// network, and execution-canary certification gates are not implemented yet;
-/// admission must therefore remain closed.
-fn uncertified_pool_status(
+/// Counters remain observations; only `Ready=True` authorizes admission. The
+/// caller must therefore pass `certified=true` only after completing every
+/// placement-specific live check described by [`reconcile_pool`].
+fn pool_status(
     pool: &SandboxPool,
     ready: u32,
     allocated: u32,
     quarantined: u32,
+    certified: bool,
     reason: &str,
     message: &str,
 ) -> Result<SandboxPoolStatus, SandboxPlacementError> {
@@ -535,7 +539,14 @@ fn uncertified_pool_status(
             .find(|condition| condition.condition_type == POOL_READY_CONDITION)
     });
     let last_transition_time = match previous {
-        Some(previous) if previous.status == SandboxConditionStatus::False => {
+        Some(previous)
+            if previous.status
+                == if certified {
+                    SandboxConditionStatus::True
+                } else {
+                    SandboxConditionStatus::False
+                } =>
+        {
             previous.last_transition_time.clone()
         }
         _ => Some(chrono::Utc::now().to_rfc3339()),
@@ -550,7 +561,11 @@ fn uncertified_pool_status(
         .collect();
     conditions.push(SandboxCondition {
         condition_type: POOL_READY_CONDITION.into(),
-        status: SandboxConditionStatus::False,
+        status: if certified {
+            SandboxConditionStatus::True
+        } else {
+            SandboxConditionStatus::False
+        },
         reason: reason.into(),
         message: message.into(),
         observed_generation: Some(generation),
@@ -561,6 +576,10 @@ fn uncertified_pool_status(
         ready,
         allocated,
         quarantined,
+        certification: pool
+            .status
+            .as_ref()
+            .and_then(|status| status.certification.clone()),
         conditions,
     })
 }
@@ -607,10 +626,12 @@ async fn patch_pool_status_fenced(
 /// additionally creates and independently observes its exact-owned upstream
 /// Template/WarmPool. Child pools do not create management-cluster capacity.
 ///
-/// This slice deliberately publishes `Ready=False`: `readyReplicas` alone is
-/// not certification. Admission remains closed until the runtime, policy,
-/// network, and execution-canary checks can write a current-generation
-/// `Ready=True` condition.
+/// `Ready=True` is published only after placement-specific live proof.
+/// Management validates the pinned runtime, exact WarmPool population,
+/// restricted scheduled Pods, strict NetworkPolicy and real execution canary.
+/// Child placement proves composition eligibility and repeats runtime/canary
+/// checks inside the exact child before its Claim. Replica counters alone
+/// never authorize admission.
 pub async fn reconcile_pool(
     pool: Arc<SandboxPool>,
     ctx: Arc<SandboxContext>,
@@ -625,11 +646,12 @@ pub async fn reconcile_pool(
         Ok(leases) => leases,
         Err(error) => {
             let previous = pool.status.clone().unwrap_or_default();
-            let status = uncertified_pool_status(
+            let status = pool_status(
                 &pool,
                 0,
                 previous.allocated,
                 previous.quarantined,
+                false,
                 "LeaseAccountingUnavailable",
                 "Exact-UID lease accounting is unavailable; pool certification is withheld",
             )?;
@@ -639,21 +661,46 @@ pub async fn reconcile_pool(
     };
     let (allocated, quarantined) = pool_allocation_counts(lease_list, &pool_uid)?;
 
-    if !matches!(pool.spec.placement, SandboxPlacement::Management {}) {
-        let status = uncertified_pool_status(
-            &pool,
-            0,
-            allocated,
-            quarantined,
-            POOL_CERTIFICATION_PENDING_REASON,
-            "Child placement runtime, policy, network, and execution-canary certification is not implemented",
-        )?;
+    if let SandboxPlacement::ChildCluster { cluster_pool_ref } = &pool.spec.placement {
+        let cluster_pools: Api<crate::crd::ClusterPool> =
+            Api::namespaced(ctx.client.clone(), &ctx.namespace);
+        let child_result = async {
+            let cluster_pool = cluster_pools.get(cluster_pool_ref).await?;
+            crate::controllers::sandbox_child::child_pool_is_composition_eligible(
+                &pool,
+                &cluster_pool,
+            )?;
+            if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
+                crate::sandbox_runtime::validate_managed_child_pool(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &cluster_pool,
+                )
+                .await
+                .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+            }
+            Ok::<(), SandboxPlacementError>(())
+        }
+        .await;
+        let (reason, message) = match child_result {
+            Ok(()) => (
+                "CompositionEligible",
+                format!(
+                    "ClusterPool {cluster_pool_ref} is eligible for verified composition, but Ready remains withheld until an equivalent in-child certification and teardown receipt protocol exists"
+                ),
+            ),
+            Err(error) => (
+                "ChildPlacementUnavailable",
+                format!("Child placement certification is withheld: {error}"),
+            ),
+        };
+        let status = pool_status(&pool, 0, allocated, quarantined, false, reason, &message)?;
         if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
             debug!(pool = %name, "child SandboxPool status write lost a race");
             return Ok(Action::await_change());
         }
-        debug!(pool = %name, "child SandboxPool remains uncertified");
-        return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+        debug!(pool = %name, "reconciled fail-closed child SandboxPool eligibility");
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
     }
 
     let owner = pool.controller_owner_ref(&()).ok_or_else(|| {
@@ -676,11 +723,12 @@ pub async fn reconcile_pool(
     {
         Ok(observation) => observation,
         Err(error) => {
-            let status = uncertified_pool_status(
+            let status = pool_status(
                 &pool,
                 0,
                 allocated,
                 quarantined,
+                false,
                 "UpstreamObservationUnavailable",
                 "Exact-owned Template/WarmPool replicas are unavailable; pool certification is withheld",
             )?;
@@ -688,25 +736,67 @@ pub async fn reconcile_pool(
             return Err(error);
         }
     };
-    let message = format!(
-        "Observed exact-owned Template/WarmPool replicas={}/readyReplicas={}; runtime, policy, network, and execution-canary certification is not implemented",
-        observation.replicas, observation.ready_replicas
-    );
-    let status = uncertified_pool_status(
+    let certification = if observation.replicas != pool.spec.warm_capacity
+        || observation.ready_replicas != pool.spec.warm_capacity
+    {
+        Err(format!(
+            "WarmPool has replicas={}/readyReplicas={}, expected {} exact Ready members",
+            observation.replicas, observation.ready_replicas, pool.spec.warm_capacity
+        ))
+    } else {
+        Box::pin(
+            crate::controllers::sandbox_pool_certification::reconcile_management_pool_certification(
+                &ctx.client,
+                &ctx.namespace,
+                &pool,
+                &observation.template,
+                &observation.warm_pool,
+            ),
+        )
+        .await
+    };
+    let (certified, ready, reason, message, progress_status, mutated) = match certification {
+        Ok(progress) => (
+            progress.certified,
+            progress.ready,
+            progress.reason,
+            progress.message,
+            Some(progress.status),
+            progress.mutated,
+        ),
+        Err(error) => (
+            false,
+            observation.ready_replicas,
+            POOL_CERTIFICATION_PENDING_REASON,
+            format!("Management placement certification is withheld: {error}"),
+            pool.status
+                .as_ref()
+                .and_then(|status| status.certification.clone()),
+            false,
+        ),
+    };
+    // Creating a Claim or fence is the sole mutation for that reconcile. Its
+    // returned identity is deliberately checkpointed by the next strong GET.
+    if mutated {
+        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+    }
+    let mut status = pool_status(
         &pool,
-        observation.ready_replicas,
+        ready,
         allocated,
         quarantined,
-        POOL_CERTIFICATION_PENDING_REASON,
+        certified,
+        reason,
         &message,
     )?;
+    status.certification = progress_status;
     if !patch_pool_status_fenced(&ctx, &pool, &status).await? {
         debug!(pool = %name, "SandboxPool status write lost a race");
         return Ok(Action::await_change());
     }
 
-    debug!(pool = %name, "reconciled upstream pool observations; certification remains pending");
-    Ok(Action::requeue(std::time::Duration::from_secs(120)))
+    debug!(pool = %name, certified, "reconciled management SandboxPool certification");
+    Ok(Action::requeue(std::time::Duration::from_secs(30)))
 }
 
 /// Reconcile one admitted `SandboxLease` into exactly one `SandboxClaim`.
@@ -938,11 +1028,17 @@ pub async fn reconcile_lease(
             claim_owner: None,
         },
         SandboxPlacement::ChildCluster { cluster_pool_ref } => {
-            if !current_sandbox_pool_authorizes_create(&lease, &pools).await? {
+            if current_sandbox_pool_for_create(&lease, &pools)
+                .await?
+                .is_none()
+            {
                 debug!(lease = %name, pool = %lease.spec.pool_ref.name, "child composition withheld until current pool certification");
                 return Ok(Action::requeue(std::time::Duration::from_secs(10)));
             }
-            match compose_child_target(&lease, &pool, cluster_pool_ref, &ctx).await? {
+            // Child runtime certification contains its own multi-checkpoint
+            // async state machine. Heap it so management/release reconciles do
+            // not inherit that future's stack footprint.
+            match Box::pin(compose_child_target(&lease, &pool, cluster_pool_ref, &ctx)).await? {
                 ChildTarget::Ready(target) => target,
                 ChildTarget::Pending(action) => return Ok(action),
             }
@@ -1065,7 +1161,11 @@ pub async fn reconcile_lease(
         .and_then(|target| target.sandbox_claim.as_ref())
         .cloned();
     if recorded_claim.is_none() {
-        if create_sandbox_claim_fenced(&lease, &ctx, &claims, &claim).await? {
+        // Keep the complete final live-certification + allocation-fence + POST
+        // state machine off the parent reconcile future's stack. Release and
+        // child-placement passes never execute this branch, but an unboxed
+        // async child still inflates every `reconcile_lease` future.
+        if Box::pin(create_sandbox_claim_fenced(&lease, &ctx, &claims, &claim)).await? {
             info!(lease = %name, "created upstream SandboxClaim behind final allocation fence");
         } else {
             // Includes a lost 409 race, a revoked Pool certificate, a release
@@ -2786,7 +2886,9 @@ async fn create_internal_cluster_lease_fenced(
     let attempt = async {
         let current = leases.get(&expected.name_any()).await?;
         if !current_outer_lease_authorizes_create(&current, expected)?
-            || !current_sandbox_pool_authorizes_create(&current, &pools).await?
+            || current_sandbox_pool_for_create(&current, &pools)
+                .await?
+                .is_none()
             || !allocation_fence_is_absent_for_create(&fences, &current, &ctx.namespace).await?
         {
             return Ok(None);
@@ -2817,10 +2919,61 @@ async fn create_sandbox_claim_fenced(
         Api::namespaced(ctx.client.clone(), &ctx.namespace);
     let attempt = async {
         let current = leases.get(&expected.name_any()).await?;
-        if !current_outer_lease_authorizes_create(&current, expected)?
-            || !current_sandbox_pool_authorizes_create(&current, &pools).await?
-            || !allocation_fence_is_absent_for_create(&fences, &current, &ctx.namespace).await?
-        {
+        if !current_outer_lease_authorizes_create(&current, expected)? {
+            return Ok(false);
+        }
+        let Some(current_pool) = current_sandbox_pool_for_create(&current, &pools).await? else {
+            return Ok(false);
+        };
+        if matches!(current_pool.spec.placement, SandboxPlacement::Management {}) {
+            let templates: Api<DynamicObject> = Api::namespaced_with(
+                ctx.client.clone(),
+                &ctx.namespace,
+                &upstream_resource(SANDBOX_TEMPLATE_KIND, "sandboxtemplates"),
+            );
+            let warm_pools: Api<DynamicObject> = Api::namespaced_with(
+                ctx.client.clone(),
+                &ctx.namespace,
+                &upstream_resource(SANDBOX_WARM_POOL_KIND, "sandboxwarmpools"),
+            );
+            let template = templates
+                .get(&template_name(&current_pool.name_any()))
+                .await?;
+            let warm_pool = warm_pools
+                .get(&warm_pool_name(&current_pool.name_any()))
+                .await?;
+            let provenance = current
+                .status
+                .as_ref()
+                .and_then(|status| status.target.as_ref())
+                .ok_or_else(|| {
+                    SandboxPlacementError::Invalid(format!(
+                        "SandboxLease {} has no target provenance at its final Claim gate",
+                        current.name_any()
+                    ))
+                })?;
+            if let Err(error) =
+                crate::controllers::sandbox_pool_certification::revalidate_certified_management_pool(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &current_pool,
+                    &template,
+                    &warm_pool,
+                    provenance.sandbox_template.as_ref(),
+                    provenance.sandbox_warm_pool.as_ref(),
+                )
+                .await
+            {
+                debug!(
+                    lease = %current.name_any(),
+                    pool = %current_pool.name_any(),
+                    error,
+                    "SandboxClaim creation withheld after final live pool certification"
+                );
+                return Ok(false);
+            }
+        }
+        if !allocation_fence_is_absent_for_create(&fences, &current, &ctx.namespace).await? {
             return Ok(false);
         }
         match claims.create(&PostParams::default(), desired).await {
@@ -6272,7 +6425,7 @@ fn child_runtime_certified(
         status.conditions.iter().any(|condition| {
             condition.condition_type == CHILD_RUNTIME_CERTIFIED_CONDITION
                 && condition.status == crate::crd::SandboxConditionStatus::True
-                && condition.reason == "AgentSandboxV0_5_4"
+                && condition.reason == "AgentSandboxV0_5_6"
                 && condition.observed_generation == Some(generation)
         })
     })
@@ -6576,10 +6729,10 @@ fn require_exact_reference(
 /// Strongly re-read the exact admitted pool before an allocation side effect.
 /// A stale informer object or a Ready certificate for another generation never
 /// authorizes creation.
-async fn current_sandbox_pool_authorizes_create(
+async fn current_sandbox_pool_for_create(
     lease: &SandboxLease,
     pools: &Api<SandboxPool>,
-) -> Result<bool, SandboxPlacementError> {
+) -> Result<Option<SandboxPool>, SandboxPlacementError> {
     let pool = pools.get(&lease.spec.pool_ref.name).await?;
     if pool.uid().as_deref() != Some(lease.spec.pool_ref.uid.as_str())
         || pool.metadata.generation != Some(lease.spec.pool_ref.generation)
@@ -6590,7 +6743,10 @@ async fn current_sandbox_pool_authorizes_create(
             lease.spec.pool_ref.name
         )));
     }
-    Ok(crate::sandbox::require_current_sandbox_pool_ready(&pool).is_ok())
+    if crate::sandbox::require_current_sandbox_pool_ready(&pool).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(pool))
 }
 
 /// Observe the exact management-cluster pool objects a lease will consume.
@@ -6906,7 +7062,7 @@ async fn compose_child_target(
     // Backend capability first: a pool that cannot prove teardown must never
     // back an exclusive tenant cluster, and finding that out after allocating
     // one helps nobody.
-    child::child_pool_is_eligible(&pool.name_any(), &cluster_pool)?;
+    child::child_pool_is_composition_eligible(pool, &cluster_pool)?;
     if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
         crate::sandbox_runtime::validate_managed_child_pool(
             &ctx.client,
@@ -7273,7 +7429,7 @@ async fn compose_child_target(
             lease.metadata.generation,
             CHILD_RUNTIME_CERTIFIED_CONDITION,
             crate::crd::SandboxConditionStatus::True,
-            "AgentSandboxV0_5_4",
+            "AgentSandboxV0_5_6",
             "pinned child Agent Sandbox controller, webhook and Claim lifecycle certified",
         );
         if patch_lease_status_fenced(ctx, lease, &next).await? {
@@ -7768,6 +7924,8 @@ pub(crate) mod tests {
     const SERVICE_PATH: &str = "/api/v1/namespaces/test-ns/services/sandbox-service";
     const PVCS_PATH: &str = "/api/v1/namespaces/test-ns/persistentvolumeclaims";
     const PVS_PATH: &str = "/api/v1/persistentvolumes";
+    const NETWORK_POLICY_PATH: &str =
+        "/apis/networking.k8s.io/v1/namespaces/test-ns/networkpolicies/kobe-agents-network-policy";
     const LEASE_STATUS_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/sbx-1/status";
     const LEASE_PATH: &str =
@@ -7778,6 +7936,294 @@ pub(crate) mod tests {
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/children";
     const CHILD_INSTANCE_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/kobe-abc123";
+
+    async fn mount_healthy_runtime(server: &MockServer) {
+        for (name, group, plural, kind) in [
+            (
+                "sandboxtemplates.extensions.agents.x-k8s.io",
+                "extensions.agents.x-k8s.io",
+                "sandboxtemplates",
+                "SandboxTemplate",
+            ),
+            (
+                "sandboxwarmpools.extensions.agents.x-k8s.io",
+                "extensions.agents.x-k8s.io",
+                "sandboxwarmpools",
+                "SandboxWarmPool",
+            ),
+            (
+                "sandboxclaims.extensions.agents.x-k8s.io",
+                "extensions.agents.x-k8s.io",
+                "sandboxclaims",
+                "SandboxClaim",
+            ),
+            (
+                "sandboxes.agents.x-k8s.io",
+                "agents.x-k8s.io",
+                "sandboxes",
+                "Sandbox",
+            ),
+        ] {
+            let openapi = if kind == "SandboxWarmPool" {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "object",
+                            "properties": {
+                                "observedGeneration": {
+                                    "type": "integer",
+                                    "format": "int64",
+                                    "minimum": 0
+                                }
+                            }
+                        }
+                    }
+                })
+            } else {
+                serde_json::json!({ "type": "object" })
+            };
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "CustomResourceDefinition",
+                    "metadata": { "name": name },
+                    "spec": {
+                        "group": group,
+                        "names": {
+                            "kind": kind,
+                            "listKind": format!("{kind}List"),
+                            "plural": plural,
+                            "singular": plural.trim_end_matches('s')
+                        },
+                        "scope": "Namespaced",
+                        "versions": [{
+                            "name": "v1beta1",
+                            "served": true,
+                            "storage": true,
+                            "schema": { "openAPIV3Schema": openapi }
+                        }],
+                        "conversion": {
+                            "strategy": "Webhook",
+                            "webhook": {
+                                "conversionReviewVersions": ["v1", "v1beta1"],
+                                "clientConfig": {
+                                    "caBundle": "AQ==",
+                                    "service": {
+                                        "name": "agent-sandbox-webhook-service",
+                                        "namespace": "agent-sandbox-system",
+                                        "path": "/convert",
+                                        "port": 443
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "status": {
+                        "conditions": [{
+                            "type": "Established",
+                            "status": "True",
+                            "reason": "Installed",
+                            "message": "installed",
+                            "lastTransitionTime": "2026-08-20T00:00:00Z"
+                        }],
+                        "storedVersions": ["v1beta1"]
+                    }
+                })))
+                .mount(server)
+                .await;
+        }
+
+        let labels = serde_json::json!({ "app": "agent-sandbox-controller" });
+        let pod_spec = serde_json::json!({
+            "containers": [{
+                "name": "agent-sandbox-controller",
+                "image": crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE,
+                "args": ["--extensions"]
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/apis/apps/v1/namespaces/agent-sandbox-system/deployments/agent-sandbox-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "agent-sandbox-controller",
+                    "namespace": "agent-sandbox-system",
+                    "uid": "runtime-deployment-uid",
+                    "generation": 1
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": { "matchLabels": labels },
+                    "template": { "metadata": { "labels": labels }, "spec": pod_spec }
+                },
+                "status": {
+                    "observedGeneration": 1,
+                    "replicas": 1,
+                    "updatedReplicas": 1,
+                    "readyReplicas": 1,
+                    "availableReplicas": 1,
+                    "unavailableReplicas": 0
+                }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/apps/v1/namespaces/agent-sandbox-system/replicasets",
+            ))
+            .and(query_param("labelSelector", "app=agent-sandbox-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSetList",
+                "metadata": {},
+                "items": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "metadata": {
+                        "name": "agent-sandbox-controller-rs",
+                        "namespace": "agent-sandbox-system",
+                        "uid": "runtime-rs-uid",
+                        "generation": 1,
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1",
+                            "kind": "Deployment",
+                            "name": "agent-sandbox-controller",
+                            "uid": "runtime-deployment-uid",
+                            "controller": true
+                        }]
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "selector": { "matchLabels": labels },
+                        "template": { "metadata": { "labels": labels }, "spec": pod_spec }
+                    },
+                    "status": {
+                        "observedGeneration": 1,
+                        "replicas": 1,
+                        "fullyLabeledReplicas": 1,
+                        "readyReplicas": 1,
+                        "availableReplicas": 1
+                    }
+                }]
+            })))
+            .mount(server)
+            .await;
+        let digest = crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE_DIGESTS[0];
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/agent-sandbox-system/pods"))
+            .and(query_param("labelSelector", "app=agent-sandbox-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": {},
+                "items": [{
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "agent-sandbox-controller-pod",
+                        "namespace": "agent-sandbox-system",
+                        "uid": "runtime-pod-uid",
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1",
+                            "kind": "ReplicaSet",
+                            "name": "agent-sandbox-controller-rs",
+                            "uid": "runtime-rs-uid",
+                            "controller": true
+                        }]
+                    },
+                    "spec": pod_spec,
+                    "status": {
+                        "conditions": [{ "type": "Ready", "status": "True" }],
+                        "containerStatuses": [{
+                            "name": "agent-sandbox-controller",
+                            "image": crate::sandbox_runtime::AGENT_SANDBOX_CONTROLLER_IMAGE,
+                            "imageID": format!("registry.k8s.io/controller@{digest}"),
+                            "ready": true,
+                            "restartCount": 0,
+                            "started": true,
+                            "state": { "running": {} }
+                        }]
+                    }
+                }]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/agent-sandbox-system/secrets/agent-sandbox-webhook-certs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "agent-sandbox-webhook-certs", "namespace": "agent-sandbox-system" },
+                "data": { "ca.crt": "AQ==", "tls.crt": "AQ==", "tls.key": "AQ==" }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/agent-sandbox-system/services/agent-sandbox-webhook-service"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "agent-sandbox-webhook-service",
+                    "namespace": "agent-sandbox-system",
+                    "uid": "runtime-service-uid"
+                },
+                "spec": {
+                    "selector": labels,
+                    "ports": [{ "name": "webhook", "port": 443, "protocol": "TCP", "targetPort": 9443 }]
+                }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/discovery.k8s.io/v1/namespaces/agent-sandbox-system/endpointslices",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kubernetes.io/service-name=agent-sandbox-webhook-service",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{
+                    "apiVersion": "discovery.k8s.io/v1",
+                    "kind": "EndpointSlice",
+                    "metadata": {
+                        "name": "agent-sandbox-webhook",
+                        "namespace": "agent-sandbox-system",
+                        "ownerReferences": [{
+                            "apiVersion": "v1",
+                            "kind": "Service",
+                            "name": "agent-sandbox-webhook-service",
+                            "uid": "runtime-service-uid",
+                            "controller": true
+                        }]
+                    },
+                    "addressType": "IPv4",
+                    "ports": [{ "name": "webhook", "port": 9443, "protocol": "TCP" }],
+                    "endpoints": [{
+                        "addresses": ["10.0.0.10"],
+                        "conditions": { "ready": true, "terminating": false },
+                        "targetRef": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "namespace": "agent-sandbox-system",
+                            "name": "agent-sandbox-controller-pod",
+                            "uid": "runtime-pod-uid"
+                        }
+                    }]
+                }]
+            })))
+            .mount(server)
+            .await;
+    }
 
     async fn test_context() -> (Arc<SandboxContext>, MockServer) {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -7791,28 +8237,37 @@ pub(crate) mod tests {
             runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
             placement_enabled: true,
         });
-        for (path_value, kind, uid) in [
-            (TEMPLATE_PATH, SANDBOX_TEMPLATE_KIND, "template-uid"),
-            (WARM_POOL_PATH, SANDBOX_WARM_POOL_KIND, "warm-pool-uid"),
-        ] {
+        mount_healthy_runtime(&server).await;
+
+        let pool = management_pool(POOL_UID, POOL_GENERATION);
+        let owner = pool.controller_owner_ref(&()).unwrap();
+        let mut template =
+            build_sandbox_template("kobe-agents", NS, &pool.spec, Some(&owner)).unwrap();
+        template.metadata.uid = Some("template-uid".into());
+        template.metadata.generation = Some(1);
+        let mut warm_pool = build_sandbox_warm_pool(
+            "kobe-agents",
+            NS,
+            "kobe-agents",
+            pool.spec.warm_capacity,
+            Some(&owner),
+        )
+        .unwrap();
+        warm_pool.metadata.uid = Some("warm-pool-uid".into());
+        warm_pool.metadata.generation = Some(1);
+        warm_pool.data["status"] = serde_json::json!({
+            "observedGeneration": 1,
+            "replicas": 0,
+            "readyReplicas": 0,
+            "selector": format!(
+                "agents.x-k8s.io/warm-pool-sandbox={}",
+                crate::controllers::sandbox_pool_certification::upstream_name_hash("kobe-agents")
+            )
+        });
+        for (path_value, object) in [(TEMPLATE_PATH, template), (WARM_POOL_PATH, warm_pool)] {
             Mock::given(method("GET"))
                 .and(path(path_value))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "apiVersion": AGENT_SANDBOX_API_VERSION,
-                    "kind": kind,
-                    "metadata": {
-                        "name": "kobe-agents",
-                        "namespace": NS,
-                        "uid": uid,
-                        "ownerReferences": [{
-                            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
-                            "kind": "SandboxPool",
-                            "name": "agents",
-                            "uid": POOL_UID,
-                            "controller": true,
-                        }],
-                    },
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(object))
                 .with_priority(10)
                 .mount(&server)
                 .await;
@@ -7831,6 +8286,46 @@ pub(crate) mod tests {
             .with_priority(100)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path(NETWORK_POLICY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": "kobe-agents-network-policy",
+                    "namespace": NS,
+                    "uid": "network-policy-uid",
+                    "ownerReferences": [{
+                        "apiVersion": AGENT_SANDBOX_API_VERSION,
+                        "kind": SANDBOX_TEMPLATE_KIND,
+                        "name": "kobe-agents",
+                        "uid": "template-uid",
+                        "controller": true
+                    }]
+                },
+                "spec": crate::controllers::sandbox_pool_certification::expected_network_policy_spec("kobe-agents")
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SANDBOXES_PATH))
+            .and(query_param(
+                "labelSelector",
+                format!(
+                    "agents.x-k8s.io/warm-pool-sandbox={}",
+                    crate::controllers::sandbox_pool_certification::upstream_name_hash(
+                        "kobe-agents"
+                    )
+                ),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1",
+                "kind": "SandboxList",
+                "metadata": {},
+                "items": []
+            })))
+            .mount(&server)
+            .await;
         (ctx, server)
     }
 
@@ -7840,7 +8335,7 @@ pub(crate) mod tests {
         status.conditions.push(crate::crd::SandboxCondition {
             condition_type: CHILD_RUNTIME_CERTIFIED_CONDITION.to_string(),
             status: crate::crd::SandboxConditionStatus::True,
-            reason: "AgentSandboxV0_5_4".to_string(),
+            reason: "AgentSandboxV0_5_6".to_string(),
             observed_generation: Some(3),
             ..Default::default()
         });
@@ -7861,7 +8356,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn management_pool(uid: &str, generation: i64) -> SandboxPool {
-        SandboxPool {
+        let mut pool = SandboxPool {
             metadata: ObjectMeta {
                 name: Some("agents".into()),
                 namespace: Some(NS.into()),
@@ -7870,7 +8365,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
             spec: SandboxPoolSpec {
-                warm_capacity: 2,
+                warm_capacity: 0,
                 default_ttl: "1h".into(),
                 max_ttl: "8h".into(),
                 provisioning_timeout: "10m".into(),
@@ -7894,9 +8389,7 @@ pub(crate) mod tests {
                     }],
                     runner_path: None,
                 },
-                isolation: SandboxIsolation::Gvisor {
-                    runtime_class_name: "runsc".into(),
-                },
+                isolation: SandboxIsolation::TrustedRunc {},
                 readiness: SandboxReadinessRequirements {
                     canary: SandboxExecutionCanary {
                         argv: vec!["/agent".into(), "health".into()],
@@ -7906,9 +8399,10 @@ pub(crate) mod tests {
             },
             status: Some(SandboxPoolStatus {
                 observed_generation: Some(generation),
-                ready: 2,
+                ready: 0,
                 allocated: 0,
                 quarantined: 0,
+                certification: None,
                 conditions: vec![SandboxCondition {
                     condition_type: POOL_READY_CONDITION.into(),
                     status: SandboxConditionStatus::True,
@@ -7918,7 +8412,101 @@ pub(crate) mod tests {
                     last_transition_time: Some("2026-08-20T00:00:00Z".into()),
                 }],
             }),
-        }
+        };
+        let upstream = |kind: &str, object_uid: &str| DynamicObject {
+            types: Some(kube::api::TypeMeta {
+                api_version: AGENT_SANDBOX_API_VERSION.into(),
+                kind: kind.into(),
+            }),
+            metadata: ObjectMeta {
+                name: Some("kobe-agents".into()),
+                namespace: Some(NS.into()),
+                uid: Some(object_uid.into()),
+                generation: Some(1),
+                ..ObjectMeta::default()
+            },
+            data: serde_json::json!({}),
+        };
+        let template = upstream(SANDBOX_TEMPLATE_KIND, "template-uid");
+        let mut warm_pool = upstream(SANDBOX_WARM_POOL_KIND, "warm-pool-uid");
+        warm_pool.data = serde_json::json!({
+            "status": {
+                "observedGeneration": 1,
+                "replicas": 2,
+                "readyReplicas": 2
+            }
+        });
+        let reference = |api_version: &str,
+                         kind: &str,
+                         name: &str,
+                         object_uid: &str,
+                         object_generation: Option<i64>| {
+            crate::crd::SandboxObjectReference {
+                api_version: api_version.into(),
+                kind: kind.into(),
+                namespace: Some(NS.into()),
+                name: name.into(),
+                uid: object_uid.into(),
+                generation: object_generation,
+            }
+        };
+        let fingerprint =
+            crate::controllers::sandbox_pool_certification::certification_fingerprint(
+                &pool, &template, &warm_pool,
+            )
+            .unwrap();
+        pool.status.as_mut().unwrap().certification =
+            Some(crate::crd::SandboxPoolCertificationStatus {
+                fingerprint,
+                observed_generation: generation,
+                phase: crate::crd::SandboxPoolCertificationPhase::Certified,
+                sandbox_template: reference(
+                    AGENT_SANDBOX_API_VERSION,
+                    SANDBOX_TEMPLATE_KIND,
+                    "kobe-agents",
+                    "template-uid",
+                    Some(1),
+                ),
+                sandbox_warm_pool: reference(
+                    AGENT_SANDBOX_API_VERSION,
+                    SANDBOX_WARM_POOL_KIND,
+                    "kobe-agents",
+                    "warm-pool-uid",
+                    Some(1),
+                ),
+                sandbox_claim: Some(reference(
+                    AGENT_SANDBOX_API_VERSION,
+                    SANDBOX_CLAIM_KIND,
+                    "kobe-cert",
+                    "cert-claim-uid",
+                    Some(1),
+                )),
+                sandbox: Some(reference(
+                    crate::controllers::sandbox_canary::SANDBOX_API_VERSION,
+                    crate::controllers::sandbox_canary::SANDBOX_KIND,
+                    "cert-sandbox",
+                    "cert-sandbox-uid",
+                    Some(1),
+                )),
+                pod: Some(reference("v1", "Pod", "cert-pod", "cert-pod-uid", None)),
+                service: None,
+                persistent_volume_claims: vec![],
+                persistent_volumes: vec![],
+                teardown_fence: Some(reference(
+                    "v1",
+                    "ConfigMap",
+                    "deleted-cert-fence",
+                    "cert-fence-uid",
+                    None,
+                )),
+                baseline_idle_sandbox_uids: vec!["retired-cert-sandbox-uid".into()],
+                drain_generation: Some(1),
+                replenish_generation: Some(1),
+                canary_passed_at: Some("2026-08-20T00:00:00Z".into()),
+                certified_at: Some("2026-08-20T00:01:00Z".into()),
+                message: None,
+            });
+        pool
     }
 
     pub(crate) fn admitted_lease() -> SandboxLease {
@@ -8607,6 +9195,7 @@ pub(crate) mod tests {
             .await;
 
         let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.warm_capacity = 2;
         pool.metadata.resource_version = Some("pool-rv".into());
         Mock::given(method("PATCH"))
             .and(path(POOL_STATUS_PATH))
@@ -9428,9 +10017,14 @@ pub(crate) mod tests {
                 "generation": 1,
             },
             "spec": {
-                "ttl": "8h",
+                "ttl": "9h",
                 "backend": { "type": "k3s" },
                 "cluster": { "version": "v1.32.0" },
+            },
+            "status": {
+                "phase": "Idle",
+                "quarantined": 0,
+                "unhealthy": 0,
             },
         }))
         .unwrap();
@@ -12900,8 +13494,15 @@ pub(crate) mod tests {
             },
             "spec": {
                 "size": 1,
+                "ttl": "9h",
                 "backend": { "type": "k3s" },
                 "cluster": { "version": "v1.32.0" }
+            },
+            "status": {
+                "phase": "Healthy",
+                "ready": 1,
+                "quarantined": 0,
+                "unhealthy": 0
             }
         })
     }
@@ -13580,6 +14181,21 @@ current-context: child
 
     const CLUSTER_LEASE_PATH: &str =
         "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/kobe-sbx-sbx-1";
+
+    /// Pool certification must not make every lease reconcile carry its large
+    /// async state machines inline. Release paths run on ordinary Tokio test
+    /// and controller worker stacks even though they never execute those
+    /// branches.
+    #[tokio::test]
+    async fn pool_certification_submachines_are_heap_bounded() {
+        let (ctx, _server) = test_context().await;
+        let future = reconcile_lease(Arc::new(admitted_lease()), ctx);
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes < 64 * 1024,
+            "reconcile_lease future grew to {bytes} bytes; box large certification submachines"
+        );
+    }
 
     /// A child-placed lease must never be released by a claim delete here.
     ///
