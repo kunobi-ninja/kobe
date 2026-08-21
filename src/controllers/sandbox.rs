@@ -65,6 +65,10 @@ pub struct SandboxContext {
     /// unit tests may disable it and exercise the barrier through its own
     /// API-server CAS suite instead of duplicating every teardown fixture.
     access_ledger_enabled: bool,
+    /// Installation ownership selected at process startup. Child composition
+    /// uses it to require the pinned built-in bootstrap only in managed mode;
+    /// external mode never installs or adopts runtime infrastructure.
+    pub runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2196,12 +2200,32 @@ async fn quarantine_lease(
 pub(crate) const CLEANUP_VERIFIED_CONDITION: &str = "CleanupVerified";
 /// Durable latch proving the lease-owned workload is gone before quota moves.
 const FOOTPRINT_ABSENT_CONDITION: &str = "FootprintAbsent";
+/// Durable proof that this exact child composition passed the pinned runtime
+/// health and real Claim certification before tenant objects were created.
+const CHILD_RUNTIME_CERTIFIED_CONDITION: &str = "ChildRuntimeCertified";
 /// Durable record that the pool's canary already ran and passed.
 ///
 /// Durable rather than in-memory because the alternative is running an
 /// administrator's command inside a live tenant workload again after every
 /// controller restart.
 const READINESS_CANARY_CONDITION: &str = "ReadinessCanary";
+
+fn child_runtime_certified(
+    status: Option<&crate::crd::SandboxLeaseStatus>,
+    generation: Option<i64>,
+) -> bool {
+    let Some(generation) = generation else {
+        return false;
+    };
+    status.is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.condition_type == CHILD_RUNTIME_CERTIFIED_CONDITION
+                && condition.status == crate::crd::SandboxConditionStatus::True
+                && condition.reason == "AgentSandboxV0_5_4"
+                && condition.observed_generation == Some(generation)
+        })
+    })
+}
 
 /// Whether the readiness canary has already been observed to pass.
 fn canary_already_passed(status: &crate::crd::SandboxLeaseStatus) -> bool {
@@ -2704,6 +2728,15 @@ async fn compose_child_target(
     // back an exclusive tenant cluster, and finding that out after allocating
     // one helps nobody.
     child::child_pool_is_eligible(&pool.name_any(), &cluster_pool)?;
+    if ctx.runtime_mode == crate::sandbox_runtime::AgentSandboxMode::Managed {
+        crate::sandbox_runtime::validate_managed_child_pool(
+            &ctx.client,
+            &ctx.namespace,
+            &cluster_pool,
+        )
+        .await
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+    }
 
     let runtime_ttl = crate::pool::parse_duration(&lease.spec.ttl)
         .and_then(|ttl| ttl.to_std().ok())
@@ -2858,18 +2891,45 @@ async fn compose_child_target(
             cluster: binding.binding.instance.name.clone(),
         })?;
 
-    // Kobe validates the child runtime; it does not install it. Installing
-    // cluster-scoped CRDs, RBAC and a webhook with cluster-admin is one of the
-    // effects paused on #72, and a controller must not perform under a
-    // different issue number what it was told to hold.
-    child::validate_child_runtime(&child_client, &binding.binding.instance.name).await?;
-
     let target_namespace = ensure_child_namespace(&child_client, &name, &lease_uid).await?;
     let namespace_owner = target_namespace.controller_owner_ref(&()).ok_or_else(|| {
         SandboxPlacementError::Invalid(format!(
             "namespace {CHILD_SANDBOX_NAMESPACE} has no UID to own child Sandbox objects"
         ))
     })?;
+
+    let runtime_certified =
+        child_runtime_certified(lease.status.as_ref(), lease.metadata.generation);
+    if !runtime_certified {
+        // Managed pools install the exact built-in bundle during cluster
+        // bootstrap; external pools bring their own. Both must prove the same
+        // running image, webhook and real Claim lifecycle before tenant objects.
+        child::validate_child_runtime(
+            &child_client,
+            &binding.binding.instance.name,
+            CHILD_SANDBOX_NAMESPACE,
+            &namespace_owner,
+        )
+        .await?;
+
+        // A real canary can take minutes. Persist the exact-generation proof so
+        // ordinary provisioning reconciles do not create/delete it repeatedly.
+        let mut next = lease.status.clone().unwrap_or_default();
+        next.conditions = with_condition_for_status(
+            &next,
+            lease.metadata.generation,
+            CHILD_RUNTIME_CERTIFIED_CONDITION,
+            crate::crd::SandboxConditionStatus::True,
+            "AgentSandboxV0_5_4",
+            "pinned child Agent Sandbox controller, webhook and Claim lifecycle certified",
+        );
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            debug!(lease = %name, "recorded child runtime certification");
+        } else {
+            debug!(lease = %name, "child runtime certification write lost a status race");
+        }
+        return Ok(ChildTarget::Pending(Action::await_change()));
+    }
 
     // The pool's template and warm pool have to exist inside the child; nothing
     // else reconciles them there.
@@ -3102,6 +3162,7 @@ pub async fn run_sandbox_controller(
     client: Client,
     namespace: &str,
     reservation_namespace: &str,
+    runtime_mode: crate::sandbox_runtime::AgentSandboxMode,
     shutdown: CancellationToken,
 ) {
     let ctx = Arc::new(SandboxContext {
@@ -3110,6 +3171,7 @@ pub async fn run_sandbox_controller(
         reservation_namespace: reservation_namespace.to_string(),
         shutdown: shutdown.clone(),
         access_ledger_enabled: true,
+        runtime_mode,
     });
 
     let pools: Api<SandboxPool> = Api::namespaced(client.clone(), namespace);
@@ -3266,6 +3328,7 @@ pub(crate) mod tests {
             reservation_namespace: NS.to_string(),
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
+            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
         });
         for (path_value, kind, uid) in [
             (TEMPLATE_PATH, SANDBOX_TEMPLATE_KIND, "template-uid"),
@@ -3294,6 +3357,24 @@ pub(crate) mod tests {
                 .await;
         }
         (ctx, server)
+    }
+
+    #[test]
+    fn child_runtime_certification_is_versioned_and_generation_bound() {
+        let mut status = SandboxLeaseStatus::default();
+        status.conditions.push(crate::crd::SandboxCondition {
+            condition_type: CHILD_RUNTIME_CERTIFIED_CONDITION.to_string(),
+            status: crate::crd::SandboxConditionStatus::True,
+            reason: "AgentSandboxV0_5_4".to_string(),
+            observed_generation: Some(3),
+            ..Default::default()
+        });
+
+        assert!(child_runtime_certified(Some(&status), Some(3)));
+        assert!(!child_runtime_certified(Some(&status), Some(4)));
+        assert!(!child_runtime_certified(Some(&status), None));
+        status.conditions[0].reason = "AgentSandboxV0_5_3".to_string();
+        assert!(!child_runtime_certified(Some(&status), Some(3)));
     }
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
@@ -3891,6 +3972,7 @@ pub(crate) mod tests {
             reservation_namespace: NS.into(),
             shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
+            runtime_mode: crate::sandbox_runtime::AgentSandboxMode::External,
         });
 
         let upstream = |kind: &str, uid: &str, resource_version: &str, status| {

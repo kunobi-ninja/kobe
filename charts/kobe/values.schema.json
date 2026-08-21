@@ -18,10 +18,15 @@
       "type": "object",
       "properties": {
         "mode": { "type": "string", "enum": ["disabled", "external", "managed"] },
-        "leaseRetention": { "type": "string", "minLength": 1 },
+        "leaseRetention": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9]+(h|m|s)$"
+        },
         "reservationObjectLimit": { "type": "integer", "minimum": 4, "maximum": 1000000 }
       },
-      "required": ["mode", "reservationObjectLimit"]
+      "required": ["mode", "leaseRetention", "reservationObjectLimit"],
+      "additionalProperties": false
     },
     "kobeSync": {
       "type": "object",

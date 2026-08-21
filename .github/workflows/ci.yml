@@ -182,6 +182,7 @@ jobs:
           helm template kobe charts/kobe/ \
             --set agentSandbox.mode=external \
             --debug > /dev/null
+          mise exec -- bun run hack/test-agent-sandbox-chart.ts
 
       - name: Verify CRDs match generated output
         run: |
@@ -237,6 +238,59 @@ jobs:
       - name: Tear down contract cluster
         if: always()
         run: mise exec -- kind delete cluster --name "$SANDBOX_CONTRACT_CLUSTER" || true
+
+  # Proves the managed artifact against a real cluster: pinned controller and
+  # conversion webhook health, then a real Claim -> Sandbox -> Pod lifecycle.
+  # The script owns a uniquely named Kind cluster and refuses to reuse one.
+  sandbox-runtime-contract:
+    name: Agent Sandbox Runtime Contract
+    runs-on: kunobi-runners
+    timeout-minutes: 20
+    env:
+      SANDBOX_RUNTIME_CLUSTER: sandbox-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up pinned runtime-contract tools
+        uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+
+      - name: Install bun, kind and kubectl
+        run: mise install bun kind kubectl
+
+      - name: Install Helm and chart dependencies
+        uses: azure/setup-helm@v5
+
+      - name: Render and exercise the managed v0.5.4 runtime
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm dependency build charts/kobe/
+          mise exec -- bun run ./hack/test-agent-sandbox-runtime.ts
+
+      # A force-cancel can prevent the script's own finally-style cleanup. Only
+      # delete when the exact cluster presents the ownership marker written by
+      # this run; a collision or unrelated cluster is deliberately untouched.
+      - name: Recover an interrupted contract cluster
+        if: always()
+        run: |
+          CONTRACT_KUBECONFIG="$RUNNER_TEMP/$SANDBOX_RUNTIME_CLUSTER.kubeconfig"
+          CONTRACT_CONTEXT="kind-$SANDBOX_RUNTIME_CLUSTER"
+          MARKER="$(mise exec -- kubectl \
+            --kubeconfig "$CONTRACT_KUBECONFIG" \
+            --context "$CONTRACT_CONTEXT" \
+            --request-timeout=5s \
+            get namespace kobe-runtime-contract \
+            -o jsonpath='{.metadata.labels.kobe\.kunobi\.ninja/contract-cluster}' \
+            2>/dev/null || true)"
+          if [ "$MARKER" = "$SANDBOX_RUNTIME_CLUSTER" ]; then
+            mise exec -- kind delete cluster \
+              --name "$SANDBOX_RUNTIME_CLUSTER" \
+              --kubeconfig "$CONTRACT_KUBECONFIG"
+          elif [ -n "$MARKER" ]; then
+            echo "::warning::Refusing cleanup: ownership marker is $MARKER"
+          fi
 
   docker-dry-run:
     if: github.event_name == 'pull_request'

@@ -1,0 +1,25 @@
+{{- /*
+  The child-cluster path uses the exact same release asset and image digest as
+  the management path above. ClusterPools used by child SandboxPools must name
+  this BootstrapConfig; Kobe validates its content digest before allocating.
+*/ -}}
+{{- if eq (.Values.agentSandbox.mode | default "disabled") "managed" }}
+{{- $taggedImage := "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4" -}}
+{{- $pinnedImage := "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f" -}}
+{{- $release := .Files.Get "files/agent-sandbox-v0.5.4.yaml" | replace $taggedImage $pinnedImage -}}
+apiVersion: kobe.kunobi.ninja/v1alpha1
+kind: BootstrapConfig
+metadata:
+  name: agent-sandbox-v0-5-4
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox-bootstrap
+  annotations:
+    kobe.kunobi.ninja/source-release: v0.5.4
+    kobe.kunobi.ninja/source-sha256: 7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4
+spec:
+  files:
+    agent-sandbox-v0.5.4.yaml: |
+{{ $release | indent 6 }}
+{{- end }}

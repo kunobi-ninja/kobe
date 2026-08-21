@@ -1,0 +1,31 @@
+{{- /*
+  Agent Sandbox v0.5.4 managed runtime.
+
+  Source asset:
+  https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.4/sandbox-with-extensions.yaml
+  Upstream SHA-256: 7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4
+
+  The release asset uses a tag. Kobe never emits that mutable reference: this
+  template rewrites it to the immutable multi-platform OCI index digest. CRDs
+  are retained on uninstall so Helm cannot silently delete Sandbox data.
+*/ -}}
+{{- if eq (.Values.agentSandbox.mode | default "disabled") "managed" }}
+{{- $taggedImage := "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4" -}}
+{{- $pinnedImage := "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f" -}}
+{{- $release := .Files.Get "files/agent-sandbox-v0.5.4.yaml" | replace $taggedImage $pinnedImage -}}
+{{- range $document := splitList "\n---\n" $release }}
+{{- $resource := fromYaml $document }}
+{{- if $resource }}
+{{- if eq (get $resource "kind") "CustomResourceDefinition" }}
+{{- $metadata := get $resource "metadata" }}
+{{- $annotations := default (dict) (get $metadata "annotations") }}
+{{- $_ := set $annotations "helm.sh/resource-policy" "keep" }}
+{{- $_ := set $annotations "kobe.kunobi.ninja/source-release" "v0.5.4" }}
+{{- $_ := set $annotations "kobe.kunobi.ninja/source-sha256" "7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4" }}
+{{- $_ := set $metadata "annotations" $annotations }}
+{{- end }}
+---
+{{ toYaml $resource }}
+{{- end }}
+{{- end }}
+{{- end }}

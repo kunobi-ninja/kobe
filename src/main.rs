@@ -92,18 +92,21 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let client = Client::try_default().await?;
+    let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
+    let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
+    let pod_name = std::env::var("POD_NAME").unwrap_or_default();
 
-    // In `external` mode the runtime is the operator's to install, so verify it
-    // is actually there and compatible before anything depends on it. Refused
-    // at startup rather than per-request: a cluster that looks healthy and only
-    // fails when someone tries to use Sandbox is the worse failure.
-    //
-    // Deliberately no create/delete canary — writing a real SandboxClaim is one
-    // of the effects paused on #72. Presence and version are a weaker signal
-    // than a canary, and that limit is stated rather than hidden.
-    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
-        match sandbox_runtime::validate_external_runtime(&client).await {
-            Ok(()) => info!("Agent Sandbox runtime validated (external, operator-installed)"),
+    // Do not bind the HTTP listener until every replica has certified the
+    // pinned controller, webhook and a real Pod-owned Claim lifecycle. This is
+    // intentionally stronger than CRD discovery: a wedged controller or a
+    // broken webhook must make the whole Sandbox surface fail closed.
+    if agent_sandbox_mode.enabled() {
+        if pod_name.is_empty() {
+            error!("POD_NAME is required for the crash-safe Agent Sandbox runtime canary");
+            std::process::exit(1);
+        }
+        match sandbox_runtime::wait_for_runtime(&client, &pod_namespace, &pod_name).await {
+            Ok(()) => info!(?agent_sandbox_mode, "Agent Sandbox runtime certified"),
             Err(err) => {
                 error!(reason = err.reason_code(), "{err}");
                 std::process::exit(1);
@@ -111,11 +114,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let namespace = std::env::var("OPERATOR_NAMESPACE").unwrap_or_else(|_| "kunobi-pool".into());
-    let pod_namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| namespace.clone());
     let sandbox_reservation_namespace = std::env::var("KOBE_SANDBOX_RESERVATION_NAMESPACE")
         .unwrap_or_else(|_| format!("{namespace}-sandbox-ledger"));
-    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External
+    if agent_sandbox_mode.enabled()
         && (sandbox_reservation_namespace == namespace
             || !crate::pool::is_valid_k8s_name(&sandbox_reservation_namespace))
     {
@@ -125,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(1);
     }
-    if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
+    if agent_sandbox_mode.enabled() {
         let policy_name = match std::env::var("KOBE_SANDBOX_LEDGER_POLICY_NAME") {
             Ok(value) if crate::pool::is_valid_k8s_name(&value) => value,
             _ => {
@@ -191,62 +192,60 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("KOBE_SSH_NAMESPACE").unwrap_or_else(|_| "kobe-system".to_string());
     let authenticator = Arc::new(JwtAuthenticator::new(ssh_namespace));
 
-    let sandbox_serving_replica =
-        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
-            let replica = crate::sandbox_access_ledger::ServingReplica {
-                namespace: pod_namespace.clone(),
-                pod_name: std::env::var("POD_NAME")
-                    .map_err(|_| anyhow::anyhow!("POD_NAME is required when Sandbox is enabled"))?,
-                pod_uid: std::env::var("POD_UID")
-                    .map_err(|_| anyhow::anyhow!("POD_UID is required when Sandbox is enabled"))?,
-                boot_id: uuid::Uuid::new_v4().to_string(),
-            };
-            replica.validate()?;
-            Some(replica)
-        } else {
-            None
+    let sandbox_serving_replica = if agent_sandbox_mode.enabled() {
+        let replica = crate::sandbox_access_ledger::ServingReplica {
+            namespace: pod_namespace.clone(),
+            pod_name: std::env::var("POD_NAME")
+                .map_err(|_| anyhow::anyhow!("POD_NAME is required when Sandbox is enabled"))?,
+            pod_uid: std::env::var("POD_UID")
+                .map_err(|_| anyhow::anyhow!("POD_UID is required when Sandbox is enabled"))?,
+            boot_id: uuid::Uuid::new_v4().to_string(),
         };
+        replica.validate()?;
+        Some(replica)
+    } else {
+        None
+    };
 
     // Stream revocation is a per-replica API responsibility, not a leader
     // controller. Start it before this process can serve Sandbox routes and
     // before leader acquisition can block indefinitely. The handle remains
     // supervised below: silently losing the watch would leave upgraded exec,
     // attach, and port-forward connections alive after their lease ends.
-    let mut stream_revoker_handle =
-        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
-            let revoker_client = client.clone();
-            let revoker_ns = namespace.clone();
-            let revoker_shutdown = shutdown.clone();
-            let (revoker_ready_tx, revoker_ready_rx) = tokio::sync::oneshot::channel();
-            let mut handle = tokio::spawn(async move {
-                api::sandbox_streams::run_stream_revoker(
-                    revoker_client,
-                    &revoker_ns,
-                    api::sandbox_streams::registry().clone(),
-                    revoker_ready_tx,
-                    revoker_shutdown,
-                )
-                .await;
-            });
-            await_critical_task_readiness(
-                revoker_ready_rx,
-                &mut handle,
-                "Sandbox stream revoker",
-                &shutdown,
+    let mut stream_revoker_handle = if agent_sandbox_mode.enabled() {
+        let revoker_client = client.clone();
+        let revoker_ns = namespace.clone();
+        let revoker_shutdown = shutdown.clone();
+        let (revoker_ready_tx, revoker_ready_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(async move {
+            api::sandbox_streams::run_stream_revoker(
+                revoker_client,
+                &revoker_ns,
+                api::sandbox_streams::registry().clone(),
+                revoker_ready_tx,
+                revoker_shutdown,
             )
-            .await?;
-            crate::sandbox_access_ledger::recover_replica(
-                &client,
-                &sandbox_reservation_namespace,
-                sandbox_serving_replica
-                    .as_ref()
-                    .expect("external Sandbox mode has replica identity"),
-            )
-            .await?;
-            Some(handle)
-        } else {
-            None
-        };
+            .await;
+        });
+        await_critical_task_readiness(
+            revoker_ready_rx,
+            &mut handle,
+            "Sandbox stream revoker",
+            &shutdown,
+        )
+        .await?;
+        crate::sandbox_access_ledger::recover_replica(
+            &client,
+            &sandbox_reservation_namespace,
+            sandbox_serving_replica
+                .as_ref()
+                .expect("enabled Sandbox mode has replica identity"),
+        )
+        .await?;
+        Some(handle)
+    } else {
+        None
+    };
 
     // ── Start HTTP server immediately (all replicas serve API + health) ──
     let state = AppState {
@@ -261,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
         connect_cache: Default::default(),
         sandbox_admission_limiter: Default::default(),
         shutdown: shutdown.clone(),
-        sandbox_enabled: agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External,
+        sandbox_enabled: agent_sandbox_mode.enabled(),
     };
 
     let app = build_router(state);
@@ -422,95 +421,93 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    let access_ledger_reaper_handle =
-        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
-            let access_client = client.clone();
-            let access_sandbox_ns = namespace.clone();
-            let access_ledger_ns = sandbox_reservation_namespace.clone();
-            let access_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
-                crate::sandbox_access_ledger::run_reaper(
-                    access_client,
-                    access_sandbox_ns,
-                    access_ledger_ns,
-                    access_shutdown,
-                )
-                .await;
-            }))
-        } else {
-            None
-        };
+    let access_ledger_reaper_handle = if agent_sandbox_mode.enabled() {
+        let access_client = client.clone();
+        let access_sandbox_ns = namespace.clone();
+        let access_ledger_ns = sandbox_reservation_namespace.clone();
+        let access_shutdown = shutdown.clone();
+        Some(tokio::spawn(async move {
+            crate::sandbox_access_ledger::run_reaper(
+                access_client,
+                access_sandbox_ns,
+                access_ledger_ns,
+                access_shutdown,
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
 
     // Start Sandbox placement, but ONLY when a validated runtime is present.
     // Spawning it in `disabled` mode would have it watch CRDs that may not
     // exist and log errors forever; spawning it without the #72 validation
     // would let it write objects an incompatible runtime cannot reconcile.
-    let (sandbox_controller_handle, execution_reaper_handle) =
-        if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
-            let sandbox_client = client.clone();
-            let sandbox_ns = namespace.clone();
-            let sandbox_reservation_ns = sandbox_reservation_namespace.clone();
-            let sandbox_shutdown = shutdown.clone();
-            let handle = tokio::spawn(async move {
-                controllers::sandbox::run_sandbox_controller(
-                    sandbox_client,
-                    &sandbox_ns,
-                    &sandbox_reservation_ns,
-                    sandbox_shutdown,
-                )
-                .await;
-            });
+    let (sandbox_controller_handle, execution_reaper_handle) = if agent_sandbox_mode.enabled() {
+        let sandbox_client = client.clone();
+        let sandbox_ns = namespace.clone();
+        let sandbox_reservation_ns = sandbox_reservation_namespace.clone();
+        let sandbox_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            controllers::sandbox::run_sandbox_controller(
+                sandbox_client,
+                &sandbox_ns,
+                &sandbox_reservation_ns,
+                agent_sandbox_mode,
+                sandbox_shutdown,
+            )
+            .await;
+        });
 
-            // Queued executions whose setup owner disappeared are settled here.
-            // Running executions remain fail-closed until the exact runner
-            // reports a terminal result (or NotFound); elapsed wall time alone
-            // is never evidence that their process stopped.
-            let execution_reaper_client = client.clone();
-            let execution_reaper_ns = namespace.clone();
-            let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
-            let execution_reaper_shutdown = shutdown.clone();
-            let execution_reaper_handle = tokio::spawn(async move {
-                api::sandbox_executions::run_execution_reaper(
-                    execution_reaper_client,
-                    &execution_reaper_ns,
-                    &execution_reaper_reservation_ns,
-                    std::time::Duration::from_secs(60),
-                    execution_reaper_shutdown,
-                )
-                .await;
-            });
+        // Queued executions whose setup owner disappeared are settled here.
+        // Running executions remain fail-closed until the exact runner
+        // reports a terminal result (or NotFound); elapsed wall time alone
+        // is never evidence that their process stopped.
+        let execution_reaper_client = client.clone();
+        let execution_reaper_ns = namespace.clone();
+        let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
+        let execution_reaper_shutdown = shutdown.clone();
+        let execution_reaper_handle = tokio::spawn(async move {
+            api::sandbox_executions::run_execution_reaper(
+                execution_reaper_client,
+                &execution_reaper_ns,
+                &execution_reaper_reservation_ns,
+                std::time::Duration::from_secs(60),
+                execution_reaper_shutdown,
+            )
+            .await;
+        });
+        // Terminal lease records are retired here. `Released` and `Expired`
+        // stop consuming capacity when they are written, so nothing leaks —
+        // the objects just accumulate, one per Sandbox ever leased, until
+        // etcd carries a row for every Sandbox that ever existed. The window
+        // is measured in days because the record is an audit trail, and the
+        // tick is hourly because nothing on that scale is worth a minute's
+        // list churn against the API server.
+        let lease_reaper_client = client.clone();
+        let lease_reaper_ns = namespace.clone();
+        let lease_reaper_shutdown = shutdown.clone();
+        let lease_retention = api::sandbox::sandbox_lease_retention(
+            std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
+                .ok()
+                .as_deref(),
+        );
+        tokio::spawn(async move {
+            api::sandbox::run_sandbox_lease_reaper(
+                lease_reaper_client,
+                &lease_reaper_ns,
+                std::time::Duration::from_secs(3600),
+                lease_retention,
+                lease_reaper_shutdown,
+            )
+            .await;
+        });
 
-            // Terminal lease records are retired here. `Released` and `Expired`
-            // stop consuming capacity when they are written, so nothing leaks —
-            // the objects just accumulate, one per Sandbox ever leased, until
-            // etcd carries a row for every Sandbox that ever existed. The window
-            // is measured in days because the record is an audit trail, and the
-            // tick is hourly because nothing on that scale is worth a minute's
-            // list churn against the API server.
-            let lease_reaper_client = client.clone();
-            let lease_reaper_ns = namespace.clone();
-            let lease_reaper_shutdown = shutdown.clone();
-            let lease_retention = api::sandbox::sandbox_lease_retention(
-                std::env::var(api::sandbox::ENV_SANDBOX_LEASE_RETENTION)
-                    .ok()
-                    .as_deref(),
-            );
-            tokio::spawn(async move {
-                api::sandbox::run_sandbox_lease_reaper(
-                    lease_reaper_client,
-                    &lease_reaper_ns,
-                    std::time::Duration::from_secs(3600),
-                    lease_retention,
-                    lease_reaper_shutdown,
-                )
-                .await;
-            });
-
-            (Some(handle), Some(execution_reaper_handle))
-        } else {
-            info!("Sandbox placement not started (agentSandbox.mode is not external)");
-            (None, None)
-        };
+        (Some(handle), Some(execution_reaper_handle))
+    } else {
+        info!("Sandbox placement not started (agentSandbox.mode is disabled)");
+        (None, None)
+    };
 
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
     // hardcoded `pool::cidr_alloc::ipam_plan`. The instance controller

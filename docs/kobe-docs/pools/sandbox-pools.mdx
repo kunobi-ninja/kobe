@@ -7,14 +7,63 @@ description: Define bounded, administrator-owned Agent Sandbox templates and pla
 
 <Callout type="warn">
   `SandboxPool` and `SandboxLease` are alpha APIs. Set
-  `agentSandbox.mode=external` only after installing a compatible Agent Sandbox
-  runtime. Kobe validates that runtime at startup and then mounts the Sandbox
-  HTTP API; disabled mode mounts no Sandbox endpoints.
+  `agentSandbox.mode=managed` to install Kobe's pinned runtime, or use
+  `external` only after installing the compatible release yourself. Kobe
+  certifies the runtime before mounting the Sandbox HTTP API; `disabled`
+  mounts no Sandbox endpoints.
 </Callout>
 
 Administrators author `SandboxPool` objects. API callers only choose an allowed
 pool, TTL, and optional alias; they cannot provide a Pod spec, namespace,
 RuntimeClass, environment values, mounts, PVCs, or target credentials.
+
+## Runtime installation modes
+
+`agentSandbox.mode` has three explicit values:
+
+- `disabled` is the default. Kobe renders no upstream Agent Sandbox resources
+  and serves no Sandbox API.
+- `managed` installs the official Agent Sandbox `v0.5.4` core and extensions
+  bundle. Kobe rewrites the controller image to an immutable OCI digest and
+  does not install the optional Router.
+- `external` installs nothing. The operator must provide the compatible
+  `v0.5.4` controller, extensions, CRDs, conversion webhook, and exact running
+  image digest.
+
+Both enabled modes block startup until the current controller Deployment, a
+Ready controller Pod, webhook certificates and endpoint are healthy. Each Kobe
+replica then creates a restricted, Pod-owned `SandboxTemplate`, zero-size
+`SandboxWarmPool`, and short-lived `SandboxClaim`; the Claim must become Ready
+and all three objects must be deleted successfully. A broken controller,
+webhook, image mismatch, or failed cleanup keeps Sandbox endpoints unavailable.
+
+Managed mode also creates the `agent-sandbox-v0-5-4` `BootstrapConfig`. Every
+`ClusterPool` used by a child-cluster SandboxPool must reference it exactly:
+
+```yaml
+spec:
+  bootstraps:
+    - name: agent-sandbox-v0-5-4
+```
+
+Kobe verifies the BootstrapConfig content digest before allocating the child,
+so management and child clusters cannot silently run different releases.
+External mode never injects that bootstrap; configure the child pool's own
+compatible installation instead.
+
+Managed installation fails if same-named upstream resources are already owned
+by another Helm release. Switch to `external`, or back up and deliberately
+remove the conflicting installation before retrying; Kobe does not adopt it.
+On uninstall, Helm removes the managed controller, webhook Service, and RBAC,
+but retains all four upstream CRDs and their data. Remove those CRDs manually
+only after deleting or exporting every Sandbox resource. Because conversion
+uses that removed webhook, retained objects may be unreadable until the same
+runtime is reinstalled; do not uninstall an active managed runtime as a way to
+pause it. A Kobe chart upgrade is the supported way to move to a later pinned
+runtime release.
+
+Agent Sandbox does not install gVisor, Kata, node runtimes, or RuntimeClasses.
+Install the RuntimeClass selected by each SandboxPool before admitting leases.
 
 ## Example
 

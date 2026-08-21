@@ -15,19 +15,10 @@
 //! kubeconfig is read from controller-authorised storage into memory and never
 //! written to status, an API response, a log line, or an event.
 //!
-//! # What this module does NOT do
-//!
-//! It does not **install** the Agent Sandbox runtime into the child cluster.
-//! #74 as filed proposed bootstrapping it there with cluster-admin, which is
-//! one of the three effects paused pending approval on #72; #72 shipped
-//! `external` mode only, where the operator installs the runtime and Kobe owns
-//! nothing. Child placement follows the same rule: the child cluster must
-//! already serve a compatible runtime — through the pool's own bootstraps or
-//! addons — and Kobe *validates* it. A child without one is refused with a
-//! legible error rather than silently granted cluster-admin install rights.
-//!
-//! That is a real narrowing of #74, and it is recorded here rather than papered
-//! over: pools must be configured to bring their own runtime.
+//! In managed mode the selected ClusterPool must use Kobe's immutable v0.5.4
+//! BootstrapConfig. External mode leaves installation to the pool. Either way,
+//! Kobe certifies the running controller, webhook and a real child-local Claim
+//! before creating the tenant pool objects.
 
 use std::time::Duration;
 
@@ -86,7 +77,8 @@ pub enum ChildPlacementError {
     InvalidDuration { field: &'static str },
     #[error(
         "child cluster {cluster} does not serve a compatible Agent Sandbox runtime ({reason}). \
-         Kobe does not install it: configure the ClusterPool's bootstraps or addons to provide it."
+         Use Kobe's pinned BootstrapConfig in managed mode, or configure the external \
+         ClusterPool installation to provide it."
     )]
     ChildRuntimeUnusable { cluster: String, reason: String },
     #[error("child cluster {cluster} is not reachable")]
@@ -327,17 +319,24 @@ pub fn child_provenance(
     }
 }
 
-/// Validate that the child cluster serves a compatible Agent Sandbox runtime.
+/// Certify the child runtime under the exact lease-owned child Namespace.
 ///
-/// The same check #72 applies to the management cluster, pointed at the child.
-/// Kobe does not install it: a missing runtime is an error the operator fixes
-/// in the `ClusterPool`, not something the controller silently corrects using
-/// cluster-admin inside a tenant's cluster.
+/// The Namespace owner makes the deterministic canary crash-recoverable
+/// without leaking a cross-cluster owner reference. This applies the same
+/// controller/webhook/image and real Claim proof as management startup.
 pub async fn validate_child_runtime(
     child: &Client,
     cluster: &str,
+    namespace: &str,
+    owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> Result<(), ChildPlacementError> {
-    crate::sandbox_runtime::validate_external_runtime(child)
+    crate::sandbox_runtime::validate_runtime_components(child)
+        .await
+        .map_err(|reason| ChildPlacementError::ChildRuntimeUnusable {
+            cluster: cluster.to_string(),
+            reason: reason.reason_code().to_string(),
+        })?;
+    crate::sandbox_runtime::run_runtime_canary_owned(child, namespace, owner)
         .await
         .map_err(|reason| ChildPlacementError::ChildRuntimeUnusable {
             cluster: cluster.to_string(),

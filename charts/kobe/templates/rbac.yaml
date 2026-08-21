@@ -67,13 +67,10 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxexecutions", "sandboxexecutions/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
-  # Upstream Agent Sandbox objects, created and owned by the placement
-  # controller. Kobe never installs these CRDs (`agentSandbox.mode=external`
-  # means the operator owns the runtime); it only writes the objects it
-  # created, all of which carry a `kobe-` name and an owner reference to their
-  # Kobe parent. `delete` is what makes verified teardown possible: without it
-  # a released lease could never prove its Sandbox was gone, and its capacity
-  # would be withheld forever.
+  # Upstream Agent Sandbox objects created by placement and certification.
+  # Managed mode installs the pinned CRDs/controller; external mode leaves the
+  # installation operator-owned. In both modes Kobe mutates only its own
+  # exact-provenance objects. `delete` is required for canary and lease cleanup.
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
