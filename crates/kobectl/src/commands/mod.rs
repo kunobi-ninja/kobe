@@ -37,6 +37,12 @@ pub use with_lease::{WithLeaseCommand, with_lease};
 
 use config::{AuthMode, ResolvedConfig};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthInteraction {
+    Interactive,
+    NonInteractive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Text,
@@ -60,6 +66,31 @@ pub(crate) async fn get_auth_header(
     path: &str,
     body: &[u8],
 ) -> anyhow::Result<Option<String>> {
+    get_auth_header_with_interaction(config, method, path, body, AuthInteraction::Interactive).await
+}
+
+/// Build authorization without ever prompting or writing a trust warning.
+///
+/// Machine-output commands use this path so stdout remains their only output
+/// channel. An SSH first-connect or audience change becomes structured command
+/// failure; the caller can rerun a text-mode command to review it interactively.
+pub(crate) async fn get_auth_header_noninteractive(
+    config: &ResolvedConfig,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> anyhow::Result<Option<String>> {
+    get_auth_header_with_interaction(config, method, path, body, AuthInteraction::NonInteractive)
+        .await
+}
+
+async fn get_auth_header_with_interaction(
+    config: &ResolvedConfig,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    interaction: AuthInteraction,
+) -> anyhow::Result<Option<String>> {
     match &config.auth {
         AuthMode::None => Ok(None),
         AuthMode::Token => match &config.token {
@@ -71,18 +102,68 @@ pub(crate) async fn get_auth_header(
         AuthMode::Oidc => {
             let service_config =
                 kunobi_auth::client::ServiceConfig::discover(&config.endpoint).await?;
-            let client = kunobi_auth::client::AuthClient::new(service_config)?;
-            Ok(Some(format!("Bearer {}", client.token().await?)))
+            let token = match interaction {
+                AuthInteraction::Interactive => {
+                    kunobi_auth::client::AuthClient::new(service_config)?
+                        .token()
+                        .await?
+                }
+                AuthInteraction::NonInteractive => {
+                    oidc_token_noninteractive(&service_config).await?
+                }
+            };
+            Ok(Some(format!("Bearer {token}")))
         }
         AuthMode::Ssh => {
             let client = kunobi_auth::client::AuthClient::with_ssh(config.ssh_fingerprint.clone())?;
             // Discover audience from /v1/status — retry once if server hasn't loaded policies yet
             let audience = discover_ssh_audience(&config.endpoint).await?;
-            tofu_check(&config.endpoint, &audience).await?;
+            tofu_check(&config.endpoint, &audience, interaction).await?;
             let header = client.authorize(&audience, method, path, body).await?;
             Ok(Some(header))
         }
     }
+}
+
+/// Load or refresh OIDC credentials without falling back to browser login.
+///
+/// `AuthClient::token()` deliberately becomes interactive when neither path is
+/// usable. Machine output cannot permit that fallback because browser-login
+/// writes prompts to stdout. This mirrors its cache/refresh path and fails
+/// before any user interaction would begin.
+async fn oidc_token_noninteractive(
+    config: &kunobi_auth::client::ServiceConfig,
+) -> anyhow::Result<String> {
+    use kunobi_auth::client::TokenStore;
+
+    let store = TokenStore::new()?;
+    let Some(stored) = store.load(&config.issuer)? else {
+        anyhow::bail!("OIDC login is required; run `kobe login` before using --output json")
+    };
+    if !stored.is_expired() {
+        return Ok(stored.id_token);
+    }
+    let Some(refresh_token) = stored.refresh_token.as_deref() else {
+        anyhow::bail!(
+            "OIDC credentials expired without a refresh token; run `kobe login` before using --output json"
+        )
+    };
+    let mut refreshed = kunobi_auth::client::oidc::refresh(
+        &config.issuer,
+        &config.client_id,
+        &config.redirect_uri,
+        refresh_token,
+    )
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "OIDC refresh failed without interactive fallback ({error}); run `kobe login`"
+        )
+    })?;
+    refreshed.extra = stored.extra;
+    let token = refreshed.id_token.clone();
+    store.save(&refreshed)?;
+    Ok(token)
 }
 
 async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
@@ -111,14 +192,50 @@ async fn discover_ssh_audience(endpoint: &str) -> anyhow::Result<String> {
     )
 }
 
-async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
+/// Verify SSH trust off the async worker thread.
+///
+/// The interactive path reads stdin synchronously. Running it in Tokio's
+/// blocking pool means an enclosing request deadline or signal `select!` can
+/// still make progress instead of being trapped inside one future poll.
+async fn tofu_check(
+    endpoint: &str,
+    audience: &str,
+    interaction: AuthInteraction,
+) -> anyhow::Result<()> {
+    let endpoint = endpoint.to_string();
+    let audience = audience.to_string();
+    tokio::task::spawn_blocking(move || tofu_check_blocking(&endpoint, &audience, interaction))
+        .await
+        .map_err(|error| anyhow::anyhow!("SSH trust check task failed: {error}"))?
+}
+
+fn tofu_check_blocking(
+    endpoint: &str,
+    audience: &str,
+    interaction: AuthInteraction,
+) -> anyhow::Result<()> {
     let store = kunobi_auth::client::TofuStore::new()?;
+    apply_tofu_result(&store, store.verify(endpoint, audience)?, interaction)
+}
+
+fn apply_tofu_result(
+    store: &kunobi_auth::client::TofuStore,
+    result: kunobi_auth::client::TofuResult,
+    interaction: AuthInteraction,
+) -> anyhow::Result<()> {
     // The SSH auth path has no OIDC issuer (status reports issuer=None for ssh,
     // and SSH identities are stamped issuer="ssh"), so pin the endpoint under
-    // the "ssh" sentinel for the issuer slot that TofuStore::trust now requires.
+    // the "ssh" sentinel for the issuer slot that TofuStore::trust requires.
     let pinned_issuer = "ssh";
-    match store.verify(endpoint, audience)? {
+    match result {
         kunobi_auth::client::TofuResult::Trusted => Ok(()),
+        kunobi_auth::client::TofuResult::FirstConnect { endpoint, audience }
+            if interaction == AuthInteraction::NonInteractive =>
+        {
+            anyhow::bail!(
+                "SSH trust is not established for {endpoint} (audience {audience}); rerun in text mode to review it"
+            )
+        }
         kunobi_auth::client::TofuResult::FirstConnect { endpoint, audience } => {
             eprintln!();
             eprintln!("Connecting to {endpoint}");
@@ -133,6 +250,15 @@ async fn tofu_check(endpoint: &str, audience: &str) -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("Connection refused by user")
             }
+        }
+        kunobi_auth::client::TofuResult::AudienceChanged {
+            endpoint,
+            previous,
+            current,
+        } if interaction == AuthInteraction::NonInteractive => {
+            anyhow::bail!(
+                "SSH audience changed for {endpoint} from {previous} to {current}; rerun in text mode to review it"
+            )
         }
         kunobi_auth::client::TofuResult::AudienceChanged {
             endpoint,
@@ -174,5 +300,44 @@ pub(crate) fn with_auth(
     match auth_header {
         Some(h) => builder.header("Authorization", h),
         None => builder,
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn noninteractive_tofu_never_accepts_a_promptable_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = kunobi_auth::client::TofuStore::with_path(directory.path().join("known.json"));
+        let first = kunobi_auth::client::TofuResult::FirstConnect {
+            endpoint: "https://kobe.example".into(),
+            audience: "kobe".into(),
+        };
+        assert!(
+            apply_tofu_result(&store, first, AuthInteraction::NonInteractive)
+                .unwrap_err()
+                .to_string()
+                .contains("rerun in text mode")
+        );
+
+        let changed = kunobi_auth::client::TofuResult::AudienceChanged {
+            endpoint: "https://kobe.example".into(),
+            previous: "old".into(),
+            current: "new".into(),
+        };
+        assert!(
+            apply_tofu_result(&store, changed, AuthInteraction::NonInteractive)
+                .unwrap_err()
+                .to_string()
+                .contains("rerun in text mode")
+        );
+        apply_tofu_result(
+            &store,
+            kunobi_auth::client::TofuResult::Trusted,
+            AuthInteraction::NonInteractive,
+        )
+        .unwrap();
     }
 }

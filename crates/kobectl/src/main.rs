@@ -1,6 +1,6 @@
 mod commands;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use commands::OutputFormat;
 
 #[derive(Parser)]
@@ -296,7 +296,24 @@ async fn main() -> anyhow::Result<()> {
     // without needing a daemon or cron job.
     commands::session::gc_dead_sessions();
 
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit()
+        }
+        Err(error) if requests_sandbox_json(&args) => {
+            let code = error.exit_code();
+            commands::sandbox::emit_cli_parse_error(&error.to_string(), code)?;
+            std::process::exit(code)
+        }
+        Err(error) => error.exit(),
+    };
     let target = cli.target.as_deref();
     let endpoint = cli.endpoint.as_deref();
     let output = cli.output;
@@ -420,6 +437,7 @@ async fn main() -> anyhow::Result<()> {
                         !no_tty,
                         target,
                         endpoint,
+                        output,
                     )
                     .await
                 }
@@ -439,7 +457,14 @@ async fn main() -> anyhow::Result<()> {
                 Ok(0) => Ok(()),
                 Ok(code) => std::process::exit(code),
                 Err(error) => {
-                    eprintln!("kobe: {error:#}");
+                    if output == OutputFormat::Json {
+                        // Machine mode owns stdout exclusively; mixing a human
+                        // stderr diagnostic into an agent pipeline makes the
+                        // invocation impossible to consume deterministically.
+                        let _ = commands::sandbox::emit_cli_error(&error);
+                    } else {
+                        eprintln!("kobe: {error:#}");
+                    }
                     std::process::exit(commands::sandbox::CLI_FAILURE_EXIT)
                 }
             }
@@ -493,6 +518,59 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+fn requests_sandbox_json(args: &[std::ffi::OsString]) -> bool {
+    let args: Vec<_> = args
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect();
+    let end = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    let arguments = args.get(1..end).unwrap_or_default();
+    let json = arguments.iter().enumerate().any(|(index, argument)| {
+        argument == "--output=json"
+            || argument == "-o=json"
+            || argument == "-ojson"
+            || ((argument == "--output" || argument == "-o")
+                && arguments
+                    .get(index + 1)
+                    .is_some_and(|value| value == "json"))
+    });
+    if !json {
+        return false;
+    }
+
+    // Find the first positional while skipping the values of known global
+    // options. A target literally named `sandbox`, or `--output json` passed
+    // to the remote command after `--`, must not change Clap's error channel.
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        if matches!(
+            argument.as_ref(),
+            "--endpoint" | "--target" | "--context" | "--output" | "-o"
+        ) {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--endpoint=")
+            || argument.starts_with("--target=")
+            || argument.starts_with("--context=")
+            || argument.starts_with("--output=")
+            || argument.starts_with("-o")
+        {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return argument == "sandbox";
+    }
+    false
+}
+
 fn print_config_help() -> anyhow::Result<()> {
     let mut cmd = Cli::command();
     let config_cmd = cmd
@@ -506,6 +584,33 @@ fn print_config_help() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_json_parse_errors_are_detected_before_clap_exits() {
+        for args in [
+            vec!["kobe", "sandbox", "run", "agents", "--output", "json"],
+            vec!["kobe", "--output=json", "sandbox", "run", "agents"],
+            vec!["kobe", "sandbox", "run", "agents", "-o=json"],
+            vec!["kobe", "sandbox", "run", "agents", "-ojson"],
+        ] {
+            let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+            assert!(requests_sandbox_json(&args));
+        }
+        let text: Vec<std::ffi::OsString> = ["kobe", "sandbox", "run", "agents"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert!(!requests_sandbox_json(&text));
+        for args in [
+            vec!["kobe", "--target", "sandbox", "status", "--output", "json"],
+            vec![
+                "kobe", "sandbox", "run", "agents", "--", "tool", "--output", "json",
+            ],
+        ] {
+            let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+            assert!(!requests_sandbox_json(&args));
+        }
+    }
 
     /// The public #84 shape reaches the durable execution-log route with follow
     /// enabled; these flags must not be mistaken for global or sandbox options.

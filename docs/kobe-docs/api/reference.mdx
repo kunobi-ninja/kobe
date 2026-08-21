@@ -5,7 +5,10 @@ description: All HTTP endpoints with request and response shapes.
 
 # API reference
 
-The kobe HTTP API is served by the operator. All endpoints except `/v1/status`, `/healthz`, and `/metrics` require authentication via a `Bearer` token in the `Authorization` header.
+The kobe HTTP API is served by the operator. All endpoints except `/v1/status`,
+`/healthz`, and `/metrics` require an `Authorization` header using a method the
+service advertises: a Bearer token for OIDC/static-token auth, or an SSH request
+signature.
 
 ## Quick reference
 
@@ -24,6 +27,13 @@ The kobe HTTP API is served by the operator. All endpoints except `/v1/status`, 
 | `GET` | `/v1/sandbox-leases` | Required | List your Sandbox leases |
 | `GET` | `/v1/sandbox-leases/:id` | Required | Get one Sandbox lease |
 | `DELETE` | `/v1/sandbox-leases/:id` | Required | Request Sandbox release |
+| `GET` | `/v1/sandbox-leases/:id/logs` | Required | Read the Sandbox log tail |
+| `POST` | `/v1/sandbox-leases/:id/executions` | Required | Run or reserve an idempotent execution |
+| `GET` | `/v1/sandbox-leases/:id/executions/:execution` | Required | Read execution state |
+| `DELETE` | `/v1/sandbox-leases/:id/executions/:execution` | Required | Cancel an execution |
+| `GET` | `/v1/sandbox-leases/:id/executions/:execution/logs` | Required | Read retained stdout/stderr windows |
+| `GET` | `/v1/sandbox-leases/:id/attach` | Required | Upgrade to an attach WebSocket |
+| `GET` | `/v1/sandbox-leases/:id/port-forward` | Required | Upgrade to a declared-port WebSocket |
 | `GET` | `/v1/status` | Optional | Endpoint status, auth methods, pool summary |
 | `GET` | `/healthz` | None | Liveness probe |
 | `GET` | `/metrics` | None | Prometheus metrics |
@@ -264,17 +274,20 @@ ready or terminal.
 {
   "pool": "agent-small",
   "ttl": "30m",
-  "alias": "review-142"
+  "alias": "review-142",
+  "idempotencyKey": "one-random-key-per-deliberate-create"
 }
 ```
 
 `ttl` defaults to the pool's `defaultTtl` and is capped by both the pool and the
 caller's Sandbox policy. `alias` is optional and must be unique among that
-identity's active Sandbox leases.
+identity's active Sandbox leases. Current clients should generate one random
+`idempotencyKey` (1–253 bytes) for each deliberate create and reuse it only
+while recovering that request. It remains optional for older clients.
 
 ```json
 {
-  "id": "sandbox-a1b2c3d4e5f6",
+  "id": "sandbox-a1b2c3d4e5f60718293a4b5c",
   "phase": "Pending",
   "pool": "agent-small",
   "ttl": "30m",
@@ -293,14 +306,14 @@ it preserves the same legacy fields and adds an explicit non-retry handoff:
 
 ```json
 {
-  "id": "sandbox-a1b2c3d4e5f6",
+  "id": "sandbox-a1b2c3d4e5f60718293a4b5c",
   "phase": "Pending",
   "pool": "agent-small",
   "ttl": "30m",
   "provisioning_deadline": "2026-08-20T12:10:00Z",
   "status": "admission_pending",
   "retry": false,
-  "statusUrl": "/v1/sandbox-leases/sandbox-a1b2c3d4e5f6"
+  "statusUrl": "/v1/sandbox-leases/sandbox-a1b2c3d4e5f60718293a4b5c"
 }
 ```
 
@@ -310,27 +323,28 @@ will either admit that exact lease or cancel it; a later `404` means
 cancellation won. `phase: "Pending"` remains present so older clients also keep
 polling the handle instead of treating it as placeable.
 
-This server-side handoff does not make the create idempotent if the client loses
-the final HTTP response itself. Until the create API accepts a caller-owned
-idempotency key, do not blindly retry an ambiguous transport failure; reconcile
-the caller's lease list first.
+A keyed retry returns the same durable lease and `Location`. Reusing a key with
+different pool, TTL, or alias intent returns `409`. If response headers arrived
+but the body was lost, recover with `GET Location`; do not repeat the POST. If
+the connection failed before headers, the same keyed POST may be repeated.
 
 | Status | Meaning |
 |---|---|
 | `400` | Invalid pool name, alias, or TTL |
 | `403` | Missing Sandbox `lease` permission or resource ceiling exceeded |
 | `404` | An allowed SandboxPool does not exist |
-| `409` | Alias is already active |
+| `409` | Alias is already active, or an idempotency key is bound to different intent |
 | `429` | Sandbox concurrency limit reached, or the per-principal admission rate limit was hit |
 | `503` | Pool configuration or Kubernetes admission cannot be verified |
 
 Admission is rate limited per principal, independently of the concurrency
-limit. The budget is charged per *attempt* — a refused attempt costs the same
-as an accepted one, because refusing one still costs the API server a lease
-create, a contested reservation, and the cleanup that undoes them. A caller
-that has run out of budget gets `429` with a `Retry-After` header, in seconds;
-the concurrency `429` carries no such header. The limit is per API replica, and
-`kobe_sandbox_admission_rate_limited_total` counts every refusal.
+limit. Each attempt that passes the limiter spends one token before admission
+work starts. An already-throttled request is refused without another charge or
+admission mutation. A keyed retry may perform one exact-name GET solely to
+recover an already committed lease; a miss remains `429`. Rate-limit `429`
+includes `Retry-After` in seconds, while concurrency `429` does not. The limit
+is per API replica, and `kobe_sandbox_admission_rate_limited_total` counts every
+refusal.
 
 ### `GET /v1/sandbox-leases`
 
@@ -368,6 +382,110 @@ Repeated release of an already requested, `Releasing`, `Released`, or `Expired`
 lease returns `204 No Content`. A `Quarantined` lease returns `409 Conflict`:
 cleanup is still uncertain, so its capacity remains unavailable rather than
 being reported as released.
+
+### `POST /v1/sandbox-leases/:id/executions`
+
+Reserves the execution before starting its process, so retrying the same
+request cannot run a command twice. `idempotencyKey` is required, contains
+1–253 bytes, and must be new for each deliberate execution. Reusing it with
+different command, working directory, timeout, container, or detach intent
+returns `409 Conflict`.
+
+```json
+{
+  "command": ["/agent", "analyse", "./repo"],
+  "cwd": "/workspace",
+  "timeout": "5m",
+  "container": "agent",
+  "idempotencyKey": "execution-018f8f4f",
+  "detach": false
+}
+```
+
+`command` is an argv array and is never interpreted by a shell. `cwd` and
+`container` are optional. `timeout` defaults to 60 seconds, is capped at one
+hour, and can never extend past the lease expiry.
+
+Wait mode (`detach: false`) returns `200 OK` after the supervised command ends:
+
+```json
+{
+  "id": "sbxe-a1b2c3d4e5f6",
+  "state": "Succeeded",
+  "exitCode": 0,
+  "startedAt": "2026-08-20T12:01:00Z",
+  "finishedAt": "2026-08-20T12:01:12Z",
+  "stdout": "analysis complete\n",
+  "stderr": "",
+  "truncated": false
+}
+```
+
+Detached mode returns `202 Accepted` once the durable reservation exists. Poll
+the execution URL; a keyed retry returns the same execution rather than
+starting another process.
+
+Execution states are `Queued`, `Running`, `Succeeded`, `Failed`, `Cancelled`,
+`TimedOut`, and `Unknown`. `exitCode` is present only when the remote process
+reported one. `Unknown` means Kobe could not establish the outcome and must not
+be treated as permission to rerun effects automatically.
+
+Common failures are `400` for an invalid command, timeout, cwd, or idempotency
+key; `403`/`404` for unavailable lease access; `409` for key reuse with changed
+intent; `429` for the execution concurrency limit; `501` when the pool has no
+Kobe runner; and `503` when the execution store or target cannot be verified.
+
+### `GET /v1/sandbox-leases/:id/executions/:execution`
+
+Returns the current execution object in the same response shape, without
+inline stdout/stderr. It returns `404` unless both the lease and execution
+belong to the authenticated caller and exact lease instance.
+
+### `GET /v1/sandbox-leases/:id/executions/:execution/logs`
+
+Reads retained output with independent resume positions:
+
+```text
+?stdoutOffset=0&stderrOffset=0
+```
+
+```json
+{
+  "id": "sbxe-a1b2c3d4e5f6",
+  "state": "Running",
+  "stdout": {
+    "data": "building\n",
+    "nextOffset": 9,
+    "more": true,
+    "truncated": false
+  },
+  "stderr": {
+    "data": "",
+    "nextOffset": 0,
+    "more": false,
+    "truncated": false
+  }
+}
+```
+
+Pass each returned `nextOffset` unchanged on the next request. Offsets count
+the runner's retained raw bytes and are opaque resume tokens; do not derive
+them from the length of `data`. The API represents each returned window as a
+string, replacing invalid UTF-8 when necessary. `more` means another window is
+already available. `truncated` means earlier or excess output was irreversibly
+dropped at the retention cap.
+
+A follower is drained only when the execution state is terminal and both
+windows report `more: false`. Transport/body retry uses the same offsets so it
+cannot duplicate an already acknowledged window. `401` and `403` are terminal
+authorization results, not retry signals.
+
+### `DELETE /v1/sandbox-leases/:id/executions/:execution`
+
+Requests cancellation and returns `200 OK` with the state that actually
+applies. Runner-managed execution cancellation signals the whole process group.
+An execution already terminal remains in that terminal state; the response does
+not claim it was cancelled after the fact. Repeating cancellation is safe.
 
 ---
 

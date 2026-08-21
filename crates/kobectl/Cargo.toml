@@ -29,8 +29,10 @@ dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+sha2 = "0.10"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
 # rustls (ring) — never default-features (which would pull aws-lc-sys and break
 # the Windows cross-build, per kache's hard-won note).
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
@@ -58,6 +60,10 @@ kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [package.metadata.binstall]
 # Asset stem is `kobe-<target>` (named after the binary, NOT the crate) — do NOT

@@ -32,7 +32,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::config::{CliConfig, ResolvedConfig};
-use super::{OutputFormat, get_auth_header};
+use super::{OutputFormat, get_auth_header, get_auth_header_noninteractive};
 
 pub const CHANNEL_STDIN: u8 = 0;
 pub const CHANNEL_STDOUT: u8 = 1;
@@ -187,7 +187,11 @@ pub async fn attach(
     tty: bool,
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
+    output: OutputFormat,
 ) -> Result<i32> {
+    if output == OutputFormat::Json {
+        anyhow::bail!("sandbox attach is interactive and does not support --output json");
+    }
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
 
@@ -199,7 +203,7 @@ pub async fn attach(
         path.push_str(&format!("&command={}", urlencoding_minimal(argument)));
     }
 
-    let mut socket = open_stream(&config, &path).await?;
+    let mut socket = open_stream(&config, &path, OutputFormat::Text).await?;
     let _raw = if tty {
         Some(RawModeGuard::enter()?)
     } else {
@@ -224,11 +228,14 @@ pub async fn attach(
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn open_stream(config: &ResolvedConfig, path: &str) -> Result<Socket> {
+async fn open_stream(config: &ResolvedConfig, path: &str, output: OutputFormat) -> Result<Socket> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let url = websocket_url(config.endpoint.as_str(), path)?;
-    let token = get_auth_header(config, "GET", path, b"").await?;
+    let token = match output {
+        OutputFormat::Text => get_auth_header(config, "GET", path, b"").await?,
+        OutputFormat::Json => get_auth_header_noninteractive(config, "GET", path, b"").await?,
+    };
 
     let mut request = url
         .as_str()
@@ -380,8 +387,9 @@ pub async fn port_forward(
     let bound = listener.local_addr()?;
 
     match output {
-        OutputFormat::Json => super::print_json(&serde_json::json!({
+        OutputFormat::Json => emit_port_forward_json(&serde_json::json!({
             "apiVersion": super::sandbox::SANDBOX_CLI_API_VERSION,
+            "event": "listening",
             "lease": lease,
             "listening": bound.to_string(),
             "remote": remote,
@@ -402,17 +410,50 @@ pub async fn port_forward(
     // exhaust it and the failures would look like the sandbox misbehaving.
     loop {
         let (mut local, peer) = listener.accept().await.context("accept failed")?;
-        let mut socket = match open_stream(&config, &path).await {
+        let mut socket = match open_stream(&config, &path, output).await {
             Ok(socket) => socket,
             Err(error) => {
-                eprintln!("kobe: {peer} could not be forwarded: {error:#}");
+                report_port_forward_error(output, lease, peer, &format!("{error:#}"))?;
                 continue;
             }
         };
         if let Err(error) = pump_connection(&mut local, &mut socket).await {
-            eprintln!("kobe: {peer} disconnected: {error:#}");
+            report_port_forward_error(output, lease, peer, &format!("{error:#}"))?;
         }
     }
+}
+
+/// Report long-lived forward failures without contaminating machine stderr.
+///
+/// JSON mode is an event stream because the listener remains alive across
+/// individual connection failures. Every event is one flushed NDJSON record.
+fn report_port_forward_error(
+    output: OutputFormat,
+    lease: &str,
+    peer: std::net::SocketAddr,
+    error: &str,
+) -> Result<()> {
+    match output {
+        OutputFormat::Json => emit_port_forward_json(&serde_json::json!({
+            "apiVersion": super::sandbox::SANDBOX_CLI_API_VERSION,
+            "event": "connectionError",
+            "lease": lease,
+            "peer": peer.to_string(),
+            "error": error,
+        })),
+        OutputFormat::Text => {
+            eprintln!("kobe: {peer} could not be forwarded: {error}");
+            Ok(())
+        }
+    }
+}
+
+fn emit_port_forward_json(value: &serde_json::Value) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 async fn pump_connection(local: &mut tokio::net::TcpStream, socket: &mut Socket) -> Result<()> {
@@ -439,7 +480,7 @@ async fn pump_connection(local: &mut tokio::net::TcpStream, socket: &mut Socket)
                     }
                     Some(ServerFrame::Ended { reason }) => {
                         if end_is_failure(&reason) {
-                            eprintln!("kobe: forward ended: {reason}");
+                            anyhow::bail!("forward ended: {reason}");
                         }
                         return Ok(());
                     }

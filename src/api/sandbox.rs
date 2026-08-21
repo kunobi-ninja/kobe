@@ -76,6 +76,10 @@ const SANDBOX_ADMISSION_CANCELLED: &str = "cancelled";
 /// this annotation with the same object resourceVersion fence.
 pub(crate) const SANDBOX_RELEASE_REQUESTED_AT_ANNOTATION: &str =
     "kobe.kunobi.ninja/sandbox-release-requested-at";
+/// Digest of the caller-supplied create key. The key itself is never persisted.
+const SANDBOX_CREATE_KEY_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-create-key";
+/// Digest of the exact caller intent paired with [`SANDBOX_CREATE_KEY_ANNOTATION`].
+const SANDBOX_CREATE_INTENT_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-create-intent";
 
 /// Build the caller-authenticated Sandbox lease routes.
 pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
@@ -2674,6 +2678,66 @@ struct CreateSandboxLeaseRequest {
     ttl: Option<String>,
     #[serde(default)]
     alias: Option<String>,
+    /// Optional for compatibility with older API clients. Current clients send
+    /// one key per deliberate create and reuse it only to recover an ambiguous
+    /// response. The server never treats a missing key as retryable.
+    #[serde(default, rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxCreateIdentity {
+    lease_id: String,
+    key_digest: String,
+    intent_digest: String,
+}
+
+/// Derive the durable identity for one keyed create.
+///
+/// The name depends only on the random caller key so the caller can recover the
+/// exact `Location` even when the response is lost before headers. Ownership
+/// and the complete request digest are persisted separately and must both match
+/// before a repeated POST may reuse the object. Keys are bounded before hashing
+/// to prevent an authenticated caller from turning a tiny request into
+/// unbounded hashing work.
+fn sandbox_create_identity(
+    request: &CreateSandboxLeaseRequest,
+) -> Result<Option<SandboxCreateIdentity>, &'static str> {
+    let Some(key) = request.idempotency_key.as_deref() else {
+        return Ok(None);
+    };
+    if key.is_empty() || key.len() > 253 {
+        return Err("idempotencyKey must contain between 1 and 253 bytes");
+    }
+
+    let key_digest = sha256_hex([key.as_bytes()]);
+    let intent_digest = sha256_hex([
+        request.pool.as_bytes(),
+        request.ttl.as_deref().unwrap_or_default().as_bytes(),
+        request.alias.as_deref().unwrap_or_default().as_bytes(),
+        &[
+            u8::from(request.ttl.is_some()),
+            u8::from(request.alias.is_some()),
+        ],
+    ]);
+    Ok(Some(SandboxCreateIdentity {
+        lease_id: format!("{LEASE_ID_PREFIX}{}", &key_digest[..24]),
+        key_digest,
+        intent_digest,
+    }))
+}
+
+fn sha256_hex<'a>(components: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut hasher = Sha256::new();
+    for component in components {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -2795,9 +2859,9 @@ fn sandbox_lease_accepted(
 /// the supervised reaper. Returning a normal accepted lease here would lie;
 /// returning 503 would invite a duplicate create after a lost response.
 ///
-/// This protocol does not make a create idempotent across a client disconnect
-/// after the final HTTP response. That broader guarantee requires a
-/// caller-supplied create idempotency key and remains outside admission #101.
+/// Current callers also send a create idempotency key. Its deterministic
+/// parent name and response `Location` let a disconnected caller recover this
+/// same handle instead of issuing an unkeyed duplicate create.
 fn sandbox_admission_pending(
     lease_id: String,
     pool: String,
@@ -2825,6 +2889,76 @@ fn sandbox_admission_pending(
     )
         .into_response();
     if let Ok(location) = axum::http::HeaderValue::from_str(&status_url) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::LOCATION, location);
+    }
+    response
+}
+
+/// Return the one durable object owned by a repeated keyed create.
+///
+/// A replay is successful only when both server-owned digests and the complete
+/// authenticated principal match. A truncated-name hash collision or reuse of
+/// a key for different intent therefore fails closed instead of returning or
+/// mutating somebody else's lease.
+fn sandbox_create_replay(
+    lease: SandboxLease,
+    identity: &AuthIdentity,
+    create: &SandboxCreateIdentity,
+) -> Response {
+    let matches = principal_matches(&lease.spec.requester, identity)
+        && lease
+            .annotations()
+            .get(SANDBOX_CREATE_KEY_ANNOTATION)
+            .is_some_and(|digest| digest == &create.key_digest)
+        && lease
+            .annotations()
+            .get(SANDBOX_CREATE_INTENT_ANNOTATION)
+            .is_some_and(|digest| digest == &create.intent_digest);
+    if !matches {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox create idempotency key is already bound to different intent",
+            None,
+        );
+    }
+
+    let location = format!("/v1/sandbox-leases/{}", lease.name_any());
+    let admitted = lease
+        .annotations()
+        .get(SANDBOX_ADMISSION_ANNOTATION)
+        .is_some_and(|value| value == SANDBOX_ADMISSION_ADMITTED);
+    let terminal = lease.status.as_ref().is_some_and(|status| {
+        matches!(
+            status.phase,
+            SandboxLeasePhase::Released
+                | SandboxLeasePhase::Expired
+                | SandboxLeasePhase::Quarantined
+        )
+    });
+    let lease = sandbox_lease_response(lease, None);
+    let mut response = if terminal {
+        (StatusCode::OK, Json(lease)).into_response()
+    } else if !admitted {
+        // A retry can race between durable parent CREATE and the admission
+        // metadata CAS. Preserve the non-retry handoff shape; a generic
+        // `phase: Pending` response would erase the distinction and let a
+        // current client mistake an unresolved parent for admitted work.
+        (
+            StatusCode::ACCEPTED,
+            Json(SandboxAdmissionPendingResponse {
+                lease,
+                status: "admission_pending",
+                retry: false,
+                status_url: location.clone(),
+            }),
+        )
+            .into_response()
+    } else {
+        (StatusCode::ACCEPTED, Json(lease)).into_response()
+    };
+    if let Ok(location) = axum::http::HeaderValue::from_str(&location) {
         response
             .headers_mut()
             .insert(axum::http::header::LOCATION, location);
@@ -2923,18 +3057,49 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     request: CreateSandboxLeaseRequest,
     active_admission_deadline: tokio::time::Instant,
 ) -> Response {
-    // FIRST statement, deliberately. Everything below — the CRD probe, the pool
-    // GET, the lease CREATE, up to `max_concurrent_leases` reservation CREATEs,
-    // and the DELETE that undoes them — is apiserver work this handler performs
-    // *before* it can decide the answer, and it performs all of it just as
-    // eagerly for a request that is going to be refused. So the budget is spent
-    // by the attempt, not by its outcome: a caller looping on 429s pays exactly
-    // like one looping on 202s, and no exit below can skip the charge because
-    // none of them is reachable without passing through here.
+    let create_identity = match sandbox_create_identity(&request) {
+        Ok(identity) => identity,
+        Err(detail) => {
+            return sandbox_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid Sandbox create idempotency key",
+                Some(detail.into()),
+            );
+        }
+    };
+    // FIRST operation that touches shared state, deliberately. Once admitted
+    // by this limiter, the attempt spends its token even if a later pool,
+    // policy, quota, or Kubernetes check refuses it: downstream failure must
+    // not make admission work free. An attempt refused by the limiter spends
+    // no additional token and performs no admission mutation; the keyed GET
+    // below is only recovery for an object a previous allowed attempt created.
     let principal = principal_hash(&identity);
     if let RateLimitDecision::Throttled { retry_after } =
         state.sandbox_admission_limiter.charge(&principal)
     {
+        // A lost response must remain recoverable even when its one bounded
+        // retry arrives after the admission burst was consumed. Only an exact
+        // keyed object owned by this principal bypasses the refusal; arbitrary
+        // keys still pay one GET and receive the original 429, never admission
+        // work. Current policy is checked so replay cannot revive visibility
+        // that was revoked after the first request.
+        if let Some(create) = create_identity.as_ref() {
+            let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
+            if let Ok(Ok(existing)) = await_admission_stage_until(
+                active_admission_deadline,
+                &state.shutdown,
+                leases.get(&create.lease_id),
+            )
+            .await
+                && is_sandbox_allowed(
+                    &existing.spec.pool_ref.name,
+                    SandboxVerb::Lease,
+                    &policy_for(&identity),
+                )
+            {
+                return sandbox_create_replay(existing, &identity, create);
+            }
+        }
         crate::metrics::SANDBOX_ADMISSION_RATE_LIMITED_TOTAL.inc();
         warn!(
             identity = %identity.identity,
@@ -2990,6 +3155,26 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
                     .into(),
             ),
         );
+    }
+
+    let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    if let Some(create) = create_identity.as_ref() {
+        match await_admission_stage_until(
+            active_admission_deadline,
+            &state.shutdown,
+            leases.get(&create.lease_id),
+        )
+        .await
+        {
+            Ok(Ok(existing)) => return sandbox_create_replay(existing, &identity, create),
+            Ok(Err(kube::Error::Api(error))) if error.code == 404 => {}
+            Ok(Err(error)) => {
+                return sandbox_infra_error("Unable to recover keyed Sandbox create", error);
+            }
+            Err(error) => {
+                return sandbox_infra_error("Sandbox create recovery was interrupted", error);
+            }
+        }
     }
 
     let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
@@ -3111,7 +3296,6 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
         Err(err) => return sandbox_infra_error("Sandbox resource ceiling is invalid", err),
     }
 
-    let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
     let reservations: Api<Lease> =
         Api::namespaced(state.client.clone(), &state.sandbox_reservation_namespace);
     if grant.max_concurrent_leases > MAX_SANDBOX_CONCURRENCY_SLOTS {
@@ -3138,18 +3322,26 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
         );
     }
 
-    let lease_id = format!(
-        "{LEASE_ID_PREFIX}{}",
-        &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+    let lease_id = create_identity.as_ref().map_or_else(
+        || {
+            format!(
+                "{LEASE_ID_PREFIX}{}",
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+            )
+        },
+        |create| create.lease_id.clone(),
     );
-    let lease = build_sandbox_lease(
-        &lease_id,
-        &state.namespace,
-        pool_reference,
-        placement_authority,
-        &effective_ttl,
-        request.alias.as_deref(),
-        &identity,
+    let lease = with_sandbox_create_identity(
+        build_sandbox_lease(
+            &lease_id,
+            &state.namespace,
+            pool_reference,
+            placement_authority,
+            &effective_ttl,
+            request.alias.as_deref(),
+            &identity,
+        ),
+        create_identity.as_ref(),
     );
     // The request-local timer bounds ordinary stalled API work before the
     // controller's ten-minute cancellation boundary. It is intentionally only
@@ -3166,6 +3358,30 @@ async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     .await
     {
         Ok(Ok(created)) => created,
+        Ok(Err(kube::Error::Api(error))) if error.code == 409 && create_identity.is_some() => {
+            let create = create_identity.as_ref().expect("checked above");
+            match await_admission_stage_until(
+                active_admission_deadline,
+                &state.shutdown,
+                leases.get(&create.lease_id),
+            )
+            .await
+            {
+                Ok(Ok(existing)) => return sandbox_create_replay(existing, &identity, create),
+                Ok(Err(error)) => {
+                    return sandbox_infra_error(
+                        "Failed to recover concurrent keyed Sandbox create",
+                        error,
+                    );
+                }
+                Err(error) => {
+                    return sandbox_infra_error(
+                        "Concurrent Sandbox create recovery was interrupted",
+                        error,
+                    );
+                }
+            }
+        }
         Ok(Err(err)) => return sandbox_infra_error("Failed to create Sandbox lease", err),
         Err(error) => {
             return sandbox_infra_error("Sandbox lease admission was interrupted", error);
@@ -4224,6 +4440,24 @@ fn build_sandbox_lease(
         },
         status: None,
     }
+}
+
+fn with_sandbox_create_identity(
+    mut lease: SandboxLease,
+    create_identity: Option<&SandboxCreateIdentity>,
+) -> SandboxLease {
+    if let Some(create) = create_identity {
+        let annotations = lease.metadata.annotations.get_or_insert_default();
+        annotations.insert(
+            SANDBOX_CREATE_KEY_ANNOTATION.to_string(),
+            create.key_digest.clone(),
+        );
+        annotations.insert(
+            SANDBOX_CREATE_INTENT_ANNOTATION.to_string(),
+            create.intent_digest.clone(),
+        );
+    }
+    lease
 }
 
 /// Live lease ids carrying one alias, for this caller only.
@@ -7638,6 +7872,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 }),
             )
             .await;
@@ -7700,6 +7935,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -7736,6 +7972,119 @@ mod tests {
                 "field {field} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn keyed_create_derives_one_name_and_binds_the_exact_intent() {
+        let request = CreateSandboxLeaseRequest {
+            pool: "agent-small".into(),
+            ttl: Some("1h".into()),
+            alias: Some("review".into()),
+            idempotency_key: Some("caller-key-1".into()),
+        };
+        let first = sandbox_create_identity(&request).unwrap().unwrap();
+        let repeated = sandbox_create_identity(&request).unwrap().unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(first.lease_id, "sandbox-74e5a3f11fea32a242354940");
+
+        let changed = sandbox_create_identity(&CreateSandboxLeaseRequest {
+            ttl: Some("2h".into()),
+            ..request
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.lease_id, changed.lease_id);
+        assert_eq!(first.key_digest, changed.key_digest);
+        assert_ne!(first.intent_digest, changed.intent_digest);
+
+        for invalid in [String::new(), "x".repeat(254)] {
+            assert!(
+                sandbox_create_identity(&CreateSandboxLeaseRequest {
+                    pool: "agent-small".into(),
+                    ttl: None,
+                    alias: None,
+                    idempotency_key: Some(invalid),
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_create_replay_requires_owner_key_and_intent_and_returns_location() {
+        let identity = identity();
+        let request = CreateSandboxLeaseRequest {
+            pool: "agent-small".into(),
+            ttl: Some("1h".into()),
+            alias: None,
+            idempotency_key: Some("caller-key-1".into()),
+        };
+        let create = sandbox_create_identity(&request).unwrap().unwrap();
+        let lease = with_sandbox_create_identity(
+            build_sandbox_lease(
+                &create.lease_id,
+                "kobe",
+                pool_reference(),
+                None,
+                "1h",
+                None,
+                &identity,
+            ),
+            Some(&create),
+        );
+
+        let response = sandbox_create_replay(lease.clone(), &identity, &create);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("/v1/sandbox-leases/{}", create.lease_id)
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "admission_pending");
+        assert_eq!(body["retry"], false);
+        assert_eq!(
+            body["statusUrl"],
+            format!("/v1/sandbox-leases/{}", create.lease_id)
+        );
+        assert_eq!(body["id"], create.lease_id);
+
+        let changed = sandbox_create_identity(&CreateSandboxLeaseRequest {
+            pool: request.pool.clone(),
+            ttl: Some("2h".into()),
+            alias: request.alias.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sandbox_create_replay(lease.clone(), &identity, &changed).status(),
+            StatusCode::CONFLICT
+        );
+
+        let mut other_owner = identity.clone();
+        other_owner.identity = "mallory@example.com".into();
+        assert_eq!(
+            sandbox_create_replay(lease.clone(), &other_owner, &create).status(),
+            StatusCode::CONFLICT
+        );
+
+        let other_key = sandbox_create_identity(&CreateSandboxLeaseRequest {
+            pool: request.pool,
+            ttl: request.ttl,
+            alias: request.alias,
+            idempotency_key: Some("caller-key-2".into()),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            sandbox_create_replay(lease, &identity, &other_key).status(),
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]
@@ -8029,6 +8378,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 }),
             )
         };
@@ -8098,20 +8448,8 @@ mod tests {
 
     /// The id a caller is handed back must be usable as a lease id.
     ///
-    /// REVIEW FINDING (expected to fail). `create_sandbox_lease` mints
-    /// `sandbox-{12 hex}`, but `sandbox_access::looks_like_lease_id` decides
-    /// "id or alias" by testing for a `sbx-` prefix. No id this endpoint issues
-    /// carries it, so every operation addressed by id — logs, exec, attach,
-    /// port-forward, executions — is routed through `resolve_alias`, finds no
-    /// lease whose ALIAS is that string, and answers 404.
-    ///
-    /// That is the whole access surface dead for its primary identifier: `kobe
-    /// sandbox run` creates a lease, is handed this id, and then cannot address
-    /// it. Worse, the two are not merely disconnected: because the id falls
-    /// through to alias resolution, a caller's own second lease created with
-    /// `alias = <first lease's id>` silently captures operations aimed at the
-    /// first — exactly the substitution `looks_like_lease_id` is documented to
-    /// prevent.
+    /// Minting and routing share [`LEASE_ID_PREFIX`], so a returned id can
+    /// never fall through to caller-controlled alias resolution.
     #[tokio::test]
     async fn the_id_a_caller_is_handed_back_resolves_as_a_lease_id() {
         let server = MockServer::start().await;
@@ -8124,6 +8462,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8151,6 +8490,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("3h".into()),
                 alias: Some("review".into()),
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8275,6 +8615,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_keyed_create_returns_one_durable_lease_and_location() {
+        let server = MockServer::start().await;
+        mount_create_api(&server, true, false).await;
+        let request = || CreateSandboxLeaseRequest {
+            pool: "agent-small".into(),
+            ttl: Some("1h".into()),
+            alias: None,
+            idempotency_key: Some("caller-key-1".into()),
+        };
+        let expected = sandbox_create_identity(&request()).unwrap().unwrap();
+        let expected_location = format!("/v1/sandbox-leases/{}", expected.lease_id);
+        let state = test_state(&server);
+
+        for attempt in 1..=2 {
+            if attempt == 2 {
+                let principal = principal_hash(&identity());
+                while state.sandbox_admission_limiter.charge(&principal)
+                    == RateLimitDecision::Allowed
+                {}
+            }
+            let response = create_sandbox_lease::<crate::testutil::MockBackend>(
+                State(state.clone()),
+                identity(),
+                Json(request()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "attempt {attempt}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_location.as_str())
+            );
+            let body = response_json(response).await;
+            assert_eq!(body["id"], expected.lease_id);
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let creates: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path().ends_with("/sandboxleases")
+            })
+            .collect();
+        assert_eq!(creates.len(), 1, "a replay must not create another parent");
+        let object: serde_json::Value = serde_json::from_slice(&creates[0].body).unwrap();
+        assert_eq!(object["metadata"]["name"], expected.lease_id);
+        assert_eq!(
+            object["metadata"]["annotations"][SANDBOX_CREATE_KEY_ANNOTATION],
+            expected.key_digest
+        );
+        assert_eq!(
+            object["metadata"]["annotations"][SANDBOX_CREATE_INTENT_ANNOTATION],
+            expected.intent_digest
+        );
+    }
+
+    #[tokio::test]
     async fn create_treats_applied_but_lost_admission_response_as_success() {
         let server = MockServer::start().await;
         let state = mount_create_api(&server, true, true).await;
@@ -8286,6 +8685,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8335,6 +8735,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8376,6 +8777,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8432,6 +8834,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8482,6 +8885,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -8650,6 +9054,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -9474,6 +9879,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 },
                 deadline,
             ),
@@ -9528,6 +9934,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 },
                 tokio::time::Instant::now() + std::time::Duration::from_millis(100),
             ),
@@ -9577,6 +9984,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 },
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             ),
@@ -9628,6 +10036,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 },
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             ),
@@ -9682,6 +10091,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 },
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
             ),
@@ -9759,6 +10169,7 @@ mod tests {
                     pool: "agent-small".into(),
                     ttl: Some("1h".into()),
                     alias: None,
+                    idempotency_key: None,
                 },
                 tokio::time::Instant::now() + std::time::Duration::from_millis(200),
             ),
@@ -10117,6 +10528,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;
@@ -10151,6 +10563,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: Some("review".into()),
+                idempotency_key: None,
             }),
         )
         .await;
@@ -10181,6 +10594,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: Some("review".into()),
+                idempotency_key: None,
             }),
         )
         .await;
@@ -11139,6 +11553,7 @@ mod tests {
                 pool: "agent-small".into(),
                 ttl: Some("1h".into()),
                 alias: None,
+                idempotency_key: None,
             }),
         )
         .await;

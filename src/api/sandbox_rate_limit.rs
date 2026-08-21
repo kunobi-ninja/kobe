@@ -20,10 +20,13 @@
 //! of the handler and not a decision taken at one of its exits: every exit
 //! below it has already paid.
 //!
-//! A *throttled* attempt is different, and costs nothing: it is refused before
-//! any I/O, so there is nothing to bill. Charging it as well would turn a
-//! bounded delay into a permanent lockout for any client with a tight retry
-//! loop, which punishes bad retry code rather than bounding load.
+//! A *throttled* unkeyed attempt is different, and costs nothing: it is refused
+//! before any I/O. A keyed attempt may perform one exact-name GET so a caller
+//! that lost an already-committed create response can recover that object; a
+//! miss still performs no admission mutation and returns the same throttle.
+//! Charging a refusal again would turn a bounded delay into permanent lockout
+//! for a tight retry loop, which punishes bad retry code rather than bounding
+//! load.
 //!
 //! ## Scope, stated narrowly
 //!

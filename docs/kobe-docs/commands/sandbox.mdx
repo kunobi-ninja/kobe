@@ -18,14 +18,23 @@ Create a sandbox, run one command in it, and release it.
 kobe sandbox run agents --ttl 30m -- /agent analyse ./repo
 ```
 
-This is the command to reach for from CI or a script: it owns the whole
-lifecycle and performs bounded cleanup when your job is cancelled.
+This is the command to reach for from CI or a script: it owns the create,
+execution, and release requests in one process.
 
-`run` catches SIGINT and SIGTERM, requests release, and waits up to 30 seconds
-until the lease is observably `Releasing`, cleanly terminal, or absent. It then
-returns the conventional signal status (`130` for SIGINT, `143` for SIGTERM).
-The same bounded cleanup runs after a remote timeout, cancellation, transport
-disconnect, success, or non-zero exit.
+On Unix, `run` catches SIGINT and SIGTERM. A signal received before the create
+POST starts exits without creating a lease. After the POST starts, `run` first
+resolves that keyed request within the create recovery bound, then attempts
+release and observes it for up to 30 seconds. It returns after seeing
+`Releasing`, a clean terminal phase, or absence, using the conventional signal
+status (`130` or `143`). Signal handling remains active during cleanup: a second
+signal still allows the DELETE request to be attempted, then stops observation
+and reports cleanup as unconfirmed. Release is also attempted after a remote
+timeout, cancellation, transport disconnect, success, or non-zero exit.
+Automatic cleanup never opens a login or trust prompt; if authorization can no
+longer be refreshed non-interactively, `cleanup` reports that failure.
+
+Readiness has one absolute five-minute CLI deadline. Authorization, each GET,
+response-body reads, and polling waits all consume that same bound.
 
 **The exit code is the remote command's exit code.** `set -e` works:
 
@@ -35,19 +44,24 @@ kobe sandbox run agents -- /agent test   # non-zero here fails the script
 ```
 
 **Cleanup is reported separately from the result.** If the command succeeded
-but the lease could not be released, you are told both — the success is not
-hidden, and the leak is not swallowed:
+but release could not be confirmed, you are told both — the success is not
+hidden, and cleanup uncertainty is not swallowed:
 
 ```json
 {
   "apiVersion": "kobe.sandbox/v1",
-  "lease": "sbx-7f3a",
+  "outcome": "success",
+  "lease": "sandbox-a1b2c3d4e5f60718293a4b5c",
   "execution": "sbxe-91c4",
   "state": "Succeeded",
   "exitCode": 0,
+  "processExitCode": 0,
   "stdout": "...",
   "stderr": "",
-  "cleanup": { "released": false, "error": "HTTP 503" }
+  "truncated": false,
+  "signal": null,
+  "error": null,
+  "cleanup": { "released": false, "phase": null, "error": "HTTP 503" }
 }
 ```
 
@@ -62,8 +76,8 @@ text mode). Headless callers should check both.
 Run a command in a sandbox you already hold.
 
 ```bash
-kobe sandbox exec sbx-7f3a -- /agent status
-kobe sandbox exec sbx-7f3a --cwd /work --timeout 5m -- ./build.sh
+kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c -- /agent status
+kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c --cwd /work --timeout 5m -- ./build.sh
 ```
 
 `argv` is sent **as-is**. There is no shell, so there are no quoting rules of
@@ -71,14 +85,14 @@ Kobe's own to learn — and no way for an argument to become a shell operator:
 
 ```bash
 # Runs a program whose name contains a semicolon. It does not run two commands.
-kobe sandbox exec sbx-7f3a -- ./weird;name
+kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c -- './weird;name'
 ```
 
 If you need a shell, ask for one explicitly — then its quoting is yours to
 reason about:
 
 ```bash
-kobe sandbox exec sbx-7f3a -- /bin/sh -lc 'a && b'
+kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c -- /bin/sh -lc 'a && b'
 ```
 
 ## `kobe sandbox logs`
@@ -86,7 +100,7 @@ kobe sandbox exec sbx-7f3a -- /bin/sh -lc 'a && b'
 A bounded tail of the sandbox's own output.
 
 ```bash
-kobe sandbox logs sbx-7f3a --tail 500
+kobe sandbox logs sandbox-a1b2c3d4e5f60718293a4b5c --tail 500
 ```
 
 The tail is capped server-side. Asking for more than the cap returns the cap
@@ -96,21 +110,21 @@ Pass an execution id to recover its retained stdout and stderr after a
 disconnect:
 
 ```bash
-kobe sandbox logs sbx-7f3a --execution sbxe-91c4
-kobe sandbox logs sbx-7f3a --execution sbxe-91c4 --follow
+kobe sandbox logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
+kobe sandbox logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4 --follow
 ```
 
 Follow mode resumes stdout and stderr from separate offsets and stops only
 after the execution is terminal and both returned windows are drained. Text
-mode writes bytes back to their original streams. With `--output json`, follow
-mode emits one compact, versioned object per line (NDJSON); each object carries
-`state`, `stdout`, and `stderr` windows with `nextOffset`, `more`, and
+mode writes each returned string to its original stream. With `--output json`,
+follow mode emits one compact, versioned object per line (NDJSON); each object
+carries `state`, `stdout`, and `stderr` windows with `nextOffset`, `more`, and
 `truncated`.
 
 ## `kobe sandbox cancel`
 
 ```bash
-kobe sandbox cancel sbx-7f3a --execution sbxe-91c4
+kobe sandbox cancel sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
 ```
 
 Reports the state that **actually** applies. An execution that had already
@@ -128,8 +142,8 @@ code=$?
 
 echo "$result" | jq -r '.stdout'
 echo "$result" | jq -r '.exitCode'
-echo "$result" | jq -e '.cleanup.released // true' >/dev/null \
-  || echo "warning: the sandbox lease leaked"
+echo "$result" | jq -e '.cleanup == null or .cleanup.released == true' >/dev/null \
+  || echo "warning: sandbox release was not confirmed"
 ```
 
 Check `.cleanup` even when `$code` is `0`: command and release outcomes are
@@ -138,12 +152,31 @@ independent by design.
 `stdout` and `stderr` are always separate fields. A consumer that cannot tell
 a tool's diagnostics from its output cannot reliably parse either.
 
+For `sandbox run`, JSON mode always emits exactly one
+`kobe.sandbox/v1` envelope to stdout, including client and command-line syntax
+errors. Human diagnostics are not mixed into stderr. JSON mode is also
+non-interactive: it never opens an OIDC browser login or asks whether to trust
+an SSH audience. Run `kobe login` or establish SSH trust in text mode first.
+
+The envelope always contains `apiVersion`, `outcome`, `lease`, `execution`,
+`state`, `exitCode`, `processExitCode`, `stdout`, `stderr`, `truncated`,
+`signal`, `error`, and `cleanup`; unavailable values are `null` rather than
+omitted. `outcome` is one of `clientError`, `createError`, `timeout`,
+`disconnect`, `executionError`, `executionFailure`, `signal`, `cancelled`,
+`success`, or `nonzero`. `exitCode` is only an observed remote exit code;
+`processExitCode` is what the local `kobe` process returns. `cleanup` is `null`
+when no create could have committed or a create was definitely rejected.
+Otherwise it is an object whose `released`, `phase`, and `error` fields are
+always present.
+
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | *0–255 from your command* | The remote command ran and exited with this code |
-| `125` | **Kobe** failed — the command may not have run at all |
+| `2` | Command-line syntax was invalid |
+| `125` | **Kobe** failed, or the execution ended without a remote exit code |
+| `130` / `143` | `run` caught SIGINT / SIGTERM on Unix |
 
 `125` is the convention `docker run` and `env` already use for "the tool
 failed, not your command", so a script that already handles it needs no new
@@ -152,19 +185,22 @@ knowledge. It is reported when an execution ends without an exit code:
 
 ### Retries are safe
 
-Every invocation carries an idempotency key. If your client retries after a
-disconnect, the retry finds the original execution rather than starting a
-second one — which matters most for the commands you would least like to run
-twice.
+Every create and execution carries an idempotency key. A create response lost
+after headers is recovered from its `Location` without another POST. If both
+headers and body are lost, the CLI sends the same keyed create at most once
+more, then polls the deterministic lease handle through the server's bounded
+settlement window. A temporary `404` during that window is not treated as
+proof that the first request cannot still commit. The same settlement happens
+before cleanup after a server failure that may have followed parent creation.
+The server returns the one existing lease instead of starting another.
 
-The CLI retries one transport or response-body failure automatically, using
-the same request and idempotency key with fresh authorization. It never
-retries an HTTP error response.
+Execution and log reads retry one transport or response-body failure using the
+same execution key or stream offsets and fresh authorization. HTTP error
+responses are terminal; authorization failures are never retried.
 
 An `Unknown` state means Kobe could not establish what happened: the command
-may have run. It is deliberately **not** reported as a failure, because a
-failure invites an automatic retry of something that may already have had
-effects. Deciding what to do is yours.
+may have run, so an automatic retry may repeat its effects. Deciding what to do
+is yours.
 
 ## `kobe sandbox attach`
 
@@ -208,6 +244,11 @@ The listener binds `127.0.0.1` unless you pass `--bind`. A forward reachable
 from the network turns "a port on my machine" into "a port on the office LAN",
 and the sandbox behind it is yours alone.
 
+With `--output json`, the listener and per-connection failures are flushed as
+versioned NDJSON events on stdout; authentication is non-interactive and no
+human diagnostics are written to stderr. `sandbox attach` is interactive and
+therefore rejects JSON mode with a structured client error.
+
 One connection is forwarded at a time. Each local connection needs its own
 upstream stream, and those count against your lease's concurrency limit — a
 browser opening six sockets would exhaust it, and the failures would look like
@@ -239,7 +280,7 @@ out from its side effects.
 Released, expired and quarantined sandboxes do not count, so reusing an alias
 after releasing works the way you would expect.
 
-Anything starting with `sbx-` is treated as a lease id, never an alias. That
+Anything starting with `sandbox-` is treated as a lease id, never an alias. That
 is deliberate: falling back from one to the other would let a request for a
 just-expired lease silently reach a *different* sandbox that happens to use
 that name as an alias.
