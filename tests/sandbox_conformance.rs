@@ -596,6 +596,100 @@ both_placements!(
 );
 
 both_placements!(
+    detached_logs_resume_and_cancel_stops_the_process,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
+        sandbox.wait_ready(Duration::from_secs(300)).await?;
+
+        let (status, created) = sandbox
+            .api
+            .json(
+                reqwest::Method::POST,
+                &format!("/v1/sandbox-leases/{}/executions", sandbox.id),
+                Some(serde_json::json!({
+                    "command": [
+                        "/bin/sh",
+                        "-c",
+                        "echo detached-started; while :; do echo tick; sleep 1; done",
+                    ],
+                    "idempotencyKey": "conformance-detached-cancel",
+                    "detach": true,
+                    "timeout": "5m",
+                })),
+            )
+            .await?;
+        anyhow::ensure!(
+            status == reqwest::StatusCode::ACCEPTED,
+            "detached execution was not accepted: HTTP {status} {created}"
+        );
+        let execution = created["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("detached execution returned no id: {created}"))?;
+        let execution_path = format!("/v1/sandbox-leases/{}/executions/{execution}", sandbox.id);
+
+        // Output is addressed independently of the create response. Polling
+        // from offset zero must recover the bytes produced before this client
+        // attached, which is the reconnect contract detached mode exists for.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (status, logs) = sandbox
+                .api
+                .json(
+                    reqwest::Method::GET,
+                    &format!("{execution_path}/logs?stdoutOffset=0&stderrOffset=0"),
+                    None,
+                )
+                .await?;
+            anyhow::ensure!(status.is_success(), "could not read logs: {logs}");
+            if logs["stdout"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("detached-started")
+            {
+                anyhow::ensure!(
+                    logs["stdout"]["nextOffset"].as_u64().unwrap_or_default() > 0,
+                    "a non-empty log window did not advance its offset: {logs}"
+                );
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "detached output never became readable"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        let (status, cancelled) = sandbox
+            .api
+            .json(reqwest::Method::DELETE, &execution_path, None)
+            .await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "execution cancellation failed: HTTP {status} {cancelled}"
+        );
+        anyhow::ensure!(
+            cancelled["id"] == execution && cancelled["state"] == "Cancelled",
+            "cancellation did not terminate the exact execution: {cancelled}"
+        );
+
+        // Cancellation is durable, not merely the DELETE response. A fresh
+        // GET must report the same terminal state and never rediscover a
+        // running process after the request that signalled it has returned.
+        let (status, observed) = sandbox
+            .api
+            .json(reqwest::Method::GET, &execution_path, None)
+            .await?;
+        anyhow::ensure!(status.is_success(), "cancelled record vanished: {observed}");
+        anyhow::ensure!(
+            observed["state"] == "Cancelled",
+            "cancelled execution did not stay terminal: {observed}"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
     another_identity_can_neither_see_nor_use_the_lease,
     |placement| async move {
         let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
