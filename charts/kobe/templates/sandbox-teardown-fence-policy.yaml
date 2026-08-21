@@ -1,0 +1,74 @@
+{{- if ne .Values.agentSandbox.mode "disabled" }}
+{{- $policyName := include "kobe.sandboxTeardownFencePolicyName" . -}}
+# Each active teardown fence is an immutable, finalizer-held ConfigMap in the
+# target namespace. Its data keys are exact controller-owner UIDs that may no
+# longer create descendants. The binding evaluates this policy once for every
+# selected fence in the request namespace, so any matching UID denies CREATE.
+#
+# This is the admission half of the teardown barrier. The controller must also
+# wait for the upstream same-key acknowledgement after installing a fence;
+# otherwise a request admitted before the fence could still land afterwards.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $policyName }}
+  annotations:
+    # A chart uninstall or External -> Disabled transition must not remove the
+    # admission half of a barrier while finalizer-held fence parameters exist.
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["agents.x-k8s.io"]
+        apiVersions: ["v1beta1"]
+        resources: ["sandboxes"]
+        operations: ["CREATE"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods", "services", "persistentvolumeclaims"]
+        operations: ["CREATE"]
+  matchConditions:
+    - name: controller-owned-descendant
+      expression: >-
+        has(object.metadata.ownerReferences) &&
+        object.metadata.ownerReferences.exists(owner,
+          has(owner.controller) && owner.controller == true)
+  validations:
+    - expression: 'has(params.data) && size(params.data) > 0'
+      message: "a Sandbox teardown fence must contain at least one blocked owner UID"
+      reason: Invalid
+    - expression: >-
+        !object.metadata.ownerReferences.exists(owner,
+          has(owner.controller) && owner.controller == true &&
+          string(owner.uid) in params.data)
+      message: "Sandbox teardown has fenced descendant creation for this controller owner UID"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $policyName }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $policyName }}
+  paramRef:
+    # Kubernetes authorizes the identity that creates this binding to list the
+    # ConfigMap parameter kind. Admission evaluation itself reads through the
+    # API-server informer; Agent Sandbox controllers need no ConfigMap access.
+    selector:
+      matchLabels:
+        kobe.kunobi.ninja/sandbox-teardown-fence: "true"
+    # No active fence is the normal steady state. Once a fence is checkpointed
+    # the controller validates its exact UID and proves denial with dry-run.
+    parameterNotFoundAction: Allow
+  validationActions: [Deny]
+{{- end }}

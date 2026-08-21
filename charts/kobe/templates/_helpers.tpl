@@ -71,6 +71,17 @@ old tokens and reset admission capacity.
 {{- end }}
 
 {{/*
+Cluster-scoped admission policy that consumes namespaced, immutable teardown
+fence ConfigMaps. Include the release namespace in the hash so two Helm
+releases with the same name cannot collide.
+*/}}
+{{- define "kobe.sandboxTeardownFencePolicyName" -}}
+{{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $prefix := printf "%s-sandbox-teardown-fence" .Release.Name | trunc 50 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix ($identity | sha256sum | trunc 12) -}}
+{{- end }}
+
+{{/*
 kobe-sync sidecar image reference.
 */}}
 {{- define "kobe.syncImage" -}}

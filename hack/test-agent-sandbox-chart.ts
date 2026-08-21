@@ -62,6 +62,12 @@ function metadata(document: Record<string, unknown>): Record<string, unknown> {
 	return (document.metadata ?? {}) as Record<string, unknown>;
 }
 
+function annotations(
+	document: Record<string, unknown>,
+): Record<string, unknown> {
+	return (metadata(document).annotations ?? {}) as Record<string, unknown>;
+}
+
 function objectNamed(
 	documents: Record<string, unknown>[],
 	kind: string,
@@ -70,6 +76,17 @@ function objectNamed(
 	return documents.find(
 		(document) => document.kind === kind && metadata(document).name === name,
 	);
+}
+
+function teardownFencePolicy(
+	documents: Record<string, unknown>[],
+): Record<string, unknown> | undefined {
+	return documents.find((document) => {
+		if (document.kind !== "ValidatingAdmissionPolicy") return false;
+		const spec = (document.spec ?? {}) as Record<string, unknown>;
+		const paramKind = (spec.paramKind ?? {}) as Record<string, unknown>;
+		return paramKind.apiVersion === "v1" && paramKind.kind === "ConfigMap";
+	});
 }
 
 function collectImages(value: unknown, images: string[] = []): string[] {
@@ -98,6 +115,83 @@ const [disabledYaml, managedYaml, externalYaml] = await Promise.all([
 const disabled = parseDocuments(disabledYaml);
 const managed = parseDocuments(managedYaml);
 const external = parseDocuments(externalYaml);
+
+invariant(
+	!teardownFencePolicy(disabled),
+	"disabled rendered the Sandbox teardown admission fence",
+);
+for (const [mode, documents] of [
+	["managed", managed],
+	["external", external],
+] as const) {
+	const policy = teardownFencePolicy(documents);
+	invariant(policy, `${mode} omitted the Sandbox teardown admission fence`);
+	invariant(
+		annotations(policy)["helm.sh/resource-policy"] === "keep",
+		`${mode} teardown fence policy is not retained across uninstall`,
+	);
+	const policyName = String(metadata(policy).name);
+	const spec = policy.spec as Record<string, unknown>;
+	const constraints = spec.matchConstraints as Record<string, unknown>;
+	const rules = constraints.resourceRules as Record<string, unknown>[];
+	invariant(
+		rules.some(
+			(rule) =>
+				Array.isArray(rule.apiGroups) &&
+				rule.apiGroups.includes("agents.x-k8s.io") &&
+				Array.isArray(rule.resources) &&
+				rule.resources.includes("sandboxes"),
+		),
+		`${mode} fence does not cover Sandbox CREATE`,
+	);
+	invariant(
+		rules.some(
+			(rule) =>
+				Array.isArray(rule.apiGroups) &&
+				rule.apiGroups.includes("") &&
+				Array.isArray(rule.resources) &&
+				["pods", "services", "persistentvolumeclaims"].every((resource) =>
+					rule.resources.includes(resource),
+				),
+		),
+		`${mode} fence does not cover every Sandbox descendant`,
+	);
+	const validations = spec.validations as Record<string, unknown>[];
+	invariant(
+		validations.some((validation) =>
+			String(validation.expression).includes(
+				"string(owner.uid) in params.data",
+			),
+		),
+		`${mode} fence is not keyed by exact controller-owner UID`,
+	);
+	const binding = objectNamed(
+		documents,
+		"ValidatingAdmissionPolicyBinding",
+		policyName,
+	);
+	invariant(binding, `${mode} omitted the teardown-fence binding`);
+	invariant(
+		annotations(binding)["helm.sh/resource-policy"] === "keep",
+		`${mode} teardown fence binding is not retained across uninstall`,
+	);
+	const bindingSpec = binding.spec as Record<string, unknown>;
+	const paramRef = bindingSpec.paramRef as Record<string, unknown>;
+	invariant(
+		paramRef.namespace === undefined,
+		`${mode} fence is not scoped to each admitted object's namespace`,
+	);
+	invariant(
+		paramRef.parameterNotFoundAction === "Allow",
+		`${mode} fence would block steady-state creation without a parameter`,
+	);
+	const selector = paramRef.selector as Record<string, unknown>;
+	const matchLabels = selector.matchLabels as Record<string, unknown>;
+	invariant(
+		matchLabels["kobe.kunobi.ninja/sandbox-teardown-fence"] === "true",
+		`${mode} binding does not select exact teardown fences`,
+	);
+}
 
 for (const [mode, documents] of [
 	["disabled", disabled],

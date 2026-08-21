@@ -24,6 +24,11 @@ const policyCanaryName = "kobe-ledger-policy-enforcement-canary";
 const policyCanaryMessage =
 	"Sandbox ledger admission-policy enforcement canary";
 const quotaCanaryName = "kobe-ledger-quota-enforcement-canary";
+const teardownFencePolicy = `${namespace}-teardown-fence`;
+const teardownFenceLabel = "kobe.kunobi.ninja/sandbox-teardown-fence";
+const teardownFenceMessage =
+	"Sandbox teardown has fenced descendant creation for this controller owner UID";
+const blockedOwnerUid = "11111111-1111-4111-8111-111111111111";
 
 type CommandResult = {
 	stdout: string;
@@ -110,6 +115,228 @@ function configMap(name: string): string {
 		kind: "ConfigMap",
 		metadata: { name, namespace: ledgerNamespace },
 	});
+}
+
+function ownedPod(name: string, ownerUid: string): string {
+	return JSON.stringify({
+		apiVersion: "v1",
+		kind: "Pod",
+		metadata: {
+			name,
+			namespace,
+			ownerReferences: [
+				{
+					apiVersion: "v1",
+					kind: "ConfigMap",
+					name: "upstream-owner",
+					uid: ownerUid,
+					controller: true,
+					blockOwnerDeletion: true,
+				},
+			],
+		},
+		spec: {
+			restartPolicy: "Never",
+			containers: [{ name: "sandbox", image: "registry.k8s.io/pause:3.10" }],
+		},
+	});
+}
+
+async function waitForTeardownFencePolicy(): Promise<void> {
+	const deadline = Date.now() + 60_000;
+	while (Date.now() < deadline) {
+		const policy = JSON.parse(
+			(
+				await kubectl([
+					"get",
+					"validatingadmissionpolicy",
+					teardownFencePolicy,
+					"-o",
+					"json",
+				])
+			).stdout,
+		);
+		const warnings = policy.status?.typeChecking?.expressionWarnings;
+		if (Array.isArray(warnings) && warnings.length > 0) {
+			throw new Error(
+				`teardown fence policy type-check warnings: ${JSON.stringify(warnings)}`,
+			);
+		}
+		if (
+			policy.status?.observedGeneration === policy.metadata?.generation &&
+			policy.status?.typeChecking !== undefined
+		) {
+			const probe = await kubectl(
+				["create", "-f", "-", "--validate=false", "--dry-run=server"],
+				{
+					stdin: ownedPod("blocked-descendant", blockedOwnerUid),
+					allowFailure: true,
+				},
+			);
+			if (probe.stderr.includes(teardownFenceMessage)) return;
+		}
+		await Bun.sleep(500);
+	}
+	throw new Error("Sandbox teardown fence policy did not become active");
+}
+
+async function testTeardownAdmissionFence(): Promise<void> {
+	const controls = `
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tenant
+  namespace: ${namespace}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: teardown-fence-probe
+  namespace: ${namespace}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: teardown-fence-probe
+  namespace: ${namespace}
+subjects:
+  - kind: ServiceAccount
+    name: tenant
+    namespace: ${namespace}
+roleRef:
+  kind: Role
+  name: teardown-fence-probe
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ${teardownFencePolicy}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["agents.x-k8s.io"]
+        apiVersions: ["v1beta1"]
+        resources: ["sandboxes"]
+        operations: ["CREATE"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods", "services", "persistentvolumeclaims"]
+        operations: ["CREATE"]
+  matchConditions:
+    - name: controller-owned-descendant
+      expression: >-
+        has(object.metadata.ownerReferences) &&
+        object.metadata.ownerReferences.exists(owner,
+          has(owner.controller) && owner.controller == true)
+  validations:
+    - expression: 'has(params.data) && size(params.data) > 0'
+      message: a Sandbox teardown fence must contain at least one blocked owner UID
+      reason: Invalid
+    - expression: >-
+        !object.metadata.ownerReferences.exists(owner,
+          has(owner.controller) && owner.controller == true &&
+          string(owner.uid) in params.data)
+      message: ${teardownFenceMessage}
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ${teardownFencePolicy}
+spec:
+  policyName: ${teardownFencePolicy}
+  paramRef:
+    selector:
+      matchLabels:
+        ${teardownFenceLabel}: "true"
+    parameterNotFoundAction: Allow
+  validationActions: [Deny]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blocked-owner-uids
+  namespace: ${namespace}
+  labels:
+    ${teardownFenceLabel}: "true"
+  finalizers:
+    - kobe.kunobi.ninja/sandbox-teardown-fence
+immutable: true
+data:
+  ${blockedOwnerUid}: blocked
+`;
+	await kubectl(["apply", "-f", "-"], { stdin: controls });
+	await waitForTeardownFencePolicy();
+
+	// Parameter authorization is checked when the binding is created. The
+	// admission caller itself deliberately has Pod CREATE but no ConfigMap read.
+	const hiddenParameter = await kubectlAs(
+		tenantUsername,
+		["get", "configmap", "blocked-owner-uids", "-n", namespace],
+		true,
+	);
+	assert(
+		hiddenParameter.exitCode !== 0 &&
+			hiddenParameter.stderr.toLowerCase().includes("forbidden"),
+		"teardown-fence probe identity unexpectedly reads policy parameters",
+	);
+	const denied = await runCommand(
+		[
+			"kubectl",
+			"--context",
+			context,
+			`--as=${tenantUsername}`,
+			"create",
+			"-f",
+			"-",
+			"--validate=false",
+			"--dry-run=server",
+		],
+		{
+			stdin: ownedPod("blocked-descendant", blockedOwnerUid),
+			allowFailure: true,
+		},
+	);
+	assert(denied.exitCode !== 0, "blocked owner created a descendant");
+	assert(
+		denied.stderr.includes(teardownFenceMessage),
+		`blocked descendant failed for an unexpected reason: ${denied.stderr}`,
+	);
+
+	const allowed = await runCommand(
+		[
+			"kubectl",
+			"--context",
+			context,
+			`--as=${tenantUsername}`,
+			"create",
+			"-f",
+			"-",
+			"--validate=false",
+			"--dry-run=server",
+		],
+		{
+			stdin: ownedPod(
+				"unrelated-descendant",
+				"22222222-2222-4222-8222-222222222222",
+			),
+			allowFailure: true,
+		},
+	);
+	assert(
+		allowed.exitCode === 0,
+		`unrelated controller owner was fenced: ${allowed.stderr}`,
+	);
+	info("exact owner UID admission fence denies stale descendants only");
 }
 
 async function waitForAdmissionLedgerControls(): Promise<void> {
@@ -853,10 +1080,15 @@ async function testAdmissionCancellationCas(): Promise<void> {
 	const name = "cancellation-wins-cas";
 	const pending = await createLease(name);
 
-	await patchLease(name, pending.metadata.uid, pending.metadata.resourceVersion, [
-		{ op: "test", path: admissionPath, value: "pending" },
-		{ op: "replace", path: admissionPath, value: "cancelled" },
-	]);
+	await patchLease(
+		name,
+		pending.metadata.uid,
+		pending.metadata.resourceVersion,
+		[
+			{ op: "test", path: admissionPath, value: "pending" },
+			{ op: "replace", path: admissionPath, value: "cancelled" },
+		],
+	);
 	let current = await getLease(name);
 	assert(
 		current.metadata.annotations?.["kobe.kunobi.ninja/sandbox-admission"] ===
@@ -930,8 +1162,40 @@ try {
 	await testJsonPatchFences();
 	await testAdmissionCancellationCas();
 	await testAdmissionLedgerBoundary();
+	await testTeardownAdmissionFence();
 	console.log("SandboxLease API-server contract passed");
 } finally {
+	await kubectl(
+		[
+			"delete",
+			"validatingadmissionpolicybinding",
+			teardownFencePolicy,
+			"--ignore-not-found",
+		],
+		{ allowFailure: true },
+	);
+	await kubectl(
+		[
+			"delete",
+			"validatingadmissionpolicy",
+			teardownFencePolicy,
+			"--ignore-not-found",
+		],
+		{ allowFailure: true },
+	);
+	await kubectl(
+		[
+			"patch",
+			"configmap",
+			"blocked-owner-uids",
+			"-n",
+			namespace,
+			"--type=json",
+			"-p",
+			'[{"op":"remove","path":"/metadata/finalizers"}]',
+		],
+		{ allowFailure: true },
+	);
 	await kubectl(
 		[
 			"delete",
