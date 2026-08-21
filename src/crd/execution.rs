@@ -36,9 +36,13 @@ use serde::{Deserialize, Serialize};
 
 /// One command's durable record.
 ///
-/// Owner-referenced to its `SandboxLease`, so it cannot outlive the lease it
-/// belongs to: #82 requires history to end with the Sandbox, and an execution
-/// record that survived would describe a workload nobody can inspect.
+/// Current records are deliberately **not** owner-referenced to their
+/// `SandboxLease`. A foreground delete could garbage-collect an owner-referenced
+/// record before Kobe had cancelled its process group, erasing the only durable
+/// evidence that teardown still had work to do. Instead every record carries a
+/// cleanup finalizer and exact lease identity; the lease controller removes the
+/// record explicitly before it releases workload or capacity. History still
+/// ends with the Sandbox, but never ahead of process termination.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, KubeSchema, PartialEq, Eq)]
 #[kube(
     group = "kobe.kunobi.ninja",
@@ -48,12 +52,21 @@ use serde::{Deserialize, Serialize};
     shortname = "sbxe",
     status = "SandboxExecutionStatus",
     namespaced,
+    validation = kube::core::Rule::new("self.spec == oldSelf.spec")
+        .message("SandboxExecution spec is immutable"),
     printcolumn = r#"{"name":"State","type":"string","jsonPath":".status.state"}"#,
     printcolumn = r#"{"name":"Exit","type":"integer","jsonPath":".status.exitCode"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxExecutionSpec {
+    /// The lease's API name. Optional only for records written by an older
+    /// Kobe; current records persist name and UID together so background
+    /// reconciliation never has to discover a parent from mutable labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 253))]
+    pub lease_name: Option<String>,
+
     /// The lease this ran under, by UID. An execution never outlives its exact
     /// lease: a same-named successor is a different Sandbox, and answering its
     /// caller with this record would describe somebody else's command.
@@ -92,6 +105,32 @@ pub struct SandboxExecutionSpec {
     /// runner-managed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_managed: Option<bool>,
+
+    /// Exact runner address captured before the command can start.
+    ///
+    /// Pool configuration is pinned by generation at admission, but it may be
+    /// unavailable during release. Persisting this non-secret address lets
+    /// teardown cancel the same runner/Pod without trusting a replacement pool
+    /// or re-deriving a target from mutable names. Optional only for legacy
+    /// records; every current runner-managed execution requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SandboxExecutionTarget>,
+}
+
+/// Immutable, non-secret address of the runner that owns one execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxExecutionTarget {
+    #[schemars(length(min = 1, max = 253))]
+    pub namespace: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub pod_name: String,
+    #[schemars(length(min = 1))]
+    pub pod_uid: String,
+    #[schemars(length(min = 1, max = 63))]
+    pub container: String,
+    #[schemars(length(min = 1, max = 255), pattern(r"^/[A-Za-z0-9._/-]*$"))]
+    pub runner_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
@@ -268,24 +307,32 @@ pub fn state_for_exit_code(exit_code: i32) -> ExecutionState {
 /// different command wearing the first one's name, and returning the first
 /// one's result would be a wrong answer rather than a cached one.
 #[allow(dead_code)]
-pub fn request_digest(argv: &[String], cwd: Option<&str>, timeout: &str, detached: bool) -> String {
-    request_digest_with_mode(argv, cwd, timeout, Some(detached))
+pub fn request_digest(
+    argv: &[String],
+    cwd: Option<&str>,
+    timeout: &str,
+    container: &str,
+    detached: bool,
+) -> String {
+    request_digest_with_mode(argv, cwd, timeout, Some(container), Some(detached))
 }
 
-/// Digest emitted before lifecycle mode became part of the request identity.
+/// Digest emitted before resolved container and lifecycle mode became part of
+/// the request identity.
 ///
 /// Kept only to recognise exact live records across a rolling upgrade. New
 /// reservations always use [`request_digest`], and callers must also match the
 /// legacy record's explicit `detached` field before this digest is accepted.
 #[allow(dead_code)]
 pub fn legacy_request_digest(argv: &[String], cwd: Option<&str>, timeout: &str) -> String {
-    request_digest_with_mode(argv, cwd, timeout, None)
+    request_digest_with_mode(argv, cwd, timeout, None, None)
 }
 
 fn request_digest_with_mode(
     argv: &[String],
     cwd: Option<&str>,
     timeout: &str,
+    container: Option<&str>,
     detached: Option<bool>,
 ) -> String {
     use sha2::{Digest, Sha256};
@@ -309,6 +356,13 @@ fn request_digest_with_mode(
     }
     hasher.update((timeout.len() as u64).to_be_bytes());
     hasher.update(timeout.as_bytes());
+    if let Some(container) = container {
+        // Container selection changes where the command runs. Hash the
+        // resolved container rather than the optional request field so an
+        // omitted default and the same explicit default remain one request.
+        hasher.update((container.len() as u64).to_be_bytes());
+        hasher.update(container.as_bytes());
+    }
     if let Some(detached) = detached {
         // Wait and detached mode have different lifecycle semantics. Treating
         // them as one request could return a wait-mode record to a caller that
@@ -379,9 +433,11 @@ pub fn execution_name(lease_uid: &str, idempotency_key: &str) -> String {
 mod tests {
     use super::*;
     use ExecutionState::*;
+    use kube::CustomResourceExt;
 
     fn spec(lease_uid: &str, digest: &str) -> SandboxExecutionSpec {
         SandboxExecutionSpec {
+            lease_name: None,
             lease_uid: lease_uid.into(),
             pod_uid: "pod-uid".into(),
             idempotency_key: "key-1".into(),
@@ -389,6 +445,7 @@ mod tests {
             timeout: "60s".into(),
             detached: false,
             runner_managed: None,
+            target: None,
         }
     }
 
@@ -524,6 +581,28 @@ mod tests {
         assert_eq!(encoded["detached"], false);
     }
 
+    /// Target and parent provenance are additive for stored legacy records,
+    /// but once a record exists its complete spec cannot be redirected to a
+    /// replacement Pod or runner.
+    #[test]
+    fn execution_schema_keeps_legacy_fields_optional_and_makes_spec_immutable() {
+        let crd = serde_json::to_value(SandboxExecution::crd()).unwrap();
+        let root = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let validations = root["x-kubernetes-validations"].as_array().unwrap();
+        assert!(validations.iter().any(|rule| {
+            rule["rule"] == "self.spec == oldSelf.spec"
+                && rule["message"] == "SandboxExecution spec is immutable"
+        }));
+        let spec = &root["properties"]["spec"];
+        let required = spec["required"].as_array().unwrap();
+        assert!(!required.iter().any(|field| field == "leaseName"));
+        assert!(!required.iter().any(|field| field == "target"));
+        assert_eq!(
+            spec["properties"]["target"]["properties"]["runnerPath"]["pattern"],
+            "^/[A-Za-z0-9._/-]*$"
+        );
+    }
+
     /// The digest covers everything that changes what runs, unambiguously.
     ///
     /// Length-prefixing matters: without it `["a","bc"]` and `["ab","c"]`
@@ -531,27 +610,45 @@ mod tests {
     /// under a key whose first use they already got a result for.
     #[test]
     fn the_request_digest_cannot_be_made_to_collide() {
-        let base = request_digest(&["/agent".into(), "run".into()], None, "60s", false);
+        let base = request_digest(
+            &["/agent".into(), "run".into()],
+            None,
+            "60s",
+            "workspace",
+            false,
+        );
 
         assert_eq!(
             base,
-            request_digest(&["/agent".into(), "run".into()], None, "60s", false),
+            request_digest(
+                &["/agent".into(), "run".into()],
+                None,
+                "60s",
+                "workspace",
+                false,
+            ),
             "the same request must digest identically"
         );
 
         // Argument boundaries.
         assert_ne!(
             base,
-            request_digest(&["/agentrun".into()], None, "60s", false)
+            request_digest(&["/agentrun".into()], None, "60s", "workspace", false)
         );
         assert_ne!(
-            request_digest(&["a".into(), "bc".into()], None, "60s", false),
-            request_digest(&["ab".into(), "c".into()], None, "60s", false)
+            request_digest(&["a".into(), "bc".into()], None, "60s", "workspace", false,),
+            request_digest(&["ab".into(), "c".into()], None, "60s", "workspace", false,)
         );
         // Order.
         assert_ne!(
             base,
-            request_digest(&["run".into(), "/agent".into()], None, "60s", false)
+            request_digest(
+                &["run".into(), "/agent".into()],
+                None,
+                "60s",
+                "workspace",
+                false,
+            )
         );
         // Working directory, including present-but-empty versus absent.
         assert_ne!(
@@ -560,24 +657,54 @@ mod tests {
                 &["/agent".into(), "run".into()],
                 Some("/work"),
                 "60s",
+                "workspace",
                 false
             )
         );
         assert_ne!(
             base,
-            request_digest(&["/agent".into(), "run".into()], Some(""), "60s", false)
+            request_digest(
+                &["/agent".into(), "run".into()],
+                Some(""),
+                "60s",
+                "workspace",
+                false,
+            )
         );
         // Timeout: the same command with a different bound is a different
         // request, because its outcome can differ.
         assert_ne!(
             base,
-            request_digest(&["/agent".into(), "run".into()], None, "600s", false)
+            request_digest(
+                &["/agent".into(), "run".into()],
+                None,
+                "600s",
+                "workspace",
+                false,
+            )
+        );
+        // The resolved container is part of where the command runs.
+        assert_ne!(
+            base,
+            request_digest(
+                &["/agent".into(), "run".into()],
+                None,
+                "60s",
+                "sidecar",
+                false,
+            )
         );
         // Lifecycle mode is part of the request. Returning a wait-mode result
         // for a detached retry would silently remove its reconnectability.
         assert_ne!(
             base,
-            request_digest(&["/agent".into(), "run".into()], None, "60s", true)
+            request_digest(
+                &["/agent".into(), "run".into()],
+                None,
+                "60s",
+                "workspace",
+                true,
+            )
         );
 
         assert_eq!(base.len(), 64);

@@ -61,9 +61,9 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxleases", "sandboxleases/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
-  # Durable execution records (#82). The reservation is a `create` on a derived
-  # name, which is what makes two concurrent retries of one idempotency key
-  # race for a single object instead of spawning twice.
+  # Durable execution records (#82). A bounded access-ledger CAS reserves
+  # capacity first; the derived-name CREATE and exact UID bind then ensure two
+  # concurrent retries cannot spawn the same idempotency key twice.
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxexecutions", "sandboxexecutions/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]

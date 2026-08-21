@@ -32,9 +32,13 @@ spec:
             description: |-
               One command's durable record.
 
-              Owner-referenced to its `SandboxLease`, so it cannot outlive the lease it
-              belongs to: #82 requires history to end with the Sandbox, and an execution
-              record that survived would describe a workload nobody can inspect.
+              Current records are deliberately **not** owner-referenced to their
+              `SandboxLease`. A foreground delete could garbage-collect an owner-referenced
+              record before Kobe had cancelled its process group, erasing the only durable
+              evidence that teardown still had work to do. Instead every record carries a
+              cleanup finalizer and exact lease identity; the lease controller removes the
+              record explicitly before it releases workload or capacity. History still
+              ends with the Sandbox, but never ahead of process termination.
             properties:
               detached:
                 default: false
@@ -46,6 +50,15 @@ spec:
                 description: Caller-supplied key. Two requests with this key are the same request.
                 maxLength: 253
                 minLength: 1
+                type: string
+              leaseName:
+                description: |-
+                  The lease's API name. Optional only for records written by an older
+                  Kobe; current records persist name and UID together so background
+                  reconciliation never has to discover a parent from mutable labels.
+                maxLength: 253
+                minLength: 1
+                nullable: true
                 type: string
               leaseUid:
                 description: |-
@@ -78,6 +91,44 @@ spec:
                   runner-managed.
                 nullable: true
                 type: boolean
+              target:
+                description: |-
+                  Exact runner address captured before the command can start.
+
+                  Pool configuration is pinned by generation at admission, but it may be
+                  unavailable during release. Persisting this non-secret address lets
+                  teardown cancel the same runner/Pod without trusting a replacement pool
+                  or re-deriving a target from mutable names. Optional only for legacy
+                  records; every current runner-managed execution requires it.
+                nullable: true
+                properties:
+                  container:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  namespace:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  podName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  podUid:
+                    minLength: 1
+                    type: string
+                  runnerPath:
+                    maxLength: 255
+                    minLength: 1
+                    pattern: ^/[A-Za-z0-9._/-]*$
+                    type: string
+                required:
+                - container
+                - namespace
+                - podName
+                - podUid
+                - runnerPath
+                type: object
               timeout:
                 description: Wall-clock bound the runner enforces.
                 minLength: 1
@@ -139,8 +190,11 @@ spec:
             type: object
         required:
         - spec
-        title: SandboxExecution
+        title: SandboxExecutionValidated
         type: object
+        x-kubernetes-validations:
+        - message: SandboxExecution spec is immutable
+          rule: self.spec == oldSelf.spec
     served: true
     storage: true
     subresources:

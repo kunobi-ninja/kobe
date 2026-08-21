@@ -38,8 +38,8 @@
 //! path records.
 
 use kobe_runner::protocol::{
-    Envelope, ExecutionReport, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES, MAX_RETENTION_BYTES,
-    PROTOCOL_VERSION, Reply, RunnerErrorCode, RunnerState, StartRequest,
+    Envelope, ExecutionReport, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES, PROTOCOL_VERSION, Reply,
+    RunnerErrorCode, RunnerState, StartRequest,
 };
 
 use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget, exec_capped};
@@ -211,7 +211,7 @@ pub fn start_request(
         // Rounded up, never down: a request for one and a half seconds that
         // became one would kill a command before its own bound elapsed.
         timeout_seconds: (timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0)).max(1),
-        max_output_bytes: MAX_RETENTION_BYTES,
+        max_output_bytes: crate::api::sandbox_executions::EXECUTION_OUTPUT_RETENTION_BYTES,
     }
 }
 
@@ -832,7 +832,10 @@ mod tests {
             None,
             std::time::Duration::from_secs(60),
         );
-        assert_eq!(request.max_output_bytes, MAX_RETENTION_BYTES);
-        assert!(request.max_output_bytes <= MAX_RETENTION_BYTES);
+        assert_eq!(
+            request.max_output_bytes,
+            crate::api::sandbox_executions::EXECUTION_OUTPUT_RETENTION_BYTES
+        );
+        assert!(request.max_output_bytes <= kobe_runner::protocol::MAX_RETENTION_BYTES);
     }
 }

@@ -42,6 +42,7 @@ const GATE_KIND: &str = "lease-gate";
 const PRINCIPAL_KIND: &str = "principal-ledger";
 const STATE_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-access-state";
 const ENTRIES_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-access-entries";
+const EXECUTIONS_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-executions";
 const PRINCIPAL_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-principal-hash";
 /// Exact API-server identity of the pre-admission access gate.
 pub const ACCESS_GATE_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-access-gate";
@@ -90,6 +91,102 @@ struct PrincipalEntry {
     lease_uid: String,
     gate_name: String,
     replica: ServingReplica,
+}
+
+/// Durable lifetime reservation for one idempotency key.
+///
+/// Written before the `SandboxExecution` CREATE. The name/digest pair is the
+/// authority that makes retrying that CREATE safe after a lost response, while
+/// `active` is the process-count slot that must be retired only after a terminal
+/// runner verdict. Entries remain until lease teardown, bounding retained
+/// history independently of how quickly commands finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutionEntry {
+    request_digest: String,
+    pod_uid: String,
+    reserved_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_uid: Option<String>,
+    active: bool,
+}
+
+/// Result of reserving one execution's lifetime and active-process slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionCapacity {
+    /// A new key consumed one lifetime and one active slot.
+    Reserved,
+    /// This exact key/digest already owns an active slot (lost response/retry).
+    ExistingActive {
+        execution_uid: Option<String>,
+    },
+    /// This exact key already settled; only its existing record may be read.
+    ExistingTerminal {
+        execution_uid: Option<String>,
+    },
+    LeaseClosed,
+    LimitReached,
+    Conflict,
+}
+
+fn reserve_execution_entry(
+    entries: &mut BTreeMap<String, ExecutionEntry>,
+    execution_name: &str,
+    request_digest: &str,
+    pod_uid: &str,
+    reserved_at: &str,
+) -> ExecutionCapacity {
+    if let Some(existing) = entries.get(execution_name) {
+        if existing.request_digest != request_digest || existing.pod_uid != pod_uid {
+            return ExecutionCapacity::Conflict;
+        }
+        return if existing.active {
+            ExecutionCapacity::ExistingActive {
+                execution_uid: existing.execution_uid.clone(),
+            }
+        } else {
+            ExecutionCapacity::ExistingTerminal {
+                execution_uid: existing.execution_uid.clone(),
+            }
+        };
+    }
+    let active = entries.values().filter(|entry| entry.active).count();
+    if entries.len() >= crate::api::sandbox_executions::MAX_EXECUTIONS_PER_LEASE
+        || active >= crate::api::sandbox_executions::MAX_ACTIVE_EXECUTIONS_PER_LEASE
+    {
+        return ExecutionCapacity::LimitReached;
+    }
+    entries.insert(
+        execution_name.to_string(),
+        ExecutionEntry {
+            request_digest: request_digest.to_string(),
+            pod_uid: pod_uid.to_string(),
+            reserved_at: reserved_at.to_string(),
+            execution_uid: None,
+            active: true,
+        },
+    );
+    ExecutionCapacity::Reserved
+}
+
+/// Read-only execution identity exposed to teardown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionManifestEntry {
+    pub name: String,
+    pub request_digest: String,
+    pub pod_uid: String,
+    pub reserved_at: String,
+    pub execution_uid: Option<String>,
+    pub active: bool,
+}
+
+fn execution_can_release_active_capacity(
+    state: crate::crd::ExecutionState,
+    started: bool,
+    process_absence_proven: bool,
+) -> bool {
+    state.is_terminal()
+        && (state != crate::crd::ExecutionState::Unknown || !started || process_absence_proven)
 }
 
 /// Immutable, non-secret handle persisted atomically with Sandbox admission.
@@ -257,6 +354,16 @@ where
     Ok(serde_json::from_str(encoded)?)
 }
 
+fn parse_execution_entries(
+    lease: &Lease,
+) -> Result<BTreeMap<String, ExecutionEntry>, AccessLedgerError> {
+    let encoded = lease
+        .annotations()
+        .get(EXECUTIONS_ANNOTATION)
+        .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+    Ok(serde_json::from_str(encoded)?)
+}
+
 fn lease_uid(lease: &Lease) -> Result<&str, AccessLedgerError> {
     lease
         .metadata
@@ -288,6 +395,7 @@ fn build_gate(namespace: &str, lease_name: &str, lease_uid: &str, state: &'stati
             annotations: Some(BTreeMap::from([
                 (STATE_ANNOTATION.into(), state.into()),
                 (ENTRIES_ANNOTATION.into(), "{}".into()),
+                (EXECUTIONS_ANNOTATION.into(), "{}".into()),
             ])),
             ..ObjectMeta::default()
         },
@@ -381,6 +489,11 @@ pub async fn prepare_open_gate(
     if !parse_entries::<GateEntry>(&gate)?.is_empty() {
         return Err(AccessLedgerError::Invalid(
             "pre-admission lease gate entries",
+        ));
+    }
+    if !parse_execution_entries(&gate)?.is_empty() {
+        return Err(AccessLedgerError::Invalid(
+            "pre-admission execution entries",
         ));
     }
     Ok(AccessGateReference {
@@ -487,6 +600,7 @@ pub async fn remove_pre_admission_gate(
     validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
     if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN)
         || !parse_entries::<GateEntry>(&gate)?.is_empty()
+        || !parse_execution_entries(&gate)?.is_empty()
     {
         return Err(AccessLedgerError::Invalid("pre-admission lease gate state"));
     }
@@ -547,11 +661,17 @@ fn validate_gate(
         return Err(AccessLedgerError::Invalid("lease gate provenance"));
     }
     let annotations = gate.annotations();
-    if annotations.len() != 2 || !annotations.contains_key(ENTRIES_ANNOTATION) {
+    if annotations.len() != 3
+        || !annotations.contains_key(ENTRIES_ANNOTATION)
+        || !annotations.contains_key(EXECUTIONS_ANNOTATION)
+    {
         return Err(AccessLedgerError::Invalid("lease gate annotations"));
     }
     match annotations.get(STATE_ANNOTATION).map(String::as_str) {
-        Some(OPEN | CLOSED) => Ok(()),
+        Some(OPEN | CLOSED) => {
+            parse_execution_entries(gate)?;
+            Ok(())
+        }
         _ => Err(AccessLedgerError::Invalid("lease gate state")),
     }
 }
@@ -662,6 +782,30 @@ async fn patch_entries_for_acquire<T: Serialize>(
         Ok(result) => Ok(result?),
         Err(error) => Err(AccessLedgerError::MutationTask(error)),
     }
+}
+
+async fn patch_execution_entries(
+    api: &Api<Lease>,
+    gate: &Lease,
+    previous: &str,
+    entries: &BTreeMap<String, ExecutionEntry>,
+) -> Result<Lease, AccessLedgerError> {
+    let next = serde_json::to_string(entries)?;
+    let patch = serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid(gate)? },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv(gate)? },
+        { "op": "test", "path": annotation_path(EXECUTIONS_ANNOTATION), "value": previous },
+        { "op": "replace", "path": annotation_path(EXECUTIONS_ANNOTATION), "value": next }
+    ]);
+    Ok(api
+        .patch(
+            &gate.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(
+                serde_json::from_value(patch).expect("valid execution-ledger patch"),
+            ),
+        )
+        .await?)
 }
 
 async fn add_gate_entry(
@@ -855,6 +999,344 @@ pub async fn acquire(
         return Ok(AccessAcquire::LimitReached);
     };
     Ok(AccessAcquire::Acquired(guard))
+}
+
+async fn exact_gate_for_lease(
+    api: &Api<Lease>,
+    lease: &SandboxLease,
+) -> Result<Lease, AccessLedgerError> {
+    let sandbox_name = lease.name_any();
+    let sandbox_uid = lease
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxLease UID"))?;
+    let expected = persisted_gate_reference(lease)?;
+    let gate = api.get(&expected.name).await?;
+    let ledger_namespace = api
+        .namespace()
+        .ok_or(AccessLedgerError::Invalid("ledger namespace"))?;
+    validate_gate(&gate, ledger_namespace, &sandbox_name, &sandbox_uid)?;
+    if lease_uid(&gate)? != expected.uid {
+        return Err(AccessLedgerError::Invalid("persisted access gate UID"));
+    }
+    Ok(gate)
+}
+
+/// Reserve one lifetime-history entry and one active process slot.
+///
+/// This CAS precedes the `SandboxExecution` CREATE. Retrying after an ambiguous
+/// CREATE is safe because the derived execution name and request digest are
+/// already durable here; a different request under the same name conflicts and
+/// no request can exceed either bound by racing another replica.
+pub async fn reserve_execution_capacity(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    execution_name: &str,
+    request_digest: &str,
+    pod_uid: &str,
+) -> Result<ExecutionCapacity, AccessLedgerError> {
+    if execution_name.is_empty() || request_digest.len() != 64 || pod_uid.is_empty() {
+        return Err(AccessLedgerError::Invalid("execution reservation identity"));
+    }
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN) {
+            return Ok(ExecutionCapacity::LeaseClosed);
+        }
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let outcome = reserve_execution_entry(
+            &mut entries,
+            execution_name,
+            request_digest,
+            pod_uid,
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        if outcome != ExecutionCapacity::Reserved {
+            return Ok(outcome);
+        }
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(ExecutionCapacity::Reserved),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Bind a reserved slot to the exact API-server UID before marking it Running.
+///
+/// A close racing this checkpoint wins through the shared gate
+/// resourceVersion. When close wins this returns `false`; the record remains
+/// Queued and teardown removes it, but no runner may be started.
+pub async fn bind_execution_capacity(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    execution: &crate::crd::SandboxExecution,
+) -> Result<bool, AccessLedgerError> {
+    let execution_uid = execution
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxExecution UID"))?;
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(OPEN) {
+            return Ok(false);
+        }
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let entry = entries
+            .get_mut(&execution.name_any())
+            .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
+        if !entry.active
+            || entry.request_digest != execution.spec.request_digest
+            || entry.pod_uid != execution.spec.pod_uid
+        {
+            return Err(AccessLedgerError::Invalid("execution reservation identity"));
+        }
+        match entry.execution_uid.as_deref() {
+            Some(uid) if uid == execution_uid => return Ok(true),
+            Some(_) => return Err(AccessLedgerError::Invalid("execution reservation UID")),
+            None => entry.execution_uid = Some(execution_uid.clone()),
+        }
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(true),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Retire one active slot only after its exact execution record is terminal.
+///
+/// The lifetime entry remains, so finishing quickly cannot bypass the
+/// per-Sandbox history/disk bound with a stream of new idempotency keys.
+/// `process_absence_proven` is reserved for teardown after an exact target
+/// destruction receipt; ordinary reapers must leave it false so an `Unknown`
+/// runner verdict cannot release capacity while a process may still exist.
+pub async fn complete_execution_capacity(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    execution: &crate::crd::SandboxExecution,
+    process_absence_proven: bool,
+) -> Result<(), AccessLedgerError> {
+    let state = execution
+        .status
+        .as_ref()
+        .map(|status| status.state)
+        .unwrap_or_default();
+    let started = execution
+        .status
+        .as_ref()
+        .and_then(|status| status.started_at.as_ref())
+        .is_some();
+    if !execution_can_release_active_capacity(state, started, process_absence_proven) {
+        return Err(AccessLedgerError::Invalid(
+            "execution process group is not proven terminal",
+        ));
+    }
+    let execution_uid = execution
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(AccessLedgerError::Invalid("SandboxExecution UID"))?;
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let entry = entries
+            .get_mut(&execution.name_any())
+            .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
+        if entry.request_digest != execution.spec.request_digest
+            || entry.pod_uid != execution.spec.pod_uid
+            || entry.execution_uid.as_deref() != Some(execution_uid.as_str())
+        {
+            return Err(AccessLedgerError::Invalid("execution reservation identity"));
+        }
+        if !entry.active {
+            return Ok(());
+        }
+        entry.active = false;
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(()),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Read the exact closed/open gate's durable execution manifest.
+pub async fn execution_manifest(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+) -> Result<Vec<ExecutionManifestEntry>, AccessLedgerError> {
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    let gate = exact_gate_for_lease(&api, lease).await?;
+    Ok(parse_execution_entries(&gate)?
+        .into_iter()
+        .map(|(name, entry)| ExecutionManifestEntry {
+            name,
+            request_digest: entry.request_digest,
+            pod_uid: entry.pod_uid,
+            reserved_at: entry.reserved_at,
+            execution_uid: entry.execution_uid,
+            active: entry.active,
+        })
+        .collect())
+}
+
+/// Retire an execution whose CREATE/bind checkpoint never completed.
+///
+/// The entry is fenced by the gate resourceVersion and may still have no CR,
+/// or an exact CR whose CREATE response was lost. In the latter case its UID is
+/// captured in the same CAS that closes the active slot. A concurrent bind
+/// either wins first (and this returns `false`) or sees `active=false` and can
+/// never start the runner afterward.
+pub async fn expire_unbound_execution(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    execution_name: &str,
+    expected_digest: &str,
+    expected_pod_uid: &str,
+    observed_execution_uid: Option<&str>,
+) -> Result<bool, AccessLedgerError> {
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let entry = entries
+            .get_mut(execution_name)
+            .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
+        if entry.request_digest != expected_digest || entry.pod_uid != expected_pod_uid {
+            return Err(AccessLedgerError::Invalid("execution reservation identity"));
+        }
+        if entry.execution_uid.is_some() {
+            return Ok(false);
+        }
+        if !entry.active && observed_execution_uid.is_none() {
+            return Ok(false);
+        }
+        if let Some(uid) = observed_execution_uid {
+            if uid.is_empty() {
+                return Err(AccessLedgerError::Invalid("SandboxExecution UID"));
+            }
+            entry.execution_uid = Some(uid.to_string());
+        }
+        entry.active = false;
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(true),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Retire a pre-CREATE reservation after the gate is closed.
+///
+/// Only an entry with no bound Kubernetes UID qualifies. Once closed, binding
+/// and spawning are impossible; a bound record disappearing is instead lost
+/// evidence about a command that may have run and must fail closed.
+pub async fn retire_unbound_execution(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    execution_name: &str,
+) -> Result<(), AccessLedgerError> {
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(CLOSED) {
+            return Err(AccessLedgerError::Invalid("execution gate is not closed"));
+        }
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let entry = entries
+            .get_mut(execution_name)
+            .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
+        if entry.execution_uid.is_some() {
+            return Err(AccessLedgerError::Invalid("bound execution is missing"));
+        }
+        if !entry.active {
+            return Ok(());
+        }
+        entry.active = false;
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(()),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Clear the manifest after every exact execution record is absent.
+///
+/// Returns `true` when this call wrote the checkpoint. The caller requeues and
+/// re-lists records before accepting the next pass as clean, so a lost response
+/// cannot skip the final absence observation.
+pub async fn clear_execution_manifest(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+) -> Result<bool, AccessLedgerError> {
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(CLOSED)
+            || !parse_entries::<GateEntry>(&gate)?.is_empty()
+        {
+            return Err(AccessLedgerError::Invalid("execution cleanup gate state"));
+        }
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        if entries.values().any(|entry| entry.active) {
+            return Err(AccessLedgerError::Invalid("active execution reservation"));
+        }
+        match patch_execution_entries(&api, &gate, &previous, &BTreeMap::new()).await {
+            Ok(_) => return Ok(true),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
 }
 
 async fn remove_principal_entry(
@@ -1503,6 +1985,10 @@ pub async fn reap_empty(
                     // retained entry still owns the gate. Re-list before ever
                     // considering object deletion.
                     false
+                } else if !parse_execution_entries(&object)?.is_empty() {
+                    // Durable executions share the exact gate. The gate name
+                    // remains occupied until their manifest has been drained.
+                    false
                 } else {
                     if !sandbox_snapshot_complete {
                         warn!(object = %object.name_any(), "retaining empty Sandbox lease gate because the parent ledger snapshot is incomplete");
@@ -1629,8 +2115,13 @@ mod tests {
         uid: &str,
         resource_version: &str,
         labels: BTreeMap<String, String>,
-        annotations: BTreeMap<String, String>,
+        mut annotations: BTreeMap<String, String>,
     ) -> Value {
+        if labels.get(LEDGER_KIND_LABEL).map(String::as_str) == Some(GATE_KIND) {
+            annotations
+                .entry(EXECUTIONS_ANNOTATION.into())
+                .or_insert_with(|| "{}".into());
+        }
         json!({
             "apiVersion":"coordination.k8s.io/v1", "kind":"Lease",
             "metadata":{
@@ -1824,6 +2315,27 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PatchedExecutionLease {
+        object: Value,
+    }
+
+    impl Respond for PatchedExecutionLease {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let patch: Value = serde_json::from_slice(&request.body).expect("JSON Patch body");
+            let executions = patch
+                .as_array()
+                .and_then(|operations| operations.last())
+                .and_then(|operation| operation.get("value"))
+                .and_then(Value::as_str)
+                .expect("last operation replaces execution entries");
+            let mut object = self.object.clone();
+            object["metadata"]["resourceVersion"] = json!("2");
+            object["metadata"]["annotations"][EXECUTIONS_ANNOTATION] = json!(executions);
+            ResponseTemplate::new(200).set_body_json(object)
+        }
+    }
+
     #[test]
     fn names_are_dns_bounded_and_identity_derived() {
         let gate = gate_name("12345678-1234-1234-1234-123456789012");
@@ -1846,6 +2358,313 @@ mod tests {
         let mut invalid = valid;
         invalid.pod_uid.clear();
         assert!(invalid.validate().is_err());
+    }
+
+    /// Lifetime and concurrent execution limits are one mutation of the same
+    /// map, so racing replicas cannot each observe a spare slot. Exact retries
+    /// reuse their entry; changed content under the same derived name cannot.
+    #[test]
+    fn execution_capacity_is_bounded_by_history_and_active_processes() {
+        let digest = "d".repeat(64);
+        let mut entries = BTreeMap::new();
+        assert_eq!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-0",
+                &digest,
+                "pod-uid",
+                "2026-08-20T00:00:00Z",
+            ),
+            ExecutionCapacity::Reserved
+        );
+        assert_eq!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-0",
+                &digest,
+                "pod-uid",
+                "2026-08-20T00:01:00Z",
+            ),
+            ExecutionCapacity::ExistingActive {
+                execution_uid: None
+            }
+        );
+        assert_eq!(entries.len(), 1, "an exact retry spends no second slot");
+        assert_eq!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-0",
+                &"e".repeat(64),
+                "pod-uid",
+                "2026-08-20T00:01:00Z",
+            ),
+            ExecutionCapacity::Conflict
+        );
+
+        for index in 1..crate::api::sandbox_executions::MAX_ACTIVE_EXECUTIONS_PER_LEASE {
+            assert_eq!(
+                reserve_execution_entry(
+                    &mut entries,
+                    &format!("execution-{index}"),
+                    &digest,
+                    "pod-uid",
+                    "2026-08-20T00:00:00Z",
+                ),
+                ExecutionCapacity::Reserved
+            );
+        }
+        assert_eq!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-active-overflow",
+                &digest,
+                "pod-uid",
+                "2026-08-20T00:00:00Z",
+            ),
+            ExecutionCapacity::LimitReached
+        );
+        entries.get_mut("execution-0").unwrap().active = false;
+        assert_eq!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-after-terminal",
+                &digest,
+                "pod-uid",
+                "2026-08-20T00:00:00Z",
+            ),
+            ExecutionCapacity::Reserved,
+            "a terminal process frees concurrency but not its history row"
+        );
+
+        for index in entries.len()..crate::api::sandbox_executions::MAX_EXECUTIONS_PER_LEASE {
+            for entry in entries.values_mut() {
+                entry.active = false;
+            }
+            assert_eq!(
+                reserve_execution_entry(
+                    &mut entries,
+                    &format!("execution-history-{index}"),
+                    &digest,
+                    "pod-uid",
+                    "2026-08-20T00:00:00Z",
+                ),
+                ExecutionCapacity::Reserved
+            );
+        }
+        for entry in entries.values_mut() {
+            entry.active = false;
+        }
+        assert_eq!(
+            entries.len(),
+            crate::api::sandbox_executions::MAX_EXECUTIONS_PER_LEASE
+        );
+        assert_eq!(
+            reserve_execution_entry(
+                &mut entries,
+                "execution-lifetime-overflow",
+                &digest,
+                "pod-uid",
+                "2026-08-20T00:00:00Z",
+            ),
+            ExecutionCapacity::LimitReached
+        );
+    }
+
+    /// `Unknown` is an information state, not proof that a process group is
+    /// gone. A command that reached Running holds its active slot until runner
+    /// cancellation or target destruction supplies that missing proof.
+    #[test]
+    fn unknown_running_execution_keeps_its_active_capacity() {
+        use crate::crd::ExecutionState;
+
+        assert!(!execution_can_release_active_capacity(
+            ExecutionState::Running,
+            true,
+            true
+        ));
+        assert!(!execution_can_release_active_capacity(
+            ExecutionState::Unknown,
+            true,
+            false
+        ));
+        assert!(execution_can_release_active_capacity(
+            ExecutionState::Unknown,
+            true,
+            true
+        ));
+        assert!(execution_can_release_active_capacity(
+            ExecutionState::Unknown,
+            false,
+            false
+        ));
+        for settled in [
+            ExecutionState::Succeeded,
+            ExecutionState::Failed,
+            ExecutionState::Cancelled,
+            ExecutionState::TimedOut,
+        ] {
+            assert!(execution_can_release_active_capacity(settled, true, false));
+        }
+    }
+
+    /// Reserving capacity is one UID/resourceVersion/previous-value CAS. A
+    /// second replica cannot reserve from the same snapshot after the first
+    /// wins, which is what makes the pure numerical bounds real under load.
+    #[tokio::test]
+    async fn execution_capacity_reservation_is_exactly_cas_fenced() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let gate = gate_name("sandbox-uid");
+        let gate_path = format!("/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{gate}");
+        let object = lease_object(
+            &gate,
+            "gate-uid",
+            "1",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+                (EXECUTIONS_ANNOTATION.into(), "{}".into()),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(object.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(PatchedExecutionLease { object })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reserve_execution_capacity(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                "execution-a",
+                &"d".repeat(64),
+                "pod-uid",
+            )
+            .await
+            .unwrap(),
+            ExecutionCapacity::Reserved
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("capacity CAS");
+        let patch: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            patch[0],
+            json!({"op":"test","path":"/metadata/uid","value":"gate-uid"})
+        );
+        assert_eq!(
+            patch[1],
+            json!({"op":"test","path":"/metadata/resourceVersion","value":"1"})
+        );
+        assert_eq!(
+            patch[2],
+            json!({
+                "op":"test",
+                "path":"/metadata/annotations/kobe.kunobi.ninja~1sandbox-executions",
+                "value":"{}"
+            })
+        );
+        let entries: BTreeMap<String, ExecutionEntry> =
+            serde_json::from_str(patch[3]["value"].as_str().unwrap()).unwrap();
+        assert!(entries["execution-a"].active);
+        assert_eq!(entries["execution-a"].execution_uid, None);
+    }
+
+    /// Closing an unbound slot and adopting a late exact CR is one CAS. A
+    /// concurrent binder either wins first or sees the inactive entry; there
+    /// is no state in which both the reaper and a new process can proceed.
+    #[tokio::test]
+    async fn late_execution_record_is_adopted_only_while_closing_its_slot() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let gate = gate_name("sandbox-uid");
+        let gate_path = format!("/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{gate}");
+        let existing = BTreeMap::from([(
+            "execution-a".to_string(),
+            ExecutionEntry {
+                request_digest: "d".repeat(64),
+                pod_uid: "pod-uid".into(),
+                reserved_at: "2026-08-20T00:00:00Z".into(),
+                execution_uid: None,
+                active: true,
+            },
+        )]);
+        let object = lease_object(
+            &gate,
+            "gate-uid",
+            "1",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), CLOSED.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+                (
+                    EXECUTIONS_ANNOTATION.into(),
+                    serde_json::to_string(&existing).unwrap(),
+                ),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(object.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(PatchedExecutionLease { object })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            expire_unbound_execution(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                "execution-a",
+                &"d".repeat(64),
+                "pod-uid",
+                Some("execution-uid"),
+            )
+            .await
+            .unwrap()
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("unbound retirement CAS");
+        let patch: Value = serde_json::from_slice(&request.body).unwrap();
+        let entries: BTreeMap<String, ExecutionEntry> =
+            serde_json::from_str(patch[3]["value"].as_str().unwrap()).unwrap();
+        assert!(!entries["execution-a"].active);
+        assert_eq!(
+            entries["execution-a"].execution_uid.as_deref(),
+            Some("execution-uid")
+        );
     }
 
     #[test]
@@ -1888,6 +2707,7 @@ mod tests {
         let gate = build_gate("ledger", "sandbox-a", "uid-a", OPEN);
         validate_gate(&gate, "ledger", "sandbox-a", "uid-a").unwrap();
         assert_eq!(parse_entries::<GateEntry>(&gate).unwrap(), BTreeMap::new());
+        assert_eq!(parse_execution_entries(&gate).unwrap(), BTreeMap::new());
         let principal = build_principal("ledger", "principal");
         assert_eq!(
             parse_entries::<PrincipalEntry>(&principal).unwrap(),
@@ -1966,6 +2786,7 @@ mod tests {
         .unwrap();
         assert_eq!(post["metadata"]["annotations"][STATE_ANNOTATION], OPEN);
         assert_eq!(post["metadata"]["annotations"][ENTRIES_ANNOTATION], "{}");
+        assert_eq!(post["metadata"]["annotations"][EXECUTIONS_ANNOTATION], "{}");
     }
 
     #[tokio::test]

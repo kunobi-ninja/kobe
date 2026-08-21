@@ -128,9 +128,18 @@ must not silently remove working-directory, exact-exit-code, process-group
 cancellation, or reconnectability guarantees.
 
 Output from every durable execution is retained inside the container until the
-Sandbox is torn down, bounded per stream, and can be read back through
-`GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Cancelling one
-terminates its whole process group, not only the process Kobe started.
+Sandbox is torn down and can be read back through
+`GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Kobe retains at most
+1 MiB of stdout and 1 MiB of stderr per execution, allows at most 8 active
+executions at once, and accepts at most 256 idempotency keys over one Sandbox
+lifetime. The resulting worst-case retained output is 512 MiB per Sandbox.
+Requests beyond either execution limit return `429 Too Many Requests`.
+
+Cancelling an execution terminates its whole process group, not only the
+process Kobe started. Lease release first closes new access, then cancels and
+proves every recorded execution terminal before credentials and workload are
+removed; the execution records are deleted with that Sandbox rather than kept
+as history after it ends.
 
 ## Placement and isolation
 

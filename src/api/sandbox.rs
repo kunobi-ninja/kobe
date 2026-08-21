@@ -287,11 +287,26 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         return execution_denied(&identity, &id, &error);
     }
 
+    // Register before reserving capacity or creating the execution object.
+    // Release closes this same gate and cannot observe it drained while a
+    // CREATE/bind request is still in flight. Registering later would leave a
+    // window in which teardown clears the execution manifest, then the delayed
+    // request creates a finalised record after absence was already certified.
+    let guard = match register_live_stream(&state, &lease, &target).await {
+        Ok(guard) => guard,
+        Err(denied) => {
+            return stream_registration_denied(&identity, &id, "execution", denied);
+        }
+    };
+    let revoked = guard.cancelled();
+
     let reservation = match executions::reserve_execution(
         &state.client,
         &state.namespace,
+        &state.sandbox_reservation_namespace,
         &lease,
         &target,
+        &container,
         &requested,
     )
     .await
@@ -333,43 +348,11 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         );
     }
 
-    // Durable executions count against the same per-lease bound as every other
-    // operation: each holds a connection to the target cluster, and a caller
-    // submitting them concurrently is consuming the same resource whether the
-    // request is called `exec` or `executions`. Registering unbounded here
-    // meant the limit existed on paper and not in the path most likely to be
-    // driven by a loop.
-    let guard = match register_live_stream(&state, &lease, &target).await {
-        Ok(guard) => guard,
-        Err(denied) => {
-            if fresh {
-                // Nothing spawned, so cancellation is exact even when the
-                // final lease revalidation itself failed. A reused record may
-                // already be running, so a retry failure never settles it.
-                let reason = match denied {
-                    StreamRegistrationDenied::LimitReached => "concurrency_limit",
-                    StreamRegistrationDenied::LeaseEnded => "lease_ended",
-                    StreamRegistrationDenied::Backend => "lease_revalidation_failed",
-                };
-                executions::record_terminal(
-                    &state.client,
-                    &state.namespace,
-                    &reserved,
-                    ExecutionState::Cancelled,
-                    None,
-                    reason,
-                )
-                .await;
-            }
-            return stream_registration_denied(&identity, &id, "execution", denied);
-        }
-    };
-    let revoked = guard.cancelled();
-
     // Registration and its exact lease re-read precede target resolution and
-    // TokenRequest. A release event that already passed can therefore never
-    // mint a fresh credential, and an event racing setup cancels the network
-    // wait instead of letting it complete under ended authority.
+    // every durable mutation as well as TokenRequest. A release event that
+    // already passed can therefore never reserve, create, or mint a fresh
+    // credential, and an event racing setup cancels the network wait instead
+    // of letting it complete under ended authority.
     let scoped = match scoped_client_after_registration(
         &state,
         &lease,
@@ -1016,6 +999,8 @@ async fn wait_for_runner(
 async fn reconcile_runner<B: ClusterBackend>(
     state: &AppState<B>,
     target: &crate::api::sandbox_access::SandboxTarget,
+    container: &str,
+    runner_path: &str,
     record: &crate::crd::SandboxExecution,
     scoped: &kube::Client,
 ) -> crate::crd::SandboxExecution {
@@ -1031,18 +1016,7 @@ async fn reconcile_runner<B: ClusterBackend>(
     if current.is_terminal() {
         return record.clone();
     }
-    let Some(runner_path) = target.runner_path.clone() else {
-        return record.clone();
-    };
-
-    let polled = runner::poll(
-        scoped,
-        target,
-        &target.container,
-        &runner_path,
-        &record.name_any(),
-    )
-    .await;
+    let polled = runner::poll(scoped, target, container, runner_path, &record.name_any()).await;
 
     let outcome = match polled {
         Ok(report) => runner::outcome_from_report(&report),
@@ -1110,16 +1084,26 @@ async fn get_sandbox_execution<B: ClusterBackend>(
     .await
     {
         Ok(Some(record)) => {
-            if !crate::api::sandbox_executions::execution_pod_identity_holds(
+            let runner_address = match crate::api::sandbox_executions::execution_runner_address(
                 &record.spec,
-                &target.pod_uid,
+                &target,
             ) {
-                return sandbox_error(
-                    StatusCode::GONE,
-                    "This execution belonged to a replaced Sandbox Pod",
-                    None,
-                );
-            }
+                Ok(address) => address,
+                Err("execution_runner_missing") => {
+                    return sandbox_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "This runner-managed execution can no longer be reached",
+                        None,
+                    );
+                }
+                Err(_) => {
+                    return sandbox_error(
+                        StatusCode::GONE,
+                        "This execution belonged to a replaced Sandbox runner",
+                        None,
+                    );
+                }
+            };
             // Current executions are runner-supervised in both modes. Legacy
             // raw wait records are not: polling their id against the runner
             // would turn a valid pre-upgrade Running record into Unknown.
@@ -1129,6 +1113,13 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                     .as_ref()
                     .is_some_and(|status| status.state.is_terminal())
             {
+                let Some((container, runner_path)) = runner_address.as_ref() else {
+                    return sandbox_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "This runner-managed execution can no longer be reached",
+                        None,
+                    );
+                };
                 let guard = match register_live_stream(&state, &lease, &target).await {
                     Ok(guard) => guard,
                     Err(denied) => {
@@ -1170,7 +1161,7 @@ async fn get_sandbox_execution<B: ClusterBackend>(
                 };
                 match complete_before_revocation(
                     &revoked,
-                    reconcile_runner(&state, &target, &record, &scoped),
+                    reconcile_runner(&state, &target, container, runner_path, &record, &scoped),
                 )
                 .await
                 {
@@ -1275,15 +1266,6 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         Err(error) => return execution_denied(&identity, &id, &error),
     };
 
-    if !crate::api::sandbox_executions::execution_pod_identity_holds(&record.spec, &target.pod_uid)
-    {
-        return sandbox_error(
-            StatusCode::GONE,
-            "This execution belonged to a replaced Sandbox Pod",
-            None,
-        );
-    }
-
     if !execution_is_runner_managed(&record.spec) {
         return sandbox_error(
             StatusCode::CONFLICT,
@@ -1292,13 +1274,31 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         );
     }
 
-    let Some(runner_path) = target.runner_path.clone() else {
-        return sandbox_error(
-            StatusCode::CONFLICT,
-            "This Sandbox pool stopped providing the Kobe runner",
-            None,
-        );
-    };
+    let (container, runner_path) =
+        match crate::api::sandbox_executions::execution_runner_address(&record.spec, &target) {
+            Ok(Some(address)) => address,
+            Ok(None) => {
+                return sandbox_error(
+                    StatusCode::CONFLICT,
+                    "Retained output is unavailable for this legacy execution",
+                    None,
+                );
+            }
+            Err("execution_runner_missing") => {
+                return sandbox_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "This runner-managed execution can no longer be reached",
+                    None,
+                );
+            }
+            Err(_) => {
+                return sandbox_error(
+                    StatusCode::GONE,
+                    "This execution belonged to a replaced Sandbox runner",
+                    None,
+                );
+            }
+        };
 
     // Output reads are live operations too. Holding a guard ensures release,
     // expiry, or quarantine interrupts every runner call below rather than
@@ -1347,7 +1347,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
     // raw records were refused above, so this id is always runner-owned.
     let record = match complete_before_revocation(
         &revoked,
-        reconcile_runner(&state, &target, &record, &scoped),
+        reconcile_runner(&state, &target, &container, &runner_path, &record, &scoped),
     )
     .await
     {
@@ -1358,7 +1358,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                 &record,
                 &scoped,
                 &target,
-                &target.container,
+                &container,
                 &runner_path,
             )
             .await;
@@ -1375,7 +1375,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
             runner::read_output(
                 &scoped,
                 &target,
-                &target.container,
+                &container,
                 &runner_path,
                 &record.name_any(),
                 stream,
@@ -1403,7 +1403,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                     &record,
                     &scoped,
                     &target,
-                    &target.container,
+                    &container,
                     &runner_path,
                 )
                 .await;
@@ -1623,25 +1623,39 @@ async fn cancel_runner<B: ClusterBackend>(
             (StatusCode::OK, Json(execution_response(&record, None))).into_response(),
         );
     }
-    if !executions::execution_pod_identity_holds(&record.spec, &target.pod_uid) {
-        return RunnerCancellation::Handled(sandbox_error(
-            StatusCode::GONE,
-            "This execution belonged to a replaced Sandbox Pod",
-            None,
-        ));
-    }
-    let Some(runner_path) = target.runner_path.clone() else {
-        if !execution_is_runner_managed(&record.spec) {
+    let (container, runner_path) = match executions::execution_runner_address(&record.spec, target)
+    {
+        Ok(Some(address)) => address,
+        Ok(None) if !execution_is_runner_managed(&record.spec) => {
             return RunnerCancellation::NotRunnerManaged;
         }
-        return RunnerCancellation::Handled(access_denied_with(
-            identity,
-            id,
-            "execution-cancel",
-            "runner_missing",
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Runner-supervised execution termination could not be confirmed",
-        ));
+        Ok(None) => {
+            return RunnerCancellation::Handled(access_denied_with(
+                identity,
+                id,
+                "execution-cancel",
+                "runner_missing",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runner-supervised execution termination could not be confirmed",
+            ));
+        }
+        Err("execution_runner_missing") => {
+            return RunnerCancellation::Handled(access_denied_with(
+                identity,
+                id,
+                "execution-cancel",
+                "runner_missing",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runner-supervised execution termination could not be confirmed",
+            ));
+        }
+        Err(_) => {
+            return RunnerCancellation::Handled(sandbox_error(
+                StatusCode::GONE,
+                "This execution belonged to a replaced Sandbox runner",
+                None,
+            ));
+        }
     };
 
     let scoped = match scoped_client_after_registration(
@@ -1685,7 +1699,7 @@ async fn cancel_runner<B: ClusterBackend>(
         runner::cancel(
             &scoped,
             target,
-            &target.container,
+            &container,
             &runner_path,
             &record.name_any(),
         ),
@@ -12054,6 +12068,7 @@ mod tests {
     #[test]
     fn runner_managed_wait_execution_never_falls_back_to_record_only_cancellation() {
         let spec = |detached, runner_managed| crate::crd::SandboxExecutionSpec {
+            lease_name: None,
             lease_uid: "lease-uid".into(),
             pod_uid: "pod-uid".into(),
             idempotency_key: "key-1".into(),
@@ -12061,6 +12076,7 @@ mod tests {
             timeout: "60s".into(),
             detached,
             runner_managed,
+            target: None,
         };
 
         assert!(execution_is_runner_managed(&spec(false, Some(true))));

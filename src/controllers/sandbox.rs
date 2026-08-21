@@ -1453,6 +1453,34 @@ async fn drive_release(
 
     let child_placed = is_child_placed(lease, ctx).await;
 
+    // Durable executions are capabilities plus process groups, not audit-only
+    // records. On management placement, cancel/prove every exact runner group
+    // and delete its finalised record before scoped credentials or the Claim
+    // can disappear. The closed access gate above prevents any new bind/spawn
+    // from racing this cleanup.
+    if ctx.access_ledger_enabled && !child_placed {
+        match crate::api::sandbox_executions::cleanup_lease_executions(
+            &ctx.client,
+            &ctx.namespace,
+            &ctx.reservation_namespace,
+            lease,
+            &ctx.client,
+        )
+        .await
+        {
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+                return Ok(Action::await_change());
+            }
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
+                return quarantine_lease(lease, ctx, reason).await;
+            }
+        }
+    }
+
     // Scoped identities are externally usable capabilities. Remove and prove
     // them absent before deleting the management Claim, including when an old
     // controller already checkpointed footprint absence. A lease without Pod
@@ -5342,6 +5370,7 @@ pub(crate) mod tests {
                     "annotations": {
                         "kobe.kunobi.ninja/sandbox-access-state": "open",
                         "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                        "kobe.kunobi.ninja/sandbox-executions": "{}",
                     },
                 },
                 "spec": {},
@@ -5367,6 +5396,7 @@ pub(crate) mod tests {
                     "annotations": {
                         "kobe.kunobi.ninja/sandbox-access-state": "closed",
                         "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                        "kobe.kunobi.ninja/sandbox-executions": "{}",
                     },
                 },
                 "spec": {},
@@ -5402,6 +5432,111 @@ pub(crate) mod tests {
             "/metadata/annotations/kobe.kunobi.ninja~1sandbox-access-state"
         );
         assert_eq!(body[3]["value"], "closed");
+    }
+
+    /// A closed access gate still carries the exact execution inventory.
+    /// Teardown retires one abandoned pre-CREATE slot and ends the pass before
+    /// credentials or workload can be touched; the next pass must re-list the
+    /// execution namespace before accepting absence.
+    #[tokio::test]
+    async fn execution_cleanup_checkpoints_before_credentials_and_claims() {
+        use sha2::{Digest, Sha256};
+
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
+        let lease_uid = lease.uid().unwrap();
+        let gate = format!(
+            "kobe-access-g-{}",
+            &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
+        );
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION.into(),
+            crate::sandbox_access_ledger::encode_gate_reference(
+                &crate::sandbox_access_ledger::AccessGateReference {
+                    name: gate.clone(),
+                    uid: "access-gate-uid".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let gate_path = format!("{RESERVATIONS_PATH}/{gate}");
+        let execution_manifest = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2020-01-01T00:00:00Z",
+                "active": true
+            }
+        })
+        .to_string();
+        let gate_object = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": gate,
+                "namespace": NS,
+                "uid": "access-gate-uid",
+                "resourceVersion": "1",
+                "labels": {
+                    "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                    "kobe.kunobi.ninja/sandbox-lease-name": LEASE,
+                    "kobe.kunobi.ninja/sandbox-access-lease-uid": lease_uid,
+                },
+                "annotations": {
+                    "kobe.kunobi.ninja/sandbox-access-state": "closed",
+                    "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                    "kobe.kunobi.ninja/sandbox-executions": execution_manifest,
+                },
+            },
+            "spec": {},
+        });
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object.clone()))
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxExecutionList",
+                "metadata":{"resourceVersion":"1"},
+                "items":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
+        assert!(requests.iter().all(|request| {
+            let path = request.url.path();
+            !path.contains("/serviceaccounts/")
+                && !path.contains("/roles/")
+                && !path.contains("/rolebindings/")
+        }));
+        let patch = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("execution retirement checkpoint");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        let entries: serde_json::Value =
+            serde_json::from_str(body[3]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(entries["execution-a"]["active"], false);
     }
 
     /// Run the destructive half only after the durable Releasing checkpoint
