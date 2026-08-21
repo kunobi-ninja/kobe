@@ -65,6 +65,7 @@ const DEMO_FLUX_BOOTSTRAP_CONFIG = "flux";
 const DEMO_FLUX_NAMESPACE = "flux-system";
 const DEMO_VKOBE_VERSION = "1.35";
 const LOCAL_TARGET = "e2e";
+const LOCAL_OTHER_TARGET = "e2e-other";
 const LOCAL_ENDPOINT = "http://127.0.0.1:8080";
 const LOCAL_NODE_PORT = 30080;
 // Where an injected failure's ORIGINAL state is parked until `clear-failure`.
@@ -129,6 +130,7 @@ const COMMANDS = [
   "clear-failure",
   "reap-lease",
   "attach-pty",
+  "port-forward",
 ] as const;
 
 type Command = (typeof COMMANDS)[number];
@@ -180,6 +182,8 @@ type Args = {
   /// The `kobe` binary the pty harness drives. A path, not a shell string:
   /// it is passed to the pty as argv[0] and never re-parsed.
   kobeBin: string;
+  /// Exact CLI target whose identity opens the upgraded stream.
+  cliTarget: string;
   /// Keystroke payloads, in order. Escapes are decoded by `decodeKeystrokes`.
   send: string[];
   sendDelayMs: number;
@@ -188,6 +192,14 @@ type Args = {
   expect?: string;
   /// Exit code `kobe sandbox attach` must terminate with.
   expectExit?: number;
+  /// HTTP status an upgraded port-forward handshake must be refused with.
+  expectHttpStatus?: number;
+  /// Terminal size applied after `resizeAfter` appears in the transcript.
+  resize?: { width: number; height: number };
+  /// Transcript marker proving the remote terminal is ready to observe resize.
+  resizeAfter?: string;
+  /// Pool-declared remote port driven by the port-forward harness.
+  remotePort: string;
   /// Argv handed to `kobe sandbox attach ... -- <argv>`, after a bare `--`.
   attachArgv: string[];
 };
@@ -393,6 +405,7 @@ export function parseArgs(argv: string[]): Args {
     failure: "teardown-unverifiable" as const,
     revocation: {},
     kobeBin: process.env.KOBE_BIN ?? "kobe",
+    cliTarget: LOCAL_TARGET,
     send: [],
     // Long enough for the attach WebSocket to be established and the CLI to
     // have entered raw mode. Keystrokes written before that are typed into a
@@ -401,6 +414,7 @@ export function parseArgs(argv: string[]): Args {
     // exists to detect. Better to spend two seconds than to report it falsely.
     sendDelayMs: 300,
     settleMs: 2000,
+    remotePort: "http",
     attachArgv: [],
   } as Args;
 
@@ -511,6 +525,11 @@ export function parseArgs(argv: string[]): Args {
       i += 1;
       continue;
     }
+    if (token === "--target" && next) {
+      args.cliTarget = next;
+      i += 1;
+      continue;
+    }
     if (token === "--send" && next !== undefined) {
       args.send.push(next);
       i += 1;
@@ -536,12 +555,49 @@ export function parseArgs(argv: string[]): Args {
       i += 1;
       continue;
     }
+    if (token === "--expect-http-status" && next) {
+      const status = parsePositiveInt(next, "--expect-http-status");
+      if (status < 100 || status > 599) {
+        throw new Error("--expect-http-status must be between 100 and 599");
+      }
+      args.expectHttpStatus = status;
+      i += 1;
+      continue;
+    }
+    if (token === "--resize" && next) {
+      args.resize = parseTerminalSize(next);
+      i += 1;
+      continue;
+    }
+    if (token === "--resize-after" && next !== undefined) {
+      args.resizeAfter = next;
+      i += 1;
+      continue;
+    }
+    if (token === "--port" && next) {
+      args.remotePort = next;
+      i += 1;
+      continue;
+    }
     if (token === "--help" || token === "-h") {
       printHelpAndExit();
     }
   }
 
   return args;
+}
+
+export function parseTerminalSize(value: string): { width: number; height: number } {
+  const match = /^(\d+)x(\d+)$/.exec(value);
+  if (!match) {
+    throw new Error(`--resize must be WIDTHxHEIGHT, got '${value}'`);
+  }
+  const width = parsePositiveInt(match[1], "--resize width");
+  const height = parsePositiveInt(match[2], "--resize height");
+  if (width > 4096 || height > 4096) {
+    throw new Error("--resize dimensions must be <= 4096");
+  }
+  return { width, height };
 }
 
 function parsePositiveInt(value: string, name: string, options?: { allowZero?: boolean }): number {
@@ -581,8 +637,12 @@ function printHelpAndExit(): never {
   info("      then delete the clean record. No reservation is removed ahead of teardown proof.");
   info("");
   info("  bun run ./hack/e2e.ts attach-pty --lease ID [--send KEYS]... [--expect TEXT] [--expect-exit N]");
+  info("                                   [--resize WIDTHxHEIGHT --resize-after TEXT]");
   info("                                   [--kobe PATH] [--settle MS] [--send-delay MS] [-- ARGV...]");
   info("      Drive `kobe sandbox attach` through a real pty. --send accepts \\r \\n \\t \\e \\xNN.");
+  info("");
+  info("  bun run ./hack/e2e.ts port-forward --lease ID [--port NAME] [--expect TEXT] [--kobe PATH]");
+  info("      Drive a real loopback connection through `kobe sandbox port-forward`.");
   process.exit(0);
 }
 
@@ -1662,6 +1722,11 @@ async function writeLocalCliConfig(): Promise<void> {
 endpoint = "${LOCAL_ENDPOINT}"
 auth = "token"
 token = "${DEMO_TOKEN}"
+
+[targets.${LOCAL_OTHER_TARGET}]
+endpoint = "${LOCAL_ENDPOINT}"
+auth = "token"
+token = "${DEMO_OTHER_TOKEN}"
 `;
   await runCommand(
     ["/bin/sh", "-lc", `cat <<'EOF' > .kobe.toml
@@ -2699,6 +2764,54 @@ export function decodeKeystrokes(spec: string): Uint8Array {
 /// status. `sys.argv[1:]` because `-c` occupies `sys.argv[0]`.
 const PTY_SPAWN = "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))";
 
+/// A pty bridge whose parent can apply one deterministic resize with SIGUSR1.
+///
+/// The resize is deliberately out-of-band. Sending an escape sequence through
+/// stdin would test a shell convention, not the terminal-size ioctl that
+/// `kobe sandbox attach` observes and forwards on channel 4.
+const RESIZABLE_PTY_SPAWN = String.raw`
+import fcntl, os, pty, select, signal, struct, sys, termios
+
+def set_size(spec):
+    width, height = (int(part) for part in spec.split("x", 1))
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+
+pid, master = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[1], sys.argv[1:])
+
+set_size(os.environ.get("KOBE_E2E_PTY_INITIAL", "80x24"))
+signal.signal(signal.SIGUSR1, lambda _signal, _frame: set_size(os.environ["KOBE_E2E_PTY_RESIZE"]))
+
+try:
+    while True:
+        try:
+            ready, _, _ = select.select([master, 0], [], [])
+        except InterruptedError:
+            continue
+        if master in ready:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            os.write(1, data)
+        if 0 in ready:
+            data = os.read(0, 65536)
+            if not data:
+                break
+            os.write(master, data)
+finally:
+    try:
+        os.close(master)
+    except OSError:
+        pass
+
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+`;
+
 /// Wrap a command so it runs with a controlling terminal.
 ///
 /// A pty is not a convenience here, it is the only option. `kobe sandbox attach`
@@ -2726,6 +2839,10 @@ export function ptyCommand(python: string, argv: string[]): string[] {
   return [python, "-c", PTY_SPAWN, ...argv];
 }
 
+export function resizablePtyCommand(python: string, argv: string[]): string[] {
+  return [python, "-c", RESIZABLE_PTY_SPAWN, ...argv];
+}
+
 /// Locate a Python that can allocate the pty, or say so plainly.
 ///
 /// Named explicitly rather than falling back to `script`: two allocators with
@@ -2747,15 +2864,21 @@ async function attachPty(args: Args): Promise<void> {
   if (!args.expect && args.expectExit === undefined) {
     throw new Error("attach-pty needs --expect and/or --expect-exit: a session with no assertion proves nothing");
   }
+  if ((args.resize === undefined) !== (args.resizeAfter === undefined)) {
+    throw new Error("attach-pty needs --resize and --resize-after together");
+  }
 
   const attach = [
     args.kobeBin,
+    "--target",
+    args.cliTarget,
     "sandbox",
     "attach",
     args.lease,
     ...(args.attachArgv.length > 0 ? ["--", ...args.attachArgv] : []),
   ];
-  const cmd = ptyCommand(await resolvePython(), attach);
+  const python = await resolvePython();
+  const cmd = args.resize ? resizablePtyCommand(python, attach) : ptyCommand(python, attach);
   step(`Attaching through a pty: ${attach.join(" ")}`);
 
   const proc = Bun.spawn({
@@ -2767,7 +2890,16 @@ async function attachPty(args: Args): Promise<void> {
     // A terminal type the remote shell can render into. Without one it falls
     // back to `dumb`, where a prompt may never be drawn — and a harness waiting
     // on output would then time out with nothing to show for it.
-    env: { ...process.env, TERM: process.env.TERM ?? "xterm-256color" },
+    env: {
+      ...process.env,
+      TERM: process.env.TERM ?? "xterm-256color",
+      ...(args.resize
+        ? {
+            KOBE_E2E_PTY_INITIAL: "80x24",
+            KOBE_E2E_PTY_RESIZE: `${args.resize.width}x${args.resize.height}`,
+          }
+        : {}),
+    },
   });
 
   let transcript = "";
@@ -2790,10 +2922,26 @@ async function attachPty(args: Args): Promise<void> {
     await Bun.sleep(args.sendDelayMs);
   }
 
+  const assertionDeadline = Date.now() + args.timeoutSeconds * 1000;
+  if (args.resizeAfter !== undefined) {
+    while (Date.now() < assertionDeadline && !transcript.includes(args.resizeAfter)) {
+      await Bun.sleep(100);
+    }
+    if (!transcript.includes(args.resizeAfter)) {
+      writer.end();
+      proc.kill();
+      await proc.exited;
+      await pumped;
+      throw new Error(
+        `the attached session never became resize-ready at ${JSON.stringify(args.resizeAfter)} within ${args.timeoutSeconds}s`,
+      );
+    }
+    process.kill(proc.pid, "SIGUSR1");
+  }
+
   let matched = args.expect === undefined;
   if (args.expect !== undefined) {
-    const deadline = Date.now() + args.timeoutSeconds * 1000;
-    while (Date.now() < deadline) {
+    while (Date.now() < assertionDeadline) {
       if (transcript.includes(args.expect)) {
         matched = true;
         break;
@@ -2845,6 +2993,144 @@ async function attachPty(args: Args): Promise<void> {
   step("Attached session satisfied every assertion");
 }
 
+export function forwardingAddress(
+  transcript: string,
+  lease: string,
+  remote: string,
+): string | undefined {
+  const match = /^Forwarding 127\.0\.0\.1:([0-9]+) -> ([^:\s]+):([^\s]+)$/m.exec(transcript);
+  if (!match || match[2] !== lease || match[3] !== remote) return undefined;
+  const port = Number.parseInt(match[1], 10);
+  if (port < 1 || port > 65_535) return undefined;
+  return `127.0.0.1:${port}`;
+}
+
+/// Drive the CLI's loopback listener and prove bytes cross the upgraded
+/// connection into the pool-declared remote port.
+async function portForward(args: Args): Promise<void> {
+  if (!args.lease) {
+    throw new Error("port-forward needs --lease <id>");
+  }
+  if (args.expect === undefined && args.expectHttpStatus === undefined) {
+    throw new Error("port-forward needs --expect <text> or --expect-http-status <status>");
+  }
+
+  const command = [
+    args.kobeBin,
+    "--target",
+    args.cliTarget,
+    "sandbox",
+    "port-forward",
+    args.lease,
+    `0:${args.remotePort}`,
+  ];
+  step(`Forwarding a declared port: ${command.join(" ")}`);
+  const proc = Bun.spawn({
+    cmd: command,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: process.cwd(),
+    env: process.env,
+  });
+
+  let stdout = "";
+  let stderr = "";
+  let exited: number | undefined;
+  void proc.exited.then((code) => {
+    exited = code;
+  });
+  const drain = async (stream: ReadableStream<Uint8Array>, append: (text: string) => void): Promise<void> => {
+    const decoder = new TextDecoder();
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      append(decoder.decode(value, { stream: true }));
+    }
+  };
+  const pumped = Promise.all([
+    drain(proc.stdout, (text) => {
+      stdout += text;
+    }),
+    drain(proc.stderr, (text) => {
+      stderr += text;
+    }),
+  ]);
+
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  try {
+    let address: string | undefined;
+    while (Date.now() < deadline) {
+      address = forwardingAddress(stdout, args.lease, args.remotePort);
+      if (address) break;
+      if (exited !== undefined) {
+        throw new Error(`kobe sandbox port-forward exited ${exited} before listening:\n${stdout}${stderr}`);
+      }
+      await Bun.sleep(100);
+    }
+    if (!address) {
+      throw new Error(`kobe sandbox port-forward did not listen within ${args.timeoutSeconds}s:\n${stdout}${stderr}`);
+    }
+
+    if (args.expectHttpStatus !== undefined) {
+      try {
+        await fetch(`http://${address}/`, {
+          redirect: "error",
+          signal: AbortSignal.timeout(Math.min(2_000, Math.max(1, deadline - Date.now()))),
+        });
+      } catch {
+        // The local side is expected to see EOF when the upstream WebSocket
+        // handshake is refused. The authoritative assertion is the exact HTTP
+        // status printed by kobectl below.
+      }
+      const expectedStatus = new RegExp(`HTTP(?: error:)? ${args.expectHttpStatus}\\b`);
+      while (Date.now() < deadline && !expectedStatus.test(stderr)) {
+        await Bun.sleep(100);
+      }
+      if (!expectedStatus.test(stderr)) {
+        throw new Error(
+          `port-forward did not report upstream HTTP ${args.expectHttpStatus} within ${args.timeoutSeconds}s:\n${stdout}${stderr}`,
+        );
+      }
+      info(stderr.trimEnd());
+      step(`Upgraded port-forward was refused with HTTP ${args.expectHttpStatus}`);
+      return;
+    }
+
+    const expected = new TextEncoder().encode(args.expect);
+    let lastError = "the workload listener did not answer";
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://${address}/`, {
+          redirect: "error",
+          signal: AbortSignal.timeout(Math.min(2_000, Math.max(1, deadline - Date.now()))),
+        });
+        const body = new Uint8Array(await response.arrayBuffer());
+        const exact = body.length === expected.length && body.every((byte, index) => byte === expected[index]);
+        if (!response.ok || !exact) {
+          throw new Error(
+            `forwarded request returned HTTP ${response.status} with ${body.length} bytes, expected exact ${expected.length} bytes`,
+          );
+        }
+        info(new TextDecoder().decode(body).trimEnd());
+        step("Declared port forwarded exact response bytes over loopback");
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        await Bun.sleep(100);
+      }
+    }
+    throw new Error(
+      `forwarded request did not return exact bytes within ${args.timeoutSeconds}s: ${lastError}\n${stderr}`,
+    );
+  } finally {
+    if (exited === undefined) proc.kill();
+    await proc.exited;
+    await pumped;
+  }
+}
+
 async function main() {
   try {
     const args = parseArgs(Bun.argv.slice(2));
@@ -2873,6 +3159,9 @@ async function main() {
         return;
       case "attach-pty":
         await attachPty(args);
+        return;
+      case "port-forward":
+        await portForward(args);
         return;
     }
   } catch (error) {

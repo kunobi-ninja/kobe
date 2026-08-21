@@ -438,6 +438,19 @@ impl LeasedSandbox {
         timeout: &str,
     ) -> anyhow::Result<String> {
         let script = format!("echo {marker}; while :; do sleep 1; done");
+        self.start_detached_script(key, &script, marker, timeout)
+            .await
+    }
+
+    /// Start an exact background script and wait until its retained output
+    /// proves the process reached the caller-selected readiness point.
+    async fn start_detached_script(
+        &self,
+        key: &str,
+        script: &str,
+        marker: &str,
+        timeout: &str,
+    ) -> anyhow::Result<String> {
         let (status, created) = self
             .api
             .json(
@@ -832,6 +845,50 @@ both_placements!(
             );
         }
 
+        // Streaming operations use a real WebSocket handshake. A plain HTTP
+        // GET could be rejected by Axum before Kobe resolves the lease and
+        // would therefore prove nothing about tenant isolation.
+        let attach = harness(&[
+            "attach-pty",
+            "--target",
+            "e2e-other",
+            "--lease",
+            &sandbox.id,
+            "--expect",
+            "404",
+            "--expect-exit",
+            "1",
+            "--timeout",
+            "30",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo pwned",
+        ])
+        .await?;
+        anyhow::ensure!(
+            attach.contains("404"),
+            "stranger attach did not fail as an undiscoverable lease: {attach}"
+        );
+        let forward = harness(&[
+            "port-forward",
+            "--target",
+            "e2e-other",
+            "--lease",
+            &sandbox.id,
+            "--port",
+            "http",
+            "--expect-http-status",
+            "404",
+            "--timeout",
+            "30",
+        ])
+        .await?;
+        anyhow::ensure!(
+            forward.contains("HTTP 404"),
+            "stranger port-forward did not fail as an undiscoverable lease: {forward}"
+        );
+
         // And the sandbox is untouched: the stranger's exec did not run.
         let (_, evidence) = sandbox
             .exec(&["/bin/sh", "-c", "echo intact"], "conformance-intact")
@@ -1064,30 +1121,68 @@ both_placements!(an_undeclared_port_is_refused, |placement| async move {
     let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
     sandbox.wait_ready(Duration::from_secs(300)).await?;
 
-    // Port-forward is an upgrade, so a refusal arrives as a non-101 status
-    // rather than a close frame. An undeclared port must never resolve:
-    // otherwise the forward is a general tunnel into the Pod's network
-    // namespace.
+    // Exercise the real CLI/WebSocket handshake. A plain GET can fail in
+    // Axum's WebSocket extractor before Kobe ever checks the declared port.
     for undeclared in ["22", "9999", "ssh"] {
-        let (status, body) = sandbox
-            .api
-            .request(
-                reqwest::Method::GET,
-                &format!(
-                    "/v1/sandbox-leases/{}/port-forward?port={undeclared}",
-                    sandbox.id
-                ),
-                None,
-            )
-            .await?;
+        let transcript = harness(&[
+            "port-forward",
+            "--lease",
+            &sandbox.id,
+            "--port",
+            undeclared,
+            "--expect-http-status",
+            "400",
+            "--timeout",
+            "30",
+        ])
+        .await?;
         anyhow::ensure!(
-            !status.is_success() && status.as_u16() != 101,
-            "undeclared port {undeclared} was accepted: HTTP {status} {body}"
+            transcript.contains("HTTP 400"),
+            "undeclared port {undeclared} did not fail at the upgraded authorization path: {transcript}"
         );
     }
 
     sandbox.release().await
 });
+
+both_placements!(
+    a_declared_port_forwards_exact_bytes_over_loopback,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
+        sandbox.wait_ready(Duration::from_secs(300)).await?;
+
+        let marker = format!("kobe-forwarded-{}", nonce(placement));
+        let expected = format!("{marker}\n");
+        let content_length = expected.len();
+        let script = format!(
+            "set -eu; echo {marker}; while :; do \
+             printf 'HTTP/1.1 200 OK\\r\\nContent-Length: {content_length}\\r\\nConnection: close\\r\\n\\r\\n{marker}\\n' \
+             | /usr/bin/nc -l -p 8080; done"
+        );
+        let _server = sandbox
+            .start_detached_script("conformance-declared-port", &script, &marker, "5m")
+            .await?;
+
+        let transcript = harness(&[
+            "port-forward",
+            "--lease",
+            &sandbox.id,
+            "--port",
+            "http",
+            "--expect",
+            &expected,
+            "--timeout",
+            "120",
+        ])
+        .await?;
+        anyhow::ensure!(
+            transcript.contains(&marker),
+            "declared port did not return the workload's exact marker: {transcript}"
+        );
+
+        sandbox.release().await
+    }
+);
 
 both_placements!(a_tampered_target_fails_closed, |placement| async move {
     let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
@@ -1481,6 +1576,49 @@ both_placements!(
             "/bin/sh",
         ])
         .await?;
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// Resizing the caller's real terminal reaches the remote PTY.
+    ///
+    /// The initial 80x24 and final 120x40 sizes are intentionally different;
+    /// observing `40 120` from `stty` proves a live channel-4 resize rather
+    /// than the initial size Kobe sends when attach opens.
+    a_real_terminal_resize_reaches_the_remote_pty,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let ready = format!("kobe-resize-ready-{}", nonce(placement));
+        let resized = format!("kobe-resized-{}", nonce(placement));
+        let script = format!(
+            "trap 'echo {resized}; stty size' WINCH; echo {ready}; while :; do read _ || :; done"
+        );
+        let transcript = harness(&[
+            "attach-pty",
+            "--lease",
+            &sandbox.id,
+            "--resize",
+            "120x40",
+            "--resize-after",
+            &ready,
+            "--expect",
+            "40 120",
+            "--timeout",
+            "120",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .await?;
+        anyhow::ensure!(
+            transcript.contains(&resized) && transcript.contains("40 120"),
+            "remote PTY did not observe the exact resize: {transcript}"
+        );
 
         sandbox.release().await
     }

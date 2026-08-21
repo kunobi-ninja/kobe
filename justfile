@@ -140,6 +140,9 @@ test-sandbox-conformance-pr:
       an_execution_returns_the_exact_remote_exit_code \
       detached_logs_resume_and_cancel_stops_the_process \
       another_identity_can_neither_see_nor_use_the_lease \
+      an_undeclared_port_is_refused \
+      a_declared_port_forwards_exact_bytes_over_loopback \
+      a_real_terminal_resize_reaches_the_remote_pty \
       release_rejects_further_access \
       natural_expiry_rejects_further_access; do
       cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --test-threads=1

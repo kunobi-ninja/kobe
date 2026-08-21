@@ -3,11 +3,14 @@ import { expect, test } from "bun:test";
 import {
   bootstrapManifest,
   decodeKeystrokes,
+  forwardingAddress,
   guestImagesForBackend,
   LEASE_STAGES,
   leaseStageReached,
   parseArgs,
+  parseTerminalSize,
   ptyCommand,
+  resizablePtyCommand,
   revokeVerb,
   sandboxConformanceManifest,
 } from "./e2e";
@@ -89,6 +92,51 @@ test("a bare `--` hands the rest to the attached session, not to the harness", (
 
   expect(args.lease).toBe("abc");
   expect(args.attachArgv).toEqual(["/bin/sh", "--norc"]);
+});
+
+test("the transport harness parses a bounded resize and a named declared port", () => {
+  const resize = parseArgs([
+    "attach-pty",
+    "--lease",
+    "abc",
+    "--resize",
+    "120x40",
+    "--resize-after",
+    "ready",
+    "--expect",
+    "40 120",
+  ]);
+  const forward = parseArgs(["port-forward", "--lease", "abc", "--port", "http", "--expect", "exact-body"]);
+  const refused = parseArgs([
+    "port-forward",
+    "--target",
+    "e2e-other",
+    "--lease",
+    "abc",
+    "--port",
+    "ssh",
+    "--expect-http-status",
+    "404",
+  ]);
+
+  expect(resize.resize).toEqual({ width: 120, height: 40 });
+  expect(resize.resizeAfter).toBe("ready");
+  expect(forward.remotePort).toBe("http");
+  expect(forward.expect).toBe("exact-body");
+  expect(refused.cliTarget).toBe("e2e-other");
+  expect(refused.expectHttpStatus).toBe(404);
+  expect(() => parseTerminalSize("0x40")).toThrow(/integer >= 1/);
+  expect(() => parseTerminalSize("5000x40")).toThrow(/<= 4096/);
+});
+
+test("the port-forward harness accepts only the CLI's exact listening line", () => {
+  expect(forwardingAddress("Forwarding 127.0.0.1:45123 -> lease:http\n", "lease", "http")).toBe(
+    "127.0.0.1:45123",
+  );
+  expect(forwardingAddress("Forwarding 0.0.0.0:45123 -> lease:http\n", "lease", "http")).toBeUndefined();
+  expect(forwardingAddress("Forwarding 127.0.0.1:45123 -> other:http\n", "lease", "http")).toBeUndefined();
+  expect(forwardingAddress("Forwarding 127.0.0.1:45123 -> lease:9999\n", "lease", "http")).toBeUndefined();
+  expect(forwardingAddress("kobe: 127.0.0.1:45123 failed\n", "lease", "http")).toBeUndefined();
 });
 
 test("#138's --after-phase and the clearer --wait-for-phase name the same stage", () => {
@@ -246,4 +294,12 @@ test("the pty wrapper exits with the attached command's own status", () => {
   // --expect-exit asserts kobe's 125-on-abnormal-end contract. A wrapper that
   // reported its own success would make that assertion meaningless.
   expect(ptyCommand("python3", ["kobe"])[2]).toContain("waitstatus_to_exitcode");
+});
+
+test("the resizable pty uses a terminal ioctl rather than stdin bytes", () => {
+  const source = resizablePtyCommand("python3", ["kobe"])[2];
+
+  expect(source).toContain("TIOCSWINSZ");
+  expect(source).toContain("SIGUSR1");
+  expect(source).not.toContain("os.system");
 });
