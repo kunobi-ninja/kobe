@@ -1822,6 +1822,8 @@ mod tests {
         }
     }
 
+    type ReceiptMutation = Box<dyn Fn(&mut TeardownReceipt)>;
+
     #[test]
     fn acknowledgement_token_is_bound_to_the_entire_verified_receipt() {
         let base = receipt(
@@ -1835,7 +1837,7 @@ mod tests {
             .acknowledgement_token()
             .expect("a complete verified receipt has an ACK token");
 
-        let mutations: Vec<Box<dyn Fn(&mut TeardownReceipt)>> = vec![
+        let mutations: Vec<ReceiptMutation> = vec![
             Box::new(|receipt| receipt.attempt_id = "attempt-2".into()),
             Box::new(|receipt| receipt.creation_manifest_digest = "other-manifest".into()),
             Box::new(|receipt| receipt.lease.uid = Some("other-lease".into())),

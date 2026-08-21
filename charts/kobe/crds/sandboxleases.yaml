@@ -138,13 +138,6 @@ spec:
                 - VerifiedDestroyFallbackV1
                 nullable: true
                 type: string
-              claimCleanupFence:
-                description: Durable management-Claim deletion fence understood by this controller.
-                enum:
-                - AdmissionOnlyV1
-                - FinalizerV1
-                nullable: true
-                type: string
               childTeardownReceiptAcknowledgement:
                 description: |-
                   Durable consumer acknowledgement of the exact internal ClusterLease
@@ -155,6 +148,13 @@ spec:
                 minLength: 71
                 nullable: true
                 pattern: ^sha256:[0-9a-f]{64}$
+                type: string
+              claimCleanupFence:
+                description: Durable management-Claim deletion fence understood by this controller.
+                enum:
+                - AdmissionOnlyV1
+                - FinalizerV1
+                nullable: true
                 type: string
               conditions:
                 items:

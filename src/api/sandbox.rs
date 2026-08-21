@@ -4423,23 +4423,30 @@ const SANDBOX_ADMISSION_RESOLUTION_TIMEOUT_SECS: u64 = 30;
 /// the HTTP lifetime. Shutdown has the same bound: before parent creation it
 /// is a safe retryable refusal; after creation callers must use the durable
 /// admission arbiter and return a non-retry handoff when classification cannot
-/// finish.
-async fn await_admission_stage_until<T, F>(
+/// finish. The erased, heap-backed future is also an intentional stack bound:
+/// recovery, reservation and exact-cleanup stages each retain several object
+/// snapshots and must not form one deeply nested poll chain on an Axum worker.
+fn await_admission_stage_until<'a, T, F>(
     deadline: tokio::time::Instant,
-    shutdown: &tokio_util::sync::CancellationToken,
+    shutdown: &'a tokio_util::sync::CancellationToken,
     future: F,
-) -> Result<T, SandboxLeaseMutationError>
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, SandboxLeaseMutationError>> + Send + 'a>,
+>
 where
-    F: std::future::Future<Output = T>,
+    T: Send + 'a,
+    F: std::future::Future<Output = T> + Send + 'a,
 {
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => Err(SandboxLeaseMutationError::AdmissionShuttingDown),
-        _ = tokio::time::sleep_until(deadline) => {
-            Err(SandboxLeaseMutationError::AdmissionDeadlineExceeded)
+    Box::pin(async move {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Err(SandboxLeaseMutationError::AdmissionShuttingDown),
+            _ = tokio::time::sleep_until(deadline) => {
+                Err(SandboxLeaseMutationError::AdmissionDeadlineExceeded)
+            }
+            output = future => Ok(output),
         }
-        output = future => Ok(output),
-    }
+    })
 }
 
 /// Bound best-effort deletion by the same absolute request envelope.

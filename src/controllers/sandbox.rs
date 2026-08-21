@@ -4181,7 +4181,7 @@ async fn drive_release(
     // checkpoints did not include them.
     if footprint_absence_proven(&status) {
         if child_placed {
-            return finish_child_release_after_proof(lease, ctx, reason).await;
+            return Box::pin(finish_child_release_after_proof(lease, ctx, reason)).await;
         }
         return finish_release(lease, ctx, reason).await;
     }
@@ -4794,7 +4794,7 @@ enum ChildTargetAbsenceProof {
 
 enum ChildProofAcknowledgement {
     Receipt {
-        receipt: crate::crd::TeardownReceipt,
+        receipt: Box<crate::crd::TeardownReceipt>,
         token: String,
     },
     NeverBound {
@@ -5659,7 +5659,7 @@ async fn finish_child_release_after_proof(
             .await;
         };
         ChildProofAcknowledgement::Receipt {
-            receipt: receipt.clone(),
+            receipt: Box::new(receipt.clone()),
             token,
         }
     } else if unbound_child_release_is_proven(&current, recorded_instance) {
@@ -5924,9 +5924,7 @@ fn validated_child_receipt_token(
     {
         return None;
     }
-    let Some(expected) = recorded_instance else {
-        return None;
-    };
+    let expected = recorded_instance?;
     if expected.uid.is_empty()
         || binding.instance.name != expected.name
         || binding.instance.uid != expected.uid
