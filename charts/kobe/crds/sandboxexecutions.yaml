@@ -180,10 +180,11 @@ spec:
                 type: string
               verdictDeadline:
                 description: |-
-                  Deadline after which a still-`Running` execution becomes `Unknown`.
+                  Legacy diagnostic deadline from the first durable-execution rollout.
 
-                  Persisted rather than derived, so a restarted controller reaches the
-                  same verdict as the one that started it.
+                  Retained for stored-object compatibility. Current Kobe versions never
+                  convert `Running` to a terminal state by time alone; an exact runner
+                  report or target-destruction receipt is required.
                 format: date-time
                 nullable: true
                 type: string

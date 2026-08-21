@@ -60,6 +60,14 @@ pub const MAX_RETENTION_BYTES: u64 = 8 * 1024 * 1024;
 /// consequence of how much somebody's command printed.
 pub const MAX_LOG_CHUNK_BYTES: usize = 256 * 1024;
 
+/// Largest encoded start request, including its terminating newline.
+///
+/// Kobe validates this before spending an execution reservation, and the
+/// runner enforces the same value while reading stdin. Keeping the bound in the
+/// shared wire crate prevents a rollout from accepting an execution that the
+/// installed runner can only reject after its idempotency key is durable.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 /// Whether an id may name a spool directory.
 ///
 /// Restrictive on purpose: a permissive check here is a path traversal with

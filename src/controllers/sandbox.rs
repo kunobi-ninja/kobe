@@ -58,6 +58,8 @@ pub struct SandboxContext {
     /// It is separate from workload/control-plane objects so a hard ledger
     /// quota cannot starve unrelated controllers or leader election.
     pub reservation_namespace: String,
+    /// Stops bounded runner cancellation during operator shutdown.
+    shutdown: CancellationToken,
     /// Whether the protected distributed access ledger is available.
     /// Production lifecycle controllers always enable it; focused controller
     /// unit tests may disable it and exercise the barrier through its own
@@ -1465,6 +1467,7 @@ async fn drive_release(
             &ctx.reservation_namespace,
             lease,
             &ctx.client,
+            &ctx.shutdown,
         )
         .await
         {
@@ -3105,6 +3108,7 @@ pub async fn run_sandbox_controller(
         client: client.clone(),
         namespace: namespace.to_string(),
         reservation_namespace: reservation_namespace.to_string(),
+        shutdown: shutdown.clone(),
         access_ledger_enabled: true,
     });
 
@@ -3260,6 +3264,7 @@ pub(crate) mod tests {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.to_string(),
             reservation_namespace: NS.to_string(),
+            shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
         });
         for (path_value, kind, uid) in [
@@ -3884,6 +3889,7 @@ pub(crate) mod tests {
             client: crate::testutil::mock_k8s_client(&server),
             namespace: NS.into(),
             reservation_namespace: NS.into(),
+            shutdown: CancellationToken::new(),
             access_ledger_enabled: false,
         });
 
@@ -5466,7 +5472,8 @@ pub(crate) mod tests {
                 "requestDigest": "d".repeat(64),
                 "podUid": "pod-uid",
                 "reservedAt": "2020-01-01T00:00:00Z",
-                "active": true
+                "creationState": "rejected",
+                "active": false
             }
         })
         .to_string();
@@ -5536,7 +5543,7 @@ pub(crate) mod tests {
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         let entries: serde_json::Value =
             serde_json::from_str(body[3]["value"].as_str().unwrap()).unwrap();
-        assert_eq!(entries["execution-a"]["active"], false);
+        assert_eq!(entries, serde_json::json!({}));
     }
 
     /// Run the destructive half only after the durable Releasing checkpoint

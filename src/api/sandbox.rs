@@ -282,9 +282,29 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     let requested_timeout = crate::pool::parse_duration(&requested.timeout)
         .and_then(|timeout| timeout.to_std().ok())
         .expect("validated execution timeout must parse");
-    if let Err(error) = executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now())
-    {
-        return execution_denied(&identity, &id, &error);
+    let initial_timeout =
+        match executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now()) {
+            Ok(timeout) => timeout,
+            Err(error) => return execution_denied(&identity, &id, &error),
+        };
+
+    // The same encoded-byte ceiling is enforced by the runner. Prove it before
+    // registration, capacity CAS, or CR creation so an oversized command cannot
+    // spend an idempotency key on something the target must reject.
+    let candidate_execution =
+        crate::crd::execution_name(&target.lease_uid, &requested.idempotency_key);
+    let candidate_start = crate::api::sandbox_runner::start_request(
+        &candidate_execution,
+        &requested.argv,
+        requested.cwd.as_deref(),
+        initial_timeout,
+    );
+    if crate::api::sandbox_runner::start_line(&candidate_start).is_err() {
+        return execution_denied(
+            &identity,
+            &id,
+            &executions::ExecutionRequestError::Invalid { what: "command" },
+        );
     }
 
     // Register before reserving capacity or creating the execution object.
@@ -300,6 +320,8 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     };
     let revoked = guard.cancelled();
 
+    let reservation_deadline =
+        tokio::time::Instant::now() + executions::EXECUTION_RESERVATION_TIMEOUT;
     let reservation = match executions::reserve_execution(
         &state.client,
         &state.namespace,
@@ -308,6 +330,8 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         &target,
         &container,
         &requested,
+        reservation_deadline,
+        &state.shutdown,
     )
     .await
     {
@@ -335,6 +359,21 @@ async fn create_sandbox_execution<B: ClusterBackend>(
             (existing, false)
         }
         executions::Reservation::Reserved(reserved) => (reserved, true),
+        executions::Reservation::Pending(pending) => {
+            info!(
+                principal = %identity.identity,
+                lease = %id,
+                execution = %pending.name_any(),
+                operation = "execution",
+                outcome = "creation_pending",
+                "Sandbox access"
+            );
+            return (
+                StatusCode::ACCEPTED,
+                Json(execution_response(&pending, None)),
+            )
+                .into_response();
+        }
     };
 
     // Belt and braces: a reservation that is not fresh must never spawn, even
@@ -533,7 +572,14 @@ async fn run_with_runner<B: ClusterBackend>(
     );
 
     let started = tokio::select! {
-        started = runner::start(scoped, target, container, &runner_path, &request) => started,
+        started = runner::start(
+            scoped,
+            target,
+            container,
+            &runner_path,
+            &request,
+            &state.shutdown,
+        ) => started,
         _ = revoked.cancelled() => {
             // The lease stopped permitting access mid-start. Whether the runner
             // received the request is exactly the thing nobody can now say.
@@ -645,14 +691,20 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
             scoped,
             &runner_path,
             revoked,
-            None,
         )
         .await;
     }
 
     let polled = complete_before_revocation(
         &revoked,
-        runner::poll(scoped, target, container, &runner_path, &record.name_any()),
+        runner::poll(
+            scoped,
+            target,
+            container,
+            &runner_path,
+            &record.name_any(),
+            &state.shutdown,
+        ),
     )
     .await;
     let report = match polled {
@@ -661,8 +713,15 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
             return sandbox_error(failure.http_status(), failure.to_string(), None);
         }
         None => {
-            let cancelled =
-                runner::cancel(scoped, target, container, &runner_path, &record.name_any()).await;
+            let cancelled = runner::cancel(
+                scoped,
+                target,
+                container,
+                &runner_path,
+                &record.name_any(),
+                &state.shutdown,
+            )
+            .await;
             record_revoked_outcome(state, record, cancelled).await;
             return sandbox_error(
                 StatusCode::GONE,
@@ -711,6 +770,7 @@ async fn complete_wait_mode<B: ClusterBackend>(
         &record.name_any(),
         report,
         revoked.clone(),
+        &state.shutdown,
     )
     .await
     {
@@ -732,7 +792,7 @@ async fn complete_wait_mode<B: ClusterBackend>(
     };
 
     let outcome = runner::outcome_from_report(&report);
-    executions::record_terminal(
+    let Some(durable) = executions::record_terminal(
         &state.client,
         &state.namespace,
         record,
@@ -740,7 +800,14 @@ async fn complete_wait_mode<B: ClusterBackend>(
         outcome.exit_code,
         &outcome.reason,
     )
-    .await;
+    .await
+    else {
+        return sandbox_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The runner outcome could not be committed",
+            None,
+        );
+    };
 
     wait_output_response(
         state,
@@ -748,11 +815,10 @@ async fn complete_wait_mode<B: ClusterBackend>(
         id,
         target,
         container,
-        record,
+        &durable,
         scoped,
         runner_path,
         revoked,
-        Some(outcome),
     )
     .await
 }
@@ -798,14 +864,20 @@ async fn wait_output_response<B: ClusterBackend>(
     scoped: &kube::Client,
     runner_path: &str,
     revoked: tokio_util::sync::CancellationToken,
-    observed_outcome: Option<crate::api::sandbox_runner::RunnerOutcome>,
 ) -> Response {
     use crate::api::sandbox_executions as executions;
     use crate::api::sandbox_runner as runner;
 
     let output = complete_before_revocation(
         &revoked,
-        runner::read_wait_output(scoped, target, container, runner_path, &record.name_any()),
+        runner::read_wait_output(
+            scoped,
+            target,
+            container,
+            runner_path,
+            &record.name_any(),
+            &state.shutdown,
+        ),
     )
     .await;
     let output = match output {
@@ -825,10 +897,7 @@ async fn wait_output_response<B: ClusterBackend>(
     };
 
     let refreshed = executions::refresh(&state.client, &state.namespace, record).await;
-    let response_record = response_record_with_observed_outcome(
-        refreshed.unwrap_or_else(|| record.clone()),
-        observed_outcome,
-    );
+    let response_record = refreshed.unwrap_or_else(|| record.clone());
     let status = response_record.status.clone().unwrap_or_default();
     let output = crate::api::sandbox_access::SandboxExecResponse {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -852,27 +921,6 @@ async fn wait_output_response<B: ClusterBackend>(
         Json(execution_response(&response_record, Some(output))),
     )
         .into_response()
-}
-
-/// Overlay an exact runner outcome on the record used for the HTTP response.
-///
-/// Status persistence is best-effort. A transient failed PATCH or refresh must
-/// not erase an exit code the runner just reported to this request; the next
-/// reconciliation can repair the durable copy.
-fn response_record_with_observed_outcome(
-    mut response_record: crate::crd::SandboxExecution,
-    observed_outcome: Option<crate::api::sandbox_runner::RunnerOutcome>,
-) -> crate::crd::SandboxExecution {
-    // A successful runner poll is the exact outcome even if persisting or
-    // refreshing its status had a transient failure. Keep durable metadata,
-    // but never discard an observed exit code in the HTTP response.
-    if let Some(outcome) = observed_outcome {
-        let status = response_record.status.get_or_insert_default();
-        status.state = outcome.state;
-        status.exit_code = outcome.exit_code;
-        status.reason = Some(outcome.reason);
-    }
-    response_record
 }
 
 /// Complete one bounded operation only while the lease still permits access.
@@ -905,8 +953,8 @@ async fn runner_started_response<B: ClusterBackend>(
     use crate::api::sandbox_runner as runner;
 
     let outcome = runner::outcome_from_report(report);
-    if outcome.state.is_terminal() {
-        executions::record_terminal(
+    let durable = if outcome.state.is_terminal() {
+        let Some(durable) = executions::record_terminal(
             &state.client,
             &state.namespace,
             reserved,
@@ -914,10 +962,27 @@ async fn runner_started_response<B: ClusterBackend>(
             outcome.exit_code,
             &outcome.reason,
         )
-        .await;
-    }
-    let refreshed = executions::refresh(&state.client, &state.namespace, reserved).await;
-    let record = refreshed.as_ref().unwrap_or(reserved);
+        .await
+        else {
+            return sandbox_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The runner outcome could not be committed",
+                None,
+            );
+        };
+        Some(durable)
+    } else {
+        let Some(running) = executions::refresh(&state.client, &state.namespace, reserved).await
+        else {
+            return sandbox_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The running execution could not be re-read",
+                None,
+            );
+        };
+        Some(running)
+    };
+    let record = durable.as_ref().unwrap_or(reserved);
     info!(
         principal = %identity.identity,
         lease = %id,
@@ -950,6 +1015,7 @@ enum WaitRunnerFailure {
 /// Lease revocation races every poll and invokes the runner's process-group
 /// cancellation. A polling failure leaves the durable record Running so a
 /// later GET can recover the answer; it never invents a terminal outcome.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_runner(
     scoped: &kube::Client,
     target: &crate::api::sandbox_access::SandboxTarget,
@@ -958,6 +1024,7 @@ async fn wait_for_runner(
     execution: &str,
     mut report: kobe_runner::protocol::ExecutionReport,
     revoked: tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<kobe_runner::protocol::ExecutionReport, WaitRunnerFailure> {
     use crate::api::sandbox_runner as runner;
 
@@ -965,18 +1032,24 @@ async fn wait_for_runner(
         tokio::select! {
             _ = revoked.cancelled() => {
                 return Err(WaitRunnerFailure::Revoked(
-                    runner::cancel(scoped, target, container, runner_path, execution).await,
+                    runner::cancel(
+                        scoped, target, container, runner_path, execution, shutdown,
+                    ).await,
                 ));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
         }
         report = tokio::select! {
-            polled = runner::poll(scoped, target, container, runner_path, execution) => {
+            polled = runner::poll(
+                scoped, target, container, runner_path, execution, shutdown,
+            ) => {
                 polled.map_err(WaitRunnerFailure::Poll)?
             }
             _ = revoked.cancelled() => {
                 return Err(WaitRunnerFailure::Revoked(
-                    runner::cancel(scoped, target, container, runner_path, execution).await,
+                    runner::cancel(
+                        scoped, target, container, runner_path, execution, shutdown,
+                    ).await,
                 ));
             }
         };
@@ -995,7 +1068,7 @@ async fn wait_for_runner(
 /// The one exception is a runner that has *no record* of an execution Kobe
 /// reserved. That means the container was replaced under a Pod that kept its
 /// identity, and the outcome is genuinely unrecoverable — so it settles as
-/// `Unknown` now rather than after the verdict deadline.
+/// `Unknown` immediately. Wall-clock age alone never settles a running command.
 async fn reconcile_runner<B: ClusterBackend>(
     state: &AppState<B>,
     target: &crate::api::sandbox_access::SandboxTarget,
@@ -1016,7 +1089,15 @@ async fn reconcile_runner<B: ClusterBackend>(
     if current.is_terminal() {
         return record.clone();
     }
-    let polled = runner::poll(scoped, target, container, runner_path, &record.name_any()).await;
+    let polled = runner::poll(
+        scoped,
+        target,
+        container,
+        runner_path,
+        &record.name_any(),
+        &state.shutdown,
+    )
+    .await;
 
     let outcome = match polled {
         Ok(report) => runner::outcome_from_report(&report),
@@ -1027,8 +1108,8 @@ async fn reconcile_runner<B: ClusterBackend>(
                 reason: "runner_forgot_execution".into(),
             }
         }
-        // Nothing was learned. The record keeps saying `Running`, and the
-        // verdict deadline remains the backstop it was designed to be.
+        // Nothing was learned. The record keeps saying `Running`; wall clock is
+        // not evidence that the process group stopped.
         Err(_) => return record.clone(),
     };
     if !outcome.state.is_terminal() {
@@ -1043,10 +1124,8 @@ async fn reconcile_runner<B: ClusterBackend>(
         outcome.exit_code,
         &outcome.reason,
     )
-    .await;
-    executions::refresh(&state.client, &state.namespace, record)
-        .await
-        .unwrap_or_else(|| record.clone())
+    .await
+    .unwrap_or_else(|| record.clone())
 }
 
 #[tracing::instrument(skip_all, fields(lease = %id))]
@@ -1380,6 +1459,7 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                 &record.name_any(),
                 stream,
                 offset,
+                &state.shutdown,
             ),
         )
         .await;
@@ -1411,16 +1491,12 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
         }
     }
 
-    let window = |chunk: &kobe_runner::protocol::LogChunk| {
-        use base64::Engine;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&chunk.data_base64)
-            .unwrap_or_default();
+    let window = |chunk: &crate::api::sandbox_runner::RunnerLogChunk| {
         ExecutionStreamWindow {
             // Lossy on purpose: a sandboxed command's output is arbitrary
             // bytes, and refusing the window because one of them was not UTF-8
             // would lose all the ones that were.
-            data: String::from_utf8_lossy(&data).into_owned(),
+            data: String::from_utf8_lossy(&chunk.bytes).into_owned(),
             next_offset: chunk.next_offset,
             more: chunk.more,
             truncated: chunk.truncated,
@@ -1479,6 +1555,7 @@ async fn runner_output_revoked_response<B: ClusterBackend>(
             container,
             runner_path,
             &record.name_any(),
+            &state.shutdown,
         )
         .await;
         record_revoked_outcome(state, record, cancelled).await;
@@ -1702,6 +1779,7 @@ async fn cancel_runner<B: ClusterBackend>(
             &container,
             &runner_path,
             &record.name_any(),
+            &state.shutdown,
         ),
     )
     .await;
@@ -1724,7 +1802,7 @@ async fn cancel_runner<B: ClusterBackend>(
                     None,
                 ));
             }
-            executions::record_terminal(
+            let Some(response_record) = executions::record_terminal(
                 &state.client,
                 &state.namespace,
                 &record,
@@ -1732,12 +1810,14 @@ async fn cancel_runner<B: ClusterBackend>(
                 outcome.exit_code,
                 &outcome.reason,
             )
-            .await;
-            let refreshed = executions::refresh(&state.client, &state.namespace, &record).await;
-            let response_record = response_record_with_observed_outcome(
-                refreshed.unwrap_or_else(|| record.clone()),
-                Some(outcome.clone()),
-            );
+            .await
+            else {
+                return RunnerCancellation::Handled(sandbox_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The runner cancellation outcome could not be committed",
+                    None,
+                ));
+            };
             info!(
                 principal = %identity.identity,
                 lease = %id,
@@ -4568,6 +4648,7 @@ async fn resolve_timed_out_admission(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_timed_out_admission_until(
     leases: &Api<SandboxLease>,
     reservations: &Api<Lease>,
@@ -7275,6 +7356,13 @@ mod tests {
                                 object["metadata"]["annotations"]
                                     [SANDBOX_RESERVATIONS_ANNOTATION] = operation["value"].clone();
                             }
+                            Some(
+                                "/metadata/annotations/kobe.kunobi.ninja~1sandbox-access-gate",
+                            ) => {
+                                object["metadata"]["annotations"]
+                                    [crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION] =
+                                    operation["value"].clone();
+                            }
                             _ => {}
                         }
                     }
@@ -8873,8 +8961,12 @@ mod tests {
         };
         let persisted =
             encoded_reservation_provenance(&parent, std::slice::from_ref(&reservation)).unwrap();
+        let parent_uid = parent.uid().unwrap();
         let access_gate = crate::sandbox_access_ledger::AccessGateReference {
-            name: "sandbox-access-sandbox-pending-uid".into(),
+            name: format!(
+                "kobe-access-g-{}",
+                &format!("{:x}", Sha256::digest(parent_uid.as_bytes()))[..40]
+            ),
             uid: "access-gate-uid".into(),
         };
         let gate_provenance =
@@ -12273,24 +12365,6 @@ mod tests {
         assert_eq!(response.exit_code, Some(42));
         assert_eq!(response.stdout.as_deref(), Some("retained-out"));
         assert_eq!(response.stderr.as_deref(), Some("retained-err"));
-
-        let mut stale_running = record.clone();
-        stale_running.status.as_mut().unwrap().state = crate::crd::ExecutionState::Running;
-        stale_running.status.as_mut().unwrap().exit_code = None;
-        let exact = response_record_with_observed_outcome(
-            stale_running,
-            Some(crate::api::sandbox_runner::RunnerOutcome {
-                state: crate::crd::ExecutionState::Failed,
-                exit_code: Some(42),
-                reason: "exited".into(),
-            }),
-        );
-        assert_eq!(
-            exact.status.as_ref().unwrap().state,
-            crate::crd::ExecutionState::Failed,
-            "a transient status persistence failure must not hide the observed outcome"
-        );
-        assert_eq!(exact.status.as_ref().unwrap().exit_code, Some(42));
 
         record.spec.runner_managed = None;
         assert_eq!(

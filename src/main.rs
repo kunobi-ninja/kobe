@@ -445,7 +445,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawning it in `disabled` mode would have it watch CRDs that may not
     // exist and log errors forever; spawning it without the #72 validation
     // would let it write objects an incompatible runtime cannot reconcile.
-    let sandbox_controller_handle =
+    let (sandbox_controller_handle, execution_reaper_handle) =
         if agent_sandbox_mode == sandbox_runtime::AgentSandboxMode::External {
             let sandbox_client = client.clone();
             let sandbox_ns = namespace.clone();
@@ -461,16 +461,15 @@ async fn main() -> anyhow::Result<()> {
                 .await;
             });
 
-            // Executions left Running by a process that disappeared are settled
-            // here. The reserve-then-spawn order buys "never a duplicate spawn"
-            // and pays for it with records nobody is left to finish; this is what
-            // turns those into an honest `Unknown` rather than a poll that never
-            // ends.
+            // Queued executions whose setup owner disappeared are settled here.
+            // Running executions remain fail-closed until the exact runner
+            // reports a terminal result (or NotFound); elapsed wall time alone
+            // is never evidence that their process stopped.
             let execution_reaper_client = client.clone();
             let execution_reaper_ns = namespace.clone();
             let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
             let execution_reaper_shutdown = shutdown.clone();
-            tokio::spawn(async move {
+            let execution_reaper_handle = tokio::spawn(async move {
                 api::sandbox_executions::run_execution_reaper(
                     execution_reaper_client,
                     &execution_reaper_ns,
@@ -507,10 +506,10 @@ async fn main() -> anyhow::Result<()> {
                 .await;
             });
 
-            Some(handle)
+            (Some(handle), Some(execution_reaper_handle))
         } else {
             info!("Sandbox placement not started (agentSandbox.mode is not external)");
-            None
+            (None, None)
         };
 
     // Start IPAM controller. Reconciles `CIDRClaim`s against the
@@ -612,6 +611,12 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(()) => warn!("Sandbox placement controller exited unexpectedly"),
                     Err(e) => error!("Sandbox placement controller panicked: {e}"),
+                }
+            }
+            result = await_optional_critical_task(execution_reaper_handle) => {
+                match result {
+                    Ok(()) => warn!("Sandbox execution reaper exited unexpectedly"),
+                    Err(e) => error!("Sandbox execution reaper panicked: {e}"),
                 }
             }
         }

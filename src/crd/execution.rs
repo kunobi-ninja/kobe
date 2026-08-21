@@ -154,10 +154,11 @@ pub struct SandboxExecutionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     pub reason: Option<String>,
-    /// Deadline after which a still-`Running` execution becomes `Unknown`.
+    /// Legacy diagnostic deadline from the first durable-execution rollout.
     ///
-    /// Persisted rather than derived, so a restarted controller reaches the
-    /// same verdict as the one that started it.
+    /// Retained for stored-object compatibility. Current Kobe versions never
+    /// convert `Running` to a terminal state by time alone; an exact runner
+    /// report or target-destruction receipt is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
     pub verdict_deadline: Option<String>,

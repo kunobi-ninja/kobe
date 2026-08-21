@@ -24,25 +24,18 @@
 //! on stdin, which nothing on the path records. It is one line, so the runner
 //! never has to wait for an EOF that the exec transport may never deliver.
 
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 
 use clap::{Parser, Subcommand};
 
 use kobe_runner::protocol::{
-    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_RETENTION_BYTES,
-    MAX_TIMEOUT_SECONDS, PROTOCOL_VERSION, Reply, RunnerErrorCode, RunnerState, StartRequest,
-    is_valid_id,
+    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES,
+    MAX_RETENTION_BYTES, MAX_TIMEOUT_SECONDS, PROTOCOL_VERSION, Reply, RunnerErrorCode,
+    RunnerState, StartRequest, is_valid_id,
 };
 use kobe_runner::spool::{self, Reservation, Spool, SpoolError};
 #[cfg(unix)]
 use kobe_runner::supervisor;
-
-/// Largest start request the runner will read.
-///
-/// The request arrives on a pipe from outside the container. Reading it
-/// unbounded would let whoever holds that pipe make the runner allocate without
-/// limit, inside the tenant's own memory cgroup.
-const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 #[derive(Parser)]
 #[command(name = "kobe-runner", about = "Supervise one Kobe Sandbox execution")]
@@ -145,14 +138,7 @@ fn start(spool: &Spool, state_dir: &str) -> Reply {
     // waiting for something that may never come — and the command would not
     // start until the timeout fired. JSON never contains a raw newline, so a
     // line IS the document.
-    let mut raw = Vec::new();
-    if std::io::BufReader::new(std::io::stdin().take(MAX_REQUEST_BYTES))
-        .read_until(b'\n', &mut raw)
-        .is_err()
-    {
-        return error(RunnerErrorCode::InvalidRequest);
-    }
-    let Ok(request) = serde_json::from_slice::<StartRequest>(&raw) else {
+    let Ok(request) = read_start_request(std::io::stdin()) else {
         return error(RunnerErrorCode::InvalidRequest);
     };
     if let Err(code) = validate(&request) {
@@ -184,6 +170,19 @@ fn start(spool: &Spool, state_dir: &str) -> Reply {
         Ok(report) => Reply::Started { report },
         Err(code) => error(code),
     }
+}
+
+fn read_start_request(reader: impl std::io::Read) -> Result<StartRequest, RunnerErrorCode> {
+    let mut raw = Vec::new();
+    if std::io::BufReader::new(reader.take((MAX_REQUEST_BYTES + 1) as u64))
+        .read_until(b'\n', &mut raw)
+        .is_err()
+        || raw.len() > MAX_REQUEST_BYTES
+        || !raw.ends_with(b"\n")
+    {
+        return Err(RunnerErrorCode::InvalidRequest);
+    }
+    serde_json::from_slice(&raw).map_err(|_| RunnerErrorCode::InvalidRequest)
 }
 
 /// Refuse a request that could never run, before anything is reserved.
@@ -469,5 +468,36 @@ mod tests {
         assert!(with(60, 0).is_err());
         assert!(with(60, MAX_RETENTION_BYTES + 1).is_err());
         assert!(with(60, u64::MAX).is_err());
+    }
+
+    /// The runner reads exactly the same encoded boundary Kobe validates.
+    #[test]
+    fn encoded_request_bound_is_exact_and_requires_a_complete_line() {
+        let mut request = request();
+        request.argv = vec![String::new()];
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        let fill = MAX_REQUEST_BYTES - encoded.len();
+        request.argv[0] = "x".repeat(fill);
+        let mut exact = serde_json::to_vec(&request).unwrap();
+        exact.push(b'\n');
+        assert_eq!(exact.len(), MAX_REQUEST_BYTES);
+        assert_eq!(read_start_request(exact.as_slice()).unwrap(), request);
+
+        let mut oversized = request.clone();
+        oversized.argv[0].push('x');
+        let mut oversized = serde_json::to_vec(&oversized).unwrap();
+        oversized.push(b'\n');
+        assert_eq!(oversized.len(), MAX_REQUEST_BYTES + 1);
+        assert_eq!(
+            read_start_request(oversized.as_slice()).unwrap_err(),
+            RunnerErrorCode::InvalidRequest
+        );
+
+        assert_eq!(
+            read_start_request(&exact[..exact.len() - 1]).unwrap_err(),
+            RunnerErrorCode::InvalidRequest,
+            "EOF without the line receipt is incomplete"
+        );
     }
 }

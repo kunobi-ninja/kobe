@@ -72,13 +72,7 @@ pub const EXECUTION_OUTPUT_RETENTION_BYTES: u64 = 1024 * 1024;
 /// is retired with an honest Unknown record.
 pub const EXECUTION_SETUP_GRACE: chrono::Duration = chrono::Duration::minutes(5);
 
-/// How long a `Running` execution may go unresolved before it becomes
-/// `Unknown`.
-///
-/// Generous, because the alternative to waiting is guessing. An execution
-/// declared `Unknown` too early tells a caller to make a decision they did not
-/// need to make; one never declared at all leaves them polling forever.
-pub const VERDICT_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+const STATUS_CAS_ATTEMPTS: usize = 64;
 
 /// Why an execution request was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -220,7 +214,15 @@ pub enum Reservation {
     /// The same request already reserved it. Return the original; spawn
     /// nothing.
     AlreadyExists(Box<SandboxExecution>),
+    /// Capacity is durable and the exact CREATE/bind resolver owns the request,
+    /// but this HTTP task reached its absolute deadline or process shutdown.
+    /// The caller receives a non-retry 202 handle; retrying the same key/digest
+    /// may observe the record but can never mint a second spawn authority.
+    Pending(Box<SandboxExecution>),
 }
+
+/// Absolute budget for capacity reservation, CR CREATE, and UID binding.
+pub const EXECUTION_RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn build_execution_record(
     namespace: &str,
@@ -280,6 +282,7 @@ fn build_execution_record(
 /// its exact UID is bound back into the same gate before spawn. On 409 the
 /// existing record decides: same request digest returns it, a different one
 /// conflicts.
+#[allow(clippy::too_many_arguments)]
 pub async fn reserve_execution(
     client: &kube::Client,
     namespace: &str,
@@ -288,6 +291,8 @@ pub async fn reserve_execution(
     target: &SandboxTarget,
     container: &str,
     request: &ExecutionRequest,
+    deadline: tokio::time::Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Reservation, ExecutionRequestError> {
     validate_request(request)?;
 
@@ -307,16 +312,35 @@ pub async fn reserve_execution(
         .clone()
         .ok_or(ExecutionRequestError::Backend)?;
 
-    let capacity = crate::sandbox_access_ledger::reserve_execution_capacity(
-        client,
-        ledger_namespace,
-        lease,
+    let capacity = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Err(ExecutionRequestError::Backend),
+        _ = tokio::time::sleep_until(deadline) => return Err(ExecutionRequestError::Backend),
+        capacity = crate::sandbox_access_ledger::reserve_execution_capacity(
+            client,
+            ledger_namespace,
+            lease,
+            &name,
+            &digest,
+            &target.pod_uid,
+        ) => capacity.map_err(|_| ExecutionRequestError::Backend)?,
+    };
+
+    let reserved = build_execution_record(
+        namespace,
         &name,
+        lease,
+        target,
+        request,
         &digest,
-        &target.pod_uid,
-    )
-    .await
-    .map_err(|_| ExecutionRequestError::Backend)?;
+        SandboxExecutionTarget {
+            namespace: target.namespace.clone(),
+            pod_name: target.pod_name.clone(),
+            pod_uid: target.pod_uid.clone(),
+            container: container.to_string(),
+            runner_path: runner_path.clone(),
+        },
+    );
     match capacity {
         crate::sandbox_access_ledger::ExecutionCapacity::LimitReached => {
             return Err(ExecutionRequestError::LimitReached);
@@ -332,10 +356,18 @@ pub async fn reserve_execution(
             return Err(ExecutionRequestError::IdempotencyConflict);
         }
         crate::sandbox_access_ledger::ExecutionCapacity::ExistingTerminal { execution_uid } => {
-            let existing = executions
-                .get(&name)
-                .await
-                .map_err(|_| ExecutionRequestError::Backend)?;
+            let existing = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    return Ok(Reservation::Pending(Box::new(reserved)));
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Ok(Reservation::Pending(Box::new(reserved)));
+                }
+                existing = executions.get(&name) => {
+                    existing.map_err(|_| ExecutionRequestError::Backend)?
+                }
+            };
             if execution_uid.as_deref() != existing.uid().as_deref() {
                 return Err(ExecutionRequestError::Backend);
             }
@@ -362,22 +394,67 @@ pub async fn reserve_execution(
         | crate::sandbox_access_ledger::ExecutionCapacity::ExistingActive { .. } => {}
     }
 
-    let reserved = build_execution_record(
-        namespace,
-        &name,
-        lease,
-        target,
-        request,
-        &digest,
-        SandboxExecutionTarget {
-            namespace: target.namespace.clone(),
-            pod_name: target.pod_name.clone(),
-            pod_uid: target.pod_uid.clone(),
-            container: container.to_string(),
-            runner_path: runner_path.clone(),
-        },
-    );
+    // Once the capacity CAS is visible, run CREATE/bind in its own task. Axum
+    // cancellation or shutdown may drop the JoinHandle, but Tokio detaches the
+    // task and the durable `Creating` tombstone keeps teardown fail-closed until
+    // this request resolves or an exact retry observes the same object.
+    let resolver_client = client.clone();
+    let resolver_namespace = namespace.to_string();
+    let resolver_ledger_namespace = ledger_namespace.to_string();
+    let resolver_lease = lease.clone();
+    let resolver_target = target.clone();
+    let resolver_container = container.to_string();
+    let resolver_runner_path = runner_path.clone();
+    let resolver_digest = digest.clone();
+    let resolver_legacy_digest = legacy_digest.clone();
+    let resolver_detached = request.detached;
+    let pending = reserved.clone();
+    let mut resolver = tokio::spawn(async move {
+        let result = resolve_execution_create(
+            &resolver_client,
+            &resolver_namespace,
+            &resolver_ledger_namespace,
+            &resolver_lease,
+            &resolver_target,
+            &resolver_container,
+            &resolver_runner_path,
+            &resolver_digest,
+            &resolver_legacy_digest,
+            resolver_detached,
+            reserved,
+        )
+        .await;
+        if let Err(error) = &result {
+            tracing::warn!(execution = %name, %error, "execution CREATE/bind resolver did not complete");
+        }
+        result
+    });
 
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(Reservation::Pending(Box::new(pending))),
+        _ = tokio::time::sleep_until(deadline) => Ok(Reservation::Pending(Box::new(pending))),
+        resolved = &mut resolver => resolved
+            .map_err(|_| ExecutionRequestError::Backend)?,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_execution_create(
+    client: &kube::Client,
+    namespace: &str,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    target: &SandboxTarget,
+    container: &str,
+    runner_path: &str,
+    digest: &str,
+    legacy_digest: &str,
+    detached: bool,
+    reserved: SandboxExecution,
+) -> Result<Reservation, ExecutionRequestError> {
+    let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
+    let name = reserved.name_any();
     let reservation = match executions.create(&PostParams::default(), &reserved).await {
         Ok(created) => Reservation::Reserved(Box::new(created)),
         Err(kube::Error::Api(error)) if error.code == 409 => {
@@ -387,7 +464,7 @@ pub async fn reserve_execution(
                 .await
                 .map_err(|_| ExecutionRequestError::Backend)?;
             if existing.spec.lease_uid == target.lease_uid
-                && !execution_reuse_target_holds(&existing.spec, target, container, &runner_path)
+                && !execution_reuse_target_holds(&existing.spec, target, container, runner_path)
             {
                 // The key still names the old execution, but its runner spool
                 // belonged to a different Pod. Never reinterpret that id in a
@@ -399,9 +476,9 @@ pub async fn reserve_execution(
             match compatible_reuse_verdict(
                 &existing.spec,
                 &target.lease_uid,
-                &digest,
-                &legacy_digest,
-                request.detached,
+                digest,
+                legacy_digest,
+                detached,
             ) {
                 ReuseVerdict::SameRequest => Reservation::AlreadyExists(Box::new(existing)),
                 ReuseVerdict::Conflict => {
@@ -415,10 +492,26 @@ pub async fn reserve_execution(
                 }
             }
         }
+        Err(kube::Error::Api(error)) if definitive_create_rejection(error.code) => {
+            if let Err(rejection_error) = crate::sandbox_access_ledger::reject_execution_creation(
+                client,
+                ledger_namespace,
+                lease,
+                &name,
+                digest,
+                &target.pod_uid,
+            )
+            .await
+            {
+                tracing::warn!(execution = %name, error = %rejection_error, "could not checkpoint definitive execution CREATE rejection");
+            }
+            return Err(ExecutionRequestError::Backend);
+        }
         Err(_) => return Err(ExecutionRequestError::Backend),
     };
     let execution = match &reservation {
         Reservation::Reserved(execution) | Reservation::AlreadyExists(execution) => execution,
+        Reservation::Pending(execution) => execution,
     };
     if !crate::sandbox_access_ledger::bind_execution_capacity(
         client,
@@ -436,6 +529,18 @@ pub async fn reserve_execution(
         ));
     }
     Ok(reservation)
+}
+
+/// API responses that prove the object was not created.
+///
+/// Transport errors, request timeout, throttling, conflict, and every 5xx stay
+/// ambiguous. Their `Creating` tombstone remains occupied because a late CREATE
+/// can still become visible.
+fn definitive_create_rejection(code: u16) -> bool {
+    matches!(
+        code,
+        400 | 401 | 403 | 404 | 405 | 406 | 410 | 411 | 413 | 414 | 415 | 422
+    )
 }
 
 /// Whether an execution still addresses the exact Pod that reserved it.
@@ -543,26 +648,6 @@ pub fn may_spawn(execution: &SandboxExecution) -> bool {
         == ExecutionState::Queued
 }
 
-/// Whether a `Running` execution has gone unresolved long enough to be
-/// `Unknown`.
-///
-/// A missing or unreadable deadline resolves to `false`: refusing to declare
-/// `Unknown` leaves a caller polling, which is recoverable; declaring it
-/// wrongly tells them a completed command may not have run.
-pub fn verdict_due(
-    status: &crate::crd::SandboxExecutionStatus,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    if status.state != ExecutionState::Running {
-        return false;
-    }
-    status
-        .verdict_deadline
-        .as_deref()
-        .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).ok())
-        .is_some_and(|deadline| now >= deadline)
-}
-
 /// Whether a reservation stayed Queued past the only window in which Kobe may
 /// checkpoint it Running.
 pub fn queued_verdict_due(
@@ -585,15 +670,7 @@ pub fn queued_verdict_due(
         .is_some_and(|created| now >= created + EXECUTION_SETUP_GRACE)
 }
 
-/// The deadline recorded when an execution starts running.
-pub fn verdict_deadline(
-    started: chrono::DateTime<chrono::Utc>,
-    timeout: chrono::Duration,
-) -> chrono::DateTime<chrono::Utc> {
-    started + timeout + VERDICT_GRACE
-}
-
-/// Move a reservation to `Running` and record the deadline its verdict uses.
+/// Move a reservation to `Running` before the runner may see it.
 ///
 /// Written BEFORE the spawn. After this point nothing may spawn this key
 /// again, whatever happens next — including this process disappearing.
@@ -601,31 +678,29 @@ pub async fn mark_running(
     client: &kube::Client,
     namespace: &str,
     execution: &SandboxExecution,
-    timeout: std::time::Duration,
+    _timeout: std::time::Duration,
 ) -> Result<(), ExecutionRequestError> {
     let started = chrono::Utc::now();
-    let deadline = verdict_deadline(
-        started,
-        chrono::Duration::from_std(timeout).unwrap_or(VERDICT_GRACE),
-    );
     mutate_status(client, namespace, execution, |status| {
         crate::crd::transition_execution(status.state, ExecutionState::Running, None)
             .map_err(|_| ExecutionRequestError::Backend)?;
         status.state = ExecutionState::Running;
         status.started_at = Some(started.to_rfc3339());
-        status.verdict_deadline = Some(deadline.to_rfc3339());
+        // A wall clock cannot prove that the runner stopped. Legacy records may
+        // carry this field, but current writers never use it as a terminal CAS.
+        status.verdict_deadline = None;
         Ok(())
     })
     .await
     .map(|_| ())
 }
 
-/// Record a settled outcome.
+/// Record a settled outcome and return the authoritative durable winner.
 ///
-/// Best-effort by design, and never propagated: this runs on paths that are
-/// already returning an error to the caller, and failing to write the record
-/// must not turn one problem into two. A record left `Running` is exactly what
-/// the verdict deadline exists to resolve.
+/// Terminal state is monotonic. If another exact writer wins the UID/RV CAS,
+/// this retries from a strong GET; if that writer already committed a terminal
+/// state, that durable state is returned instead of overlaying a different
+/// runner observation in the HTTP response.
 pub async fn record_terminal(
     client: &kube::Client,
     namespace: &str,
@@ -633,25 +708,67 @@ pub async fn record_terminal(
     state: ExecutionState,
     exit_code: Option<i32>,
     reason: &str,
-) {
+) -> Option<SandboxExecution> {
+    match persist_terminal(client, namespace, execution, state, exit_code, reason).await {
+        Ok(durable) => Some(durable),
+        Err(error) => {
+            tracing::warn!(
+                execution = %execution.name_any(),
+                error = %error,
+                "could not durably record the execution outcome"
+            );
+            None
+        }
+    }
+}
+
+async fn persist_terminal(
+    client: &kube::Client,
+    namespace: &str,
+    expected: &SandboxExecution,
+    state: ExecutionState,
+    exit_code: Option<i32>,
+    reason: &str,
+) -> Result<SandboxExecution, ExecutionRequestError> {
+    let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
+    let expected_uid = expected.uid().ok_or(ExecutionRequestError::Backend)?;
     let finished_at = chrono::Utc::now().to_rfc3339();
-    if let Err(error) = mutate_status(client, namespace, execution, |status| {
+    for _ in 0..STATUS_CAS_ATTEMPTS {
+        let live = executions
+            .get(&expected.name_any())
+            .await
+            .map_err(|_| ExecutionRequestError::Backend)?;
+        if live.uid().as_deref() != Some(expected_uid.as_str()) {
+            return Err(ExecutionRequestError::Backend);
+        }
+        let mut status = live.status.clone().unwrap_or_default();
+        if status.state.is_terminal() {
+            return Ok(live);
+        }
         crate::crd::transition_execution(status.state, state, exit_code)
             .map_err(|_| ExecutionRequestError::Backend)?;
         status.state = state;
-        status.finished_at = Some(finished_at);
+        status.finished_at = Some(finished_at.clone());
         status.exit_code = exit_code;
         status.reason = Some(reason.to_string());
-        Ok(())
-    })
-    .await
-    {
-        tracing::warn!(
-            execution = %execution.name_any(),
-            error = %error,
-            "could not record the execution outcome; the verdict deadline will resolve it"
-        );
+        let resource_version = live
+            .resource_version()
+            .ok_or(ExecutionRequestError::Backend)?;
+        let patch = fenced_status_patch(&expected_uid, &resource_version, &status)?;
+        match executions
+            .patch_status(
+                &expected.name_any(),
+                &PatchParams::default(),
+                &Patch::Json::<()>(patch),
+            )
+            .await
+        {
+            Ok(updated) => return Ok(updated),
+            Err(kube::Error::Api(error)) if error.code == 409 || error.code == 422 => continue,
+            Err(_) => return Err(ExecutionRequestError::Backend),
+        }
     }
+    Err(ExecutionRequestError::Backend)
 }
 
 /// Settle a setup timeout only while the exact record is still `Queued`.
@@ -810,12 +927,13 @@ pub async fn cancel_owned(
         .or(Some(execution)))
 }
 
-/// Resolve executions nobody is left to resolve.
+/// Resolve setup reservations nobody is left to resolve.
 ///
 /// The reserve-then-spawn order guarantees no duplicate spawn, and pays for it
-/// with records that can be left `Running` by a process that disappeared. This
-/// is what settles them: past its verdict deadline, an execution nobody
-/// finished becomes `Unknown`.
+/// with records that can be left `Queued` before any runner started. This
+/// settles only that proven pre-spawn state. A `Running` record is never judged
+/// by wall clock: only an exact runner report or exact target-destruction receipt
+/// can establish its terminal state.
 ///
 /// `Unknown`, and never `Failed`. A caller reading `Failed` retries; a caller
 /// reading `Unknown` has to decide, which is the correct amount of work to
@@ -858,32 +976,15 @@ pub async fn run_execution_reaper(
                 complete_capacity_for_record(&client, &leases, ledger_namespace, &execution).await;
                 continue;
             }
-            let running_due = execution
-                .status
-                .as_ref()
-                .is_some_and(|status| verdict_due(status, now));
             let setup_due = state == ExecutionState::Queued && queued_verdict_due(&execution, now);
-            if !running_due && !setup_due {
+            if !setup_due {
                 continue;
             }
             tracing::warn!(
                 execution = %execution.name_any(),
-                "execution outcome was never recorded; declaring it Unknown"
+                "execution never reached Running; declaring setup Unknown"
             );
-            let terminal = if setup_due {
-                record_queued_setup_unknown(&client, namespace, &execution).await
-            } else {
-                record_terminal(
-                    &client,
-                    namespace,
-                    &execution,
-                    ExecutionState::Unknown,
-                    None,
-                    "outcome_unverifiable",
-                )
-                .await;
-                refresh(&client, namespace, &execution).await
-            };
+            let terminal = record_queued_setup_unknown(&client, namespace, &execution).await;
             if let Some(terminal) = terminal {
                 complete_capacity_for_record(&client, &leases, ledger_namespace, &terminal).await;
             }
@@ -896,11 +997,9 @@ pub async fn run_execution_reaper(
 
 /// Retire setup reservations that never reached the UID-bind checkpoint.
 ///
-/// This sweep is the liveness half of reserve-before-CREATE. The gate CAS is
-/// also the safety half: a late CREATE may still produce its finalised record,
-/// but once the reservation is inactive no caller can bind or spawn it. A late
-/// exact record is adopted into the inactive manifest so lease teardown can
-/// prove and delete it instead of leaking a finalizer forever.
+/// A 404 never closes `Creating`: a late CREATE may still produce its finalised
+/// record. An exact record is adopted into the inactive manifest by CAS so a
+/// racing bind either wins first or can never start the runner afterward.
 async fn reap_unbound_execution_capacity(
     client: &kube::Client,
     leases: &Api<SandboxLease>,
@@ -1236,14 +1335,15 @@ async fn remove_execution_record(
 /// The distributed access gate must already be closed and stream-empty. The
 /// gate's execution manifest is then the durable inventory: a bound entry may
 /// disappear only after its exact runner outcome and record deletion are
-/// proven; an unbound entry can be retired because the closed gate makes a
-/// later bind/spawn impossible.
+/// proven. A `Creating` tombstone is never retired merely because its object is
+/// absent: a lost CREATE response may still land after that observation.
 pub async fn cleanup_lease_executions(
     management_client: &kube::Client,
     execution_namespace: &str,
     ledger_namespace: &str,
     lease: &SandboxLease,
     target_client: &kube::Client,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> ExecutionCleanupOutcome {
     cleanup_lease_executions_inner(
         management_client,
@@ -1251,6 +1351,7 @@ pub async fn cleanup_lease_executions(
         ledger_namespace,
         lease,
         Some(target_client),
+        shutdown,
     )
     .await
 }
@@ -1261,6 +1362,7 @@ async fn cleanup_lease_executions_inner(
     ledger_namespace: &str,
     lease: &SandboxLease,
     target_client: Option<&kube::Client>,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> ExecutionCleanupOutcome {
     use crate::api::sandbox_runner::{self as runner, RunnerCallFailure};
     use kobe_runner::protocol::RunnerErrorCode;
@@ -1318,14 +1420,30 @@ async fn cleanup_lease_executions_inner(
     if let Some(entry) = manifest.first() {
         let Some(execution) = owned.remove(&entry.name) else {
             if !entry.active {
-                return match crate::sandbox_access_ledger::retire_inactive_execution(
-                    management_client,
-                    ledger_namespace,
-                    lease,
-                    entry,
-                )
-                .await
-                {
+                let retired = match entry.creation_state {
+                    crate::sandbox_access_ledger::ExecutionCreationState::Rejected => {
+                        crate::sandbox_access_ledger::retire_rejected_execution(
+                            management_client,
+                            ledger_namespace,
+                            lease,
+                            entry,
+                        )
+                        .await
+                    }
+                    crate::sandbox_access_ledger::ExecutionCreationState::Bound => {
+                        crate::sandbox_access_ledger::retire_inactive_execution(
+                            management_client,
+                            ledger_namespace,
+                            lease,
+                            entry,
+                        )
+                        .await
+                    }
+                    crate::sandbox_access_ledger::ExecutionCreationState::Creating => {
+                        return ExecutionCleanupOutcome::Retry;
+                    }
+                };
+                return match retired {
                     Ok(true) => ExecutionCleanupOutcome::Checkpointed,
                     Ok(false) => ExecutionCleanupOutcome::Retry,
                     Err(_) => ExecutionCleanupOutcome::Retry,
@@ -1334,27 +1452,9 @@ async fn cleanup_lease_executions_inner(
             if entry.execution_uid.is_some() {
                 return ExecutionCleanupOutcome::Quarantine("bound_execution_missing");
             }
-            let due = chrono::DateTime::parse_from_rfc3339(&entry.reserved_at)
-                .ok()
-                .map(|reserved| reserved.with_timezone(&chrono::Utc) + EXECUTION_SETUP_GRACE)
-                .is_some_and(|deadline| chrono::Utc::now() >= deadline);
-            if !due {
-                // A CREATE whose response was lost may still land. Keep its
-                // manifest name occupied through the setup envelope before
-                // closing the slot; a late record can then be adopted exactly.
-                return ExecutionCleanupOutcome::Retry;
-            }
-            return match crate::sandbox_access_ledger::retire_unbound_execution(
-                management_client,
-                ledger_namespace,
-                lease,
-                &entry.name,
-            )
-            .await
-            {
-                Ok(()) => ExecutionCleanupOutcome::Checkpointed,
-                Err(_) => ExecutionCleanupOutcome::Retry,
-            };
+            // Neither age nor a strong 404 proves that an API request whose
+            // response was lost cannot still create this exact object.
+            return ExecutionCleanupOutcome::Retry;
         };
         let execution_uid = match execution_identity_holds(&execution, lease) {
             Ok(uid) => uid,
@@ -1434,6 +1534,7 @@ async fn cleanup_lease_executions_inner(
                     &target.container,
                     runner_path,
                     &execution.name_any(),
+                    shutdown,
                 )
                 .await
                 {
@@ -1497,7 +1598,7 @@ async fn cleanup_lease_executions_inner(
             ledger_namespace,
             lease,
             &terminal,
-            true,
+            target_client.is_none(),
         )
         .await
         .is_err()
@@ -1523,6 +1624,16 @@ async fn cleanup_lease_executions_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_definitive_create_rejections_release_a_creating_tombstone() {
+        for code in [400, 401, 403, 404, 405, 406, 410, 411, 413, 414, 415, 422] {
+            assert!(definitive_create_rejection(code), "HTTP {code}");
+        }
+        for code in [408, 409, 425, 429, 500, 502, 503, 504] {
+            assert!(!definitive_create_rejection(code), "HTTP {code}");
+        }
+    }
 
     fn request() -> ExecutionRequest {
         ExecutionRequest {
@@ -2070,73 +2181,6 @@ mod tests {
         );
     }
 
-    /// `Unknown` is declared on a deadline, and never guessed.
-    ///
-    /// Too early tells a caller to make a decision they did not need to make;
-    /// never at all leaves them polling forever. A deadline that cannot be read
-    /// resolves to "not yet", because polling is recoverable and a wrong
-    /// `Unknown` is not.
-    #[test]
-    fn unknown_is_declared_only_once_its_deadline_passes() {
-        let now = chrono::Utc::now();
-        let status =
-            |state: ExecutionState, deadline: Option<String>| crate::crd::SandboxExecutionStatus {
-                state,
-                verdict_deadline: deadline,
-                ..Default::default()
-            };
-
-        let future = (now + chrono::Duration::minutes(1)).to_rfc3339();
-        let past = (now - chrono::Duration::seconds(1)).to_rfc3339();
-
-        assert!(!verdict_due(
-            &status(ExecutionState::Running, Some(future.clone())),
-            now
-        ));
-        assert!(verdict_due(
-            &status(ExecutionState::Running, Some(past.clone())),
-            now
-        ));
-
-        // A settled execution is never re-judged, however old its deadline.
-        for state in [
-            ExecutionState::Succeeded,
-            ExecutionState::Failed,
-            ExecutionState::Cancelled,
-            ExecutionState::TimedOut,
-            ExecutionState::Unknown,
-            ExecutionState::Queued,
-        ] {
-            assert!(
-                !verdict_due(&status(state, Some(past.clone())), now),
-                "{state} must not be re-judged"
-            );
-        }
-
-        // Unreadable deadlines wait rather than guess.
-        for unreadable in [None, Some(String::new()), Some("soon".into())] {
-            assert!(!verdict_due(
-                &status(ExecutionState::Running, unreadable),
-                now
-            ));
-        }
-    }
-
-    /// The verdict deadline leaves room for the command itself.
-    ///
-    /// A deadline shorter than the timeout would declare `Unknown` about
-    /// executions that are simply still running, which is the fastest way to
-    /// make the state meaningless.
-    #[test]
-    fn the_verdict_deadline_outlasts_the_command() {
-        let started = chrono::Utc::now();
-        let timeout = chrono::Duration::minutes(10);
-        let deadline = verdict_deadline(started, timeout);
-
-        assert!(deadline > started + timeout);
-        assert_eq!(deadline, started + timeout + VERDICT_GRACE);
-    }
-
     /// An execution's wall-clock bound is never longer than the lease that
     /// authorises it, even when the caller asks for the global maximum.
     #[test]
@@ -2204,6 +2248,100 @@ mod tests {
                     "value": { "state": "Running" }
                 }
             ])
+        );
+    }
+
+    /// A concurrent terminal writer wins permanently and becomes the HTTP
+    /// answer; a stale observation is never overlaid on top of it.
+    #[tokio::test]
+    async fn terminal_status_cas_returns_the_durable_winner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct RunningThenSucceeded {
+            running: serde_json::Value,
+            succeeded: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Respond for RunningThenSucceeded {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                let object = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    &self.running
+                } else {
+                    &self.succeeded
+                };
+                ResponseTemplate::new(200).set_body_json(object)
+            }
+        }
+
+        let server = MockServer::start().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut running = build_execution_record(
+            "kobe-system",
+            "execution-a",
+            &lease(),
+            &target(),
+            &request(),
+            &"d".repeat(64),
+            recorded_target("workspace"),
+        );
+        running.metadata.uid = Some("execution-uid".into());
+        running.metadata.resource_version = Some("1".into());
+        running.status = Some(crate::crd::SandboxExecutionStatus {
+            state: ExecutionState::Running,
+            started_at: Some("2026-08-20T00:00:00Z".into()),
+            ..Default::default()
+        });
+        let mut succeeded = running.clone();
+        succeeded.metadata.resource_version = Some("2".into());
+        succeeded.status = Some(crate::crd::SandboxExecutionStatus {
+            state: ExecutionState::Succeeded,
+            started_at: Some("2026-08-20T00:00:00Z".into()),
+            finished_at: Some("2026-08-20T00:00:01Z".into()),
+            exit_code: Some(0),
+            reason: Some("completed".into()),
+            ..Default::default()
+        });
+        let path_value =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxexecutions/execution-a";
+        Mock::given(method("GET"))
+            .and(path(path_value))
+            .respond_with(RunningThenSucceeded {
+                running: serde_json::to_value(&running).unwrap(),
+                succeeded: serde_json::to_value(&succeeded).unwrap(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{path_value}/status")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure",
+                "reason":"Conflict","code":409
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let durable = persist_terminal(
+            &client,
+            "kobe-system",
+            &running,
+            ExecutionState::Unknown,
+            None,
+            "outcome_unverifiable",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            durable.status.unwrap().state,
+            ExecutionState::Succeeded,
+            "the first durable terminal CAS is authoritative"
         );
     }
 }

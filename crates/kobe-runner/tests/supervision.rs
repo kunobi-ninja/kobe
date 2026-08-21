@@ -98,11 +98,13 @@ fn start_in(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut line = request.to_string();
+    line.push('\n');
     child
         .stdin
         .take()
         .unwrap()
-        .write_all(request.to_string().as_bytes())
+        .write_all(line.as_bytes())
         .unwrap();
     reply(child.wait_with_output().unwrap())
 }

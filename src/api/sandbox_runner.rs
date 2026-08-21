@@ -38,11 +38,11 @@
 //! path records.
 
 use kobe_runner::protocol::{
-    Envelope, ExecutionReport, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES, PROTOCOL_VERSION, Reply,
-    RunnerErrorCode, RunnerState, StartRequest,
+    Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
+    Reply, RunnerErrorCode, RunnerState, StartRequest,
 };
 
-use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget, exec_capped};
+use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget, exec_capped_until};
 use crate::crd::ExecutionState;
 
 /// How long one control call may take.
@@ -124,6 +124,16 @@ pub struct RunnerOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub truncated: bool,
+}
+
+/// One validated output window from the exact requested runner record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerLogChunk {
+    pub offset: u64,
+    pub next_offset: u64,
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+    pub more: bool,
 }
 
 /// Translate a report into the record a caller reads.
@@ -219,6 +229,9 @@ pub fn start_request(
 pub fn start_line(request: &StartRequest) -> Result<Vec<u8>, RunnerCallFailure> {
     let mut line = serde_json::to_vec(request).map_err(|_| RunnerCallFailure::Unreadable)?;
     line.push(b'\n');
+    if line.len() > MAX_REQUEST_BYTES {
+        return Err(RunnerCallFailure::Refused(RunnerErrorCode::InvalidRequest));
+    }
     Ok(line)
 }
 
@@ -267,11 +280,26 @@ pub fn parse_reply(stdout: &[u8]) -> Result<Reply, RunnerCallFailure> {
     }
 }
 
-fn report_from(reply: Reply) -> Result<ExecutionReport, RunnerCallFailure> {
-    match reply {
-        Reply::Started { report } | Reply::State { report } => Ok(report),
-        _ => Err(RunnerCallFailure::Unreadable),
+#[derive(Clone, Copy)]
+enum ExpectedReportReply {
+    Started,
+    State,
+}
+
+fn report_from(
+    reply: Reply,
+    expected: ExpectedReportReply,
+    expected_id: &str,
+) -> Result<ExecutionReport, RunnerCallFailure> {
+    let report = match (expected, reply) {
+        (ExpectedReportReply::Started, Reply::Started { report })
+        | (ExpectedReportReply::State, Reply::State { report }) => report,
+        _ => return Err(RunnerCallFailure::Unreadable),
+    };
+    if report.id != expected_id {
+        return Err(RunnerCallFailure::Unreadable);
     }
+    Ok(report)
 }
 
 /// Start one command, and return once it is supervised — not once it is done.
@@ -285,6 +313,7 @@ pub async fn start(
     container: &str,
     runner_path: &str,
     request: &StartRequest,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecutionReport, RunnerCallFailure> {
     let line = start_line(request)?;
     let output = call(
@@ -294,9 +323,14 @@ pub async fn start(
         &[runner_path.to_string(), "start".to_string()],
         Some(&line),
         RUNNER_CALL_TIMEOUT,
+        shutdown,
     )
     .await?;
-    report_from(parse_reply(&output)?)
+    report_from(
+        parse_reply(&output)?,
+        ExpectedReportReply::Started,
+        &request.id,
+    )
 }
 
 /// Ask what one execution is doing.
@@ -306,6 +340,7 @@ pub async fn poll(
     container: &str,
     runner_path: &str,
     id: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecutionReport, RunnerCallFailure> {
     let output = call(
         client,
@@ -314,9 +349,10 @@ pub async fn poll(
         &control_argv(runner_path, "status", id, &[]),
         None,
         RUNNER_CALL_TIMEOUT,
+        shutdown,
     )
     .await?;
-    report_from(parse_reply(&output)?)
+    report_from(parse_reply(&output)?, ExpectedReportReply::State, id)
 }
 
 /// Terminate one execution's process group.
@@ -326,6 +362,7 @@ pub async fn cancel(
     container: &str,
     runner_path: &str,
     id: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecutionReport, RunnerCallFailure> {
     let output = call(
         client,
@@ -334,12 +371,14 @@ pub async fn cancel(
         &control_argv(runner_path, "cancel", id, &[]),
         None,
         RUNNER_CANCEL_TIMEOUT,
+        shutdown,
     )
     .await?;
-    report_from(parse_reply(&output)?)
+    report_from(parse_reply(&output)?, ExpectedReportReply::State, id)
 }
 
 /// Read one bounded window of one stream.
+#[allow(clippy::too_many_arguments)]
 pub async fn read_output(
     client: &kube::Client,
     target: &SandboxTarget,
@@ -348,7 +387,8 @@ pub async fn read_output(
     id: &str,
     stream: LogStream,
     offset: u64,
-) -> Result<LogChunk, RunnerCallFailure> {
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<RunnerLogChunk, RunnerCallFailure> {
     let stream_name = match stream {
         LogStream::Stdout => "stdout",
         LogStream::Stderr => "stderr",
@@ -372,12 +412,47 @@ pub async fn read_output(
         ),
         None,
         RUNNER_CALL_TIMEOUT,
+        shutdown,
     )
     .await?;
     match parse_reply(&output)? {
-        Reply::Logs { chunk } => Ok(*chunk),
+        Reply::Logs { chunk } => validate_log_chunk(*chunk, id, stream, offset),
         _ => Err(RunnerCallFailure::Unreadable),
     }
+}
+
+fn validate_log_chunk(
+    chunk: kobe_runner::protocol::LogChunk,
+    expected_id: &str,
+    expected_stream: LogStream,
+    expected_offset: u64,
+) -> Result<RunnerLogChunk, RunnerCallFailure> {
+    use base64::Engine;
+
+    if chunk.id != expected_id || chunk.stream != expected_stream || chunk.offset != expected_offset
+    {
+        return Err(RunnerCallFailure::Unreadable);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&chunk.data_base64)
+        .map_err(|_| RunnerCallFailure::Unreadable)?;
+    if bytes.len() > MAX_LOG_CHUNK_BYTES
+        || chunk.next_offset
+            != chunk
+                .offset
+                .checked_add(bytes.len() as u64)
+                .ok_or(RunnerCallFailure::Unreadable)?
+        || (chunk.more && bytes.is_empty())
+    {
+        return Err(RunnerCallFailure::Unreadable);
+    }
+    Ok(RunnerLogChunk {
+        offset: chunk.offset,
+        next_offset: chunk.next_offset,
+        bytes,
+        truncated: chunk.truncated,
+        more: chunk.more,
+    })
 }
 
 /// Read both retained streams to the API response cap.
@@ -392,6 +467,7 @@ pub async fn read_wait_output(
     container: &str,
     runner_path: &str,
     id: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<RunnerOutput, RunnerCallFailure> {
     let stdout = read_stream_to_cap(
         client,
@@ -400,6 +476,7 @@ pub async fn read_wait_output(
         runner_path,
         id,
         LogStream::Stdout,
+        shutdown,
     );
     let stderr = read_stream_to_cap(
         client,
@@ -408,6 +485,7 @@ pub async fn read_wait_output(
         runner_path,
         id,
         LogStream::Stderr,
+        shutdown,
     );
     let (stdout, stderr) = tokio::join!(stdout, stderr);
     let (stdout, stdout_truncated) = stdout?;
@@ -426,29 +504,29 @@ async fn read_stream_to_cap(
     runner_path: &str,
     id: &str,
     stream: LogStream,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<(Vec<u8>, bool), RunnerCallFailure> {
-    use base64::Engine;
-
     let mut offset = 0;
     let mut output = Vec::new();
     let mut truncated = false;
     loop {
-        let chunk = read_output(client, target, container, runner_path, id, stream, offset).await?;
-        if chunk.offset != offset || chunk.next_offset < chunk.offset {
-            return Err(RunnerCallFailure::Unreadable);
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&chunk.data_base64)
-            .map_err(|_| RunnerCallFailure::Unreadable)?;
-        if chunk.next_offset != chunk.offset.saturating_add(bytes.len() as u64) {
-            return Err(RunnerCallFailure::Unreadable);
-        }
+        let chunk = read_output(
+            client,
+            target,
+            container,
+            runner_path,
+            id,
+            stream,
+            offset,
+            shutdown,
+        )
+        .await?;
 
         let remaining =
             crate::api::sandbox_access::MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len());
-        let kept = bytes.len().min(remaining);
-        output.extend_from_slice(&bytes[..kept]);
-        truncated |= chunk.truncated || kept < bytes.len();
+        let kept = chunk.bytes.len().min(remaining);
+        output.extend_from_slice(&chunk.bytes[..kept]);
+        truncated |= chunk.truncated || kept < chunk.bytes.len();
         if output.len() == crate::api::sandbox_access::MAX_EXEC_OUTPUT_BYTES {
             truncated |= chunk.more;
             break;
@@ -476,14 +554,17 @@ async fn call(
     argv: &[String],
     stdin: Option<&[u8]>,
     timeout: std::time::Duration,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<u8>, RunnerCallFailure> {
-    let raw = exec_capped(
+    let deadline = tokio::time::Instant::now() + timeout;
+    let raw = exec_capped_until(
         client,
         target,
         container,
         argv,
         stdin,
-        timeout,
+        deadline,
+        shutdown,
         RUNNER_REPLY_CAP,
     )
     .await
@@ -598,6 +679,120 @@ mod tests {
         let mut noisy = b"WARNING: locale not set\n".to_vec();
         noisy.extend_from_slice(&good);
         assert!(parse_reply(&noisy).is_ok());
+    }
+
+    /// A well-formed reply for the wrong verb or execution is still hostile.
+    #[test]
+    fn reports_are_bound_to_the_exact_verb_and_execution_id() {
+        let exact = report(RunnerState::Running);
+        assert!(
+            report_from(
+                Reply::Started {
+                    report: exact.clone()
+                },
+                ExpectedReportReply::Started,
+                "sbxe-1",
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            report_from(
+                Reply::State {
+                    report: exact.clone()
+                },
+                ExpectedReportReply::Started,
+                "sbxe-1",
+            )
+            .unwrap_err(),
+            RunnerCallFailure::Unreadable,
+            "status must not acknowledge start"
+        );
+        assert_eq!(
+            report_from(
+                Reply::State { report: exact },
+                ExpectedReportReply::State,
+                "sbxe-another",
+            )
+            .unwrap_err(),
+            RunnerCallFailure::Unreadable,
+            "one spool id must never answer for another"
+        );
+    }
+
+    /// Log bytes are accepted only with exact identity, stream, and offsets.
+    #[test]
+    fn log_chunks_reject_identity_offset_and_encoding_drift() {
+        use base64::Engine;
+        use kobe_runner::protocol::LogChunk;
+
+        let exact = LogChunk {
+            id: "sbxe-1".into(),
+            stream: LogStream::Stdout,
+            offset: 7,
+            next_offset: 10,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(b"abc"),
+            truncated: false,
+            more: false,
+        };
+        assert_eq!(
+            validate_log_chunk(exact.clone(), "sbxe-1", LogStream::Stdout, 7)
+                .unwrap()
+                .bytes,
+            b"abc"
+        );
+
+        let mut hostile = Vec::new();
+        let mut wrong_id = exact.clone();
+        wrong_id.id = "sbxe-2".into();
+        hostile.push(wrong_id);
+        let mut wrong_stream = exact.clone();
+        wrong_stream.stream = LogStream::Stderr;
+        hostile.push(wrong_stream);
+        let mut wrong_offset = exact.clone();
+        wrong_offset.offset = 8;
+        hostile.push(wrong_offset);
+        let mut wrong_next = exact.clone();
+        wrong_next.next_offset = 11;
+        hostile.push(wrong_next);
+        let mut malformed = exact.clone();
+        malformed.data_base64 = "%%%".into();
+        hostile.push(malformed);
+        let mut no_progress = exact.clone();
+        no_progress.data_base64.clear();
+        no_progress.next_offset = no_progress.offset;
+        no_progress.more = true;
+        hostile.push(no_progress);
+        let mut oversized = exact;
+        oversized.data_base64 =
+            base64::engine::general_purpose::STANDARD.encode(vec![b'x'; MAX_LOG_CHUNK_BYTES + 1]);
+        oversized.next_offset = oversized.offset + MAX_LOG_CHUNK_BYTES as u64 + 1;
+        hostile.push(oversized);
+
+        for chunk in hostile {
+            assert_eq!(
+                validate_log_chunk(chunk, "sbxe-1", LogStream::Stdout, 7).unwrap_err(),
+                RunnerCallFailure::Unreadable
+            );
+        }
+    }
+
+    /// Kobe and the runner share the exact encoded request ceiling.
+    #[test]
+    fn start_request_bound_includes_the_newline() {
+        let mut request = start_request(
+            "sbxe-1",
+            &[String::new()],
+            None,
+            std::time::Duration::from_secs(1),
+        );
+        let base = start_line(&request).unwrap().len();
+        request.argv[0] = "x".repeat(MAX_REQUEST_BYTES - base);
+        assert_eq!(start_line(&request).unwrap().len(), MAX_REQUEST_BYTES);
+        request.argv[0].push('x');
+        assert_eq!(
+            start_line(&request).unwrap_err(),
+            RunnerCallFailure::Refused(RunnerErrorCode::InvalidRequest)
+        );
     }
 
     /// A refusal is a refusal, not an outcome.

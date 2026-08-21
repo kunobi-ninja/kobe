@@ -697,6 +697,17 @@ pub struct RawExecOutput {
     pub truncated: bool,
 }
 
+struct AbortExecOnDrop(kube::api::AttachedProcess);
+
+impl Drop for AbortExecOnDrop {
+    fn drop(&mut self) {
+        // Dropping kube's JoinHandle detaches it. Explicit abort is therefore
+        // required when the absolute deadline or shutdown drops this future;
+        // otherwise the websocket and remote exec can outlive the request.
+        self.0.abort();
+    }
+}
+
 /// Run one command in the Sandbox, optionally writing to its stdin.
 ///
 /// The stdin half exists for the runner contract (#82) and for nothing else: a
@@ -714,6 +725,53 @@ pub async fn exec_capped(
     command: &[String],
     stdin: Option<&[u8]>,
     timeout: std::time::Duration,
+    output_cap: usize,
+) -> Result<RawExecOutput, SandboxAccessDenied> {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    exec_capped_until(
+        client,
+        target,
+        container,
+        command,
+        stdin,
+        tokio::time::Instant::now() + timeout,
+        &shutdown,
+        output_cap,
+    )
+    .await
+}
+
+/// Run one exec under one absolute deadline and process shutdown signal.
+///
+/// The envelope surrounds every await, including the exact Pod GET, exec
+/// connection, stdin write, output drains, and status receipt. Stage-local
+/// timeouts would restart the budget after each successful await and could keep
+/// graceful shutdown alive indefinitely.
+#[allow(clippy::too_many_arguments)]
+pub async fn exec_capped_until(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    command: &[String],
+    stdin: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+    shutdown: &tokio_util::sync::CancellationToken,
+    output_cap: usize,
+) -> Result<RawExecOutput, SandboxAccessDenied> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err(SandboxAccessDenied::Backend),
+        _ = tokio::time::sleep_until(deadline) => Err(SandboxAccessDenied::Backend),
+        result = exec_capped_inner(client, target, container, command, stdin, output_cap) => result,
+    }
+}
+
+async fn exec_capped_inner(
+    client: &kube::Client,
+    target: &SandboxTarget,
+    container: &str,
+    command: &[String],
+    stdin: Option<&[u8]>,
     output_cap: usize,
 ) -> Result<RawExecOutput, SandboxAccessDenied> {
     use k8s_openapi::api::core::v1::Pod;
@@ -740,46 +798,44 @@ pub async fn exec_capped(
         .stderr(true)
         .tty(false);
 
-    let mut attached = tokio::time::timeout(timeout, pods.exec(&target.pod_name, command, &params))
-        .await
-        .map_err(|_| SandboxAccessDenied::Backend)?
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+    let mut attached = AbortExecOnDrop(
+        pods.exec(&target.pod_name, command, &params)
+            .await
+            .map_err(|_| SandboxAccessDenied::Backend)?,
+    );
 
     if let Some(input) = stdin {
         use tokio::io::AsyncWriteExt;
-        let Some(mut writer) = attached.stdin() else {
+        let Some(mut writer) = attached.0.stdin() else {
             return Err(SandboxAccessDenied::Backend);
         };
         // A failed write is not swallowed: the command on the other end is
         // waiting for a request it will now never get, and reporting success
         // here would attribute its silence to the workload.
-        tokio::time::timeout(timeout, async {
-            writer.write_all(input).await?;
-            writer.shutdown().await
-        })
-        .await
-        .map_err(|_| SandboxAccessDenied::Backend)?
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+        writer
+            .write_all(input)
+            .await
+            .map_err(|_| SandboxAccessDenied::Backend)?;
+        writer
+            .shutdown()
+            .await
+            .map_err(|_| SandboxAccessDenied::Backend)?;
     }
 
-    let stdout_stream = attached.stdout();
-    let stderr_stream = attached.stderr();
-    let status = attached.take_status().ok_or(SandboxAccessDenied::Backend)?;
+    let stdout_stream = attached.0.stdout();
+    let stderr_stream = attached.0.stderr();
+    let status = attached
+        .0
+        .take_status()
+        .ok_or(SandboxAccessDenied::Backend)?;
 
     // Drain both bounded pipes while waiting for status. Reading stdout to EOF
     // before touching stderr deadlocks when the command fills stderr's pipe
     // while Kobe is blocked on stdout (and vice versa).
     let ((stdout, stderr, stdout_truncated, stderr_truncated), status) = tokio::join!(
-        drain_capped_pair(stdout_stream, stderr_stream, output_cap, timeout),
-        tokio::time::timeout(timeout, status),
+        drain_capped_pair(stdout_stream, stderr_stream, output_cap),
+        status,
     );
-    let status = match status {
-        Ok(status) => status,
-        Err(_) => {
-            attached.abort();
-            None
-        }
-    };
     let exit_code = exact_exec_exit_code(status.as_ref());
     let success = exit_code == Some(0);
 
@@ -800,7 +856,6 @@ async fn drain_capped_pair<Stdout, Stderr>(
     stdout: Option<Stdout>,
     stderr: Option<Stderr>,
     cap: usize,
-    timeout: std::time::Duration,
 ) -> (Vec<u8>, Vec<u8>, bool, bool)
 where
     Stdout: tokio::io::AsyncRead + Unpin,
@@ -809,7 +864,7 @@ where
     let stdout_read = async {
         let mut output = Vec::new();
         let truncated = match stdout {
-            Some(mut stream) => read_capped(&mut stream, &mut output, cap, timeout).await,
+            Some(mut stream) => read_capped(&mut stream, &mut output, cap).await,
             None => false,
         };
         (output, truncated)
@@ -817,7 +872,7 @@ where
     let stderr_read = async {
         let mut output = Vec::new();
         let truncated = match stderr {
-            Some(mut stream) => read_capped(&mut stream, &mut output, cap, timeout).await,
+            Some(mut stream) => read_capped(&mut stream, &mut output, cap).await,
             None => false,
         };
         (output, truncated)
@@ -863,22 +918,14 @@ fn exact_exec_exit_code(
 ///
 /// Stops reading at the cap rather than reading everything and truncating
 /// afterwards — the memory is spent either way if you read first.
-async fn read_capped<R>(
-    stream: &mut R,
-    into: &mut Vec<u8>,
-    cap: usize,
-    timeout: std::time::Duration,
-) -> bool
+async fn read_capped<R>(stream: &mut R, into: &mut Vec<u8>, cap: usize) -> bool
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
 
     let mut limited = stream.take((cap + 1) as u64);
-    if tokio::time::timeout(timeout, limited.read_to_end(into))
-        .await
-        .is_err()
-    {
+    if limited.read_to_end(into).await.is_err() {
         return true;
     }
     if into.len() > cap {
@@ -1253,6 +1300,67 @@ mod tests {
         );
     }
 
+    /// Pod identity lookup is inside the same absolute budget as the exec.
+    #[tokio::test]
+    async fn absolute_exec_deadline_and_shutdown_cover_the_preflight_get() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let target = target_from_provenance(&ready_lease(), &pool(), now()).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/kobe/pods/sbx-0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({
+                        "apiVersion":"v1","kind":"Pod",
+                        "metadata":{"name":"sbx-0","namespace":"kobe","uid":"pod-uid"}
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            exec_capped_until(
+                &client,
+                &target,
+                "agent",
+                &["/bin/true".into()],
+                None,
+                started + std::time::Duration::from_millis(50),
+                &shutdown,
+                64,
+            )
+            .await
+            .unwrap_err(),
+            SandboxAccessDenied::Backend
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let stopped = tokio_util::sync::CancellationToken::new();
+        stopped.cancel();
+        assert_eq!(
+            exec_capped_until(
+                &client,
+                &target,
+                "agent",
+                &["/bin/true".into()],
+                None,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                &stopped,
+                64,
+            )
+            .await
+            .unwrap_err(),
+            SandboxAccessDenied::Backend
+        );
+    }
+
     /// Exec requests carry argv and nothing else.
     ///
     /// `tty`, `stdin`, `pod` and `namespace` are all things a caller might try
@@ -1299,41 +1407,21 @@ mod tests {
     async fn command_output_is_capped_and_the_truncation_is_reported() {
         let mut into = Vec::new();
         let mut source = std::io::Cursor::new(vec![b'x'; MAX_EXEC_OUTPUT_BYTES * 2]);
-        let truncated = read_capped(
-            &mut source,
-            &mut into,
-            MAX_EXEC_OUTPUT_BYTES,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
+        let truncated = read_capped(&mut source, &mut into, MAX_EXEC_OUTPUT_BYTES).await;
         assert!(truncated, "the caller must be told output was cut off");
         assert_eq!(into.len(), MAX_EXEC_OUTPUT_BYTES);
 
         // Output that fits is returned whole, and not flagged.
         let mut into = Vec::new();
         let mut source = std::io::Cursor::new(b"hello".to_vec());
-        let truncated = read_capped(
-            &mut source,
-            &mut into,
-            MAX_EXEC_OUTPUT_BYTES,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
+        let truncated = read_capped(&mut source, &mut into, MAX_EXEC_OUTPUT_BYTES).await;
         assert!(!truncated);
         assert_eq!(into, b"hello");
 
         // Exactly at the cap is not truncation.
         let mut into = Vec::new();
         let mut source = std::io::Cursor::new(vec![b'x'; MAX_EXEC_OUTPUT_BYTES]);
-        assert!(
-            !read_capped(
-                &mut source,
-                &mut into,
-                MAX_EXEC_OUTPUT_BYTES,
-                std::time::Duration::from_secs(5)
-            )
-            .await
-        );
+        assert!(!read_capped(&mut source, &mut into, MAX_EXEC_OUTPUT_BYTES).await);
         assert_eq!(into.len(), MAX_EXEC_OUTPUT_BYTES);
     }
 
@@ -1356,12 +1444,7 @@ mod tests {
 
         let (stdout, stderr, stdout_truncated, stderr_truncated) = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            drain_capped_pair(
-                Some(stdout_reader),
-                Some(stderr_reader),
-                64,
-                std::time::Duration::from_secs(1),
-            ),
+            drain_capped_pair(Some(stdout_reader), Some(stderr_reader), 64),
         )
         .await
         .expect("a concurrent drain must not deadlock");

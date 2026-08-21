@@ -95,11 +95,13 @@ struct PrincipalEntry {
 
 /// Durable lifetime reservation for one idempotency key.
 ///
-/// Written before the `SandboxExecution` CREATE. The name/digest pair is the
-/// authority that makes retrying that CREATE safe after a lost response, while
-/// `active` is the process-count slot that must be retired only after a terminal
-/// runner verdict. Entries remain until lease teardown, bounding retained
-/// history independently of how quickly commands finish.
+/// Written before the `SandboxExecution` CREATE. `creation_state=creating` is a
+/// durable tombstone: neither a clock nor a 404 may retire it because a CREATE
+/// request whose response was lost can still land. Only an exact object UID or
+/// a definitive API rejection moves that state forward. `active` is the
+/// process-count slot and is retired only after a terminal runner verdict (or a
+/// proof that no runner was ever started). Entries remain until lease teardown,
+/// bounding retained history independently of how quickly commands finish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExecutionEntry {
@@ -108,7 +110,32 @@ struct ExecutionEntry {
     reserved_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_uid: Option<String>,
+    #[serde(default)]
+    creation_state: ExecutionCreationState,
     active: bool,
+}
+
+impl ExecutionEntry {
+    fn effective_creation_state(&self) -> ExecutionCreationState {
+        if self.execution_uid.is_some() {
+            ExecutionCreationState::Bound
+        } else {
+            self.creation_state
+        }
+    }
+}
+
+/// Monotonic resolution of the Kubernetes CREATE for one execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionCreationState {
+    /// The request may not have reached the API server, or may still land.
+    #[default]
+    Creating,
+    /// An exact `SandboxExecution` UID was committed into this ledger row.
+    Bound,
+    /// The API server definitively rejected the CREATE without creating it.
+    Rejected,
 }
 
 /// Result of reserving one execution's lifetime and active-process slots.
@@ -163,6 +190,7 @@ fn reserve_execution_entry(
             pod_uid: pod_uid.to_string(),
             reserved_at: reserved_at.to_string(),
             execution_uid: None,
+            creation_state: ExecutionCreationState::Creating,
             active: true,
         },
     );
@@ -177,6 +205,7 @@ pub struct ExecutionManifestEntry {
     pub pod_uid: String,
     pub reserved_at: String,
     pub execution_uid: Option<String>,
+    pub creation_state: ExecutionCreationState,
     pub active: bool,
 }
 
@@ -1109,7 +1138,15 @@ pub async fn bind_execution_capacity(
         match entry.execution_uid.as_deref() {
             Some(uid) if uid == execution_uid => return Ok(true),
             Some(_) => return Err(AccessLedgerError::Invalid("execution reservation UID")),
-            None => entry.execution_uid = Some(execution_uid.clone()),
+            None if entry.creation_state == ExecutionCreationState::Creating => {
+                entry.execution_uid = Some(execution_uid.clone());
+                entry.creation_state = ExecutionCreationState::Bound;
+            }
+            None => {
+                return Err(AccessLedgerError::Invalid(
+                    "execution creation is already resolved",
+                ));
+            }
         }
         match patch_execution_entries(&api, &gate, &previous, &entries).await {
             Ok(_) => return Ok(true),
@@ -1168,6 +1205,7 @@ pub async fn complete_execution_capacity(
         if entry.request_digest != execution.spec.request_digest
             || entry.pod_uid != execution.spec.pod_uid
             || entry.execution_uid.as_deref() != Some(execution_uid.as_str())
+            || entry.effective_creation_state() != ExecutionCreationState::Bound
         {
             return Err(AccessLedgerError::Invalid("execution reservation identity"));
         }
@@ -1194,22 +1232,26 @@ pub async fn execution_manifest(
     let gate = exact_gate_for_lease(&api, lease).await?;
     Ok(parse_execution_entries(&gate)?
         .into_iter()
-        .map(|(name, entry)| ExecutionManifestEntry {
-            name,
-            request_digest: entry.request_digest,
-            pod_uid: entry.pod_uid,
-            reserved_at: entry.reserved_at,
-            execution_uid: entry.execution_uid,
-            active: entry.active,
+        .map(|(name, entry)| {
+            let creation_state = entry.effective_creation_state();
+            ExecutionManifestEntry {
+                name,
+                request_digest: entry.request_digest,
+                pod_uid: entry.pod_uid,
+                reserved_at: entry.reserved_at,
+                execution_uid: entry.execution_uid,
+                creation_state,
+                active: entry.active,
+            }
         })
         .collect())
 }
 
-/// Retire an execution whose CREATE/bind checkpoint never completed.
+/// Adopt an exact execution whose CREATE/bind response was lost.
 ///
-/// The entry is fenced by the gate resourceVersion and may still have no CR,
-/// or an exact CR whose CREATE response was lost. In the latter case its UID is
-/// captured in the same CAS that closes the active slot. A concurrent bind
+/// A missing object is deliberately a no-op: 404 does not prove that an
+/// in-flight CREATE cannot still land. When an exact object is visible, its UID
+/// is captured in the same CAS that closes the active slot. A concurrent bind
 /// either wins first (and this returns `false`) or sees `active=false` and can
 /// never start the runner afterward.
 pub async fn expire_unbound_execution(
@@ -1239,15 +1281,17 @@ pub async fn expire_unbound_execution(
         if entry.execution_uid.is_some() {
             return Ok(false);
         }
-        if !entry.active && observed_execution_uid.is_none() {
+        let Some(uid) = observed_execution_uid else {
+            return Ok(false);
+        };
+        if uid.is_empty() {
+            return Err(AccessLedgerError::Invalid("SandboxExecution UID"));
+        }
+        if entry.creation_state != ExecutionCreationState::Creating {
             return Ok(false);
         }
-        if let Some(uid) = observed_execution_uid {
-            if uid.is_empty() {
-                return Err(AccessLedgerError::Invalid("SandboxExecution UID"));
-            }
-            entry.execution_uid = Some(uid.to_string());
-        }
+        entry.execution_uid = Some(uid.to_string());
+        entry.creation_state = ExecutionCreationState::Bound;
         entry.active = false;
         match patch_execution_entries(&api, &gate, &previous, &entries).await {
             Ok(_) => return Ok(true),
@@ -1258,24 +1302,22 @@ pub async fn expire_unbound_execution(
     Err(AccessLedgerError::Contended)
 }
 
-/// Remove a pre-CREATE reservation after the gate is closed.
+/// Resolve a CREATE that the API server definitively rejected.
 ///
-/// Only an entry with no bound Kubernetes UID qualifies. Once closed, binding
-/// and spawning are impossible, so removing the exact name/digest/Pod row is
-/// the durable teardown checkpoint. Leaving an inactive row behind would make
-/// the next cleanup pass loop forever on a manifest entry with no record.
-pub async fn retire_unbound_execution(
+/// Transport failures, timeouts, 5xx responses, and 404 observations do not
+/// qualify. The rejection and exact identity are committed by CAS so a racing
+/// bind either wins first or can no longer start a runner afterward.
+pub async fn reject_execution_creation(
     client: &Client,
     ledger_namespace: &str,
     lease: &SandboxLease,
     execution_name: &str,
-) -> Result<(), AccessLedgerError> {
+    expected_digest: &str,
+    expected_pod_uid: &str,
+) -> Result<bool, AccessLedgerError> {
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
     for _ in 0..MAX_CAS_ATTEMPTS {
         let gate = exact_gate_for_lease(&api, lease).await?;
-        if gate.annotations().get(STATE_ANNOTATION).map(String::as_str) != Some(CLOSED) {
-            return Err(AccessLedgerError::Invalid("execution gate is not closed"));
-        }
         let previous = gate
             .annotations()
             .get(EXECUTIONS_ANNOTATION)
@@ -1283,14 +1325,23 @@ pub async fn retire_unbound_execution(
             .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
         let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
         let entry = entries
-            .get(execution_name)
+            .get_mut(execution_name)
             .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
-        if entry.execution_uid.is_some() {
-            return Err(AccessLedgerError::Invalid("bound execution is missing"));
+        if entry.request_digest != expected_digest || entry.pod_uid != expected_pod_uid {
+            return Err(AccessLedgerError::Invalid("execution reservation identity"));
         }
-        entries.remove(execution_name);
+        if entry.execution_uid.is_some()
+            || entry.effective_creation_state() == ExecutionCreationState::Bound
+        {
+            return Ok(false);
+        }
+        if entry.creation_state == ExecutionCreationState::Rejected {
+            return Ok(false);
+        }
+        entry.creation_state = ExecutionCreationState::Rejected;
+        entry.active = false;
         match patch_execution_entries(&api, &gate, &previous, &entries).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(true),
             Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
             Err(error) => return Err(error),
         }
@@ -1298,19 +1349,38 @@ pub async fn retire_unbound_execution(
     Err(AccessLedgerError::Contended)
 }
 
+/// Remove a definitively rejected CREATE after the gate is closed.
+pub async fn retire_rejected_execution(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    expected: &ExecutionManifestEntry,
+) -> Result<bool, AccessLedgerError> {
+    if expected.active
+        || expected.execution_uid.is_some()
+        || expected.creation_state != ExecutionCreationState::Rejected
+    {
+        return Err(AccessLedgerError::Invalid(
+            "execution CREATE is not rejected",
+        ));
+    }
+    retire_inactive_execution(client, ledger_namespace, lease, expected).await
+}
+
 /// Remove one inactive manifest row after its exact execution CR is absent.
 ///
-/// `active=false` is the durable proof that runner termination or exact target
-/// destruction completed. The complete entry is compared before the CAS, so a
-/// same-named key or UID replacement cannot be retired as somebody else's
-/// evidence.
+/// `active=false` is the durable proof that runner termination, exact target
+/// destruction, or a definitive pre-CREATE rejection completed. A `Creating`
+/// tombstone is never eligible: its request may still land. The complete entry
+/// is compared before the CAS, so a same-named key or UID replacement cannot be
+/// retired as somebody else's evidence.
 pub async fn retire_inactive_execution(
     client: &Client,
     ledger_namespace: &str,
     lease: &SandboxLease,
     expected: &ExecutionManifestEntry,
 ) -> Result<bool, AccessLedgerError> {
-    if expected.active {
+    if expected.active || expected.creation_state == ExecutionCreationState::Creating {
         return Err(AccessLedgerError::Invalid("active execution reservation"));
     }
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
@@ -1333,6 +1403,7 @@ pub async fn retire_inactive_execution(
             || entry.pod_uid != expected.pod_uid
             || entry.reserved_at != expected.reserved_at
             || entry.execution_uid != expected.execution_uid
+            || entry.effective_creation_state() != expected.creation_state
         {
             return Err(AccessLedgerError::Invalid("execution reservation identity"));
         }
@@ -1373,7 +1444,9 @@ pub async fn clear_execution_manifest(
         if entries.is_empty() {
             return Ok(false);
         }
-        if entries.values().any(|entry| entry.active) {
+        if entries.values().any(|entry| {
+            entry.active || entry.effective_creation_state() == ExecutionCreationState::Creating
+        }) {
             return Err(AccessLedgerError::Invalid("active execution reservation"));
         }
         match patch_execution_entries(&api, &gate, &previous, &BTreeMap::new()).await {
@@ -2649,6 +2722,7 @@ mod tests {
                 pod_uid: "pod-uid".into(),
                 reserved_at: "2026-08-20T00:00:00Z".into(),
                 execution_uid: None,
+                creation_state: ExecutionCreationState::Creating,
                 active: true,
             },
         )]);
@@ -2713,6 +2787,74 @@ mod tests {
         );
     }
 
+    /// A 404 observation cannot retire a CREATE request that may still land.
+    #[tokio::test]
+    async fn missing_execution_keeps_its_creating_tombstone_and_active_slot() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let gate = gate_name("sandbox-uid");
+        let gate_path = format!("/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{gate}");
+        let existing = BTreeMap::from([(
+            "execution-a".to_string(),
+            ExecutionEntry {
+                request_digest: "d".repeat(64),
+                pod_uid: "pod-uid".into(),
+                reserved_at: "2026-08-20T00:00:00Z".into(),
+                execution_uid: None,
+                creation_state: ExecutionCreationState::Creating,
+                active: true,
+            },
+        )]);
+        let object = lease_object(
+            &gate,
+            "gate-uid",
+            "1",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), CLOSED.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+                (
+                    EXECUTIONS_ANNOTATION.into(),
+                    serde_json::to_string(&existing).unwrap(),
+                ),
+            ]),
+        );
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(object))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            !expire_unbound_execution(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                "execution-a",
+                &"d".repeat(64),
+                "pod-uid",
+                None,
+            )
+            .await
+            .unwrap(),
+            "absence is not a terminal CREATE receipt"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "PATCH"),
+            "404 recovery must not free or rewrite the tombstone"
+        );
+    }
+
     /// Teardown must remove each durable manifest row, not merely mark it
     /// inactive. Otherwise the next pass sees a missing bound record and
     /// quarantines, while an unbound inactive row loops forever.
@@ -2728,7 +2870,12 @@ mod tests {
                 pod_uid: "pod-uid".into(),
                 reserved_at: "2026-08-20T00:00:00Z".into(),
                 execution_uid: execution_uid.map(str::to_string),
-                active: execution_uid.is_none(),
+                creation_state: if execution_uid.is_some() {
+                    ExecutionCreationState::Bound
+                } else {
+                    ExecutionCreationState::Rejected
+                },
+                active: false,
             };
             let existing = BTreeMap::from([("execution-a".to_string(), entry.clone())]);
             let object = lease_object(
@@ -2774,6 +2921,7 @@ mod tests {
                             pod_uid: entry.pod_uid,
                             reserved_at: entry.reserved_at,
                             execution_uid: Some(execution_uid.into()),
+                            creation_state: ExecutionCreationState::Bound,
                             active: false,
                         },
                     )
@@ -2781,9 +2929,22 @@ mod tests {
                     .unwrap()
                 );
             } else {
-                retire_unbound_execution(&client, "ledger", &sandbox_lease(), "execution-a")
-                    .await
-                    .unwrap();
+                retire_rejected_execution(
+                    &client,
+                    "ledger",
+                    &sandbox_lease(),
+                    &ExecutionManifestEntry {
+                        name: "execution-a".into(),
+                        request_digest: entry.request_digest,
+                        pod_uid: entry.pod_uid,
+                        reserved_at: entry.reserved_at,
+                        execution_uid: None,
+                        creation_state: ExecutionCreationState::Rejected,
+                        active: false,
+                    },
+                )
+                .await
+                .unwrap();
             }
 
             let request = server
