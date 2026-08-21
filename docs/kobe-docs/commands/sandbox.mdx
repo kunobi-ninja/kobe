@@ -19,7 +19,13 @@ kobe sandbox run agents --ttl 30m -- /agent analyse ./repo
 ```
 
 This is the command to reach for from CI or a script: it owns the whole
-lifecycle, so there is no lease left behind if your job is cancelled.
+lifecycle and performs bounded cleanup when your job is cancelled.
+
+`run` catches SIGINT and SIGTERM, requests release, and waits up to 30 seconds
+until the lease is observably `Releasing`, cleanly terminal, or absent. It then
+returns the conventional signal status (`130` for SIGINT, `143` for SIGTERM).
+The same bounded cleanup runs after a remote timeout, cancellation, transport
+disconnect, success, or non-zero exit.
 
 **The exit code is the remote command's exit code.** `set -e` works:
 
@@ -45,8 +51,11 @@ hidden, and the leak is not swallowed:
 }
 ```
 
-A run whose command succeeded but whose lease leaked exits `125` rather than
-`0`, so an unattended caller notices.
+`cleanup.released` becomes true only after release is observable. Its `phase`
+distinguishes a `Releasing` checkpoint from `Released`, `Expired`, or `Absent`.
+A cleanup failure never rewrites a remote exit code: a command that returned
+`0` still returns `0`, while the warning remains in `cleanup` (and on stderr in
+text mode). Headless callers should check both.
 
 ## `kobe sandbox exec`
 
@@ -83,6 +92,21 @@ kobe sandbox logs sbx-7f3a --tail 500
 The tail is capped server-side. Asking for more than the cap returns the cap
 rather than an error.
 
+Pass an execution id to recover its retained stdout and stderr after a
+disconnect:
+
+```bash
+kobe sandbox logs sbx-7f3a --execution sbxe-91c4
+kobe sandbox logs sbx-7f3a --execution sbxe-91c4 --follow
+```
+
+Follow mode resumes stdout and stderr from separate offsets and stops only
+after the execution is terminal and both returned windows are drained. Text
+mode writes bytes back to their original streams. With `--output json`, follow
+mode emits one compact, versioned object per line (NDJSON); each object carries
+`state`, `stdout`, and `stderr` windows with `nextOffset`, `more`, and
+`truncated`.
+
 ## `kobe sandbox cancel`
 
 ```bash
@@ -107,6 +131,9 @@ echo "$result" | jq -r '.exitCode'
 echo "$result" | jq -e '.cleanup.released // true' >/dev/null \
   || echo "warning: the sandbox lease leaked"
 ```
+
+Check `.cleanup` even when `$code` is `0`: command and release outcomes are
+independent by design.
 
 `stdout` and `stderr` are always separate fields. A consumer that cannot tell
 a tool's diagnostics from its output cannot reliably parse either.

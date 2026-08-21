@@ -24,6 +24,7 @@
 //! them would either hide a leaked lease behind a successful command, or fail
 //! a command that actually worked.
 
+use std::future::Future;
 use std::io::Write;
 
 use anyhow::{Context, Result};
@@ -72,10 +73,16 @@ pub struct ExecOutput {
 
 pub const SANDBOX_CLI_API_VERSION: &str = "kobe.sandbox/v1";
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupOutcome {
+    /// True only after a GET observes the controller's `Releasing` checkpoint,
+    /// a clean terminal phase, or that the lease is already absent.
     pub released: bool,
+    /// The phase that proved the release request became observable. `Absent`
+    /// means a 404 proved there was no lease left to clean up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -362,8 +369,189 @@ struct SandboxLeaseResponse {
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const READY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long to keep trying to release before giving up and saying so.
+/// How long to wait for release intent to become observable before giving up.
 const RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const LOGS_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReleasePhaseObservation<'a> {
+    Pending,
+    Observed(&'a str),
+    Failed(&'static str),
+}
+
+fn observe_release_phase(phase: &str) -> ReleasePhaseObservation<'_> {
+    match phase {
+        "Releasing" | "Released" | "Expired" => ReleasePhaseObservation::Observed(phase),
+        "Quarantined" => ReleasePhaseObservation::Failed("sandbox cleanup entered Quarantined"),
+        _ => ReleasePhaseObservation::Pending,
+    }
+}
+
+/// A catchable process signal that interrupted `sandbox run`.
+///
+/// It is an orchestration outcome, not a remote command result: Kobe never
+/// fabricates an execution id or exit code for a response it did not observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunInterruption {
+    SigInt,
+    SigTerm,
+}
+
+impl RunInterruption {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SigInt => "SIGINT",
+            Self::SigTerm => "SIGTERM",
+        }
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::SigInt => 130,
+            Self::SigTerm => 143,
+        }
+    }
+}
+
+/// The execution side of one `run` lifecycle.
+#[derive(Debug)]
+enum RunOutcome {
+    Execution(Result<ExecutionResponse>),
+    Interrupted(RunInterruption),
+}
+
+/// A complete `run` lifecycle. Cleanup is always present because this value is
+/// only constructed after the release observation attempt has finished.
+#[derive(Debug)]
+struct RunLifecycle {
+    outcome: RunOutcome,
+    cleanup: CleanupOutcome,
+}
+
+/// Finish an in-flight create after shutdown so its durable lease id is not
+/// lost between POST and release.
+///
+/// Cancelling the request future when SIGINT/SIGTERM wins would be unsafe: the
+/// server may already have committed the lease even though the response body
+/// has not reached the client. Once a shutdown signal is observed, this waits
+/// for that same request to return its handle; the caller then skips execution
+/// and releases the exact lease.
+async fn create_before_shutdown<Create, Shutdown>(
+    create: Create,
+    mut shutdown: std::pin::Pin<&mut Shutdown>,
+) -> Result<(String, Option<RunInterruption>)>
+where
+    Create: Future<Output = Result<String>>,
+    Shutdown: Future<Output = RunInterruption>,
+{
+    tokio::pin!(create);
+    tokio::select! {
+        biased;
+        result = &mut create => result.map(|lease| (lease, None)),
+        signal = &mut shutdown => {
+            let lease = (&mut create).await?;
+            Ok((lease, Some(signal)))
+        }
+    }
+}
+
+/// Race one execution against client shutdown, then always await release.
+///
+/// Dropping the losing execution future on interruption closes its HTTP
+/// request, but does not return from this function: the release future is
+/// awaited to its own bound first. Keeping the orchestration generic makes the
+/// signal, timeout, disconnect, cancellation and cleanup-failure invariants
+/// deterministic unit tests rather than timing-sensitive process tests.
+async fn orchestrate_run<Execution, Shutdown, Release, ReleaseFuture>(
+    execution: Execution,
+    shutdown: Shutdown,
+    release: Release,
+) -> RunLifecycle
+where
+    Execution: Future<Output = Result<ExecutionResponse>>,
+    Shutdown: Future<Output = RunInterruption>,
+    Release: FnOnce() -> ReleaseFuture,
+    ReleaseFuture: Future<Output = CleanupOutcome>,
+{
+    tokio::pin!(execution);
+    tokio::pin!(shutdown);
+    let outcome = tokio::select! {
+        // If both became ready in the same scheduler turn, an observed remote
+        // result is stronger evidence than a concurrent local signal.
+        biased;
+        result = &mut execution => RunOutcome::Execution(result),
+        signal = &mut shutdown => RunOutcome::Interrupted(signal),
+    };
+    let cleanup = release().await;
+    RunLifecycle { outcome, cleanup }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> RunInterruption {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => tokio::select! {
+            _ = tokio::signal::ctrl_c() => RunInterruption::SigInt,
+            _ = sigterm.recv() => RunInterruption::SigTerm,
+        },
+        // If SIGTERM registration is unavailable, SIGINT is still catchable.
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            RunInterruption::SigInt
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> RunInterruption {
+    let _ = tokio::signal::ctrl_c().await;
+    RunInterruption::SigInt
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptedRunOutput<'a> {
+    api_version: &'static str,
+    lease: &'a str,
+    state: &'static str,
+    signal: &'static str,
+    cleanup: &'a CleanupOutcome,
+}
+
+fn emit_interruption(
+    lease: &str,
+    signal: RunInterruption,
+    cleanup: &CleanupOutcome,
+    output: OutputFormat,
+) -> Result<()> {
+    match output {
+        OutputFormat::Json => print_json(&InterruptedRunOutput {
+            api_version: SANDBOX_CLI_API_VERSION,
+            lease,
+            state: "Interrupted",
+            signal: signal.name(),
+            cleanup,
+        }),
+        OutputFormat::Text => {
+            eprintln!(
+                "kobe: {} received; sandbox release {}",
+                signal.name(),
+                if cleanup.released {
+                    "was observed"
+                } else {
+                    "could not be confirmed"
+                }
+            );
+            if let Some(error) = cleanup.error.as_deref() {
+                eprintln!("kobe: WARNING the sandbox lease was not released: {error}");
+            }
+            Ok(())
+        }
+    }
+}
 
 /// Create a Sandbox, run one command in it, and release it.
 ///
@@ -404,26 +592,41 @@ pub async fn run(command: RunCommand<'_>) -> Result<i32> {
         anyhow::bail!("a command is required: kobe sandbox run <pool> -- <argv...>");
     }
 
-    let lease = create_sandbox_lease(&config, pool, ttl).await?;
+    // Install signal handling before sending the create. If shutdown races the
+    // response, keep the same POST future alive until its durable handle is
+    // known; only then can cleanup address the exact lease.
+    let mut shutdown = Box::pin(shutdown_signal());
+    let (lease, interrupted_during_create) =
+        create_before_shutdown(create_sandbox_lease(&config, pool, ttl), shutdown.as_mut()).await?;
 
     // Everything from here on must release. The result of the command and the
     // result of the release are tracked separately so neither can hide the
     // other.
-    let outcome = run_in_lease(&config, &lease, argv, cwd, timeout).await;
-    let cleanup = release_sandbox_lease(&config, &lease).await;
+    let lifecycle = if let Some(signal) = interrupted_during_create {
+        RunLifecycle {
+            outcome: RunOutcome::Interrupted(signal),
+            cleanup: release_sandbox_lease(&config, &lease).await,
+        }
+    } else {
+        orchestrate_run(
+            run_in_lease(&config, &lease, argv, cwd, timeout),
+            shutdown,
+            || release_sandbox_lease(&config, &lease),
+        )
+        .await
+    };
+    let RunLifecycle { outcome, cleanup } = lifecycle;
 
     match outcome {
-        Ok(result) => {
+        RunOutcome::Execution(Ok(result)) => {
             let code = exit_code_for(&result);
             emit(&config, &lease, &result, Some(cleanup.clone()), output)?;
-            // A leaked lease does not fail a command that worked, but it does
-            // fail a command that had nothing else to report.
-            if !cleanup.released && code == 0 {
-                return Ok(CLI_FAILURE_EXIT);
-            }
+            // Cleanup is a separate result. Rewriting a real remote zero to
+            // 125 would violate the exact-exit-code contract; JSON callers can
+            // inspect `cleanup`, while text callers receive the warning above.
             Ok(code)
         }
-        Err(error) => {
+        RunOutcome::Execution(Err(error)) => {
             if !cleanup.released {
                 // Both problems, in the order they matter: the caller's
                 // command first, the leaked lease second.
@@ -437,6 +640,10 @@ pub async fn run(command: RunCommand<'_>) -> Result<i32> {
                 );
             }
             Err(error)
+        }
+        RunOutcome::Interrupted(signal) => {
+            emit_interruption(&lease, signal, &cleanup, output)?;
+            Ok(signal.exit_code())
         }
     }
 }
@@ -532,63 +739,147 @@ async fn wait_until_ready(config: &ResolvedConfig, lease: &str) -> Result<()> {
 /// Release the lease, reporting what actually happened.
 ///
 /// Never returns an error: a release failure is data the caller needs
-/// alongside their command's result, not a replacement for it. A 404 counts
-/// as released — the lease is gone, which is the goal.
+/// alongside their command's result, not a replacement for it. A successful
+/// DELETE only requests release, so this waits until GET observes `Releasing`,
+/// a clean terminal phase, or absence. A 404 counts as released — the lease is
+/// gone, which is the goal.
 async fn release_sandbox_lease(config: &ResolvedConfig, lease: &str) -> CleanupOutcome {
-    let path = format!("/v1/sandbox-leases/{lease}");
-    let attempt = async {
+    let observe = async {
+        let path = format!("/v1/sandbox-leases/{lease}");
         let token = get_auth_header(config, "DELETE", &path, b"").await?;
         let response = with_auth(
             authed_client().delete(format!("{}{path}", config.endpoint)),
             &token,
         )
         .send()
-        .await?;
-        let status = response.status();
-        if status.is_success() || status.as_u16() == 404 {
-            Ok(())
-        } else {
-            anyhow::bail!("HTTP {status}")
+        .await;
+        if let Ok(response) = response {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok("Absent".to_string());
+            }
+            if !status.is_success() {
+                anyhow::bail!("HTTP {status}")
+            }
+        }
+        // A DELETE transport loss is ambiguous: it may have committed. Polling
+        // the exact lease is both safe and stronger than reporting a leak from
+        // a response body that merely failed to arrive.
+
+        loop {
+            let token = get_auth_header(config, "GET", &path, b"").await?;
+            let response = with_auth(
+                authed_client().get(format!("{}{path}", config.endpoint)),
+                &token,
+            )
+            .send()
+            .await;
+            let Ok(response) = response else {
+                tokio::time::sleep(RELEASE_POLL).await;
+                continue;
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok("Absent".to_string());
+            }
+            if !status.is_success() {
+                anyhow::bail!("release observation failed with HTTP {status}");
+            }
+            let current: SandboxLeaseResponse = response
+                .json()
+                .await
+                .context("could not parse the sandbox release status")?;
+            match observe_release_phase(&current.phase) {
+                ReleasePhaseObservation::Observed(_) => return Ok(current.phase),
+                ReleasePhaseObservation::Failed(message) => anyhow::bail!(message),
+                ReleasePhaseObservation::Pending => tokio::time::sleep(RELEASE_POLL).await,
+            }
         }
     };
 
-    match tokio::time::timeout(RELEASE_TIMEOUT, attempt).await {
-        Ok(Ok(())) => CleanupOutcome {
+    match tokio::time::timeout(RELEASE_TIMEOUT, observe).await {
+        Ok(Ok(phase)) => CleanupOutcome {
             released: true,
+            phase: Some(phase),
             error: None,
         },
         Ok(Err(error)) => CleanupOutcome {
             released: false,
+            phase: None,
             error: Some(error.to_string()),
         },
         Err(_) => CleanupOutcome {
             released: false,
+            phase: None,
             error: Some(format!(
-                "release did not complete within {RELEASE_TIMEOUT:?}"
+                "release did not become observable within {RELEASE_TIMEOUT:?}"
             )),
         },
     }
 }
 
-impl Clone for CleanupOutcome {
-    fn clone(&self) -> Self {
-        Self {
-            released: self.released,
-            error: self.error.clone(),
-        }
-    }
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionLogWindow {
+    data: String,
+    next_offset: u64,
+    more: bool,
+    truncated: bool,
 }
 
-/// Read a bounded tail of the sandbox's own output.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionLogsResponse {
+    id: String,
+    state: String,
+    stdout: ExecutionLogWindow,
+    stderr: ExecutionLogWindow,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionLogsOutput<'a> {
+    api_version: &'static str,
+    lease: &'a str,
+    execution: &'a str,
+    state: &'a str,
+    stdout: &'a ExecutionLogWindow,
+    stderr: &'a ExecutionLogWindow,
+}
+
+fn execution_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "Succeeded" | "Failed" | "Cancelled" | "TimedOut" | "Unknown"
+    )
+}
+
+/// Read logs for a Sandbox or for one durable execution.
+///
+/// `--execution` selects the reconnectable offset route. With `--follow`, each
+/// response advances the stdout and stderr offsets independently, so a retry
+/// never duplicates one stream merely because the other advanced more slowly.
+/// Text writes bytes to their original streams. JSON follow mode emits one
+/// compact JSON object per window (NDJSON); non-follow JSON remains one normal
+/// pretty-printed object.
 pub async fn logs(
     lease: &str,
     tail: Option<i64>,
+    execution: Option<&str>,
+    follow: bool,
     target_override: Option<&str>,
     endpoint_override: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
+
+    if let Some(execution) = execution {
+        return execution_logs(&config, lease, execution, follow, output).await;
+    }
+    if follow {
+        anyhow::bail!("--follow requires --execution <id>");
+    }
 
     let mut path = format!("/v1/sandbox-leases/{lease}/logs");
     if let Some(tail) = tail {
@@ -621,6 +912,108 @@ pub async fn logs(
         OutputFormat::Text => {
             print!("{body}");
             std::io::stdout().flush().ok();
+            Ok(())
+        }
+    }
+}
+
+async fn execution_logs(
+    config: &ResolvedConfig,
+    lease: &str,
+    execution: &str,
+    follow: bool,
+    output: OutputFormat,
+) -> Result<()> {
+    let mut stdout_offset = 0;
+    let mut stderr_offset = 0;
+
+    loop {
+        let previous_offsets = (stdout_offset, stderr_offset);
+        let current =
+            read_execution_logs(config, lease, execution, stdout_offset, stderr_offset).await?;
+        emit_execution_logs(lease, &current, follow, output)?;
+
+        stdout_offset = current.stdout.next_offset;
+        stderr_offset = current.stderr.next_offset;
+        let more = current.stdout.more || current.stderr.more;
+        if !follow || (execution_is_terminal(&current.state) && !more) {
+            return Ok(());
+        }
+        if !more || previous_offsets == (stdout_offset, stderr_offset) {
+            tokio::time::sleep(LOGS_FOLLOW_POLL).await;
+        }
+    }
+}
+
+fn execution_logs_path(
+    lease: &str,
+    execution: &str,
+    stdout_offset: u64,
+    stderr_offset: u64,
+) -> String {
+    format!(
+        "/v1/sandbox-leases/{lease}/executions/{execution}/logs?stdoutOffset={stdout_offset}&stderrOffset={stderr_offset}"
+    )
+}
+
+async fn read_execution_logs(
+    config: &ResolvedConfig,
+    lease: &str,
+    execution: &str,
+    stdout_offset: u64,
+    stderr_offset: u64,
+) -> Result<ExecutionLogsResponse> {
+    let path = execution_logs_path(lease, execution, stdout_offset, stderr_offset);
+    let token = get_auth_header(config, "GET", &path, b"").await?;
+    let response = with_auth(
+        authed_client().get(format!("{}{path}", config.endpoint)),
+        &token,
+    )
+    .send()
+    .await
+    .context("could not reach the Kobe endpoint")?;
+    let status = response.status();
+    let payload = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "could not read execution logs (HTTP {status}): {}",
+            payload.trim()
+        );
+    }
+    serde_json::from_str(&payload).context("could not parse the execution logs response")
+}
+
+fn emit_execution_logs(
+    lease: &str,
+    current: &ExecutionLogsResponse,
+    follow: bool,
+    output: OutputFormat,
+) -> Result<()> {
+    match output {
+        OutputFormat::Json => {
+            let output = ExecutionLogsOutput {
+                api_version: SANDBOX_CLI_API_VERSION,
+                lease,
+                execution: &current.id,
+                state: &current.state,
+                stdout: &current.stdout,
+                stderr: &current.stderr,
+            };
+            if follow {
+                println!("{}", serde_json::to_string(&output)?);
+                Ok(())
+            } else {
+                print_json(&output)
+            }
+        }
+        OutputFormat::Text => {
+            print!("{}", current.stdout.data);
+            std::io::stdout().flush().ok();
+            eprint!("{}", current.stderr.data);
+            std::io::stderr().flush().ok();
+            if current.stdout.truncated || current.stderr.truncated {
+                eprintln!("kobe: execution output was truncated at the server's retention cap");
+            }
             Ok(())
         }
     }
@@ -689,6 +1082,45 @@ mod tests {
             truncated: false,
             reason: None,
         }
+    }
+
+    fn observed_cleanup() -> CleanupOutcome {
+        CleanupOutcome {
+            released: true,
+            phase: Some("Releasing".into()),
+            error: None,
+        }
+    }
+
+    fn failed_cleanup() -> CleanupOutcome {
+        CleanupOutcome {
+            released: false,
+            phase: None,
+            error: Some("HTTP 503".into()),
+        }
+    }
+
+    /// A 204 DELETE is only intent. Cleanup becomes successful after a later
+    /// read observes the controller checkpoint or a clean terminal phase;
+    /// Quarantined is terminal uncertainty, never success.
+    #[test]
+    fn cleanup_requires_an_observable_release_phase() {
+        for pending in ["Pending", "Provisioning", "Ready"] {
+            assert_eq!(
+                observe_release_phase(pending),
+                ReleasePhaseObservation::Pending
+            );
+        }
+        for observed in ["Releasing", "Released", "Expired"] {
+            assert_eq!(
+                observe_release_phase(observed),
+                ReleasePhaseObservation::Observed(observed)
+            );
+        }
+        assert_eq!(
+            observe_release_phase("Quarantined"),
+            ReleasePhaseObservation::Failed("sandbox cleanup entered Quarantined")
+        );
     }
 
     /// The shutdown handoff extends, rather than replaces, the create schema.
@@ -849,6 +1281,167 @@ mod tests {
         assert_eq!(http_attempts, 1);
     }
 
+    /// SIGINT cancels the in-flight HTTP future but not the cleanup future.
+    ///
+    /// Returning as soon as the signal arrives would make `sandbox run` leak a
+    /// lease whenever a CI job or human interrupted it. The lifecycle remains
+    /// pending until release has reached its own observable bound.
+    #[tokio::test]
+    async fn signal_waits_for_observable_release_before_returning() {
+        let (release_started_tx, release_started_rx) = tokio::sync::oneshot::channel();
+        let (release_finish_tx, release_finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(orchestrate_run(
+            std::future::pending::<Result<ExecutionResponse>>(),
+            std::future::ready(RunInterruption::SigInt),
+            move || async move {
+                let _ = release_started_tx.send(());
+                let _ = release_finish_rx.await;
+                observed_cleanup()
+            },
+        ));
+
+        release_started_rx.await.unwrap();
+        assert!(
+            !task.is_finished(),
+            "signal handling must not return before cleanup settles"
+        );
+        release_finish_tx.send(()).unwrap();
+
+        let lifecycle = task.await.unwrap();
+        assert!(matches!(
+            lifecycle.outcome,
+            RunOutcome::Interrupted(RunInterruption::SigInt)
+        ));
+        assert_eq!(RunInterruption::SigInt.exit_code(), 130);
+        assert_eq!(lifecycle.cleanup, observed_cleanup());
+    }
+
+    /// A signal racing lease creation must not discard a possibly committed
+    /// POST response. The same request is allowed to return its durable handle,
+    /// after which the caller can release that exact lease without executing.
+    #[tokio::test]
+    async fn signal_during_create_waits_for_the_handle_needed_by_cleanup() {
+        let (create_started_tx, create_started_rx) = tokio::sync::oneshot::channel();
+        let (create_finish_tx, create_finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut shutdown = Box::pin(std::future::ready(RunInterruption::SigTerm));
+            create_before_shutdown(
+                async move {
+                    let _ = create_started_tx.send(());
+                    let _ = create_finish_rx.await;
+                    Ok("sandbox-created".to_string())
+                },
+                shutdown.as_mut(),
+            )
+            .await
+        });
+
+        create_started_rx.await.unwrap();
+        assert!(
+            !task.is_finished(),
+            "shutdown must wait for the in-flight create handle"
+        );
+        create_finish_tx.send(()).unwrap();
+
+        let (lease, signal) = task.await.unwrap().unwrap();
+        assert_eq!(lease, "sandbox-created");
+        assert_eq!(signal, Some(RunInterruption::SigTerm));
+        assert_eq!(RunInterruption::SigTerm.exit_code(), 143);
+    }
+
+    /// A runner-enforced timeout is a terminal execution outcome, not a reason
+    /// to skip release. No exit code is invented for it.
+    #[tokio::test]
+    async fn timeout_still_releases_and_keeps_the_remote_outcome() {
+        let lifecycle = orchestrate_run(
+            std::future::ready(Ok(response("TimedOut", None))),
+            std::future::pending::<RunInterruption>(),
+            || std::future::ready(observed_cleanup()),
+        )
+        .await;
+
+        let RunOutcome::Execution(Ok(result)) = lifecycle.outcome else {
+            panic!("timeout must remain an execution outcome")
+        };
+        assert_eq!(result.state, "TimedOut");
+        assert_eq!(exit_code_for(&result), CLI_FAILURE_EXIT);
+        assert_eq!(lifecycle.cleanup, observed_cleanup());
+    }
+
+    /// Losing the execution response is ambiguous, but cleanup is not optional.
+    /// The original transport error survives after the release attempt.
+    #[tokio::test]
+    async fn disconnect_still_releases_and_preserves_the_transport_error() {
+        let lifecycle = orchestrate_run(
+            std::future::ready(Err(anyhow::anyhow!("response disconnected"))),
+            std::future::pending::<RunInterruption>(),
+            || std::future::ready(observed_cleanup()),
+        )
+        .await;
+
+        let RunOutcome::Execution(Err(error)) = lifecycle.outcome else {
+            panic!("disconnect must remain an execution transport error")
+        };
+        assert_eq!(error.to_string(), "response disconnected");
+        assert_eq!(lifecycle.cleanup, observed_cleanup());
+    }
+
+    /// Server-confirmed cancellation is terminal and still followed by lease
+    /// release. It has no remote exit code, so Kobe's distinct 125 applies.
+    #[tokio::test]
+    async fn cancelled_execution_still_releases_without_fabricating_an_exit_code() {
+        let lifecycle = orchestrate_run(
+            std::future::ready(Ok(response("Cancelled", None))),
+            std::future::pending::<RunInterruption>(),
+            || std::future::ready(observed_cleanup()),
+        )
+        .await;
+
+        let RunOutcome::Execution(Ok(result)) = lifecycle.outcome else {
+            panic!("cancellation must remain a remote execution outcome")
+        };
+        assert_eq!(exit_code_for(&result), CLI_FAILURE_EXIT);
+        assert_eq!(lifecycle.cleanup, observed_cleanup());
+    }
+
+    /// Cleanup failure is reported beside the command and never rewrites its
+    /// exact exit code — including a successful zero.
+    #[tokio::test]
+    async fn release_failure_never_rewrites_the_remote_exit_code() {
+        let lifecycle = orchestrate_run(
+            std::future::ready(Ok(response("Succeeded", Some(0)))),
+            std::future::pending::<RunInterruption>(),
+            || std::future::ready(failed_cleanup()),
+        )
+        .await;
+
+        let RunOutcome::Execution(Ok(result)) = lifecycle.outcome else {
+            panic!("the command result must survive cleanup failure")
+        };
+        assert_eq!(exit_code_for(&result), 0);
+        assert_eq!(lifecycle.cleanup, failed_cleanup());
+    }
+
+    /// The CLI uses the reconnectable execution-log route and advances each
+    /// stream independently using the API's canonical camel-case query names.
+    #[test]
+    fn execution_log_route_carries_both_resume_offsets() {
+        assert_eq!(
+            execution_logs_path("sandbox-1", "sbxe-1", 7, 11),
+            "/v1/sandbox-leases/sandbox-1/executions/sbxe-1/logs?stdoutOffset=7&stderrOffset=11"
+        );
+    }
+
+    #[test]
+    fn execution_log_terminal_states_match_the_api_contract() {
+        for terminal in ["Succeeded", "Failed", "Cancelled", "TimedOut", "Unknown"] {
+            assert!(execution_is_terminal(terminal), "{terminal}");
+        }
+        for active in ["Queued", "Running"] {
+            assert!(!execution_is_terminal(active), "{active}");
+        }
+    }
+
     /// Machine output is versioned and keeps the streams apart.
     ///
     /// An agent parses this. A field that changed meaning without a version
@@ -909,6 +1502,7 @@ mod tests {
             // ...and the lease leaked. Both facts survive.
             cleanup: Some(CleanupOutcome {
                 released: false,
+                phase: None,
                 error: Some("HTTP 503".into()),
             }),
         };

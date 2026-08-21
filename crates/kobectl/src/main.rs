@@ -175,11 +175,18 @@ enum SandboxAction {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Read a bounded tail of the sandbox's output.
+    /// Read a bounded tail of the sandbox or one durable execution.
     Logs {
         lease: String,
-        /// Lines from the end.
-        #[arg(long)]
+        /// Durable execution id. Reads reconnectable stdout/stderr windows.
+        #[arg(long, conflicts_with = "tail")]
+        execution: Option<String>,
+        /// Continue from returned offsets until the execution is terminal.
+        /// With `--output json`, emits one JSON object per line (NDJSON).
+        #[arg(long, requires = "execution")]
+        follow: bool,
+        /// Lines from the end of the sandbox's own output.
+        #[arg(long, conflicts_with = "execution")]
         tail: Option<i64>,
     },
     /// Cancel a running execution.
@@ -379,11 +386,22 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .await
                 }
-                SandboxAction::Logs { lease, tail } => {
-                    commands::sandbox::logs(&lease, tail, target, endpoint, output)
-                        .await
-                        .map(|()| 0)
-                }
+                SandboxAction::Logs {
+                    lease,
+                    execution,
+                    follow,
+                    tail,
+                } => commands::sandbox::logs(
+                    &lease,
+                    tail,
+                    execution.as_deref(),
+                    follow,
+                    target,
+                    endpoint,
+                    output,
+                )
+                .await
+                .map(|()| 0),
                 SandboxAction::Cancel { lease, execution } => {
                     commands::sandbox::cancel(&lease, &execution, target, endpoint, output)
                         .await
@@ -483,4 +501,62 @@ fn print_config_help() -> anyhow::Result<()> {
     config_cmd.print_help()?;
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The public #84 shape reaches the durable execution-log route with follow
+    /// enabled; these flags must not be mistaken for global or sandbox options.
+    #[test]
+    fn execution_logs_accept_execution_and_follow_options() {
+        let cli = Cli::try_parse_from([
+            "kobe",
+            "sandbox",
+            "logs",
+            "sandbox-1",
+            "--execution",
+            "sbxe-1",
+            "--follow",
+        ])
+        .unwrap();
+
+        let Commands::Sandbox {
+            action:
+                SandboxAction::Logs {
+                    lease,
+                    execution,
+                    follow,
+                    tail,
+                },
+        } = cli.command
+        else {
+            panic!("expected sandbox logs")
+        };
+        assert_eq!(lease, "sandbox-1");
+        assert_eq!(execution.as_deref(), Some("sbxe-1"));
+        assert!(follow);
+        assert_eq!(tail, None);
+    }
+
+    /// Sandbox-tail and execution-window modes are distinct server routes.
+    /// Rejecting a mixed invocation prevents silently ignoring one bound.
+    #[test]
+    fn execution_logs_reject_tail_and_follow_requires_execution() {
+        assert!(
+            Cli::try_parse_from([
+                "kobe",
+                "sandbox",
+                "logs",
+                "sandbox-1",
+                "--execution",
+                "sbxe-1",
+                "--tail",
+                "10",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["kobe", "sandbox", "logs", "sandbox-1", "--follow"]).is_err());
+    }
 }
