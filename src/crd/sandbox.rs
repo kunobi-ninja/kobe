@@ -499,8 +499,12 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("spec.placementAuthority is immutable"),
     validation = Rule::new("!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.spec.placementAuthority.kind == 'ClusterPool' && self.spec.placementAuthority.namespace == self.metadata.namespace)")
         .message("spec.placementAuthority must identify a same-namespace ClusterPool"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == 'management' && !has(self.spec.placementAuthority)) || (self.status.placement.type == 'childCluster' && has(self.spec.placementAuthority) && self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))")
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == 'management' && !has(self.spec.placementAuthority)) || (self.status.placement.type == 'childCluster' && (!has(self.spec.placementAuthority) || (self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))))")
         .message("resolved placement must match the immutable admission placementAuthority"),
+    validation = Rule::new("!(has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == 'childCluster' && !has(self.spec.placementAuthority)) || (has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == 'childCluster' && !has(oldSelf.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)")
+        .message("child placement without placementAuthority may only preserve an exact legacy placement"),
+    validation = Rule::new("!(has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == 'childCluster' && !has(oldSelf.spec.placementAuthority)) || (has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == 'childCluster' && !has(self.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)")
+        .message("legacy child placement without placementAuthority may not be removed or changed"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -512,7 +516,10 @@ pub struct SandboxLeaseSpec {
     pub pool_ref: SandboxPoolReference,
     /// Server-owned exact child `ClusterPool` identity copied from the admitted
     /// [`SandboxPoolStatus`]. It is absent for management placement and may not
-    /// be added, removed, or changed after the `SandboxLease` CREATE.
+    /// be added, removed, or changed after the `SandboxLease` CREATE. During a
+    /// rolling controller upgrade, replicas built before this field fail to
+    /// deserialize such leases and therefore fail closed; deploy the new reader
+    /// before any child admission is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_authority: Option<SandboxPlacementAuthority>,
     #[schemars(length(min = 1))]
@@ -1602,6 +1609,8 @@ mod tests {
             "spec.placementAuthority is immutable",
             "spec.placementAuthority must identify a same-namespace ClusterPool",
             "resolved placement must match the immutable admission placementAuthority",
+            "child placement without placementAuthority may only preserve an exact legacy placement",
+            "legacy child placement without placementAuthority may not be removed or changed",
         ] {
             assert!(
                 lease_validations
@@ -1609,5 +1618,62 @@ mod tests {
                     .any(|validation| validation["message"] == message)
             );
         }
+        for message in [
+            "child placement without placementAuthority may only preserve an exact legacy placement",
+            "legacy child placement without placementAuthority may not be removed or changed",
+        ] {
+            let rule = lease_validations
+                .iter()
+                .find(|validation| validation["message"] == message)
+                .and_then(|validation| validation["rule"].as_str())
+                .expect("legacy transition rule");
+            assert!(rule.contains("self.status.placement == oldSelf.status.placement"));
+            assert!(rule.contains("!has(oldSelf.spec.placementAuthority)"));
+        }
+    }
+
+    #[test]
+    fn pre_authority_replica_rejects_new_lease_field_during_rolling_upgrade() {
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct PreAuthoritySandboxLeaseSpec {
+            pool_ref: SandboxPoolReference,
+            ttl: String,
+            #[serde(default)]
+            alias: Option<String>,
+            requester: SandboxPrincipal,
+        }
+
+        let current = SandboxLeaseSpec {
+            pool_ref: SandboxPoolReference {
+                name: "sandbox-pool".into(),
+                uid: "sandbox-pool-uid".into(),
+                generation: 1,
+            },
+            placement_authority: Some(SandboxPlacementAuthority {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "ClusterPool".into(),
+                namespace: "kobe-system".into(),
+                name: "child-pool".into(),
+                uid: "child-pool-uid".into(),
+                generation: 3,
+            }),
+            ttl: "1h".into(),
+            alias: None,
+            requester: SandboxPrincipal {
+                provider: "oidc".into(),
+                requester_type: "user".into(),
+                issuer: "https://issuer.invalid".into(),
+                identity: "alice".into(),
+            },
+        };
+        let result = serde_json::from_value::<PreAuthoritySandboxLeaseSpec>(
+            serde_json::to_value(current).unwrap(),
+        );
+        let error = result
+            .err()
+            .expect("older strict replica must reject the field");
+        assert!(error.to_string().contains("placementAuthority"));
     }
 }

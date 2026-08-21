@@ -15,7 +15,7 @@ use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
     BackendProvenance, BoundInstanceRef, CleanupMode, ClusterInstance, ClusterInstancePhase,
     ClusterLease, ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase,
-    ClusterPoolStatus, LeaseBinding, LeasePhase, ResourceRef,
+    ClusterPoolStatus, LeaseBinding, LeasePhase, ResourceRef, SandboxPlacementAuthority,
     TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION, TEARDOWN_RECEIPT_RETENTION_FINALIZER,
     UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
 };
@@ -32,11 +32,40 @@ struct SandboxCompositionIdentity {
 #[derive(Debug)]
 enum SandboxCompositionGate {
     NotComposition,
-    Authorized,
+    Authorized(SandboxPlacementAuthority),
+    LegacyBoundRecovery,
     NeedsMigration(SandboxCompositionIdentity),
     Closed(SandboxCompositionIdentity),
     Invalid,
     Retry,
+}
+
+/// The outer Sandbox authority is exact only while the named live ClusterPool
+/// still has the UID and generation admitted by Kobe.
+fn live_cluster_pool_matches_sandbox_authority(
+    pool: &ClusterPool,
+    authority: &SandboxPlacementAuthority,
+    namespace: &str,
+) -> bool {
+    authority.api_version == "kobe.kunobi.ninja/v1alpha1"
+        && authority.kind == "ClusterPool"
+        && authority.namespace == namespace
+        && authority.name == pool.name_any()
+        && pool.namespace().as_deref() == Some(namespace)
+        && pool.uid().as_deref() == Some(authority.uid.as_str())
+        && pool.metadata.generation == Some(authority.generation)
+        && pool.metadata.deletion_timestamp.is_none()
+}
+
+/// A binding records a pool UID but no generation. Its name and UID must match
+/// the immutable outer authority; the gate's fresh live-pool read supplies the
+/// generation and deletion-state half of the proof.
+fn binding_pool_matches_sandbox_authority(
+    binding: &LeaseBinding,
+    authority: &SandboxPlacementAuthority,
+) -> bool {
+    binding.pool.name == authority.name
+        && binding.pool.uid.as_deref() == Some(authority.uid.as_str())
 }
 
 /// Produce the owner-independent metadata fence for one exact composition.
@@ -207,9 +236,45 @@ async fn sandbox_composition_allocation_gate(
         }
         Err(_) => return SandboxCompositionGate::Retry,
     };
+    if lease
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == LeasePhase::Bound)
+        && outer.uid().as_deref() == Some(outer_uid.as_str())
+        && outer.spec.placement_authority.is_none()
+    {
+        return SandboxCompositionGate::LegacyBoundRecovery;
+    }
     let outer_is_open = outer.uid().as_deref() == Some(outer_uid.as_str())
         && crate::controllers::sandbox::sandbox_lease_authorizes_allocation(&outer);
     if !outer_is_open {
+        return SandboxCompositionGate::Closed(identity);
+    }
+
+    let Some(authority) = outer.spec.placement_authority.as_ref() else {
+        // A Pending handle from a pre-authority producer cannot safely select
+        // same-named capacity. Already-Bound legacy recovery never enters this
+        // allocation gate.
+        return SandboxCompositionGate::Closed(identity);
+    };
+    if authority.api_version != "kobe.kunobi.ninja/v1alpha1"
+        || authority.kind != "ClusterPool"
+        || authority.namespace != namespace
+        || authority.name != lease.spec.pool_ref
+        || authority.uid.is_empty()
+        || authority.generation < 1
+    {
+        return SandboxCompositionGate::Invalid;
+    }
+    let pools: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
+    let live_pool = match pools.get(&authority.name).await {
+        Ok(pool) => pool,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return SandboxCompositionGate::Closed(identity);
+        }
+        Err(_) => return SandboxCompositionGate::Retry,
+    };
+    if !live_cluster_pool_matches_sandbox_authority(&live_pool, authority, namespace) {
         return SandboxCompositionGate::Closed(identity);
     }
 
@@ -223,13 +288,38 @@ async fn sandbox_composition_allocation_gate(
     {
         Err(kube::Error::Api(error)) if error.code == 404 => {
             if sandbox_composition_retention_fence_matches(lease, &identity) {
-                SandboxCompositionGate::Authorized
+                SandboxCompositionGate::Authorized(authority.clone())
             } else {
                 SandboxCompositionGate::NeedsMigration(identity)
             }
         }
         Ok(_) => SandboxCompositionGate::Closed(identity),
         Err(_) => SandboxCompositionGate::Retry,
+    }
+}
+
+/// Re-run the complete outer/live-pool proof for one proposed or resumed
+/// reservation. `false` is a durable fail-closed result; an unavailable API
+/// read is surfaced so the caller retries without writing authority-bearing
+/// token or binding state.
+async fn sandbox_composition_binding_is_authorized(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<bool, LeaseError> {
+    match sandbox_composition_allocation_gate(client, namespace, lease).await {
+        SandboxCompositionGate::NotComposition => Ok(true),
+        SandboxCompositionGate::Authorized(authority) => {
+            Ok(binding_pool_matches_sandbox_authority(binding, &authority))
+        }
+        SandboxCompositionGate::Retry => Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "Sandbox composition authority unavailable while reserving capacity"
+        ))),
+        SandboxCompositionGate::NeedsMigration(_)
+        | SandboxCompositionGate::Closed(_)
+        | SandboxCompositionGate::LegacyBoundRecovery
+        | SandboxCompositionGate::Invalid => Ok(false),
     }
 }
 
@@ -694,7 +784,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     // two operator replicas may reconcile the same object concurrently.
     if status.phase == LeasePhase::Pending {
         match sandbox_composition_allocation_gate(&ctx.client, &ns, &lease).await {
-            SandboxCompositionGate::NotComposition | SandboxCompositionGate::Authorized => {}
+            SandboxCompositionGate::NotComposition | SandboxCompositionGate::Authorized(_) => {}
             SandboxCompositionGate::NeedsMigration(identity) => {
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 return migrate_sandbox_composition_retention_fence(&leases_api, &lease, &identity)
@@ -717,6 +807,10 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             }
             SandboxCompositionGate::Retry => {
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+            SandboxCompositionGate::LegacyBoundRecovery => {
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return quarantine_invalid_sandbox_composition(&leases_api, &lease).await;
             }
         }
     }
@@ -1444,6 +1538,67 @@ fn created_at_for(lease: &ClusterLease) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(chrono::Utc::now)
 }
 
+/// Enforce the durable Sandbox authority around final publication.
+///
+/// A legacy composition that is already exactly `Bound` may finish recovery:
+/// this helper is not granting new access in that case. Every Pending intent,
+/// including one from a legacy producer, must still prove the outer authority,
+/// its exact live pool, and the binding pool before `Bound` can be published.
+async fn sandbox_composition_finalization_is_authorized<B: ClusterBackend>(
+    ctx: &LeaseContext<B>,
+    namespace: &str,
+    leases_api: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+    already_bound: bool,
+) -> Result<bool, LeaseError> {
+    match sandbox_composition_allocation_gate(&ctx.client, namespace, lease).await {
+        SandboxCompositionGate::NotComposition => {
+            if lease.metadata.deletion_timestamp.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "lease was deleted while finalizing binding"
+                )));
+            }
+            Ok(true)
+        }
+        SandboxCompositionGate::Authorized(authority)
+            if binding_pool_matches_sandbox_authority(binding, &authority) =>
+        {
+            Ok(true)
+        }
+        SandboxCompositionGate::LegacyBoundRecovery if already_bound => Ok(true),
+        SandboxCompositionGate::LegacyBoundRecovery => Ok(false),
+        SandboxCompositionGate::Authorized(_) | SandboxCompositionGate::Invalid => {
+            if !mark_instance_recycling(&ctx.client, namespace, binding).await? {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "invalid Sandbox reservation could not be fenced for recycling"
+                )));
+            }
+            let _ = quarantine_invalid_sandbox_composition(leases_api, lease).await?;
+            Ok(false)
+        }
+        SandboxCompositionGate::NeedsMigration(identity) => {
+            let _ =
+                migrate_sandbox_composition_retention_fence(leases_api, lease, &identity).await?;
+            Ok(false)
+        }
+        SandboxCompositionGate::Closed(identity) => {
+            let _ = close_stale_sandbox_composition(
+                &ctx.client,
+                namespace,
+                leases_api,
+                lease,
+                &identity,
+            )
+            .await?;
+            Ok(false)
+        }
+        SandboxCompositionGate::Retry => Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "Sandbox composition authorization unavailable while finalizing binding"
+        ))),
+    }
+}
+
 /// Complete a previously persisted two-sided reservation.
 ///
 /// Returns `true` only when `Bound` is already or successfully published. If a
@@ -1475,45 +1630,17 @@ async fn finalize_binding<B: ClusterBackend>(
             "lease binding intent changed before finalization"
         )));
     }
-    match sandbox_composition_allocation_gate(&ctx.client, namespace, &lease).await {
-        SandboxCompositionGate::NotComposition => {
-            if lease.metadata.deletion_timestamp.is_some() {
-                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-                    "lease was deleted while finalizing binding"
-                )));
-            }
-        }
-        SandboxCompositionGate::Authorized => {}
-        SandboxCompositionGate::NeedsMigration(identity) => {
-            let _ =
-                migrate_sandbox_composition_retention_fence(&leases_api, &lease, &identity).await?;
-            return Ok(false);
-        }
-        SandboxCompositionGate::Closed(identity) => {
-            let _ = close_stale_sandbox_composition(
-                &ctx.client,
-                namespace,
-                &leases_api,
-                &lease,
-                &identity,
-            )
-            .await?;
-            return Ok(false);
-        }
-        SandboxCompositionGate::Invalid => {
-            if !mark_instance_recycling(&ctx.client, namespace, binding).await? {
-                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-                    "invalid Sandbox reservation could not be fenced for recycling"
-                )));
-            }
-            let _ = quarantine_invalid_sandbox_composition(&leases_api, &lease).await?;
-            return Ok(false);
-        }
-        SandboxCompositionGate::Retry => {
-            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-                "Sandbox composition authorization unavailable while finalizing binding"
-            )));
-        }
+    if !sandbox_composition_finalization_is_authorized(
+        ctx,
+        namespace,
+        &leases_api,
+        &lease,
+        binding,
+        already_bound,
+    )
+    .await?
+    {
+        return Ok(false);
     }
 
     let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
@@ -1574,6 +1701,21 @@ async fn finalize_binding<B: ClusterBackend>(
     };
     new_status.conditions =
         derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
+
+    // Re-read the outer and exact live pool immediately before publishing
+    // `Bound`. This closes replacement races during instance/token validation.
+    if !sandbox_composition_finalization_is_authorized(
+        ctx,
+        namespace,
+        &leases_api,
+        &lease,
+        binding,
+        false,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
 
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": lease_uid },
@@ -2163,6 +2305,10 @@ async fn reserve_ready_instance(
         .as_ref()
         .and_then(|status| status.binding.clone())
     {
+        if !sandbox_composition_binding_is_authorized(client, namespace, &lease, &binding).await? {
+            warn!(lease = %lease.name_any(), "Cannot resume reservation whose pool differs from the outer Sandbox authority");
+            return Ok(None);
+        }
         let instance = Api::<ClusterInstance>::namespaced(client.clone(), namespace)
             .get(&binding.instance.name)
             .await?;
@@ -2260,6 +2406,10 @@ async fn reserve_ready_instance(
         {
             warn!(lease = %lease.name_any(), instance = %instance.name_any(), error = %error, "Skipping instance that cannot satisfy immutable cleanup provenance");
             continue;
+        }
+        if !sandbox_composition_binding_is_authorized(client, namespace, &lease, &binding).await? {
+            warn!(lease = %lease.name_any(), "Refusing binding intent whose pool differs from the outer Sandbox authority");
+            return Ok(None);
         }
         if binding.cleanup_mode.requires_receipt() {
             let token_identity =
@@ -3737,6 +3887,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumed_composition_intent_must_match_outer_pool_authority() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let mut lease = authorized_sandbox_composition_handle(outer_name, "30");
+        lease
+            .metadata
+            .finalizers
+            .get_or_insert_default()
+            .push(TEARDOWN_RECEIPT_RETENTION_FINALIZER.into());
+        let mut binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        binding.pool = ResourceRef {
+            name: "child-pool".into(),
+            uid: Some("child-pool-uid-b".into()),
+        };
+        lease.status.as_mut().unwrap().binding = Some(binding);
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+                crate::controllers::sandbox::allocation_fence_name(outer_name)
+            )))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "leases",
+                    "sandbox-allocation-late-outer",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        assert!(
+            reserve_ready_instance(&ctx.client, "test-ns", &lease, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/secrets")
+                || request.method == http::Method::PATCH
+        }));
+    }
+
+    #[tokio::test]
     async fn replayed_lease_intent_resumes_only_the_same_exact_instance() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
@@ -3929,7 +4139,238 @@ mod tests {
             "phase": "Provisioning",
             "observedGeneration": 1
         });
+        outer["spec"]["placementAuthority"] = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "namespace": "test-ns",
+            "name": "child-pool",
+            "uid": "child-pool-uid-a",
+            "generation": 3
+        });
         outer
+    }
+
+    fn child_cluster_pool(uid: &str, generation: i64) -> serde_json::Value {
+        let mut pool = make_test_profile();
+        pool["metadata"]["name"] = "child-pool".into();
+        pool["metadata"]["uid"] = uid.into();
+        pool["metadata"]["generation"] = generation.into();
+        pool
+    }
+
+    fn authorized_sandbox_composition_handle(
+        outer_name: &str,
+        resource_version: &str,
+    ) -> ClusterLease {
+        let mut lease = delayed_sandbox_composition_handle(outer_name, resource_version, false);
+        let identity = SandboxCompositionIdentity {
+            outer_name: outer_name.into(),
+            outer_uid: "late-outer-uid".into(),
+        };
+        let (labels, annotations, finalizers) =
+            sandbox_composition_retention_metadata(&lease, &identity, false);
+        lease.metadata.owner_references = Some(Vec::new());
+        lease.metadata.labels = Some(labels);
+        lease.metadata.annotations = Some(annotations);
+        lease.metadata.finalizers = Some(finalizers);
+        lease
+    }
+
+    #[tokio::test]
+    async fn exact_outer_authority_and_live_pool_authorize_composition() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = authorized_sandbox_composition_handle(outer_name, "10");
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+                crate::controllers::sandbox::allocation_fence_name(outer_name)
+            )))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "leases",
+                    "sandbox-allocation-late-outer",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let SandboxCompositionGate::Authorized(authority) =
+            sandbox_composition_allocation_gate(&ctx.client, "test-ns", &lease).await
+        else {
+            panic!("exact live authority must authorize the composition");
+        };
+        assert_eq!(authority.uid, "child-pool-uid-a");
+        assert_eq!(authority.generation, 3);
+    }
+
+    /// The producer may read pool A and have its POST commit only after the
+    /// same name points at pool B. The consumer closes that handle before any
+    /// queue entry, binding intent, token, or instance observation.
+    #[tokio::test]
+    async fn same_name_pool_replacement_before_consumer_never_queues_or_binds() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = authorized_sandbox_composition_handle(outer_name, "10");
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-b", 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let identity = SandboxCompositionIdentity {
+            outer_name: outer_name.into(),
+            outer_uid: "late-outer-uid".into(),
+        };
+        let (labels, annotations, finalizers) =
+            sandbox_composition_retention_metadata(&lease, &identity, true);
+        let mut rejected = lease.clone();
+        rejected.metadata.owner_references = Some(Vec::new());
+        rejected.metadata.labels = Some(labels);
+        rejected.metadata.annotations = Some(annotations);
+        rejected.metadata.finalizers = Some(finalizers);
+        rejected.metadata.resource_version = Some("11".into());
+        Mock::given(method("PATCH"))
+            .and(path(child_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&rejected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut released = rejected;
+        released.metadata.resource_version = Some("12".into());
+        released.status.as_mut().unwrap().phase = LeasePhase::Released;
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(released))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx.clone()).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(1))
+        );
+        assert!(ctx.queues.read().await.values().all(Vec::is_empty));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/secrets")
+        }));
+        let status_patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_status_path
+            })
+            .expect("stale handle status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&status_patch.body).unwrap();
+        assert!(!operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/binding" || operation["value"]["phase"] == "Bound"
+        }));
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_composition_without_authority_never_enters_queue() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = authorized_sandbox_composition_handle(outer_name, "20");
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let mut legacy_outer = open_outer_sandbox(outer_name);
+        legacy_outer["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placementAuthority");
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(legacy_outer))
+            .mount(&server)
+            .await;
+
+        let identity = SandboxCompositionIdentity {
+            outer_name: outer_name.into(),
+            outer_uid: "late-outer-uid".into(),
+        };
+        let (labels, annotations, finalizers) =
+            sandbox_composition_retention_metadata(&lease, &identity, true);
+        let mut rejected = lease.clone();
+        rejected.metadata.labels = Some(labels);
+        rejected.metadata.annotations = Some(annotations);
+        rejected.metadata.finalizers = Some(finalizers);
+        rejected.metadata.resource_version = Some("21".into());
+        Mock::given(method("PATCH"))
+            .and(path(child_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&rejected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut released = rejected;
+        released.metadata.resource_version = Some("22".into());
+        released.status.as_mut().unwrap().phase = LeasePhase::Released;
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(released))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx.clone()).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(1))
+        );
+        assert!(ctx.queues.read().await.values().all(Vec::is_empty));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterpools")
+                || request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/secrets")
+        }));
     }
 
     /// A true base object has no UID label, so the exact sole ownerRef is the
@@ -3964,6 +4405,15 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path(fence_path))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
@@ -3987,7 +4437,6 @@ mod tests {
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(!requests.iter().any(|request| {
             request.url.path().contains("/clusterinstances")
-                || request.url.path().contains("/clusterpools/child-pool")
                 || request.url.path() == child_status_path
         }));
         let patch = requests
@@ -4306,6 +4755,150 @@ mod tests {
         assert!(operations.as_array().unwrap().iter().any(|operation| {
             operation["path"] == "/status/phase" && operation["value"] == "Recycling"
         }));
+    }
+
+    #[tokio::test]
+    async fn finalize_binding_recycles_authority_mismatch_without_publishing_bound() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let mut lease = authorized_sandbox_composition_handle(outer_name, "40");
+        let mut binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        binding.pool = ResourceRef {
+            name: "child-pool".into(),
+            uid: Some("child-pool-uid-b".into()),
+        };
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+        let instance_status_path = format!("{instance_path}/status");
+        Mock::given(method("GET"))
+            .and(path(child_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+                crate::controllers::sandbox::allocation_fence_name(outer_name)
+            )))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "leases",
+                    "sandbox-allocation-late-outer",
+                )),
+            )
+            .mount(&server)
+            .await;
+        let instance = exact_instance_for_binding(Some(&binding), "Leased");
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(instance_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut quarantined = lease.clone();
+        quarantined.status.as_mut().unwrap().phase = LeasePhase::Quarantined;
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(quarantined))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            !finalize_binding(&ctx, "test-ns", &binding, chrono::Utc::now())
+                .await
+                .unwrap()
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let lease_patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_status_path
+            })
+            .expect("quarantine status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&lease_patch.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Quarantined"
+        }));
+        assert!(!operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Bound"
+        }));
+        let recycle = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == instance_status_path
+            })
+            .expect("instance recycle patch");
+        let operations: serde_json::Value = serde_json::from_slice(&recycle.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/phase" && operation["value"] == "Recycling"
+        }));
+    }
+
+    #[tokio::test]
+    async fn already_bound_legacy_composition_remains_recoverable_without_authority() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = authorized_sandbox_composition_handle("late-outer", "50");
+        lease.status.as_mut().unwrap().phase = LeasePhase::Bound;
+        let binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        let mut legacy_outer = open_outer_sandbox("late-outer");
+        legacy_outer["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placementAuthority");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/late-outer",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(legacy_outer))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            sandbox_composition_finalization_is_authorized(
+                &ctx,
+                "test-ns",
+                &Api::namespaced(ctx.client.clone(), "test-ns"),
+                &lease,
+                &binding,
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
+        );
     }
 
     /// A lost status response must be retryable, and the recovered write must

@@ -39,7 +39,10 @@ spec:
                 description: |-
                   Server-owned exact child `ClusterPool` identity copied from the admitted
                   [`SandboxPoolStatus`]. It is absent for management placement and may not
-                  be added, removed, or changed after the `SandboxLease` CREATE.
+                  be added, removed, or changed after the `SandboxLease` CREATE. During a
+                  rolling controller upgrade, replicas built before this field fail to
+                  deserialize such leases and therefore fail closed; deploy the new reader
+                  before any child admission is enabled.
                 nullable: true
                 properties:
                   apiVersion:
@@ -699,7 +702,11 @@ spec:
         - message: spec.placementAuthority must identify a same-namespace ClusterPool
           rule: '!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.spec.placementAuthority.kind == ''ClusterPool'' && self.spec.placementAuthority.namespace == self.metadata.namespace)'
         - message: resolved placement must match the immutable admission placementAuthority
-          rule: '!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == ''management'' && !has(self.spec.placementAuthority)) || (self.status.placement.type == ''childCluster'' && has(self.spec.placementAuthority) && self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))'
+          rule: '!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == ''management'' && !has(self.spec.placementAuthority)) || (self.status.placement.type == ''childCluster'' && (!has(self.spec.placementAuthority) || (self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))))'
+        - message: child placement without placementAuthority may only preserve an exact legacy placement
+          rule: '!(has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == ''childCluster'' && !has(self.spec.placementAuthority)) || (has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == ''childCluster'' && !has(oldSelf.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)'
+        - message: legacy child placement without placementAuthority may not be removed or changed
+          rule: '!(has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == ''childCluster'' && !has(oldSelf.spec.placementAuthority)) || (has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == ''childCluster'' && !has(self.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)'
     served: true
     storage: true
     subresources:
