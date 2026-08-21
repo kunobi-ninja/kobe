@@ -77,9 +77,12 @@ test("the conformance manifest contains two exact placements and a pullable runn
   expect(pools).toContain("name: e2e-other-token");
 });
 
-test("the Sandbox fixture runs as the restricted workload identity", async () => {
+test("the Sandbox fixture provisions and exercises the default runner spool as its restricted identity", async () => {
   const dockerfile = await Bun.file("docker/sandbox-e2e.Dockerfile").text();
+  expect(dockerfile).toContain("install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions");
   expect(dockerfile).toContain("USER 65532:65532");
+  expect(dockerfile).toContain("/kobe-runner start");
+  expect(dockerfile).not.toContain("/kobe-runner --state-dir");
 });
 
 test("the conformance preflight reports durable pool blockers without waiting for timeout", () => {
@@ -177,6 +180,29 @@ test("an unknown failure kind is refused rather than defaulted", () => {
   // Silently falling back to the default would break the target in a way the
   // caller did not ask for, and the scenario would assert against it.
   expect(() => parseArgs(["inject-failure", "--kind", "chaos"])).toThrow(/unknown failure kind/);
+});
+
+test("#82 crash windows carry the exact idempotency key into the harness", () => {
+  for (const kind of [
+    "execution-after-running-before-target-reservation",
+    "execution-before-spawn",
+    "execution-after-spawn-before-ack",
+    "execution-after-ack-before-status",
+  ]) {
+    const args = parseArgs([
+      "inject-failure",
+      "--kind",
+      kind,
+      "--lease",
+      "sandbox-a",
+      "--idempotency-key",
+      "conformance-crash-key",
+    ]);
+
+    expect(args.failure).toBe(kind);
+    expect(args.lease).toBe("sandbox-a");
+    expect(args.idempotencyKey).toBe("conformance-crash-key");
+  }
 });
 
 test("every stage is backed by a signal the operator actually writes", () => {

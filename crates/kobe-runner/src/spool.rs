@@ -20,7 +20,8 @@
 //! ends history with the lease: output that outlived its Pod would describe a
 //! workload nobody can inspect, from a filesystem nobody is cleaning up.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{ExecutionReport, LogChunk, LogStream, StartRequest, is_valid_id};
@@ -36,6 +37,9 @@ const REQUEST_FILE: &str = "request.json";
 const STATE_FILE: &str = "state.json";
 const CANCEL_FILE: &str = "cancel";
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
+const START_LOCK_FILE: &str = "start.lock";
+const STATE_LOCK_FILE: &str = "state.lock";
+const SPAWN_INTENT_FILE: &str = "spawn.intent";
 
 #[derive(Debug)]
 pub enum SpoolError {
@@ -59,10 +63,29 @@ impl From<std::io::Error> for SpoolError {
 pub enum Reservation {
     /// This call created it. It may now spawn a supervisor — and nothing else
     /// will.
-    Created,
+    Created(StartReservation),
     /// The identical request already reserved it. Report what it is doing;
     /// spawn nothing.
     AlreadyReserved,
+}
+
+/// Exclusive ownership of the reserve-to-supervisor window.
+///
+/// The file lock is acquired before the reservation directory becomes visible
+/// and is released by the kernel even when `start` hard-exits. A concurrent
+/// retry can therefore distinguish an active first starter from a reservation
+/// whose starter disappeared before it could persist spawn intent.
+pub struct StartReservation {
+    _lock: File,
+}
+
+/// Exclusive ownership of one report transition.
+///
+/// `status`, `cancel`, and the detached supervisor are separate processes. The
+/// lock makes their read/decide/rename sequence one operation, and the kernel
+/// releases it if any writer is killed halfway through.
+struct StateReservation {
+    _lock: File,
 }
 
 pub struct Spool {
@@ -107,6 +130,9 @@ impl Spool {
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging)?;
 
+        let start_lock = File::create(staging.join(START_LOCK_FILE))?;
+        let start_reservation = lock_start(start_lock)?;
+
         let assemble = || -> Result<(), SpoolError> {
             std::fs::write(
                 staging.join(REQUEST_FILE),
@@ -125,6 +151,7 @@ impl Spool {
                 })
                 .map_err(|_| SpoolError::Corrupt)?,
             )?;
+            std::fs::File::create(staging.join(STATE_LOCK_FILE))?;
             std::fs::File::create(staging.join(LogStream::Stdout.file_name()))?;
             std::fs::File::create(staging.join(LogStream::Stderr.file_name()))?;
             Ok(())
@@ -135,7 +162,7 @@ impl Spool {
         }
 
         match std::fs::rename(&staging, &target) {
-            Ok(()) => Ok(Reservation::Created),
+            Ok(()) => Ok(Reservation::Created(start_reservation)),
             Err(_) => {
                 // Somebody reserved it first — possibly this same caller
                 // retrying. The existing request decides, never the clock.
@@ -162,21 +189,56 @@ impl Spool {
         serde_json::from_slice(&bytes).map_err(|_| SpoolError::Corrupt)
     }
 
-    /// Replace the report, atomically.
+    /// Advance the report, atomically and monotonically.
     ///
-    /// Written to a temporary file and renamed, because a poll can arrive at
-    /// any instant: a reader that caught a partial write would parse a
-    /// truncated document, and a report that does not parse is one nobody can
-    /// act on.
-    pub fn write_report(&self, report: &ExecutionReport) -> Result<(), SpoolError> {
+    /// Every writer locks the execution before re-reading its current state. A
+    /// terminal report is immutable: in particular, a `status` process that
+    /// observed stale `Running` can never replace the supervisor's exact exit
+    /// result with `Unknown`. The write uses a process-unique temporary file and
+    /// rename, so readers see either complete document and killed writers leave
+    /// no shared temporary pathname for another process to corrupt.
+    ///
+    /// Returns the authoritative report. It can differ from `report` when
+    /// another writer committed a terminal result first.
+    pub fn write_report(&self, report: &ExecutionReport) -> Result<ExecutionReport, SpoolError> {
         let dir = self.dir(&report.id)?;
-        let temporary = dir.join(".state.json.tmp");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec(report).map_err(|_| SpoolError::Corrupt)?,
-        )?;
-        std::fs::rename(&temporary, dir.join(STATE_FILE))?;
-        Ok(())
+        let state_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(STATE_LOCK_FILE))?;
+        let _state_reservation = lock_state(state_lock)?;
+
+        let current: ExecutionReport =
+            serde_json::from_slice(&read_existing(&dir.join(STATE_FILE))?)
+                .map_err(|_| SpoolError::Corrupt)?;
+        if current.id != report.id {
+            return Err(SpoolError::Corrupt);
+        }
+        if current.state.is_terminal() {
+            return Ok(current);
+        }
+
+        static NEXT_TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temporary = dir.join(format!(
+            ".state.json.tmp-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let write = || -> Result<(), SpoolError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&serde_json::to_vec(report).map_err(|_| SpoolError::Corrupt)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, dir.join(STATE_FILE))?;
+            Ok(())
+        };
+        if let Err(error) = write() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(report.clone())
     }
 
     /// Ask the supervisor to terminate the process group.
@@ -217,6 +279,39 @@ impl Spool {
     pub fn read_supervisor_pid(&self, id: &str) -> Option<i32> {
         let path = self.dir(id).ok()?.join(SUPERVISOR_PID_FILE);
         std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Persist that the only authorised starter is about to spawn.
+    ///
+    /// Absence of this marker after [`StartReservation`] is unlocked proves the
+    /// starter died before reaching the spawn call. Presence without a tracked
+    /// supervisor stays uncertain: the crash could have landed on either side
+    /// of the operating system's spawn boundary.
+    pub fn mark_spawn_intent(&self, id: &str) -> Result<(), SpoolError> {
+        std::fs::write(self.dir(id)?.join(SPAWN_INTENT_FILE), b"1")?;
+        Ok(())
+    }
+
+    /// Whether the authorised starter crossed the durable spawn-intent fence.
+    pub fn spawn_was_intended(&self, id: &str) -> bool {
+        let Ok(path) = self.dir(id) else {
+            return true;
+        };
+        match std::fs::metadata(path.join(SPAWN_INTENT_FILE)) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            // An unreadable marker is uncertainty, never proof of no spawn.
+            Err(_) => true,
+        }
+    }
+
+    /// Whether the process that won the target-side reservation still owns
+    /// the narrow window before a supervisor pid is durable.
+    pub fn starter_active(&self, id: &str) -> bool {
+        let Ok(path) = self.dir(id) else {
+            return true;
+        };
+        starter_lock_is_held(&path.join(START_LOCK_FILE))
     }
 
     pub fn stream_path(&self, id: &str, stream: LogStream) -> Result<PathBuf, SpoolError> {
@@ -271,6 +366,70 @@ impl Spool {
     }
 }
 
+#[cfg(unix)]
+fn lock_start(file: File) -> Result<StartReservation, SpoolError> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: flock only operates on this owned descriptor. The lock is
+    // released automatically if this process exits at an injected crashpoint.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == -1 {
+        return Err(SpoolError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(StartReservation { _lock: file })
+}
+
+#[cfg(not(unix))]
+fn lock_start(file: File) -> Result<StartReservation, SpoolError> {
+    Ok(StartReservation { _lock: file })
+}
+
+#[cfg(unix)]
+fn lock_state(file: File) -> Result<StateReservation, SpoolError> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: flock operates only on this owned descriptor. Holding it across
+    // the current-report read and atomic rename serializes all runner processes.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == -1 {
+        return Err(SpoolError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(StateReservation { _lock: file })
+}
+
+#[cfg(not(unix))]
+fn lock_state(file: File) -> Result<StateReservation, SpoolError> {
+    Ok(StateReservation { _lock: file })
+}
+
+#[cfg(unix)]
+fn starter_lock_is_held(path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        // Legacy or unreadable reservations have no trustworthy owner proof.
+        return true;
+    };
+    // SAFETY: flock only operates on this owned descriptor. Acquiring the lock
+    // proves no other process owns it; it is released again before returning.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // SAFETY: this descriptor owns the lock acquired immediately above.
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        // Contention means the starter is alive. Any other lock error is also
+        // uncertainty and must not be converted into a no-spawn proof.
+        true
+    }
+}
+
+#[cfg(not(unix))]
+fn starter_lock_is_held(_path: &Path) -> bool {
+    true
+}
+
 fn read_existing(path: &Path) -> Result<Vec<u8>, SpoolError> {
     std::fs::read(path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => SpoolError::NotFound,
@@ -299,6 +458,7 @@ mod tests {
         StartRequest {
             protocol: PROTOCOL_VERSION,
             id: id.into(),
+            request_digest: None,
             argv: argv.iter().map(|argument| argument.to_string()).collect(),
             cwd: None,
             timeout_seconds: 60,
@@ -321,7 +481,7 @@ mod tests {
             spool
                 .reserve(&request("sbxe-1", &["/agent", "run"]))
                 .unwrap(),
-            Reservation::Created
+            Reservation::Created(_)
         ));
         // The same request is a retry, not a second command.
         assert!(matches!(
@@ -349,7 +509,14 @@ mod tests {
         spool.reserve(&request("sbxe-1", &["/agent"])).unwrap();
 
         let dir = root.path().join("sbxe-1");
-        for required in [REQUEST_FILE, STATE_FILE, "stdout.log", "stderr.log"] {
+        for required in [
+            REQUEST_FILE,
+            STATE_FILE,
+            START_LOCK_FILE,
+            STATE_LOCK_FILE,
+            "stdout.log",
+            "stderr.log",
+        ] {
             assert!(
                 dir.join(required).exists(),
                 "{required} must exist the moment the directory does"
@@ -362,6 +529,101 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".staging"))
             .collect();
         assert!(staging.is_empty(), "staging directories must not survive");
+    }
+
+    /// The reservation lock closes the race between a concurrent retry and the
+    /// first starter reaching its supervisor spawn.
+    #[test]
+    fn the_reserve_to_spawn_owner_is_observable_even_after_rename() {
+        let root = tempdir();
+        let spool = Spool::new(root.path());
+        let reservation = spool.reserve(&request("sbxe-1", &["/agent"])).unwrap();
+        let Reservation::Created(guard) = reservation else {
+            panic!("first reservation must win");
+        };
+
+        assert!(spool.starter_active("sbxe-1"));
+        assert!(!spool.spawn_was_intended("sbxe-1"));
+        spool.mark_spawn_intent("sbxe-1").unwrap();
+        assert!(spool.spawn_was_intended("sbxe-1"));
+
+        drop(guard);
+        assert!(!spool.starter_active("sbxe-1"));
+    }
+
+    /// A status process may decide from a stale Running read after the
+    /// supervisor has already persisted an exact exit result. The later
+    /// `Unknown` is a downgrade and must observe, rather than replace, that
+    /// terminal result.
+    #[test]
+    fn a_stale_unknown_cannot_overwrite_an_exact_terminal_report() {
+        let root = tempdir();
+        let spool = Spool::new(root.path());
+        spool.reserve(&request("sbxe-1", &["/agent"])).unwrap();
+        let exact = ExecutionReport {
+            id: "sbxe-1".into(),
+            state: RunnerState::Succeeded,
+            exit_code: Some(0),
+            reason: Some(crate::protocol::reason::COMPLETED.into()),
+            ..Default::default()
+        };
+        assert_eq!(spool.write_report(&exact).unwrap(), exact);
+
+        let stale = ExecutionReport {
+            id: "sbxe-1".into(),
+            state: RunnerState::Unknown,
+            reason: Some(crate::protocol::reason::SUPERVISOR_LOST.into()),
+            ..Default::default()
+        };
+        assert_eq!(spool.write_report(&stale).unwrap(), exact);
+        assert_eq!(spool.read_report("sbxe-1").unwrap(), exact);
+    }
+
+    /// `status`, `cancel`, and the supervisor are different processes in
+    /// production. Concurrent terminal attempts must linearize to one complete
+    /// document and must not contend on a shared temporary pathname.
+    #[test]
+    fn concurrent_report_writers_publish_one_complete_terminal_document() {
+        let root = tempdir();
+        let spool = Spool::new(root.path());
+        spool.reserve(&request("sbxe-1", &["/agent"])).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+        let mut writers = Vec::new();
+        for code in 1..=16 {
+            let root = root.path().to_path_buf();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                let spool = Spool::new(root);
+                barrier.wait();
+                spool
+                    .write_report(&ExecutionReport {
+                        id: "sbxe-1".into(),
+                        state: RunnerState::Failed,
+                        exit_code: Some(code),
+                        reason: Some(crate::protocol::reason::COMPLETED.into()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let reports: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect();
+        let final_report = spool.read_report("sbxe-1").unwrap();
+        assert!(final_report.state.is_terminal());
+        assert!(reports.iter().all(|report| report == &final_report));
+        assert!(
+            std::fs::read_dir(root.path().join("sbxe-1"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".state.json.tmp")),
+            "no writer may leave a shared or partial temporary report"
+        );
     }
 
     /// An id that is not a plain name resolves to nothing at all.

@@ -31,7 +31,7 @@ use clap::{Parser, Subcommand};
 use kobe_runner::protocol::{
     Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES,
     MAX_RETENTION_BYTES, MAX_TIMEOUT_SECONDS, PROTOCOL_VERSION, Reply, RunnerErrorCode,
-    RunnerState, StartRequest, is_valid_id,
+    RunnerState, StartRequest, TEST_EXECUTION_CRASH_EXIT_CODE, is_valid_id, reason,
 };
 use kobe_runner::spool::{self, Reservation, Spool, SpoolError};
 #[cfg(unix)]
@@ -52,7 +52,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Reserve an id and supervise its command. The request is read from stdin.
-    Start,
+    Start {
+        /// Administrator-driven #82 conformance crashpoint.
+        #[arg(long, hide = true, conflicts_with = "test_exit_after_spawn_before_ack")]
+        test_exit_before_spawn: bool,
+        /// Administrator-driven #82 conformance crashpoint.
+        #[arg(long, hide = true, conflicts_with = "test_exit_before_spawn")]
+        test_exit_after_spawn_before_ack: bool,
+    },
     /// Run the supervision loop. Started by `start`, never by Kobe.
     #[command(hide = true)]
     Supervise {
@@ -95,7 +102,15 @@ fn main() {
     }
 
     let reply = match &cli.command {
-        Commands::Start => start(&spool, &cli.state_dir),
+        Commands::Start {
+            test_exit_before_spawn,
+            test_exit_after_spawn_before_ack,
+        } => start(
+            &spool,
+            &cli.state_dir,
+            *test_exit_before_spawn,
+            *test_exit_after_spawn_before_ack,
+        ),
         Commands::Status { id } => status(&spool, id),
         Commands::Logs {
             id,
@@ -132,7 +147,12 @@ fn error(code: RunnerErrorCode) -> Reply {
 /// Reservation happens before the supervisor exists, and the supervisor is
 /// spawned exactly once per reservation. A retry of the same request finds the
 /// reservation and reports it; it never spawns a second command.
-fn start(spool: &Spool, state_dir: &str) -> Reply {
+fn start(
+    spool: &Spool,
+    state_dir: &str,
+    exit_before_spawn: bool,
+    exit_after_spawn_before_ack: bool,
+) -> Reply {
     // One line, not "until EOF". The request arrives over an exec connection
     // whose write half Kobe cannot reliably half-close, so waiting for EOF is
     // waiting for something that may never come — and the command would not
@@ -146,19 +166,35 @@ fn start(spool: &Spool, state_dir: &str) -> Reply {
     }
 
     match spool.reserve(&request) {
-        Ok(Reservation::Created) => {
-            if spawn_supervisor(state_dir, &request.id).is_err() {
-                // Nothing was started, but this process cannot prove that to
-                // Kobe in a way it could distinguish from a lost reply — so the
-                // execution settles as the state that never invites a blind
-                // retry.
-                let _ = spool.write_report(&ExecutionReport {
-                    id: request.id.clone(),
-                    state: RunnerState::Unknown,
-                    finished_at_unix_ms: Some(spool::now_unix_ms()),
-                    reason: Some("supervisor_not_started".into()),
-                    ..Default::default()
-                });
+        Ok(Reservation::Created(_start_reservation)) => {
+            if exit_before_spawn {
+                // The target-side reservation and its exclusive starter lock
+                // are durable, but no spawn intent exists. Hard exit releases
+                // the lock, so a retry can settle this exact record Unknown
+                // without ever manufacturing the command.
+                std::process::exit(TEST_EXECUTION_CRASH_EXIT_CODE);
+            }
+            match spawn_supervisor(state_dir, &request.id) {
+                Ok(()) if exit_after_spawn_before_ack => {
+                    // The reservation and supervisor are both durable, but no
+                    // reply is written. Kobe must settle the lost
+                    // acknowledgement as Unknown and must never spawn again.
+                    std::process::exit(TEST_EXECUTION_CRASH_EXIT_CODE);
+                }
+                Ok(()) => {}
+                Err(_) => {
+                    // Nothing was started, but this process cannot prove that
+                    // to Kobe in a way it could distinguish from a lost reply —
+                    // so the execution settles as the state that never invites
+                    // a blind retry.
+                    let _ = spool.write_report(&ExecutionReport {
+                        id: request.id.clone(),
+                        state: RunnerState::Unknown,
+                        finished_at_unix_ms: Some(spool::now_unix_ms()),
+                        reason: Some(reason::SUPERVISOR_NOT_STARTED.into()),
+                        ..Default::default()
+                    });
+                }
             }
         }
         Ok(Reservation::AlreadyReserved) => {}
@@ -199,6 +235,14 @@ fn validate(request: &StartRequest) -> Result<(), RunnerErrorCode> {
     if !is_valid_id(&request.id) {
         return Err(RunnerErrorCode::InvalidRequest);
     }
+    if request.request_digest.as_deref().is_some_and(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(RunnerErrorCode::InvalidRequest);
+    }
     if request.argv.is_empty() || request.argv.iter().any(String::is_empty) {
         return Err(RunnerErrorCode::InvalidRequest);
     }
@@ -237,6 +281,14 @@ fn spawn_supervisor(state_dir: &str, id: &str) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    let spool = Spool::new(state_dir);
+    // Durable before the OS spawn boundary. If the starter later disappears
+    // with neither this marker nor a supervisor pid, a retry proves the
+    // command never existed. Once present, missing pid remains Unknown.
+    spool
+        .mark_spawn_intent(id)
+        .map_err(|_| std::io::Error::other("could not persist supervisor spawn intent"))?;
+
     let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
     command
@@ -267,7 +319,7 @@ fn spawn_supervisor(state_dir: &str, id: &str) -> std::io::Result<()> {
     let child = command.spawn()?;
     // Recorded so a later `status` or `cancel` can tell "still running" from
     // "the supervisor is gone and nobody will ever record an outcome".
-    let _ = Spool::new(state_dir).write_supervisor_pid(id, child.id());
+    let _ = spool.write_supervisor_pid(id, child.id());
     Ok(())
 }
 
@@ -299,36 +351,54 @@ fn reconcile(spool: &Spool, id: &str) -> Result<ExecutionReport, RunnerErrorCode
     if report.state.is_terminal() {
         return Ok(report);
     }
-    if supervisor_alive(spool, id) {
-        return Ok(report);
-    }
+    let reason = match supervisor_liveness(spool, id) {
+        SupervisorLiveness::Alive => return Ok(report),
+        SupervisorLiveness::NeverStarted => reason::SUPERVISOR_NOT_STARTED,
+        SupervisorLiveness::Lost => reason::SUPERVISOR_LOST,
+    };
 
     let settled = ExecutionReport {
         state: RunnerState::Unknown,
         finished_at_unix_ms: Some(spool::now_unix_ms()),
-        reason: Some("supervisor_lost".into()),
+        reason: Some(reason.into()),
         ..report
     };
-    let _ = spool.write_report(&settled);
-    Ok(settled)
+    // The supervisor may have committed an exact terminal result after our
+    // initial Running read. `write_report` re-reads under the per-execution lock
+    // and returns that authoritative result instead of downgrading it.
+    spool.write_report(&settled).map_err(map_error)
+}
+
+enum SupervisorLiveness {
+    Alive,
+    NeverStarted,
+    Lost,
 }
 
 #[cfg(unix)]
-fn supervisor_alive(spool: &Spool, id: &str) -> bool {
+fn supervisor_liveness(spool: &Spool, id: &str) -> SupervisorLiveness {
     let Some(pid) = spool.read_supervisor_pid(id) else {
-        // No pid recorded yet: `start` writes it immediately after spawning, so
-        // the window is a few microseconds wide. Treating it as alive costs a
-        // poll; treating it as dead would settle a command that is running.
-        return true;
+        if spool.starter_active(id) {
+            return SupervisorLiveness::Alive;
+        }
+        return if spool.spawn_was_intended(id) {
+            SupervisorLiveness::Lost
+        } else {
+            SupervisorLiveness::NeverStarted
+        };
     };
     // SAFETY: signal 0 performs the permission and existence checks without
     // delivering anything.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) == 0 } {
+        SupervisorLiveness::Alive
+    } else {
+        SupervisorLiveness::Lost
+    }
 }
 
 #[cfg(not(unix))]
-fn supervisor_alive(_spool: &Spool, _id: &str) -> bool {
-    true
+fn supervisor_liveness(_spool: &Spool, _id: &str) -> SupervisorLiveness {
+    SupervisorLiveness::Alive
 }
 
 fn logs(spool: &Spool, id: &str, stream: &str, offset: u64, max_bytes: u64) -> Reply {
@@ -403,11 +473,49 @@ mod tests {
         StartRequest {
             protocol: PROTOCOL_VERSION,
             id: "sbxe-1".into(),
+            request_digest: None,
             argv: vec!["/agent".into(), "run".into()],
             cwd: Some("/work".into()),
             timeout_seconds: 60,
             max_output_bytes: 1024,
         }
+    }
+
+    /// Kobe and the runner share exact hidden flags for both target-side crash
+    /// boundaries, and clap refuses an invocation that tries to select both.
+    #[test]
+    fn crash_flags_select_one_exact_runner_boundary() {
+        for (flag, before_spawn, after_spawn) in [
+            (
+                kobe_runner::protocol::TEST_EXIT_BEFORE_SPAWN_FLAG,
+                true,
+                false,
+            ),
+            (
+                kobe_runner::protocol::TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG,
+                false,
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["kobe-runner", "start", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Start {
+                    test_exit_before_spawn,
+                    test_exit_after_spawn_before_ack,
+                } if test_exit_before_spawn == before_spawn
+                    && test_exit_after_spawn_before_ack == after_spawn
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "kobe-runner",
+                "start",
+                kobe_runner::protocol::TEST_EXIT_BEFORE_SPAWN_FLAG,
+                kobe_runner::protocol::TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG,
+            ])
+            .is_err()
+        );
     }
 
     /// A request that could never run is refused before anything is reserved.
@@ -434,6 +542,9 @@ mod tests {
         assert!(with(&|r| r.argv = vec![String::new()]).is_err());
         assert!(with(&|r| r.argv = vec!["/bin/sh".into(), "\0".into()]).is_err());
         assert!(with(&|r| r.id = "../escape".into()).is_err());
+        assert!(with(&|r| r.request_digest = Some("a".repeat(64))).is_ok());
+        assert!(with(&|r| r.request_digest = Some("A".repeat(64))).is_err());
+        assert!(with(&|r| r.request_digest = Some("a".repeat(63))).is_err());
 
         for bad in ["", "work", "./work", "/work\0/etc"] {
             assert!(

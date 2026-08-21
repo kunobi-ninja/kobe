@@ -39,7 +39,8 @@
 
 use kobe_runner::protocol::{
     Envelope, ExecutionReport, LogStream, MAX_LOG_CHUNK_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
-    Reply, RunnerErrorCode, RunnerState, StartRequest,
+    Reply, RunnerErrorCode, RunnerState, StartRequest, TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG,
+    TEST_EXIT_BEFORE_SPAWN_FLAG,
 };
 
 use crate::api::sandbox_access::{SandboxAccessDenied, SandboxTarget, exec_capped_until};
@@ -212,10 +213,12 @@ pub fn start_request(
     argv: &[String],
     cwd: Option<&str>,
     timeout: std::time::Duration,
+    request_digest: Option<&str>,
 ) -> StartRequest {
     StartRequest {
         protocol: PROTOCOL_VERSION,
         id: id.to_string(),
+        request_digest: request_digest.map(str::to_string),
         argv: argv.to_vec(),
         cwd: cwd.map(str::to_string),
         // Rounded up, never down: a request for one and a half seconds that
@@ -248,6 +251,32 @@ pub fn control_argv(runner_path: &str, verb: &str, id: &str, extra: &[String]) -
         id.to_string(),
     ];
     argv.extend_from_slice(extra);
+    argv
+}
+
+/// Administrator-selected target-side boundary for the #82 live gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartCrashWindow {
+    BeforeSpawn,
+    AfterSpawnBeforeAcknowledgement,
+}
+
+fn start_argv(runner_path: &str, crash: Option<StartCrashWindow>) -> Vec<String> {
+    let mut argv = vec![runner_path.to_string(), "start".to_string()];
+    if let Some(crash) = crash {
+        // A fixed administrator-selected flag, never caller input. It asks the
+        // runner to disappear at one exact reserve/spawn boundary before it
+        // writes the acknowledgement Kobe would otherwise parse.
+        argv.push(
+            match crash {
+                StartCrashWindow::BeforeSpawn => TEST_EXIT_BEFORE_SPAWN_FLAG,
+                StartCrashWindow::AfterSpawnBeforeAcknowledgement => {
+                    TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG
+                }
+            }
+            .to_string(),
+        );
+    }
     argv
 }
 
@@ -313,14 +342,16 @@ pub async fn start(
     container: &str,
     runner_path: &str,
     request: &StartRequest,
+    crash: Option<StartCrashWindow>,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecutionReport, RunnerCallFailure> {
     let line = start_line(request)?;
+    let argv = start_argv(runner_path, crash);
     let output = call(
         client,
         target,
         container,
-        &[runner_path.to_string(), "start".to_string()],
+        &argv,
         Some(&line),
         RUNNER_CALL_TIMEOUT,
         shutdown,
@@ -618,15 +649,28 @@ mod tests {
             &["/agent".into(), "--token".into(), "s3cret".into()],
             Some("/work"),
             std::time::Duration::from_secs(60),
+            None,
         );
         let line = String::from_utf8(start_line(&request).unwrap()).unwrap();
         assert!(line.contains("s3cret"), "the command travels on stdin");
         assert!(line.ends_with('\n'), "the runner reads exactly one line");
 
         // The start call's own argv is two fixed words. Nothing else.
+        assert_eq!(start_argv("/kobe-runner", None), ["/kobe-runner", "start"]);
         assert_eq!(
-            vec!["/kobe-runner".to_string(), "start".to_string()],
-            vec!["/kobe-runner".to_string(), "start".to_string()]
+            start_argv("/kobe-runner", Some(StartCrashWindow::BeforeSpawn)),
+            ["/kobe-runner", "start", TEST_EXIT_BEFORE_SPAWN_FLAG]
+        );
+        assert_eq!(
+            start_argv(
+                "/kobe-runner",
+                Some(StartCrashWindow::AfterSpawnBeforeAcknowledgement)
+            ),
+            [
+                "/kobe-runner",
+                "start",
+                TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG
+            ]
         );
         // And no reading of the request may be spliced into an argument.
         for argument in control_argv("/kobe-runner", "status", "sbxe-abc123", &[]) {
@@ -784,6 +828,7 @@ mod tests {
             &[String::new()],
             None,
             std::time::Duration::from_secs(1),
+            None,
         );
         let base = start_line(&request).unwrap().len();
         request.argv[0] = "x".repeat(MAX_REQUEST_BYTES - base);
@@ -1002,7 +1047,7 @@ mod tests {
     #[test]
     fn a_timeout_is_never_rounded_down() {
         let seconds = |timeout: std::time::Duration| {
-            start_request("sbxe-1", &["/agent".into()], None, timeout).timeout_seconds
+            start_request("sbxe-1", &["/agent".into()], None, timeout, None).timeout_seconds
         };
 
         assert_eq!(seconds(std::time::Duration::from_secs(60)), 60);
@@ -1026,6 +1071,7 @@ mod tests {
             &["/agent".into()],
             None,
             std::time::Duration::from_secs(60),
+            None,
         );
         assert_eq!(
             request.max_output_bytes,

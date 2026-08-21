@@ -87,6 +87,9 @@ const LOCAL_NODE_PORT = 30080;
 // different `bun run` calls, and an in-memory capture would be gone by the
 // second one.
 const FAILURE_DIR = `${process.cwd()}/.tmp/e2e-failures`;
+const EXECUTION_CRASH_ENV = "KOBE_TEST_EXECUTION_CRASH";
+const EXECUTION_CRASH_EXIT_CODE = 86;
+const OPERATOR_CONTAINER = "kobe-operator";
 // Coordination Lease the operator's leader election holds (src/main.rs).
 // Restarting is only half of "restart": the HTTP server answers from any
 // replica, but the reconcilers run solely in whichever replica owns this.
@@ -150,10 +153,17 @@ type Command = (typeof COMMANDS)[number];
 
 /// Ways the target can be deliberately broken.
 ///
-/// `teardown-unverifiable` is the one #76 turns on; the other two are the
-/// primitives it is built from, exposed separately because a scenario that
-/// needs a different verb should not have to add a new kind.
-const FAILURE_KINDS = ["teardown-unverifiable", "rbac-revoke", "child-api-unreachable"] as const;
+/// #76 uses the teardown/RBAC/network faults. #82 uses the execution
+/// crash windows, each scoped to one exact lease and idempotency key.
+const FAILURE_KINDS = [
+  "teardown-unverifiable",
+  "rbac-revoke",
+  "child-api-unreachable",
+  "execution-after-running-before-target-reservation",
+  "execution-before-spawn",
+  "execution-after-spawn-before-ack",
+  "execution-after-ack-before-status",
+] as const;
 
 type FailureKind = (typeof FAILURE_KINDS)[number];
 
@@ -189,6 +199,8 @@ type Args = {
   waitForStage?: string;
   timeoutSeconds: number;
   failure: FailureKind;
+  /// Exact public request key, paired with `lease`, allowed to trigger a crashpoint.
+  idempotencyKey?: string;
   revocation: Partial<RevocationTarget>;
   /// ClusterInstance whose child API is to be severed.
   instance?: string;
@@ -511,6 +523,11 @@ export function parseArgs(argv: string[]): Args {
       i += 1;
       continue;
     }
+    if (token === "--idempotency-key" && next) {
+      args.idempotencyKey = next;
+      i += 1;
+      continue;
+    }
     if (token === "--api-group" && next !== undefined) {
       // Deliberately not `&& next`: the core API group is the empty string,
       // and rejecting it would make every core-resource revocation impossible.
@@ -639,11 +656,12 @@ function printHelpAndExit(): never {
   info("      Restart the operator and wait until it is BOTH serving and leading again.");
   info(`      Stages: ${Object.keys(LEASE_STAGES).join(", ")}`);
   info("");
-  info("  bun run ./hack/e2e.ts inject-failure [--kind KIND] [--api-group G --resource R --verb V] [--instance NAME|--lease ID]");
+  info("  bun run ./hack/e2e.ts inject-failure [--kind KIND] [--idempotency-key KEY] [--api-group G --resource R --verb V] [--instance NAME|--lease ID]");
   info("  bun run ./hack/e2e.ts clear-failure  [--kind KIND]");
   info(`      Kinds: ${FAILURE_KINDS.join(", ")} (default: teardown-unverifiable)`);
   info("      rbac-revoke needs --api-group/--resource/--verb;");
   info("      child-api-unreachable needs --instance, or --lease to resolve one from the CR.");
+  info("      execution crash windows need --lease and --idempotency-key; some restart the operator.");
   info("");
   info("  bun run ./hack/e2e.ts reap-lease --lease ID");
   info("      Trigger a repaired quarantine's evidence retry, require its protected ledger empty,");
@@ -2398,6 +2416,17 @@ async function restartOperator(args: Args): Promise<void> {
   await kubectl(args, ["rollout", "restart", `deployment/${deployment}`, "-n", args.namespace], {
     step: `failed to restart deployment '${deployment}'`,
   });
+  await waitForOperatorRollout(args, deployment, renewedBefore);
+  step("Operator is serving and leading again");
+}
+
+/// Wait for an already-requested Deployment mutation to replace the operator
+/// and restore both its HTTP and controller halves.
+async function waitForOperatorRollout(
+  args: Args,
+  deployment: string,
+  renewedBefore: string | undefined,
+): Promise<void> {
   await kubectl(
     args,
     [
@@ -2413,7 +2442,6 @@ async function restartOperator(args: Args): Promise<void> {
 
   await waitForEndpointServing(args);
   await waitForFreshLeader(args, renewedBefore);
-  step("Operator is serving and leading again");
 }
 
 // ---------------------------------------------------------------------------
@@ -2432,7 +2460,51 @@ type FailureState = {
   capturedAt: string;
   clusterRole?: { name: string; rules: PolicyRule[] };
   services?: Array<{ namespace: string; name: string; selector: Record<string, string> | null }>;
+  operatorEnvironment?: {
+    deployment: string;
+    previousValue?: string;
+    previouslyPresent: boolean;
+    expectProcessExit: boolean;
+    pods: OperatorPodSnapshot[];
+  };
 };
+
+type OperatorPodSnapshot = {
+  name: string;
+  uid: string;
+  restartCount: number;
+  lastExitCode?: number;
+};
+
+type DeploymentObject = {
+  spec?: {
+    template?: {
+      spec?: {
+        containers?: Array<{
+          name?: string;
+          env?: Array<{ name?: string; value?: string; valueFrom?: unknown }>;
+        }>;
+      };
+    };
+  };
+};
+
+type PodListObject = {
+  items?: Array<{
+    metadata?: { name?: string; uid?: string };
+    status?: {
+      containerStatuses?: Array<{
+        name?: string;
+        restartCount?: number;
+        lastState?: { terminated?: { exitCode?: number } };
+      }>;
+    };
+  }>;
+};
+
+function isExecutionCrashFailure(kind: FailureKind): boolean {
+  return kind.startsWith("execution-");
+}
 
 function failureStatePath(kind: FailureKind): string {
   return `${FAILURE_DIR}/${kind}.json`;
@@ -2538,6 +2610,140 @@ function revocationsFor(args: Args): RevocationTarget[] {
     throw new Error("--kind rbac-revoke needs --api-group, --resource and --verb");
   }
   return [{ apiGroup, resource, verb }];
+}
+
+async function operatorPodSnapshots(args: Args): Promise<OperatorPodSnapshot[]> {
+  const pods = await kubectlJson<PodListObject>(args, [
+    "get",
+    "pod",
+    "-n",
+    args.namespace,
+    "-l",
+    `app.kubernetes.io/name=kobe,app.kubernetes.io/instance=${args.release}`,
+  ]);
+  return (pods.items ?? []).flatMap((pod) => {
+    const status = pod.status?.containerStatuses?.find((candidate) => candidate.name === OPERATOR_CONTAINER);
+    const name = pod.metadata?.name;
+    const uid = pod.metadata?.uid;
+    if (!name || !uid || !status) return [];
+    return [
+      {
+        name,
+        uid,
+        restartCount: status.restartCount ?? 0,
+        lastExitCode: status.lastState?.terminated?.exitCode,
+      },
+    ];
+  });
+}
+
+async function mutateOperatorEnvironment(args: Args, deployment: string, assignment: string): Promise<void> {
+  const renewedBefore = await leaderRenewTime(args);
+  await kubectl(
+    args,
+    [
+      "set",
+      "env",
+      `deployment/${deployment}`,
+      "-n",
+      args.namespace,
+      `--containers=${OPERATOR_CONTAINER}`,
+      assignment,
+    ],
+    { step: `failed to set ${EXECUTION_CRASH_ENV} on deployment '${deployment}'` },
+  );
+  await waitForOperatorRollout(args, deployment, renewedBefore);
+}
+
+/// Arm one exact process boundary without exposing a crash selector through the
+/// public execution request. The Deployment environment is administrator
+/// state; the value also carries one lease and idempotency key so unrelated
+/// traffic cannot trip the fault while the live scenario runs.
+async function injectExecutionCrash(args: Args): Promise<void> {
+  if (!args.lease || !args.idempotencyKey) {
+    throw new Error(`--kind ${args.failure} needs --lease and --idempotency-key`);
+  }
+  refuseDoubleInjection(args.failure);
+
+  const deployment = await operatorDeployment(args);
+  const object = await kubectlJson<DeploymentObject>(args, [
+    "get",
+    "deployment",
+    deployment,
+    "-n",
+    args.namespace,
+  ]);
+  const container = object.spec?.template?.spec?.containers?.find(
+    (candidate) => candidate.name === OPERATOR_CONTAINER,
+  );
+  if (!container) {
+    throw new Error(`deployment '${deployment}' has no '${OPERATOR_CONTAINER}' container`);
+  }
+  const previous = container.env?.find((entry) => entry.name === EXECUTION_CRASH_ENV);
+  if (previous?.valueFrom) {
+    throw new Error(`${EXECUTION_CRASH_ENV} uses valueFrom; refusing to replace administrator-owned configuration`);
+  }
+
+  const state: FailureState = {
+    kind: args.failure,
+    capturedAt: new Date().toISOString(),
+    operatorEnvironment: {
+      deployment,
+      previouslyPresent: previous !== undefined,
+      previousValue: previous?.value,
+      // The two target-side windows kill the short-lived runner exec inside the
+      // Sandbox. The control-plane boundaries kill the operator container.
+      expectProcessExit: args.failure === "execution-after-running-before-target-reservation"
+        || args.failure === "execution-after-ack-before-status",
+      pods: [],
+    },
+  };
+  // Persist the original before mutation, so a killed harness can still put
+  // the Deployment back exactly as it found it.
+  await saveFailureState(state);
+  await mutateOperatorEnvironment(
+    args,
+    deployment,
+    `${EXECUTION_CRASH_ENV}=${args.failure}:${args.lease}:${args.idempotencyKey}`,
+  );
+
+  const pods = await operatorPodSnapshots(args);
+  if (pods.length === 0) {
+    throw new Error(`deployment '${deployment}' has no observable '${OPERATOR_CONTAINER}' container after rollout`);
+  }
+  state.operatorEnvironment!.pods = pods;
+  await saveFailureState(state);
+  step(`Injected '${args.failure}' for SandboxLease '${args.lease}'`);
+}
+
+async function waitForInjectedOperatorExit(args: Args, baselines: OperatorPodSnapshot[]): Promise<void> {
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let last = "no pod observation";
+  for (;;) {
+    const current = await operatorPodSnapshots(args);
+    for (const baseline of baselines) {
+      const observed = current.find((pod) => pod.uid === baseline.uid);
+      if (
+        observed &&
+        observed.restartCount > baseline.restartCount &&
+        observed.lastExitCode === EXECUTION_CRASH_EXIT_CODE
+      ) {
+        info(
+          `  - observed ${observed.name} exit ${EXECUTION_CRASH_EXIT_CODE} (restart ${baseline.restartCount} -> ${observed.restartCount})`,
+        );
+        return;
+      }
+    }
+    last = current
+      .map((pod) => `${pod.name}:uid=${pod.uid},restarts=${pod.restartCount},last=${pod.lastExitCode ?? "none"}`)
+      .join("; ");
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `operator never exited with injected status ${EXECUTION_CRASH_EXIT_CODE} within ${args.timeoutSeconds}s (${last})`,
+      );
+    }
+    await Bun.sleep(500);
+  }
 }
 
 async function injectRbacRevocation(args: Args): Promise<void> {
@@ -2663,6 +2869,10 @@ async function childInstanceOf(args: Args): Promise<string> {
 }
 
 async function injectFailure(args: Args): Promise<void> {
+  if (isExecutionCrashFailure(args.failure)) {
+    await injectExecutionCrash(args);
+    return;
+  }
   if (args.failure === "child-api-unreachable") {
     await injectChildApiUnreachable(args);
     return;
@@ -2678,6 +2888,25 @@ async function clearFailure(args: Args): Promise<void> {
     // path noisy would bury the real failure under a second one.
     info(`no '${args.failure}' failure is injected`);
     return;
+  }
+
+  let triggerFailure: Error | undefined;
+  if (state.operatorEnvironment?.expectProcessExit) {
+    step(`Waiting for the '${state.kind}' process exit`);
+    try {
+      await waitForInjectedOperatorExit(args, state.operatorEnvironment.pods);
+    } catch (error) {
+      triggerFailure = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  if (state.operatorEnvironment) {
+    const operator = state.operatorEnvironment;
+    step(`Restoring ${EXECUTION_CRASH_ENV} on Deployment '${operator.deployment}'`);
+    const assignment = operator.previouslyPresent
+      ? `${EXECUTION_CRASH_ENV}=${operator.previousValue ?? ""}`
+      : `${EXECUTION_CRASH_ENV}-`;
+    await mutateOperatorEnvironment(args, operator.deployment, assignment);
   }
 
   if (state.clusterRole) {
@@ -2718,6 +2947,7 @@ async function clearFailure(args: Args): Promise<void> {
   // broken cluster that no longer knows it is broken.
   rmSync(failureStatePath(args.failure), { force: true });
   step(`Cleared '${args.failure}'`);
+  if (triggerFailure) throw triggerFailure;
 }
 
 /// Delete a SandboxLease and the admission reservations it still holds.

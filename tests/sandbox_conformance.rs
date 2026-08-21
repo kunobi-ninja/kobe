@@ -28,9 +28,10 @@
 //! Some properties cannot be provoked through the contract at all. A crash
 //! never causing a duplicate spawn needs a crash; uncertain teardown withholding
 //! capacity needs teardown made uncertain; Ctrl-C reaching the workload needs a
-//! terminal. #138 supplies all three through `hack/e2e.ts`, and this suite
-//! *invokes* them — but it still does not perform them, and it still asserts
-//! only through HTTP.
+//! terminal. #138 supplies the lifecycle/terminal disturbances and #82 adds
+//! the exact execution crashpoints through `hack/e2e.ts`; this suite
+//! *invokes* them, but it still does not perform them and still asserts only
+//! through HTTP.
 //!
 //! That boundary is the point rather than an inconvenience. A suite that could
 //! break its own target could also mask a break it did not intend, and a suite
@@ -158,9 +159,9 @@ fn pool_for(placement: Placement) -> String {
 /// The command that disturbs the target.
 ///
 /// Absent means **fail**, never skip — the same rule as [`other_token`], for
-/// the same reason. The three properties this unlocks are asserted by
-/// construction today and proven nowhere; a scenario that quietly declined to
-/// run would leave them looking covered.
+/// the same reason. The properties this unlocks are otherwise asserted by
+/// construction and proven nowhere; a scenario that quietly declined to run
+/// would leave them looking covered.
 fn harness_command() -> Vec<String> {
     let configured = std::env::var("KOBE_SANDBOX_HARNESS").expect(
         "KOBE_SANDBOX_HARNESS is required: it names the command that restarts, breaks and \
@@ -201,6 +202,49 @@ async fn harness(argv: &[&str]) -> anyhow::Result<String> {
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(stdout)
+}
+
+async fn inject_execution_crash(kind: &str, lease: &str, key: &str) -> anyhow::Result<()> {
+    harness(&[
+        "inject-failure",
+        "--kind",
+        kind,
+        "--lease",
+        lease,
+        "--idempotency-key",
+        key,
+        "--timeout",
+        "600",
+    ])
+    .await
+    .map(|_| ())
+}
+
+async fn clear_execution_crash(kind: &str) -> anyhow::Result<()> {
+    harness(&["clear-failure", "--kind", kind, "--timeout", "600"])
+        .await
+        .map(|_| ())
+}
+
+fn interrupted_request(
+    attempted: &anyhow::Result<(reqwest::StatusCode, Value)>,
+    window: &str,
+) -> anyhow::Result<()> {
+    if let Ok((status, body)) = attempted {
+        anyhow::ensure!(
+            !status.is_success(),
+            "{window} returned success instead of interrupting the first request: {body}"
+        );
+    }
+    Ok(())
+}
+
+fn stable_execution(first: &Value, second: &Value, window: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        first == second,
+        "{window} changed its durable answer across an exact retry: {first} then {second}"
+    );
+    Ok(())
 }
 
 /// A value no other run of this suite can produce.
@@ -424,6 +468,24 @@ impl LeasedSandbox {
                 })),
             )
             .await
+    }
+
+    /// Count an execution's externally visible side effect without assuming
+    /// the marker exists. Zero is therefore evidence for the pre-spawn window,
+    /// while one distinguishes idempotency from a duplicated hidden spawn.
+    async fn marker_count(&self, marker: &str, key: &str) -> anyhow::Result<i64> {
+        let script = format!("if [ -f {marker} ]; then wc -l < {marker}; else echo 0; fi");
+        let (status, observed) = self.exec(&["/bin/sh", "-c", script.as_str()], key).await?;
+        anyhow::ensure!(
+            status.is_success() && observed["state"] == "Succeeded",
+            "could not inspect execution side effects: HTTP {status} {observed}"
+        );
+        observed["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .map_err(Into::into)
     }
 
     /// Start one supervised process and prove its retained output is readable.
@@ -1282,12 +1344,12 @@ both_placements!(
 );
 
 // ---------------------------------------------------------------------------
-// Harness-driven scenarios (#138)
+// Harness-driven scenarios (#82, #138)
 //
-// The three rows of #76's matrix that needed the target disturbed rather than
-// merely queried. Each covers a property the design leans on and that nothing
-// proves end to end: a crash never causes a duplicate spawn; uncertain teardown
-// withholds capacity rather than releasing it; Ctrl-C reaches the workload.
+// The rows of #76/#82 that need the target disturbed rather than merely
+// queried. Each covers a property the design leans on and that nothing proves
+// end to end: every execution crash window is idempotent, uncertain teardown
+// withholds capacity rather than releasing it, and Ctrl-C reaches the workload.
 //
 // A restart takes longer than an untouched lease does, so these use wider
 // budgets than the scenarios above. That is not slack — a restart scenario that
@@ -1422,6 +1484,231 @@ both_placements!(
         anyhow::ensure!(
             lines == 1,
             "the command ran {lines} times across a restart, expected exactly 1"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// Kobe may die after its durable Running checkpoint but before the target
+    /// runner sees `start`. `NotFound` from that same recorded target proves the
+    /// target reservation never existed, so the identical retry may safely
+    /// complete it and must still run the command exactly once.
+    crash_after_running_before_target_reservation_recovers_or_tears_down_safely,
+    |placement| async move {
+        const WINDOW: &str = "execution-after-running-before-target-reservation";
+        const KEY: &str = "conformance-crash-before-target-reservation";
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let marker = format!("/tmp/kobe-before-target-reservation-{}", nonce(placement));
+        let script = format!("echo x >> {marker}; echo recovered-target-reservation");
+        let argv = ["/bin/sh", "-c", script.as_str()];
+
+        inject_execution_crash(WINDOW, &sandbox.id, KEY).await?;
+        let attempted = sandbox.exec(&argv, KEY).await;
+        let cleared = clear_execution_crash(WINDOW).await;
+        interrupted_request(&attempted, WINDOW)?;
+        cleared?;
+
+        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(status.is_success(), "pre-target retry failed: {first}");
+        anyhow::ensure!(
+            first["state"] == "Succeeded"
+                && first["exitCode"] == 0
+                && first["stdout"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("recovered-target-reservation"),
+            "pre-target retry did not recover the original request: {first}"
+        );
+        let (second_status, second) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(
+            second_status == status,
+            "pre-target retry changed HTTP status from {status} to {second_status}: {second}"
+        );
+        stable_execution(&first, &second, WINDOW)?;
+        anyhow::ensure!(
+            sandbox
+                .marker_count(&marker, "conformance-before-target-reservation-count")
+                .await?
+                == 1,
+            "the recovered pre-target command did not run exactly once"
+        );
+
+        // Exercise the same boundary without an API retry. Release must treat
+        // NotFound from this exact target as proof that no runner reservation or
+        // process exists; quarantining here would strand both lease and slot.
+        const ABANDONED_KEY: &str = "conformance-crash-before-target-release";
+        let abandoned_marker =
+            format!("/tmp/kobe-before-target-release-{}", nonce(placement));
+        let abandoned_script = format!("echo x >> {abandoned_marker}");
+        let abandoned_argv = ["/bin/sh", "-c", abandoned_script.as_str()];
+        inject_execution_crash(WINDOW, &sandbox.id, ABANDONED_KEY).await?;
+        let abandoned = sandbox.exec(&abandoned_argv, ABANDONED_KEY).await;
+        let cleared = clear_execution_crash(WINDOW).await;
+        interrupted_request(&abandoned, WINDOW)?;
+        cleared?;
+        anyhow::ensure!(
+            sandbox
+                .marker_count(&abandoned_marker, "conformance-before-target-release-count")
+                .await?
+                == 0,
+            "the abandoned pre-target command ran without a target reservation"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// A runner crash after its target-side reservation but before supervisor
+    /// spawn returns one stable Unknown and never manufactures the command.
+    crash_before_spawn_is_unknown_and_never_retried,
+    |placement| async move {
+        const WINDOW: &str = "execution-before-spawn";
+        const KEY: &str = "conformance-crash-before-spawn";
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let marker = format!("/tmp/kobe-before-spawn-{}", nonce(placement));
+        let script = format!("echo x >> {marker}");
+        let argv = ["/bin/sh", "-c", script.as_str()];
+
+        inject_execution_crash(WINDOW, &sandbox.id, KEY).await?;
+        let attempted = sandbox.exec(&argv, KEY).await;
+        let cleared = clear_execution_crash(WINDOW).await;
+        cleared?;
+        let (status, interrupted) = attempted?;
+        anyhow::ensure!(
+            status == reqwest::StatusCode::BAD_GATEWAY,
+            "pre-spawn runner crash returned HTTP {status}, expected 502: {interrupted}"
+        );
+
+        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(status.is_success(), "pre-spawn retry failed: {first}");
+        anyhow::ensure!(
+            first["state"] == "Unknown"
+                && first["reason"] == "runner_unreachable"
+                && first["exitCode"].is_null()
+                && first["stdout"] == ""
+                && first["stderr"] == "",
+            "pre-spawn crash did not settle as the exact Unknown: {first}"
+        );
+        let (second_status, second) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(
+            second_status == status,
+            "pre-spawn retry changed HTTP status from {status} to {second_status}: {second}"
+        );
+        stable_execution(&first, &second, WINDOW)?;
+        anyhow::ensure!(
+            sandbox
+                .marker_count(&marker, "conformance-before-spawn-count")
+                .await?
+                == 0,
+            "the command ran despite a crash before spawn"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// The runner may spawn and then disappear before acknowledging Kobe. The
+    /// caller gets one stable Unknown, while the target-side reservation keeps
+    /// an exact retry from spawning the side effect twice.
+    crash_after_spawn_before_ack_is_unknown_and_runs_once,
+    |placement| async move {
+        const WINDOW: &str = "execution-after-spawn-before-ack";
+        const KEY: &str = "conformance-crash-before-ack";
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let marker = format!("/tmp/kobe-before-ack-{}", nonce(placement));
+        let script = format!("echo x >> {marker}");
+        let argv = ["/bin/sh", "-c", script.as_str()];
+
+        inject_execution_crash(WINDOW, &sandbox.id, KEY).await?;
+        let attempted = sandbox.exec(&argv, KEY).await;
+        let cleared = clear_execution_crash(WINDOW).await;
+        cleared?;
+        let (status, interrupted) = attempted?;
+        anyhow::ensure!(
+            status == reqwest::StatusCode::BAD_GATEWAY,
+            "lost runner acknowledgement returned HTTP {status}, expected 502: {interrupted}"
+        );
+
+        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(status.is_success(), "lost-ack retry failed: {first}");
+        anyhow::ensure!(
+            first["state"] == "Unknown"
+                && first["reason"] == "runner_unreachable"
+                && first["exitCode"].is_null()
+                && first["stdout"] == ""
+                && first["stderr"] == "",
+            "lost acknowledgement did not stay the exact Unknown: {first}"
+        );
+        let (second_status, second) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(
+            second_status == status,
+            "lost-ack retry changed HTTP status from {status} to {second_status}: {second}"
+        );
+        stable_execution(&first, &second, WINDOW)?;
+        anyhow::ensure!(
+            sandbox
+                .marker_count(&marker, "conformance-before-ack-count")
+                .await?
+                == 1,
+            "the lost-ack command did not run exactly once"
+        );
+
+        sandbox.release().await
+    }
+);
+
+both_placements!(
+    /// Once Kobe has parsed the runner acknowledgement, a process crash before
+    /// terminal status persistence is recovered by polling that same runner
+    /// reservation. Exact output, exit status and side effects stay stable.
+    crash_after_ack_before_status_recovers_the_original_outcome,
+    |placement| async move {
+        const WINDOW: &str = "execution-after-ack-before-status";
+        const KEY: &str = "conformance-crash-after-ack";
+        let mut sandbox = LeasedSandbox::create(placement, "20m").await?;
+        sandbox.wait_ready(Duration::from_secs(600)).await?;
+
+        let marker = format!("/tmp/kobe-after-ack-{}", nonce(placement));
+        let script = format!("echo x >> {marker}; echo ack-out; echo ack-err >&2; exit 7");
+        let argv = ["/bin/sh", "-c", script.as_str()];
+
+        inject_execution_crash(WINDOW, &sandbox.id, KEY).await?;
+        let attempted = sandbox.exec(&argv, KEY).await;
+        let cleared = clear_execution_crash(WINDOW).await;
+        interrupted_request(&attempted, WINDOW)?;
+        cleared?;
+
+        let (status, first) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(status.is_success(), "post-ack retry failed: {first}");
+        anyhow::ensure!(
+            first["state"] == "Failed"
+                && first["exitCode"] == 7
+                && first["stdout"].as_str().unwrap_or_default().contains("ack-out")
+                && first["stderr"].as_str().unwrap_or_default().contains("ack-err"),
+            "post-ack retry did not recover the exact runner outcome: {first}"
+        );
+        let (second_status, second) = sandbox.exec(&argv, KEY).await?;
+        anyhow::ensure!(
+            second_status == status,
+            "post-ack retry changed HTTP status from {status} to {second_status}: {second}"
+        );
+        stable_execution(&first, &second, WINDOW)?;
+        anyhow::ensure!(
+            sandbox
+                .marker_count(&marker, "conformance-after-ack-count")
+                .await?
+                == 1,
+            "the post-ack command did not run exactly once"
         );
 
         sandbox.release().await

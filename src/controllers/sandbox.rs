@@ -175,6 +175,43 @@ enum AllocationFence {
     Quarantine(&'static str),
 }
 
+/// What reachable execution cleanup permits the release state machine to do.
+///
+/// `DestroyTarget` is intentionally distinct from `Retry`: a terminal runner
+/// verdict without process-absence proof must retain its record and capacity,
+/// but it must also let management Claim or child-cluster destruction advance.
+/// Exact target absence then authorises the post-proof retirement pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionCleanupAdvance {
+    Continue,
+    Checkpointed,
+    DestroyTarget,
+    Retry,
+    Quarantine(&'static str),
+}
+
+fn execution_cleanup_advance(
+    outcome: crate::api::sandbox_executions::ExecutionCleanupOutcome,
+) -> ExecutionCleanupAdvance {
+    match outcome {
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {
+            ExecutionCleanupAdvance::Continue
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+            ExecutionCleanupAdvance::Checkpointed
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
+            ExecutionCleanupAdvance::DestroyTarget
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+            ExecutionCleanupAdvance::Retry
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
+            ExecutionCleanupAdvance::Quarantine(reason)
+        }
+    }
+}
+
 /// The upstream API resources this controller writes.
 ///
 /// Built by hand rather than discovered: the version is pinned so an
@@ -4362,28 +4399,31 @@ async fn drive_release(
 
     // Durable executions are capabilities plus process groups, not audit-only
     // records. On management placement, cancel/prove every exact runner group
-    // and delete its finalised record before scoped credentials or the Claim
-    // can disappear. The closed access gate above prevents any new bind/spawn
-    // from racing this cleanup.
-    if ctx.access_ledger_enabled && !child_placed {
-        match crate::api::sandbox_executions::cleanup_lease_executions(
-            &ctx.client,
-            &ctx.namespace,
-            &ctx.reservation_namespace,
-            lease,
-            &ctx.client,
-            &ctx.shutdown,
-        )
-        .await
-        {
-            crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
-            crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+    // before scoped credentials or the Claim disappear. A supervisor_lost
+    // Unknown deliberately keeps its record and capacity; in that case Claim
+    // destruction supplies the stronger process-absence proof and the record is
+    // retired on the post-proof pass below. The closed access gate prevents any
+    // new bind/spawn from racing either path.
+    if ctx.access_ledger_enabled && !child_placed && !footprint_absence_proven(&status) {
+        match execution_cleanup_advance(
+            crate::api::sandbox_executions::cleanup_lease_executions(
+                &ctx.client,
+                &ctx.namespace,
+                &ctx.reservation_namespace,
+                lease,
+                &ctx.client,
+                &ctx.shutdown,
+            )
+            .await,
+        ) {
+            ExecutionCleanupAdvance::Continue | ExecutionCleanupAdvance::DestroyTarget => {}
+            ExecutionCleanupAdvance::Checkpointed => {
                 return Ok(Action::await_change());
             }
-            crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+            ExecutionCleanupAdvance::Retry => {
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
             }
-            crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
+            ExecutionCleanupAdvance::Quarantine(reason) => {
                 return quarantine_lease(lease, ctx, reason).await;
             }
         }
@@ -4432,6 +4472,44 @@ async fn drive_release(
     if footprint_absence_proven(&status) {
         if child_placed {
             return Box::pin(finish_child_release_after_proof(lease, ctx, reason)).await;
+        }
+        if ctx.access_ledger_enabled {
+            match crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
+                &ctx.client,
+                &ctx.namespace,
+                &ctx.reservation_namespace,
+                lease,
+                &ctx.shutdown,
+            )
+            .await
+            {
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+                    return Ok(Action::await_change());
+                }
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
+                | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction =>
+                {
+                    return record_post_proof_cleanup_failure(
+                        lease,
+                        ctx,
+                        "ManagementExecutionCleanupRetry",
+                        "Target absence is proven, but exact execution retirement must be retried",
+                        std::time::Duration::from_secs(15),
+                    )
+                    .await;
+                }
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(_) => {
+                    return record_post_proof_cleanup_failure(
+                        lease,
+                        ctx,
+                        "ManagementExecutionCleanupInvalid",
+                        "Target absence is proven, but execution provenance is contradictory",
+                        std::time::Duration::from_secs(300),
+                    )
+                    .await;
+                }
+            }
         }
         return finish_release(lease, ctx, reason).await;
     }
@@ -5155,6 +5233,11 @@ async fn cleanup_child_executions_after_proof(
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
             Ok(Some(Action::await_change()))
         }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
+            // This function runs only after exact target-absence proof. Reaching
+            // this state means the proof was not consumed and must be retried.
+            Ok(Some(Action::requeue(std::time::Duration::from_secs(15))))
+        }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
             Ok(Some(Action::requeue(std::time::Duration::from_secs(15))))
         }
@@ -5804,29 +5887,43 @@ async fn release_bound_child_composition(
         };
         match recorded_child_access(lease, ctx, expected_instance).await {
             RecordedChildAccess::Reachable(child_client) => {
-                // Durable runner groups and scoped identities are retired
-                // before the internal lease may enter release.
+                // Inspect durable runner groups before scoped credentials.
+                // Proven-absent groups retire here; a lost supervisor selects
+                // receipt-backed cluster destruction while retaining its
+                // record and capacity.
                 if ctx.access_ledger_enabled {
-                    match crate::api::sandbox_executions::cleanup_lease_executions(
-                        &ctx.client,
-                        &ctx.namespace,
-                        &ctx.reservation_namespace,
-                        lease,
-                        &child_client,
-                        &ctx.shutdown,
-                    )
-                    .await
-                    {
-                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
-                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+                    match execution_cleanup_advance(
+                        crate::api::sandbox_executions::cleanup_lease_executions(
+                            &ctx.client,
+                            &ctx.namespace,
+                            &ctx.reservation_namespace,
+                            lease,
+                            &child_client,
+                            &ctx.shutdown,
+                        )
+                        .await,
+                    ) {
+                        ExecutionCleanupAdvance::Continue => {}
+                        ExecutionCleanupAdvance::Checkpointed => {
                             return Ok(Action::await_change());
                         }
-                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+                        ExecutionCleanupAdvance::DestroyTarget => {
+                            // Preserve Unknown and its capacity, but do not
+                            // deadlock before cluster destruction. The exact
+                            // destroy receipt will retire both.
+                            return checkpoint_child_teardown_mode(
+                                lease,
+                                ctx,
+                                crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1,
+                            )
+                            .await;
+                        }
+                        ExecutionCleanupAdvance::Retry => {
                             return Ok(Action::requeue(std::time::Duration::from_secs(15)));
                         }
-                        crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(
-                            reason,
-                        ) => return quarantine_lease(lease, ctx, reason).await,
+                        ExecutionCleanupAdvance::Quarantine(reason) => {
+                            return quarantine_lease(lease, ctx, reason).await;
+                        }
                     }
                 }
 
@@ -6323,7 +6420,8 @@ async fn finish_child_release_after_proof(
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
                 return Ok(Action::await_change());
             }
-            crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
+            | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
                 return record_post_proof_cleanup_failure(
                     lease,
                     ctx,
@@ -8466,6 +8564,26 @@ pub async fn run_sandbox_controller(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// `supervisor_lost` is deliberately not process-absence proof. Its cleanup
+    /// outcome must advance the exact target's destruction instead of joining
+    /// ordinary retries; management then deletes the Claim, while child
+    /// placement checkpoints verified-destroy receipt mode.
+    #[test]
+    fn uncertain_terminal_execution_advances_target_destruction() {
+        assert_eq!(
+            execution_cleanup_advance(
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction,
+            ),
+            ExecutionCleanupAdvance::DestroyTarget
+        );
+        assert_eq!(
+            execution_cleanup_advance(
+                crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry,
+            ),
+            ExecutionCleanupAdvance::Retry
+        );
+    }
 
     /// Upstream object names are DERIVED, never taken from caller input.
     ///

@@ -174,11 +174,12 @@ fn execution_response(
 
 /// Whether a reused POST may return its record immediately.
 ///
-/// Detached requests are handle-based and return `202` while active. Legacy
-/// raw wait-mode records have no runner output to recover. A current
-/// runner-managed wait request returns `None` so the handler resumes polling or
-/// reads its retained terminal output instead of silently returning empty
-/// streams after a lost HTTP response.
+/// Terminal detached requests and legacy raw wait-mode records can return their
+/// durable object directly. An active runner-managed request, detached or not,
+/// must first inspect the target reservation: Kobe may have crashed after its
+/// own Running checkpoint but before the target saw `start`. In that one proven
+/// no-reservation case, the identical request safely completes the missing
+/// target-side step.
 fn reused_execution_response_status(
     execution: &crate::crd::SandboxExecution,
 ) -> Option<StatusCode> {
@@ -187,12 +188,8 @@ fn reused_execution_response_status(
         .as_ref()
         .map(|status| status.state)
         .unwrap_or_default();
-    if execution.spec.detached {
-        return Some(if current.is_terminal() {
-            StatusCode::OK
-        } else {
-            StatusCode::ACCEPTED
-        });
+    if execution.spec.detached && current.is_terminal() {
+        return Some(StatusCode::OK);
     }
     (!execution_is_runner_managed(&execution.spec)).then_some(StatusCode::OK)
 }
@@ -297,11 +294,19 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     // spend an idempotency key on something the target must reject.
     let candidate_execution =
         crate::crd::execution_name(&target.lease_uid, &requested.idempotency_key);
+    let candidate_digest = crate::crd::request_digest(
+        &requested.argv,
+        requested.cwd.as_deref(),
+        &requested.timeout,
+        &container,
+        requested.detached,
+    );
     let candidate_start = crate::api::sandbox_runner::start_request(
         &candidate_execution,
         &requested.argv,
         requested.cwd.as_deref(),
         initial_timeout,
+        Some(&candidate_digest),
     );
     if crate::api::sandbox_runner::start_line(&candidate_start).is_err() {
         return execution_denied(
@@ -346,8 +351,9 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     let (reserved, fresh) = match reservation {
         // Somebody already reserved this exact request. Detached callers keep
         // the handle/poll contract. Wait callers resume observing the same
-        // runner record below; they never spawn it again, but a lost response
-        // must not turn exact retained output into an empty successful result.
+        // runner record below. Only an exact target-side NotFound may complete a
+        // missing reservation; a lost response must not turn retained output
+        // into an empty successful result.
         executions::Reservation::AlreadyExists(existing) => {
             info!(
                 principal = %identity.identity,
@@ -380,9 +386,10 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         }
     };
 
-    // Belt and braces: a reservation that is not fresh must never spawn, even
-    // though `Reserved` is fresh by construction. The cost of the check is
-    // nothing; the cost of the case it guards is a duplicate `terraform apply`.
+    // Belt and braces: only `Reserved` receives fresh spawn authority. Recovery
+    // of a missing target reservation is fenced separately by exact target-side
+    // NotFound. The cost of the check is nothing; the cost of getting it wrong
+    // is a duplicate `terraform apply`.
     if fresh && !executions::may_spawn(&reserved) {
         return sandbox_error(
             StatusCode::CONFLICT,
@@ -468,8 +475,26 @@ async fn create_sandbox_execution<B: ClusterBackend>(
     };
 
     if !fresh {
+        // Recovery may happen well after Kobe's Running checkpoint. Shorten the
+        // target-side runtime against the lease as it exists now; the durable
+        // request digest lets concurrent identical retries choose slightly
+        // different remaining seconds without becoming different commands.
+        let recovery_timeout =
+            match executions::effective_timeout(requested_timeout, &lease, chrono::Utc::now()) {
+                Ok(timeout) => timeout,
+                Err(error) => return execution_denied(&identity, &id, &error),
+            };
         return resume_wait_with_runner(
-            &state, &identity, &id, &target, &container, &reserved, &scoped, revoked,
+            &state,
+            &identity,
+            &id,
+            &target,
+            &container,
+            &requested,
+            &reserved,
+            &scoped,
+            recovery_timeout,
+            revoked,
         )
         .await;
     }
@@ -494,8 +519,9 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         }
     };
 
-    // Marked Running before the runner sees the request. From here on nothing
-    // may spawn this key again, including after this process disappears.
+    // Marked Running before the runner sees the request. A retry may complete
+    // the missing target reservation only when this exact target proves it has
+    // no record; every other retry observes the existing one.
     if executions::mark_running(&state.client, &state.namespace, &reserved, timeout)
         .await
         .is_err()
@@ -506,6 +532,12 @@ async fn create_sandbox_execution<B: ClusterBackend>(
             None,
         );
     }
+
+    executions::crash_if_requested(
+        executions::ExecutionCrashWindow::AfterRunningBeforeTargetReservation,
+        &id,
+        &requested.idempotency_key,
+    );
 
     run_with_runner(
         &state, &identity, &id, &target, &container, &requested, &reserved, &scoped, timeout,
@@ -573,7 +605,23 @@ async fn run_with_runner<B: ClusterBackend>(
         &requested.argv,
         requested.cwd.as_deref(),
         timeout,
+        Some(&reserved.spec.request_digest),
     );
+    let runner_crash = if executions::crash_requested(
+        executions::ExecutionCrashWindow::BeforeSpawn,
+        id,
+        &requested.idempotency_key,
+    ) {
+        Some(runner::StartCrashWindow::BeforeSpawn)
+    } else if executions::crash_requested(
+        executions::ExecutionCrashWindow::AfterSpawnBeforeAcknowledgement,
+        id,
+        &requested.idempotency_key,
+    ) {
+        Some(runner::StartCrashWindow::AfterSpawnBeforeAcknowledgement)
+    } else {
+        None
+    };
 
     let started = tokio::select! {
         started = runner::start(
@@ -582,6 +630,7 @@ async fn run_with_runner<B: ClusterBackend>(
             container,
             &runner_path,
             &request,
+            runner_crash,
             &state.shutdown,
         ) => started,
         _ = revoked.cancelled() => {
@@ -629,6 +678,12 @@ async fn run_with_runner<B: ClusterBackend>(
         }
     };
 
+    executions::crash_if_requested(
+        executions::ExecutionCrashWindow::AfterAcknowledgementBeforeStatusPersistence,
+        id,
+        &requested.idempotency_key,
+    );
+
     if requested.detached {
         return runner_started_response(state, identity, id, reserved, &report).await;
     }
@@ -648,11 +703,15 @@ async fn run_with_runner<B: ClusterBackend>(
     .await
 }
 
-/// Resume a wait-mode request after its first HTTP response was lost.
+/// Resume a runner-managed request after its first HTTP response was lost.
 ///
-/// The durable record and runner id are reused exactly; this path never calls
-/// `start`. A `Running` record resumes polling, while a terminal record reads
-/// the retained streams so retrying cannot turn real output into empty output.
+/// The durable record and runner id are reused exactly. A `Running` record
+/// normally resumes polling. The sole exception is `NotFound` from the exact
+/// recorded target: that proves Kobe crashed after its Running checkpoint but
+/// before target-side reservation, so replaying the identical validated request
+/// completes the missing reservation without duplicating a command. A terminal
+/// record reads retained streams so retrying cannot turn real output into empty
+/// output.
 #[allow(clippy::too_many_arguments)]
 async fn resume_wait_with_runner<B: ClusterBackend>(
     state: &AppState<B>,
@@ -660,8 +719,10 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     id: &str,
     target: &crate::api::sandbox_access::SandboxTarget,
     container: &str,
+    requested: &crate::api::sandbox_executions::ExecutionRequest,
     record: &crate::crd::SandboxExecution,
     scoped: &kube::Client,
+    recovery_timeout: std::time::Duration,
     revoked: tokio_util::sync::CancellationToken,
 ) -> Response {
     use crate::api::sandbox_runner as runner;
@@ -713,6 +774,27 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
     .await;
     let report = match polled {
         Some(Ok(report)) => report,
+        Some(Err(runner::RunnerCallFailure::Refused(
+            kobe_runner::protocol::RunnerErrorCode::NotFound,
+        ))) => {
+            // The exact target has no reservation, so no supervisor or command
+            // can belong to this id. The Kubernetes digest already proved this
+            // is the same request; target-side reserve-before-spawn now supplies
+            // the second half of the idempotency fence.
+            return run_with_runner(
+                state,
+                identity,
+                id,
+                target,
+                container,
+                requested,
+                record,
+                scoped,
+                recovery_timeout,
+                revoked,
+            )
+            .await;
+        }
         Some(Err(failure)) => {
             return sandbox_error(failure.http_status(), failure.to_string(), None);
         }
@@ -734,6 +816,10 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
             );
         }
     };
+
+    if record.spec.detached {
+        return runner_started_response(state, identity, id, record, &report).await;
+    }
 
     complete_wait_mode(
         state,
@@ -886,6 +972,19 @@ async fn wait_output_response<B: ClusterBackend>(
     .await;
     let output = match output {
         Some(Ok(output)) => output,
+        Some(Err(runner::RunnerCallFailure::Refused(
+            kobe_runner::protocol::RunnerErrorCode::NotFound,
+        ))) if record
+            .status
+            .as_ref()
+            .is_some_and(|status| status.state == crate::crd::ExecutionState::Unknown) =>
+        {
+            // The durable state already says nobody can verify the outcome,
+            // and the exact runner confirms it has no retained record. Return
+            // that stable answer; the runner's private 404 is not the public
+            // identity of this execution.
+            return (StatusCode::OK, Json(execution_response(record, None))).into_response();
+        }
         Some(Err(failure)) => {
             // The outcome is durable and exact; output retrieval is a separate
             // transport failure and must not rewrite it to Unknown.
@@ -13096,6 +13195,14 @@ mod tests {
         assert_eq!(response.stdout.as_deref(), Some("retained-out"));
         assert_eq!(response.stderr.as_deref(), Some("retained-err"));
 
+        record.status.as_mut().unwrap().state = crate::crd::ExecutionState::Unknown;
+        record.status.as_mut().unwrap().exit_code = None;
+        assert_eq!(
+            reused_execution_response_status(&record),
+            None,
+            "Unknown still recovers retained output when the runner has a record"
+        );
+
         record.spec.runner_managed = None;
         assert_eq!(
             reused_execution_response_status(&record),
@@ -13106,8 +13213,14 @@ mod tests {
         record.status.as_mut().unwrap().state = crate::crd::ExecutionState::Running;
         assert_eq!(
             reused_execution_response_status(&record),
-            Some(StatusCode::ACCEPTED),
-            "detached retries remain handle-based"
+            None,
+            "active detached retries must verify or recover the target reservation"
+        );
+        record.status.as_mut().unwrap().state = crate::crd::ExecutionState::Succeeded;
+        assert_eq!(
+            reused_execution_response_status(&record),
+            Some(StatusCode::OK),
+            "terminal detached retries remain handle-based"
         );
     }
 

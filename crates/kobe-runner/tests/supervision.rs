@@ -74,6 +74,26 @@ fn start_in(
     timeout: u64,
     cap: u64,
 ) -> Reply {
+    reply(start_output(
+        scratch,
+        &["start"],
+        id,
+        argv,
+        cwd,
+        timeout,
+        cap,
+    ))
+}
+
+fn start_output(
+    scratch: &Scratch,
+    runner_arguments: &[&str],
+    id: &str,
+    argv: &[&str],
+    cwd: Option<&str>,
+    timeout: u64,
+    cap: u64,
+) -> std::process::Output {
     use std::io::Write;
 
     let request = serde_json::json!({
@@ -92,7 +112,7 @@ fn start_in(
         request.as_object_mut().unwrap().remove("cwd");
     }
 
-    let mut child = runner(scratch, &["start"])
+    let mut child = runner(scratch, runner_arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -106,7 +126,7 @@ fn start_in(
         .unwrap()
         .write_all(line.as_bytes())
         .unwrap();
-    reply(child.wait_with_output().unwrap())
+    child.wait_with_output().unwrap()
 }
 
 fn status(scratch: &Scratch, id: &str) -> Reply {
@@ -213,6 +233,7 @@ fn assert_process_gone(pid: i32) {
 fn a_started_command_outlives_the_process_that_started_it() {
     let scratch = Scratch::new();
     let marker = scratch.path().join("finished");
+    let release = scratch.path().join("allow-finish");
 
     let report = report_of(start(
         &scratch,
@@ -220,7 +241,11 @@ fn a_started_command_outlives_the_process_that_started_it() {
         &[
             "/bin/sh",
             "-c",
-            &format!("sleep 1; touch {}", marker.display()),
+            &format!(
+                "while [ ! -f {} ]; do sleep 0.05; done; touch {}",
+                release.display(),
+                marker.display()
+            ),
         ],
         30,
         4096,
@@ -231,6 +256,7 @@ fn a_started_command_outlives_the_process_that_started_it() {
 
     // `start` has already exited by the time we get here: the command has not.
     assert!(!marker.exists(), "the command must not have finished yet");
+    std::fs::write(release, b"finish").unwrap();
 
     let settled = settled(&scratch, "sbxe-detached", Duration::from_secs(20));
     assert_eq!(settled.state, RunnerState::Succeeded);
@@ -303,6 +329,143 @@ fn one_id_runs_one_command_however_often_it_is_started() {
         1,
         "the command ran more than once: {ledger:?}"
     );
+}
+
+/// A hard exit after the target-side reservation but before spawn releases the
+/// reservation owner lock. The first exact retry settles the original runner
+/// record Unknown; later retries return that byte-for-byte report and no retry
+/// ever manufactures the command.
+#[test]
+fn a_reserved_command_whose_starter_crashed_is_never_spawned() {
+    let scratch = Scratch::new();
+    let ledger = scratch.path().join("before-spawn-ledger");
+    let script = format!("echo ran >> {}", ledger.display());
+    let argv = ["/bin/sh", "-c", script.as_str()];
+    let output = start_output(
+        &scratch,
+        &["start", kobe_runner::protocol::TEST_EXIT_BEFORE_SPAWN_FLAG],
+        "sbxe-before-spawn",
+        &argv,
+        None,
+        30,
+        4096,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(kobe_runner::protocol::TEST_EXECUTION_CRASH_EXIT_CODE)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the crash wrote an acknowledgement"
+    );
+
+    let first = report_of(start(&scratch, "sbxe-before-spawn", &argv, 30, 4096));
+    assert_eq!(first.state, RunnerState::Unknown);
+    assert_eq!(
+        first.reason.as_deref(),
+        Some(kobe_runner::protocol::reason::SUPERVISOR_NOT_STARTED)
+    );
+    assert!(first.process_absence_proven());
+    let second = report_of(start(&scratch, "sbxe-before-spawn", &argv, 30, 4096));
+    assert_eq!(second, first, "the recovered Unknown must be stable");
+    assert!(!ledger.exists(), "the pre-spawn command ran");
+}
+
+/// The injected lost-ack window occurs after the runner's durable reservation
+/// and supervisor spawn, but before one reply byte. Retrying the ordinary start
+/// must observe that same process rather than spawning the side effect again.
+#[test]
+fn a_lost_start_acknowledgement_still_spawns_exactly_once() {
+    let scratch = Scratch::new();
+    let ledger = scratch.path().join("lost-ack-ledger");
+    let script = format!("echo ran >> {}; sleep 1", ledger.display());
+    let argv = ["/bin/sh", "-c", script.as_str()];
+    let output = start_output(
+        &scratch,
+        &[
+            "start",
+            kobe_runner::protocol::TEST_EXIT_AFTER_SPAWN_BEFORE_ACK_FLAG,
+        ],
+        "sbxe-lost-ack",
+        &argv,
+        None,
+        30,
+        4096,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(kobe_runner::protocol::TEST_EXECUTION_CRASH_EXIT_CODE)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the lost acknowledgement wrote bytes"
+    );
+
+    let retried = report_of(start(&scratch, "sbxe-lost-ack", &argv, 30, 4096));
+    assert_eq!(retried.id, "sbxe-lost-ack");
+    let terminal = settled(&scratch, "sbxe-lost-ack", Duration::from_secs(20));
+    let repeated = report_of(start(&scratch, "sbxe-lost-ack", &argv, 30, 4096));
+    assert_eq!(repeated, terminal, "the retained outcome must be stable");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        std::fs::read_to_string(ledger)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+/// A killed supervisor leaves the verdict Unknown and does not manufacture
+/// process-absence proof. Lease teardown must preserve this report until
+/// destroying the exact target supplies that proof.
+#[test]
+fn a_lost_supervisor_is_unknown_without_process_absence_proof() {
+    let scratch = Scratch::new();
+    let command_pidfile = scratch.path().join("lost-supervisor-command.pid");
+    let script = format!("echo $$ > {}; sleep 60", command_pidfile.display());
+    let report = report_of(start(
+        &scratch,
+        "sbxe-lost-supervisor",
+        &["/bin/sh", "-c", &script],
+        60,
+        4096,
+    ));
+    assert_eq!(report.state, RunnerState::Running);
+    let command_pid = wait_for_pid(&command_pidfile);
+    let supervisor_pid = wait_for_pid(
+        &scratch
+            .path()
+            .join("spool/sbxe-lost-supervisor/supervisor.pid"),
+    );
+
+    // SAFETY: both pids came from this test's private spool/process. SIGKILL is
+    // intentional failure injection; the command group is cleaned below.
+    assert_eq!(unsafe { libc::kill(supervisor_pid, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(supervisor_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor never disappeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let unknown = report_of(status(&scratch, "sbxe-lost-supervisor"));
+    assert_eq!(unknown.state, RunnerState::Unknown);
+    assert_eq!(
+        unknown.reason.as_deref(),
+        Some(kobe_runner::protocol::reason::SUPERVISOR_LOST)
+    );
+    assert!(!unknown.process_absence_proven());
+    assert!(
+        alive(command_pid),
+        "Unknown must not claim the command vanished"
+    );
+
+    // SAFETY: the command is its own session/process-group leader by contract.
+    unsafe { libc::kill(-command_pid, libc::SIGKILL) };
+    assert_process_gone(command_pid);
 }
 
 /// A different command under a used id is refused, never run.

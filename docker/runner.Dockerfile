@@ -18,8 +18,11 @@
 # Administrators consume it either way round:
 #
 #     COPY --from=zondax/kobe-runner:latest /kobe-runner /kobe-runner
+#     RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
+#     USER 65532:65532
 #
-# and then set `spec.template.runnerPath: /kobe-runner` on the SandboxPool.
+# using the workload's real UID/GID, then set
+# `spec.template.runnerPath: /kobe-runner` on the SandboxPool.
 # =============================================================================
 FROM rust:1-slim-bookworm AS build
 

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{ExecutionReport, LogStream, RunnerState, StartRequest};
+use crate::protocol::{ExecutionReport, LogStream, RunnerState, StartRequest, reason};
 use crate::spool::{Spool, now_unix_ms};
 
 /// How often the supervisor looks at the world.
@@ -55,17 +55,6 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 /// because a stray process still has the write end would turn a known outcome
 /// into an `Unknown` for no reason.
 const OUTPUT_SETTLE: Duration = Duration::from_secs(2);
-
-/// Reason codes. A closed set, because Kobe persists these.
-mod reason {
-    pub const COMPLETED: &str = "completed";
-    pub const TIMED_OUT: &str = "timed_out";
-    pub const CANCELLED: &str = "cancelled_by_caller";
-    pub const SIGNALLED: &str = "signalled";
-    pub const SPAWN_FAILED: &str = "spawn_failed";
-    pub const SUPERVISOR_SETUP_FAILED: &str = "supervisor_setup_failed";
-    pub const OUTCOME_UNOBSERVED: &str = "outcome_unobserved";
-}
 
 /// Supervise one reserved execution until it settles, then exit.
 pub fn supervise(spool: &Spool, id: &str) {

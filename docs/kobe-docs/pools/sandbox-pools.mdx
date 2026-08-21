@@ -165,11 +165,15 @@ Copy the binary into your own agent image:
 
 ```dockerfile
 COPY --from=zondax/kobe-runner:latest /kobe-runner /kobe-runner
+RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
+USER 65532:65532
 ```
 
-It is a static binary with no dependencies on the base image, and it runs as
-whatever user the container already uses — it needs no privileges beyond
-starting a process and writing under `/var/run`.
+Replace `65532:65532` with the UID and GID your workload uses. The directory must
+exist and be writable by that identity; ordinary non-root users cannot create
+new directories directly under `/var/run`. The runner is a static binary with
+no dependencies on the base image, and at runtime it needs no privileges beyond
+starting a process and writing that private execution spool.
 
 Without `runnerPath`, `POST /v1/sandbox-leases/{id}/executions` returns
 `501 Not Implemented` in both modes. That is deliberate: selecting wait mode
@@ -185,10 +189,12 @@ lifetime. The resulting worst-case retained output is 512 MiB per Sandbox.
 Requests beyond either execution limit return `429 Too Many Requests`.
 
 Cancelling an execution terminates its whole process group, not only the
-process Kobe started. Lease release first closes new access, then cancels and
-proves every recorded execution terminal before credentials and workload are
-removed; the execution records are deleted with that Sandbox rather than kept
-as history after it ends.
+process Kobe started. Lease release first closes new access, then asks every
+recorded runner to cancel and prove its process group absent. If a lost
+supervisor makes that proof impossible, Kobe retains the execution record and
+capacity, destroys the exact Sandbox target, and retires them only after target
+absence is proven. Execution records are deleted with that Sandbox rather than
+kept as history after it ends.
 
 ## Placement and isolation
 

@@ -807,9 +807,11 @@ pub struct SandboxLeaseStatus {
     /// Restart-safe decision made before requesting destruction of a bound
     /// child cluster. `ReachableCleanupV1` means exact runner records and
     /// scoped credentials were proven clean through the checkpointed child
-    /// kubeconfig Secret; `VerifiedDestroyFallbackV1` means an authenticated
-    /// child probe failed only at the transport layer, so the exact backend
-    /// receipt must linearize target absence before records can be retired.
+    /// kubeconfig Secret; `VerifiedDestroyFallbackV1` means either an
+    /// authenticated child probe failed at the transport layer or a reachable
+    /// runner could not prove its process group absent. In both cases the exact
+    /// backend receipt must linearize target absence before records can be
+    /// retired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_teardown_mode: Option<SandboxChildTeardownMode>,
 
@@ -862,9 +864,10 @@ pub enum SandboxChildTeardownMode {
     /// The exact child API was reachable and every durable execution plus
     /// scoped credential was proven clean before cluster destruction began.
     ReachableCleanupV1,
-    /// Only a Hyper/Service transport failure made the exact child API
-    /// unreachable; execution records may be retired only after the exact
-    /// verified-destroy receipt proves their target cluster absent.
+    /// Reachable cleanup could not prove all target processes absent, either
+    /// because the exact child API was unreachable at the transport layer or a
+    /// runner supervisor was lost. Execution records may be retired only after
+    /// the exact verified-destroy receipt proves their target cluster absent.
     VerifiedDestroyFallbackV1,
 }
 
