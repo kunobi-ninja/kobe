@@ -26,6 +26,15 @@ operatorNamespace: "kunobi-pool"
 # teardown may leave the database and role behind. They are harmless
 # (CONNECT is revoked from PUBLIC) but they accumulate.
 #
+# COORDINATION BOUNDARY. kobe always connects its administrative/DDL pool to
+# the `postgres` database, regardless of the path in this URL; that database
+# must exist and accept this credential or initial connection/reload is rejected.
+# The endpoint must resolve to one authoritative writable primary, never a
+# load-balanced read replica or multi-primary set. PostgreSQL advisory locks are
+# database/session-local and are not replicated through WAL. Connect directly or
+# use PgBouncer session pooling; transaction/statement pooling is unsupported
+# because it does not preserve the physical PostgreSQL session holding the lock.
+#
 # UPGRADE NOTE. Clusters provisioned before per-cluster roles existed still
 # hold the shared admin credential in their control-plane configuration, and
 # that credential reaches any other cluster's database. Recycle datastore-backed

@@ -10,6 +10,15 @@
 //! **SQL injection safety**: database names cannot be parameterized in DDL
 //! statements. We enforce a strict allowlist (`[a-zA-Z0-9_]`) and wrap names
 //! in double quotes.
+//!
+//! **Coordination boundary**: every administrative/DDL connection is pinned to
+//! the `postgres` database on one authoritative writable primary. PostgreSQL
+//! advisory locks are database- and physical-session-local; they are not WAL
+//! replicated. A load balancer that can route to a replica or another primary,
+//! or PgBouncer transaction/statement pooling that swaps the server session,
+//! breaks the coordination invariant. Direct connections and session pooling
+//! are supported. The `postgres` database must exist and accept the configured
+//! administrator credential or initial connection/reload fails closed.
 
 use std::sync::Arc;
 
@@ -22,6 +31,21 @@ use sha2::{Digest, Sha256};
 
 /// Maximum length for a PostgreSQL identifier (63 bytes).
 const MAX_IDENT_LEN: usize = 63;
+
+/// Fixed coordination database for every administrative and DDL session.
+const ADMIN_DATABASE_PATH: &str = "/postgres";
+
+/// Rewrite only the database selected by the configured administrator DSN.
+///
+/// User, password, host, port, TLS/query options, and the original child-base
+/// URL are preserved. Pinning all pools here is required because PostgreSQL
+/// advisory-lock namespaces include the current database: two otherwise
+/// identical DSNs selecting different paths would not coordinate.
+fn admin_connection_url(base_url: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(base_url).context("Invalid PostgreSQL datastore URL")?;
+    parsed.set_path(ADMIN_DATABASE_PATH);
+    Ok(parsed.to_string())
+}
 
 /// Versioned domain for the application-level PostgreSQL lifecycle fence.
 ///
@@ -295,9 +319,8 @@ async fn role_catalog_state(
     ))
 }
 
-/// One live PostgreSQL connection: the pool plus the base URL it was built from
-/// (the URL carries the current credential, and per-cluster endpoints are
-/// derived from it).
+/// One live PostgreSQL connection: an administrative pool pinned to `/postgres`
+/// plus the original configured URL used only to derive per-cluster endpoints.
 #[derive(Clone)]
 pub struct DatastoreConn {
     pub pool: PgPool,
@@ -306,7 +329,12 @@ pub struct DatastoreConn {
 
 impl DatastoreConn {
     async fn connect(base_url: String) -> std::result::Result<Self, BoxError> {
-        let pool = PgPool::connect(&base_url).await?;
+        // Both Static and Reloading construction flow through here. Never build
+        // the DDL pool from the caller-selected database path: advisory locks
+        // taken in different PostgreSQL databases do not share a namespace,
+        // and DROP DATABASE cannot target the current database.
+        let admin_url = admin_connection_url(&base_url)?;
+        let pool = PgPool::connect(&admin_url).await?;
         Ok(Self { pool, base_url })
     }
 }
@@ -345,9 +373,11 @@ pub enum SharedDatastore {
 }
 
 impl SharedDatastore {
-    /// The current `(pool, base_url)`, cloned, if a datastore is configured and
-    /// connected. Cheap (a `PgPool` clone is an `Arc` clone); re-read on every
-    /// use so a rotation is observed without restarting.
+    /// The current `(admin_pool, child_base_url)`, cloned, if a datastore is
+    /// configured and connected. The pool always selects `/postgres`; the URL
+    /// remains the original configured value so child endpoint derivation can
+    /// replace its database and credential. Cheap (a `PgPool` clone is an `Arc`
+    /// clone); re-read on every use so a rotation is observed without restart.
     pub fn current(&self) -> Option<(PgPool, String)> {
         match self {
             SharedDatastore::None => None,
@@ -377,8 +407,10 @@ impl SharedDatastore {
     /// - else `POSTGRES_URL` set → a static (non-reloading) connection;
     /// - else → no datastore.
     ///
-    /// A connection/watch failure logs and degrades to `None` (embedded store),
-    /// matching the previous best-effort behavior.
+    /// `/postgres` must exist and accept the configured credential. A static
+    /// connection failure logs and degrades to `None`; a reload failure retains
+    /// the prior pool and reports `Stale`. Both paths withhold the new datastore
+    /// rather than using a DSN-selected child database as a DDL authority.
     pub async fn from_env() -> Self {
         if let Ok(dir) = std::env::var("POSTGRES_URL_DIR") {
             // The FromMount/reloadable path (not .spawn) runs DatastoreConn::retire
@@ -1055,6 +1087,50 @@ mod tests {
                 "unsafe catalog state was accepted: {rows:?}"
             );
         }
+    }
+
+    #[test]
+    fn admin_dsns_with_different_users_and_paths_share_postgres_lock_namespace() {
+        let first_base =
+            "postgresql://admin_a:secret-a@primary.internal:5432/tenant_a?sslmode=require";
+        let second_base =
+            "postgresql://admin_b:secret-b@primary.internal:5432/tenant_b?application_name=kobe";
+
+        let first = url::Url::parse(&admin_connection_url(first_base).unwrap()).unwrap();
+        let second = url::Url::parse(&admin_connection_url(second_base).unwrap()).unwrap();
+
+        assert_eq!(first.path(), ADMIN_DATABASE_PATH);
+        assert_eq!(second.path(), ADMIN_DATABASE_PATH);
+        assert_eq!(first.host_str(), second.host_str());
+        assert_eq!(
+            first.port_or_known_default(),
+            second.port_or_known_default()
+        );
+        assert_eq!(first.username(), "admin_a");
+        assert_eq!(second.username(), "admin_b");
+        assert_eq!(first.password(), Some("secret-a"));
+        assert_eq!(second.password(), Some("secret-b"));
+        assert_eq!(first.query(), Some("sslmode=require"));
+        assert_eq!(second.query(), Some("application_name=kobe"));
+    }
+
+    #[test]
+    fn admin_normalization_does_not_replace_the_child_endpoint_base() {
+        let base =
+            "postgresql://admin:secret@primary.internal:5432/configured_path?sslmode=require";
+        let admin = url::Url::parse(&admin_connection_url(base).unwrap()).unwrap();
+        let child = url::Url::parse(
+            &cluster_endpoint_as_role(base, "pool-0", "k3s_", "tenant-secret").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(admin.path(), ADMIN_DATABASE_PATH);
+        assert_eq!(admin.username(), "admin");
+        assert_eq!(child.path(), "/k3s_pool_0");
+        assert_eq!(child.username(), "k3s_pool_0");
+        assert_eq!(child.password(), Some("tenant-secret"));
+        assert_eq!(child.query(), Some("sslmode=require"));
+        assert!(admin_connection_url("not a postgres URL").is_err());
     }
 
     #[test]
