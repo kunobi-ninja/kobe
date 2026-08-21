@@ -1351,6 +1351,59 @@ pub async fn cleanup_lease_executions(
         ledger_namespace,
         lease,
         Some(target_client),
+        false,
+        shutdown,
+    )
+    .await
+}
+
+/// Retire exact execution records after an authenticated destroy receipt has
+/// proven their entire target cluster absent.
+///
+/// This variant performs every manifest/record UID, resourceVersion and
+/// finalizer check used by reachable cleanup, but deliberately makes no runner
+/// call: the receipt is stronger evidence that no process group survives. It
+/// must never be called for a mere credential error, timeout, or name-based
+/// 404; the caller owns the exact receipt check.
+pub async fn cleanup_lease_executions_after_target_absence(
+    management_client: &kube::Client,
+    execution_namespace: &str,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> ExecutionCleanupOutcome {
+    cleanup_lease_executions_inner(
+        management_client,
+        execution_namespace,
+        ledger_namespace,
+        lease,
+        None,
+        false,
+        shutdown,
+    )
+    .await
+}
+
+/// Prove a NeverBound child never acquired execution authority.
+///
+/// A non-empty manifest is contradictory evidence and is quarantined rather
+/// than rewritten as target-destroyed. With an empty manifest the ordinary
+/// exact-owned record scan still rejects any orphan record and clears only the
+/// empty durable manifest checkpoint.
+pub async fn prove_never_bound_execution_footprint_empty(
+    management_client: &kube::Client,
+    execution_namespace: &str,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> ExecutionCleanupOutcome {
+    cleanup_lease_executions_inner(
+        management_client,
+        execution_namespace,
+        ledger_namespace,
+        lease,
+        None,
+        true,
         shutdown,
     )
     .await
@@ -1362,6 +1415,7 @@ async fn cleanup_lease_executions_inner(
     ledger_namespace: &str,
     lease: &SandboxLease,
     target_client: Option<&kube::Client>,
+    require_empty_manifest: bool,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> ExecutionCleanupOutcome {
     use crate::api::sandbox_runner::{self as runner, RunnerCallFailure};
@@ -1377,6 +1431,9 @@ async fn cleanup_lease_executions_inner(
         Ok(manifest) => manifest,
         Err(_) => return ExecutionCleanupOutcome::Quarantine("execution_manifest_unverifiable"),
     };
+    if require_empty_manifest && !manifest.is_empty() {
+        return ExecutionCleanupOutcome::Quarantine("never_bound_execution_manifest_nonempty");
+    }
     let executions: Api<SandboxExecution> =
         Api::namespaced(management_client.clone(), execution_namespace);
     let listed = match executions.list(&ListParams::default()).await {
@@ -1923,6 +1980,235 @@ mod tests {
         assert_eq!(body[0]["value"], "execution-uid");
         assert_eq!(body[1]["value"], "7");
         assert_eq!(body[3]["op"], "remove");
+    }
+
+    /// An exact destroy receipt proves the runner target absent, but the
+    /// management-cluster record still follows every UID/RV/finalizer fence.
+    /// A running record is first durably cancelled as `target_destroyed`, then
+    /// its capacity and object are retired without any runner request.
+    #[tokio::test]
+    async fn target_absence_cleanup_terminalizes_and_uid_fences_a_running_record() {
+        use sha2::{Digest as _, Sha256};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct ExecutionReads {
+            running: serde_json::Value,
+            terminal: serde_json::Value,
+            unfinalized: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Respond for ExecutionReads {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(200).set_body_json(self.running.clone()),
+                    1 => ResponseTemplate::new(200).set_body_json(self.terminal.clone()),
+                    2 => ResponseTemplate::new(200).set_body_json(self.unfinalized.clone()),
+                    _ => ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                        "apiVersion":"v1","kind":"Status","status":"Failure",
+                        "reason":"NotFound","code":404
+                    })),
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = crate::controllers::sandbox::tests::admitted_lease();
+        let lease_uid = lease.uid().unwrap();
+        let gate = format!(
+            "kobe-access-g-{}",
+            &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
+        );
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION.into(),
+            crate::sandbox_access_ledger::encode_gate_reference(
+                &crate::sandbox_access_ledger::AccessGateReference {
+                    name: gate.clone(),
+                    uid: "gate-uid".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let target = SandboxTarget {
+            lease_uid: lease_uid.clone(),
+            placement: crate::api::sandbox_access::TargetPlacement::Management,
+            namespace: "test-ns".into(),
+            claim_uid: "claim-uid".into(),
+            sandbox_name: "sbx".into(),
+            sandbox_uid: "sandbox-uid".into(),
+            pod_name: "sandbox-pod".into(),
+            pod_uid: "pod-uid".into(),
+            container: "agent".into(),
+            ports: vec![],
+            runner_path: Some("/kobe-runner".into()),
+        };
+        let mut running = build_execution_record(
+            "test-ns",
+            "execution-a",
+            &lease,
+            &target,
+            &request(),
+            &"d".repeat(64),
+            SandboxExecutionTarget {
+                namespace: "test-ns".into(),
+                pod_name: "sandbox-pod".into(),
+                pod_uid: "pod-uid".into(),
+                container: "agent".into(),
+                runner_path: "/kobe-runner".into(),
+            },
+        );
+        running.metadata.uid = Some("execution-uid".into());
+        running.metadata.resource_version = Some("execution-rv-1".into());
+        running.status = Some(crate::crd::SandboxExecutionStatus {
+            state: ExecutionState::Running,
+            started_at: Some("2026-08-20T00:00:00Z".into()),
+            ..Default::default()
+        });
+        let mut terminal = running.clone();
+        terminal.metadata.resource_version = Some("execution-rv-2".into());
+        terminal.status = Some(crate::crd::SandboxExecutionStatus {
+            state: ExecutionState::Cancelled,
+            started_at: Some("2026-08-20T00:00:00Z".into()),
+            finished_at: Some("2026-08-20T00:01:00Z".into()),
+            reason: Some("target_destroyed".into()),
+            ..Default::default()
+        });
+        let mut unfinalized = terminal.clone();
+        unfinalized.metadata.resource_version = Some("execution-rv-3".into());
+        unfinalized.metadata.finalizers = Some(vec![]);
+
+        let execution_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions/execution-a";
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxExecutionList",
+                "metadata":{"resourceVersion":"1"},
+                "items":[running.clone()]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(execution_path))
+            .respond_with(ExecutionReads {
+                running: serde_json::to_value(&running).unwrap(),
+                terminal: serde_json::to_value(&terminal).unwrap(),
+                unfinalized: serde_json::to_value(&unfinalized).unwrap(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{execution_path}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&terminal))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(execution_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&unfinalized))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(execution_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manifest = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "executionUid": "execution-uid",
+                "creationState": "bound",
+                "active": true
+            }
+        })
+        .to_string();
+        let gate_path = format!("/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{gate}");
+        let gate_object = serde_json::json!({
+            "apiVersion":"coordination.k8s.io/v1",
+            "kind":"Lease",
+            "metadata":{
+                "name":gate,"namespace":"test-ns","uid":"gate-uid","resourceVersion":"1",
+                "labels":{
+                    "kobe.kunobi.ninja/sandbox-access-kind":"lease-gate",
+                    "kobe.kunobi.ninja/sandbox-lease-name":lease.name_any(),
+                    "kobe.kunobi.ninja/sandbox-access-lease-uid":lease_uid,
+                },
+                "annotations":{
+                    "kobe.kunobi.ninja/sandbox-access-state":"closed",
+                    "kobe.kunobi.ninja/sandbox-access-entries":"{}",
+                    "kobe.kunobi.ninja/sandbox-executions":manifest,
+                }
+            },
+            "spec":{}
+        });
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object.clone()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            cleanup_lease_executions_after_target_absence(
+                &client,
+                "test-ns",
+                "test-ns",
+                &lease,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await,
+            ExecutionCleanupOutcome::Checkpointed
+        );
+        let requests = server.received_requests().await.unwrap();
+        let terminal_patch: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.url.path() == format!("{execution_path}/status"))
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(terminal_patch[2]["value"]["state"], "Cancelled");
+        assert_eq!(terminal_patch[2]["value"]["reason"], "target_destroyed");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().contains("/proxy"))
+        );
+        let delete: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method.as_str() == "DELETE")
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(delete["preconditions"]["uid"], "execution-uid");
+        assert_eq!(delete["preconditions"]["resourceVersion"], "execution-rv-3");
     }
 
     /// A stale setup-timeout observation cannot overwrite a concurrent

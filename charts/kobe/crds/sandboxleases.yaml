@@ -128,6 +128,16 @@ spec:
                 - name
                 - uid
                 type: object
+              childTeardownMode:
+                description: |-
+                  Durable ordering proof selected before a bound child `ClusterLease` is
+                  released. The value is write-once: a restart must never reinterpret the
+                  same in-flight destroy as a successful reachable cleanup.
+                enum:
+                - ReachableCleanupV1
+                - VerifiedDestroyFallbackV1
+                nullable: true
+                type: string
               claimCleanupFence:
                 description: Durable management-Claim deletion fence understood by this controller.
                 enum:
@@ -334,6 +344,53 @@ spec:
                     - name
                     - uid
                     type: object
+                  childClusterKubeconfigSecret:
+                    description: |-
+                      Exact management-cluster Secret whose bytes authenticate the child
+                      client. The Secret is checkpointed before its contents are first used,
+                      then re-read by UID and payload digest on every later pass. Only
+                      non-secret identity is persisted; kubeconfig bytes never enter status,
+                      logs, or API responses.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        nullable: true
+                        type: string
+                      uid:
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  childClusterKubeconfigSha256:
+                    description: |-
+                      SHA-256 of the exact, sole `data.kubeconfig` payload read from
+                      [`Self::child_cluster_kubeconfig_secret`]. It is checkpointed in the
+                      same status write as the Secret UID and never changes. ResourceVersion
+                      may move on an idempotent publisher apply; payload identity may not.
+                    maxLength: 64
+                    minLength: 64
+                    nullable: true
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
                   childClusterLease:
                     description: Non-secret identity of one exact Kubernetes object.
                     nullable: true
@@ -572,6 +629,18 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True'') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
         - message: FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause
           rule: '!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != ''FootprintAbsent'' || (c.status == ''True'' && has(self.status.releaseCause) && self.status.phase in [''Releasing'', ''Released'', ''Expired'']))'
+        - message: status.target.childClusterKubeconfigSecret is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSecret) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret) && self.status.target.childClusterKubeconfigSecret == oldSelf.status.target.childClusterKubeconfigSecret)'
+        - message: status.target.childClusterKubeconfigSha256 is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSha256) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSha256) && self.status.target.childClusterKubeconfigSha256 == oldSelf.status.target.childClusterKubeconfigSha256)'
+        - message: child kubeconfig Secret identity and payload digest must be checkpointed together
+          rule: '!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))'
+        - message: childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance
+          rule: '!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == ''v1'' && self.status.target.childClusterKubeconfigSecret.kind == ''Secret'' && has(self.status.target.childClusterKubeconfigSecret.namespace) && has(self.status.target.childClusterInstance.namespace) && self.status.target.childClusterKubeconfigSecret.namespace == self.status.target.childClusterInstance.namespace && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + ''-kubeconfig'' && self.status.target.childClusterKubeconfigSha256.matches(''^[0-9a-f]{64}$''))'
+        - message: status.childTeardownMode is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownMode) || (has(self.status) && self.status != null && has(self.status.childTeardownMode) && self.status.childTeardownMode == oldSelf.status.childTeardownMode)'
+        - message: childTeardownMode requires exact child placement and kubeconfig Secret provenance
+          rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownMode) || (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret))'
     served: true
     storage: true
     subresources:

@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim};
+use k8s_openapi::api::core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
@@ -4209,7 +4209,11 @@ async fn drive_release(
     // be handed to the next caller while the previous tenant's Sandbox was
     // still running in a cluster nobody had touched.
     if child_placed {
-        return release_child_composition(lease, ctx, reason).await;
+        // Keep the large, proof-carrying child state machine off this already
+        // broad reconcile future. Besides bounding controller task frames,
+        // this prevents test/runtime thread stacks from depending on how many
+        // child teardown checkpoints are added over time.
+        return Box::pin(release_child_composition(lease, ctx, reason)).await;
     }
 
     let resource = upstream_resource(SANDBOX_CLAIM_KIND, "sandboxclaims");
@@ -4348,6 +4352,8 @@ async fn drive_release(
                 namespace: ctx.namespace.clone(),
                 child_cluster_lease: None,
                 child_cluster_instance: None,
+                child_cluster_kubeconfig_secret: None,
+                child_cluster_kubeconfig_sha256: None,
                 sandbox_template: None,
                 sandbox_warm_pool: None,
                 sandbox_claim: None,
@@ -4633,6 +4639,183 @@ async fn is_child_placed(lease: &SandboxLease, ctx: &SandboxContext) -> bool {
     }
 }
 
+enum RecordedChildAccess {
+    Reachable(Client),
+    /// Management-cluster or child API state may recover without destruction.
+    Retry(&'static str),
+    /// Only a child Hyper/Service transport failure selects receipt fallback.
+    TransportUnreachable,
+    /// Identity, authentication, or credential ambiguity is not unreachability.
+    Quarantine(&'static str),
+}
+
+/// Re-authenticate one bound child through the exact Secret checkpoint.
+///
+/// Management API failures are classified before a child client exists and can
+/// therefore never select destroy fallback. Missing/replaced/malformed Secret
+/// data and child 401/403 responses quarantine. Only an actual Hyper/Service
+/// error from an exact child API probe is durable grounds for the
+/// `VerifiedDestroyFallbackV1` path.
+async fn recorded_child_access(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    instance: &crate::crd::SandboxObjectReference,
+) -> RecordedChildAccess {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let Some(recorded_secret) = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_kubeconfig_secret.as_ref())
+    else {
+        return RecordedChildAccess::Quarantine("child_kubeconfig_provenance_missing");
+    };
+    let Some(recorded_digest) = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_kubeconfig_sha256.as_deref())
+    else {
+        return RecordedChildAccess::Quarantine("child_kubeconfig_provenance_missing");
+    };
+    let secret_name = crate::backend::kubeconfig_secret_name(&instance.name);
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let secret = match secrets.get(&secret_name).await {
+        Ok(secret) => secret,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return RecordedChildAccess::Quarantine("child_kubeconfig_secret_missing");
+        }
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            return RecordedChildAccess::Quarantine("child_kubeconfig_secret_forbidden");
+        }
+        Err(_) => {
+            return RecordedChildAccess::Retry("child_kubeconfig_management_read_retry");
+        }
+    };
+    let observation = match child_kubeconfig_secret_observation(&secret, &ctx.namespace, instance) {
+        Ok(observation) => observation,
+        Err(_) => {
+            return RecordedChildAccess::Quarantine("child_kubeconfig_secret_malformed");
+        }
+    };
+    if require_exact_child_kubeconfig_secret(recorded_secret, recorded_digest, &observation)
+        .is_err()
+    {
+        return RecordedChildAccess::Quarantine("child_kubeconfig_secret_replaced");
+    }
+    let kubeconfig = match String::from_utf8(observation.kubeconfig_payload) {
+        Ok(kubeconfig) => kubeconfig,
+        Err(_) => {
+            return RecordedChildAccess::Quarantine("child_kubeconfig_payload_invalid");
+        }
+    };
+    let child = match crate::backend::virtual_client_from_kubeconfig(&kubeconfig).await {
+        Ok(child) => child,
+        Err(_) => {
+            return RecordedChildAccess::Quarantine("child_kubeconfig_client_invalid");
+        }
+    };
+    let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+        return RecordedChildAccess::Quarantine("child_parent_uid_missing");
+    };
+    let namespaces: Api<Namespace> = Api::all(child.clone());
+    match namespaces.get(CHILD_SANDBOX_NAMESPACE).await {
+        Ok(namespace)
+            if child_namespace_matches_lease(&namespace, &lease.name_any(), &lease_uid) =>
+        {
+            RecordedChildAccess::Reachable(child)
+        }
+        Ok(_) => RecordedChildAccess::Quarantine("child_namespace_identity_changed"),
+        Err(kube::Error::Api(error)) if error.code == 401 || error.code == 403 => {
+            RecordedChildAccess::Quarantine("child_api_authentication_failed")
+        }
+        Err(kube::Error::Api(error)) if (500..=599).contains(&error.code) => {
+            RecordedChildAccess::Retry("child_api_server_retry")
+        }
+        Err(kube::Error::HyperError(_) | kube::Error::Service(_)) => {
+            RecordedChildAccess::TransportUnreachable
+        }
+        Err(kube::Error::Api(_)) => RecordedChildAccess::Quarantine("child_namespace_unverifiable"),
+        Err(_) => RecordedChildAccess::Quarantine("child_api_response_unverifiable"),
+    }
+}
+
+/// Persist the cleanup interpretation before the internal ClusterLease can be
+/// released. A crash after this status write may retry the same mode; it may
+/// never switch reachable cleanup into receipt fallback or vice versa.
+async fn checkpoint_child_teardown_mode(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    mode: crate::crd::SandboxChildTeardownMode,
+) -> Result<Action, SandboxPlacementError> {
+    let mut next = lease.status.clone().unwrap_or_default();
+    if let Some(current) = next.child_teardown_mode {
+        if current != mode {
+            return quarantine_lease(lease, ctx, "child_teardown_mode_changed").await;
+        }
+        return Ok(Action::await_change());
+    }
+    next.child_teardown_mode = Some(mode);
+    if patch_lease_status_fenced(ctx, lease, &next).await? {
+        info!(lease = %lease.name_any(), mode = ?mode, "checkpointed child teardown mode");
+    } else {
+        debug!(lease = %lease.name_any(), "child teardown mode checkpoint lost a status race");
+    }
+    Ok(Action::await_change())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChildTargetAbsenceProof {
+    VerifiedDestroyReceipt,
+    NeverBound,
+}
+
+/// Retire execution authority before `FootprintAbsent` is allowed to become
+/// durable. Receipt-backed cleanup may mark an exact running record cancelled
+/// because the whole target is gone; NeverBound requires an empty manifest and
+/// rejects any contradictory bound record instead.
+async fn cleanup_child_executions_after_proof(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    proof: ChildTargetAbsenceProof,
+) -> Result<Option<Action>, SandboxPlacementError> {
+    if !ctx.access_ledger_enabled {
+        return Ok(None);
+    }
+    let outcome = match proof {
+        ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
+            crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
+                &ctx.client,
+                &ctx.namespace,
+                &ctx.reservation_namespace,
+                lease,
+                &ctx.shutdown,
+            )
+            .await
+        }
+        ChildTargetAbsenceProof::NeverBound => {
+            crate::api::sandbox_executions::prove_never_bound_execution_footprint_empty(
+                &ctx.client,
+                &ctx.namespace,
+                &ctx.reservation_namespace,
+                lease,
+                &ctx.shutdown,
+            )
+            .await
+        }
+    };
+    match outcome {
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => Ok(None),
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+            Ok(Some(Action::await_change()))
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+            Ok(Some(Action::requeue(std::time::Duration::from_secs(15))))
+        }
+        crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
+            quarantine_lease(lease, ctx, reason).await.map(Some)
+        }
+    }
+}
+
 /// Tear a child composition down, and complete only against its receipt.
 ///
 /// The internal `ClusterLease` was created with `CleanupMode::VerifiedDestroy`,
@@ -4799,6 +4982,8 @@ async fn release_child_composition(
                                 namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
                                 child_cluster_lease: None,
                                 child_cluster_instance: None,
+                                child_cluster_kubeconfig_secret: None,
+                                child_cluster_kubeconfig_sha256: None,
                                 sandbox_template: None,
                                 sandbox_warm_pool: None,
                                 sandbox_claim: None,
@@ -4853,6 +5038,8 @@ async fn release_child_composition(
                                 namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
                                 child_cluster_lease: None,
                                 child_cluster_instance: None,
+                                child_cluster_kubeconfig_secret: None,
+                                child_cluster_kubeconfig_sha256: None,
                                 sandbox_template: None,
                                 sandbox_warm_pool: None,
                                 sandbox_claim: None,
@@ -4935,6 +5122,15 @@ async fn release_child_composition(
                         )
                     }) =>
                 {
+                    if let Some(action) = cleanup_child_executions_after_proof(
+                        lease,
+                        ctx,
+                        ChildTargetAbsenceProof::VerifiedDestroyReceipt,
+                    )
+                    .await?
+                    {
+                        return Ok(action);
+                    }
                     info!(lease = %name, "child teardown receipt verified");
                     return finish_release(lease, ctx, reason).await;
                 }
@@ -4960,6 +5156,15 @@ async fn release_child_composition(
             // retains it until the outer FootprintAbsent checkpoint is ACKed.
             if child_status.binding.is_none() {
                 if unbound_child_release_is_proven(&current, recorded_instance) {
+                    if let Some(action) = cleanup_child_executions_after_proof(
+                        lease,
+                        ctx,
+                        ChildTargetAbsenceProof::NeverBound,
+                    )
+                    .await?
+                    {
+                        return Ok(action);
+                    }
                     info!(lease = %name, "child allocation absence verified as NeverBound");
                     return finish_release(lease, ctx, reason).await;
                 }
@@ -4976,6 +5181,11 @@ async fn release_child_composition(
                 }
                 request_child_release(&internal, &current).await?;
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+
+            if !crate::controllers::sandbox_child::internal_lease_has_secret_uid_protocol(&current)
+            {
+                return quarantine_lease(lease, ctx, "child_kubeconfig_protocol_missing").await;
             }
 
             let Some(recorded_pool) = recorded_pool else {
@@ -5063,87 +5273,140 @@ async fn release_child_composition(
                 return Ok(Action::await_change());
             }
 
-            // When the child API is still reachable, revoke every scoped
-            // identity before asking the internal lease to destroy the
-            // cluster. If it is unreachable, VerifiedDestroy remains the
-            // fail-closed fallback: only the exact backend receipt can prove
-            // that the inaccessible credentials disappeared with the cluster.
-            if !matches!(
+            let internal_release_started = matches!(
                 child_status.phase,
                 crate::crd::LeasePhase::Released
                     | crate::crd::LeasePhase::Expired
                     | crate::crd::LeasePhase::Recycling
-            ) && let Some(target) = status.target.as_ref()
-                && let Some(pod) = target.pod.as_ref()
-            {
-                let lease_uid = lease.uid().ok_or_else(|| {
-                    SandboxPlacementError::Invalid(format!(
-                        "SandboxLease {name} has no UID to clean child scoped identities"
-                    ))
-                })?;
+            );
+            if internal_release_started && status.child_teardown_mode.is_none() {
+                // An older process started destruction without durably proving
+                // which cleanup path it took. Do not reinterpret missing
+                // credentials as unreachability; only a later exact receipt can
+                // recover this quarantine through target-absence cleanup.
+                return quarantine_lease(lease, ctx, "child_teardown_mode_missing").await;
+            }
+
+            if status.child_teardown_mode.is_none() {
                 let Some(expected_instance) = recorded_instance else {
                     return quarantine_lease(lease, ctx, "child_credential_target_unverifiable")
                         .await;
                 };
-                let binding = &resolved.binding;
-                if binding.instance.name != expected_instance.name
-                    || binding.instance.uid != expected_instance.uid
-                    || target.namespace != CHILD_SANDBOX_NAMESPACE
-                    || pod.name.is_empty()
-                    || pod.uid.is_empty()
-                {
-                    return quarantine_lease(lease, ctx, "child_credential_target_unverifiable")
-                        .await;
-                }
-
-                let child_client = match crate::backend::read_kubeconfig_secret(
-                    &ctx.client,
-                    &expected_instance.name,
-                    &ctx.namespace,
-                )
-                .await
-                {
-                    Ok(kubeconfig) => crate::backend::virtual_client_from_kubeconfig(&kubeconfig)
-                        .await
-                        .ok(),
-                    Err(_) => None,
-                };
-                if let Some(child_client) = child_client {
-                    match crate::api::sandbox_credentials::cleanup_scoped_identities(
-                        &child_client,
-                        &target.namespace,
-                        &lease_uid,
-                        &pod.name,
-                        &pod.uid,
-                    )
-                    .await
+                let target = match status.target.as_ref() {
+                    Some(target)
+                        if target.namespace == CHILD_SANDBOX_NAMESPACE
+                            && resolved.binding.instance.name == expected_instance.name
+                            && resolved.binding.instance.uid == expected_instance.uid =>
                     {
-                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Clean => {}
-                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Retry => {
-                            return Ok(Action::requeue(std::time::Duration::from_secs(15)));
-                        }
-                        crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
-                            return quarantine_lease(
-                                lease,
-                                ctx,
-                                "child_credential_cleanup_unverifiable",
-                            )
-                            .await;
-                        }
+                        target
                     }
-                } else {
-                    warn!(lease = %name, "child API unavailable during credential cleanup; relying on exact destroy receipt");
+                    _ => {
+                        return quarantine_lease(
+                            lease,
+                            ctx,
+                            "child_credential_target_unverifiable",
+                        )
+                        .await;
+                    }
+                };
+                match recorded_child_access(lease, ctx, expected_instance).await {
+                    RecordedChildAccess::Reachable(child_client) => {
+                        // Durable runner groups are retired before scoped
+                        // credentials, and both are proven clean before the
+                        // internal ClusterLease may enter release.
+                        if ctx.access_ledger_enabled {
+                            match crate::api::sandbox_executions::cleanup_lease_executions(
+                                &ctx.client,
+                                &ctx.namespace,
+                                &ctx.reservation_namespace,
+                                lease,
+                                &child_client,
+                                &ctx.shutdown,
+                            )
+                            .await
+                            {
+                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
+                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+                                    return Ok(Action::await_change());
+                                }
+                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+                                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                                }
+                                crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(reason) => {
+                                    return quarantine_lease(lease, ctx, reason).await;
+                                }
+                            }
+                        }
+
+                        if let Some(pod) = target.pod.as_ref() {
+                            let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+                                return quarantine_lease(
+                                    lease,
+                                    ctx,
+                                    "child_credential_target_unverifiable",
+                                )
+                                .await;
+                            };
+                            if pod.name.is_empty() || pod.uid.is_empty() {
+                                return quarantine_lease(
+                                    lease,
+                                    ctx,
+                                    "child_credential_target_unverifiable",
+                                )
+                                .await;
+                            }
+                            match crate::api::sandbox_credentials::cleanup_scoped_identities(
+                                &child_client,
+                                &target.namespace,
+                                &lease_uid,
+                                &pod.name,
+                                &pod.uid,
+                            )
+                            .await
+                            {
+                                crate::api::sandbox_credentials::CredentialCleanupOutcome::Clean => {}
+                                crate::api::sandbox_credentials::CredentialCleanupOutcome::Retry => {
+                                    return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                                }
+                                crate::api::sandbox_credentials::CredentialCleanupOutcome::Quarantine => {
+                                    return quarantine_lease(
+                                        lease,
+                                        ctx,
+                                        "child_credential_cleanup_unverifiable",
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        return checkpoint_child_teardown_mode(
+                            lease,
+                            ctx,
+                            crate::crd::SandboxChildTeardownMode::ReachableCleanupV1,
+                        )
+                        .await;
+                    }
+                    RecordedChildAccess::TransportUnreachable => {
+                        return checkpoint_child_teardown_mode(
+                            lease,
+                            ctx,
+                            crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1,
+                        )
+                        .await;
+                    }
+                    RecordedChildAccess::Retry(reason) => {
+                        debug!(lease = %name, reason, "child access classification will retry");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+                    }
+                    RecordedChildAccess::Quarantine(reason) => {
+                        return quarantine_lease(lease, ctx, reason).await;
+                    }
                 }
             }
 
-            // No receipt yet. Ask for release if nobody has, then wait —
-            // destroying a cluster and proving it gone both take time.
-            if !matches!(
-                child_status.phase,
-                crate::crd::LeasePhase::Released
-                    | crate::crd::LeasePhase::Expired
-                    | crate::crd::LeasePhase::Recycling
-            ) {
+            // The exact cleanup interpretation is durable before this mutation.
+            // A reachable path has already retired executions/credentials; the
+            // fallback path can retire them only after the exact receipt.
+            if !internal_release_started {
                 request_child_release(&internal, &current).await?;
             }
             debug!(lease = %name, "waiting for the child teardown receipt");
@@ -5302,7 +5565,7 @@ async fn finish_child_release_after_proof(
         .target
         .as_ref()
         .and_then(|target| target.child_cluster_instance.as_ref());
-    let (ack_annotation, proof_path, proof_value) = if let Some(receipt) = current
+    let (ack_annotation, proof_path, proof_value, absence_proof) = if let Some(receipt) = current
         .status
         .as_ref()
         .and_then(|status| status.teardown_receipt.as_ref())
@@ -5315,6 +5578,7 @@ async fn finish_child_release_after_proof(
             crate::crd::TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
             "/status/teardownReceipt/attemptId",
             receipt.attempt_id.clone(),
+            ChildTargetAbsenceProof::VerifiedDestroyReceipt,
         )
     } else if unbound_child_release_is_proven(&current, recorded_instance) {
         (
@@ -5325,6 +5589,7 @@ async fn finish_child_release_after_proof(
                 .as_ref()
                 .and_then(|status| status.unbound_release_verified_at.clone())
                 .expect("verified NeverBound proof has a timestamp"),
+            ChildTargetAbsenceProof::NeverBound,
         )
     } else {
         return record_post_proof_cleanup_failure(
@@ -5336,6 +5601,61 @@ async fn finish_child_release_after_proof(
         )
         .await;
     };
+
+    // Older controllers could checkpoint FootprintAbsent before #82 execution
+    // retirement was integrated. Revalidate and finish that durable cleanup
+    // now, while the exact receipt/NeverBound handle is still retained and
+    // before ACK, handle deletion, reservation release, or terminal status.
+    if ctx.access_ledger_enabled {
+        let outcome = match absence_proof {
+            ChildTargetAbsenceProof::VerifiedDestroyReceipt => {
+                crate::api::sandbox_executions::cleanup_lease_executions_after_target_absence(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &ctx.reservation_namespace,
+                    lease,
+                    &ctx.shutdown,
+                )
+                .await
+            }
+            ChildTargetAbsenceProof::NeverBound => {
+                crate::api::sandbox_executions::prove_never_bound_execution_footprint_empty(
+                    &ctx.client,
+                    &ctx.namespace,
+                    &ctx.reservation_namespace,
+                    lease,
+                    &ctx.shutdown,
+                )
+                .await
+            }
+        };
+        match outcome {
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
+                return Ok(Action::await_change());
+            }
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry => {
+                return record_post_proof_cleanup_failure(
+                    lease,
+                    ctx,
+                    "ChildExecutionCleanupRetry",
+                    "Target absence is proven, but exact child execution retirement must be retried",
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
+            }
+            crate::api::sandbox_executions::ExecutionCleanupOutcome::Quarantine(_) => {
+                return record_post_proof_cleanup_failure(
+                    lease,
+                    ctx,
+                    "ChildExecutionCleanupInvalid",
+                    "Target absence is proven, but child execution provenance is contradictory",
+                    std::time::Duration::from_secs(300),
+                )
+                .await;
+            }
+        }
+    }
 
     let ack_is_exact = |handle: &crate::crd::ClusterLease| {
         handle
@@ -5946,6 +6266,89 @@ fn target_reference(
     })
 }
 
+struct ChildKubeconfigObservation {
+    reference: crate::crd::SandboxObjectReference,
+    payload_sha256: String,
+    kubeconfig_payload: Vec<u8>,
+}
+
+/// Observe the write-once identity and payload checkpoint for the management
+/// Secret that authenticates one exact child instance.
+///
+/// The k3s publisher intentionally creates this Secret without a GC owner, so
+/// composition uses a trust-on-first-use boundary before kubeconfig bytes are
+/// parsed or used: the first read only computes the checkpoint, then returns.
+/// Every later use re-GETs the same UID and payload digest. Existing child
+/// placements that already consumed an uncheckpointed Secret cannot be
+/// backfilled safely.
+fn child_kubeconfig_secret_observation(
+    secret: &Secret,
+    management_namespace: &str,
+    instance: &crate::crd::SandboxObjectReference,
+) -> Result<ChildKubeconfigObservation, SandboxPlacementError> {
+    use sha2::{Digest as _, Sha256};
+
+    let expected_name = crate::backend::kubeconfig_secret_name(&instance.name);
+    let uid = secret.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        SandboxPlacementError::Invalid(format!(
+            "child kubeconfig Secret {management_namespace}/{expected_name} has no UID"
+        ))
+    })?;
+    if instance.api_version != "kobe.kunobi.ninja/v1alpha1"
+        || instance.kind != "ClusterInstance"
+        || instance.namespace.as_deref() != Some(management_namespace)
+        || instance.uid.is_empty()
+        || secret.name_any() != expected_name
+        || secret.namespace().as_deref() != Some(management_namespace)
+        || secret
+            .metadata
+            .resource_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || secret.metadata.deletion_timestamp.is_some()
+        || !metadata_has_no_owner_references(&secret.metadata)
+    {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "child kubeconfig Secret {management_namespace}/{expected_name} has unsafe provenance"
+        )));
+    }
+    let kubeconfig_payload =
+        crate::backend::checkpointed_kubeconfig_payload(secret).map_err(|_| {
+            SandboxPlacementError::Invalid("child kubeconfig payload is ambiguous".into())
+        })?;
+    let payload_sha256 = format!("{:x}", Sha256::digest(&kubeconfig_payload));
+    Ok(ChildKubeconfigObservation {
+        reference: crate::crd::SandboxObjectReference {
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            namespace: Some(management_namespace.into()),
+            name: expected_name,
+            uid,
+            generation: None,
+        },
+        payload_sha256,
+        kubeconfig_payload,
+    })
+}
+
+/// Require that one GET response is still the exact checkpointed child
+/// credential before its bytes can be parsed or used.
+fn require_exact_child_kubeconfig_secret(
+    recorded: &crate::crd::SandboxObjectReference,
+    recorded_digest: &str,
+    observed: &ChildKubeconfigObservation,
+) -> Result<(), SandboxPlacementError> {
+    if recorded != &observed.reference || recorded_digest != observed.payload_sha256 {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "recorded child kubeconfig Secret provenance cannot change: expected {}/{} uid {}",
+            recorded.namespace.as_deref().unwrap_or_default(),
+            recorded.name,
+            recorded.uid
+        )));
+    }
+    Ok(())
+}
+
 /// Prove that a live object is still the exact identity previously recorded in
 /// lease status. A same-named replacement is not the original allocation.
 fn require_exact_reference(
@@ -6057,6 +6460,8 @@ async fn observed_management_pool_provenance(
             namespace: ctx.namespace.clone(),
             child_cluster_lease: None,
             child_cluster_instance: None,
+            child_cluster_kubeconfig_secret: None,
+            child_cluster_kubeconfig_sha256: None,
             sandbox_template: None,
             sandbox_warm_pool: None,
             sandbox_claim: None,
@@ -6145,6 +6550,12 @@ async fn observed_provenance(
         child_cluster_instance: existing
             .as_ref()
             .and_then(|existing| existing.child_cluster_instance.clone()),
+        child_cluster_kubeconfig_secret: existing
+            .as_ref()
+            .and_then(|existing| existing.child_cluster_kubeconfig_secret.clone()),
+        child_cluster_kubeconfig_sha256: existing
+            .as_ref()
+            .and_then(|existing| existing.child_cluster_kubeconfig_sha256.clone()),
         sandbox_template: existing
             .as_ref()
             .and_then(|existing| existing.sandbox_template.clone()),
@@ -6198,6 +6609,22 @@ enum ChildTarget {
 }
 
 const CHILD_LEASE_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
+
+fn child_namespace_matches_lease(namespace: &Namespace, lease_name: &str, lease_uid: &str) -> bool {
+    let labels = namespace.labels();
+    let annotations = namespace.annotations();
+    namespace.metadata.deletion_timestamp.is_none()
+        && labels
+            .get("app.kubernetes.io/managed-by")
+            .is_some_and(|value| value == crate::sandbox::KOBE_MANAGED_BY)
+        && labels
+            .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+            .is_some_and(|value| value == lease_uid)
+        && annotations
+            .get(CHILD_LEASE_NAME_ANNOTATION)
+            .is_some_and(|value| value == lease_name)
+        && namespace.uid().is_some_and(|uid| !uid.is_empty())
+}
 
 /// Create or adopt the fixed target namespace inside one exclusive child.
 ///
@@ -6255,20 +6682,7 @@ async fn ensure_child_namespace(
         Err(error) => return Err(error.into()),
     };
 
-    let labels = namespace.labels();
-    let annotations = namespace.annotations();
-    if namespace.metadata.deletion_timestamp.is_some()
-        || labels
-            .get("app.kubernetes.io/managed-by")
-            .is_none_or(|value| value != crate::sandbox::KOBE_MANAGED_BY)
-        || labels
-            .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
-            .is_none_or(|value| value != lease_uid)
-        || annotations
-            .get(CHILD_LEASE_NAME_ANNOTATION)
-            .is_none_or(|value| value != lease_name)
-        || namespace.uid().is_none_or(|uid| uid.is_empty())
-    {
+    if !child_namespace_matches_lease(&namespace, lease_name, lease_uid) {
         return Err(SandboxPlacementError::Invalid(format!(
             "namespace {CHILD_SANDBOX_NAMESPACE} is not owned by SandboxLease {lease_name} uid {lease_uid}"
         )));
@@ -6383,6 +6797,11 @@ async fn compose_child_target(
             )));
         }
     }
+    if !child::internal_lease_has_secret_uid_protocol(&internal_lease) {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "ClusterLease {internal_name} predates child kubeconfig UID provenance and cannot resume placement"
+        )));
+    }
     if !child::internal_lease_matches_composition(
         &internal_lease,
         lease,
@@ -6428,6 +6847,8 @@ async fn compose_child_target(
             namespace: CHILD_SANDBOX_NAMESPACE.to_string(),
             child_cluster_lease: None,
             child_cluster_instance: None,
+            child_cluster_kubeconfig_secret: None,
+            child_cluster_kubeconfig_sha256: None,
             sandbox_template: None,
             sandbox_warm_pool: None,
             sandbox_claim: None,
@@ -6536,23 +6957,95 @@ async fn compose_child_target(
         )));
     }
 
-    // The kubeconfig is read into memory and never leaves it: not into status,
-    // not into an API response, not into a log line. It is cluster-admin on a
-    // cluster the caller must not be able to reach.
-    let kubeconfig = crate::backend::read_kubeconfig_secret(
-        &ctx.client,
-        &binding.binding.instance.name,
-        &ctx.namespace,
-    )
-    .await
-    // The error is swallowed on purpose: a kubeconfig read failure can carry
-    // the secret's own contents in its context, and this value reaches status.
-    .map_err(|_| child::ChildPlacementError::ChildUnreachable {
-        cluster: binding.binding.instance.name.clone(),
+    // Checkpoint the exact management Secret UID and canonical payload digest
+    // before parsing it into a client or sending one authenticated request.
+    // The publisher creates an ownerless deterministic name, so an older child
+    // that already consumed an unrecorded Secret cannot later prove which UID
+    // and bytes authenticated that use. New composition records the boundary,
+    // returns, and re-GETs that same object on the next pass.
+    let recorded_instance = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_instance.as_ref())
+        .ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxLease {name} has no child instance provenance"
+            ))
+        })?;
+    let secret_name = crate::backend::kubeconfig_secret_name(&recorded_instance.name);
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let secret = match secrets.get(&secret_name).await {
+        Ok(secret) => secret,
+        Err(kube::Error::Api(error))
+            if error.code == 404
+                && status
+                    .target
+                    .as_ref()
+                    .and_then(|target| target.child_cluster_kubeconfig_secret.as_ref())
+                    .is_none() =>
+        {
+            debug!(lease = %name, "waiting for child kubeconfig Secret before provenance checkpoint");
+            return Ok(ChildTarget::Pending(Action::requeue(
+                std::time::Duration::from_secs(5),
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let observation =
+        child_kubeconfig_secret_observation(&secret, &ctx.namespace, recorded_instance)?;
+    let recorded_secret = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_kubeconfig_secret.as_ref());
+    let recorded_digest = status
+        .target
+        .as_ref()
+        .and_then(|target| target.child_cluster_kubeconfig_sha256.as_deref());
+    if recorded_secret.is_none() && recorded_digest.is_none() {
+        let placement = crate::sandbox::require_resolved_placement(&status, &ctx.namespace)
+            .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        let mut proposed = status.target.clone().ok_or_else(|| {
+            SandboxPlacementError::Invalid(format!(
+                "SandboxLease {name} has no child target provenance"
+            ))
+        })?;
+        proposed.child_cluster_kubeconfig_secret = Some(observation.reference.clone());
+        proposed.child_cluster_kubeconfig_sha256 = Some(observation.payload_sha256.clone());
+        let provenance = crate::sandbox::merge_target_provenance(
+            status.target.as_ref(),
+            proposed,
+            placement,
+            &ctx.namespace,
+        )
+        .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
+        let mut next = status;
+        next.target = Some(provenance);
+        if patch_lease_status_fenced(ctx, lease, &next).await? {
+            debug!(lease = %name, "checkpointed exact child kubeconfig Secret before use");
+        } else {
+            debug!(lease = %name, "child kubeconfig Secret checkpoint lost a status race");
+        }
+        return Ok(ChildTarget::Pending(Action::await_change()));
+    }
+    let (Some(recorded_secret), Some(recorded_digest)) = (recorded_secret, recorded_digest) else {
+        return Err(SandboxPlacementError::Invalid(format!(
+            "SandboxLease {name} has a partial child kubeconfig provenance checkpoint"
+        )));
+    };
+    require_exact_child_kubeconfig_secret(recorded_secret, recorded_digest, &observation)?;
+
+    // Kubeconfig bytes remain in memory and never enter status, API responses,
+    // error text, or logs. Client construction uses the same exact GET response
+    // whose UID and digest were checked above, avoiding a second name-based
+    // read race.
+    let kubeconfig = String::from_utf8(observation.kubeconfig_payload).map_err(|_| {
+        child::ChildPlacementError::ChildCredentialUnusable {
+            cluster: binding.binding.instance.name.clone(),
+        }
     })?;
     let child_client = crate::backend::virtual_client_from_kubeconfig(&kubeconfig)
         .await
-        .map_err(|_| child::ChildPlacementError::ChildUnreachable {
+        .map_err(|_| child::ChildPlacementError::ChildCredentialUnusable {
             cluster: binding.binding.instance.name.clone(),
         })?;
 
@@ -7315,6 +7808,8 @@ pub(crate) mod tests {
                     namespace: NS.into(),
                     child_cluster_lease: None,
                     child_cluster_instance: None,
+                    child_cluster_kubeconfig_secret: None,
+                    child_cluster_kubeconfig_sha256: None,
                     sandbox_template: Some(reference(
                         AGENT_SANDBOX_API_VERSION,
                         SANDBOX_TEMPLATE_KIND,
@@ -9784,6 +10279,7 @@ pub(crate) mod tests {
 
         let (mut ctx, server) = test_context().await;
         Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        mount_teardown_scaffolding(&server).await;
         let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Releasing);
         let lease_uid = lease.uid().unwrap();
         let gate = format!(
@@ -11975,6 +12471,15 @@ pub(crate) mod tests {
                 uid: "child-instance-uid".into(),
                 generation: Some(2),
             }),
+            child_cluster_kubeconfig_secret: Some(crate::crd::SandboxObjectReference {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: Some(NS.into()),
+                name: "kobe-abc123-kubeconfig".into(),
+                uid: "child-kubeconfig-secret-uid".into(),
+                generation: None,
+            }),
+            child_cluster_kubeconfig_sha256: Some("a".repeat(64)),
             sandbox_template: None,
             sandbox_warm_pool: None,
             sandbox_claim: None,
@@ -12042,6 +12547,8 @@ pub(crate) mod tests {
                     crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION: LEASE,
                     crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION:
                         (chrono::Utc::now() + chrono::Duration::days(8)).to_rfc3339(),
+                    crate::controllers::sandbox_child::CHILD_KUBECONFIG_PROVENANCE_ANNOTATION:
+                        crate::controllers::sandbox_child::CHILD_KUBECONFIG_PROVENANCE_SECRET_UID_SHA256_V1,
                 },
                 "finalizers": [
                     crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
@@ -12135,6 +12642,513 @@ pub(crate) mod tests {
                 }
             }
         })
+    }
+
+    fn child_test_kubeconfig(server: &MockServer) -> String {
+        format!(
+            r#"apiVersion: v1
+kind: Config
+clusters:
+- name: child
+  cluster:
+    server: {}
+users:
+- name: admin
+  user:
+    token: test-token
+contexts:
+- name: child
+  context:
+    cluster: child
+    user: admin
+current-context: child
+"#,
+            server.uri()
+        )
+    }
+
+    fn child_placed_lease_with_reachable_access(
+        cluster_lease_uid: &str,
+        server: &MockServer,
+    ) -> SandboxLease {
+        use sha2::{Digest as _, Sha256};
+
+        let mut lease = child_placed_lease(cluster_lease_uid);
+        lease
+            .status
+            .as_mut()
+            .and_then(|status| status.target.as_mut())
+            .expect("child target provenance")
+            .child_cluster_kubeconfig_sha256 = Some(format!(
+            "{:x}",
+            Sha256::digest(child_test_kubeconfig(server).as_bytes())
+        ));
+        lease
+    }
+
+    fn child_kubeconfig_secret_json(server: &MockServer, uid: &str) -> serde_json::Value {
+        use base64::Engine as _;
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "kobe-abc123-kubeconfig",
+                "namespace": NS,
+                "uid": uid,
+                "resourceVersion": "secret-rv-1",
+                "ownerReferences": [],
+            },
+            "data": {
+                "kubeconfig": base64::engine::general_purpose::STANDARD
+                    .encode(child_test_kubeconfig(server)),
+            }
+        })
+    }
+
+    /// Secret identity alone is insufficient: an in-place payload rewrite
+    /// would redirect every later cleanup request while retaining the UID.
+    /// Idempotent metadata/SSA churn is harmless when the canonical bytes are
+    /// unchanged, but alternate keys and content drift fail closed.
+    #[tokio::test]
+    async fn child_kubeconfig_checkpoint_fences_uid_and_exact_payload_not_resource_version() {
+        let server = MockServer::start().await;
+        let lease = child_placed_lease_with_reachable_access("child-lease-uid", &server);
+        let target = lease.status.as_ref().unwrap().target.as_ref().unwrap();
+        let instance = target.child_cluster_instance.as_ref().unwrap();
+        let recorded = target.child_cluster_kubeconfig_secret.as_ref().unwrap();
+        let digest = target.child_cluster_kubeconfig_sha256.as_deref().unwrap();
+
+        let exact: Secret = serde_json::from_value(child_kubeconfig_secret_json(
+            &server,
+            "child-kubeconfig-secret-uid",
+        ))
+        .unwrap();
+        let observed = child_kubeconfig_secret_observation(&exact, NS, instance).unwrap();
+        require_exact_child_kubeconfig_secret(recorded, digest, &observed).unwrap();
+
+        let mut newer_rv = exact.clone();
+        newer_rv.metadata.resource_version = Some("secret-rv-2".into());
+        let newer = child_kubeconfig_secret_observation(&newer_rv, NS, instance).unwrap();
+        require_exact_child_kubeconfig_secret(recorded, digest, &newer).unwrap();
+
+        let mut rewritten = exact.clone();
+        rewritten.data.as_mut().unwrap().insert(
+            "kubeconfig".into(),
+            k8s_openapi::ByteString(b"different credential".to_vec()),
+        );
+        let rewritten = child_kubeconfig_secret_observation(&rewritten, NS, instance).unwrap();
+        assert!(require_exact_child_kubeconfig_secret(recorded, digest, &rewritten).is_err());
+
+        let mut ambiguous = exact.clone();
+        ambiguous.data.as_mut().unwrap().insert(
+            "value".into(),
+            k8s_openapi::ByteString(b"alternate credential".to_vec()),
+        );
+        assert!(child_kubeconfig_secret_observation(&ambiguous, NS, instance).is_err());
+
+        let mut replaced = exact;
+        replaced.metadata.uid = Some("replacement-secret-uid".into());
+        let replaced = child_kubeconfig_secret_observation(&replaced, NS, instance).unwrap();
+        assert!(require_exact_child_kubeconfig_secret(recorded, digest, &replaced).is_err());
+    }
+
+    /// The first Secret observation may hash bytes for the checkpoint, but it
+    /// must return immediately after the fenced status write. No child API
+    /// request is authorised until a later reconcile re-reads the same UID and
+    /// payload digest from durable status.
+    #[tokio::test]
+    async fn child_composition_checkpoints_secret_uid_and_digest_before_first_child_request() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_kubeconfig_secret_json(
+                    &server,
+                    "child-kubeconfig-secret-uid",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let mut pool = management_pool(POOL_UID, POOL_GENERATION);
+        pool.spec.placement = serde_json::from_value(serde_json::json!({
+            "type": "childCluster",
+            "clusterPoolRef": "children"
+        }))
+        .unwrap();
+        let mut lease = child_placed_lease("child-lease-uid");
+        let target = lease.status.as_mut().unwrap().target.as_mut().unwrap();
+        target.child_cluster_kubeconfig_secret = None;
+        target.child_cluster_kubeconfig_sha256 = None;
+        let cluster_pool: crate::crd::ClusterPool =
+            serde_json::from_value(child_cluster_pool_json()).unwrap();
+        let lifetime = crate::controllers::sandbox_child::child_lifetime_fits(
+            &cluster_pool,
+            &pool,
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let mut internal = crate::controllers::sandbox_child::build_internal_cluster_lease(
+            &lease, "children", lifetime,
+        )
+        .unwrap();
+        internal.metadata.uid = Some("child-lease-uid".into());
+        internal.metadata.generation = Some(1);
+        internal.metadata.resource_version = Some("child-rv-1".into());
+        let bound: crate::crd::ClusterLease =
+            serde_json::from_value(child_cluster_lease("child-lease-uid", "Bound", None)).unwrap();
+        internal.status = bound.status;
+        internal.status.as_mut().unwrap().expires_at =
+            Some((chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339());
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(internal))
+            .mount(&server)
+            .await;
+
+        let outcome = compose_child_target(&lease, &pool, "children", &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ChildTarget::Pending(action) if action == Action::await_change()
+        ));
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let checkpoint = requests.iter().filter_map(status_value_of).next_back();
+        assert!(
+            checkpoint.is_some(),
+            "Secret provenance checkpoint missing; requests: {:?}",
+            requests
+                .iter()
+                .map(|request| format!("{} {}", request.method, request.url.path()))
+                .collect::<Vec<_>>()
+        );
+        let checkpoint = checkpoint.unwrap();
+        assert_eq!(
+            checkpoint["target"]["childClusterKubeconfigSecret"]["uid"],
+            "child-kubeconfig-secret-uid"
+        );
+        assert_eq!(
+            checkpoint["target"]["childClusterKubeconfigSha256"],
+            child_placed_lease_with_reachable_access("child-lease-uid", &server)
+                .status
+                .unwrap()
+                .target
+                .unwrap()
+                .child_cluster_kubeconfig_sha256
+                .unwrap()
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "GET",
+                &format!("/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}")
+            )
+            .await,
+            0,
+            "the checkpointing pass must not authenticate to the child"
+        );
+        assert!(requests.iter().all(|request| {
+            !request
+                .url
+                .path()
+                .starts_with("/apis/agent-sandbox.sigs.k8s.io/")
+        }));
+    }
+
+    async fn mount_reachable_child_access(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_kubeconfig_secret_json(
+                    server,
+                    "child-kubeconfig-secret-uid",
+                )),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": CHILD_SANDBOX_NAMESPACE,
+                    "uid": "child-namespace-uid",
+                    "resourceVersion": "namespace-rv-1",
+                    "labels": {
+                        "app.kubernetes.io/managed-by": crate::sandbox::KOBE_MANAGED_BY,
+                        crate::sandbox::SANDBOX_LEASE_UID_LABEL: "lease-uid-1",
+                    },
+                    "annotations": {
+                        CHILD_LEASE_NAME_ANNOTATION: LEASE,
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn attach_test_access_gate(lease: &mut SandboxLease) -> (String, String) {
+        use sha2::{Digest as _, Sha256};
+
+        let lease_uid = lease.uid().unwrap();
+        let gate = format!(
+            "kobe-access-g-{}",
+            &format!("{:x}", Sha256::digest(lease_uid.as_bytes()))[..40]
+        );
+        lease.metadata.annotations.as_mut().unwrap().insert(
+            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION.into(),
+            crate::sandbox_access_ledger::encode_gate_reference(
+                &crate::sandbox_access_ledger::AccessGateReference {
+                    name: gate.clone(),
+                    uid: "access-gate-uid".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let gate_path = format!("{RESERVATIONS_PATH}/{gate}");
+        (gate, gate_path)
+    }
+
+    async fn mount_closed_execution_gate(
+        server: &MockServer,
+        lease: &SandboxLease,
+        gate: &str,
+        gate_path: &str,
+        execution_manifest: &str,
+    ) {
+        let gate_object = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": gate,
+                "namespace": NS,
+                "uid": "access-gate-uid",
+                "resourceVersion": "gate-rv-1",
+                "labels": {
+                    "kobe.kunobi.ninja/sandbox-access-kind": "lease-gate",
+                    "kobe.kunobi.ninja/sandbox-lease-name": lease.name_any(),
+                    "kobe.kunobi.ninja/sandbox-access-lease-uid": lease.uid().unwrap(),
+                },
+                "annotations": {
+                    "kobe.kunobi.ninja/sandbox-access-state": "closed",
+                    "kobe.kunobi.ninja/sandbox-access-entries": "{}",
+                    "kobe.kunobi.ninja/sandbox-executions": execution_manifest,
+                },
+            },
+            "spec": {},
+        });
+        Mock::given(method("GET"))
+            .and(path(gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object.clone()))
+            .mount(server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_object))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1",
+                "kind":"SandboxExecutionList",
+                "metadata":{"resourceVersion":"1"},
+                "items":[]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Credential ambiguity is not child unreachability. Only a transport
+    /// failure from an exact, digest-checked Secret may select destroy-receipt
+    /// fallback; management reads, authentication and child 5xx remain
+    /// quarantine/retry classes.
+    #[tokio::test]
+    async fn child_access_classification_never_turns_credential_errors_into_destroy_fallback() {
+        for (code, quarantine) in [(404, true), (403, true), (500, false)] {
+            let (ctx, server) = test_context().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(code).set_body_json(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "code": code,
+                    })),
+                )
+                .mount(&server)
+                .await;
+            let lease = child_placed_lease("child-lease-uid");
+            let instance = lease
+                .status
+                .as_ref()
+                .unwrap()
+                .target
+                .as_ref()
+                .unwrap()
+                .child_cluster_instance
+                .as_ref()
+                .unwrap();
+            let result = recorded_child_access(&lease, &ctx, instance).await;
+            if quarantine {
+                assert!(
+                    matches!(result, RecordedChildAccess::Quarantine(_)),
+                    "HTTP {code}"
+                );
+            } else {
+                assert!(
+                    matches!(result, RecordedChildAccess::Retry(_)),
+                    "HTTP {code}"
+                );
+            }
+        }
+
+        let (ctx, server) = test_context().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_kubeconfig_secret_json(
+                    &server,
+                    "child-kubeconfig-secret-uid",
+                )),
+            )
+            .mount(&server)
+            .await;
+        let lease = child_placed_lease("child-lease-uid");
+        let instance = lease
+            .status
+            .as_ref()
+            .unwrap()
+            .target
+            .as_ref()
+            .unwrap()
+            .child_cluster_instance
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            recorded_child_access(&lease, &ctx, instance).await,
+            RecordedChildAccess::Quarantine(_)
+        ));
+        assert_eq!(
+            requests_to(
+                &server,
+                "GET",
+                &format!("/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}")
+            )
+            .await,
+            0,
+            "same UID with changed bytes must fail before authenticating"
+        );
+
+        for (code, quarantine) in [(403, true), (500, false)] {
+            let (ctx, server) = test_context().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    child_kubeconfig_secret_json(&server, "child-kubeconfig-secret-uid"),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/api/v1/namespaces/{CHILD_SANDBOX_NAMESPACE}"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(code).set_body_json(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "code": code,
+                    })),
+                )
+                .mount(&server)
+                .await;
+            let lease = child_placed_lease_with_reachable_access("child-lease-uid", &server);
+            let instance = lease
+                .status
+                .as_ref()
+                .unwrap()
+                .target
+                .as_ref()
+                .unwrap()
+                .child_cluster_instance
+                .as_ref()
+                .unwrap();
+            let result = recorded_child_access(&lease, &ctx, instance).await;
+            if quarantine {
+                assert!(
+                    matches!(result, RecordedChildAccess::Quarantine(_)),
+                    "HTTP {code}"
+                );
+            } else {
+                assert!(
+                    matches!(result, RecordedChildAccess::Retry(_)),
+                    "HTTP {code}"
+                );
+            }
+        }
+
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        let (ctx, server) = test_context().await;
+        let unreachable_kubeconfig =
+            child_test_kubeconfig(&server).replace(&server.uri(), "http://127.0.0.1:1");
+        let mut secret = child_kubeconfig_secret_json(&server, "child-kubeconfig-secret-uid");
+        secret["data"]["kubeconfig"] = base64::engine::general_purpose::STANDARD
+            .encode(&unreachable_kubeconfig)
+            .into();
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret))
+            .mount(&server)
+            .await;
+        let mut lease = child_placed_lease("child-lease-uid");
+        lease
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_kubeconfig_sha256 = Some(format!(
+            "{:x}",
+            Sha256::digest(unreachable_kubeconfig.as_bytes())
+        ));
+        let instance = lease
+            .status
+            .as_ref()
+            .unwrap()
+            .target
+            .as_ref()
+            .unwrap()
+            .child_cluster_instance
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            recorded_child_access(&lease, &ctx, instance).await,
+            RecordedChildAccess::TransportUnreachable
+        ));
     }
 
     /// Model an internal lease through proof ACK and foreground deletion.
@@ -12233,6 +13247,7 @@ pub(crate) mod tests {
     async fn a_child_lease_is_never_released_by_deleting_a_management_claim() {
         let (ctx, server) = test_context().await;
         mount_teardown_scaffolding(&server).await;
+        mount_reachable_child_access(&server).await;
         // The child cluster lease is still there: the tenant's cluster, and
         // their Sandbox inside it, are still running.
         Mock::given(method("GET"))
@@ -12248,8 +13263,12 @@ pub(crate) mod tests {
             .await;
         mount_child_release_patch(&server).await;
 
-        reconcile_release_after_checkpoint(child_placed_lease("child-lease-uid"), ctx, &server)
-            .await;
+        reconcile_release_after_checkpoint(
+            child_placed_lease_with_reachable_access("child-lease-uid", &server),
+            ctx,
+            &server,
+        )
+        .await;
 
         assert_eq!(
             requests_to(&server, "DELETE", CLAIM_PATH).await,
@@ -12273,7 +13292,339 @@ pub(crate) mod tests {
             "capacity must not return while the tenant's cluster is still up"
         );
         let phases = recorded_phases(&server).await;
-        assert_eq!(phases, vec!["Releasing".to_string()]);
+        assert!(
+            phases.iter().all(|phase| phase == "Releasing"),
+            "teardown must remain nonterminal until the child receipt exists: {phases:?}"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let statuses: Vec<serde_json::Value> =
+            requests.iter().filter_map(status_value_of).collect();
+        assert!(statuses.iter().any(|status| {
+            status["childTeardownMode"] == serde_json::json!("ReachableCleanupV1")
+        }));
+        let mode_checkpoint = requests
+            .iter()
+            .position(|request| {
+                status_value_of(request).is_some_and(|status| {
+                    status["childTeardownMode"] == serde_json::json!("ReachableCleanupV1")
+                })
+            })
+            .expect("reachable cleanup mode checkpoint");
+        let internal_release = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "PATCH"
+                    && request.url.path() == format!("{CLUSTER_LEASE_PATH}/status")
+            })
+            .expect("internal release request");
+        assert!(
+            mode_checkpoint < internal_release,
+            "the cleanup interpretation must be durable before cluster destruction starts"
+        );
+    }
+
+    /// A restart consumes the write-once cleanup interpretation instead of
+    /// reclassifying credentials. Both modes may request release only after
+    /// their status checkpoint is visible, and neither re-reads the Secret on
+    /// that destructive pass.
+    #[tokio::test]
+    async fn restart_uses_durable_child_teardown_mode_before_cluster_release() {
+        for mode in [
+            crate::crd::SandboxChildTeardownMode::ReachableCleanupV1,
+            crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1,
+        ] {
+            let (ctx, server) = test_context().await;
+            mount_teardown_scaffolding(&server).await;
+            Mock::given(method("GET"))
+                .and(path(CLUSTER_LEASE_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                        "child-lease-uid",
+                        "Bound",
+                        None,
+                    )),
+                )
+                .mount(&server)
+                .await;
+            mount_child_release_patch(&server).await;
+
+            let mut lease = child_placed_lease("child-lease-uid");
+            let status = lease.status.as_mut().unwrap();
+            status.phase = crate::crd::SandboxLeasePhase::Releasing;
+            status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+            status.child_teardown_mode = Some(mode);
+
+            assert_eq!(
+                reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+                Action::requeue(std::time::Duration::from_secs(30))
+            );
+            assert_eq!(
+                requests_to(
+                    &server,
+                    "GET",
+                    "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig"
+                )
+                .await,
+                0,
+                "a durable mode is not reinterpreted after restart"
+            );
+            assert_eq!(
+                requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+                1
+            );
+        }
+    }
+
+    /// Reachable-child teardown retires the execution manifest one durable
+    /// mutation per pass. It cannot clean scoped credentials, checkpoint a
+    /// mode, or release the cluster in the same pass as that ledger mutation.
+    #[tokio::test]
+    async fn reachable_child_execution_checkpoint_precedes_credentials_and_cluster_release() {
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        mount_teardown_scaffolding(&server).await;
+        mount_reachable_child_access(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Bound",
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease_with_reachable_access("child-lease-uid", &server);
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status.target.as_mut().unwrap().pod = Some(crate::crd::SandboxObjectReference {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            namespace: Some(CHILD_SANDBOX_NAMESPACE.into()),
+            name: "sandbox-pod".into(),
+            uid: "sandbox-pod-uid".into(),
+            generation: None,
+        });
+        let (gate, gate_path) = attach_test_access_gate(&mut lease);
+        let manifest = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "sandbox-pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "creationState": "rejected",
+                "active": false
+            }
+        })
+        .to_string();
+        mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.iter().all(|request| {
+            let path = request.url.path();
+            !path.contains("/serviceaccounts/")
+                && !path.contains("/roles/")
+                && !path.contains("/rolebindings/")
+        }));
+        assert!(
+            requests
+                .iter()
+                .filter_map(status_value_of)
+                .all(|status| { status.get("childTeardownMode").is_none() })
+        );
+    }
+
+    /// Transport-only fallback does the inverse ordering: it durably selects
+    /// receipt mode without touching a running execution record. Only the
+    /// later exact destroy receipt can authorise runner-free retirement.
+    #[tokio::test]
+    async fn unreachable_child_keeps_execution_manifest_until_destroy_receipt() {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        mount_teardown_scaffolding(&server).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Bound",
+                    None,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let unreachable_kubeconfig =
+            child_test_kubeconfig(&server).replace(&server.uri(), "http://127.0.0.1:1");
+        let mut secret = child_kubeconfig_secret_json(&server, "child-kubeconfig-secret-uid");
+        secret["data"]["kubeconfig"] = base64::engine::general_purpose::STANDARD
+            .encode(&unreachable_kubeconfig)
+            .into();
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_kubeconfig_sha256 = Some(format!(
+            "{:x}",
+            Sha256::digest(unreachable_kubeconfig.as_bytes())
+        ));
+        let (gate, gate_path) = attach_test_access_gate(&mut lease);
+        let manifest = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "executionUid": "execution-uid",
+                "creationState": "bound",
+                "active": true
+            }
+        })
+        .to_string();
+        mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "GET",
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxexecutions"
+            )
+            .await,
+            0
+        );
+        assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 0);
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0
+        );
+        let status = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .next_back()
+            .expect("fallback mode checkpoint");
+        assert_eq!(status["childTeardownMode"], "VerifiedDestroyFallbackV1");
+    }
+
+    /// Destruction started by a pre-protocol process carries no durable proof
+    /// of whether child cleanup ran. Missing credentials must not be
+    /// reinterpreted as transport unreachability on restart.
+    #[tokio::test]
+    async fn in_flight_child_destroy_without_a_mode_quarantines_on_restart() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut child = child_cluster_lease("child-lease-uid", "Recycling", None);
+        child["status"]["clusterName"] = "kobe-abc123".into();
+        child["status"]["binding"] = serde_json::to_value(child_binding()).unwrap();
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(child))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "GET",
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0
+        );
+    }
+
+    /// A legacy bound handle may be ownerRef-migrated, but it cannot be given a
+    /// from-birth credential marker after the fact. Without that marker Kobe
+    /// cannot prove which Secret bytes authenticated earlier child requests.
+    #[tokio::test]
+    async fn active_legacy_child_without_from_birth_credential_protocol_quarantines() {
+        let (ctx, server) = test_context().await;
+        mount_teardown_scaffolding(&server).await;
+        let mut child = child_cluster_lease("child-lease-uid", "Bound", None);
+        child["metadata"]["annotations"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::controllers::sandbox_child::CHILD_KUBECONFIG_PROVENANCE_ANNOTATION);
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(child))
+            .mount(&server)
+            .await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+        assert_eq!(
+            requests_to(
+                &server,
+                "GET",
+                "/api/v1/namespaces/test-ns/secrets/kobe-abc123-kubeconfig"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            requests_to(&server, "PATCH", &format!("{CLUSTER_LEASE_PATH}/status")).await,
+            0
+        );
     }
 
     /// Teardown acts on the recorded UID, not the recorded name — and a name
@@ -12862,6 +14213,146 @@ pub(crate) mod tests {
             requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await,
             1,
             "the receipt handle is removed only after its proof is durable"
+        );
+    }
+
+    /// Receipt-backed fallback still retires the durable execution inventory
+    /// before `FootprintAbsent`, ACK, child-handle deletion, or quota release.
+    /// The receipt permits runner-free cancellation; it does not permit the
+    /// ledger record to be skipped.
+    #[tokio::test]
+    async fn child_destroy_receipt_checkpoints_execution_cleanup_before_footprint_absence() {
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        mount_teardown_scaffolding(&server).await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        status.child_teardown_mode =
+            Some(crate::crd::SandboxChildTeardownMode::VerifiedDestroyFallbackV1);
+        let (gate, gate_path) = attach_test_access_gate(&mut lease);
+        let manifest = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "creationState": "rejected",
+                "active": false
+            }
+        })
+        .to_string();
+        mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_lease(
+                    "child-lease-uid",
+                    "Released",
+                    Some(verified_receipt("kobe-abc123", "child-instance-uid")),
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert!(statuses.iter().all(|status| {
+            status["conditions"].as_array().is_none_or(|conditions| {
+                conditions
+                    .iter()
+                    .all(|condition| condition["type"] != FOOTPRINT_ABSENT_CONDITION)
+            })
+        }));
+        assert_eq!(requests_to(&server, "PATCH", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
+        );
+    }
+
+    /// NeverBound is a proof of no allocation, not authority to rewrite a
+    /// contradictory execution ledger. One non-empty manifest quarantines and
+    /// leaves both the proof handle and quota intact.
+    #[tokio::test]
+    async fn never_bound_child_with_execution_manifest_quarantines_before_ack_or_release() {
+        let (mut ctx, server) = test_context().await;
+        Arc::get_mut(&mut ctx).unwrap().access_ledger_enabled = true;
+        mount_teardown_scaffolding(&server).await;
+
+        let mut lease = child_placed_lease("child-lease-uid");
+        let status = lease.status.as_mut().unwrap();
+        status.phase = crate::crd::SandboxLeasePhase::Releasing;
+        status.release_cause = Some(crate::crd::SandboxReleaseCause::Requested);
+        let target = status.target.as_mut().unwrap();
+        target.child_cluster_instance = None;
+        target.child_cluster_kubeconfig_secret = None;
+        target.child_cluster_kubeconfig_sha256 = None;
+        let (gate, gate_path) = attach_test_access_gate(&mut lease);
+        let manifest = serde_json::json!({
+            "execution-a": {
+                "requestDigest": "d".repeat(64),
+                "podUid": "pod-uid",
+                "reservedAt": "2026-08-20T00:00:00Z",
+                "creationState": "creating",
+                "active": true
+            }
+        })
+        .to_string();
+        mount_closed_execution_gate(&server, &lease, &gate, &gate_path, &manifest).await;
+
+        let proof = "2026-08-20T00:00:00Z";
+        let mut never_bound = child_cluster_lease("child-lease-uid", "Released", None);
+        never_bound["status"]["unboundReleaseVerifiedAt"] = proof.into();
+        never_bound["status"]["conditions"] = serde_json::json!([{
+            "type": "AllocationAbsent",
+            "status": "True",
+            "reason": "NeverBound",
+            "message": "no allocation was ever bound",
+            "lastTransitionTime": proof,
+        }]);
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_LEASE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(never_bound))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            recorded_phases(&server).await.last().map(String::as_str),
+            Some("Quarantined")
+        );
+        assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 0);
+        assert_eq!(requests_to(&server, "PATCH", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(requests_to(&server, "DELETE", CLUSTER_LEASE_PATH).await, 0);
+        assert_eq!(
+            requests_to(
+                &server,
+                "DELETE",
+                &format!("{RESERVATIONS_PATH}/{}", reservation_name())
+            )
+            .await,
+            0
         );
     }
 

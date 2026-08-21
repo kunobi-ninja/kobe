@@ -2894,16 +2894,30 @@ async fn create_sandbox_lease<B: ClusterBackend>(
     // snapshots across cancellation branches. Keep that large future off the
     // request task's stack; repeated endpoint calls must not grow a Tokio test
     // or server worker frame enough to overflow it.
-    Box::pin(create_sandbox_lease_until(
+    create_sandbox_lease_until(state, identity, request, active_admission_deadline).await
+}
+
+/// Run the admission state machine from a heap-backed future.
+///
+/// The state machine retains exact Kubernetes snapshots across every
+/// cancellation branch. Boxing at the constructor boundary keeps those
+/// snapshots off both Axum worker stacks and the default-sized Tokio test
+/// thread stack, including callers that exercise the deadline helper directly.
+fn create_sandbox_lease_until<B: ClusterBackend>(
+    state: AppState<B>,
+    identity: AuthIdentity,
+    request: CreateSandboxLeaseRequest,
+    active_admission_deadline: tokio::time::Instant,
+) -> impl std::future::Future<Output = Response> {
+    Box::pin(create_sandbox_lease_until_inner(
         state,
         identity,
         request,
         active_admission_deadline,
     ))
-    .await
 }
 
-async fn create_sandbox_lease_until<B: ClusterBackend>(
+async fn create_sandbox_lease_until_inner<B: ClusterBackend>(
     state: AppState<B>,
     identity: AuthIdentity,
     request: CreateSandboxLeaseRequest,
@@ -4147,6 +4161,8 @@ fn caller_visible_provenance(target: SandboxTargetProvenance) -> SandboxTargetPr
     SandboxTargetProvenance {
         child_cluster_lease: None,
         child_cluster_instance: None,
+        child_cluster_kubeconfig_secret: None,
+        child_cluster_kubeconfig_sha256: None,
         ..target
     }
 }
@@ -11527,6 +11543,15 @@ mod tests {
             namespace: "kobe".into(),
             child_cluster_lease: Some(reference("ClusterLease", "kobe-sbx-sbx-1")),
             child_cluster_instance: Some(reference("ClusterInstance", "kobe-abc123")),
+            child_cluster_kubeconfig_secret: Some(crate::crd::SandboxObjectReference {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: Some("kobe".into()),
+                name: "kobe-abc123-kubeconfig".into(),
+                uid: "kubeconfig-secret-uid".into(),
+                generation: None,
+            }),
+            child_cluster_kubeconfig_sha256: Some("a".repeat(64)),
             sandbox_template: Some(reference("SandboxTemplate", "kobe-agents")),
             sandbox_warm_pool: Some(reference("SandboxWarmPool", "kobe-agents")),
             sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1")),
@@ -11538,6 +11563,8 @@ mod tests {
         let visible = caller_visible_provenance(target.clone());
         assert!(visible.child_cluster_lease.is_none());
         assert!(visible.child_cluster_instance.is_none());
+        assert!(visible.child_cluster_kubeconfig_secret.is_none());
+        assert!(visible.child_cluster_kubeconfig_sha256.is_none());
 
         // Nothing else is stripped: the Sandbox-side objects are the caller's
         // own, and #81 resolves targets against exactly these.
@@ -11553,8 +11580,12 @@ mod tests {
         for secret in [
             "kobe-sbx-sbx-1",
             "kobe-abc123",
+            &"a".repeat(64),
             "ClusterLease",
             "ClusterInstance",
+            "kobe-abc123-kubeconfig",
+            "kubeconfig-secret-uid",
+            "Secret",
         ] {
             assert!(!json.contains(secret), "{secret} leaked into {json}");
         }

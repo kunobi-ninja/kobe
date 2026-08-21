@@ -739,6 +739,7 @@ pub fn merge_target_provenance(
     let Some(existing) = existing else {
         return Ok(proposed);
     };
+    validate_target_provenance(existing, placement, management_namespace)?;
     if existing.namespace != proposed.namespace {
         return Err(SandboxProvenanceError::NamespaceChanged);
     }
@@ -754,6 +755,16 @@ pub fn merge_target_provenance(
             "childClusterInstance",
             &existing.child_cluster_instance,
             proposed.child_cluster_instance,
+        )?,
+        child_cluster_kubeconfig_secret: merge_reference(
+            "childClusterKubeconfigSecret",
+            &existing.child_cluster_kubeconfig_secret,
+            proposed.child_cluster_kubeconfig_secret,
+        )?,
+        child_cluster_kubeconfig_sha256: merge_string(
+            "childClusterKubeconfigSha256",
+            &existing.child_cluster_kubeconfig_sha256,
+            proposed.child_cluster_kubeconfig_sha256,
         )?,
         sandbox_template: merge_reference(
             "sandboxTemplate",
@@ -808,7 +819,9 @@ fn validate_target_provenance(
     match placement {
         ResolvedSandboxPlacement::Management {}
             if provenance.child_cluster_lease.is_some()
-                || provenance.child_cluster_instance.is_some() =>
+                || provenance.child_cluster_instance.is_some()
+                || provenance.child_cluster_kubeconfig_secret.is_some()
+                || provenance.child_cluster_kubeconfig_sha256.is_some() =>
         {
             return Err(SandboxProvenanceError::UnexpectedChildReference);
         }
@@ -840,6 +853,14 @@ fn validate_target_provenance(
             "ClusterInstance",
             Some(management_namespace),
             true,
+        ),
+        (
+            "childClusterKubeconfigSecret",
+            &provenance.child_cluster_kubeconfig_secret,
+            CORE_API_VERSION,
+            "Secret",
+            Some(management_namespace),
+            false,
         ),
         (
             "sandboxTemplate",
@@ -901,6 +922,45 @@ fn validate_target_provenance(
             )?;
         }
     }
+    match (
+        provenance.child_cluster_kubeconfig_secret.as_ref(),
+        provenance.child_cluster_kubeconfig_sha256.as_deref(),
+    ) {
+        (Some(secret), Some(digest)) => {
+            let Some(instance) = provenance.child_cluster_instance.as_ref() else {
+                return Err(SandboxProvenanceError::InvalidReference {
+                    field: "childClusterKubeconfigSecret",
+                    reason: "credential Secret requires a recorded child instance",
+                });
+            };
+            if secret.name != format!("{}-kubeconfig", instance.name)
+                || secret.namespace != instance.namespace
+                || secret.generation.is_some()
+            {
+                return Err(SandboxProvenanceError::InvalidReference {
+                    field: "childClusterKubeconfigSecret",
+                    reason: "credential Secret does not match the recorded child instance",
+                });
+            }
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(SandboxProvenanceError::InvalidReference {
+                    field: "childClusterKubeconfigSha256",
+                    reason: "credential payload digest is not lowercase SHA-256",
+                });
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(SandboxProvenanceError::InvalidReference {
+                field: "childClusterKubeconfigSecret",
+                reason: "credential Secret identity and payload digest must be recorded together",
+            });
+        }
+    }
     Ok(())
 }
 
@@ -958,6 +1018,19 @@ fn merge_reference(
     existing: &Option<SandboxObjectReference>,
     proposed: Option<SandboxObjectReference>,
 ) -> Result<Option<SandboxObjectReference>, SandboxProvenanceError> {
+    match (existing, proposed) {
+        (None, proposed) => Ok(proposed),
+        (Some(_), None) => Err(SandboxProvenanceError::ReferenceCleared(field)),
+        (Some(current), Some(proposed)) if current == &proposed => Ok(Some(current.clone())),
+        (Some(_), Some(_)) => Err(SandboxProvenanceError::ReferenceChanged(field)),
+    }
+}
+
+fn merge_string(
+    field: &'static str,
+    existing: &Option<String>,
+    proposed: Option<String>,
+) -> Result<Option<String>, SandboxProvenanceError> {
     match (existing, proposed) {
         (None, proposed) => Ok(proposed),
         (Some(_), None) => Err(SandboxProvenanceError::ReferenceCleared(field)),
@@ -1364,6 +1437,8 @@ mod tests {
             namespace: "targets".into(),
             child_cluster_lease: None,
             child_cluster_instance: None,
+            child_cluster_kubeconfig_secret: None,
+            child_cluster_kubeconfig_sha256: None,
             sandbox_template: Some(reference("SandboxTemplate", "agents", "template-uid")),
             sandbox_warm_pool: None,
             sandbox_claim: claim,
@@ -1748,6 +1823,77 @@ mod tests {
             merge_target_provenance(None, wrong_gvk, &placement, "kobe"),
             Err(SandboxProvenanceError::InvalidReference {
                 field: "sandboxClaim",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn child_kubeconfig_uid_and_payload_digest_are_one_monotonic_checkpoint() {
+        let placement = ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: cluster_pool_reference("kobe"),
+        };
+        let instance = SandboxObjectReference {
+            api_version: KOBE_API_VERSION.into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some("kobe".into()),
+            name: "kobe-child".into(),
+            uid: "instance-uid".into(),
+            generation: Some(1),
+        };
+        let mut target = SandboxTargetProvenance {
+            namespace: CHILD_SANDBOX_NAMESPACE.into(),
+            child_cluster_lease: None,
+            child_cluster_instance: Some(instance),
+            child_cluster_kubeconfig_secret: Some(SandboxObjectReference {
+                api_version: CORE_API_VERSION.into(),
+                kind: "Secret".into(),
+                namespace: Some("kobe".into()),
+                name: "kobe-child-kubeconfig".into(),
+                uid: "secret-uid".into(),
+                generation: None,
+            }),
+            child_cluster_kubeconfig_sha256: Some("a".repeat(64)),
+            sandbox_template: None,
+            sandbox_warm_pool: None,
+            sandbox_claim: None,
+            sandbox: None,
+            pod: None,
+            service: None,
+        };
+        assert_eq!(
+            merge_target_provenance(Some(&target), target.clone(), &placement, "kobe"),
+            Ok(target.clone())
+        );
+
+        let mut changed = target.clone();
+        changed.child_cluster_kubeconfig_sha256 = Some("b".repeat(64));
+        assert_eq!(
+            merge_target_provenance(Some(&target), changed, &placement, "kobe"),
+            Err(SandboxProvenanceError::ReferenceChanged(
+                "childClusterKubeconfigSha256"
+            ))
+        );
+
+        let mut noncanonical = target.clone();
+        noncanonical
+            .child_cluster_kubeconfig_secret
+            .as_mut()
+            .unwrap()
+            .generation = Some(1);
+        assert!(matches!(
+            merge_target_provenance(None, noncanonical, &placement, "kobe"),
+            Err(SandboxProvenanceError::InvalidReference {
+                field: "childClusterKubeconfigSecret",
+                ..
+            })
+        ));
+
+        target.child_cluster_kubeconfig_sha256 = None;
+        assert!(matches!(
+            merge_target_provenance(None, target, &placement, "kobe"),
+            Err(SandboxProvenanceError::InvalidReference {
+                field: "childClusterKubeconfigSecret",
                 ..
             })
         ));

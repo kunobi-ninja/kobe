@@ -45,6 +45,7 @@ struct SandboxControllerStartup {
 }
 
 impl SandboxControllerStartup {
+    #[cfg(test)]
     const fn placement_enabled(self) -> bool {
         self.runtime_mode.enabled()
     }

@@ -780,20 +780,37 @@ pub trait ClusterBackend: Send + Sync {
 // backends. Each backend delegates to these rather than duplicating the logic.
 // ---------------------------------------------------------------------------
 
-/// Read the `{name}-kubeconfig` Secret from the host cluster.
-pub async fn read_kubeconfig_secret(
-    client: &Client,
-    name: &str,
-    namespace: &str,
-) -> Result<String> {
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret_name = format!("{name}-kubeconfig");
+/// Deterministic management-cluster Secret published for one instance.
+pub fn kubeconfig_secret_name(name: &str) -> String {
+    format!("{name}-kubeconfig")
+}
 
-    let secret = secrets
-        .get(&secret_name)
-        .await
-        .with_context(|| format!("Kubeconfig secret {secret_name} not found"))?;
+/// Extract the one canonical kubeconfig payload used by Sandbox composition.
+///
+/// The durable provenance digest commits to both this key contract and its
+/// bytes. Alternative or additional data keys are rejected so a later reader
+/// cannot select a different credential interpretation from the same Secret.
+pub fn checkpointed_kubeconfig_payload(secret: &Secret) -> Result<Vec<u8>> {
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Kubeconfig secret has no data"))?;
+    if data.len() != 1 || !data.contains_key("kubeconfig") {
+        anyhow::bail!("Kubeconfig secret must contain only the 'kubeconfig' key");
+    }
+    let kubeconfig_bytes = data
+        .get("kubeconfig")
+        .expect("the exact key was checked above");
+    Ok(kubeconfig_bytes.0.clone())
+}
 
+/// Extract kubeconfig bytes from an already identity-checked Secret.
+///
+/// Teardown callers first compare the Secret's exact UID against durable
+/// provenance and then pass that same GET response here. Keeping extraction
+/// separate from lookup prevents a second, unfenced GET from substituting a
+/// same-named credential between identity validation and use.
+pub fn kubeconfig_from_secret(secret: &Secret) -> Result<String> {
     let data = secret
         .data
         .as_ref()
@@ -804,8 +821,24 @@ pub async fn read_kubeconfig_secret(
         .or_else(|| data.get("value"))
         .ok_or_else(|| anyhow::anyhow!("Kubeconfig secret has no 'kubeconfig' or 'value' key"))?;
 
-    let kubeconfig =
-        String::from_utf8(kubeconfig_bytes.0.clone()).context("Kubeconfig is not valid UTF-8")?;
+    String::from_utf8(kubeconfig_bytes.0.clone()).context("Kubeconfig is not valid UTF-8")
+}
+
+/// Read the `{name}-kubeconfig` Secret from the host cluster.
+pub async fn read_kubeconfig_secret(
+    client: &Client,
+    name: &str,
+    namespace: &str,
+) -> Result<String> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret_name = kubeconfig_secret_name(name);
+
+    let secret = secrets
+        .get(&secret_name)
+        .await
+        .with_context(|| format!("Kubeconfig secret {secret_name} not found"))?;
+
+    let kubeconfig = kubeconfig_from_secret(&secret)?;
 
     debug!(
         cluster = name,

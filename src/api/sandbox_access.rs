@@ -960,6 +960,8 @@ mod tests {
             namespace: "kobe".into(),
             child_cluster_lease: None,
             child_cluster_instance: None,
+            child_cluster_kubeconfig_secret: None,
+            child_cluster_kubeconfig_sha256: None,
             sandbox_template: None,
             sandbox_warm_pool: None,
             sandbox_claim: Some(reference("SandboxClaim", "kobe-sbx-1", "claim-uid")),

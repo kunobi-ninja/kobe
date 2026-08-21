@@ -56,6 +56,9 @@ pub const CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION: &str =
 pub const CHILD_HANDLE_OUTER_NAME_ANNOTATION: &str = "kobe.kunobi.ninja/sandbox-lease-name";
 pub const CHILD_HANDLE_STALE_REJECTED_ANNOTATION: &str =
     "kobe.kunobi.ninja/stale-sandbox-composition-rejected";
+pub const CHILD_KUBECONFIG_PROVENANCE_ANNOTATION: &str =
+    "kobe.kunobi.ninja/child-kubeconfig-provenance";
+pub const CHILD_KUBECONFIG_PROVENANCE_SECRET_UID_SHA256_V1: &str = "secret-uid-sha256-v1";
 
 /// Retain the handle at least as long as the outer audit record, plus the
 /// bounded create window and scheduling margin used by the release fence.
@@ -110,8 +113,8 @@ pub enum ChildPlacementError {
          ClusterPool installation to provide it."
     )]
     ChildRuntimeUnusable { cluster: String, reason: String },
-    #[error("child cluster {cluster} is not reachable")]
-    ChildUnreachable { cluster: String },
+    #[error("child cluster {cluster} has an unusable checkpointed kubeconfig Secret")]
+    ChildCredentialUnusable { cluster: String },
 }
 
 impl ChildPlacementError {
@@ -123,7 +126,7 @@ impl ChildPlacementError {
             Self::LifetimeUnachievable { .. } => "lifetime_unachievable",
             Self::InvalidDuration { .. } => "invalid_duration",
             Self::ChildRuntimeUnusable { .. } => "child_runtime_unusable",
-            Self::ChildUnreachable { .. } => "child_unreachable",
+            Self::ChildCredentialUnusable { .. } => "child_credential_unusable",
         }
     }
 }
@@ -287,6 +290,10 @@ pub fn build_internal_cluster_lease(
                         CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.to_string(),
                         child_handle_retention_deadline(chrono::Utc::now()).to_rfc3339(),
                     ),
+                    (
+                        CHILD_KUBECONFIG_PROVENANCE_ANNOTATION.to_string(),
+                        CHILD_KUBECONFIG_PROVENANCE_SECRET_UID_SHA256_V1.to_string(),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
@@ -391,6 +398,17 @@ pub fn internal_lease_is_for_sandbox(
     internal_lease_ownership(internal, sandbox_lease) == InternalLeaseOwnership::Ownerless
 }
 
+/// Whether this handle was created under the checkpoint-before-first-use
+/// kubeconfig protocol. The marker is written on CREATE; adding it to an older
+/// already-bound handle would manufacture provenance for credentials that may
+/// already have been consumed.
+pub fn internal_lease_has_secret_uid_protocol(internal: &ClusterLease) -> bool {
+    internal
+        .annotations()
+        .get(CHILD_KUBECONFIG_PROVENANCE_ANNOTATION)
+        .is_some_and(|value| value == CHILD_KUBECONFIG_PROVENANCE_SECRET_UID_SHA256_V1)
+}
+
 /// Whether a legacy-owner migration is permitted without changing the
 /// immutable composition request.
 pub(crate) fn internal_lease_matches_composition_identity(
@@ -478,6 +496,8 @@ pub fn child_provenance(
             uid: instance_uid.to_string(),
             generation: instance_generation,
         }),
+        child_cluster_kubeconfig_secret: None,
+        child_cluster_kubeconfig_sha256: None,
         // Upstream object references are filled in by placement once each
         // object exists. Provenance is monotonic: a reference is only ever
         // added, never cleared, so teardown can always name what it must prove
@@ -697,6 +717,10 @@ mod tests {
         // Verified destroy is requested explicitly. A pool that cannot honour
         // it rejects at bind time instead of quietly downgrading.
         assert_eq!(lease.spec.cleanup_mode, Some(CleanupMode::VerifiedDestroy));
+        assert!(
+            internal_lease_has_secret_uid_protocol(&lease),
+            "the from-birth marker is the proof that no child request preceded the Secret UID+digest checkpoint"
+        );
 
         // The requester is Kobe. Attributing it to the tenant would surface the
         // internal cluster in their listings and read as theirs to release.

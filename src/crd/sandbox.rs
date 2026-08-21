@@ -465,6 +465,18 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status FootprintAbsent proof is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != 'FootprintAbsent' || (c.status == 'True' && has(self.status.releaseCause) && self.status.phase in ['Releasing', 'Released', 'Expired']))")
         .message("FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSecret) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret) && self.status.target.childClusterKubeconfigSecret == oldSelf.status.target.childClusterKubeconfigSecret)")
+        .message("status.target.childClusterKubeconfigSecret is immutable once recorded"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSha256) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSha256) && self.status.target.childClusterKubeconfigSha256 == oldSelf.status.target.childClusterKubeconfigSha256)")
+        .message("status.target.childClusterKubeconfigSha256 is immutable once recorded"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))")
+        .message("child kubeconfig Secret identity and payload digest must be checkpointed together"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == 'v1' && self.status.target.childClusterKubeconfigSecret.kind == 'Secret' && has(self.status.target.childClusterKubeconfigSecret.namespace) && has(self.status.target.childClusterInstance.namespace) && self.status.target.childClusterKubeconfigSecret.namespace == self.status.target.childClusterInstance.namespace && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + '-kubeconfig' && self.status.target.childClusterKubeconfigSha256.matches('^[0-9a-f]{64}$'))")
+        .message("childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownMode) || (has(self.status) && self.status != null && has(self.status.childTeardownMode) && self.status.childTeardownMode == oldSelf.status.childTeardownMode)")
+        .message("status.childTeardownMode is immutable once recorded"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.childTeardownMode) || (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret))")
+        .message("childTeardownMode requires exact child placement and kubeconfig Secret provenance"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -591,6 +603,14 @@ pub struct SandboxLeaseStatus {
     /// it may checkpoint footprint absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocation_fence: Option<SandboxObjectReference>,
+    /// Restart-safe decision made before requesting destruction of a bound
+    /// child cluster. `ReachableCleanupV1` means exact runner records and
+    /// scoped credentials were proven clean through the checkpointed child
+    /// kubeconfig Secret; `VerifiedDestroyFallbackV1` means an authenticated
+    /// child probe failed only at the transport layer, so the exact backend
+    /// receipt must linearize target absence before records can be retired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_teardown_mode: Option<SandboxChildTeardownMode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
         extend("x-kubernetes-list-type" = "map"),
@@ -612,6 +632,20 @@ pub enum SandboxClaimCleanupFence {
     /// or an exact non-deleting legacy Claim was atomically migrated to that
     /// ownerless/finalized shape before this checkpoint was written.
     FinalizerV1,
+}
+
+/// Durable ordering proof selected before a bound child `ClusterLease` is
+/// released. The value is write-once: a restart must never reinterpret the
+/// same in-flight destroy as a successful reachable cleanup.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum SandboxChildTeardownMode {
+    /// The exact child API was reachable and every durable execution plus
+    /// scoped credential was proven clean before cluster destruction began.
+    ReachableCleanupV1,
+    /// Only a Hyper/Service transport failure made the exact child API
+    /// unreachable; execution records may be retired only after the exact
+    /// verified-destroy receipt proves their target cluster absent.
+    VerifiedDestroyFallbackV1,
 }
 
 /// Stable public phases. `Released` and `Expired` are clean terminal states;
@@ -723,6 +757,20 @@ pub struct SandboxTargetProvenance {
     pub child_cluster_lease: Option<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_cluster_instance: Option<SandboxObjectReference>,
+    /// Exact management-cluster Secret whose bytes authenticate the child
+    /// client. The Secret is checkpointed before its contents are first used,
+    /// then re-read by UID and payload digest on every later pass. Only
+    /// non-secret identity is persisted; kubeconfig bytes never enter status,
+    /// logs, or API responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_cluster_kubeconfig_secret: Option<SandboxObjectReference>,
+    /// SHA-256 of the exact, sole `data.kubeconfig` payload read from
+    /// [`Self::child_cluster_kubeconfig_secret`]. It is checkpointed in the
+    /// same status write as the Secret UID and never changes. ResourceVersion
+    /// may move on an idempotent publisher apply; payload identity may not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 64, max = 64), pattern("^[0-9a-f]{64}$"))]
+    pub child_cluster_kubeconfig_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_template: Option<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1121,6 +1169,41 @@ mod tests {
                     .iter()
                     .any(|validation| validation["rule"] == rule),
                 "missing root validation: {rule}"
+            );
+        }
+    }
+
+    /// Child authentication and teardown interpretation are restart authority,
+    /// so the CRD rejects partial, changed, or non-canonical checkpoints even
+    /// if a buggy status writer attempts them.
+    #[test]
+    fn child_kubeconfig_and_teardown_mode_schema_are_exact_and_write_once() {
+        let lease = serde_json::to_value(SandboxLease::crd()).unwrap();
+        let root_schema = &lease["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let status = &root_schema["properties"]["status"]["properties"];
+        assert_eq!(
+            status["childTeardownMode"]["enum"],
+            serde_json::json!(["ReachableCleanupV1", "VerifiedDestroyFallbackV1"])
+        );
+        let digest = &status["target"]["properties"]["childClusterKubeconfigSha256"];
+        assert_eq!(digest["minLength"], 64);
+        assert_eq!(digest["maxLength"], 64);
+        assert_eq!(digest["pattern"], "^[0-9a-f]{64}$");
+
+        let validations = root_schema["x-kubernetes-validations"].as_array().unwrap();
+        for message in [
+            "status.target.childClusterKubeconfigSecret is immutable once recorded",
+            "status.target.childClusterKubeconfigSha256 is immutable once recorded",
+            "child kubeconfig Secret identity and payload digest must be checkpointed together",
+            "childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance",
+            "status.childTeardownMode is immutable once recorded",
+            "childTeardownMode requires exact child placement and kubeconfig Secret provenance",
+        ] {
+            assert!(
+                validations
+                    .iter()
+                    .any(|validation| validation["message"] == message),
+                "missing root validation: {message}"
             );
         }
     }
