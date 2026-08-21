@@ -361,6 +361,58 @@ impl LeasedSandbox {
         }
     }
 
+    /// Wait for a clean terminal checkpoint exposed through the caller API.
+    ///
+    /// A terminal phase alone is not teardown evidence. `FootprintAbsent` is
+    /// the placement-specific proof (exact descendant scans for management, a
+    /// consumed destroy receipt for child placement), while `CleanupVerified`
+    /// proves execution records and admission reservations were retired before
+    /// capacity moved.
+    async fn wait_terminal_cleanup(
+        &self,
+        expected_phase: &str,
+        expected_cause: &str,
+        within: Duration,
+    ) -> anyhow::Result<Value> {
+        let deadline = Instant::now() + within;
+        loop {
+            let (status, body) = self.status().await?;
+            anyhow::ensure!(
+                status.is_success(),
+                "could not read terminal status: {body}"
+            );
+            match body["phase"].as_str() {
+                Some(phase) if phase == expected_phase => {
+                    anyhow::ensure!(
+                        body["release_cause"] == expected_cause,
+                        "{expected_phase} recorded the wrong release cause: {body}"
+                    );
+                    for required in ["FootprintAbsent", "CleanupVerified"] {
+                        let proven = body["conditions"].as_array().is_some_and(|conditions| {
+                            conditions.iter().any(|condition| {
+                                condition["type"] == required && condition["status"] == "True"
+                            })
+                        });
+                        anyhow::ensure!(
+                            proven,
+                            "{expected_phase} was exposed without {required}=True: {body}"
+                        );
+                    }
+                    return Ok(body);
+                }
+                Some(terminal @ ("Released" | "Expired" | "Quarantined")) => {
+                    anyhow::bail!("expected {expected_phase}, reached {terminal} instead: {body}");
+                }
+                _ => {}
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "sandbox did not reach verified {expected_phase} cleanup within {within:?}: {body}"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     async fn exec(&self, argv: &[&str], key: &str) -> anyhow::Result<(reqwest::StatusCode, Value)> {
         self.api
             .json(
@@ -372,6 +424,115 @@ impl LeasedSandbox {
                 })),
             )
             .await
+    }
+
+    /// Start one supervised process and prove its retained output is readable.
+    ///
+    /// Returning only after the marker appears makes teardown tests
+    /// non-vacuous: they release or expire a lease that definitely owns a live
+    /// execution record and process group.
+    async fn start_detached(
+        &self,
+        key: &str,
+        marker: &str,
+        timeout: &str,
+    ) -> anyhow::Result<String> {
+        let script = format!("echo {marker}; while :; do sleep 1; done");
+        let (status, created) = self
+            .api
+            .json(
+                reqwest::Method::POST,
+                &format!("/v1/sandbox-leases/{}/executions", self.id),
+                Some(serde_json::json!({
+                    "command": ["/bin/sh", "-c", script],
+                    "idempotencyKey": key,
+                    "detach": true,
+                    "timeout": timeout,
+                })),
+            )
+            .await?;
+        anyhow::ensure!(
+            status == reqwest::StatusCode::ACCEPTED,
+            "detached execution was not accepted: HTTP {status} {created}"
+        );
+        let execution = created["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("detached execution returned no id: {created}"))?
+            .to_string();
+        let execution_path = format!("/v1/sandbox-leases/{}/executions/{execution}", self.id);
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (status, logs) = self
+                .api
+                .json(
+                    reqwest::Method::GET,
+                    &format!("{execution_path}/logs?stdoutOffset=0&stderrOffset=0"),
+                    None,
+                )
+                .await?;
+            anyhow::ensure!(
+                status.is_success(),
+                "could not read detached logs: HTTP {status} {logs}"
+            );
+            if logs["stdout"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(marker)
+            {
+                anyhow::ensure!(
+                    logs["state"] == "Running"
+                        && logs["stdout"]["nextOffset"].as_u64().unwrap_or_default() > 0,
+                    "the marked detached execution was not durably running: {logs}"
+                );
+                return Ok(execution);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "detached output never contained {marker:?}: {logs}"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Prove an attached shell has started before its lease is ended.
+    async fn wait_for_file(&self, marker: &str, key: &str) -> anyhow::Result<()> {
+        let script = format!("while [ ! -f /tmp/{marker} ]; do sleep 1; done");
+        let (status, observed) = self.exec(&["/bin/sh", "-c", &script], key).await?;
+        anyhow::ensure!(
+            status.is_success() && observed["state"] == "Succeeded" && observed["exitCode"] == 0,
+            "the attached stream never published its readiness marker: HTTP {status} {observed}"
+        );
+        Ok(())
+    }
+
+    /// Retry one idempotent request until the ended lease rejects it.
+    ///
+    /// A request that wins the release race can create at most one record: all
+    /// retries use the same key and command. Once the shared access gate closes,
+    /// the exact caller-visible status must replace that successful response.
+    async fn wait_execution_denied(
+        &self,
+        key: &str,
+        expected: &[reqwest::StatusCode],
+        within: Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + within;
+        loop {
+            let (status, body) = self.exec(&["/bin/sh", "-c", "exit 0"], key).await?;
+            if expected.contains(&status) {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                status.is_success(),
+                "ended lease rejected access with HTTP {status}, expected one of {expected:?}: {body}"
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "lease still accepted execution after its authority ended: {body}"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     async fn release(&mut self) -> anyhow::Result<()> {
@@ -601,63 +762,13 @@ both_placements!(
         let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
         sandbox.wait_ready(Duration::from_secs(300)).await?;
 
-        let (status, created) = sandbox
-            .api
-            .json(
-                reqwest::Method::POST,
-                &format!("/v1/sandbox-leases/{}/executions", sandbox.id),
-                Some(serde_json::json!({
-                    "command": [
-                        "/bin/sh",
-                        "-c",
-                        "echo detached-started; while :; do echo tick; sleep 1; done",
-                    ],
-                    "idempotencyKey": "conformance-detached-cancel",
-                    "detach": true,
-                    "timeout": "5m",
-                })),
-            )
-            .await?;
-        anyhow::ensure!(
-            status == reqwest::StatusCode::ACCEPTED,
-            "detached execution was not accepted: HTTP {status} {created}"
-        );
-        let execution = created["id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("detached execution returned no id: {created}"))?;
-        let execution_path = format!("/v1/sandbox-leases/{}/executions/{execution}", sandbox.id);
-
         // Output is addressed independently of the create response. Polling
-        // from offset zero must recover the bytes produced before this client
+        // from offset zero must recover bytes produced before this client
         // attached, which is the reconnect contract detached mode exists for.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let (status, logs) = sandbox
-                .api
-                .json(
-                    reqwest::Method::GET,
-                    &format!("{execution_path}/logs?stdoutOffset=0&stderrOffset=0"),
-                    None,
-                )
-                .await?;
-            anyhow::ensure!(status.is_success(), "could not read logs: {logs}");
-            if logs["stdout"]["data"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("detached-started")
-            {
-                anyhow::ensure!(
-                    logs["stdout"]["nextOffset"].as_u64().unwrap_or_default() > 0,
-                    "a non-empty log window did not advance its offset: {logs}"
-                );
-                break;
-            }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "detached output never became readable"
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        let execution = sandbox
+            .start_detached("conformance-detached-cancel", "detached-started", "5m")
+            .await?;
+        let execution_path = format!("/v1/sandbox-leases/{}/executions/{execution}", sandbox.id);
 
         let (status, cancelled) = sandbox
             .api
@@ -737,30 +848,136 @@ both_placements!(
 both_placements!(release_rejects_further_access, |placement| async move {
     let mut sandbox = LeasedSandbox::create(placement, "10m").await?;
     sandbox.wait_ready(Duration::from_secs(300)).await?;
-    sandbox.release().await?;
 
-    // A released lease serves nothing, however recently it was working. The
-    // cached-context case is the one that matters: a caller who was mid-session
-    // must not be able to keep going.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (status, body) = sandbox
-            .exec(
-                &["/bin/sh", "-c", "echo after-release"],
-                "conformance-after",
-            )
+    // Give teardown a live supervised process and durable record to retire.
+    // Without one, CleanupVerified could pass while the execution path was
+    // never exercised.
+    let execution_marker = format!("release-execution-{}", nonce(placement));
+    let _execution = sandbox
+        .start_detached("conformance-release-execution", &execution_marker, "5m")
+        .await?;
+
+    // Keep a real upgraded stream open across the release. Its readiness file
+    // proves the stream was established before DELETE; exit 125 plus the
+    // bounded `revoked` reason proves cached authority did not survive it.
+    let stream_marker = format!("release-stream-{}", nonce(placement));
+    let attach_script = format!("echo {stream_marker}; touch /tmp/{stream_marker}; sleep 300");
+    let lease = sandbox.id.clone();
+    let argv = [
+        "attach-pty",
+        "--lease",
+        &lease,
+        "--expect",
+        &stream_marker,
+        "--expect-exit",
+        "125",
+        "--timeout",
+        "180",
+        "--",
+        "/bin/sh",
+        "-c",
+        &attach_script,
+    ];
+    let revoke = async {
+        sandbox
+            .wait_for_file(&stream_marker, "conformance-release-stream-ready")
             .await?;
-        if !status.is_success() {
-            break;
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "a released sandbox still served an execution: {body}"
-        );
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+        sandbox.release().await?;
+        sandbox
+            .wait_execution_denied(
+                "conformance-after-release",
+                &[reqwest::StatusCode::CONFLICT],
+                Duration::from_secs(60),
+            )
+            .await
+    };
+    let (attached, revoked) = tokio::join!(harness(&argv), revoke);
+    revoked?;
+    let transcript = attached?;
+    anyhow::ensure!(
+        transcript.contains("session ended: revoked"),
+        "the released upgraded stream did not report revocation: {transcript}"
+    );
+
+    sandbox
+        .wait_terminal_cleanup("Released", "Requested", Duration::from_secs(900))
+        .await?;
     Ok(())
 });
+
+both_placements!(
+    natural_expiry_rejects_further_access,
+    |placement| async move {
+        let mut sandbox = LeasedSandbox::create(placement, "90s").await?;
+        let ready = sandbox.wait_ready(Duration::from_secs(300)).await?;
+        let expires_at = chrono::DateTime::parse_from_rfc3339(
+            ready["expires_at"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Ready lease returned no expires_at: {ready}"))?,
+        )?
+        .with_timezone(&chrono::Utc);
+
+        let execution_marker = format!("expiry-execution-{}", nonce(placement));
+        let _execution = sandbox
+            .start_detached("conformance-expiry-execution", &execution_marker, "5m")
+            .await?;
+
+        let stream_marker = format!("expiry-stream-{}", nonce(placement));
+        let attach_script = format!("echo {stream_marker}; touch /tmp/{stream_marker}; sleep 300");
+        let lease = sandbox.id.clone();
+        let argv = [
+            "attach-pty",
+            "--lease",
+            &lease,
+            "--expect",
+            &stream_marker,
+            "--expect-exit",
+            "125",
+            "--timeout",
+            "180",
+            "--",
+            "/bin/sh",
+            "-c",
+            &attach_script,
+        ];
+        let expire = async {
+            sandbox
+                .wait_for_file(&stream_marker, "conformance-expiry-stream-ready")
+                .await?;
+            let remaining = (expires_at - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            tokio::time::sleep(remaining + Duration::from_secs(1)).await;
+            sandbox
+                .wait_execution_denied(
+                    "conformance-after-expiry",
+                    &[
+                        // Ready + elapsed timestamp is 410. If the lifecycle
+                        // controller checkpointed Releasing first, it is 409.
+                        // Both are ended authority; the terminal cause below
+                        // distinguishes natural expiry from caller release.
+                        reqwest::StatusCode::GONE,
+                        reqwest::StatusCode::CONFLICT,
+                    ],
+                    Duration::from_secs(60),
+                )
+                .await
+        };
+        let (attached, expired) = tokio::join!(harness(&argv), expire);
+        expired?;
+        let transcript = attached?;
+        anyhow::ensure!(
+            transcript.contains("session ended: revoked"),
+            "the expired upgraded stream did not report revocation: {transcript}"
+        );
+
+        sandbox
+            .wait_terminal_cleanup("Expired", "RuntimeTtl", Duration::from_secs(900))
+            .await?;
+        sandbox.released = true;
+        Ok(())
+    }
+);
 
 both_placements!(
     a_caller_never_receives_target_credentials,
