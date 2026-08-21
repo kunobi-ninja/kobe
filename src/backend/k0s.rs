@@ -1162,7 +1162,6 @@ impl ClusterBackend for K0sBackend {
         // 2. If PostgreSQL configured, create per-cluster database. Read the
         // current connection each time so a rotated credential is picked up.
         let datastore_endpoint = if let Some((pool, base_url)) = self.datastore.current() {
-            datastore::create_database(&pool, name, DB_PREFIX).await?;
             // The endpoint below is written into the k0s config ConfigMap and
             // is therefore readable by anything that can read the guest's
             // config. It must carry a per-cluster credential, never the shared
@@ -1176,7 +1175,7 @@ impl ClusterBackend for K0sBackend {
                 None,
             )
             .await?;
-            datastore::ensure_cluster_role(&pool, name, DB_PREFIX, &password).await?;
+            datastore::provision_cluster_datastore(&pool, name, DB_PREFIX, &password).await?;
             let endpoint =
                 datastore::cluster_endpoint_as_role(&base_url, name, DB_PREFIX, &password)?;
             Some(endpoint)

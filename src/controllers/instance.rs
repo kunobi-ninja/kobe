@@ -2344,7 +2344,7 @@ async fn verified_teardown_gate<B: ClusterBackend + Clone>(
     .await;
     let mut checks = match resolve_verified_backend(ctx, instance).await {
         Some(backend) => match backend
-            .delete_verified_manifest(name, namespace, manifest)
+            .delete_verified_manifest(name, namespace, manifest, &pending.attempt_id)
             .await
         {
             Ok(checks) => checks,

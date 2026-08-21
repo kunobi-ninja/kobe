@@ -2299,7 +2299,7 @@ impl K3sBackend {
         subject: TeardownSubject,
         bound_volumes: &std::result::Result<Vec<String>, String>,
         delete_outcome: &Result<()>,
-        manifest: Option<&TeardownCreationManifest>,
+        manifest_attempt: Option<(&TeardownCreationManifest, &str)>,
     ) -> TeardownCheck {
         // A failed delete means the footprint was never fully addressed, so no
         // subject can be claimed absent on the strength of this attempt.
@@ -2312,6 +2312,10 @@ impl K3sBackend {
                 verified: Vec::new(),
             };
         }
+
+        let (manifest, attempt_id) = manifest_attempt
+            .map(|(manifest, attempt_id)| (Some(manifest), Some(attempt_id)))
+            .unwrap_or((None, None));
 
         // Recorded alongside the verdict so the receipt says WHICH resources
         // were inspected, not merely that some resource of this category was.
@@ -2434,12 +2438,20 @@ impl K3sBackend {
                     // deletion too. A hot-reload to another PostgreSQL server
                     // where the same name is absent is not proof that the
                     // original database was destroyed.
+                    let Some(attempt_id) = attempt_id else {
+                        return TeardownCheck {
+                            subject,
+                            result: CheckResult::Unknown,
+                            reason: Some("teardown_attempt_missing".into()),
+                            verified: Vec::new(),
+                        };
+                    };
                     match self
-                        .validate_manifest_datastore(name, manifest, false)
+                        .verify_manifest_datastore_absence(name, manifest, attempt_id)
                         .await
                     {
-                        Ok(Some((_, false, _))) => (CheckResult::Verified, None),
-                        Ok(Some((_, true, _))) => {
+                        Ok(Some(observed)) if observed.database => (CheckResult::Verified, None),
+                        Ok(Some(_)) => {
                             (CheckResult::Unknown, Some("database_still_present".into()))
                         }
                         Ok(None) => (
@@ -2471,14 +2483,20 @@ impl K3sBackend {
             }
             TeardownSubject::DatabaseRole => {
                 if let Some(manifest) = manifest {
+                    let Some(attempt_id) = attempt_id else {
+                        return TeardownCheck {
+                            subject,
+                            result: CheckResult::Unknown,
+                            reason: Some("teardown_attempt_missing".into()),
+                            verified: Vec::new(),
+                        };
+                    };
                     match self
-                        .validate_manifest_datastore(name, manifest, false)
+                        .verify_manifest_datastore_absence(name, manifest, attempt_id)
                         .await
                     {
-                        Ok(Some((_, _, false))) => (CheckResult::Verified, None),
-                        Ok(Some((_, _, true))) => {
-                            (CheckResult::Unknown, Some("role_still_present".into()))
-                        }
+                        Ok(Some(observed)) if observed.role => (CheckResult::Verified, None),
+                        Ok(Some(_)) => (CheckResult::Unknown, Some("role_still_present".into())),
                         Ok(None) => (
                             CheckResult::Unknown,
                             Some("datastore_provenance_invalid".into()),
@@ -3159,6 +3177,53 @@ impl K3sBackend {
         )))
     }
 
+    /// Re-observe external PostgreSQL absence against the immutable manifest
+    /// and durable teardown attempt. Unlike placement validation this searches
+    /// by expected OID, original name, and attempt tombstone while holding the
+    /// lifecycle advisory lock, so a post-rename crash cannot masquerade as
+    /// completed deletion.
+    async fn verify_manifest_datastore_absence(
+        &self,
+        name: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> Result<Option<datastore::VerifiedPostgresAbsence>> {
+        let DatastoreProvenance::ExternalPostgres {
+            endpoint_digest,
+            system_identifier,
+            database,
+            database_oid,
+            role,
+            role_oid,
+        } = &manifest.datastore
+        else {
+            return Ok(None);
+        };
+        let expected = datastore::sanitize_db_name(name, "k3s_")?;
+        if database != &expected || role != &expected {
+            anyhow::bail!("datastore name does not match the instance identity");
+        }
+        let Some((pool, base_url)) = self.datastore.current() else {
+            anyhow::bail!("datastore connection is unavailable");
+        };
+        if datastore::endpoint_identity_digest(&base_url)? != *endpoint_digest {
+            anyhow::bail!("datastore endpoint identity changed");
+        }
+        datastore::verify_cluster_datastore_absence(
+            &pool,
+            datastore::VerifiedPostgresIdentity {
+                system_identifier,
+                database,
+                database_oid,
+                role,
+                role_oid,
+            },
+            attempt_id,
+        )
+        .await
+        .map(Some)
+    }
+
     /// At placement time every recorded replica-derived object must still be
     /// present, and no extra matching object may have appeared. Teardown retry
     /// validation deliberately allows a shrinking subset, so this stricter
@@ -3435,7 +3500,6 @@ impl ClusterBackend for K3sBackend {
         // PVCs) is torn down and a fresh-named one created. We never mutate the
         // replica count of a live StatefulSet in place.
         let datastore_endpoint = if let Some((pool, base_url)) = self.datastore.current() {
-            datastore::create_database(&pool, name, "k3s_").await?;
             // The endpoint below is readable by the tenant: it lands on the k3s
             // server command line, and the server node is schedulable and
             // untainted by default. So it must carry a per-cluster credential,
@@ -3449,7 +3513,7 @@ impl ClusterBackend for K3sBackend {
                 owner_ref,
             )
             .await?;
-            datastore::ensure_cluster_role(&pool, name, "k3s_", &password).await?;
+            datastore::provision_cluster_datastore(&pool, name, "k3s_", &password).await?;
             let endpoint = datastore::cluster_endpoint_as_role(&base_url, name, "k3s_", &password)?;
             Some(endpoint)
         } else {
@@ -4261,6 +4325,7 @@ impl ClusterBackend for K3sBackend {
         name: &str,
         namespace: &str,
         manifest: &TeardownCreationManifest,
+        attempt_id: &str,
     ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
         if manifest.validate().is_err()
             || manifest.instance.name != name
@@ -4355,7 +4420,7 @@ impl ClusterBackend for K3sBackend {
                         subject,
                         &bound_volumes,
                         &delete_outcome,
-                        Some(manifest),
+                        Some((manifest, attempt_id)),
                     )
                     .await;
                 if check.result != CheckResult::Verified {
@@ -4382,7 +4447,7 @@ impl ClusterBackend for K3sBackend {
                     subject,
                     &bound_volumes,
                     &delete_outcome,
-                    Some(manifest),
+                    Some((manifest, attempt_id)),
                 )
                 .await,
             );
@@ -5642,7 +5707,7 @@ mod tests {
                 TeardownSubject::Database,
                 &Ok(Vec::new()),
                 &Ok(()),
-                Some(&manifest),
+                Some((&manifest, "attempt-1")),
             )
             .await;
         assert_eq!(check.result, CheckResult::Unknown);

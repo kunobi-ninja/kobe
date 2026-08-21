@@ -393,13 +393,29 @@ impl ClusterBackend for BackendDispatch {
         name: &str,
         namespace: &str,
         manifest: &TeardownCreationManifest,
+        attempt_id: &str,
     ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
         match self {
-            Self::K3s(b) => b.delete_verified_manifest(name, namespace, manifest).await,
-            Self::K0s(b) => b.delete_verified_manifest(name, namespace, manifest).await,
-            Self::Capi(b) => b.delete_verified_manifest(name, namespace, manifest).await,
-            Self::Vkobe(b) => b.delete_verified_manifest(name, namespace, manifest).await,
-            Self::Vcluster(b) => b.delete_verified_manifest(name, namespace, manifest).await,
+            Self::K3s(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
         }
     }
 
@@ -784,16 +800,20 @@ pub trait ClusterBackend: Send + Sync {
     }
 
     /// Verified teardown against the immutable concrete creation manifest.
-    /// Backends must not derive scope from teardown-time observations.
+    /// Backends must not derive scope from teardown-time observations. The
+    /// `attempt_id` was persisted before the first destructive side effect and
+    /// must remain unchanged across retries; backends use it for deterministic
+    /// crash-safe tombstones and attempt-bound external evidence.
     #[allow(dead_code)]
     fn delete_verified_manifest(
         &self,
         name: &str,
         namespace: &str,
         manifest: &TeardownCreationManifest,
+        attempt_id: &str,
     ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
     {
-        let _ = (name, namespace, manifest);
+        let _ = (name, namespace, manifest, attempt_id);
         async { Err(VerifiedDestroyUnsupported) }
     }
 
