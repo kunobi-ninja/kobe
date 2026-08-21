@@ -30,8 +30,8 @@ use thiserror::Error;
         .message("exact certification references are immutable within one fingerprint"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == 'certified' || (oldSelf.status.certification.phase in ['initialized', 'cleanupBlocked'] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))")
         .message("an active certification fingerprint cannot be abandoned before exact cleanup"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == 'childCluster' && self.status.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.status.placementAuthority.kind == 'ClusterPool' && self.status.placementAuthority.namespace == self.metadata.namespace && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)")
-        .message("placementAuthority must identify the exact same-namespace child ClusterPool"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == 'childCluster' && self.status.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.status.placementAuthority.kind == 'ClusterPool' && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)")
+        .message("placementAuthority must identify the exact child ClusterPool"),
     validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == 'childCluster' && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'False' && c.reason == 'CompositionEligible' && has(c.observedGeneration) && c.observedGeneration == self.metadata.generation)))")
         .message("placementAuthority is published only with current-generation CompositionEligible status"),
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.ready"}"#,
@@ -497,8 +497,8 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("a child teardown receipt acknowledgement requires FootprintAbsent=True in the same checkpoint"),
     validation = Rule::new("!has(oldSelf.spec.placementAuthority) ? !has(self.spec.placementAuthority) : (has(self.spec.placementAuthority) && self.spec.placementAuthority == oldSelf.spec.placementAuthority)")
         .message("spec.placementAuthority is immutable"),
-    validation = Rule::new("!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.spec.placementAuthority.kind == 'ClusterPool' && self.spec.placementAuthority.namespace == self.metadata.namespace)")
-        .message("spec.placementAuthority must identify a same-namespace ClusterPool"),
+    validation = Rule::new("!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.spec.placementAuthority.kind == 'ClusterPool')")
+        .message("spec.placementAuthority must identify a ClusterPool"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == 'management' && !has(self.spec.placementAuthority)) || (self.status.placement.type == 'childCluster' && (!has(self.spec.placementAuthority) || (self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))))")
         .message("resolved placement must match the immutable admission placementAuthority"),
     validation = Rule::new("!(has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == 'childCluster' && !has(self.spec.placementAuthority)) || (has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == 'childCluster' && !has(oldSelf.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)")
@@ -540,7 +540,7 @@ pub struct SandboxLeaseSpec {
 pub struct SandboxPoolReference {
     #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub name: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 128))]
     pub uid: String,
     #[schemars(range(min = 1))]
     pub generation: i64,
@@ -554,15 +554,15 @@ pub struct SandboxPoolReference {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxPlacementAuthority {
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 253))]
     pub api_version: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 63))]
     pub kind: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub namespace: String,
     #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub name: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 128))]
     pub uid: String,
     #[schemars(range(min = 1))]
     pub generation: i64,
@@ -622,6 +622,7 @@ pub struct SandboxPoolStatus {
     /// Replica counters alone never authorize admission.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
+        length(max = 16),
         extend("x-kubernetes-list-type" = "map"),
         extend("x-kubernetes-list-map-keys" = ["type"])
     )]
@@ -701,8 +702,10 @@ pub struct SandboxPoolCertificationStatus {
     /// Exact PVC/PV identities seen before teardown. Empty means the closed
     /// Pool template proved that no durable volumes can be created.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
     pub persistent_volume_claims: Vec<SandboxObjectReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
     pub persistent_volumes: Vec<SandboxObjectReference>,
     /// Immutable parameter object for the teardown ValidatingAdmissionPolicy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -711,6 +714,7 @@ pub struct SandboxPoolCertificationStatus {
     /// replenishment must exclude the claimed Sandbox and preserve none of a
     /// replaced generation's identities.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<BoundedSandboxUidSchema>", length(max = 256))]
     pub baseline_idle_sandbox_uids: Vec<String>,
     /// WarmPool generation created by the post-fence scale-to-zero write. The
     /// v0.5.6 `observedGeneration` ACK is meaningful only for this exact value.
@@ -722,16 +726,21 @@ pub struct SandboxPoolCertificationStatus {
     #[schemars(range(min = 1))]
     pub replenish_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("format" = "date-time"))]
+    #[schemars(length(max = 64), extend("format" = "date-time"))]
     pub canary_passed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("format" = "date-time"))]
+    #[schemars(length(max = 64), extend("format" = "date-time"))]
     pub certified_at: Option<String>,
     /// Human-readable fail-closed reason. In `CleanupBlocked`, this is the
     /// exact causal proof that the controller could not obtain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
     pub message: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct BoundedSandboxUidSchema(#[schemars(length(min = 1, max = 128))] String);
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -798,6 +807,7 @@ pub struct SandboxLeaseStatus {
     pub child_teardown_receipt_acknowledgement: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(
+        length(max = 16),
         extend("x-kubernetes-list-type" = "map"),
         extend("x-kubernetes-list-map-keys" = ["type"])
     )]
@@ -911,20 +921,22 @@ impl JsonSchema for ResolvedSandboxPlacement {
     }
 }
 
-/// Non-secret identity of one exact Kubernetes object.
+/// Non-secret identity of one exact Kubernetes object. String fields use the
+/// Kubernetes name/identity ceilings so root-level CEL comparisons have a
+/// finite admission cost instead of being rejected by the API server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxObjectReference {
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 253))]
     pub api_version: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 63))]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub namespace: Option<String>,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 253))]
     pub name: String,
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 128))]
     pub uid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
@@ -936,7 +948,7 @@ pub struct SandboxObjectReference {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxTargetProvenance {
-    #[schemars(length(min = 1))]
+    #[schemars(length(min = 1, max = 63), pattern("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_cluster_lease: Option<SandboxObjectReference>,
@@ -974,13 +986,18 @@ pub struct SandboxTargetProvenance {
 }
 
 /// Kubernetes-style condition with the generation from which it was derived.
+/// Status lists are capped because CEL lifecycle proofs scan them on every
+/// status write.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxCondition {
     #[serde(rename = "type")]
+    #[schemars(length(min = 1, max = 63))]
     pub condition_type: String,
     pub status: SandboxConditionStatus,
+    #[schemars(length(max = 128))]
     pub reason: String,
+    #[schemars(length(max = 32768))]
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
@@ -1391,6 +1408,22 @@ mod tests {
                 .map(Vec::len),
             Some(6)
         );
+        assert_eq!(
+            certification["properties"]["persistentVolumeClaims"]["maxItems"],
+            16
+        );
+        assert_eq!(
+            certification["properties"]["persistentVolumes"]["maxItems"],
+            16
+        );
+        assert_eq!(
+            certification["properties"]["baselineIdleSandboxUids"]["maxItems"],
+            256
+        );
+        assert_eq!(
+            certification["properties"]["baselineIdleSandboxUids"]["items"]["maxLength"],
+            128
+        );
         let pool_validations =
             pool["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["x-kubernetes-validations"]
                 .as_array()
@@ -1569,6 +1602,26 @@ mod tests {
         }
     }
 
+    /// Every string or list traversed by a root CEL rule has a finite schema
+    /// bound. Kubernetes rejects an otherwise-valid CRD when the static CEL
+    /// estimator must assume unbounded identities or condition lists.
+    #[test]
+    fn sandbox_lease_root_cel_inputs_are_bounded() {
+        let lease = serde_json::to_value(SandboxLease::crd()).unwrap();
+        let root = &lease["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let status = &root["properties"]["status"]["properties"];
+        let conditions = &status["conditions"];
+        assert_eq!(conditions["maxItems"], 16);
+        assert_eq!(conditions["items"]["properties"]["type"]["maxLength"], 63);
+
+        let reference = &status["target"]["properties"]["childClusterKubeconfigSecret"];
+        assert_eq!(reference["properties"]["apiVersion"]["maxLength"], 253);
+        assert_eq!(reference["properties"]["kind"]["maxLength"], 63);
+        assert_eq!(reference["properties"]["namespace"]["maxLength"], 63);
+        assert_eq!(reference["properties"]["name"]["maxLength"], 253);
+        assert_eq!(reference["properties"]["uid"]["maxLength"], 128);
+    }
+
     #[test]
     fn placement_authority_schema_is_exact_child_only_and_immutable() {
         let pool = serde_json::to_value(SandboxPool::crd()).unwrap();
@@ -1591,11 +1644,16 @@ mod tests {
                 assert!(required.iter().any(|required| required == field));
             }
             assert_eq!(authority["properties"]["generation"]["minimum"], 1.0);
+            assert_eq!(authority["properties"]["apiVersion"]["maxLength"], 253);
+            assert_eq!(authority["properties"]["kind"]["maxLength"], 63);
+            assert_eq!(authority["properties"]["namespace"]["maxLength"], 63);
+            assert_eq!(authority["properties"]["name"]["maxLength"], 63);
+            assert_eq!(authority["properties"]["uid"]["maxLength"], 128);
         }
 
         let pool_validations = pool_root["x-kubernetes-validations"].as_array().unwrap();
         for message in [
-            "placementAuthority must identify the exact same-namespace child ClusterPool",
+            "placementAuthority must identify the exact child ClusterPool",
             "placementAuthority is published only with current-generation CompositionEligible status",
         ] {
             assert!(
@@ -1607,7 +1665,7 @@ mod tests {
         let lease_validations = lease_root["x-kubernetes-validations"].as_array().unwrap();
         for message in [
             "spec.placementAuthority is immutable",
-            "spec.placementAuthority must identify a same-namespace ClusterPool",
+            "spec.placementAuthority must identify a ClusterPool",
             "resolved placement must match the immutable admission placementAuthority",
             "child placement without placementAuthority may only preserve an exact legacy placement",
             "legacy child placement without placementAuthority may not be removed or changed",
@@ -1629,6 +1687,15 @@ mod tests {
                 .expect("legacy transition rule");
             assert!(rule.contains("self.status.placement == oldSelf.status.placement"));
             assert!(rule.contains("!has(oldSelf.spec.placementAuthority)"));
+        }
+        for validation in pool_validations.iter().chain(lease_validations) {
+            assert!(
+                !validation["rule"]
+                    .as_str()
+                    .expect("CEL validation rule")
+                    .contains("metadata.namespace"),
+                "CRD CEL cannot address metadata.namespace"
+            );
         }
     }
 

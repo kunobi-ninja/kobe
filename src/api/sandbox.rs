@@ -9460,9 +9460,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        // Leave enough wall-clock margin for the preceding local CRD and Pool
+        // reads when the full test binary is scheduler-saturated. The mocked
+        // sweep still stalls for 30 seconds, so this remains a stage-specific
+        // deadline proof rather than a race against unrelated preflight work.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
             create_sandbox_lease_until::<crate::testutil::MockBackend>(
                 test_state(&server),
                 identity(),

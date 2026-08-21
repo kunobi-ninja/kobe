@@ -327,14 +327,19 @@ spec:
                       replenishment must exclude the claimed Sandbox and preserve none of a
                       replaced generation's identities.
                     items:
+                      maxLength: 128
+                      minLength: 1
                       type: string
+                    maxItems: 256
                     type: array
                   canaryPassedAt:
                     format: date-time
+                    maxLength: 64
                     nullable: true
                     type: string
                   certifiedAt:
                     format: date-time
+                    maxLength: 64
                     nullable: true
                     type: string
                   drainGeneration:
@@ -357,6 +362,7 @@ spec:
                     description: |-
                       Human-readable fail-closed reason. In `CleanupBlocked`, this is the
                       exact causal proof that the controller could not obtain.
+                    maxLength: 4096
                     nullable: true
                     type: string
                   observedGeneration:
@@ -368,9 +374,13 @@ spec:
                       Exact PVC/PV identities seen before teardown. Empty means the closed
                       Pool template proved that no durable volumes can be created.
                     items:
-                      description: Non-secret identity of one exact Kubernetes object.
+                      description: |-
+                        Non-secret identity of one exact Kubernetes object. String fields use the
+                        Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                        finite admission cost instead of being rejected by the API server.
                       properties:
                         apiVersion:
+                          maxLength: 253
                           minLength: 1
                           type: string
                         generation:
@@ -379,16 +389,21 @@ spec:
                           nullable: true
                           type: integer
                         kind:
+                          maxLength: 63
                           minLength: 1
                           type: string
                         name:
+                          maxLength: 253
                           minLength: 1
                           type: string
                         namespace:
+                          maxLength: 63
                           minLength: 1
                           nullable: true
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         uid:
+                          maxLength: 128
                           minLength: 1
                           type: string
                       required:
@@ -397,12 +412,17 @@ spec:
                       - name
                       - uid
                       type: object
+                    maxItems: 16
                     type: array
                   persistentVolumes:
                     items:
-                      description: Non-secret identity of one exact Kubernetes object.
+                      description: |-
+                        Non-secret identity of one exact Kubernetes object. String fields use the
+                        Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                        finite admission cost instead of being rejected by the API server.
                       properties:
                         apiVersion:
+                          maxLength: 253
                           minLength: 1
                           type: string
                         generation:
@@ -411,16 +431,21 @@ spec:
                           nullable: true
                           type: integer
                         kind:
+                          maxLength: 63
                           minLength: 1
                           type: string
                         name:
+                          maxLength: 253
                           minLength: 1
                           type: string
                         namespace:
+                          maxLength: 63
                           minLength: 1
                           nullable: true
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                           type: string
                         uid:
+                          maxLength: 128
                           minLength: 1
                           type: string
                       required:
@@ -429,6 +454,7 @@ spec:
                       - name
                       - uid
                       type: object
+                    maxItems: 16
                     type: array
                   phase:
                     description: |-
@@ -454,10 +480,14 @@ spec:
                     - cleanupBlocked
                     type: string
                   pod:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -466,16 +496,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -491,10 +526,14 @@ spec:
                     nullable: true
                     type: integer
                   sandbox:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -503,16 +542,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -522,10 +566,14 @@ spec:
                     - uid
                     type: object
                   sandboxClaim:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -534,16 +582,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -553,9 +606,13 @@ spec:
                     - uid
                     type: object
                   sandboxTemplate:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -564,16 +621,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -583,9 +645,13 @@ spec:
                     - uid
                     type: object
                   sandboxWarmPool:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -594,16 +660,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -613,10 +684,14 @@ spec:
                     - uid
                     type: object
                   service:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -625,16 +700,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -648,6 +728,7 @@ spec:
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -656,16 +737,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -700,13 +786,17 @@ spec:
                   leases; missing, stale, `False`, or `Unknown` conditions fail closed.
                   Replica counters alone never authorize admission.
                 items:
-                  description: Kubernetes-style condition with the generation from which it was derived.
+                  description: |-
+                    Kubernetes-style condition with the generation from which it was derived.
+                    Status lists are capped because CEL lifecycle proofs scan them on every
+                    status write.
                   properties:
                     lastTransitionTime:
                       format: date-time
                       nullable: true
                       type: string
                     message:
+                      maxLength: 32768
                       type: string
                     observedGeneration:
                       format: int64
@@ -714,6 +804,7 @@ spec:
                       nullable: true
                       type: integer
                     reason:
+                      maxLength: 128
                       type: string
                     status:
                       description: Kubernetes Condition status values.
@@ -723,6 +814,8 @@ spec:
                       - Unknown
                       type: string
                     type:
+                      maxLength: 63
+                      minLength: 1
                       type: string
                   required:
                   - message
@@ -730,6 +823,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
@@ -748,6 +842,7 @@ spec:
                 nullable: true
                 properties:
                   apiVersion:
+                    maxLength: 253
                     minLength: 1
                     type: string
                   generation:
@@ -755,6 +850,7 @@ spec:
                     minimum: 1.0
                     type: integer
                   kind:
+                    maxLength: 63
                     minLength: 1
                     type: string
                   name:
@@ -763,9 +859,12 @@ spec:
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   namespace:
+                    maxLength: 63
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   uid:
+                    maxLength: 128
                     minLength: 1
                     type: string
                 required:
@@ -805,8 +904,8 @@ spec:
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint != self.status.certification.fingerprint || (oldSelf.status.certification.sandboxTemplate == self.status.certification.sandboxTemplate && oldSelf.status.certification.sandboxWarmPool == self.status.certification.sandboxWarmPool && (!has(oldSelf.status.certification.sandboxClaim) || (has(self.status.certification.sandboxClaim) && oldSelf.status.certification.sandboxClaim == self.status.certification.sandboxClaim)) && (!has(oldSelf.status.certification.sandbox) || (has(self.status.certification.sandbox) && oldSelf.status.certification.sandbox == self.status.certification.sandbox)) && (!has(oldSelf.status.certification.pod) || (has(self.status.certification.pod) && oldSelf.status.certification.pod == self.status.certification.pod)) && (!has(oldSelf.status.certification.service) || (has(self.status.certification.service) && oldSelf.status.certification.service == self.status.certification.service)) && (!has(oldSelf.status.certification.persistentVolumeClaims) || (has(self.status.certification.persistentVolumeClaims) && oldSelf.status.certification.persistentVolumeClaims == self.status.certification.persistentVolumeClaims)) && (!has(oldSelf.status.certification.persistentVolumes) || (has(self.status.certification.persistentVolumes) && oldSelf.status.certification.persistentVolumes == self.status.certification.persistentVolumes)) && (!has(oldSelf.status.certification.baselineIdleSandboxUids) || (has(self.status.certification.baselineIdleSandboxUids) && oldSelf.status.certification.baselineIdleSandboxUids == self.status.certification.baselineIdleSandboxUids)) && (!has(oldSelf.status.certification.teardownFence) || (has(self.status.certification.teardownFence) && oldSelf.status.certification.teardownFence == self.status.certification.teardownFence)) && (!has(oldSelf.status.certification.drainGeneration) || (has(self.status.certification.drainGeneration) && oldSelf.status.certification.drainGeneration == self.status.certification.drainGeneration)) && (!has(oldSelf.status.certification.replenishGeneration) || (has(self.status.certification.replenishGeneration) && oldSelf.status.certification.replenishGeneration == self.status.certification.replenishGeneration)) && (!has(oldSelf.status.certification.canaryPassedAt) || (has(self.status.certification.canaryPassedAt) && oldSelf.status.certification.canaryPassedAt == self.status.certification.canaryPassedAt)) && (!has(oldSelf.status.certification.certifiedAt) || (has(self.status.certification.certifiedAt) && oldSelf.status.certification.certifiedAt == self.status.certification.certifiedAt)))))'
         - message: an active certification fingerprint cannot be abandoned before exact cleanup
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == ''certified'' || (oldSelf.status.certification.phase in [''initialized'', ''cleanupBlocked''] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))'
-        - message: placementAuthority must identify the exact same-namespace child ClusterPool
-          rule: '!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == ''childCluster'' && self.status.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.status.placementAuthority.kind == ''ClusterPool'' && self.status.placementAuthority.namespace == self.metadata.namespace && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)'
+        - message: placementAuthority must identify the exact child ClusterPool
+          rule: '!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == ''childCluster'' && self.status.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.status.placementAuthority.kind == ''ClusterPool'' && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)'
         - message: placementAuthority is published only with current-generation CompositionEligible status
           rule: '!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == ''childCluster'' && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''Ready'' && c.status == ''False'' && c.reason == ''CompositionEligible'' && has(c.observedGeneration) && c.observedGeneration == self.metadata.generation)))'
     served: true
