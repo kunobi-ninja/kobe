@@ -16804,6 +16804,10 @@ spec:
             type: object
           status:
             properties:
+              observedGeneration:
+                format: int64
+                minimum: 0
+                type: integer
               readyReplicas:
                 format: int32
                 type: integer
@@ -17178,7 +17182,7 @@ spec:
       - args:
         - --leader-elect=true
         - --extensions
-        image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4
+        image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6
         name: agent-sandbox-controller
         ports:
         - containerPort: 8080

@@ -91,7 +91,7 @@ containerSecurityContext:
 #             APIs/controller/webhook are the pinned release and owns none of
 #             that installation.
 #
-#   managed   Kobe installs the official Agent Sandbox v0.5.4 core + extensions
+#   managed   Kobe installs the official Agent Sandbox v0.5.6 core + extensions
 #             release with an immutable controller-image digest. The four
 #             upstream CRDs are retained on uninstall; controllers/RBAC are
 #             removed. A same-release BootstrapConfig is also installed for

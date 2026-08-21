@@ -15,7 +15,7 @@
 //! kubeconfig is read from controller-authorised storage into memory and never
 //! written to status, an API response, a log line, or an event.
 //!
-//! In managed mode the selected ClusterPool must use Kobe's immutable v0.5.4
+//! In managed mode the selected ClusterPool must use Kobe's immutable v0.5.6
 //! BootstrapConfig. External mode leaves installation to the pool. Either way,
 //! Kobe certifies the running controller, webhook and a real child-local Claim
 //! before creating the tenant pool objects.

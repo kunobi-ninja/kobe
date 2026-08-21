@@ -1,4 +1,5 @@
-// Live contract for Kobe's pinned Agent Sandbox v0.5.4 managed runtime.
+// Live contract for Kobe's pinned Agent Sandbox v0.5.6 managed runtime and
+// the supported v0.5.4 -> v0.5.6 rolling upgrade with a live warm Claim.
 //
 // This test deliberately owns its whole Kind cluster. It never accepts an
 // arbitrary kubectl context, and it refuses an existing cluster name before
@@ -6,16 +7,24 @@
 
 const chart = "charts/kobe";
 const releaseSha256 =
-	"7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4";
+	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
 const bootstrapSha256 =
-	"f5f6cd88a52ad76e2f18eac0a7a4ee620a77c3e02186abe48e8aa6f29155d8fa";
+	"f38255d5aa7761dec45507683127066a1750fbedb1e3b6a56573901033d0110f";
 const pinnedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
 const pinnedImageDigests = new Set([
-	"sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f",
-	"sha256:f7192ebdb18dbcfa26f242b7108f370ecb6e8d99352b427de4697d51853309d8",
-	"sha256:46e2bcca361a6394ec118982c77d4644942c57467ecf6649558724a4aa5e532c",
+	"sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd",
+	"sha256:a502cfdbcf550e77509cc56097978458a1ac3d5b59972f21b7ce0e0a84a5c12e",
+	"sha256:db3d5a89473701ff0859eb81c98a0f8fcbce70915f2af052f599eba094284061",
 ]);
+const previousReleaseUrl =
+	"https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.4/sandbox-with-extensions.yaml";
+const previousReleaseSha256 =
+	"7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4";
+const previousTaggedImage =
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4";
+const previousPinnedImage =
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f";
 const pauseImage =
 	"registry.k8s.io/pause@sha256:278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c";
 const crds = [
@@ -39,6 +48,7 @@ const kubeconfig = `${temporaryRoot}/${cluster}.kubeconfig`;
 const context = `kind-${cluster}`;
 const namespace = "kobe-runtime-contract";
 const canary = "runtime-contract";
+const upgradeCanary = "runtime-upgrade";
 
 type CommandResult = {
 	stdout: string;
@@ -47,6 +57,8 @@ type CommandResult = {
 };
 
 type KubeObject = {
+	apiVersion?: string;
+	kind?: string;
 	metadata?: {
 		name?: string;
 		namespace?: string;
@@ -137,6 +149,17 @@ async function getList(resource: string, ns: string): Promise<KubeObject[]> {
 	return (JSON.parse(stdout) as KubeObject).items ?? [];
 }
 
+async function exactControllerChildren(
+	resource: string,
+	ownerKind: string,
+	ownerUid: string,
+): Promise<KubeObject[]> {
+	return (await getList(resource, namespace)).filter((candidate) => {
+		const owner = controllerOwner(candidate);
+		return owner?.kind === ownerKind && owner.uid === ownerUid;
+	});
+}
+
 async function eventually<T>(
 	label: string,
 	timeoutMs: number,
@@ -188,11 +211,10 @@ async function renderManagedRuntime(): Promise<string> {
 	return stdout;
 }
 
-async function installRuntime(): Promise<void> {
-	const rendered = await renderManagedRuntime();
+async function applyRuntime(rendered: string): Promise<void> {
 	invariant(
-		rendered.includes(pinnedImage),
-		"rendered runtime lost the pinned image",
+		rendered.includes("agent-sandbox-controller"),
+		"runtime manifest has no controller",
 	);
 	await kubectl(
 		[
@@ -222,6 +244,38 @@ async function installRuntime(): Promise<void> {
 		"agent-sandbox-system",
 		"--timeout=180s",
 	]);
+}
+
+async function installPreviousRuntime(): Promise<void> {
+	const response = await fetch(previousReleaseUrl, {
+		signal: AbortSignal.timeout(60_000),
+	});
+	invariant(
+		response.ok,
+		`failed to download v0.5.4 runtime: HTTP ${response.status}`,
+	);
+	const source = await response.text();
+	invariant(
+		sha256(source) === previousReleaseSha256,
+		"downloaded v0.5.4 runtime digest drifted",
+	);
+	const pinned = source.replace(previousTaggedImage, previousPinnedImage);
+	invariant(
+		pinned.includes(previousPinnedImage) &&
+			!pinned.includes(previousTaggedImage),
+		"v0.5.4 runtime image was not pinned",
+	);
+	await applyRuntime(pinned);
+	info("installed the exact former v0.5.4 managed runtime");
+}
+
+async function installRuntime(): Promise<void> {
+	const rendered = await renderManagedRuntime();
+	invariant(
+		rendered.includes(pinnedImage),
+		"rendered runtime lost the pinned image",
+	);
+	await applyRuntime(rendered);
 }
 
 async function verifyChildBootstrap(): Promise<void> {
@@ -268,12 +322,12 @@ async function verifyChildBootstrap(): Promise<void> {
 	}
 	const bootstrap = await getObject(
 		"bootstrapconfigs.kobe.kunobi.ninja",
-		"agent-sandbox-v0-5-4",
+		"agent-sandbox-v0-5-6",
 		"kobe-system",
 	);
 	invariant(bootstrap, "managed child BootstrapConfig is missing");
 	const files = nestedRecord(nestedRecord(bootstrap.spec).files);
-	const manifest = files["agent-sandbox-v0.5.4.yaml"];
+	const manifest = files["agent-sandbox-v0.5.6.yaml"];
 	invariant(typeof manifest === "string", "managed child manifest is missing");
 	invariant(
 		sha256(manifest) === bootstrapSha256,
@@ -297,12 +351,26 @@ async function verifyRuntime(): Promise<void> {
 		);
 		const spec = nestedRecord(crd.spec);
 		const versions = spec.versions as Array<Record<string, unknown>>;
-		invariant(
-			versions.some(
-				(version) => version.name === "v1beta1" && version.served === true,
-			),
-			`CRD ${name} does not serve v1beta1`,
+		const servedVersion = versions.find(
+			(version) => version.name === "v1beta1" && version.served === true,
 		);
+		invariant(servedVersion, `CRD ${name} does not serve v1beta1`);
+		if (name === "sandboxwarmpools.extensions.agents.x-k8s.io") {
+			const schema = nestedRecord(servedVersion.schema);
+			const root = nestedRecord(schema.openAPIV3Schema);
+			const properties = nestedRecord(root.properties);
+			const status = nestedRecord(properties.status);
+			const statusProperties = nestedRecord(status.properties);
+			const observedGeneration = nestedRecord(
+				statusProperties.observedGeneration,
+			);
+			invariant(
+				observedGeneration.type === "integer" &&
+					observedGeneration.format === "int64" &&
+					observedGeneration.minimum === 0,
+				"SandboxWarmPool CRD lacks the v0.5.6 observedGeneration contract",
+			);
+		}
 		const conversion = nestedRecord(spec.conversion);
 		const webhook = nestedRecord(conversion.webhook);
 		const clientConfig = nestedRecord(webhook.clientConfig);
@@ -401,72 +469,284 @@ async function verifyRuntime(): Promise<void> {
 	info("pinned controller, CRDs and conversion webhook are healthy");
 }
 
-function canaryList(): string {
-	const shutdownTime = new Date(Date.now() + 5 * 60_000).toISOString();
-	return JSON.stringify({
-		apiVersion: "v1",
-		kind: "List",
-		items: [
-			{
-				apiVersion: "extensions.agents.x-k8s.io/v1beta1",
-				kind: "SandboxTemplate",
-				metadata: { name: canary, namespace },
-				spec: {
-					service: false,
-					networkPolicyManagement: "Managed",
-					envVarsInjectionPolicy: "Disallowed",
-					volumeClaimTemplatesPolicy: "Disallowed",
-					podTemplate: {
-						spec: {
-							automountServiceAccountToken: false,
-							restartPolicy: "Never",
-							terminationGracePeriodSeconds: 1,
-							securityContext: {
-								runAsNonRoot: true,
-								runAsUser: 65532,
-								seccompProfile: { type: "RuntimeDefault" },
-							},
-							containers: [
-								{
-									name: "canary",
-									image: pauseImage,
-									imagePullPolicy: "IfNotPresent",
-									securityContext: {
-										allowPrivilegeEscalation: false,
-										readOnlyRootFilesystem: true,
-										capabilities: { drop: ["ALL"] },
-									},
-									resources: {
-										requests: { cpu: "1m", memory: "4Mi" },
-										limits: { cpu: "10m", memory: "16Mi" },
-									},
-								},
-							],
+function canaryObjects(
+	name: string,
+	replicas: number,
+	lifetimeMs = 5 * 60_000,
+): KubeObject[] {
+	const shutdownTime = new Date(Date.now() + lifetimeMs).toISOString();
+	return [
+		{
+			apiVersion: "extensions.agents.x-k8s.io/v1beta1",
+			kind: "SandboxTemplate",
+			metadata: { name, namespace },
+			spec: {
+				service: false,
+				networkPolicyManagement: "Managed",
+				envVarsInjectionPolicy: "Disallowed",
+				volumeClaimTemplatesPolicy: "Disallowed",
+				podTemplate: {
+					spec: {
+						automountServiceAccountToken: false,
+						restartPolicy: "Never",
+						terminationGracePeriodSeconds: 1,
+						securityContext: {
+							runAsNonRoot: true,
+							runAsUser: 65532,
+							seccompProfile: { type: "RuntimeDefault" },
 						},
+						containers: [
+							{
+								name: "canary",
+								image: pauseImage,
+								imagePullPolicy: "IfNotPresent",
+								securityContext: {
+									allowPrivilegeEscalation: false,
+									readOnlyRootFilesystem: true,
+									capabilities: { drop: ["ALL"] },
+								},
+								resources: {
+									requests: { cpu: "1m", memory: "4Mi" },
+									limits: { cpu: "10m", memory: "16Mi" },
+								},
+							},
+						],
 					},
 				},
 			},
-			{
-				apiVersion: "extensions.agents.x-k8s.io/v1beta1",
-				kind: "SandboxWarmPool",
-				metadata: { name: canary, namespace },
-				spec: {
-					replicas: 0,
-					sandboxTemplateRef: { name: canary },
-					updateStrategy: { type: "Recreate" },
-				},
+		},
+		{
+			apiVersion: "extensions.agents.x-k8s.io/v1beta1",
+			kind: "SandboxWarmPool",
+			metadata: { name, namespace },
+			spec: {
+				replicas,
+				sandboxTemplateRef: { name },
+				updateStrategy: { type: "Recreate" },
 			},
-			{
-				apiVersion: "extensions.agents.x-k8s.io/v1beta1",
-				kind: "SandboxClaim",
-				metadata: { name: canary, namespace },
-				spec: {
-					warmPoolRef: { name: canary },
-					lifecycle: { shutdownTime, shutdownPolicy: "DeleteForeground" },
-				},
+		},
+		{
+			apiVersion: "extensions.agents.x-k8s.io/v1beta1",
+			kind: "SandboxClaim",
+			metadata: { name, namespace },
+			spec: {
+				warmPoolRef: { name },
+				lifecycle: { shutdownTime, shutdownPolicy: "DeleteForeground" },
 			},
-		],
+		},
+	];
+}
+
+function objectList(items: KubeObject[]): string {
+	return JSON.stringify({
+		apiVersion: "v1",
+		kind: "List",
+		items,
 	});
+}
+
+function canaryList(): string {
+	return objectList(canaryObjects(canary, 0));
+}
+
+type RuntimeFootprint = {
+	claimUid: string;
+	sandboxName: string;
+	sandboxUid: string;
+	podName: string;
+	podUid: string;
+};
+
+async function readyFootprint(name: string): Promise<RuntimeFootprint> {
+	return eventually(`${name} exact Ready footprint`, 180_000, async () => {
+		const claim = await getObject(
+			"sandboxclaims.extensions.agents.x-k8s.io",
+			name,
+			namespace,
+		);
+		const claimUid = claim?.metadata?.uid;
+		if (!claimUid || !claim.status) return undefined;
+		const conditions = (claim.status.conditions ?? []) as Array<
+			Record<string, unknown>
+		>;
+		if (
+			!conditions.some(
+				(condition) =>
+					condition.type === "Ready" && condition.status === "True",
+			)
+		) {
+			return undefined;
+		}
+		const sandboxName = nestedRecord(claim.status.sandbox).name;
+		if (typeof sandboxName !== "string" || !sandboxName) return undefined;
+		const sandboxes = await exactControllerChildren(
+			"sandboxes.agents.x-k8s.io",
+			"SandboxClaim",
+			claimUid,
+		);
+		if (sandboxes.length === 0) return undefined;
+		invariant(sandboxes.length === 1, `${name} Claim owns multiple Sandboxes`);
+		const [sandbox] = sandboxes;
+		const sandboxUid = sandbox.metadata?.uid;
+		if (!sandboxUid) return undefined;
+		invariant(
+			sandbox.metadata?.name === sandboxName,
+			`${name} Claim status does not name its exact owned Sandbox`,
+		);
+		const sandboxOwner = controllerOwner(sandbox);
+		invariant(
+			sandboxOwner?.kind === "SandboxClaim" && sandboxOwner.uid === claimUid,
+			`${name} Sandbox is not controlled by the exact Claim`,
+		);
+		const pods = await exactControllerChildren("pods", "Sandbox", sandboxUid);
+		if (pods.length === 0) return undefined;
+		invariant(pods.length === 1, `${name} Sandbox owns multiple Pods`);
+		const [pod] = pods;
+		const podName = pod?.metadata?.name;
+		const podUid = pod?.metadata?.uid;
+		if (!podName || !podUid) return undefined;
+		for (const resource of ["services", "persistentvolumeclaims"]) {
+			invariant(
+				(await exactControllerChildren(resource, "Sandbox", sandboxUid))
+					.length === 0,
+				`${name} restricted Sandbox unexpectedly owns ${resource}`,
+			);
+		}
+		return { claimUid, sandboxName, sandboxUid, podName, podUid };
+	});
+}
+
+async function createWarmUpgradeClaim(): Promise<RuntimeFootprint> {
+	// The 20-minute CI envelope must remain the thing that bounds this Claim;
+	// a five-minute emergency expiry could fire while the two controller
+	// rollouts and exact-footprint checks are still progressing.
+	const objects = canaryObjects(upgradeCanary, 1, 30 * 60_000);
+	await kubectl(
+		[
+			"apply",
+			"--server-side",
+			"--field-manager=kobe-runtime-contract",
+			"-f",
+			"-",
+		],
+		{ stdin: objectList(objects.slice(0, 2)) },
+	);
+	await eventually("v0.5.4 warm capacity", 180_000, async () => {
+		const warmPool = await getObject(
+			"sandboxwarmpools.extensions.agents.x-k8s.io",
+			upgradeCanary,
+			namespace,
+		);
+		return warmPool?.status?.readyReplicas === 1 ? warmPool : undefined;
+	});
+	await kubectl(
+		[
+			"apply",
+			"--server-side",
+			"--field-manager=kobe-runtime-contract",
+			"-f",
+			"-",
+		],
+		{ stdin: JSON.stringify(objects[2]) },
+	);
+	const footprint = await readyFootprint(upgradeCanary);
+	info("v0.5.4 warm Claim is Ready before the controller upgrade");
+	return footprint;
+}
+
+async function verifyUpgradePreserved(
+	expected: RuntimeFootprint,
+): Promise<void> {
+	const observed = await readyFootprint(upgradeCanary);
+	invariant(
+		JSON.stringify(observed) === JSON.stringify(expected),
+		"v0.5.4 -> v0.5.6 changed the live warm Claim footprint",
+	);
+	await eventually(
+		"upgraded WarmPool current-generation status",
+		90_000,
+		async () => {
+			const warmPool = await getObject(
+				"sandboxwarmpools.extensions.agents.x-k8s.io",
+				upgradeCanary,
+				namespace,
+			);
+			if (!warmPool?.status) return undefined;
+			return warmPool.status.observedGeneration ===
+				warmPool.metadata?.generation
+				? warmPool
+				: undefined;
+		},
+	);
+	info("v0.5.6 preserved the exact live warm Claim and observed its pool");
+}
+
+async function cleanupUpgradeCanary(
+	footprint: RuntimeFootprint,
+): Promise<void> {
+	const exact = await readyFootprint(upgradeCanary);
+	invariant(
+		JSON.stringify(exact) === JSON.stringify(footprint),
+		"upgrade footprint changed before cleanup",
+	);
+	await kubectl([
+		"delete",
+		"sandboxclaims.extensions.agents.x-k8s.io",
+		upgradeCanary,
+		"-n",
+		namespace,
+		"--cascade=foreground",
+		"--wait=true",
+		"--timeout=120s",
+	]);
+	for (const [resource, name, uid] of [
+		[
+			"sandboxclaims.extensions.agents.x-k8s.io",
+			upgradeCanary,
+			footprint.claimUid,
+		],
+		["sandboxes.agents.x-k8s.io", footprint.sandboxName, footprint.sandboxUid],
+		["pods", footprint.podName, footprint.podUid],
+	] as const) {
+		await eventually(`${resource}/${name} absence`, 120_000, async () => {
+			const object = await getObject(resource, name, namespace);
+			if (!object) return true;
+			invariant(
+				object.metadata?.uid === uid,
+				`${resource}/${name} was replaced during upgrade cleanup`,
+			);
+			return undefined;
+		});
+	}
+	for (const [resource, ownerKind, ownerUid] of [
+		["sandboxes.agents.x-k8s.io", "SandboxClaim", footprint.claimUid],
+		["pods", "Sandbox", footprint.sandboxUid],
+		["services", "Sandbox", footprint.sandboxUid],
+		["persistentvolumeclaims", "Sandbox", footprint.sandboxUid],
+	] as const) {
+		await eventually(`${resource} exact-owner absence`, 120_000, async () =>
+			(await exactControllerChildren(resource, ownerKind, ownerUid)).length ===
+			0
+				? true
+				: undefined,
+		);
+	}
+	for (const resource of [
+		"sandboxwarmpools.extensions.agents.x-k8s.io",
+		"sandboxtemplates.extensions.agents.x-k8s.io",
+	]) {
+		await kubectl([
+			"delete",
+			resource,
+			upgradeCanary,
+			"-n",
+			namespace,
+			"--cascade=foreground",
+			"--wait=true",
+			"--timeout=120s",
+		]);
+	}
+	info("upgrade fixture was removed after exact Claim/Sandbox/Pod absence");
 }
 
 async function createAndDeleteCanary(): Promise<void> {
@@ -480,6 +760,23 @@ async function createAndDeleteCanary(): Promise<void> {
 		],
 		{
 			stdin: canaryList(),
+		},
+	);
+
+	await eventually(
+		"SandboxWarmPool current-generation status",
+		90_000,
+		async () => {
+			const warmPool = await getObject(
+				"sandboxwarmpools.extensions.agents.x-k8s.io",
+				canary,
+				namespace,
+			);
+			if (!warmPool?.status) return undefined;
+			return warmPool.status.observedGeneration ===
+				warmPool.metadata?.generation
+				? warmPool
+				: undefined;
 		},
 	);
 
@@ -602,8 +899,12 @@ async function contract(): Promise<void> {
 		namespace,
 		`kobe.kunobi.ninja/contract-cluster=${cluster}`,
 	]);
+	await installPreviousRuntime();
+	const upgradeFootprint = await createWarmUpgradeClaim();
 	await installRuntime();
 	await verifyRuntime();
+	await verifyUpgradePreserved(upgradeFootprint);
+	await cleanupUpgradeCanary(upgradeFootprint);
 	await verifyChildBootstrap();
 	await createAndDeleteCanary();
 }
@@ -665,4 +966,4 @@ if (creationStarted) {
 }
 
 if (failure) throw failure;
-console.log("Agent Sandbox v0.5.4 managed runtime contract passed");
+console.log("Agent Sandbox v0.5.6 managed runtime contract passed");

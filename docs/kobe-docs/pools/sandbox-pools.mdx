@@ -23,11 +23,11 @@ RuntimeClass, environment values, mounts, PVCs, or target credentials.
 
 - `disabled` is the default. Kobe renders no upstream Agent Sandbox resources
   and serves no Sandbox API.
-- `managed` installs the official Agent Sandbox `v0.5.4` core and extensions
+- `managed` installs the official Agent Sandbox `v0.5.6` core and extensions
   bundle. Kobe rewrites the controller image to an immutable OCI digest and
   does not install the optional Router.
 - `external` installs nothing. The operator must provide the compatible
-  `v0.5.4` controller, extensions, CRDs, conversion webhook, and exact running
+  `v0.5.6` controller, extensions, CRDs, conversion webhook, and exact running
   image digest.
 
 Both enabled modes block startup until the current controller Deployment, a
@@ -37,19 +37,30 @@ replica then creates a restricted, Pod-owned `SandboxTemplate`, zero-size
 and all three objects must be deleted successfully. A broken controller,
 webhook, image mismatch, or failed cleanup keeps Sandbox endpoints unavailable.
 
-Managed mode also creates the `agent-sandbox-v0-5-4` `BootstrapConfig`. Every
+Managed mode also creates the `agent-sandbox-v0-5-6` `BootstrapConfig`. Every
 `ClusterPool` used by a child-cluster SandboxPool must reference it exactly:
 
 ```yaml
 spec:
   bootstraps:
-    - name: agent-sandbox-v0-5-4
+    - name: agent-sandbox-v0-5-6
 ```
 
 Kobe verifies the BootstrapConfig content digest before allocating the child,
 so management and child clusters cannot silently run different releases.
 External mode never injects that bootstrap; configure the child pool's own
 compatible installation instead.
+
+<Callout type="info">
+  Upgrading a managed installation from Kobe's former Agent Sandbox `v0.5.4`
+  pin also changes the required child bootstrap from
+  `agent-sandbox-v0-5-4` to `agent-sandbox-v0-5-6`. Update each affected
+  `ClusterPool.spec.bootstraps` in the same maintenance window. Kobe keeps a
+  pool that still names the old bootstrap unavailable rather than allocating
+  a child with a different runtime. The `v0.5.6` CRD is also required because
+  pool certification gates replica counts on
+  `SandboxWarmPool.status.observedGeneration`.
+</Callout>
 
 Managed installation fails if same-named upstream resources are already owned
 by another Helm release. Switch to `external`, or back up and deliberately

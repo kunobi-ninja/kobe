@@ -1,13 +1,13 @@
 #!/usr/bin/env bun
 
 const chart = "charts/kobe";
-const releaseAsset = `${chart}/files/agent-sandbox-v0.5.4.yaml`;
+const releaseAsset = `${chart}/files/agent-sandbox-v0.5.6.yaml`;
 const releaseSha256 =
-	"7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4";
+	"1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
 const bootstrapSha256 =
-	"f5f6cd88a52ad76e2f18eac0a7a4ee620a77c3e02186abe48e8aa6f29155d8fa";
+	"f38255d5aa7761dec45507683127066a1750fbedb1e3b6a56573901033d0110f";
 const pinnedImage =
-	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f";
+	"registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
 const upstreamCrds = new Set([
 	"sandboxclaims.extensions.agents.x-k8s.io",
 	"sandboxes.agents.x-k8s.io",
@@ -202,7 +202,7 @@ for (const [mode, documents] of [
 		`${mode} rendered the upstream controller`,
 	);
 	invariant(
-		!objectNamed(documents, "BootstrapConfig", "agent-sandbox-v0-5-4"),
+		!objectNamed(documents, "BootstrapConfig", "agent-sandbox-v0-5-6"),
 		`${mode} rendered the managed child bootstrap`,
 	);
 	invariant(
@@ -239,6 +239,33 @@ for (const crd of managedCrds) {
 	);
 }
 
+const warmPoolCrd = managedCrds.find(
+	(crd) => metadata(crd).name === "sandboxwarmpools.extensions.agents.x-k8s.io",
+);
+invariant(warmPoolCrd, "managed WarmPool CRD is missing");
+const warmPoolVersions = (warmPoolCrd.spec as Record<string, unknown>)
+	.versions as Array<Record<string, unknown>>;
+const warmPoolV1Beta1 = warmPoolVersions.find(
+	(version) => version.name === "v1beta1" && version.served === true,
+);
+invariant(warmPoolV1Beta1, "managed WarmPool v1beta1 schema is missing");
+const warmPoolSchema = warmPoolV1Beta1.schema as Record<string, unknown>;
+const warmPoolRoot = warmPoolSchema.openAPIV3Schema as Record<string, unknown>;
+const warmPoolProperties = warmPoolRoot.properties as Record<string, unknown>;
+const warmPoolStatus = warmPoolProperties.status as Record<string, unknown>;
+const warmPoolStatusProperties = warmPoolStatus.properties as Record<
+	string,
+	unknown
+>;
+const observedGeneration =
+	warmPoolStatusProperties.observedGeneration as Record<string, unknown>;
+invariant(
+	observedGeneration.type === "integer" &&
+		observedGeneration.format === "int64" &&
+		observedGeneration.minimum === 0,
+	"managed WarmPool CRD lacks v0.5.6 status.observedGeneration",
+);
+
 const controller = objectNamed(
 	managed,
 	"Deployment",
@@ -254,12 +281,12 @@ invariant(
 const bootstrap = objectNamed(
 	managed,
 	"BootstrapConfig",
-	"agent-sandbox-v0-5-4",
+	"agent-sandbox-v0-5-6",
 );
 invariant(bootstrap, "managed did not render the child BootstrapConfig");
 const bootstrapSpec = bootstrap.spec as Record<string, unknown>;
 const files = bootstrapSpec.files as Record<string, unknown>;
-const bootstrapManifest = files["agent-sandbox-v0.5.4.yaml"];
+const bootstrapManifest = files["agent-sandbox-v0.5.6.yaml"];
 invariant(
 	typeof bootstrapManifest === "string",
 	"child bootstrap manifest is missing",
@@ -273,7 +300,7 @@ invariant(
 	"child bootstrap does not use the pinned image",
 );
 invariant(
-	!bootstrapManifest.includes(":v0.5.4"),
+	!bootstrapManifest.includes(":v0.5.6"),
 	"child bootstrap kept the mutable image tag",
 );
 

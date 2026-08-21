@@ -47,7 +47,7 @@ test("the ordinary e2e manifest does not silently enable Sandbox fixtures", () =
   const manifest = bootstrapManifest("kobe-system");
 
   expect(manifest).not.toContain("kind: SandboxPool");
-  expect(manifest).not.toContain("agent-sandbox-v0-5-4");
+  expect(manifest).not.toContain("agent-sandbox-v0-5-6");
   expect(manifest).not.toContain("e2e-other-token");
 });
 
@@ -61,7 +61,7 @@ test("the conformance manifest contains two exact placements and a pullable runn
   const pools = sandboxConformanceManifest("kobe-system", fixture);
 
   expect(manifest.match(/^kind: SandboxPool$/gm)).toHaveLength(2);
-  expect(manifest).toContain("name: agent-sandbox-v0-5-4");
+  expect(manifest).toContain("name: agent-sandbox-v0-5-6");
   expect(manifest).toContain('"127.0.0.1:32001":');
   expect(manifest).toContain('"http://172.19.0.9:5000"');
   expect(pools).toContain("type: management");

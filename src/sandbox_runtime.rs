@@ -2,7 +2,7 @@
 //!
 //! Kobe consumes `SandboxTemplate`, `SandboxWarmPool` and `SandboxClaim` from
 //! the upstream [Agent Sandbox] project. In `managed` mode the chart installs
-//! the official v0.5.4 core/extensions bundle with an immutable image digest,
+//! the official v0.5.6 core/extensions bundle with an immutable image digest,
 //! retains its four CRDs across uninstall, and publishes the same bundle as a
 //! child-cluster [`crate::crd::BootstrapConfig`]. In `external` mode the
 //! operator owns that installation. Both modes run the same certification.
@@ -52,31 +52,31 @@ impl AgentSandboxMode {
 }
 
 /// Upstream release pinned by the management and child installation assets.
-pub const AGENT_SANDBOX_RELEASE: &str = "v0.5.4";
+pub const AGENT_SANDBOX_RELEASE: &str = "v0.5.6";
 
-/// SHA-256 reported by GitHub for the official v0.5.4
+/// SHA-256 reported by GitHub for the official v0.5.6
 /// `sandbox-with-extensions.yaml` release asset.
 #[cfg(test)]
 pub const AGENT_SANDBOX_RELEASE_MANIFEST_SHA256: &str =
-    "7ada631db5d5a2cc043f48ca05cec94db54bc0afa4756b3b610c920b188fe2c4";
+    "1696dbb6faded503149b3994badb599df5dcf24d5985466881784f442dd9c3e5";
 
 /// Immutable multi-platform controller image used by Kobe-managed assets.
-pub const AGENT_SANDBOX_CONTROLLER_IMAGE: &str = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f";
+pub const AGENT_SANDBOX_CONTROLLER_IMAGE: &str = "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd";
 
 /// Platform manifests accepted when validating a running external controller.
 pub const AGENT_SANDBOX_CONTROLLER_IMAGE_DIGESTS: &[&str] = &[
-    "sha256:be477ba317d84a13a38d7605e925e7b4aa82de5b313a4274358920310a931b7f",
-    "sha256:f7192ebdb18dbcfa26f242b7108f370ecb6e8d99352b427de4697d51853309d8",
-    "sha256:46e2bcca361a6394ec118982c77d4644942c57467ecf6649558724a4aa5e532c",
+    "sha256:dc23fb0d5624c306ca2f8ef0d41848dba670ebaf62beb500f870175aec529ffd",
+    "sha256:a502cfdbcf550e77509cc56097978458a1ac3d5b59972f21b7ce0e0a84a5c12e",
+    "sha256:db3d5a89473701ff0859eb81c98a0f8fcbce70915f2af052f599eba094284061",
 ];
 
 /// BootstrapConfig installed by the chart for the managed child path.
-pub const AGENT_SANDBOX_BOOTSTRAP_NAME: &str = "agent-sandbox-v0-5-4";
+pub const AGENT_SANDBOX_BOOTSTRAP_NAME: &str = "agent-sandbox-v0-5-6";
 
 /// SHA-256 of the bootstrap file after replacing the mutable upstream image
 /// tag with [`AGENT_SANDBOX_CONTROLLER_IMAGE`].
 pub const AGENT_SANDBOX_BOOTSTRAP_SHA256: &str =
-    "f5f6cd88a52ad76e2f18eac0a7a4ee620a77c3e02186abe48e8aa6f29155d8fa";
+    "f38255d5aa7761dec45507683127066a1750fbedb1e3b6a56573901033d0110f";
 
 /// Namespace used by the pinned upstream controller and conversion webhook.
 pub const AGENT_SANDBOX_SYSTEM_NAMESPACE: &str = "agent-sandbox-system";
@@ -244,12 +244,52 @@ fn crd_conversion_is_compatible(
         && webhook.conversion_review_versions == ["v1".to_string(), "v1beta1".to_string()]
 }
 
+/// Whether the served WarmPool schema exposes the v0.5.6 reconciliation
+/// checkpoint Kobe relies on before trusting replica counts.
+///
+/// Serving `v1beta1` is not sufficient: v0.5.4 serves the same API version but
+/// has no `status.observedGeneration`, so a client cannot distinguish current
+/// replica counts from a status write produced for an older spec generation.
+fn warm_pool_crd_supports_observed_generation(
+    crd: &k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+) -> bool {
+    let expected_version = REQUIRED_AGENT_SANDBOX_API_VERSION
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    let Some(root) = crd
+        .spec
+        .versions
+        .iter()
+        .find(|version| version.name == expected_version && version.served)
+        .and_then(|version| version.schema.as_ref())
+        .and_then(|schema| schema.open_api_v3_schema.as_ref())
+    else {
+        return false;
+    };
+    let Some(observed_generation) = root
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("status"))
+        .and_then(|status| status.properties.as_ref())
+        .and_then(|properties| properties.get("observedGeneration"))
+    else {
+        return false;
+    };
+
+    observed_generation.type_.as_deref() == Some("integer")
+        && observed_generation.format.as_deref() == Some("int64")
+        && observed_generation.minimum == Some(0.0)
+}
+
 /// Validate that a compatible operator-installed runtime is present.
 ///
 /// Every required CRD must be established, serve the pinned version, and use
 /// the exact TLS-backed conversion webhook installed by the pinned release.
-/// The first failure is returned rather than a collected list: an operator
-/// fixes these one at a time, and the first one usually explains the rest.
+/// The WarmPool CRD must additionally expose the v0.5.6
+/// `status.observedGeneration` checkpoint. The first failure is returned
+/// rather than a collected list: an operator fixes these one at a time, and
+/// the first one usually explains the rest.
 pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), AgentSandboxUnusable> {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::api::Api;
@@ -286,6 +326,16 @@ pub async fn validate_external_runtime(client: &kube::Client) -> Result<(), Agen
             return Err(component_unhealthy(
                 "crd_conversion",
                 format!("CRD {name} does not use the exact trusted conversion webhook"),
+            ));
+        }
+        if *name == "sandboxwarmpools.extensions.agents.x-k8s.io"
+            && observed
+                .as_ref()
+                .is_none_or(|crd| !warm_pool_crd_supports_observed_generation(crd))
+        {
+            return Err(component_unhealthy(
+                "crd_schema",
+                format!("CRD {name} does not expose v0.5.6 status.observedGeneration"),
             ));
         }
     }
@@ -473,7 +523,7 @@ fn endpoint_slices_cover_exact_pods(
 /// Validate the pinned controller, conversion webhook and running image.
 ///
 /// CRD presence alone is not a runtime signal. This additionally requires the
-/// v0.5.4 Deployment and its single current ReplicaSet to have converged, every
+/// v0.5.6 Deployment and its single current ReplicaSet to have converged, every
 /// selected Pod to be exact-owned, Ready, and running the pinned image, and the
 /// exact webhook Service to route only to those Pod UIDs through owned
 /// EndpointSlices. The webhook TLS Secret must also contain all required keys.
@@ -809,7 +859,7 @@ pub fn validate_managed_bootstrap(
     let manifest = bootstrap
         .spec
         .files
-        .get("agent-sandbox-v0.5.4.yaml")
+        .get("agent-sandbox-v0.5.6.yaml")
         .ok_or_else(|| AgentSandboxUnusable::BootstrapMismatch {
             release: AGENT_SANDBOX_RELEASE,
             reason: "pinned manifest file is missing".to_string(),
@@ -1280,7 +1330,7 @@ mod tests {
 
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/charts/kobe/files/agent-sandbox-v0.5.4.yaml"
+            "/charts/kobe/files/agent-sandbox-v0.5.6.yaml"
         ))
         .expect("vendored release asset");
         assert_eq!(
@@ -1288,21 +1338,36 @@ mod tests {
             AGENT_SANDBOX_RELEASE_MANIFEST_SHA256
         );
 
+        let warm_pool_crd = source
+            .split("\n---\n")
+            .filter_map(|document| {
+                serde_yaml_ng::from_str::<
+                    k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+                >(document)
+                .ok()
+            })
+            .find(|crd| {
+                crd.metadata.name.as_deref()
+                    == Some("sandboxwarmpools.extensions.agents.x-k8s.io")
+            })
+            .expect("vendored WarmPool CRD");
+        assert!(warm_pool_crd_supports_observed_generation(&warm_pool_crd));
+
         let pinned = source.replace(
-            "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4",
+            "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6",
             AGENT_SANDBOX_CONTROLLER_IMAGE,
         );
         assert_eq!(
             hex::encode(Sha256::digest(pinned.as_bytes())),
             AGENT_SANDBOX_BOOTSTRAP_SHA256
         );
-        assert!(!pinned.contains("agent-sandbox-controller:v0.5.4"));
+        assert!(!pinned.contains("agent-sandbox-controller:v0.5.6"));
         assert!(!pinned.to_ascii_lowercase().contains("sandbox-router"));
 
         let bootstrap = crate::crd::BootstrapConfig::new(
             AGENT_SANDBOX_BOOTSTRAP_NAME,
             crate::crd::BootstrapConfigSpec {
-                files: [("agent-sandbox-v0.5.4.yaml".to_string(), pinned.clone())]
+                files: [("agent-sandbox-v0.5.6.yaml".to_string(), pinned.clone())]
                     .into_iter()
                     .collect(),
                 job: None,
@@ -1314,7 +1379,7 @@ mod tests {
         tampered
             .spec
             .files
-            .get_mut("agent-sandbox-v0.5.4.yaml")
+            .get_mut("agent-sandbox-v0.5.6.yaml")
             .expect("manifest")
             .push_str("\n# drift");
         assert!(matches!(
@@ -1372,13 +1437,13 @@ mod tests {
             AGENT_SANDBOX_CONTROLLER_IMAGE
         ));
         assert!(controller_image_reference_is_compatible(
-            "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.4"
+            "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.6"
         ));
         assert!(!controller_image_reference_is_compatible(
             "registry.k8s.io/agent-sandbox/agent-sandbox-controller:latest"
         ));
         assert!(observed_controller_image_is_pinned(
-            "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:f7192ebdb18dbcfa26f242b7108f370ecb6e8d99352b427de4697d51853309d8"
+            "registry.k8s.io/agent-sandbox/agent-sandbox-controller@sha256:a502cfdbcf550e77509cc56097978458a1ac3d5b59972f21b7ce0e0a84a5c12e"
         ));
         assert!(!observed_controller_image_is_pinned("sha256:foreign"));
     }
@@ -1472,6 +1537,66 @@ mod tests {
             .unwrap()
             .ca_bundle = None;
         assert!(!crd_conversion_is_compatible(&untrusted));
+    }
+
+    #[test]
+    fn warm_pool_schema_requires_the_current_generation_checkpoint() {
+        let exact = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {
+                "name": "sandboxwarmpools.extensions.agents.x-k8s.io"
+            },
+            "spec": {
+                "group": "extensions.agents.x-k8s.io",
+                "scope": "Namespaced",
+                "names": {
+                    "plural": "sandboxwarmpools",
+                    "singular": "sandboxwarmpool",
+                    "kind": "SandboxWarmPool",
+                    "listKind": "SandboxWarmPoolList"
+                },
+                "versions": [{
+                    "name": "v1beta1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "status": {
+                                    "type": "object",
+                                    "properties": {
+                                        "observedGeneration": {
+                                            "type": "integer",
+                                            "format": "int64",
+                                            "minimum": 0
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+        let crd = serde_json::from_value(exact.clone()).expect("WarmPool CRD");
+        assert!(warm_pool_crd_supports_observed_generation(&crd));
+
+        let mut legacy = exact.clone();
+        legacy["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["status"]["properties"]
+            .as_object_mut()
+            .expect("status properties")
+            .remove("observedGeneration");
+        let crd = serde_json::from_value(legacy).expect("legacy WarmPool CRD");
+        assert!(!warm_pool_crd_supports_observed_generation(&crd));
+
+        let mut drifted = exact;
+        drifted["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"]
+            ["observedGeneration"]["format"] = serde_json::json!("int32");
+        let crd = serde_json::from_value(drifted).expect("drifted WarmPool CRD");
+        assert!(!warm_pool_crd_supports_observed_generation(&crd));
     }
 
     #[test]
