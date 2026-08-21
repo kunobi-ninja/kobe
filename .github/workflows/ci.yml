@@ -186,9 +186,13 @@ jobs:
 
       - name: Verify CRDs match generated output
         run: |
-          for crd in clusterpools clusterleases clusterinstances bootstrapconfigs accesspolicies kobestores cidrclaims cidrpools sandboxpools sandboxleases; do
+          # Derive the gate from the shipped chart instead of maintaining a
+          # second list that can silently omit a new CRD.
+          for crd_path in charts/kobe/crds/*.yaml; do
+            crd="${crd_path##*/}"
+            crd="${crd%.yaml}"
             cargo run --quiet --bin crdgen -- "$crd" > "/tmp/${crd}-generated.yaml"
-            diff -u "/tmp/${crd}-generated.yaml" "charts/kobe/crds/${crd}.yaml" || {
+            diff -u "/tmp/${crd}-generated.yaml" "$crd_path" || {
               echo "::error::CRD '${crd}' is out of date. Run 'cargo run --bin crdgen -- ${crd} > charts/kobe/crds/${crd}.yaml' to update."
               exit 1
             }
