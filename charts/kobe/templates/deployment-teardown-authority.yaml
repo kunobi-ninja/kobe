@@ -55,6 +55,10 @@ spec:
               value: {{ printf "system:serviceaccount:%s:%s" (include "kobe.teardownAuthorityNamespace" .) (include "kobe.teardownAuthorityServiceAccountName" .) | quote }}
             - name: KOBE_TEARDOWN_AUTHORITY_POLICY_NAME
               value: {{ include "kobe.teardownAuthorityPolicyName" . | quote }}
+            - name: KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME
+              value: {{ include "kobe.teardownAuthorityFirewallPolicyName" . | quote }}
+            - name: KOBE_CONTROL_PLANE_USERNAME
+              value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kobe.serviceAccountName" .) | quote }}
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
             - name: POOL_SERVICE_ACCOUNT

@@ -301,7 +301,7 @@ async fn reconcile_receipt_authority<B: ClusterBackend + Clone + 'static>(
 
     let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &namespace);
     let lease = leases.get(&binding.lease.name).await?;
-    if !lease_uid_matches_binding(&lease, binding) {
+    if !receipt_authority_reciprocal_binding_matches(&instance, &lease, binding) {
         return Ok(Action::requeue(std::time::Duration::from_secs(30)));
     }
     let backend_type = format!("{:?}", binding.backend.backend_type).to_lowercase();
@@ -2721,6 +2721,45 @@ fn lease_uid_matches_binding(lease: &ClusterLease, binding: &crate::crd::LeaseBi
         .is_some_and(|uid| lease.metadata.uid.as_deref() == Some(uid))
 }
 
+/// Require both live CRDs to carry the exact same verified teardown capability.
+///
+/// The receipt authority does not infer reciprocity from names or from either
+/// object's phase alone. The lease UID, instance UID/generation, pool UID,
+/// display projections, and both status copies must all agree before it may
+/// open an attempt or attest absence.
+fn receipt_authority_reciprocal_binding_matches(
+    instance: &ClusterInstance,
+    lease: &ClusterLease,
+    binding: &crate::crd::LeaseBinding,
+) -> bool {
+    let Some(instance_status) = instance.status.as_ref() else {
+        return false;
+    };
+    let Some(lease_status) = lease.status.as_ref() else {
+        return false;
+    };
+    binding.cleanup_mode == CleanupMode::VerifiedDestroy
+        && lease.name_any() == binding.lease.name
+        && lease_uid_matches_binding(lease, binding)
+        && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+        && lease.spec.pool_ref == binding.pool.name
+        && lease_status.binding.as_ref() == Some(binding)
+        && lease_status.cluster_name.as_deref() == Some(binding.instance.name.as_str())
+        && matches!(
+            lease_status.phase,
+            LeasePhase::Released
+                | LeasePhase::Expired
+                | LeasePhase::Recycling
+                | LeasePhase::Quarantined
+        )
+        && instance.name_any() == binding.instance.name
+        && instance.uid().as_deref() == Some(binding.instance.uid.as_str())
+        && instance.metadata.generation == Some(binding.instance.observed_generation)
+        && instance.spec.pool_ref.as_ref() == Some(&binding.pool)
+        && instance_status.binding.as_ref() == Some(binding)
+        && instance_status.lease_ref.as_ref() == Some(&binding.lease)
+}
+
 /// Move a receipt-proven instance through the Kubernetes deletion boundary.
 ///
 /// The normal `Recycling` path has no deletionTimestamp yet. It requests an
@@ -4306,6 +4345,89 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn teardown_surface_instance(binding: &crate::crd::LeaseBinding) -> ClusterInstance {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterInstance",
+            "metadata": {
+                "name": binding.instance.name,
+                "namespace": "test-ns",
+                "uid": binding.instance.uid,
+                "generation": binding.instance.observed_generation,
+                "resourceVersion": "24"
+            },
+            "spec": { "poolRef": binding.pool },
+            "status": {
+                "phase": "Recycling",
+                "binding": binding,
+                "leaseRef": binding.lease
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn receipt_authority_requires_exact_live_reciprocal_binding() {
+        let binding = teardown_surface_binding();
+        let instance = teardown_surface_instance(&binding);
+        let mut lease = teardown_surface_lease(
+            LeasePhase::Released,
+            binding.lease.uid.as_deref().unwrap(),
+            &binding,
+            None,
+        );
+        lease.status.as_mut().unwrap().cluster_name = Some(binding.instance.name.clone());
+        assert!(receipt_authority_reciprocal_binding_matches(
+            &instance, &lease, &binding
+        ));
+
+        let mut missing_display = lease.clone();
+        missing_display.status.as_mut().unwrap().cluster_name = None;
+        assert!(!receipt_authority_reciprocal_binding_matches(
+            &instance,
+            &missing_display,
+            &binding
+        ));
+
+        let mut wrong_lease_ref = instance.clone();
+        wrong_lease_ref
+            .status
+            .as_mut()
+            .unwrap()
+            .lease_ref
+            .as_mut()
+            .unwrap()
+            .uid = Some("replacement-lease-uid".into());
+        assert!(!receipt_authority_reciprocal_binding_matches(
+            &wrong_lease_ref,
+            &lease,
+            &binding
+        ));
+
+        let mut wrong_instance_binding = instance.clone();
+        wrong_instance_binding
+            .status
+            .as_mut()
+            .unwrap()
+            .binding
+            .as_mut()
+            .unwrap()
+            .binding_id = "other-binding".into();
+        assert!(!receipt_authority_reciprocal_binding_matches(
+            &wrong_instance_binding,
+            &lease,
+            &binding
+        ));
+
+        let mut wrong_pool = instance;
+        wrong_pool.spec.pool_ref.as_mut().unwrap().uid = Some("replacement-pool-uid".into());
+        assert!(!receipt_authority_reciprocal_binding_matches(
+            &wrong_pool,
+            &lease,
+            &binding
+        ));
     }
 
     #[tokio::test]

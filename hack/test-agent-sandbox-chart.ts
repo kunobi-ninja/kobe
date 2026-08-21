@@ -21,15 +21,19 @@ function sha256(value: string | Uint8Array): string {
 	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
-async function helm(mode: string): Promise<string> {
+async function helm(
+	mode: string,
+	release = "kobe",
+	namespace = "kobe-system",
+): Promise<string> {
 	const process = Bun.spawn(
 		[
 			"helm",
 			"template",
-			"kobe",
+			release,
 			chart,
 			"--namespace",
-			"kobe-system",
+			namespace,
 			"--set",
 			`agentSandbox.mode=${mode}`,
 		],
@@ -40,7 +44,10 @@ async function helm(mode: string): Promise<string> {
 		new Response(process.stderr).text(),
 		process.exited,
 	]);
-	invariant(exitCode === 0, `helm template ${mode} failed: ${stderr}`);
+	invariant(
+		exitCode === 0,
+		`helm template ${release}/${namespace} ${mode} failed: ${stderr}`,
+	);
 	return stdout;
 }
 
@@ -226,6 +233,86 @@ invariant(
 	authorityEnv.get("KOBE_PROCESS_ROLE") === "teardown-authority" &&
 		authorityEnv.get("AGENT_SANDBOX_MODE") === "disabled",
 	"teardown authority can run general lifecycle or Sandbox placement",
+);
+const authorityUsername = String(
+	authorityEnv.get("KOBE_TEARDOWN_AUTHORITY_USERNAME") ?? "",
+);
+const controlPlaneUsername = String(
+	authorityEnv.get("KOBE_CONTROL_PLANE_USERNAME") ?? "",
+);
+const authorityPolicyName = String(
+	authorityEnv.get("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME") ?? "",
+);
+const firewallPolicyName = String(
+	authorityEnv.get("KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME") ?? "",
+);
+invariant(
+	authorityUsername ===
+		`system:serviceaccount:${authorityNamespace}:kobe-teardown-authority`,
+	"teardown authority username does not bind its dedicated namespace and ServiceAccount",
+);
+invariant(
+	controlPlaneUsername === "system:serviceaccount:kobe-system:kobe" &&
+		controlPlaneUsername !== authorityUsername,
+	"startup contract does not name the distinct general control-plane identity",
+);
+for (const [name, value] of [
+	["authority policy", authorityPolicyName],
+	["identity firewall", firewallPolicyName],
+] as const) {
+	invariant(
+		value.length > 0 && value.length <= 63 && /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(value),
+		`${name} has an invalid cluster-scoped name`,
+	);
+}
+invariant(
+	authorityPolicyName !== firewallPolicyName,
+	"field authority policy and identity firewall share one name",
+);
+
+for (const [mode, documents] of [
+	["disabled", disabled],
+	["external", external],
+] as const) {
+	const deployment = objectNamed(documents, "Deployment", "kobe-teardown-authority");
+	invariant(deployment, `${mode} omitted the teardown-authority Deployment`);
+	const pod = ((deployment.spec as Record<string, unknown>).template as Record<
+		string,
+		unknown
+	>).spec as Record<string, unknown>;
+	const container = (pod.containers as Record<string, unknown>[])[0];
+	const env = new Map(
+		(container.env as Record<string, unknown>[]).map((entry) => [
+			String(entry.name),
+			entry.value,
+		]),
+	);
+	invariant(
+		env.get("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME") === authorityPolicyName &&
+			env.get("KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME") === firewallPolicyName,
+		`${mode} changed the mandatory startup policy pair`,
+	);
+}
+
+const otherNamespace = parseDocuments(await helm("external", "kobe", "other-system"));
+const otherAuthority = objectNamed(
+	otherNamespace,
+	"Deployment",
+	"kobe-teardown-authority",
+);
+invariant(otherAuthority, "second namespace omitted teardown authority");
+const otherPod = ((otherAuthority.spec as Record<string, unknown>)
+	.template as Record<string, unknown>).spec as Record<string, unknown>;
+const otherEnv = new Map(
+	((otherPod.containers as Record<string, unknown>[])[0].env as Record<
+		string,
+		unknown
+	>[]).map((entry) => [String(entry.name), entry.value]),
+);
+invariant(
+	otherEnv.get("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME") !== authorityPolicyName &&
+		otherEnv.get("KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME") !== firewallPolicyName,
+	"equal release names in different namespaces collide on cluster-scoped policy names",
 );
 
 const controlPlane = objectNamed(external, "Deployment", "kobe");

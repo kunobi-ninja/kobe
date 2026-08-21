@@ -711,7 +711,19 @@ async fn run_teardown_authority(
         .map_err(|_| anyhow::anyhow!("KOBE_TEARDOWN_AUTHORITY_USERNAME is required"))?;
     let policy_name = std::env::var("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME")
         .map_err(|_| anyhow::anyhow!("KOBE_TEARDOWN_AUTHORITY_POLICY_NAME is required"))?;
-    receipt_authority::validate(&client, &policy_name, &expected_username).await?;
+    let firewall_policy_name = std::env::var("KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME")
+        .map_err(|_| anyhow::anyhow!("KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME is required"))?;
+    let control_plane_username = std::env::var("KOBE_CONTROL_PLANE_USERNAME")
+        .map_err(|_| anyhow::anyhow!("KOBE_CONTROL_PLANE_USERNAME is required"))?;
+    receipt_authority::validate(
+        &client,
+        &policy_name,
+        &firewall_policy_name,
+        &expected_username,
+        &control_plane_username,
+        &authority_namespace,
+    )
+    .await?;
 
     let leader_election = kunobi_ha::leader::LeaderElection::builder(
         client.clone(),

@@ -28,17 +28,25 @@ use crate::crd::{TeardownAcknowledgement, TeardownEvidenceReference};
         .message("status.teardownAttemptId changes only when a new InProgress retry is durably begun"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || (has(self.spec.cleanupMode) ? self.status.binding.cleanupMode == self.spec.cleanupMode : self.status.binding.cleanupMode == 'Standard')")
         .message("status.binding cleanupMode must match the immutable lease cleanup contract"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || (self.status.binding.bindingId.size() > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && self.status.binding.lease.name == self.metadata.name && self.status.binding.instance.name.size() > 0 && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.pool.name == self.spec.poolRef && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest))")
+        .message("VerifiedDestroy binding must carry complete UID/generation-fenced lease, instance, pool, backend, and creation provenance"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || (has(self.status) && self.status != null && has(self.status.binding) && self.status.binding.bindingId == oldSelf.status.binding.bindingId && self.status.binding.lease == oldSelf.status.binding.lease && self.status.binding.instance == oldSelf.status.binding.instance && self.status.binding.pool == oldSelf.status.binding.pool && self.status.binding.backend == oldSelf.status.binding.backend && self.status.binding.instanceSpecDigest == oldSelf.status.binding.instanceSpecDigest && self.status.binding.cleanupMode == oldSelf.status.binding.cleanupMode && has(self.status.binding.creationManifestDigest) == has(oldSelf.status.binding.creationManifestDigest) && (!has(oldSelf.status.binding.creationManifestDigest) || self.status.binding.creationManifestDigest == oldSelf.status.binding.creationManifestDigest) && has(self.status.binding.creationManifest) == has(oldSelf.status.binding.creationManifest) && (!has(oldSelf.status.binding.creationManifest) || self.status.binding.creationManifest == oldSelf.status.binding.creationManifest) && (!has(oldSelf.status.binding.connectToken) || (has(self.status.binding.connectToken) && self.status.binding.connectToken == oldSelf.status.binding.connectToken)))")
+        .message("VerifiedDestroy binding provenance is write-once and its connect-token identity is monotonic"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || !has(self.status.clusterName) || self.status.clusterName == self.status.binding.instance.name")
+        .message("VerifiedDestroy clusterName must project the exact bound instance"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || !has(oldSelf.status.clusterName) || (has(self.status) && self.status != null && has(self.status.clusterName) && self.status.clusterName == oldSelf.status.clusterName)")
+        .message("VerifiedDestroy clusterName is immutable once published"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.teardownReceipt) || (has(self.status.binding) && has(self.status.teardownAttemptId) && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId && self.status.teardownReceipt.cleanupMode == self.status.binding.cleanupMode)")
         .message("status.teardownReceipt must match the durable attempt and reciprocal binding cleanup contract"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.unboundReleaseVerifiedAt) || (has(self.status.teardownAttemptId) && !has(self.status.binding) && !has(self.status.clusterName) && !has(self.status.teardownReceipt) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'))")
-        .message("unbound release proof requires an attempt-bound NeverBound condition and no allocation identity"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.unboundReleaseVerifiedAt) || (self.status.phase in ['Released', 'Expired'] && has(self.status.teardownAttemptId) && (!has(self.status.binding) || (self.status.binding.cleanupMode == 'VerifiedDestroy' && !has(self.status.binding.connectToken) && has(self.status.connectTokenCreation) && self.status.connectTokenCreation.phase == 'closed' && !has(self.status.connectTokenCreation.identity) && has(self.status.connectTokenCreation.verifiedAbsentAt) && self.status.connectTokenCreation.verifiedAbsentAt == self.status.unboundReleaseVerifiedAt)) && !has(self.status.clusterName) && !has(self.status.teardownReceipt) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'))")
+        .message("unbound release proof requires an attempt-bound NeverBound condition and either no intent or a retained pre-create intent"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAcknowledgement) || (has(self.status) && self.status != null && has(self.status.teardownAcknowledgement) && self.status.teardownAcknowledgement == oldSelf.status.teardownAcknowledgement)")
         .message("status.teardownAcknowledgement is immutable once authority records it"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.teardownAcknowledgement) || ((self.status.teardownAcknowledgement.proof.kind == 'receipt' && has(self.status.teardownAcknowledgement.proof.receiptToken) && has(self.status.teardownAcknowledgement.proof.evidence) && !has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)) || (self.status.teardownAcknowledgement.proof.kind == 'neverBound' && !has(self.status.teardownAcknowledgement.proof.receiptToken) && !has(self.status.teardownAcknowledgement.proof.evidence) && has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)))")
         .message("status.teardownAcknowledgement proof payload must match its kind"),
-    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.attemptId == oldSelf.status.connectTokenCreation.attemptId || (oldSelf.status.connectTokenCreation.phase == 'closed' && self.status.connectTokenCreation.phase == 'prepared')))")
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.attemptId == oldSelf.status.connectTokenCreation.attemptId || (oldSelf.status.phase == 'Pending' && !has(oldSelf.status.unboundReleaseVerifiedAt) && oldSelf.status.connectTokenCreation.phase == 'closed' && self.status.connectTokenCreation.phase == 'prepared')))")
         .message("status.connectTokenCreation attempt changes only after the prior attempt is Closed"),
-    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.phase == oldSelf.status.connectTokenCreation.phase || (oldSelf.status.connectTokenCreation.phase == 'prepared' && self.status.connectTokenCreation.phase in ['creating', 'closed']) || (oldSelf.status.connectTokenCreation.phase == 'creating' && self.status.connectTokenCreation.phase in ['reserved', 'closing']) || (oldSelf.status.connectTokenCreation.phase == 'reserved' && self.status.connectTokenCreation.phase in ['ready', 'closing']) || (oldSelf.status.connectTokenCreation.phase == 'ready' && self.status.connectTokenCreation.phase == 'closing') || (oldSelf.status.connectTokenCreation.phase == 'closing' && self.status.connectTokenCreation.phase == 'closed') || (oldSelf.status.connectTokenCreation.phase == 'closed' && self.status.connectTokenCreation.phase == 'prepared')))")
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.phase == oldSelf.status.connectTokenCreation.phase || (oldSelf.status.connectTokenCreation.phase == 'prepared' && self.status.connectTokenCreation.phase in ['creating', 'closed']) || (oldSelf.status.connectTokenCreation.phase == 'creating' && self.status.connectTokenCreation.phase in ['reserved', 'closing']) || (oldSelf.status.connectTokenCreation.phase == 'reserved' && self.status.connectTokenCreation.phase in ['ready', 'closing']) || (oldSelf.status.connectTokenCreation.phase == 'ready' && self.status.connectTokenCreation.phase == 'closing') || (oldSelf.status.connectTokenCreation.phase == 'closing' && self.status.connectTokenCreation.phase == 'closed') || (oldSelf.status.phase == 'Pending' && !has(oldSelf.status.unboundReleaseVerifiedAt) && oldSelf.status.connectTokenCreation.phase == 'closed' && self.status.connectTokenCreation.phase == 'prepared')))")
         .message("status.connectTokenCreation phase transitions are monotonic"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || ((self.status.connectTokenCreation.phase in ['prepared', 'creating'] && !has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase in ['reserved', 'ready', 'closing'] && has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase == 'closed' && has(self.status.connectTokenCreation.verifiedAbsentAt)))")
         .message("status.connectTokenCreation payload must match its phase"),
@@ -106,6 +114,11 @@ pub struct ClusterLeaseStatus {
     /// authorized only after the lease reaches `Bound` and the exact same value
     /// exists on the referenced `ClusterInstance`.
     ///
+    /// A `VerifiedDestroy` intent is write-once. If release closes it before
+    /// token creation, the exact value remains alongside `NeverBound` proof so
+    /// consumers can distinguish "intent retained, instance absent" from "no
+    /// intent was ever recorded".
+    ///
     /// `clusterName` remains for compatibility and display, but must never be
     /// used alone for access, mutation, rollback, release, or teardown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,10 +166,11 @@ pub struct ClusterLeaseStatus {
     pub connect_token_creation: Option<ConnectTokenCreation>,
 
     /// API-server-observed proof that this exact terminal lease never acquired
-    /// a reciprocal `ClusterInstance` binding. The proof is meaningful only
-    /// with the same status' immutable [`Self::teardown_attempt_id`] and a
-    /// `Closed` [`ConnectTokenCreation`]. It is retained until the composing
-    /// Sandbox explicitly acknowledges that attempt.
+    /// a reciprocal `ClusterInstance` binding. A pre-create binding intent may
+    /// remain as immutable audit provenance; it must have no token identity and
+    /// its creator must be `Closed`. The proof is meaningful only with the same
+    /// status' immutable [`Self::teardown_attempt_id`] and is retained until the
+    /// composing Sandbox explicitly acknowledges that attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
     pub unbound_release_verified_at: Option<String>,
@@ -752,6 +766,17 @@ mod json_safety_tests {
             "status.binding.cleanupMode == self.spec.cleanupMode",
             "status.teardownReceipt.attemptId == self.status.teardownAttemptId",
             "c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'",
+            "self.status.binding.bindingId == oldSelf.status.binding.bindingId",
+            "self.status.binding.connectToken == oldSelf.status.binding.connectToken",
+            "self.status.binding.lease.uid.size() > 0",
+            "self.status.binding.lease.name == self.metadata.name",
+            "self.status.binding.instance.uid.size() > 0",
+            "self.status.binding.pool.uid.size() > 0",
+            "self.status.binding.creationManifestDigest.size() > 0",
+            "self.status.clusterName == oldSelf.status.clusterName",
+            "self.status.clusterName == self.status.binding.instance.name",
+            "self.status.connectTokenCreation.verifiedAbsentAt == self.status.unboundReleaseVerifiedAt",
+            "self.status.phase in ['Released', 'Expired']",
         ] {
             assert!(rules.iter().any(|rule| {
                 rule["rule"]

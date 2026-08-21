@@ -703,8 +703,15 @@ async fn reconcile_release_authority(
         }
     };
 
-    if unbound_release_proof_is_complete(&status) || status.teardown_receipt.is_some() {
+    if unbound_release_proof_is_complete_for_lease(&lease, &status)
+        || status.teardown_receipt.is_some()
+    {
         return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+    if status.unbound_release_verified_at.is_some() {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "NeverBound proof does not match the exact retained lease intent"
+        )));
     }
     let Some(verified_at) =
         authority_never_bound_observation(&ctx.client, &ctx.namespace, &lease).await?
@@ -745,17 +752,68 @@ async fn persist_authority_teardown_attempt(
     }
 }
 
+/// Whether a retained verified binding is durably known to have stopped before
+/// any create-capable token request could be dispatched.
+///
+/// The binding intent remains an immutable audit handle. `Closed` with no
+/// identity can only be reached directly from `Prepared`; every path that
+/// reached `Creating` must first recover an exact token UID and route through
+/// receipt-backed teardown instead.
+fn retained_unstarted_binding_is_closed(status: &ClusterLeaseStatus) -> bool {
+    let Some(binding) = status.binding.as_ref() else {
+        return false;
+    };
+    let Some(creation) = status.connect_token_creation.as_ref() else {
+        return false;
+    };
+    binding.cleanup_mode == CleanupMode::VerifiedDestroy
+        && binding.connect_token.is_none()
+        && creation.phase == ConnectTokenCreationPhase::Closed
+        && creation.identity.is_none()
+        && creation
+            .verified_absent_at
+            .as_deref()
+            .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+        && status.cluster_name.is_none()
+}
+
+/// Require the retained pre-create intent to name this exact lease and pool.
+pub(crate) fn retained_unstarted_binding_matches_lease(
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> bool {
+    let Some(binding) = status.binding.as_ref() else {
+        return false;
+    };
+    retained_unstarted_binding_is_closed(status)
+        && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+        && binding.lease.name == lease.name_any()
+        && binding.lease.uid.as_deref() == lease.uid().as_deref()
+        && binding.pool.name == lease.spec.pool_ref
+        && binding
+            .pool
+            .uid
+            .as_deref()
+            .is_some_and(|uid| !uid.is_empty())
+        && !binding.instance.name.is_empty()
+        && !binding.instance.uid.is_empty()
+        && binding.instance.observed_generation > 0
+}
+
 /// Return an authority timestamp only when the exact terminal attempt cannot
 /// have a reciprocal instance allocation and its create-capable token name is
-/// closed. A missing candidate after a binding intent is ambiguous: it may
-/// have been bound and deleted, so it is never `NeverBound` evidence.
+/// closed. A retained intent is accepted only in the unique `Prepared ->
+/// Closed` shape, then a full instance list proves that neither its exact
+/// candidate nor any other instance acquired this lease UID.
 async fn authority_never_bound_observation(
     client: &Client,
     namespace: &str,
     lease: &ClusterLease,
 ) -> Result<Option<String>, LeaseError> {
     let status = lease.status.as_ref().cloned().unwrap_or_default();
-    if status.cluster_name.is_some() || status.binding.is_some() {
+    if status.cluster_name.is_some()
+        || (status.binding.is_some() && !retained_unstarted_binding_matches_lease(lease, &status))
+    {
         return Ok(None);
     }
     let verified_at = match status.connect_token_creation.as_ref() {
@@ -793,7 +851,7 @@ async fn authority_never_bound_observation(
             }
             verified_at
         }
-        // No creator state plus no binding is the durable pre-allocation
+        // No creator state plus no binding is the legacy-safe durable pre-allocation
         // checkpoint: this protocol never permits a Secret POST before both
         // values exist in one status write.
         None if status.binding.is_none() => {
@@ -852,7 +910,7 @@ async fn record_authority_unbound_release_proof(
 ) -> Result<(), LeaseError> {
     if status.teardown_attempt_id.as_deref() != Some(attempt)
         || status.cluster_name.is_some()
-        || status.binding.is_some()
+        || (status.binding.is_some() && !retained_unstarted_binding_matches_lease(lease, status))
         || status.teardown_receipt.is_some()
     {
         return Err(LeaseError::Lifecycle(anyhow::anyhow!(
@@ -1421,26 +1479,33 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     terminal_lease = closed_lease;
                     terminal_status = terminal_lease.status.clone().unwrap_or_default();
 
-                    // A persisted binding intent is never `NeverBound` proof.
-                    // A stale allocator may already have passed its final
-                    // lease-side check, so adopt the exact candidate into the
-                    // reciprocal teardown path. Competing patches converge on
-                    // the same binding; any different subject fails closed.
-                    if reserve_binding_instance_after_lease_fence(&ctx.client, &ns, &closed_binding)
-                        .await?
-                        != ReservationOutcome::Reserved
+                    if !retained_unstarted_binding_matches_lease(&terminal_lease, &terminal_status)
                     {
-                        mark_binding_unverified(
-                            &leases_api,
-                            &terminal_lease,
-                            "binding_intent_could_not_be_adopted_for_teardown",
+                        // Once creation advanced past Prepared, a persisted
+                        // intent may already have a delayed reservation. Adopt
+                        // the exact candidate into receipt-backed teardown;
+                        // only the pre-create Closed shape is eligible for an
+                        // authority-observed NeverBound proof.
+                        if reserve_binding_instance_after_lease_fence(
+                            &ctx.client,
+                            &ns,
+                            &closed_binding,
                         )
-                        .await?;
-                        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                        .await?
+                            != ReservationOutcome::Reserved
+                        {
+                            mark_binding_unverified(
+                                &leases_api,
+                                &terminal_lease,
+                                "binding_intent_could_not_be_adopted_for_teardown",
+                            )
+                            .await?;
+                            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                        }
                     }
                 }
 
-                if unbound_release_proof_is_complete(&terminal_status) {
+                if unbound_release_proof_is_complete_for_lease(&terminal_lease, &terminal_status) {
                     if !unbound_release_proof_acknowledged(&terminal_lease, &terminal_status) {
                         debug!(lease = %name, "retaining NeverBound proof until its exact attempt is acknowledged");
                         return Ok(Action::requeue(std::time::Duration::from_secs(30)));
@@ -1460,7 +1525,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     return Ok(Action::await_change());
                 }
 
-                if terminal_status.binding.is_none() && terminal_status.cluster_name.is_none() {
+                let never_bound_candidate = terminal_status.cluster_name.is_none()
+                    && (terminal_status.binding.is_none()
+                        || retained_unstarted_binding_matches_lease(
+                            &terminal_lease,
+                            &terminal_status,
+                        ));
+                if never_bound_candidate {
                     let creator_closed = terminal_status
                         .connect_token_creation
                         .as_ref()
@@ -1478,7 +1549,10 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                         return Ok(Action::requeue(std::time::Duration::from_secs(30)));
                     }
 
-                    if !unbound_release_proof_is_complete(&terminal_status) {
+                    if !unbound_release_proof_is_complete_for_lease(
+                        &terminal_lease,
+                        &terminal_status,
+                    ) {
                         // Handles created before the new protocol may carry an
                         // owner-fenced token with no binding. The release
                         // attempt above is already durable; delete its exact
@@ -1497,12 +1571,16 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             .teardown_attempt_id
                             .as_deref()
                             .expect("durable attempt checked above");
-                        let verified_at = terminal_status
-                            .connect_token_creation
-                            .as_ref()
-                            .and_then(|creation| creation.verified_absent_at.clone())
-                            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                         if !crate::receipt_authority::is_separate() {
+                            let Some(verified_at) = authority_never_bound_observation(
+                                &ctx.client,
+                                &ns,
+                                &terminal_lease,
+                            )
+                            .await?
+                            else {
+                                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                            };
                             record_unbound_release_proof(
                                 &leases_api,
                                 &terminal_lease,
@@ -2275,6 +2353,11 @@ fn teardown_receipt_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStat
 
 /// A `NeverBound` proof is attempt-bound and may exist only after the
 /// create-capable token state is absent or durably Closed.
+///
+/// A verified binding intent is deliberately retained when its creator was
+/// closed directly from `Prepared`. Keeping that exact identity prevents a
+/// later reader from mistaking "no reciprocal allocation" for "no intent ever
+/// existed", while the closed creator makes delayed token creation impossible.
 fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
     let attempt = status
         .teardown_attempt_id
@@ -2294,8 +2377,9 @@ fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
         });
     attempt.is_some()
         && verified_at.is_some()
+        && matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
         && creator_closed
-        && status.binding.is_none()
+        && (status.binding.is_none() || retained_unstarted_binding_is_closed(status))
         && status.cluster_name.is_none()
         && status.teardown_receipt.is_none()
         && status.teardown_evidence.is_none()
@@ -2305,6 +2389,14 @@ fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
                 && condition.reason == "NeverBound"
                 && condition.message.contains(attempt.unwrap())
         })
+}
+
+fn unbound_release_proof_is_complete_for_lease(
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> bool {
+    unbound_release_proof_is_complete(status)
+        && (status.binding.is_none() || retained_unstarted_binding_matches_lease(lease, status))
 }
 
 fn unbound_release_proof_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
@@ -2386,8 +2478,8 @@ async fn record_unbound_release_proof(
     verified_at: &str,
 ) -> Result<(), LeaseError> {
     if status.teardown_attempt_id.as_deref() != Some(attempt)
-        || status.binding.is_some()
         || status.cluster_name.is_some()
+        || (status.binding.is_some() && !retained_unstarted_binding_matches_lease(lease, status))
         || status.teardown_receipt.is_some()
     {
         return Err(LeaseError::Lifecycle(anyhow::anyhow!(
@@ -2408,7 +2500,7 @@ async fn record_unbound_release_proof(
         condition_type: ALLOCATION_ABSENT_CONDITION.into(),
         status: "True".into(),
         reason: "NeverBound".into(),
-        message: format!("release attempt {attempt} proved no binding was ever created"),
+        message: format!("release attempt {attempt} proved no reciprocal allocation existed"),
         last_transition_time: Some(verified_at.to_string()),
     });
     let patch = json_patch(serde_json::json!([
@@ -2487,7 +2579,6 @@ async fn close_terminal_connect_token_creation(
 
     let mut next_binding = binding.clone();
     let mut next_creation = creation.clone();
-    let mut clear_unstarted_binding = false;
     match creation.phase {
         ConnectTokenCreationPhase::Prepared => {
             if creation.identity.is_some() || binding.connect_token.is_some() {
@@ -2500,13 +2591,11 @@ async fn close_terminal_connect_token_creation(
             // therefore proves no create was dispatched for this attempt.
             next_creation.phase = ConnectTokenCreationPhase::Closed;
             next_creation.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
-            // No reservation can be in flight before Creating, so this exact
-            // candidate was never exposed and does not need a backend receipt.
-            // Clear the intent in the same CAS that closes its creator; the
-            // authority can then issue attempt-bound NeverBound proof after
-            // independently observing the deterministic Secret and every
-            // reciprocal ClusterInstance absent.
-            clear_unstarted_binding = true;
+            // No reservation can be in flight before Creating. Retain the
+            // exact intent as an audit handle while closing its creator in the
+            // same CAS; the authority may later prove the referenced instance
+            // and every other reciprocal lease UID absent without pretending
+            // the intent never existed.
         }
         ConnectTokenCreationPhase::Creating => {
             if creation.identity.is_some() || binding.connect_token.is_some() {
@@ -2581,15 +2670,9 @@ async fn close_terminal_connect_token_creation(
         serde_json::json!({ "op": "test", "path": "/status/binding", "value": binding }),
         serde_json::json!({ "op": "test", "path": "/status/connectTokenCreation", "value": creation }),
     ];
-    if clear_unstarted_binding {
-        operations.push(serde_json::json!({
-            "op": "remove", "path": "/status/binding"
-        }));
-    } else {
-        operations.push(serde_json::json!({
-            "op": "add", "path": "/status/binding", "value": next_binding
-        }));
-    }
+    operations.push(serde_json::json!({
+        "op": "add", "path": "/status/binding", "value": next_binding
+    }));
     operations.push(serde_json::json!({
         "op": "add", "path": "/status/connectTokenCreation", "value": next_creation
     }));
@@ -3049,9 +3132,10 @@ async fn complete_connect_token_creation(
             return Ok(None);
         }
         ConnectTokenCreationPhase::Closed => {
-            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-                "Closed token attempt still carries a binding intent"
-            )));
+            // Verified intents are write-once. A candidate lost after token
+            // creation therefore remains a closed, auditable handle instead
+            // of being erased and replaced with a different capability.
+            return Ok(None);
         }
     };
 
@@ -3173,6 +3257,19 @@ async fn reserve_ready_instance(
     lease: &ClusterLease,
     factory: Option<&BackendFactory>,
 ) -> Result<Option<LeaseBinding>, LeaseError> {
+    // A resumed intent is already authority-bearing. Revalidate it before the
+    // idempotent receipt-fence metadata upgrade so a replaced outer pool can
+    // never cause even an unrelated write. The check is deliberately repeated
+    // below after that CAS to close the metadata-update race.
+    if let Some(binding) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.as_ref())
+        && !sandbox_composition_binding_is_authorized(client, namespace, lease, binding).await?
+    {
+        warn!(lease = %lease.name_any(), "Cannot upgrade reservation whose pool differs from the outer Sandbox authority");
+        return Ok(None);
+    }
     let lease = ensure_receipt_retention_finalizer(client, namespace, lease).await?;
     if let Some(binding) = lease
         .status
@@ -3630,10 +3727,9 @@ async fn reserve_binding_instance_after_lease_fence(
 ///
 /// `Closing` is persisted before deleting the exact Secret UID. A crash after
 /// deletion therefore resumes deletion/absence observation instead of trying
-/// to activate or recreate the credential. The final patch retains the Closed
-/// attempt while atomically removing its abandoned binding; only a later
-/// `Closed -> Prepared` transition may open a fresh attempt for a new
-/// candidate.
+/// to activate or recreate the credential. Verified binding intent is retained
+/// with the Closed attempt: it is an immutable audit handle, not a slot that
+/// may be silently rewritten to a different candidate.
 async fn close_abandoned_pending_binding(
     client: &Client,
     namespace: &str,
@@ -3718,7 +3814,6 @@ async fn close_abandoned_pending_binding(
         { "op": "test", "path": "/status/phase", "value": "Pending" },
         { "op": "test", "path": "/status/binding", "value": binding },
         { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
-        { "op": "remove", "path": "/status/binding" },
         { "op": "add", "path": "/status/connectTokenCreation", "value": closed }
     ]));
     match leases
@@ -5266,7 +5361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_prepared_closes_creator_and_clears_unstarted_binding_atomically() {
+    async fn terminal_prepared_closes_creator_and_retains_exact_intent_atomically() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5315,7 +5410,12 @@ mod tests {
         let patch: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let operations = patch.as_array().unwrap();
         assert!(operations.iter().any(|operation| {
-            operation["op"] == "remove" && operation["path"] == "/status/binding"
+            operation["op"] == "add"
+                && operation["path"] == "/status/binding"
+                && operation["value"] == serde_json::to_value(&binding).unwrap()
+        }));
+        assert!(operations.iter().all(|operation| {
+            !(operation["op"] == "remove" && operation["path"] == "/status/binding")
         }));
         assert!(operations.iter().any(|operation| {
             operation["path"] == "/status/connectTokenCreation"
@@ -5414,6 +5514,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn never_bound_proof_retains_the_exact_pre_create_intent() {
+        let mut lease = authority_unbound_lease();
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.binding = Some(binding.clone());
+            status.unbound_release_verified_at = Some("2026-01-01T00:00:00Z".into());
+            status.conditions.push(ClusterLeaseCondition {
+                condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+                status: "True".into(),
+                reason: "NeverBound".into(),
+                message: "release attempt teardown-1 proved no reciprocal allocation existed"
+                    .into(),
+                last_transition_time: Some("2026-01-01T00:00:00Z".into()),
+            });
+        }
+        let status = lease.status.as_ref().unwrap();
+
+        assert!(retained_unstarted_binding_matches_lease(&lease, status));
+        assert!(unbound_release_proof_is_complete(status));
+        assert!(unbound_release_proof_is_complete_for_lease(&lease, status));
+        assert_eq!(status.binding.as_ref(), Some(&binding));
+
+        let mut wrong_subject = lease.clone();
+        wrong_subject
+            .status
+            .as_mut()
+            .unwrap()
+            .binding
+            .as_mut()
+            .unwrap()
+            .lease
+            .uid = Some("other-lease-uid".into());
+        assert!(unbound_release_proof_is_complete(
+            wrong_subject.status.as_ref().unwrap()
+        ));
+        assert!(!unbound_release_proof_is_complete_for_lease(
+            &wrong_subject,
+            wrong_subject.status.as_ref().unwrap()
+        ));
+    }
+
     #[tokio::test]
     async fn release_authority_refuses_never_bound_when_any_reciprocal_instance_exists() {
         use wiremock::matchers::{method, path};
@@ -5461,7 +5605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_authority_refuses_any_persisted_binding_intent() {
+    async fn release_authority_refuses_a_non_pre_create_binding_intent() {
         let server = wiremock::MockServer::start().await;
         let client = crate::testutil::mock_k8s_client(&server);
         let mut lease = authority_unbound_lease();
@@ -5472,9 +5616,111 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "even an apparently uncommitted intent can race an in-flight instance reservation"
+            "only an exact VerifiedDestroy pre-create intent can become NeverBound"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_pre_create_intent_proves_exact_candidate_replacement_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        lease.status.as_mut().unwrap().binding = Some(binding);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut replacement = exact_instance_for_binding(None, "Ready");
+        replacement["metadata"]["uid"] = "replacement-instance-uid".into();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(vec![replacement])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "a same-name different-UID free instance is not the retained candidate"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == http::Method::GET)
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_creator_and_reserver_stop_at_the_terminal_lease_fence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        lease.metadata.resource_version = Some("10".into());
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            complete_connect_token_creation(&client, "test-ns", &lease, &binding)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reserve_binding_instance(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            ReservationOutcome::Retry
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the reserver performs a fresh lease GET"
+        );
+        assert!(requests.iter().all(|request| {
+            request.method == http::Method::GET
+                && !request.url.path().contains("/clusterinstances/")
+                && !request.url.path().contains("/secrets/")
+        }));
     }
 
     #[tokio::test]

@@ -192,6 +192,12 @@ pub struct BoundInstanceRef {
     namespaced,
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.creationManifest) || (has(self.status) && self.status != null && has(self.status.creationManifest) && self.status.creationManifest == oldSelf.status.creationManifest)")
         .message("status.creationManifest is immutable once sealed"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || (self.status.binding.bindingId.size() > 0 && self.metadata.name == self.status.binding.instance.name && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest) && has(self.spec.poolRef) && self.spec.poolRef == self.status.binding.pool && has(self.status.leaseRef) && self.status.leaseRef == self.status.binding.lease)")
+        .message("VerifiedDestroy instance binding must carry complete UID/generation-fenced reciprocal lease, instance, pool, backend, and creation provenance"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || (has(self.status) && self.status != null && has(self.status.binding) && self.status.binding == oldSelf.status.binding)")
+        .message("VerifiedDestroy instance binding is immutable once reserved"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || !has(oldSelf.status.leaseRef) || (has(self.status) && self.status != null && has(self.status.leaseRef) && self.status.leaseRef == oldSelf.status.leaseRef)")
+        .message("VerifiedDestroy instance leaseRef is immutable once reserved"),
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Lease","type":"string","jsonPath":".status.leaseRef.name"}"#,
     printcolumn = r#"{"name":"Manifest","type":"integer","jsonPath":".status.creationManifest.schemaVersion"}"#,
@@ -289,11 +295,11 @@ pub struct ClusterInstanceStatus {
     /// Lease currently attached to this instance.
     ///
     /// Intentionally NO `skip_serializing_if`: unlike the write-once
-    /// `spec_hash`/`created_with` fields, `lease_ref` is *actively managed*.
-    /// It is set at bind, retained through release/recycling as a teardown
-    /// handle, and cleared only when an exact orphan reservation is safely
-    /// returned to Ready. `None` is therefore a meaningful clear signal and
-    /// must serialize as `null` rather than be omitted.
+    /// `spec_hash`/`created_with` fields, `lease_ref` is *actively managed* for
+    /// Standard bindings. A `VerifiedDestroy` reference is write-once and is
+    /// retained through release/recycling as a teardown handle. `None` remains
+    /// a meaningful clear signal for Standard and legacy cleanup, so it must
+    /// serialize as `null` rather than be omitted.
     #[serde(default)]
     pub lease_ref: Option<ResourceRef>,
 
@@ -1151,6 +1157,27 @@ mod tests {
                 rule.contains("status.creationManifest == oldSelf.status.creationManifest")
             })
         }));
+        for expected in [
+            "self.status.binding == oldSelf.status.binding",
+            "self.status.leaseRef == oldSelf.status.leaseRef",
+            "self.status.leaseRef == self.status.binding.lease",
+            "self.spec.poolRef == self.status.binding.pool",
+            "self.metadata.name == self.status.binding.instance.name",
+            "self.status.binding.instance.uid.size() > 0",
+            "self.status.binding.instance.observedGeneration > 0",
+            "self.status.binding.lease.uid.size() > 0",
+            "self.status.binding.pool.uid.size() > 0",
+            "self.status.binding.creationManifestDigest.size() > 0",
+        ] {
+            assert!(
+                validations.iter().any(|validation| {
+                    validation["rule"]
+                        .as_str()
+                        .is_some_and(|rule| rule.contains(expected))
+                }),
+                "missing VerifiedDestroy reciprocal CEL fragment: {expected}"
+            );
+        }
         let manifest = &root["properties"]["status"]["properties"]["creationManifest"];
         for field in [
             "instance",

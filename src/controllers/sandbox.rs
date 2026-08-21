@@ -6725,10 +6725,12 @@ fn unbound_child_release_is_proven(
     recorded_instance: Option<&crate::crd::SandboxObjectReference>,
 ) -> bool {
     let status = current.status.as_ref().cloned().unwrap_or_default();
+    let allocation_identity_is_safe = status.binding.is_none()
+        || crate::controllers::lease::retained_unstarted_binding_matches_lease(current, &status);
     matches!(
         status.phase,
         crate::crd::LeasePhase::Released | crate::crd::LeasePhase::Expired
-    ) && status.binding.is_none()
+    ) && allocation_identity_is_safe
         && status.cluster_name.is_none()
         && status.teardown_receipt.is_none()
         && recorded_instance.is_none()
@@ -8218,7 +8220,13 @@ async fn reconcile_receipt_ack_authority(
             acknowledged_at: chrono::Utc::now().to_rfc3339(),
         }
     } else if let Some(checkpoint) = status.child_unbound_release_proof.as_ref() {
-        if validated_child_unbound_release_proof(&child, None).as_ref() != Some(checkpoint) {
+        let recorded_instance = status
+            .target
+            .as_ref()
+            .and_then(|target| target.child_cluster_instance.as_ref());
+        if validated_child_unbound_release_proof(&child, recorded_instance).as_ref()
+            != Some(checkpoint)
+        {
             return Ok(Action::requeue(std::time::Duration::from_secs(60)));
         }
         crate::crd::TeardownAcknowledgement {
@@ -14088,6 +14096,49 @@ pub(crate) mod tests {
             !composition_handle_matches_consumer(&exact, &consumer, &replacement),
             "a same-named replacement child cannot inherit an old consumer checkpoint"
         );
+    }
+
+    #[test]
+    fn receipt_authority_never_acknowledges_never_bound_after_outer_instance_checkpoint() {
+        let mut consumer = child_placed_lease("child-lease-uid");
+        let recorded_instance = consumer
+            .status
+            .as_ref()
+            .and_then(|status| status.target.as_ref())
+            .and_then(|target| target.child_cluster_instance.as_ref())
+            .cloned()
+            .expect("fixture records the child instance");
+        let mut child: crate::crd::ClusterLease =
+            serde_json::from_value(child_cluster_lease("child-lease-uid", "Released", None))
+                .unwrap();
+        let status = child.status.as_mut().unwrap();
+        status.teardown_attempt_id = Some("never-bound-attempt".into());
+        status.unbound_release_verified_at = Some("2026-08-20T00:00:00Z".into());
+        status.conditions.push(crate::crd::ClusterLeaseCondition {
+            condition_type: "AllocationAbsent".into(),
+            status: "True".into(),
+            reason: "NeverBound".into(),
+            message: "release attempt never-bound-attempt proved no reciprocal allocation existed"
+                .into(),
+            last_transition_time: Some("2026-08-20T00:00:00Z".into()),
+        });
+
+        assert!(validated_child_unbound_release_proof(&child, Some(&recorded_instance)).is_none());
+
+        consumer
+            .status
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .child_cluster_instance = None;
+        let now_unrecorded = consumer
+            .status
+            .as_ref()
+            .and_then(|status| status.target.as_ref())
+            .and_then(|target| target.child_cluster_instance.as_ref());
+        assert!(validated_child_unbound_release_proof(&child, now_unrecorded).is_some());
     }
 
     fn child_creation_manifest() -> crate::crd::TeardownCreationManifest {

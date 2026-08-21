@@ -59,7 +59,15 @@ Service account name.
 {{- end }}
 
 {{- define "kobe.teardownAuthorityPolicyName" -}}
-{{- printf "%s-teardown-authority" (include "kobe.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $prefix := printf "%s-teardown-authority" (include "kobe.fullname" .) | trunc 46 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix ($identity | sha256sum | trunc 12) -}}
+{{- end }}
+
+{{- define "kobe.teardownAuthorityFirewallPolicyName" -}}
+{{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $prefix := printf "%s-teardown-firewall" (include "kobe.fullname" .) | trunc 46 | trimSuffix "-" -}}
+{{- printf "%s-%s" $prefix ($identity | sha256sum | trunc 12) -}}
 {{- end }}
 
 {{/*
