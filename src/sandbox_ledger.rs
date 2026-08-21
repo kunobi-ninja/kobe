@@ -273,21 +273,28 @@ fn validate_objects(
         return Err(SandboxLedgerError::NotReady("ResourceQuota"));
     }
 
-    let spec = policy
-        .spec
-        .as_ref()
-        .ok_or(SandboxLedgerError::Invalid("ValidatingAdmissionPolicy"))?;
+    let spec = policy.spec.as_ref().ok_or(SandboxLedgerError::Invalid(
+        "ValidatingAdmissionPolicy.spec",
+    ))?;
     let constraints = spec
         .match_constraints
         .as_ref()
-        .ok_or(SandboxLedgerError::Invalid("ValidatingAdmissionPolicy"))?;
+        .ok_or(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.matchConstraints",
+        ))?;
     let rules = constraints
         .resource_rules
         .as_deref()
-        .ok_or(SandboxLedgerError::Invalid("ValidatingAdmissionPolicy"))?;
+        .ok_or(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.resourceRules",
+        ))?;
     let rule = match rules {
         [rule] => rule,
-        _ => return Err(SandboxLedgerError::Invalid("ValidatingAdmissionPolicy")),
+        _ => {
+            return Err(SandboxLedgerError::Invalid(
+                "ValidatingAdmissionPolicy.resourceRules",
+            ));
+        }
     };
     let exact_rule = rule.api_groups.as_deref() == Some(&["coordination.k8s.io".into()][..])
         && rule.api_versions.as_deref() == Some(&["v1".into()][..])
@@ -319,13 +326,30 @@ fn validate_objects(
         if normalized_expression(&writer.expression) == expected_writer_validation
             && normalized_expression(&canary.expression) == expected_canary_validation
             && canary.message.as_deref() == Some(POLICY_CANARY_MESSAGE));
-    if policy.name_any() != policy_name
-        || spec.failure_policy.as_deref() != Some("Fail")
-        || !exact_rule
-        || !exact_match
-        || !exact_validation
-    {
-        return Err(SandboxLedgerError::Invalid("ValidatingAdmissionPolicy"));
+    if policy.name_any() != policy_name {
+        return Err(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.metadata.name",
+        ));
+    }
+    if spec.failure_policy.as_deref() != Some("Fail") {
+        return Err(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.failurePolicy",
+        ));
+    }
+    if !exact_rule {
+        return Err(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.resourceRules",
+        ));
+    }
+    if !exact_match {
+        return Err(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.matchConditions",
+        ));
+    }
+    if !exact_validation {
+        return Err(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.validations",
+        ));
     }
     let policy_generation = policy
         .metadata
@@ -346,7 +370,9 @@ fn validate_objects(
         return Err(SandboxLedgerError::NotReady("ValidatingAdmissionPolicy"));
     }
     if !expression_warnings.is_empty() {
-        return Err(SandboxLedgerError::Invalid("ValidatingAdmissionPolicy"));
+        return Err(SandboxLedgerError::Invalid(
+            "ValidatingAdmissionPolicy.typeChecking",
+        ));
     }
 
     let binding_spec = binding.spec.as_ref().ok_or(SandboxLedgerError::Invalid(
