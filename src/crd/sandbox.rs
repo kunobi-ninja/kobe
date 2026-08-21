@@ -485,7 +485,7 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("status.target.childClusterKubeconfigSha256 is immutable once recorded"),
     validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))")
         .message("child kubeconfig Secret identity and payload digest must be checkpointed together"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == 'v1' && self.status.target.childClusterKubeconfigSecret.kind == 'Secret' && has(self.status.target.childClusterKubeconfigSecret.namespace) && has(self.status.target.childClusterInstance.namespace) && self.status.target.childClusterKubeconfigSecret.namespace == self.status.target.childClusterInstance.namespace && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + '-kubeconfig' && self.status.target.childClusterKubeconfigSha256.matches('^[0-9a-f]{64}$'))")
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == 'v1' && self.status.target.childClusterKubeconfigSecret.kind == 'Secret' && has(self.status.target.childClusterKubeconfigSecret.__namespace__) && has(self.status.target.childClusterInstance.__namespace__) && self.status.target.childClusterKubeconfigSecret.__namespace__ == self.status.target.childClusterInstance.__namespace__ && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + '-kubeconfig' && self.status.target.childClusterKubeconfigSha256.matches('^[0-9a-f]{64}$'))")
         .message("childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownMode) || (has(self.status) && self.status != null && has(self.status.childTeardownMode) && self.status.childTeardownMode == oldSelf.status.childTeardownMode)")
         .message("status.childTeardownMode is immutable once recorded"),
@@ -499,7 +499,7 @@ struct BoundedSandboxArgSchema(#[schemars(length(max = 4096))] String);
         .message("spec.placementAuthority is immutable"),
     validation = Rule::new("!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.spec.placementAuthority.kind == 'ClusterPool')")
         .message("spec.placementAuthority must identify a ClusterPool"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == 'management' && !has(self.spec.placementAuthority)) || (self.status.placement.type == 'childCluster' && (!has(self.spec.placementAuthority) || (self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.namespace == self.spec.placementAuthority.namespace && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))))")
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == 'management' && !has(self.spec.placementAuthority)) || (self.status.placement.type == 'childCluster' && (!has(self.spec.placementAuthority) || (self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.__namespace__ == self.spec.placementAuthority.__namespace__ && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))))")
         .message("resolved placement must match the immutable admission placementAuthority"),
     validation = Rule::new("!(has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == 'childCluster' && !has(self.spec.placementAuthority)) || (has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == 'childCluster' && !has(oldSelf.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)")
         .message("child placement without placementAuthority may only preserve an exact legacy placement"),
@@ -1600,6 +1600,16 @@ mod tests {
                 "missing root validation: {message}"
             );
         }
+        let secret_rule = validations
+            .iter()
+            .find(|validation| {
+                validation["message"]
+                    == "childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance"
+            })
+            .and_then(|validation| validation["rule"].as_str())
+            .expect("child kubeconfig Secret CEL");
+        assert!(secret_rule.contains(".__namespace__"));
+        assert!(!secret_rule.contains(".namespace"));
     }
 
     /// Every string or list traversed by a root CEL rule has a finite schema
@@ -1676,6 +1686,16 @@ mod tests {
                     .any(|validation| validation["message"] == message)
             );
         }
+        let resolved_rule = lease_validations
+            .iter()
+            .find(|validation| {
+                validation["message"]
+                    == "resolved placement must match the immutable admission placementAuthority"
+            })
+            .and_then(|validation| validation["rule"].as_str())
+            .expect("resolved placement CEL");
+        assert!(resolved_rule.contains(".__namespace__"));
+        assert!(!resolved_rule.contains(".namespace"));
         for message in [
             "child placement without placementAuthority may only preserve an exact legacy placement",
             "legacy child placement without placementAuthority may not be removed or changed",
