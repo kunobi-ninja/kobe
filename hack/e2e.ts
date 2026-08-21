@@ -1870,9 +1870,16 @@ async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   let lastError = `SandboxPool/${name} has not reported certification`;
   while (Date.now() < deadline) {
-    const current = await kubectlJson<ConformanceObject>(args, [
-      "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
-    ]);
+    let current: ConformanceObject;
+    try {
+      current = await kubectlJson<ConformanceObject>(args, [
+        "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+      ]);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await Bun.sleep(1_000);
+      continue;
+    }
     const blocker = sandboxPoolCertificationBlocker(current, name);
     requireConformance(blocker === undefined, blocker ?? "unreachable certification blocker");
     try {
