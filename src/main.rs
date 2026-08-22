@@ -98,8 +98,20 @@ impl ProcessRole {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // The Sandbox admission/teardown state machines poll deeply nested
+    // futures; a default 2MiB worker stack has been observed to overflow in
+    // debug builds. Give workers the same 8MiB a main thread gets so release
+    // headroom is never marginal. Revisit when the shared lease kernel
+    // flattens these paths.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // Install the rustls crypto provider before any TLS usage.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

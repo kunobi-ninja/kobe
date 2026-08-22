@@ -115,6 +115,12 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Tests
+        # Sandbox admission/teardown tests poll deeply nested futures on the
+        # libtest thread; the default 2MiB spawned-thread stack overflows in
+        # Linux debug builds ("fatal runtime error: stack overflow"). Match
+        # the 8MiB the production runtime workers are configured with.
+        env:
+          RUST_MIN_STACK: "8388608"
         run: cargo test --workspace
 
       # The release gate itself only runs on tag pushes (version-consistency),
