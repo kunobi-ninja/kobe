@@ -489,6 +489,10 @@ struct ListLeasesParams {
 
 #[derive(Deserialize)]
 struct ExtendLeaseRequest {
+    /// `extend_ttl` is this endpoint's historical spelling. `extendTtl` is
+    /// accepted too so a client can send one body shape to both this and the
+    /// Sandbox extend endpoint, which follows the newer camelCase convention.
+    #[serde(alias = "extendTtl")]
     extend_ttl: String,
 }
 

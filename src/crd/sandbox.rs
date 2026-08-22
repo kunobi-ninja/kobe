@@ -776,6 +776,14 @@ pub struct SandboxLeaseStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("format" = "date-time"))]
     pub expires_at: Option<String>,
+    /// Runtime TTL extensions already granted to this lease.
+    ///
+    /// Monotonic and never reset: the budget is spent per lease, not per
+    /// reconcile or per API replica. Absent on leases admitted before
+    /// extension existed, which reads as zero.
+    #[serde(default)]
+    #[schemars(range(min = 0))]
+    pub extensions_count: u32,
     /// Immutable reason the lease first entered `Releasing`. Persisted in the
     /// same status write as that phase so retries, later release requests, and
     /// controller restarts cannot change the terminal accounting outcome.

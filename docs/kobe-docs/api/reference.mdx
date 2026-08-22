@@ -26,6 +26,7 @@ signature.
 | `POST` | `/v1/sandbox-leases` | Required | Create a Sandbox lease from a SandboxPool |
 | `GET` | `/v1/sandbox-leases` | Required | List your Sandbox leases |
 | `GET` | `/v1/sandbox-leases/:id` | Required | Get one Sandbox lease |
+| `PATCH` | `/v1/sandbox-leases/:id` | Required | Extend a Sandbox lease TTL |
 | `DELETE` | `/v1/sandbox-leases/:id` | Required | Request Sandbox release |
 | `GET` | `/v1/sandbox-leases/:id/logs` | Required | Read the Sandbox log tail |
 | `POST` | `/v1/sandbox-leases/:id/executions` | Required | Run or reserve an idempotent execution |
@@ -370,6 +371,31 @@ as `Quarantined` without returning capacity.
 When resolved, the response may include non-secret placement and target object
 references with exact Kubernetes UIDs. It never includes bearer tokens or
 kubeconfigs.
+
+### `PATCH /v1/sandbox-leases/:id`
+
+Extends the runtime TTL of a `Ready` lease. The body takes `extendTtl` (or
+`extend_ttl`, so one body shape works against the cluster endpoint too):
+
+```json
+{ "extendTtl": "30m" }
+```
+
+The response reports the new expiry and the remaining budget:
+
+```json
+{ "expiresAt": "2026-08-10T01:32:00Z", "extensionsCount": 1, "maxExtensions": 2 }
+```
+
+Authorized by the `lease` verb rather than one of its own: an extension can
+never move expiry past `maxTtl` measured from readiness, which is the same
+ceiling the caller could have requested at creation. Set `maxExtensions: 0` on
+the Sandbox grant to forbid extension and require callers to commit up front.
+
+Refusals are all `409 Conflict` except a malformed or non-positive duration,
+which is `400 Bad Request`: a lease that is not `Ready`, an exhausted
+extension budget, an extension that would exceed the ceiling, or a lease that
+changed concurrently — the last is safe to retry against the current lease.
 
 ### `DELETE /v1/sandbox-leases/:id`
 

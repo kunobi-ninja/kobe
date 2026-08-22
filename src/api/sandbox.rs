@@ -90,7 +90,9 @@ pub fn routes<B: ClusterBackend + Clone + 'static>() -> Router<AppState<B>> {
         )
         .route(
             "/v1/sandbox-leases/{id}",
-            get(get_sandbox_lease::<B>).delete(release_sandbox_lease::<B>),
+            get(get_sandbox_lease::<B>)
+                .patch(extend_sandbox_lease::<B>)
+                .delete(release_sandbox_lease::<B>),
         )
         .route("/v1/sandbox-leases/{id}/logs", get(sandbox_logs::<B>))
         .route("/v1/sandbox-leases/{id}/exec", post(sandbox_exec::<B>))
@@ -4053,6 +4055,195 @@ async fn get_sandbox_lease<B: ClusterBackend>(
     (StatusCode::OK, Json(sandbox_lease_response(lease, None))).into_response()
 }
 
+/// Request body for [`extend_sandbox_lease`].
+///
+/// `extendTtl` is the Sandbox API's camelCase spelling; `extend_ttl` is
+/// accepted as an alias so one client body works against both this endpoint
+/// and the older cluster-lease endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExtendSandboxLeaseRequest {
+    #[serde(alias = "extend_ttl")]
+    extend_ttl: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtendSandboxLeaseResponse {
+    expires_at: String,
+    extensions_count: u32,
+    max_extensions: u32,
+}
+
+/// Extend the runtime TTL of a Ready Sandbox lease.
+///
+/// The cluster counterpart is `PATCH /v1/leases/{id}`; the shapes deliberately
+/// match so a client can treat both kinds the same way.
+///
+/// Authorized by the `lease` verb rather than a verb of its own. An extension
+/// can never move expiry past `max_ttl` measured from readiness — precisely
+/// the ceiling the caller could have requested at creation — so it grants no
+/// runtime that was not already available. Operators who want callers to
+/// commit up front set `maxExtensions: 0`.
+///
+/// The budget is read from the caller's live policy instead of a snapshot
+/// taken at admission: a grant that has since been narrowed, or removed
+/// entirely, must bind immediately rather than let an old allowance coast.
+#[tracing::instrument(skip_all)]
+async fn extend_sandbox_lease<B: ClusterBackend>(
+    State(state): State<AppState<B>>,
+    identity: AuthIdentity,
+    Path(id): Path<String>,
+    Json(request): Json<ExtendSandboxLeaseRequest>,
+) -> Response {
+    if let Err(response) = require_sandbox_crds(&state.client, &[SANDBOX_LEASE_CRD]).await {
+        return response;
+    }
+    let leases: Api<SandboxLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let lease = match owned_sandbox_lease(&leases, &id, &identity).await {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => return sandbox_infra_error("Failed to get Sandbox lease", err),
+    };
+    let policy = policy_for(&identity);
+    if !is_sandbox_allowed(&lease.spec.pool_ref.name, SandboxVerb::Lease, &policy) {
+        return sandbox_error(
+            StatusCode::FORBIDDEN,
+            "Sandbox lease extension is not allowed",
+            None,
+        );
+    }
+    let Some(grant) = policy.sandbox.as_ref() else {
+        return sandbox_error(
+            StatusCode::FORBIDDEN,
+            "Sandbox lease extension is not allowed",
+            None,
+        );
+    };
+
+    let mut status = lease.status.clone().unwrap_or_default();
+    if status.phase != SandboxLeasePhase::Ready {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox lease is not Ready",
+            Some(format!("current phase: {}", status.phase)),
+        );
+    }
+    if status.extensions_count >= grant.max_extensions {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Maximum Sandbox lease extensions reached",
+            Some(format!(
+                "{} of {} already used",
+                status.extensions_count, grant.max_extensions
+            )),
+        );
+    }
+
+    let Some(extension) = parse_duration(&request.extend_ttl) else {
+        return sandbox_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid extension duration",
+            Some(format!("could not parse {:?}", request.extend_ttl)),
+        );
+    };
+    // A non-positive extension would move expiry backwards. That is a release
+    // decision, and it must not be reachable through the extend path — which
+    // does not run any of the teardown accounting a real release does.
+    if extension <= chrono::Duration::zero() {
+        return sandbox_error(
+            StatusCode::BAD_REQUEST,
+            "Extension must be positive",
+            Some("use release to end a Sandbox lease early".into()),
+        );
+    }
+
+    // Readiness anchors the ceiling because Sandbox `maxTtl` is defined as
+    // runtime, and runtime does not begin until the Sandbox is usable.
+    let Some(ready_at) = status.ready_at.as_deref().and_then(parse_lease_timestamp) else {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox lease has no readiness timestamp",
+            Some("refusing to extend without an anchored maximum TTL".into()),
+        );
+    };
+    let Some(current_expiry) = status.expires_at.as_deref().and_then(parse_lease_timestamp) else {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox lease has no expiry",
+            Some("refusing to extend without a durable current expiry".into()),
+        );
+    };
+    let new_expiry = current_expiry + extension;
+    let ceiling = ready_at + grant.max_ttl;
+    if new_expiry > ceiling {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Extension would exceed the maximum Sandbox TTL",
+            Some(format!("maximum expiry is {}", ceiling.to_rfc3339())),
+        );
+    }
+
+    let Some(uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+        return sandbox_error(StatusCode::CONFLICT, "Sandbox lease has no UID", None);
+    };
+    let Some(resource_version) = lease.resource_version() else {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox lease has no resourceVersion",
+            None,
+        );
+    };
+    let next_count = status.extensions_count + 1;
+    status.expires_at = Some(new_expiry.to_rfc3339());
+    status.extensions_count = next_count;
+
+    // resourceVersion is the compare-and-swap. Two concurrent extends read the
+    // same version, so only one patch can land; the loser is told to retry
+    // rather than silently spending a second extension on the same budget.
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+    if let Err(err) = leases
+        .patch_status(&id, &PatchParams::default(), &Patch::Json::<()>(patch))
+        .await
+    {
+        if matches!(&err, kube::Error::Api(api) if api.code == 409 || api.code == 422) {
+            return sandbox_error(
+                StatusCode::CONFLICT,
+                "Sandbox lease changed during extension",
+                Some("retry the extension against the current lease".into()),
+            );
+        }
+        return sandbox_infra_error("Failed to extend Sandbox lease", err);
+    }
+
+    info!(
+        lease = %id,
+        new_expiry = %new_expiry,
+        extension_number = next_count,
+        "Sandbox lease TTL extended"
+    );
+    (
+        StatusCode::OK,
+        Json(ExtendSandboxLeaseResponse {
+            expires_at: new_expiry.to_rfc3339(),
+            extensions_count: next_count,
+            max_extensions: grant.max_extensions,
+        }),
+    )
+        .into_response()
+}
+
+/// Parse a durable RFC 3339 status timestamp.
+fn parse_lease_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
 #[tracing::instrument(skip_all)]
 async fn release_sandbox_lease<B: ClusterBackend>(
     State(state): State<AppState<B>>,
@@ -7142,6 +7333,7 @@ mod tests {
                     verbs: vec![SandboxVerb::Lease, SandboxVerb::Release],
                     max_ttl: chrono::Duration::hours(2),
                     max_concurrent_leases: 2,
+                    max_extensions: 2,
                     resource_ceiling: SandboxResourceCeiling {
                         max_cpu: "2".into(),
                         max_memory: "4Gi".into(),
@@ -8484,6 +8676,166 @@ mod tests {
         );
     }
 
+    /// A Ready lease anchored at `00:02` under the 2h grant in [`identity`],
+    /// so its ceiling is exactly `02:02` and a 1h extension of the `01:02`
+    /// expiry lands on it.
+    fn extendable_lease_json(name: &str, extensions_count: u32) -> serde_json::Value {
+        let mut lease = active_release_json(name, Some(SANDBOX_ADMISSION_ADMITTED));
+        lease["status"]["extensionsCount"] = serde_json::json!(extensions_count);
+        lease
+    }
+
+    fn sandbox_lease_path(name: &str) -> String {
+        format!("/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{name}")
+    }
+
+    /// Serve `lease` and capture the status patch the handler sends, if any.
+    async fn mount_extendable(
+        server: &MockServer,
+        lease: serde_json::Value,
+    ) -> Arc<std::sync::Mutex<Option<serde_json::Value>>> {
+        let name = lease["metadata"]["name"].as_str().unwrap().to_string();
+        let lease_path = sandbox_lease_path(&name);
+        mount_sandbox_crds(server).await;
+        Mock::given(method("GET"))
+            .and(path(lease_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.clone()))
+            .mount(server)
+            .await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        Mock::given(method("PATCH"))
+            .and(path(format!("{lease_path}/status")))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                let mut patched = lease.clone();
+                if let Some(add) = operations
+                    .as_array()
+                    .and_then(|ops| ops.iter().find(|op| op["path"] == "/status"))
+                {
+                    patched["status"] = add["value"].clone();
+                }
+                *sink.lock().unwrap() = Some(operations);
+                ResponseTemplate::new(200).set_body_json(patched)
+            })
+            .mount(server)
+            .await;
+        captured
+    }
+
+    async fn extend(server: &MockServer, name: &str, by: &str) -> axum::response::Response {
+        extend_sandbox_lease::<crate::testutil::MockBackend>(
+            State(test_state(server)),
+            identity(),
+            Path(name.into()),
+            Json(ExtendSandboxLeaseRequest {
+                extend_ttl: by.into(),
+            }),
+        )
+        .await
+    }
+
+    /// The durable effect is what matters: expiry moves and the budget is
+    /// spent in the same write, so a crash cannot grant a free extension.
+    #[tokio::test]
+    async fn extending_a_ready_lease_moves_expiry_and_spends_one_extension() {
+        let server = MockServer::start().await;
+        let captured = mount_extendable(&server, extendable_lease_json("sandbox-extend", 0)).await;
+
+        let response = extend(&server, "sandbox-extend", "30m").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let operations = captured.lock().unwrap().clone().expect("status patch");
+        let status = operations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["path"] == "/status")
+            .expect("status write")["value"]
+            .clone();
+        assert_eq!(status["extensionsCount"], 1);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(status["expiresAt"].as_str().unwrap()).unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2026-08-10T01:32:00Z").unwrap()
+        );
+        // resourceVersion is the compare-and-swap for a concurrent extend.
+        let tests: Vec<&str> = operations
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation["op"] == "test")
+            .map(|operation| operation["path"].as_str().unwrap())
+            .collect();
+        assert!(tests.contains(&"/metadata/uid"));
+        assert!(tests.contains(&"/metadata/resourceVersion"));
+    }
+
+    /// The ceiling is anchored at readiness, not at the moment of the call, so
+    /// repeated extensions cannot walk a lease past its granted runtime.
+    #[tokio::test]
+    async fn extension_cannot_exceed_the_granted_runtime_ceiling() {
+        let server = MockServer::start().await;
+        let captured = mount_extendable(&server, extendable_lease_json("sandbox-ceiling", 0)).await;
+
+        let response = extend(&server, "sandbox-ceiling", "2h").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "a refused extension must not write status"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_budget_is_exhausted_at_the_policy_limit() {
+        let server = MockServer::start().await;
+        // identity() grants two extensions.
+        let captured = mount_extendable(&server, extendable_lease_json("sandbox-budget", 2)).await;
+
+        let response = extend(&server, "sandbox-budget", "1m").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn only_a_ready_lease_can_be_extended() {
+        let server = MockServer::start().await;
+        let mut lease = extendable_lease_json("sandbox-pending-extend", 0);
+        lease["status"]["phase"] = serde_json::json!("Pending");
+        let captured = mount_extendable(&server, lease).await;
+
+        let response = extend(&server, "sandbox-pending-extend", "1m").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    /// Moving expiry backwards would end a lease without running any of the
+    /// teardown accounting release performs.
+    #[tokio::test]
+    async fn a_non_positive_extension_is_refused() {
+        let server = MockServer::start().await;
+        let captured =
+            mount_extendable(&server, extendable_lease_json("sandbox-negative", 0)).await;
+
+        for by in ["0s", "-5m"] {
+            let response = extend(&server, "sandbox-negative", by).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{by}");
+        }
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn another_principals_lease_cannot_be_extended() {
+        let server = MockServer::start().await;
+        let mut lease = extendable_lease_json("sandbox-foreign", 0);
+        lease["spec"]["requester"]["identity"] = serde_json::json!("mallory@example.com");
+        let captured = mount_extendable(&server, lease).await;
+
+        let response = extend(&server, "sandbox-foreign", "1m").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(captured.lock().unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn sandbox_routes_require_authentication() {
         let server = MockServer::start().await;
@@ -8492,6 +8844,7 @@ mod tests {
             ("GET", "/v1/sandbox-leases"),
             ("POST", "/v1/sandbox-leases"),
             ("GET", "/v1/sandbox-leases/sandbox-a"),
+            ("PATCH", "/v1/sandbox-leases/sandbox-a"),
             ("DELETE", "/v1/sandbox-leases/sandbox-a"),
         ] {
             let request = http::Request::builder()

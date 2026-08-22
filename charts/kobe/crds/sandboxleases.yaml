@@ -299,6 +299,17 @@ spec:
                 format: date-time
                 nullable: true
                 type: string
+              extensionsCount:
+                default: 0
+                description: |-
+                  Runtime TTL extensions already granted to this lease.
+
+                  Monotonic and never reset: the budget is spent per lease, not per
+                  reconcile or per API replica. Absent on leases admitted before
+                  extension existed, which reads as zero.
+                format: uint32
+                minimum: 0.0
+                type: integer
               observedGeneration:
                 format: int64
                 minimum: 0.0
