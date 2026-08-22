@@ -1202,8 +1202,18 @@ pub fn mark_sandbox_ready(
         return Err(SandboxLifecycleError::ProvisioningDeadlineElapsed);
     }
     let ready_at_string = ready_at.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+    // One derivation, one writer. Granted extensions are an INPUT here rather
+    // than a competing write of `expiresAt`, so this stays idempotent across
+    // requeues and the caller's extension reaches the upstream backstop the
+    // controller stamps from the value returned below.
+    let granted = chrono::Duration::try_seconds(status.granted_extension_seconds)
+        .ok_or(SandboxLifecycleError::TimestampOverflow)?;
+    if granted < chrono::Duration::zero() {
+        return Err(SandboxLifecycleError::InvalidDuration("granted extension"));
+    }
     let expires_at = ready_at
         .checked_add_signed(runtime_ttl)
+        .and_then(|value| value.checked_add_signed(granted))
         .ok_or(SandboxLifecycleError::TimestampOverflow)?
         .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
@@ -2088,6 +2098,34 @@ mod tests {
             mark_sandbox_ready(&provisioning, 2, ready_at, chrono::Duration::hours(1)).unwrap();
         assert_eq!(ready.ready_at.as_deref(), Some("2026-08-10T10:03:00Z"));
         assert_eq!(ready.expires_at.as_deref(), Some("2026-08-10T11:03:00Z"));
+
+        // A granted extension is an INPUT to this derivation, so re-running the
+        // Ready transition over an extended lease is idempotent. It used to be
+        // a second write of `expiresAt`, which made every later pass fail as a
+        // changed timestamp - so the controller requeued forever and never
+        // re-stamped the upstream shutdown backstop, letting upstream destroy
+        // the workload at its ORIGINAL deadline while the lease advertised the
+        // extended one.
+        let mut extended = ready.clone();
+        extended.granted_extension_seconds = 1800;
+        extended.expires_at = Some("2026-08-10T11:33:00Z".into());
+        let reconciled =
+            mark_sandbox_ready(&extended, 2, ready_at, chrono::Duration::hours(1)).unwrap();
+        assert_eq!(
+            reconciled.expires_at.as_deref(),
+            Some("2026-08-10T11:33:00Z")
+        );
+
+        // And an expiry that does NOT match the derivation is still refused,
+        // so the guard against an out-of-band writer is not weakened by it.
+        let mut forged = extended.clone();
+        forged.expires_at = Some("2026-08-10T12:33:00Z".into());
+        assert_eq!(
+            mark_sandbox_ready(&forged, 2, ready_at, chrono::Duration::hours(1)),
+            Err(SandboxLifecycleError::PersistedTimestampChanged(
+                "readyAt/expiresAt"
+            ))
+        );
         assert_eq!(
             transition_sandbox_phase(
                 SandboxLeasePhase::Releasing,

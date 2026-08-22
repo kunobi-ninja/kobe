@@ -4234,8 +4234,70 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
             Some("refusing to extend without a durable current expiry".into()),
         );
     };
+    // An expiry already in the past is a lease the reaper simply has not
+    // reached yet. Extending it would race expiry reconciliation and, if the
+    // write landed first, resurrect a lease whose workload upstream has
+    // already destroyed.
+    if current_expiry <= chrono::Utc::now() {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox lease has already expired",
+            Some("request a new lease instead of extending an elapsed one".into()),
+        );
+    }
+    // The ceiling is the LOWER of the caller's grant and the pool's own
+    // maximum, exactly as creation clamps it. Using the grant alone let a
+    // caller extend past an administrator's pool limit to runtime they could
+    // never have requested at creation - which is what made reusing the
+    // `lease` verb defensible in the first place.
+    let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    let pool_max_ttl = match pools.get(&lease.spec.pool_ref.name).await {
+        Ok(pool) => match parse_duration(&pool.spec.max_ttl)
+            .filter(|duration| *duration > chrono::Duration::zero())
+        {
+            Some(duration) => duration,
+            None => {
+                return sandbox_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SandboxPool maximum TTL is invalid",
+                    None,
+                );
+            }
+        },
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return sandbox_error(
+                StatusCode::CONFLICT,
+                "SandboxPool is no longer available",
+                Some("refusing to extend without the pool's own ceiling".into()),
+            );
+        }
+        Err(err) => return sandbox_infra_error("Failed to read the SandboxPool", err),
+    };
+
+    // Refuse to extend a status whose expiry is not the value this derivation
+    // produces. That means something else wrote it, and guessing which writer
+    // is authoritative is exactly the bug this shape exists to remove.
+    let Some(spec_ttl) =
+        parse_duration(&lease.spec.ttl).filter(|duration| *duration > chrono::Duration::zero())
+    else {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox lease has an invalid TTL",
+            None,
+        );
+    };
+    let expected_expiry =
+        ready_at + spec_ttl + chrono::Duration::seconds(status.granted_extension_seconds);
+    if current_expiry != expected_expiry {
+        return sandbox_error(
+            StatusCode::CONFLICT,
+            "Sandbox expiry does not match its derivation",
+            Some("refusing to extend a lease whose expiry was written out of band".into()),
+        );
+    }
+
     let new_expiry = current_expiry + extension;
-    let ceiling = ready_at + grant.max_ttl;
+    let ceiling = ready_at + grant.max_ttl.min(pool_max_ttl);
     if new_expiry > ceiling {
         return sandbox_error(
             StatusCode::CONFLICT,
@@ -4255,7 +4317,19 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
         );
     };
     let next_count = status.extensions_count + 1;
-    status.expires_at = Some(new_expiry.to_rfc3339());
+    // Move the derivation INPUT and write `expiresAt` to exactly the value the
+    // controller derives independently, so the Ready transition stays
+    // idempotent and the controller goes on to re-stamp the upstream shutdown
+    // backstop with the extended deadline.
+    let granted_total = status.granted_extension_seconds + extension.num_seconds();
+    let Some(derived_expiry) = ready_at
+        .checked_add_signed(spec_ttl)
+        .and_then(|value| value.checked_add_signed(chrono::Duration::seconds(granted_total)))
+    else {
+        return sandbox_error(StatusCode::CONFLICT, "Sandbox expiry would overflow", None);
+    };
+    status.granted_extension_seconds = granted_total;
+    status.expires_at = Some(derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
     status.extensions_count = next_count;
 
     // resourceVersion is the compare-and-swap. Two concurrent extends read the
@@ -4289,7 +4363,7 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
     (
         StatusCode::OK,
         Json(ExtendSandboxLeaseResponse {
-            expires_at: new_expiry.to_rfc3339(),
+            expires_at: derived_expiry.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
             extensions_count: next_count,
             max_extensions: grant.max_extensions,
         }),
@@ -8753,6 +8827,16 @@ mod tests {
     fn extendable_lease_json(name: &str, extensions_count: u32) -> serde_json::Value {
         let mut lease = active_release_json(name, Some(SANDBOX_ADMISSION_ADMITTED));
         lease["status"]["extensionsCount"] = serde_json::json!(extensions_count);
+        // Anchored on the running clock: extension refuses an elapsed lease,
+        // and refuses any expiry that is not exactly readyAt + spec.ttl +
+        // grantedExtension. spec.ttl is 1h in `lease_json`, the caller grant is
+        // 2h and the pool ceiling 4h, so the effective ceiling is readyAt + 2h.
+        let ready_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let expires_at = ready_at + chrono::Duration::hours(1);
+        lease["status"]["readyAt"] =
+            serde_json::json!(ready_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+        lease["status"]["expiresAt"] =
+            serde_json::json!(expires_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
         lease
     }
 
@@ -8768,6 +8852,13 @@ mod tests {
         let name = lease["metadata"]["name"].as_str().unwrap().to_string();
         let lease_path = sandbox_lease_path(&name);
         mount_sandbox_crds(server).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool_json()))
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path(lease_path.clone()))
             .respond_with(ResponseTemplate::new(200).set_body_json(lease.clone()))
@@ -8816,27 +8907,7 @@ mod tests {
         use crate::api::sandbox_credentials::SandboxOperation;
 
         let server = MockServer::start().await;
-        // Target resolution refuses an elapsed lease, so this fixture is
-        // anchored on the running clock rather than the suite's fixed dates.
-        let mut live = extendable_lease_json("sandbox-verbs", 0);
-        let now = chrono::Utc::now();
-        live["status"]["readyAt"] = serde_json::json!(
-            (now - chrono::Duration::minutes(1))
-                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-        );
-        live["status"]["expiresAt"] = serde_json::json!(
-            (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-        );
-        mount_extendable(&server, live).await;
-        // Target resolution reads the pool too; without it every route fails
-        // 503 before reaching the guard under test.
-        Mock::given(method("GET"))
-            .and(path(
-                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(pool_json()))
-            .mount(&server)
-            .await;
+        mount_extendable(&server, extendable_lease_json("sandbox-verbs", 0)).await;
         let mut restricted = identity();
         let grant = restricted.policy.sandbox.as_mut().unwrap();
         grant.verbs = vec![SandboxVerb::Lease, SandboxVerb::Release];
@@ -8929,8 +9000,20 @@ mod tests {
             .clone();
         assert_eq!(status["extensionsCount"], 1);
         assert_eq!(
-            chrono::DateTime::parse_from_rfc3339(status["expiresAt"].as_str().unwrap()).unwrap(),
-            chrono::DateTime::parse_from_rfc3339("2026-08-10T01:32:00Z").unwrap()
+            status["grantedExtensionSeconds"], 1800,
+            "the granted extension is the derivation input"
+        );
+        // expiresAt must equal readyAt + spec.ttl(1h) + granted(30m) exactly,
+        // because the controller derives the same value and rejects any other.
+        let ready_at =
+            chrono::DateTime::parse_from_rfc3339(status["readyAt"].as_str().expect("readyAt"))
+                .unwrap();
+        let written =
+            chrono::DateTime::parse_from_rfc3339(status["expiresAt"].as_str().expect("expiresAt"))
+                .unwrap();
+        assert_eq!(
+            written,
+            ready_at + chrono::Duration::hours(1) + chrono::Duration::minutes(30)
         );
         // resourceVersion is the compare-and-swap for a concurrent extend.
         let tests: Vec<&str> = operations

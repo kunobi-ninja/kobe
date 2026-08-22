@@ -784,6 +784,19 @@ pub struct SandboxLeaseStatus {
     #[serde(default)]
     #[schemars(range(min = 0))]
     pub extensions_count: u32,
+    /// Total granted extension, in seconds, added to the derived expiry.
+    ///
+    /// Expiry has exactly ONE derivation, `readyAt + spec.ttl + this`, and the
+    /// lifecycle controller recomputes it on every Ready pass. Extension
+    /// therefore moves this INPUT rather than writing `expiresAt` behind the
+    /// controller's back: a second writer of a derived value made the Ready
+    /// transition non-idempotent, so the controller rejected every later
+    /// reconcile and stopped re-asserting the upstream shutdown backstop,
+    /// leaving the workload to be destroyed at its original deadline while the
+    /// lease still advertised the extended one.
+    #[serde(default)]
+    #[schemars(range(min = 0))]
+    pub granted_extension_seconds: i64,
     /// Immutable reason the lease first entered `Releasing`. Persisted in the
     /// same status write as that phase so retries, later release requests, and
     /// controller restarts cannot change the terminal accounting outcome.
