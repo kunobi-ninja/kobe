@@ -249,6 +249,9 @@ async fn create_sandbox_execution<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
+    if let Some(response) = sandbox_verb_denied(&identity, &lease, SandboxVerb::Exec, "execution") {
+        return response;
+    }
     let container = match target.resolve_container(request.container.as_deref()) {
         Ok(container) => container.to_string(),
         Err(denied) => return access_denied(&identity, &id, "execution", denied),
@@ -1218,6 +1221,9 @@ async fn get_sandbox_execution<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
+    if let Some(response) = sandbox_verb_denied(&identity, &lease, SandboxVerb::Exec, "execution") {
+        return response;
+    }
 
     match crate::api::sandbox_executions::get_owned(
         &state.client,
@@ -1397,6 +1403,11 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "execution-logs", denied),
         };
+    if let Some(response) =
+        sandbox_verb_denied(&identity, &lease, SandboxVerb::Logs, "execution-logs")
+    {
+        return response;
+    }
     let record = match crate::api::sandbox_executions::get_owned(
         &state.client,
         &state.namespace,
@@ -1662,6 +1673,9 @@ async fn cancel_sandbox_execution<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "execution", denied),
         };
+    if let Some(response) = sandbox_verb_denied(&identity, &lease, SandboxVerb::Exec, "execution") {
+        return response;
+    }
 
     // Cancellation reaches the same Pod and runner as execution/log reads, so
     // it must enter the same distributed gate. Otherwise it could resolve a
@@ -2131,6 +2145,38 @@ fn stream_registration_denied(
     }
 }
 
+/// Authorize one data-plane operation against the caller's Sandbox grant.
+///
+/// Resolving the target proves the caller OWNS the lease. It does not prove
+/// they may do this particular thing to it, and those are different questions:
+/// the verb set exists precisely so a grant can be narrower than "may hold a
+/// lease". A route that resolves ownership and stops silently turns
+/// `verbs: [lease]` into command execution, an interactive terminal, log
+/// exfiltration and a port tunnel, which is what every route here did before
+/// this guard existed.
+fn sandbox_verb_denied(
+    identity: &AuthIdentity,
+    lease: &SandboxLease,
+    verb: SandboxVerb,
+    operation: &str,
+) -> Option<Response> {
+    let pool = lease.spec.pool_ref.name.as_str();
+    if is_sandbox_allowed(pool, verb, &policy_for(identity)) {
+        return None;
+    }
+    warn!(
+        identity = %identity.identity,
+        pool = %pool,
+        operation = %operation,
+        "Sandbox operation refused: the caller's grant does not include the required verb"
+    );
+    Some(sandbox_error(
+        StatusCode::FORBIDDEN,
+        format!("Sandbox {operation} is not allowed"),
+        None,
+    ))
+}
+
 async fn prepare_upgrade<B: ClusterBackend>(
     state: &AppState<B>,
     identity: &AuthIdentity,
@@ -2150,6 +2196,14 @@ async fn prepare_upgrade<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
         };
+    if let Some(response) = sandbox_verb_denied(
+        identity,
+        &lease,
+        operation.required_verb(),
+        operation.as_str(),
+    ) {
+        return Err(response);
+    }
     let container = match target.resolve_container(requested_container) {
         Ok(container) => container.to_string(),
         Err(denied) => return Err(access_denied(identity, id, operation.as_str(), denied)),
@@ -2452,6 +2506,9 @@ async fn sandbox_exec<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "exec", denied),
         };
+    if let Some(response) = sandbox_verb_denied(&identity, &lease, SandboxVerb::Exec, "exec") {
+        return response;
+    }
     let container = match target.resolve_container(request.container.as_deref()) {
         Ok(container) => container.to_string(),
         Err(denied) => return access_denied(&identity, &id, "exec", denied),
@@ -2590,6 +2647,9 @@ async fn sandbox_logs<B: ClusterBackend>(
             Ok(resolved) => resolved,
             Err(denied) => return access_denied(&identity, &id, "logs", denied),
         };
+    if let Some(response) = sandbox_verb_denied(&identity, &lease, SandboxVerb::Logs, "logs") {
+        return response;
+    }
 
     let container = match target.resolve_container(query.container.as_deref()) {
         Ok(container) => container.to_string(),
@@ -7330,7 +7390,18 @@ mod tests {
                 max_extensions: 2,
                 sandbox: Some(SandboxPolicy {
                     allowed_pools: vec!["agent-*".into()],
-                    verbs: vec![SandboxVerb::Lease, SandboxVerb::Release],
+                    // The ordinary caller fixture holds the FULL verb set.
+                    // It previously held only lease+release, which meant every
+                    // exec/logs/attach test in this suite ran against a grant
+                    // that did not authorize the operation under test - and
+                    // passed, because no route consulted a verb.
+                    verbs: vec![
+                        SandboxVerb::Lease,
+                        SandboxVerb::Exec,
+                        SandboxVerb::Logs,
+                        SandboxVerb::PortForward,
+                        SandboxVerb::Release,
+                    ],
                     max_ttl: chrono::Duration::hours(2),
                     max_concurrent_leases: 2,
                     max_extensions: 2,
@@ -8734,6 +8805,108 @@ mod tests {
             }),
         )
         .await
+    }
+
+    /// `verbs: [lease, release]` is the least-privilege grant the docs
+    /// advertise. Until the verb guard existed it also bought arbitrary
+    /// command execution, an interactive terminal, log exfiltration and a port
+    /// tunnel, because every data-plane route resolved ownership and stopped.
+    #[tokio::test]
+    async fn a_lease_only_grant_cannot_exec_read_logs_attach_or_forward() {
+        use crate::api::sandbox_credentials::SandboxOperation;
+
+        let server = MockServer::start().await;
+        // Target resolution refuses an elapsed lease, so this fixture is
+        // anchored on the running clock rather than the suite's fixed dates.
+        let mut live = extendable_lease_json("sandbox-verbs", 0);
+        let now = chrono::Utc::now();
+        live["status"]["readyAt"] = serde_json::json!(
+            (now - chrono::Duration::minutes(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        );
+        live["status"]["expiresAt"] = serde_json::json!(
+            (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        );
+        mount_extendable(&server, live).await;
+        // Target resolution reads the pool too; without it every route fails
+        // 503 before reaching the guard under test.
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools/agent-small",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pool_json()))
+            .mount(&server)
+            .await;
+        let mut restricted = identity();
+        let grant = restricted.policy.sandbox.as_mut().unwrap();
+        grant.verbs = vec![SandboxVerb::Lease, SandboxVerb::Release];
+        let id = "sandbox-verbs";
+
+        let exec = sandbox_exec::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            restricted.clone(),
+            Path(id.into()),
+            Json(crate::api::sandbox_access::SandboxExecRequest {
+                command: vec!["/bin/sh".into()],
+                container: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            exec.status(),
+            StatusCode::FORBIDDEN,
+            "exec without the verb"
+        );
+
+        let logs = sandbox_logs::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            restricted.clone(),
+            Path(id.into()),
+            axum::extract::Query(crate::api::sandbox_access::SandboxLogsQuery {
+                tail: Some(10),
+                container: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            logs.status(),
+            StatusCode::FORBIDDEN,
+            "logs without the verb"
+        );
+
+        let execution = create_sandbox_execution::<crate::testutil::MockBackend>(
+            State(test_state(&server)),
+            restricted.clone(),
+            Path(id.into()),
+            Json(CreateExecutionRequest {
+                command: vec!["/bin/sh".into()],
+                cwd: None,
+                timeout: None,
+                container: None,
+                idempotency_key: "kobe-verbs-1".into(),
+                detach: false,
+            }),
+        )
+        .await;
+        assert_eq!(
+            execution.status(),
+            StatusCode::FORBIDDEN,
+            "durable execution without the verb"
+        );
+
+        // Attach and port-forward share one upgrade path, so both are proven
+        // through it. Attach requires `exec`: an interactive shell is not a
+        // weaker grant than a one-shot command.
+        for operation in [SandboxOperation::Attach, SandboxOperation::PortForward] {
+            let denied =
+                prepare_upgrade(&test_state(&server), &restricted, id, operation, None).await;
+            let response = denied.err().expect("upgrade must be refused");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{operation:?} without the verb"
+            );
+        }
     }
 
     /// The durable effect is what matters: expiry moves and the budget is

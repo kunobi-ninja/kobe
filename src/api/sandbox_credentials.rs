@@ -77,6 +77,21 @@ pub enum SandboxOperation {
 impl SandboxOperation {
     const ALL: [Self; 4] = [Self::Logs, Self::Exec, Self::Attach, Self::PortForward];
 
+    /// The AccessPolicy verb a caller must hold to perform this operation.
+    ///
+    /// `Attach` maps to `Exec`: attaching is an interactive shell on the
+    /// workload, so it is at least as powerful as a one-shot command, and the
+    /// verb set has no narrower grant for it. Being able to attach without
+    /// holding `exec` is therefore deliberately not expressible, rather than
+    /// silently free as it was before this mapping existed.
+    pub fn required_verb(self) -> crate::crd::SandboxVerb {
+        match self {
+            Self::Logs => crate::crd::SandboxVerb::Logs,
+            Self::Exec | Self::Attach => crate::crd::SandboxVerb::Exec,
+            Self::PortForward => crate::crd::SandboxVerb::PortForward,
+        }
+    }
+
     /// The exact Pod subresources this operation needs.
     ///
     /// The verb comes from the HTTP METHOD the client actually sends, not from
