@@ -62,7 +62,7 @@ pub fn verified_teardown_evidence_labels(
     namespaced,
     validation = Rule::new("self.spec == oldSelf.spec")
         .message("verified teardown evidence is immutable"),
-    validation = Rule::new("self.spec.attemptId == self.spec.receipt.attemptId && self.spec.lease == self.spec.receipt.lease")
+    validation = Rule::new("self.spec.attemptId == self.spec.receipt.attemptId && self.spec.lease.name == self.spec.receipt.lease.name && has(self.spec.lease.uid) == has(self.spec.receipt.lease.uid) && (!has(self.spec.lease.uid) || self.spec.lease.uid == self.spec.receipt.lease.uid)")
         .message("evidence identity must match its embedded receipt"),
     validation = Rule::new("self.spec.receipt.outcome == 'verified' && self.spec.receipt.cleanupMode == 'VerifiedDestroy'")
         .message("only a VerifiedDestroy terminal receipt can be authoritative evidence"),

@@ -192,7 +192,7 @@ pub struct BoundInstanceRef {
     namespaced,
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.creationManifest) || (has(self.status) && self.status != null && has(self.status.creationManifest) && self.status.creationManifest == oldSelf.status.creationManifest)")
         .message("status.creationManifest is immutable once sealed"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || (self.status.binding.bindingId.size() > 0 && self.metadata.name == self.status.binding.instance.name && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest) && has(self.spec.poolRef) && self.spec.poolRef == self.status.binding.pool && has(self.status.leaseRef) && self.status.leaseRef == self.status.binding.lease)")
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || (self.status.binding.bindingId.size() > 0 && self.metadata.name == self.status.binding.instance.name && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest) && has(self.spec.poolRef) && self.spec.poolRef.name == self.status.binding.pool.name && has(self.spec.poolRef.uid) && self.spec.poolRef.uid == self.status.binding.pool.uid && has(self.status.leaseRef) && self.status.leaseRef.name == self.status.binding.lease.name && has(self.status.leaseRef.uid) && self.status.leaseRef.uid == self.status.binding.lease.uid)")
         .message("VerifiedDestroy instance binding must carry complete UID/generation-fenced reciprocal lease, instance, pool, backend, and creation provenance"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || (has(self.status) && self.status != null && has(self.status.binding) && self.status.binding == oldSelf.status.binding)")
         .message("VerifiedDestroy instance binding is immutable once reserved"),
@@ -1160,8 +1160,8 @@ mod tests {
         for expected in [
             "self.status.binding == oldSelf.status.binding",
             "self.status.leaseRef == oldSelf.status.leaseRef",
-            "self.status.leaseRef == self.status.binding.lease",
-            "self.spec.poolRef == self.status.binding.pool",
+            "self.status.leaseRef.name == self.status.binding.lease.name && has(self.status.leaseRef.uid) && self.status.leaseRef.uid == self.status.binding.lease.uid",
+            "self.spec.poolRef.name == self.status.binding.pool.name && has(self.spec.poolRef.uid) && self.spec.poolRef.uid == self.status.binding.pool.uid",
             "self.metadata.name == self.status.binding.instance.name",
             "self.status.binding.instance.uid.size() > 0",
             "self.status.binding.instance.observedGeneration > 0",
