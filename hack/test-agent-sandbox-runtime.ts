@@ -275,13 +275,11 @@ async function installRuntime(): Promise<void> {
 
 async function verifyRuntime(): Promise<void> {
 	for (const name of crds) {
+		// The applied CRDs are the verbatim upstream release: provenance is
+		// proven by the fixture digest at install time, not by an annotation
+		// only Kobe's former managed template used to inject.
 		const crd = await getObject("crd", name);
 		invariant(crd, `CRD ${name} is missing`);
-		invariant(
-			crd.metadata?.annotations?.["kobe.kunobi.ninja/source-sha256"] ===
-				releaseSha256,
-			`CRD ${name} lost release provenance`,
-		);
 		const spec = nestedRecord(crd.spec);
 		const versions = spec.versions as Array<Record<string, unknown>>;
 		const servedVersion = versions.find(

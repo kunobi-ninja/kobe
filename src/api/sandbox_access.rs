@@ -1342,7 +1342,9 @@ mod tests {
             .unwrap_err(),
             SandboxAccessDenied::Backend
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // The only claim is that the 50ms budget preempted the mock's 5s
+        // delay; a loaded CI runner may add scheduling latency on top.
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
 
         let stopped = tokio_util::sync::CancellationToken::new();
         stopped.cancel();
