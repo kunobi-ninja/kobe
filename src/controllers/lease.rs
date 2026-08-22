@@ -13,13 +13,492 @@ use tracing::{debug, error, info, warn};
 use crate::api::auth::JwtAuthenticator;
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::crd::{
-    BackendProvenance, BoundInstanceRef, ClusterInstance, ClusterInstancePhase, ClusterLease,
-    ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase, ClusterPoolStatus,
-    LeaseBinding, LeasePhase, ResourceRef, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
+    BackendProvenance, BoundInstanceRef, CleanupMode, ClusterInstance, ClusterInstancePhase,
+    ClusterLease, ClusterLeaseCondition, ClusterLeaseStatus, ClusterPool, ClusterPoolPhase,
+    ClusterPoolStatus, ConnectTokenCreation, ConnectTokenCreationPhase, LeaseBinding, LeasePhase,
+    ResourceRef, SandboxPlacementAuthority, TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION,
+    TEARDOWN_RECEIPT_RETENTION_FINALIZER, TeardownAcknowledgedProofKind,
+    UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION,
 };
 use crate::diagnostics;
 use crate::lease_binding::BindingResolutionError;
 use crate::pool::{PoolState, parse_duration};
+
+#[derive(Debug)]
+struct SandboxCompositionIdentity {
+    outer_name: String,
+    outer_uid: String,
+}
+
+#[derive(Debug)]
+enum SandboxCompositionGate {
+    NotComposition,
+    Authorized(SandboxPlacementAuthority),
+    LegacyBoundRecovery,
+    NeedsMigration(SandboxCompositionIdentity),
+    Closed(SandboxCompositionIdentity),
+    Invalid,
+    Retry,
+}
+
+/// The outer Sandbox authority is exact only while the named live ClusterPool
+/// still has the UID and generation admitted by Kobe.
+fn live_cluster_pool_matches_sandbox_authority(
+    pool: &ClusterPool,
+    authority: &SandboxPlacementAuthority,
+    namespace: &str,
+) -> bool {
+    authority.api_version == "kobe.kunobi.ninja/v1alpha1"
+        && authority.kind == "ClusterPool"
+        && authority.namespace == namespace
+        && authority.name == pool.name_any()
+        && pool.namespace().as_deref() == Some(namespace)
+        && pool.uid().as_deref() == Some(authority.uid.as_str())
+        && pool.metadata.generation == Some(authority.generation)
+        && pool.metadata.deletion_timestamp.is_none()
+}
+
+/// A binding records a pool UID but no generation. Its name and UID must match
+/// the immutable outer authority; the gate's fresh live-pool read supplies the
+/// generation and deletion-state half of the proof.
+fn binding_pool_matches_sandbox_authority(
+    binding: &LeaseBinding,
+    authority: &SandboxPlacementAuthority,
+) -> bool {
+    binding.pool.name == authority.name
+        && binding.pool.uid.as_deref() == Some(authority.uid.as_str())
+}
+
+/// Produce the owner-independent metadata fence for one exact composition.
+///
+/// Unknown labels, annotations, and finalizers are preserved. The known
+/// identity fields are overwritten only after the caller has validated every
+/// pre-existing value against `identity`.
+fn sandbox_composition_retention_metadata(
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+    stale_rejected: bool,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let now = chrono::Utc::now();
+    let mut labels = lease.metadata.labels.clone().unwrap_or_default();
+    labels.insert(
+        crate::sandbox::SANDBOX_LEASE_UID_LABEL.into(),
+        identity.outer_uid.clone(),
+    );
+    labels.insert(
+        crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL.into(),
+        "true".into(),
+    );
+    let mut annotations = lease.metadata.annotations.clone().unwrap_or_default();
+    annotations.insert(
+        crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION.into(),
+        identity.outer_name.clone(),
+    );
+    if stale_rejected {
+        annotations.insert(
+            crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION.into(),
+            identity.outer_uid.clone(),
+        );
+    }
+    let deadline_is_live = annotations
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|deadline| deadline.with_timezone(&chrono::Utc) > now);
+    if !deadline_is_live {
+        annotations.insert(
+            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION.into(),
+            crate::controllers::sandbox_child::child_handle_retention_deadline(now).to_rfc3339(),
+        );
+    }
+    let mut finalizers = lease.metadata.finalizers.clone().unwrap_or_default();
+    if !finalizers.iter().any(|finalizer| {
+        finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+    }) {
+        finalizers.push(crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER.into());
+    }
+    (labels, annotations, finalizers)
+}
+
+fn sandbox_composition_retention_fence_matches(
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+) -> bool {
+    let (labels, annotations, finalizers) =
+        sandbox_composition_retention_metadata(lease, identity, false);
+    lease
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+        && lease.metadata.labels.as_ref() == Some(&labels)
+        && lease.metadata.annotations.as_ref() == Some(&annotations)
+        && lease.metadata.finalizers.as_ref() == Some(&finalizers)
+}
+
+/// Authorize an internal Sandbox composition at the last controller boundary
+/// before it can enter the ordinary ClusterLease allocation queue.
+///
+/// A POST may commit after the creating HTTP future was cancelled. The durable
+/// coordination fence therefore has to be enforced by the consumer as well as
+/// by the producer: a late Pending handle is terminalized before it can write a
+/// binding intent or reserve a ClusterInstance.
+async fn sandbox_composition_allocation_gate(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+) -> SandboxCompositionGate {
+    if lease.spec.requester.requester_type != "kobe:sandbox-composition" {
+        return SandboxCompositionGate::NotComposition;
+    }
+    let derived_outer = lease
+        .name_any()
+        .strip_prefix("kobe-sbx-")
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let Some(outer_name) = derived_outer else {
+        return SandboxCompositionGate::Invalid;
+    };
+    if lease
+        .annotations()
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION)
+        .is_some_and(|annotated| annotated != &outer_name)
+    {
+        return SandboxCompositionGate::Invalid;
+    }
+    if lease
+        .labels()
+        .get("app.kubernetes.io/managed-by")
+        .is_none_or(|value| value != crate::sandbox::KOBE_MANAGED_BY)
+        || lease.spec.cleanup_mode != Some(crate::crd::CleanupMode::VerifiedDestroy)
+    {
+        return SandboxCompositionGate::Invalid;
+    }
+
+    // Base producers had no outer-UID label: the sole exact controller owner
+    // was their identity. Newer producers use the UID label and no ownerRef.
+    // During a rolling upgrade both may be present, but they must agree.
+    let labelled_uid = lease
+        .labels()
+        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+        .filter(|uid| !uid.is_empty())
+        .cloned();
+    let legacy_uid = match lease
+        .metadata
+        .owner_references
+        .as_ref()
+        .filter(|owners| !owners.is_empty())
+    {
+        None => None,
+        Some(owners)
+            if owners.len() == 1
+                && owners[0].api_version == "kobe.kunobi.ninja/v1alpha1"
+                && owners[0].kind == "SandboxLease"
+                && owners[0].name == outer_name
+                && !owners[0].uid.is_empty()
+                && owners[0].controller == Some(true) =>
+        {
+            Some(owners[0].uid.clone())
+        }
+        Some(_) => return SandboxCompositionGate::Invalid,
+    };
+    if matches!((&labelled_uid, &legacy_uid), (Some(labelled), Some(legacy)) if labelled != legacy)
+    {
+        return SandboxCompositionGate::Invalid;
+    }
+    let Some(outer_uid) = labelled_uid.or(legacy_uid) else {
+        return SandboxCompositionGate::Invalid;
+    };
+    if lease.spec.requester.identity.as_str() != outer_uid.as_str()
+        && lease.spec.requester.identity != "kobe-operator"
+    {
+        return SandboxCompositionGate::Invalid;
+    }
+
+    let identity = SandboxCompositionIdentity {
+        outer_name: outer_name.clone(),
+        outer_uid: outer_uid.clone(),
+    };
+    let stale_rejected = lease
+        .annotations()
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION);
+    if stale_rejected.is_some_and(|uid| uid != &outer_uid) {
+        return SandboxCompositionGate::Invalid;
+    }
+    if lease.metadata.deletion_timestamp.is_some()
+        || stale_rejected.is_some_and(|uid| uid == &outer_uid)
+    {
+        return SandboxCompositionGate::Closed(identity);
+    }
+    let outers: Api<crate::crd::SandboxLease> = Api::namespaced(client.clone(), namespace);
+    let outer = match outers.get(&outer_name).await {
+        Ok(outer) => outer,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return SandboxCompositionGate::Closed(identity);
+        }
+        Err(_) => return SandboxCompositionGate::Retry,
+    };
+    if lease
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == LeasePhase::Bound)
+        && outer.uid().as_deref() == Some(outer_uid.as_str())
+        && outer.spec.placement_authority.is_none()
+    {
+        return SandboxCompositionGate::LegacyBoundRecovery;
+    }
+    let outer_is_open = outer.uid().as_deref() == Some(outer_uid.as_str())
+        && crate::controllers::sandbox::sandbox_lease_authorizes_allocation(&outer);
+    if !outer_is_open {
+        return SandboxCompositionGate::Closed(identity);
+    }
+
+    let Some(authority) = outer.spec.placement_authority.as_ref() else {
+        // A Pending handle from a pre-authority producer cannot safely select
+        // same-named capacity. Already-Bound legacy recovery never enters this
+        // allocation gate.
+        return SandboxCompositionGate::Closed(identity);
+    };
+    if authority.api_version != "kobe.kunobi.ninja/v1alpha1"
+        || authority.kind != "ClusterPool"
+        || authority.namespace != namespace
+        || authority.name != lease.spec.pool_ref
+        || authority.uid.is_empty()
+        || authority.generation < 1
+    {
+        return SandboxCompositionGate::Invalid;
+    }
+    let pools: Api<ClusterPool> = Api::namespaced(client.clone(), namespace);
+    let live_pool = match pools.get(&authority.name).await {
+        Ok(pool) => pool,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return SandboxCompositionGate::Closed(identity);
+        }
+        Err(_) => return SandboxCompositionGate::Retry,
+    };
+    if !live_cluster_pool_matches_sandbox_authority(&live_pool, authority, namespace) {
+        return SandboxCompositionGate::Closed(identity);
+    }
+
+    let fences: Api<k8s_openapi::api::coordination::v1::Lease> =
+        Api::namespaced(client.clone(), namespace);
+    match fences
+        .get(&crate::controllers::sandbox::allocation_fence_name(
+            &outer_name,
+        ))
+        .await
+    {
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            if sandbox_composition_retention_fence_matches(lease, &identity) {
+                SandboxCompositionGate::Authorized(authority.clone())
+            } else {
+                SandboxCompositionGate::NeedsMigration(identity)
+            }
+        }
+        Ok(_) => SandboxCompositionGate::Closed(identity),
+        Err(_) => SandboxCompositionGate::Retry,
+    }
+}
+
+/// Re-run the complete outer/live-pool proof for one proposed or resumed
+/// reservation. `false` is a durable fail-closed result; an unavailable API
+/// read is surfaced so the caller retries without writing authority-bearing
+/// token or binding state.
+async fn sandbox_composition_binding_is_authorized(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<bool, LeaseError> {
+    match sandbox_composition_allocation_gate(client, namespace, lease).await {
+        SandboxCompositionGate::NotComposition => Ok(true),
+        SandboxCompositionGate::Authorized(authority) => {
+            Ok(binding_pool_matches_sandbox_authority(binding, &authority))
+        }
+        SandboxCompositionGate::Retry => Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "Sandbox composition authority unavailable while reserving capacity"
+        ))),
+        SandboxCompositionGate::NeedsMigration(_)
+        | SandboxCompositionGate::Closed(_)
+        | SandboxCompositionGate::LegacyBoundRecovery
+        | SandboxCompositionGate::Invalid => Ok(false),
+    }
+}
+
+/// Atomically migrate an exact base composition before it can enter the queue.
+///
+/// The base object depended on the outer `SandboxLease` ownerRef and lacked its
+/// durable UID label. A single UID/resourceVersion-fenced metadata patch clears
+/// the GC edge and installs the label, tombstone marker, retention deadline,
+/// and finalizer. The caller always ends the pass after this function.
+async fn migrate_sandbox_composition_retention_fence(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+) -> Result<Action, LeaseError> {
+    let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let (labels, annotations, finalizers) =
+        sandbox_composition_retention_metadata(lease, identity, false);
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/metadata/ownerReferences", "value": [] },
+        { "op": "add", "path": "/metadata/labels", "value": labels },
+        { "op": "add", "path": "/metadata/annotations", "value": annotations },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+    ]));
+    match leases
+        .patch(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(Action::await_change()),
+        Err(error) if optimistic_conflict(&error) => {
+            Ok(Action::requeue(std::time::Duration::from_secs(1)))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn close_stale_sandbox_composition(
+    client: &Client,
+    namespace: &str,
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    identity: &SandboxCompositionIdentity,
+) -> Result<Action, LeaseError> {
+    let Some(uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let Some(resource_version) = lease.resource_version() else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let (labels, annotations, finalizers) =
+        sandbox_composition_retention_metadata(lease, identity, true);
+    let fenced = lease
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+        && lease.metadata.labels.as_ref() == Some(&labels)
+        && lease.metadata.annotations.as_ref() == Some(&annotations)
+        && lease.metadata.finalizers.as_ref() == Some(&finalizers);
+    let current = if !fenced {
+        let patch = json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "add", "path": "/metadata/ownerReferences", "value": [] },
+            { "op": "add", "path": "/metadata/labels", "value": labels },
+            { "op": "add", "path": "/metadata/annotations", "value": annotations },
+            { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+        ]));
+        match leases
+            .patch(
+                &lease.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await
+        {
+            Ok(current) => current,
+            Err(error) if optimistic_conflict(&error) => {
+                return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        lease.clone()
+    };
+
+    let Some(uid) = current.uid().filter(|uid| !uid.is_empty()) else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let Some(resource_version) = current.resource_version() else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let mut next = current.status.clone().unwrap_or_default();
+    next.phase = LeasePhase::Released;
+    next.message = Some("stale Sandbox composition rejected by allocation fence".into());
+    let patch = if current.status.is_some() {
+        json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "test", "path": "/status/phase", "value": "Pending" },
+            { "op": "add", "path": "/status", "value": next }
+        ]))
+    } else {
+        json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "add", "path": "/status", "value": next }
+        ]))
+    };
+    match leases
+        .patch_status(
+            &current.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(released) => {
+            if let Some(binding) = released
+                .status
+                .as_ref()
+                .and_then(|status| status.binding.as_ref())
+                && !mark_instance_recycling(client, namespace, binding).await?
+            {
+                return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+            }
+            Ok(Action::requeue(std::time::Duration::from_secs(1)))
+        }
+        Err(error) if optimistic_conflict(&error) => {
+            Ok(Action::requeue(std::time::Duration::from_secs(1)))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn quarantine_invalid_sandbox_composition(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+) -> Result<Action, LeaseError> {
+    let (Some(uid), Some(resource_version)) = (lease.uid(), lease.resource_version()) else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+    };
+    let mut next = lease.status.clone().unwrap_or_default();
+    next.phase = LeasePhase::Quarantined;
+    next.message = Some("internal Sandbox composition identity is invalid".into());
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/status", "value": next }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(Action::await_change()),
+        Err(error) if optimistic_conflict(&error) => Ok(Action::await_change()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+const CONNECT_TOKEN_CREATE_FENCE_ANNOTATION: &str =
+    "kobe.kunobi.ninja/connect-token-binding-before-create-v1";
+const ALLOCATION_ABSENT_CONDITION: &str = "AllocationAbsent";
 
 /// Shared state for the lease controller.
 pub struct LeaseContext<B: ClusterBackend> {
@@ -137,6 +616,355 @@ pub async fn run_lease_controller<B: ClusterBackend + Clone + 'static>(
     }
 }
 
+#[derive(Clone)]
+struct ReleaseAuthorityContext {
+    client: Client,
+    namespace: String,
+}
+
+/// Run the read/attest half of terminal lease handling under the dedicated
+/// teardown-authority identity.
+///
+/// This controller never creates or deletes a connect token, backend object,
+/// or `ClusterInstance`. It persists the attempt nonce that opens the general
+/// lifecycle controller's deletion gate, and it certifies `NeverBound` only
+/// after re-observing the complete lease namespace with that same attempt.
+pub async fn run_release_authority_controller(
+    client: Client,
+    namespace: &str,
+    shutdown: CancellationToken,
+) {
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let context = Arc::new(ReleaseAuthorityContext {
+        client,
+        namespace: namespace.to_string(),
+    });
+    info!("Starting isolated release-attempt authority");
+    let controller = Controller::new(leases, Config::default())
+        .run(
+            reconcile_release_authority,
+            release_authority_error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            if let Err(error) = result {
+                debug!(?error, "release authority reconciliation error");
+            }
+        });
+    tokio::select! {
+        _ = controller => {},
+        _ = shutdown.cancelled() => info!("Release-attempt authority shutting down"),
+    }
+}
+
+async fn reconcile_release_authority(
+    lease: Arc<ClusterLease>,
+    ctx: Arc<ReleaseAuthorityContext>,
+) -> Result<Action, LeaseError> {
+    let status = lease.status.clone().unwrap_or_default();
+
+    if lease.spec.cleanup_mode != Some(CleanupMode::VerifiedDestroy)
+        || !matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
+        || lease.metadata.deletion_timestamp.is_some()
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+    if lease
+        .annotations()
+        .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+        .map(String::as_str)
+        != Some("true")
+        || !lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+
+    let leases: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+    let attempt = match status.teardown_attempt_id.as_deref() {
+        Some(attempt) if !attempt.trim().is_empty() => attempt,
+        Some(_) => {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "terminal lease carries an empty teardown attempt"
+            )));
+        }
+        None if status.teardown_receipt.is_some()
+            || status.unbound_release_verified_at.is_some() =>
+        {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "terminal lease carries proof without a durable attempt"
+            )));
+        }
+        None => {
+            persist_authority_teardown_attempt(&leases, &lease, &status).await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+        }
+    };
+
+    if unbound_release_proof_is_complete_for_lease(&lease, &status)
+        || status.teardown_receipt.is_some()
+    {
+        return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+    }
+    if status.unbound_release_verified_at.is_some() {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "NeverBound proof does not match the exact retained lease intent"
+        )));
+    }
+    let Some(verified_at) =
+        authority_never_bound_observation(&ctx.client, &ctx.namespace, &lease).await?
+    else {
+        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+    };
+    record_authority_unbound_release_proof(&leases, &lease, &status, attempt, &verified_at).await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(1)))
+}
+
+async fn persist_authority_teardown_attempt(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> Result<(), LeaseError> {
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let attempt = uuid::Uuid::new_v4().to_string();
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "add", "path": "/status/teardownAttemptId", "value": attempt }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether a retained verified binding is durably known to have stopped before
+/// any create-capable token request could be dispatched.
+///
+/// The binding intent remains an immutable audit handle. `Closed` with no
+/// identity can only be reached directly from `Prepared`; every path that
+/// reached `Creating` must first recover an exact token UID and route through
+/// receipt-backed teardown instead.
+fn retained_unstarted_binding_is_closed(status: &ClusterLeaseStatus) -> bool {
+    let Some(binding) = status.binding.as_ref() else {
+        return false;
+    };
+    let Some(creation) = status.connect_token_creation.as_ref() else {
+        return false;
+    };
+    binding.cleanup_mode == CleanupMode::VerifiedDestroy
+        && binding.connect_token.is_none()
+        && creation.phase == ConnectTokenCreationPhase::Closed
+        && creation.identity.is_none()
+        && creation
+            .verified_absent_at
+            .as_deref()
+            .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+        && status.cluster_name.is_none()
+}
+
+/// Require the retained pre-create intent to name this exact lease and pool.
+pub(crate) fn retained_unstarted_binding_matches_lease(
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> bool {
+    let Some(binding) = status.binding.as_ref() else {
+        return false;
+    };
+    retained_unstarted_binding_is_closed(status)
+        && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+        && binding.lease.name == lease.name_any()
+        && binding.lease.uid.as_deref() == lease.uid().as_deref()
+        && binding.pool.name == lease.spec.pool_ref
+        && binding
+            .pool
+            .uid
+            .as_deref()
+            .is_some_and(|uid| !uid.is_empty())
+        && !binding.instance.name.is_empty()
+        && !binding.instance.uid.is_empty()
+        && binding.instance.observed_generation > 0
+}
+
+/// Return an authority timestamp only when the exact terminal attempt cannot
+/// have a reciprocal instance allocation and its create-capable token name is
+/// closed. A retained intent is accepted only in the unique `Prepared ->
+/// Closed` shape, then a full instance list proves that neither its exact
+/// candidate nor any other instance acquired this lease UID.
+async fn authority_never_bound_observation(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+) -> Result<Option<String>, LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    if status.cluster_name.is_some()
+        || (status.binding.is_some() && !retained_unstarted_binding_matches_lease(lease, &status))
+    {
+        return Ok(None);
+    }
+    let verified_at = match status.connect_token_creation.as_ref() {
+        Some(creation)
+            if creation.phase == ConnectTokenCreationPhase::Closed
+                && creation.verified_absent_at.is_some() =>
+        {
+            let verified_at = creation
+                .verified_absent_at
+                .as_ref()
+                .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+                .cloned();
+            let Some(verified_at) = verified_at else {
+                return Ok(None);
+            };
+            if let Some(identity) = creation.identity.as_ref() {
+                let check = crate::api::connect::observe_lease_connect_token_absent(
+                    client,
+                    namespace,
+                    &lease.name_any(),
+                    identity,
+                )
+                .await;
+                if check.result != crate::crd::CheckResult::Verified {
+                    return Ok(None);
+                }
+            } else if !deterministic_connect_token_name_is_absent(
+                client,
+                namespace,
+                &lease.name_any(),
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            verified_at
+        }
+        // No creator state plus no binding is the legacy-safe durable pre-allocation
+        // checkpoint: this protocol never permits a Secret POST before both
+        // values exist in one status write.
+        None if status.binding.is_none() => {
+            if !deterministic_connect_token_name_is_absent(client, namespace, &lease.name_any())
+                .await?
+            {
+                return Ok(None);
+            }
+            chrono::Utc::now().to_rfc3339()
+        }
+        _ => return Ok(None),
+    };
+
+    let instances: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
+    let all = instances.list(&ListParams::default()).await?;
+    let lease_uid = lease_uid_for(lease)?;
+    if all.iter().any(|instance| {
+        instance.status.as_ref().is_some_and(|instance_status| {
+            instance_status.binding.as_ref().is_some_and(|binding| {
+                binding.lease.name == lease.name_any()
+                    && binding.lease.uid.as_deref() == Some(lease_uid)
+            }) || instance_status.lease_ref.as_ref().is_some_and(|reference| {
+                reference.name == lease.name_any() && reference.uid.as_deref() == Some(lease_uid)
+            })
+        })
+    }) {
+        return Ok(None);
+    }
+
+    Ok(Some(verified_at))
+}
+
+async fn deterministic_connect_token_name_is_absent(
+    client: &Client,
+    namespace: &str,
+    lease_name: &str,
+) -> Result<bool, LeaseError> {
+    let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+        Api::namespaced(client.clone(), namespace);
+    match secrets
+        .get(&crate::api::connect::connect_secret_name(lease_name))
+        .await
+    {
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn record_authority_unbound_release_proof(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+    attempt: &str,
+    verified_at: &str,
+) -> Result<(), LeaseError> {
+    if status.teardown_attempt_id.as_deref() != Some(attempt)
+        || status.cluster_name.is_some()
+        || (status.binding.is_some() && !retained_unstarted_binding_matches_lease(lease, status))
+        || status.teardown_receipt.is_some()
+    {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "NeverBound proof lost its exact release attempt"
+        )));
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut conditions: Vec<_> = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type != ALLOCATION_ABSENT_CONDITION)
+        .cloned()
+        .collect();
+    conditions.push(ClusterLeaseCondition {
+        condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+        status: "True".into(),
+        reason: "NeverBound".into(),
+        message: format!("release attempt {attempt} proved no reciprocal allocation existed"),
+        last_transition_time: Some(verified_at.to_string()),
+    });
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "test", "path": "/status/teardownAttemptId", "value": attempt },
+        { "op": "add", "path": "/status/unboundReleaseVerifiedAt", "value": verified_at },
+        { "op": "add", "path": "/status/conditions", "value": conditions }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn release_authority_error_policy(
+    _lease: Arc<ClusterLease>,
+    error: &LeaseError,
+    _ctx: Arc<ReleaseAuthorityContext>,
+) -> Action {
+    warn!(%error, "release authority reconcile failed");
+    Action::requeue(std::time::Duration::from_secs(15))
+}
+
 /// Rebuild priority queues from existing Pending ClusterLease CRDs.
 async fn rebuild_queues<B: ClusterBackend>(ctx: &LeaseContext<B>) {
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
@@ -245,6 +1073,107 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
     let status = lease.status.clone().unwrap_or_default();
 
+    // A delayed Sandbox composition POST must be fenced before this
+    // controller performs *any* metadata upgrade on the handle. Otherwise a
+    // stale object can consume the receipt-finalizer upgrade pass and defer
+    // its allocation fence to a later reconcile.
+    if status.phase == LeasePhase::Pending {
+        match sandbox_composition_allocation_gate(&ctx.client, &ns, &lease).await {
+            SandboxCompositionGate::NotComposition | SandboxCompositionGate::Authorized(_) => {}
+            SandboxCompositionGate::NeedsMigration(identity) => {
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return migrate_sandbox_composition_retention_fence(&leases_api, &lease, &identity)
+                    .await;
+            }
+            SandboxCompositionGate::Closed(identity) => {
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return close_stale_sandbox_composition(
+                    &ctx.client,
+                    &ns,
+                    &leases_api,
+                    &lease,
+                    &identity,
+                )
+                .await;
+            }
+            SandboxCompositionGate::Invalid => {
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return quarantine_invalid_sandbox_composition(&leases_api, &lease).await;
+            }
+            SandboxCompositionGate::Retry => {
+                return Ok(Action::requeue(std::time::Duration::from_secs(15)));
+            }
+            SandboxCompositionGate::LegacyBoundRecovery => {
+                remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
+                return quarantine_invalid_sandbox_composition(&leases_api, &lease).await;
+            }
+        }
+    }
+
+    // Verified handles carry the release protocol from their first observed
+    // Pending state, not from the later allocation attempt. Internal Sandbox
+    // compositions install both at CREATE time; this is the idempotent upgrade
+    // path for older exact handles.
+    if lease.metadata.deletion_timestamp.is_none()
+        && status.phase == LeasePhase::Pending
+        && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+        && (!lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+            || lease
+                .annotations()
+                .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+                .map(String::as_str)
+                != Some("true"))
+    {
+        ensure_receipt_retention_finalizer(&ctx.client, &ns, &lease).await?;
+        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+    }
+
+    // A direct Kubernetes DELETE can race the bind path. The receipt-retention
+    // finalizer is installed before reservation, so it also owns this edge:
+    // never bind a terminating lease and never remove the finalizer until a
+    // pre-intent connect token is observed absent.
+    if lease.metadata.deletion_timestamp.is_some()
+        && lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        if matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
+            && ((status.binding.is_some() || status.cluster_name.is_some())
+                || requires_attempt_bound_token_deletion(&lease))
+        {
+            let uid = lease_uid_for(&lease)?;
+            let rv = lease
+                .resource_version()
+                .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+            let patch = json_patch(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": uid },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+                { "op": "test", "path": "/status/phase", "value": status.phase },
+                { "op": "add", "path": "/status/phase", "value": "Released" }
+            ]));
+            leases_api
+                .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
+                .await?;
+            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+        }
+        if status.binding.is_none()
+            && status.cluster_name.is_none()
+            && lease.spec.cleanup_mode == Some(CleanupMode::VerifiedDestroy)
+            && !requires_attempt_bound_token_deletion(&lease)
+        {
+            // A deleting legacy handle without the create-before-bind fence
+            // cannot exclude an already-dispatched token or reservation POST.
+            // Retain it; manufacturing NeverBound here would turn a 404 into
+            // authority while a delayed create may still commit.
+            warn!(lease = %name, "retaining legacy verified handle without creation fence");
+            return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+        }
+    }
+
     // Pre-UID-fence controllers could crash after writing only clusterName.
     // Never "repair" that name into authority. Backfill is permitted only
     // after proving a unique reciprocal pair and immutable pool provenance.
@@ -254,9 +1183,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     {
         match backfill_legacy_binding(&ctx.client, &ns, &lease).await? {
             Some(binding) => {
-                finalize_binding(&ctx, &ns, &binding, created_at_for(&lease)).await?;
+                let bound = finalize_binding(&ctx, &ns, &binding, created_at_for(&lease)).await?;
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-                return Ok(Action::requeue(std::time::Duration::from_secs(60)));
+                return Ok(Action::requeue(std::time::Duration::from_secs(if bound {
+                    60
+                } else {
+                    1
+                })));
             }
             None => {
                 mark_binding_unverified(&leases_api, &lease, "legacy_binding_unverified").await?;
@@ -310,19 +1243,34 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 (head, pos)
             };
 
-            let patch = serde_json::json!({
-                "status": {
-                    "phase": "Pending",
-                    "queuePosition": position
+            let Some(lease_uid) = lease.uid().filter(|uid| !uid.is_empty()) else {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Pending lease has no UID"
+                )));
+            };
+            let Some(lease_rv) = lease.resource_version() else {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Pending lease has no resourceVersion"
+                )));
+            };
+            let mut queued_status = status.clone();
+            queued_status.phase = LeasePhase::Pending;
+            queued_status.queue_position = position;
+            let patch = json_patch(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+                { "op": "add", "path": "/status", "value": queued_status }
+            ]));
+            let queued_lease = match leases_api
+                .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
+                .await
+            {
+                Ok(queued) => queued,
+                Err(error) if optimistic_conflict(&error) => {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(1)));
                 }
-            });
-            let queued_lease = leases_api
-                .patch_status(
-                    &name,
-                    &PatchParams::apply("kobe-operator"),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
+                Err(error) => return Err(error.into()),
+            };
 
             if let Some(profile) = get_profile(&ctx.client, &lease.spec.pool_ref, &ns).await
                 && let Some(scaling) = &profile.spec.scaling
@@ -335,14 +1283,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                         .with_label_values(&[lease.spec.pool_ref.as_str(), "expired"])
                         .observe(age.num_milliseconds() as f64 / 1000.0);
                     remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-                    let patch = expired_status_patch(&status.conditions);
-                    leases_api
-                        .patch_status(
-                            &name,
-                            &PatchParams::apply("kobe-operator"),
-                            &Patch::Merge(&patch),
-                        )
-                        .await?;
+                    expire_lease_fenced(&leases_api, &queued_lease).await?;
                     return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                 }
             }
@@ -352,16 +1293,22 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 return Ok(Action::requeue(std::time::Duration::from_secs(5)));
             }
 
-            let reserved_binding = reserve_ready_instance(&ctx.client, &ns, &queued_lease).await?;
+            let reserved_binding =
+                reserve_ready_instance(&ctx.client, &ns, &queued_lease, ctx.factory.as_ref())
+                    .await?;
 
             if let Some(binding) = reserved_binding {
                 // The instance reservation is durable. If this final status
                 // write fails or the process stops, the next reconcile sees
                 // the same lease-side intent and finishes the same pair. It
                 // must not roll back on an uncertain response.
-                finalize_binding(&ctx, &ns, &binding, created_at).await?;
+                let bound = finalize_binding(&ctx, &ns, &binding, created_at).await?;
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
-                Ok(Action::requeue(std::time::Duration::from_secs(60)))
+                Ok(Action::requeue(std::time::Duration::from_secs(if bound {
+                    60
+                } else {
+                    1
+                })))
             } else {
                 // No Ready cluster to bind. Populate status.message with the
                 // pool's health so a client can tell "warming up" from "this
@@ -411,14 +1358,17 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
                 // Best-effort: a failed message write must not block requeue —
                 // the lease is still validly Pending and will retry.
+                let queued_uid = queued_lease.metadata.uid.as_deref().unwrap_or_default();
+                let queued_rv = queued_lease.resource_version().unwrap_or_default();
+                let patch = json_patch(serde_json::json!([
+                    { "op": "test", "path": "/metadata/uid", "value": queued_uid },
+                    { "op": "test", "path": "/metadata/resourceVersion", "value": queued_rv },
+                    { "op": "test", "path": "/status/phase", "value": "Pending" },
+                    { "op": "add", "path": "/status/message", "value": message },
+                    { "op": "add", "path": "/status/conditions", "value": conditions }
+                ]));
                 if let Err(e) = leases_api
-                    .patch_status(
-                        &name,
-                        &PatchParams::apply("kobe-operator"),
-                        &Patch::Merge(
-                            &serde_json::json!({ "status": { "message": message, "conditions": conditions } }),
-                        ),
-                    )
+                    .patch_status(&name, &PatchParams::default(), &Patch::<()>::Json(patch))
                     .await
                 {
                     warn!(lease = %name, "Failed to write unsatisfiable status message (continuing): {e}");
@@ -444,14 +1394,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                                     .observe(held);
                             }
                             info!(lease = %name, "Lease TTL expired");
-                            let patch = expired_status_patch(&status.conditions);
-                            leases_api
-                                .patch_status(
-                                    &name,
-                                    &PatchParams::apply("kobe-operator"),
-                                    &Patch::Merge(&patch),
-                                )
-                                .await?;
+                            expire_lease_fenced(&leases_api, &lease).await?;
                             return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                         }
                     }
@@ -461,14 +1404,7 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                             expires_at = %expires_at_str,
                             "Failed to parse expires_at, force-expiring lease: {e}"
                         );
-                        let patch = expired_status_patch(&status.conditions);
-                        leases_api
-                            .patch_status(
-                                &name,
-                                &PatchParams::apply("kobe-operator"),
-                                &Patch::Merge(&patch),
-                            )
-                            .await?;
+                        expire_lease_fenced(&leases_api, &lease).await?;
                         return Ok(Action::requeue(std::time::Duration::from_secs(5)));
                     }
                 }
@@ -498,22 +1434,203 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
 
             remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
 
-            let Some(lease_uid) = lease.metadata.uid.as_deref() else {
-                mark_binding_unverified(&leases_api, &lease, "lease_uid_missing").await?;
+            let mut terminal_lease = (*lease).clone();
+            let mut terminal_status = status.clone();
+            let verified_cleanup = requires_attempt_bound_token_deletion(&terminal_lease);
+
+            if verified_cleanup {
+                if terminal_lease
+                    .annotations()
+                    .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+                    .map(String::as_str)
+                    != Some("true")
+                {
+                    mark_binding_unverified(
+                        &leases_api,
+                        &terminal_lease,
+                        "connect_token_create_protocol_unverified",
+                    )
+                    .await?;
+                    return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                }
+
+                // This nonce must be durable before token deletion, absence
+                // lookup, or NeverBound classification. A retry reuses it.
+                if ensure_unbound_release_attempt(&leases_api, &terminal_lease, &terminal_status)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                }
+
+                if let Some(binding) = terminal_status.binding.clone() {
+                    let Some((closed_lease, closed_binding)) =
+                        close_terminal_connect_token_creation(
+                            &ctx.client,
+                            &ns,
+                            &terminal_lease,
+                            &terminal_status,
+                            &binding,
+                        )
+                        .await?
+                    else {
+                        return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                    };
+                    terminal_lease = closed_lease;
+                    terminal_status = terminal_lease.status.clone().unwrap_or_default();
+
+                    if !retained_unstarted_binding_matches_lease(&terminal_lease, &terminal_status)
+                    {
+                        // Once creation advanced past Prepared, a persisted
+                        // intent may already have a delayed reservation. Adopt
+                        // the exact candidate into receipt-backed teardown;
+                        // only the pre-create Closed shape is eligible for an
+                        // authority-observed NeverBound proof.
+                        if reserve_binding_instance_after_lease_fence(
+                            &ctx.client,
+                            &ns,
+                            &closed_binding,
+                        )
+                        .await?
+                            != ReservationOutcome::Reserved
+                        {
+                            mark_binding_unverified(
+                                &leases_api,
+                                &terminal_lease,
+                                "binding_intent_could_not_be_adopted_for_teardown",
+                            )
+                            .await?;
+                            return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                        }
+                    }
+                }
+
+                if unbound_release_proof_is_complete_for_lease(&terminal_lease, &terminal_status) {
+                    if !unbound_release_proof_acknowledged(&terminal_lease, &terminal_status) {
+                        debug!(lease = %name, "retaining NeverBound proof until its exact attempt is acknowledged");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                    }
+
+                    info!(lease = %name, phase = %phase, "Retiring acknowledged NeverBound lease");
+                    crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+                        .with_label_values(&[
+                            terminal_lease.spec.pool_ref.as_str(),
+                            phase.to_string().as_str(),
+                        ])
+                        .inc();
+                    let terminal_lease =
+                        remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                            .await?;
+                    delete_lease_crd(&leases_api, &terminal_lease).await;
+                    return Ok(Action::await_change());
+                }
+
+                let never_bound_candidate = terminal_status.cluster_name.is_none()
+                    && (terminal_status.binding.is_none()
+                        || retained_unstarted_binding_matches_lease(
+                            &terminal_lease,
+                            &terminal_status,
+                        ));
+                if never_bound_candidate {
+                    let creator_closed = terminal_status
+                        .connect_token_creation
+                        .as_ref()
+                        .is_none_or(|creation| {
+                            creation.phase == ConnectTokenCreationPhase::Closed
+                                && creation.verified_absent_at.is_some()
+                        });
+                    if !creator_closed {
+                        mark_binding_unverified(
+                            &leases_api,
+                            &terminal_lease,
+                            "unbound_token_creator_not_closed",
+                        )
+                        .await?;
+                        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+                    }
+
+                    if !unbound_release_proof_is_complete_for_lease(
+                        &terminal_lease,
+                        &terminal_status,
+                    ) {
+                        // Handles created before the new protocol may carry an
+                        // owner-fenced token with no binding. The release
+                        // attempt above is already durable; delete its exact
+                        // live UID and observe 404 before recording proof.
+                        if terminal_status.connect_token_creation.is_none() {
+                            crate::api::connect::delete_unbound_lease_connect_token_verified(
+                                &ctx.client,
+                                &ns,
+                                &name,
+                                lease_uid_for(&terminal_lease)?,
+                            )
+                            .await
+                            .map_err(LeaseError::Lifecycle)?;
+                        }
+                        let attempt = terminal_status
+                            .teardown_attempt_id
+                            .as_deref()
+                            .expect("durable attempt checked above");
+                        if !crate::receipt_authority::is_separate() {
+                            let Some(verified_at) = authority_never_bound_observation(
+                                &ctx.client,
+                                &ns,
+                                &terminal_lease,
+                            )
+                            .await?
+                            else {
+                                return Ok(Action::requeue(std::time::Duration::from_secs(5)));
+                            };
+                            record_unbound_release_proof(
+                                &leases_api,
+                                &terminal_lease,
+                                &terminal_status,
+                                attempt,
+                                &verified_at,
+                            )
+                            .await?;
+                        }
+                        return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+                    }
+                    if !unbound_release_proof_acknowledged(&terminal_lease, &terminal_status) {
+                        debug!(lease = %name, "retaining NeverBound proof until its exact attempt is acknowledged");
+                        return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+                    }
+
+                    info!(lease = %name, phase = %phase, "Retiring acknowledged NeverBound lease");
+                    crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
+                        .with_label_values(&[
+                            terminal_lease.spec.pool_ref.as_str(),
+                            phase.to_string().as_str(),
+                        ])
+                        .inc();
+                    let terminal_lease =
+                        remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                            .await?;
+                    delete_lease_crd(&leases_api, &terminal_lease).await;
+                    return Ok(Action::await_change());
+                }
+            }
+
+            let Some(lease_uid) = terminal_lease.metadata.uid.as_deref() else {
+                mark_binding_unverified(&leases_api, &terminal_lease, "lease_uid_missing").await?;
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             };
 
-            // Explicitly delete the lease's connect-token Secret now, rather
-            // than waiting for owner-ref GC when the lease CRD is deleted at the
-            // end of Recycling (#178). Closes the window where a released lease's
-            // token still validates if the CRD delete is interrupted; access is
-            // also bounded per-request by the proxy phase/expiry re-check (#116).
-            // Best-effort: a failure must not abort recycling.
-            if let Err(e) =
+            // Standard cleanup revokes by exact live owner immediately. A
+            // VerifiedDestroy binding MUST defer deletion to the instance gate:
+            // that gate first persists the attempt nonce, then deletes the
+            // immutable `binding.connectToken` UID and records the observed
+            // absence in the same attempt's receipt. Deleting here would make
+            // that evidence post-hoc and could launder a same-name replacement.
+            let token_delete_result = if verified_cleanup {
+                Ok(())
+            } else {
                 crate::api::connect::delete_lease_connect_token(&ctx.client, &ns, &name, lease_uid)
                     .await
-            {
-                warn!(lease = %name, "best-effort connect-token delete failed (continuing): {e:#}");
+            };
+            if let Err(error) = &token_delete_result {
+                warn!(lease = %name, "connect-token delete failed: {error:#}");
             }
 
             let resolved = match crate::lease_binding::resolve_lease_binding(
@@ -552,9 +1669,11 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // failures are transient. Both still fall through to the arm
                 // below and wait.
                 Err(BindingResolutionError::BindingMissing)
-                    if status.cluster_name.is_none()
-                        && !teardown_receipt_unconsumed(&lease, &status) =>
+                    if terminal_status.cluster_name.is_none()
+                        && !sandbox_composition_requires_outer_retirement(&terminal_lease)
+                        && !teardown_receipt_unconsumed(&terminal_lease, &terminal_status) =>
                 {
+                    debug_assert!(!verified_cleanup, "verified unbound path returned above");
                     info!(
                         lease = %name,
                         phase = %phase,
@@ -562,15 +1681,22 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     );
                     crate::metrics::LEASES_RETIRED_UNBOUND_TOTAL
                         .with_label_values(&[
-                            lease.spec.pool_ref.as_str(),
+                            terminal_lease.spec.pool_ref.as_str(),
                             phase.to_string().as_str(),
                         ])
                         .inc();
-                    delete_lease_crd(&leases_api, &lease).await;
-                    return Ok(Action::await_change());
+                    let terminal_lease =
+                        remove_receipt_retention_finalizer(&ctx.client, &ns, &terminal_lease)
+                            .await?;
+                    return Ok(if delete_lease_crd(&leases_api, &terminal_lease).await {
+                        Action::await_change()
+                    } else {
+                        Action::requeue(std::time::Duration::from_secs(15))
+                    });
                 }
                 Err(err) => {
-                    mark_binding_unverified(&leases_api, &lease, err.reason_code()).await?;
+                    mark_binding_unverified(&leases_api, &terminal_lease, err.reason_code())
+                        .await?;
                     return Ok(Action::requeue(std::time::Duration::from_secs(30)));
                 }
             };
@@ -606,29 +1732,34 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
             }
 
             if !mark_instance_recycling(&ctx.client, &ns, &resolved.binding).await? {
-                mark_binding_unverified(&leases_api, &lease, "instance_recycle_fence_failed")
-                    .await?;
+                mark_binding_unverified(
+                    &leases_api,
+                    &terminal_lease,
+                    "instance_recycle_fence_failed",
+                )
+                .await?;
                 return Ok(Action::requeue(std::time::Duration::from_secs(30)));
             }
 
-            let mut recycling_status = status.clone();
+            let mut recycling_status = terminal_status.clone();
             recycling_status.phase = LeasePhase::Recycling;
             if diag_url.is_some() {
                 recycling_status.diagnostics_url = diag_url;
             }
             let conditions = derive_lease_conditions(
                 &recycling_status,
-                &status.conditions,
+                &terminal_status.conditions,
                 None,
                 &chrono::Utc::now().to_rfc3339(),
             );
             recycling_status.conditions = conditions;
-            let lease_rv = lease
+            let lease_rv = terminal_lease
                 .resource_version()
                 .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
             let patch = json_patch(serde_json::json!([
                 { "op": "test", "path": "/metadata/uid", "value": lease_uid },
                 { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
+                { "op": "test", "path": "/status/phase", "value": terminal_status.phase },
                 { "op": "test", "path": "/status/binding", "value": resolved.binding },
                 { "op": "add", "path": "/status", "value": recycling_status }
             ]));
@@ -686,26 +1817,48 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // Retain it until a consumer acknowledges. Deliberately not a
                 // timeout: evidence that expires on a clock is evidence you
                 // cannot rely on having.
-                if status.teardown_receipt.is_some()
-                    && !lease
-                        .annotations()
-                        .contains_key(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
-                {
+                if teardown_receipt_unconsumed(&lease, &status) {
                     debug!(
                         lease = %name,
                         "retaining recycled lease: its teardown receipt has not been consumed"
                     );
                     return Ok(Action::requeue(std::time::Duration::from_secs(300)));
                 }
+                let lease = if status.teardown_receipt.is_some() {
+                    remove_receipt_retention_finalizer(&ctx.client, &ns, &lease).await?
+                } else {
+                    (*lease).clone()
+                };
+                if sandbox_composition_requires_outer_retirement(&lease)
+                    && !stale_sandbox_composition_was_rejected(&lease)
+                {
+                    // ACK alone is not evidence that the new retention
+                    // finalizer is installed. The outer controller owns the
+                    // fenced delete for ordinary compositions; only an exact
+                    // autonomous stale rejection may retire itself here.
+                    debug!(lease = %name, "retaining Sandbox composition receipt for outer retirement");
+                    return Ok(Action::requeue(std::time::Duration::from_secs(300)));
+                }
                 info!(lease = %name, "Recycling complete, deleting lease CRD");
-                delete_lease_crd(&leases_api, &lease).await;
-                Ok(Action::await_change())
+                Ok(if delete_lease_crd(&leases_api, &lease).await {
+                    Action::await_change()
+                } else {
+                    Action::requeue(std::time::Duration::from_secs(15))
+                })
             } else {
                 debug!(lease = %name, "Lease in recycling phase, waiting for cluster cleanup");
                 Ok(Action::requeue(std::time::Duration::from_secs(15)))
             }
         }
     }
+}
+
+fn requires_attempt_bound_token_deletion(lease: &ClusterLease) -> bool {
+    lease
+        .spec
+        .cleanup_mode
+        .unwrap_or_default()
+        .requires_receipt()
 }
 
 /// Extend a lease's TTL.
@@ -839,15 +1992,81 @@ fn created_at_for(lease: &ClusterLease) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(chrono::Utc::now)
 }
 
-/// Complete a previously persisted two-sided reservation. The full status is
-/// replaced under UID/resourceVersion/phase/binding tests, so a replay either
-/// finishes this exact pair or conflicts without erasing newer state.
+/// Enforce the durable Sandbox authority around final publication.
+///
+/// A legacy composition that is already exactly `Bound` may finish recovery:
+/// this helper is not granting new access in that case. Every Pending intent,
+/// including one from a legacy producer, must still prove the outer authority,
+/// its exact live pool, and the binding pool before `Bound` can be published.
+async fn sandbox_composition_finalization_is_authorized<B: ClusterBackend>(
+    ctx: &LeaseContext<B>,
+    namespace: &str,
+    leases_api: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+    already_bound: bool,
+) -> Result<bool, LeaseError> {
+    match sandbox_composition_allocation_gate(&ctx.client, namespace, lease).await {
+        SandboxCompositionGate::NotComposition => {
+            if lease.metadata.deletion_timestamp.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "lease was deleted while finalizing binding"
+                )));
+            }
+            Ok(true)
+        }
+        SandboxCompositionGate::Authorized(authority)
+            if binding_pool_matches_sandbox_authority(binding, &authority) =>
+        {
+            Ok(true)
+        }
+        SandboxCompositionGate::LegacyBoundRecovery if already_bound => Ok(true),
+        SandboxCompositionGate::LegacyBoundRecovery => Ok(false),
+        SandboxCompositionGate::Authorized(_) | SandboxCompositionGate::Invalid => {
+            if !mark_instance_recycling(&ctx.client, namespace, binding).await? {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "invalid Sandbox reservation could not be fenced for recycling"
+                )));
+            }
+            let _ = quarantine_invalid_sandbox_composition(leases_api, lease).await?;
+            Ok(false)
+        }
+        SandboxCompositionGate::NeedsMigration(identity) => {
+            let _ =
+                migrate_sandbox_composition_retention_fence(leases_api, lease, &identity).await?;
+            Ok(false)
+        }
+        SandboxCompositionGate::Closed(identity) => {
+            let _ = close_stale_sandbox_composition(
+                &ctx.client,
+                namespace,
+                leases_api,
+                lease,
+                &identity,
+            )
+            .await?;
+            Ok(false)
+        }
+        SandboxCompositionGate::Retry => Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "Sandbox composition authorization unavailable while finalizing binding"
+        ))),
+    }
+}
+
+/// Complete a previously persisted two-sided reservation.
+///
+/// Returns `true` only when `Bound` is already or successfully published. If a
+/// Sandbox allocation fence closed after reservation, the exact instance is
+/// first moved to `Recycling`, the handle is terminalized behind its retention
+/// fence, and `false` asks the caller for a short convergence requeue. Thus the
+/// cross-object gate-to-reserve window can consume capacity transiently but
+/// can neither publish `Bound` nor strand that capacity.
 async fn finalize_binding<B: ClusterBackend>(
     ctx: &LeaseContext<B>,
     namespace: &str,
     binding: &LeaseBinding,
     created_at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), LeaseError> {
+) -> Result<bool, LeaseError> {
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
     let lease = leases_api.get(&binding.lease.name).await?;
     if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref() {
@@ -856,13 +2075,49 @@ async fn finalize_binding<B: ClusterBackend>(
         )));
     }
     let status = lease.status.clone().unwrap_or_default();
-    if status.phase == LeasePhase::Bound && status.binding.as_ref() == Some(binding) {
-        return Ok(());
-    }
-    if status.phase != LeasePhase::Pending || status.binding.as_ref() != Some(binding) {
+    let already_bound =
+        status.phase == LeasePhase::Bound && status.binding.as_ref() == Some(binding);
+    if !already_bound
+        && (status.phase != LeasePhase::Pending || status.binding.as_ref() != Some(binding))
+    {
         return Err(LeaseError::Lifecycle(anyhow::anyhow!(
             "lease binding intent changed before finalization"
         )));
+    }
+    if !sandbox_composition_finalization_is_authorized(
+        ctx,
+        namespace,
+        &leases_api,
+        &lease,
+        binding,
+        already_bound,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+
+    let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
+    let instance = instances.get(&binding.instance.name).await?;
+    if !instance_matches_binding_subject(&instance, binding)
+        || instance.status.as_ref().is_none_or(|status| {
+            status.phase != ClusterInstancePhase::Leased || status.binding.as_ref() != Some(binding)
+        })
+    {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "instance reciprocal binding changed before finalization"
+        )));
+    }
+    validate_binding_eligibility(ctx.factory.as_ref(), namespace, &lease, &instance, binding)
+        .await
+        .map_err(LeaseError::Lifecycle)?;
+    if binding.cleanup_mode.requires_receipt() {
+        crate::api::connect::ensure_lease_connect_token(&ctx.client, namespace, &lease, binding)
+            .await
+            .map_err(LeaseError::Lifecycle)?;
+    }
+    if already_bound {
+        return Ok(true);
     }
 
     let lease_uid = binding
@@ -895,9 +2150,29 @@ async fn finalize_binding<B: ClusterBackend>(
         message: None,
         conditions: Vec::new(),
         teardown_receipt: None,
+        teardown_evidence: None,
+        teardown_attempt_id: None,
+        connect_token_creation: status.connect_token_creation.clone(),
+        unbound_release_verified_at: None,
+        teardown_acknowledgement: None,
     };
     new_status.conditions =
         derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
+
+    // Re-read the outer and exact live pool immediately before publishing
+    // `Bound`. This closes replacement races during instance/token validation.
+    if !sandbox_composition_finalization_is_authorized(
+        ctx,
+        namespace,
+        &leases_api,
+        &lease,
+        binding,
+        false,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
 
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": lease_uid },
@@ -931,7 +2206,7 @@ async fn finalize_binding<B: ClusterBackend>(
         bind_seconds = bind_duration,
         "Lease bound to exact ClusterInstance"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Message stamped on a lease whose binding could not be verified.
@@ -943,7 +2218,7 @@ const BINDING_UNVERIFIED_MESSAGE: &str =
 /// The uid + resourceVersion preconditions mean a same-named replacement or a
 /// concurrently-modified lease is never the thing deleted. A 404 is success:
 /// something else already removed it.
-async fn delete_lease_crd(leases_api: &Api<ClusterLease>, lease: &ClusterLease) {
+async fn delete_lease_crd(leases_api: &Api<ClusterLease>, lease: &ClusterLease) -> bool {
     let name = lease.name_any();
     let delete_params = DeleteParams {
         preconditions: Some(Preconditions {
@@ -953,12 +2228,14 @@ async fn delete_lease_crd(leases_api: &Api<ClusterLease>, lease: &ClusterLease) 
         ..Default::default()
     };
     match leases_api.delete(&name, &delete_params).await {
-        Ok(_) => {}
+        Ok(_) => true,
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
             // Already deleted, that's fine
+            true
         }
         Err(e) => {
             warn!(lease = %name, "Failed to delete lease CRD: {e}");
+            false
         }
     }
 }
@@ -969,10 +2246,487 @@ async fn delete_lease_crd(leases_api: &Api<ClusterLease>, lease: &ClusterLease) 
 /// durable proof that capacity was destroyed, so it outlives the lease until a
 /// consumer acknowledges it.
 fn teardown_receipt_unconsumed(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
-    status.teardown_receipt.is_some()
-        && !lease
+    let Some(receipt) = status.teardown_receipt.as_ref() else {
+        return false;
+    };
+    if stale_sandbox_composition_was_rejected(lease) {
+        return receipt.acknowledgement_token().is_none();
+    }
+    !teardown_receipt_acknowledged(lease, status)
+}
+
+fn sandbox_composition_requires_outer_retirement(lease: &ClusterLease) -> bool {
+    lease.spec.requester.requester_type == "kobe:sandbox-composition"
+        && !lease.spec.requester.identity.is_empty()
+        && lease.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
+}
+
+fn stale_sandbox_composition_was_rejected(lease: &ClusterLease) -> bool {
+    let labels = lease.labels();
+    let annotations = lease.annotations();
+    let Some(outer_uid) = labels
+        .get(crate::sandbox::SANDBOX_LEASE_UID_LABEL)
+        .filter(|uid| !uid.is_empty())
+    else {
+        return false;
+    };
+    let Some(outer_name) = annotations
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    let retention_deadline_is_valid = annotations
+        .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some();
+
+    lease.name_any() == crate::controllers::sandbox_child::internal_lease_name(outer_name)
+        && lease.namespace().is_some()
+        && lease
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+        && labels
+            .get("app.kubernetes.io/managed-by")
+            .is_some_and(|value| value == crate::sandbox::KOBE_MANAGED_BY)
+        && labels
+            .get(crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL)
+            .is_some_and(|value| value == "true")
+        && lease.spec.requester.requester_type == "kobe:sandbox-composition"
+        && lease.spec.requester.identity == *outer_uid
+        && lease.spec.cleanup_mode == Some(crate::crd::CleanupMode::VerifiedDestroy)
+        && annotations
+            .get(crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION)
+            == Some(outer_uid)
+        && retention_deadline_is_valid
+        && lease.finalizers().iter().any(|finalizer| {
+            finalizer == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+        })
+}
+
+/// Exact acknowledgement token for a terminal lease that never bound.
+///
+/// Both the durable teardown attempt and its API-server-observed absence
+/// timestamp participate, so an acknowledgement from an earlier attempt
+/// cannot retire a later proof-bearing handle.
+pub(crate) fn unbound_release_acknowledgement_token(status: &ClusterLeaseStatus) -> Option<String> {
+    if !unbound_release_proof_is_complete(status) {
+        return None;
+    }
+    let attempt = status
+        .teardown_attempt_id
+        .as_deref()
+        .filter(|attempt| !attempt.trim().is_empty())?;
+    let verified_at = status.unbound_release_verified_at.as_deref()?;
+    Some(format!("{attempt}:{verified_at}"))
+}
+
+/// Acknowledgement is bound to the exact terminal receipt, not a boolean flag.
+/// The Sandbox consumer must first call `permits_release_for` with its trusted
+/// scope and then write this token; a stale attempt annotation never releases a
+/// newer receipt.
+fn teardown_receipt_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
+    status
+        .teardown_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.acknowledgement_token())
+        .zip(status.teardown_receipt.as_ref())
+        .is_some_and(|(expected, receipt)| {
+            if crate::receipt_authority::is_separate() {
+                return status.teardown_acknowledgement.as_ref().is_some_and(|ack| {
+                    ack.attempt_id == receipt.attempt_id
+                        && ack.proof.kind == TeardownAcknowledgedProofKind::Receipt
+                        && ack.proof.receipt_token.as_deref() == Some(expected.as_str())
+                        && ack.proof.evidence.as_ref().is_some_and(|evidence| {
+                            status.teardown_evidence.as_ref() == Some(evidence)
+                        })
+                });
+            }
+            lease
+                .annotations()
+                .get(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+                == Some(&expected)
+        })
+}
+
+/// A `NeverBound` proof is attempt-bound and may exist only after the
+/// create-capable token state is absent or durably Closed.
+///
+/// A verified binding intent is deliberately retained when its creator was
+/// closed directly from `Prepared`. Keeping that exact identity prevents a
+/// later reader from mistaking "no reciprocal allocation" for "no intent ever
+/// existed", while the closed creator makes delayed token creation impossible.
+fn unbound_release_proof_is_complete(status: &ClusterLeaseStatus) -> bool {
+    let attempt = status
+        .teardown_attempt_id
+        .as_deref()
+        .filter(|attempt| !attempt.trim().is_empty());
+    let verified_at = status
+        .unbound_release_verified_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    let creator_closed = status
+        .connect_token_creation
+        .as_ref()
+        .is_none_or(|creation| {
+            creation.phase == ConnectTokenCreationPhase::Closed
+                && creation.verified_absent_at.as_deref()
+                    == status.unbound_release_verified_at.as_deref()
+        });
+    attempt.is_some()
+        && verified_at.is_some()
+        && matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
+        && creator_closed
+        && (status.binding.is_none() || retained_unstarted_binding_is_closed(status))
+        && status.cluster_name.is_none()
+        && status.teardown_receipt.is_none()
+        && status.teardown_evidence.is_none()
+        && status.conditions.iter().any(|condition| {
+            condition.condition_type == ALLOCATION_ABSENT_CONDITION
+                && condition.status == "True"
+                && condition.reason == "NeverBound"
+                && condition.message.contains(attempt.unwrap())
+        })
+}
+
+fn unbound_release_proof_is_complete_for_lease(
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> bool {
+    unbound_release_proof_is_complete(status)
+        && (status.binding.is_none() || retained_unstarted_binding_matches_lease(lease, status))
+}
+
+fn unbound_release_proof_acknowledged(lease: &ClusterLease, status: &ClusterLeaseStatus) -> bool {
+    status.teardown_attempt_id.as_ref().is_some_and(|attempt| {
+        if crate::receipt_authority::is_separate() {
+            return status.teardown_acknowledgement.as_ref().is_some_and(|ack| {
+                ack.attempt_id == *attempt
+                    && ack.proof.kind == TeardownAcknowledgedProofKind::NeverBound
+                    && ack
+                        .proof
+                        .unbound_release_verified_at
+                        .as_ref()
+                        .is_some_and(|verified_at| {
+                            status.unbound_release_verified_at.as_ref() == Some(verified_at)
+                        })
+            });
+        }
+        lease
             .annotations()
-            .contains_key(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION)
+            .get(UNBOUND_RELEASE_PROOF_ACKNOWLEDGED_ANNOTATION)
+            == Some(attempt)
+    })
+}
+
+/// Persist the release attempt before any token deletion or absence lookup.
+async fn ensure_unbound_release_attempt(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+) -> Result<Option<String>, LeaseError> {
+    if let Some(attempt) = status
+        .teardown_attempt_id
+        .as_ref()
+        .filter(|attempt| !attempt.trim().is_empty())
+    {
+        return Ok(Some(attempt.clone()));
+    }
+    if status.teardown_attempt_id.is_some() || status.teardown_receipt.is_some() {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "unbound release has malformed or conflicting teardown evidence"
+        )));
+    }
+    if crate::receipt_authority::is_separate() {
+        // Only the dedicated authority may open a destructive attempt in the
+        // split deployment. The lifecycle controller will requeue without
+        // issuing a DELETE until that exact nonce is visible.
+        return Ok(None);
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let attempt = uuid::Uuid::new_v4().to_string();
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "add", "path": "/status/teardownAttemptId", "value": attempt }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(None),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn record_unbound_release_proof(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+    attempt: &str,
+    verified_at: &str,
+) -> Result<(), LeaseError> {
+    if status.teardown_attempt_id.as_deref() != Some(attempt)
+        || status.cluster_name.is_some()
+        || (status.binding.is_some() && !retained_unstarted_binding_matches_lease(lease, status))
+        || status.teardown_receipt.is_some()
+    {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "NeverBound proof lost its exact release attempt"
+        )));
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut conditions: Vec<_> = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type != ALLOCATION_ABSENT_CONDITION)
+        .cloned()
+        .collect();
+    conditions.push(ClusterLeaseCondition {
+        condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+        status: "True".into(),
+        reason: "NeverBound".into(),
+        message: format!("release attempt {attempt} proved no reciprocal allocation existed"),
+        last_transition_time: Some(verified_at.to_string()),
+    });
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": status.phase },
+        { "op": "test", "path": "/status/teardownAttemptId", "value": attempt },
+        { "op": "add", "path": "/status/unboundReleaseVerifiedAt", "value": verified_at },
+        { "op": "add", "path": "/status/conditions", "value": conditions }
+    ]));
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Close the only create-capable token attempt for a terminal verified lease.
+///
+/// Every destructive step is bound to the already-persisted teardown attempt.
+/// `Creating` is observation-only: a 404 is ambiguous and therefore never
+/// advances to `Closed`. `Closed` is reached only after either proving that the
+/// attempt was still `Prepared` (so no POST was permitted) or deleting an exact
+/// persisted Secret UID and observing its absence.
+async fn close_terminal_connect_token_creation(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    status: &ClusterLeaseStatus,
+    binding: &LeaseBinding,
+) -> Result<Option<(ClusterLease, LeaseBinding)>, LeaseError> {
+    let creation = status.connect_token_creation.as_ref().ok_or_else(|| {
+        LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified terminal binding has no token creation checkpoint"
+        ))
+    })?;
+    let teardown_attempt = status
+        .teardown_attempt_id
+        .as_deref()
+        .filter(|attempt| !attempt.trim().is_empty())
+        .ok_or_else(|| {
+            LeaseError::Lifecycle(anyhow::anyhow!(
+                "terminal token close has no durable teardown attempt"
+            ))
+        })?;
+    if !matches!(status.phase, LeasePhase::Released | LeasePhase::Expired)
+        || status.binding.as_ref() != Some(binding)
+        || creation.attempt_id.trim().is_empty()
+    {
+        return Ok(None);
+    }
+
+    if creation.phase == ConnectTokenCreationPhase::Closed {
+        let verified_at = creation
+            .verified_absent_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        let identity_matches = match creation.identity.as_ref() {
+            Some(identity) => binding.connect_token.as_ref() == Some(identity),
+            None => binding.connect_token.is_none(),
+        };
+        if verified_at.is_none() || !identity_matches {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "Closed connect-token attempt lacks exact absence evidence"
+            )));
+        }
+        return Ok(Some((lease.clone(), binding.clone())));
+    }
+
+    let mut next_binding = binding.clone();
+    let mut next_creation = creation.clone();
+    match creation.phase {
+        ConnectTokenCreationPhase::Prepared => {
+            if creation.identity.is_some() || binding.connect_token.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Prepared token attempt unexpectedly carries an identity"
+                )));
+            }
+            // The only code path allowed to POST first CASes Prepared to
+            // Creating while the lease is Pending. This terminal observation
+            // therefore proves no create was dispatched for this attempt.
+            next_creation.phase = ConnectTokenCreationPhase::Closed;
+            next_creation.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
+            // No reservation can be in flight before Creating. Retain the
+            // exact intent as an audit handle while closing its creator in the
+            // same CAS; the authority may later prove the referenced instance
+            // and every other reciprocal lease UID absent without pretending
+            // the intent never existed.
+        }
+        ConnectTokenCreationPhase::Creating => {
+            if creation.identity.is_some() || binding.connect_token.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Creating token attempt unexpectedly carries an identity"
+                )));
+            }
+            let Some(identity) = crate::api::connect::observe_reserved_lease_connect_token(
+                client,
+                namespace,
+                lease,
+                &creation.attempt_id,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?
+            else {
+                // The original POST may still arrive. Never issue another POST
+                // and never certify absence from this 404.
+                return Ok(None);
+            };
+            next_binding.connect_token = Some(identity.clone());
+            next_creation.identity = Some(identity);
+            next_creation.phase = ConnectTokenCreationPhase::Closing;
+        }
+        ConnectTokenCreationPhase::Reserved | ConnectTokenCreationPhase::Ready => {
+            if creation.identity.as_ref() != binding.connect_token.as_ref()
+                || creation.identity.is_none()
+            {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "reserved token identity differs from the binding"
+                )));
+            }
+            next_creation.phase = ConnectTokenCreationPhase::Closing;
+        }
+        ConnectTokenCreationPhase::Closing => {
+            let identity = creation.identity.as_ref().ok_or_else(|| {
+                LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Closing token attempt has no exact identity"
+                ))
+            })?;
+            if binding.connect_token.as_ref() != Some(identity) {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Closing token identity differs from the binding"
+                )));
+            }
+            let check = crate::api::connect::delete_lease_connect_token_verified(
+                client,
+                namespace,
+                &binding.lease.name,
+                lease_uid_for(lease)?,
+                identity,
+            )
+            .await;
+            if check.result != crate::crd::CheckResult::Verified {
+                return Ok(None);
+            }
+            next_creation.phase = ConnectTokenCreationPhase::Closed;
+            next_creation.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        ConnectTokenCreationPhase::Closed => unreachable!("handled above"),
+    }
+
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
+        serde_json::json!({ "op": "test", "path": "/status/phase", "value": status.phase }),
+        serde_json::json!({ "op": "test", "path": "/status/teardownAttemptId", "value": teardown_attempt }),
+        serde_json::json!({ "op": "test", "path": "/status/binding", "value": binding }),
+        serde_json::json!({ "op": "test", "path": "/status/connectTokenCreation", "value": creation }),
+    ];
+    operations.push(serde_json::json!({
+        "op": "add", "path": "/status/binding", "value": next_binding
+    }));
+    operations.push(serde_json::json!({
+        "op": "add", "path": "/status/connectTokenCreation", "value": next_creation
+    }));
+    let patch = json_patch(serde_json::Value::Array(operations));
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    match leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(None),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_receipt_retention_finalizer(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+) -> Result<ClusterLease, LeaseError> {
+    if !lease
+        .finalizers()
+        .iter()
+        .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        return Ok(lease.clone());
+    }
+    let uid = lease_uid_for(lease)?;
+    let rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let finalizers: Vec<String> = lease
+        .finalizers()
+        .iter()
+        .filter(|finalizer| finalizer.as_str() != TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+        .cloned()
+        .collect();
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers }
+    ]));
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    Ok(leases
+        .patch(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?)
 }
 
 async fn mark_binding_unverified(
@@ -1034,6 +2788,17 @@ async fn backfill_legacy_binding(
     namespace: &str,
     lease: &ClusterLease,
 ) -> Result<Option<LeaseBinding>, LeaseError> {
+    if lease
+        .spec
+        .cleanup_mode
+        .unwrap_or_default()
+        .requires_receipt()
+    {
+        // A name-only legacy pair never recorded the manifest digest, cleanup
+        // mode, or connect-token UID before use. It cannot be upgraded into a
+        // VerifiedDestroy capability after the fact.
+        return Ok(None);
+    }
     let status = lease.status.as_ref().cloned().unwrap_or_default();
     let Some(cluster_name) = status.cluster_name.as_deref() else {
         return Ok(None);
@@ -1119,11 +2884,370 @@ async fn backfill_legacy_binding(
         Err(err) if optimistic_conflict(&err) => return Ok(None),
         Err(err) => return Err(err.into()),
     }
-    if reserve_binding_instance(client, namespace, &binding).await? {
-        Ok(Some(binding))
-    } else {
-        clear_lease_binding_intent(client, namespace, lease_uid, &binding).await?;
-        Ok(None)
+    match reserve_binding_instance(client, namespace, &binding).await? {
+        ReservationOutcome::Reserved => Ok(Some(binding)),
+        ReservationOutcome::Occupied => {
+            clear_lease_binding_intent(client, namespace, lease_uid, &binding).await?;
+            Ok(None)
+        }
+        ReservationOutcome::Retry => Ok(None),
+    }
+}
+
+async fn ensure_receipt_retention_finalizer(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+) -> Result<ClusterLease, LeaseError> {
+    if !lease
+        .spec
+        .cleanup_mode
+        .unwrap_or_default()
+        .requires_receipt()
+        || (lease
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+            && lease
+                .annotations()
+                .get(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION)
+                .is_some_and(|value| value == "true"))
+    {
+        return Ok(lease.clone());
+    }
+    if lease.metadata.deletion_timestamp.is_some() {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "cannot start verified binding while lease deletion is pending"
+        )));
+    }
+    let uid = lease_uid_for(lease)?;
+    let rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut finalizers = lease.finalizers().to_vec();
+    if !finalizers
+        .iter()
+        .any(|finalizer| finalizer == TEARDOWN_RECEIPT_RETENTION_FINALIZER)
+    {
+        finalizers.push(TEARDOWN_RECEIPT_RETENTION_FINALIZER.to_string());
+    }
+    let mut annotations = lease.annotations().clone();
+    annotations.insert(CONNECT_TOKEN_CREATE_FENCE_ANNOTATION.into(), "true".into());
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "add", "path": "/metadata/finalizers", "value": finalizers },
+        { "op": "add", "path": "/metadata/annotations", "value": annotations }
+    ]));
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    Ok(leases
+        .patch(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await?)
+}
+
+/// Revalidate immutable and live provenance before either side of a binding is
+/// published. VerifiedDestroy requires the exact sealed manifest, a backend
+/// that can prove it live, and (once provisioned) the exact connect-token UID.
+async fn validate_binding_eligibility(
+    factory: Option<&BackendFactory>,
+    namespace: &str,
+    lease: &ClusterLease,
+    instance: &ClusterInstance,
+    binding: &LeaseBinding,
+) -> anyhow::Result<()> {
+    let requested = lease.spec.cleanup_mode.unwrap_or_default();
+    if binding.cleanup_mode != requested {
+        anyhow::bail!("cleanup mode differs from immutable binding provenance");
+    }
+    if requested != CleanupMode::VerifiedDestroy {
+        return Ok(());
+    }
+    let manifest = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.creation_manifest.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("verified placement requires a sealed creation manifest"))?;
+    manifest
+        .validate()
+        .map_err(|reason| anyhow::anyhow!(reason.to_string()))?;
+    if manifest.instance.name != binding.instance.name
+        || manifest.instance.uid.as_deref() != Some(binding.instance.uid.as_str())
+        || manifest.namespace != namespace
+        || manifest.backend_type != binding.backend.backend_type
+        || manifest.config_digest != binding.backend.config_digest
+        || binding.creation_manifest.as_ref() != Some(manifest)
+        || manifest.digest().ok().as_deref() != binding.creation_manifest_digest.as_deref()
+    {
+        anyhow::bail!("creation manifest does not match binding identity/provenance");
+    }
+    let factory = factory.ok_or_else(|| anyhow::anyhow!("backend factory unavailable"))?;
+    let backend = factory.backend_for_provenance(&binding.backend)?;
+    if !backend.supports_verified_destroy() {
+        anyhow::bail!("backend does not support VerifiedDestroy");
+    }
+    backend
+        .validate_creation_manifest_for_bind(&binding.instance.name, namespace, manifest)
+        .await
+}
+
+/// Finish the create-capable part of a verified connect-token footprint.
+///
+/// The lease-side binding and `Prepared` attempt are durable first. This
+/// function persists `Creating` and permits exactly one empty-Secret `POST` in
+/// the same call. A later reconcile that observes `Creating` only observes the
+/// original request; it never retries the `POST`. Once the exact UID is
+/// durable, activation is a patch, so terminal release can close the creator,
+/// delete that UID, and prove absence without a delayed create repopulating the
+/// name.
+async fn complete_connect_token_creation(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<Option<(ClusterLease, LeaseBinding)>, LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let Some(mut creation) = status.connect_token_creation.clone() else {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding has no durable connect-token creation attempt"
+        )));
+    };
+    if status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || creation.attempt_id.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    let lease_uid = lease_uid_for(lease)?.to_string();
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+
+    let (lease, binding, creation) = match creation.phase {
+        ConnectTokenCreationPhase::Prepared => {
+            if binding.connect_token.is_some() || creation.identity.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Prepared connect-token attempt already carries an identity"
+                )));
+            }
+            let observed_rv = lease
+                .resource_version()
+                .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+            let prepared_creation = creation.clone();
+            creation.phase = ConnectTokenCreationPhase::Creating;
+            let patch = json_patch(serde_json::json!([
+                { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+                { "op": "test", "path": "/metadata/resourceVersion", "value": observed_rv },
+                { "op": "test", "path": "/status/phase", "value": "Pending" },
+                { "op": "test", "path": "/status/binding", "value": binding },
+                { "op": "test", "path": "/status/connectTokenCreation", "value": prepared_creation },
+                { "op": "add", "path": "/status/connectTokenCreation", "value": creation }
+            ]));
+            let dispatched = match leases
+                .patch_status(
+                    &binding.lease.name,
+                    &PatchParams::default(),
+                    &Patch::<()>::Json(patch),
+                )
+                .await
+            {
+                Ok(dispatched) => dispatched,
+                Err(error) if optimistic_conflict(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let dispatched_creation = dispatched
+                .status
+                .as_ref()
+                .and_then(|status| status.connect_token_creation.clone())
+                .ok_or_else(|| {
+                    LeaseError::Lifecycle(anyhow::anyhow!(
+                        "dispatched connect-token attempt disappeared"
+                    ))
+                })?;
+            if dispatched_creation.phase != ConnectTokenCreationPhase::Creating {
+                return Ok(None);
+            }
+            let identity = crate::api::connect::reserve_lease_connect_token(
+                client,
+                namespace,
+                &dispatched,
+                &dispatched_creation.attempt_id,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?;
+            let Some(sealed) = persist_reserved_connect_token(
+                client,
+                namespace,
+                &dispatched,
+                binding,
+                &dispatched_creation,
+                identity,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            sealed
+        }
+        ConnectTokenCreationPhase::Creating => {
+            if binding.connect_token.is_some() || creation.identity.is_some() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "Creating connect-token attempt already carries an identity"
+                )));
+            }
+            let Some(identity) = crate::api::connect::observe_reserved_lease_connect_token(
+                client,
+                namespace,
+                lease,
+                &creation.attempt_id,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?
+            else {
+                // The original POST may still be in flight. Retrying it would
+                // reopen the create name after terminal teardown, so ambiguity
+                // is retained and NeverBound remains impossible.
+                return Ok(None);
+            };
+            let Some(sealed) = persist_reserved_connect_token(
+                client, namespace, lease, binding, &creation, identity,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            sealed
+        }
+        ConnectTokenCreationPhase::Reserved | ConnectTokenCreationPhase::Ready => {
+            if binding.connect_token.as_ref() != creation.identity.as_ref() {
+                return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                    "connect-token binding and creation identities differ"
+                )));
+            }
+            (lease.clone(), binding.clone(), creation)
+        }
+        ConnectTokenCreationPhase::Closing => {
+            close_abandoned_pending_binding(client, namespace, lease, binding).await?;
+            return Ok(None);
+        }
+        ConnectTokenCreationPhase::Closed => {
+            // Verified intents are write-once. A candidate lost after token
+            // creation therefore remains a closed, auditable handle instead
+            // of being erased and replaced with a different capability.
+            return Ok(None);
+        }
+    };
+
+    if creation.phase == ConnectTokenCreationPhase::Ready {
+        crate::api::connect::ensure_lease_connect_token(client, namespace, &lease, &binding)
+            .await
+            .map_err(LeaseError::Lifecycle)?;
+        return Ok(Some((lease, binding)));
+    }
+
+    crate::api::connect::activate_reserved_lease_connect_token(
+        client,
+        namespace,
+        &binding.lease.name,
+        &lease_uid,
+        &binding,
+        &creation.attempt_id,
+    )
+    .await
+    .map_err(LeaseError::Lifecycle)?;
+
+    let current = leases.get(&binding.lease.name).await?;
+    let current_status = current.status.as_ref().cloned().unwrap_or_default();
+    let Some(mut current_creation) = current_status.connect_token_creation.clone() else {
+        return Ok(None);
+    };
+    if current.metadata.uid.as_deref() != Some(lease_uid.as_str())
+        || current_status.phase != LeasePhase::Pending
+        || current_status.binding.as_ref() != Some(&binding)
+        || current_creation != creation
+    {
+        return Ok(None);
+    }
+    let resource_version = current
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    current_creation.phase = ConnectTokenCreationPhase::Ready;
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+        { "op": "add", "path": "/status/connectTokenCreation", "value": current_creation }
+    ]));
+    match leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(ready) => Ok(Some((ready, binding))),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn persist_reserved_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+    creation: &ConnectTokenCreation,
+    identity: crate::crd::KubernetesResourceIdentity,
+) -> Result<Option<(ClusterLease, LeaseBinding, ConnectTokenCreation)>, LeaseError> {
+    if creation.phase != ConnectTokenCreationPhase::Creating
+        || creation.identity.is_some()
+        || binding.connect_token.is_some()
+    {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "only an unresolved Creating attempt can persist a token UID"
+        )));
+    }
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    if status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || status.connect_token_creation.as_ref() != Some(creation)
+    {
+        return Ok(None);
+    }
+    let lease_uid = lease_uid_for(lease)?;
+    let observed_rv = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let mut sealed_binding = binding.clone();
+    sealed_binding.connect_token = Some(identity.clone());
+    let mut sealed_creation = creation.clone();
+    sealed_creation.phase = ConnectTokenCreationPhase::Reserved;
+    sealed_creation.identity = Some(identity);
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": observed_rv },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+        { "op": "add", "path": "/status/binding", "value": sealed_binding },
+        { "op": "add", "path": "/status/connectTokenCreation", "value": sealed_creation }
+    ]));
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    match leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(sealed) => Ok(Some((sealed, sealed_binding, sealed_creation))),
+        Err(error) if optimistic_conflict(&error) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1131,17 +3255,56 @@ async fn reserve_ready_instance(
     client: &Client,
     namespace: &str,
     lease: &ClusterLease,
+    factory: Option<&BackendFactory>,
 ) -> Result<Option<LeaseBinding>, LeaseError> {
+    // A resumed intent is already authority-bearing. Revalidate it before the
+    // idempotent receipt-fence metadata upgrade so a replaced outer pool can
+    // never cause even an unrelated write. The check is deliberately repeated
+    // below after that CAS to close the metadata-update race.
+    if let Some(binding) = lease
+        .status
+        .as_ref()
+        .and_then(|status| status.binding.as_ref())
+        && !sandbox_composition_binding_is_authorized(client, namespace, lease, binding).await?
+    {
+        warn!(lease = %lease.name_any(), "Cannot upgrade reservation whose pool differs from the outer Sandbox authority");
+        return Ok(None);
+    }
+    let lease = ensure_receipt_retention_finalizer(client, namespace, lease).await?;
     if let Some(binding) = lease
         .status
         .as_ref()
         .and_then(|status| status.binding.clone())
     {
-        return if reserve_binding_instance(client, namespace, &binding).await? {
-            Ok(Some(binding))
+        if !sandbox_composition_binding_is_authorized(client, namespace, &lease, &binding).await? {
+            warn!(lease = %lease.name_any(), "Cannot resume reservation whose pool differs from the outer Sandbox authority");
+            return Ok(None);
+        }
+        let instance = Api::<ClusterInstance>::namespaced(client.clone(), namespace)
+            .get(&binding.instance.name)
+            .await?;
+        if validate_binding_eligibility(factory, namespace, &lease, &instance, &binding)
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let (lease, binding) = if binding.cleanup_mode.requires_receipt() {
+            match complete_connect_token_creation(client, namespace, &lease, &binding).await? {
+                Some(ready) => ready,
+                None => return Ok(None),
+            }
         } else {
-            clear_lease_binding_intent(client, namespace, lease_uid_for(lease)?, &binding).await?;
-            Ok(None)
+            (lease.clone(), binding)
+        };
+        return match reserve_binding_instance(client, namespace, &binding).await? {
+            ReservationOutcome::Reserved => Ok(Some(binding)),
+            ReservationOutcome::Occupied => {
+                clear_lease_binding_intent(client, namespace, lease_uid_for(&lease)?, &binding)
+                    .await?;
+                Ok(None)
+            }
+            ReservationOutcome::Retry => Ok(None),
         };
     }
 
@@ -1165,14 +3328,17 @@ async fn reserve_ready_instance(
             instance
                 .status
                 .as_ref()
-                // A genuinely-free instance is Ready AND carries no leaseRef. The
-                // extra leaseRef check prevents a double-lease: if a stale write
-                // (e.g. the profile controller syncing an out-of-date in-memory
-                // phase) reverts an already-Leased instance to Ready while leaving
-                // its leaseRef set, selecting it here would bind the same cluster
-                // to a second tenant. Requiring leaseRef == None excludes that
-                // case while still admitting all genuinely-idle instances.
-                .map(|s| s.phase == ClusterInstancePhase::Ready && s.lease_ref.is_none())
+                // A genuinely-free instance is Ready and carries neither side
+                // of a reciprocal reservation. A stale full-status writer may
+                // revert phase or drop the display-only leaseRef while the
+                // authoritative binding survives; selecting that instance
+                // would manufacture a competing lease intent and risk clearing
+                // it before the adopted pair reaches verified teardown.
+                .map(|s| {
+                    s.phase == ClusterInstancePhase::Ready
+                        && s.lease_ref.is_none()
+                        && s.binding.is_none()
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -1194,7 +3360,7 @@ async fn reserve_ready_instance(
     let pool = pools_api.get(&lease.spec.pool_ref).await?;
 
     for instance in ready {
-        let binding = match binding_from_observation(lease, &instance, &pool) {
+        let mut binding = match binding_from_observation(&lease, &instance, &pool) {
             Ok(binding) => binding,
             Err(reason) => {
                 warn!(
@@ -1206,15 +3372,42 @@ async fn reserve_ready_instance(
                 continue;
             }
         };
-
+        if let Err(error) =
+            validate_binding_eligibility(factory, namespace, &lease, &instance, &binding).await
+        {
+            warn!(lease = %lease.name_any(), instance = %instance.name_any(), error = %error, "Skipping instance that cannot satisfy immutable cleanup provenance");
+            continue;
+        }
+        if !sandbox_composition_binding_is_authorized(client, namespace, &lease, &binding).await? {
+            warn!(lease = %lease.name_any(), "Refusing binding intent whose pool differs from the outer Sandbox authority");
+            return Ok(None);
+        }
         let leases_api: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
-        let intent_patch = json_patch(serde_json::json!([
-            { "op": "test", "path": "/metadata/uid", "value": lease_uid },
-            { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
-            { "op": "test", "path": "/status/phase", "value": "Pending" },
-            { "op": "add", "path": "/status/binding", "value": binding }
-        ]));
-        match leases_api
+        let token_creation =
+            binding
+                .cleanup_mode
+                .requires_receipt()
+                .then(|| ConnectTokenCreation {
+                    attempt_id: uuid::Uuid::new_v4().to_string(),
+                    phase: ConnectTokenCreationPhase::Prepared,
+                    identity: None,
+                    verified_absent_at: None,
+                });
+        let mut operations = vec![
+            serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid }),
+            serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv }),
+            serde_json::json!({ "op": "test", "path": "/status/phase", "value": "Pending" }),
+            serde_json::json!({ "op": "add", "path": "/status/binding", "value": binding }),
+        ];
+        if let Some(token_creation) = token_creation {
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": "/status/connectTokenCreation",
+                "value": token_creation
+            }));
+        }
+        let intent_patch = json_patch(serde_json::Value::Array(operations));
+        let intent_lease = match leases_api
             .patch_status(
                 &lease.name_any(),
                 &PatchParams::default(),
@@ -1222,20 +3415,32 @@ async fn reserve_ready_instance(
             )
             .await
         {
-            Ok(_) => {}
+            Ok(intent) => intent,
             Err(err) if optimistic_conflict(&err) => return Ok(None),
             Err(err) => return Err(err.into()),
+        };
+
+        if binding.cleanup_mode.requires_receipt() {
+            let Some((_, completed)) =
+                complete_connect_token_creation(client, namespace, &intent_lease, &binding).await?
+            else {
+                return Ok(None);
+            };
+            binding = completed;
         }
 
-        if reserve_binding_instance(client, namespace, &binding).await? {
-            return Ok(Some(binding));
+        match reserve_binding_instance(client, namespace, &binding).await? {
+            ReservationOutcome::Reserved => return Ok(Some(binding)),
+            ReservationOutcome::Occupied => {
+                // Only a fresh read proving the target replaced or owned by a
+                // foreign binding permits this exact intent to be cleared.
+                // An exact adoption always proceeds to finalization and, if
+                // release won, through its teardown receipt.
+                clear_lease_binding_intent(client, namespace, lease_uid, &binding).await?;
+                return Ok(None);
+            }
+            ReservationOutcome::Retry => return Ok(None),
         }
-
-        // The intended instance was won by another lease. Remove only this
-        // exact still-Pending intent; resourceVersion + full binding tests mean
-        // a concurrent finalization or replacement cannot be erased.
-        clear_lease_binding_intent(client, namespace, lease_uid, &binding).await?;
-        return Ok(None);
     }
 
     Ok(None)
@@ -1249,24 +3454,105 @@ fn lease_uid_for(lease: &ClusterLease) -> Result<&str, LeaseError> {
         .ok_or_else(|| LeaseError::Lifecycle(anyhow::anyhow!("lease missing UID")))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationOutcome {
+    Reserved,
+    Occupied,
+    Retry,
+}
+
+fn instance_carries_compatible_reservation(
+    instance: &ClusterInstance,
+    status: &crate::crd::ClusterInstanceStatus,
+    binding: &LeaseBinding,
+) -> bool {
+    instance.name_any() == binding.instance.name
+        && instance.metadata.uid.as_deref() == Some(binding.instance.uid.as_str())
+        && (status.binding.as_ref() == Some(binding)
+            || status.lease_ref.as_ref().is_some_and(|reference| {
+                reference.name == binding.lease.name
+                    && (reference.uid.is_none() || reference.uid == binding.lease.uid)
+            }))
+}
+
 /// Reserve the exact instance named by an already-persisted lease intent.
-/// Returns `false` on an optimistic conflict/occupied instance and leaves
-/// uncertain transport failures for the next reconcile to recover.
+///
+/// An optimistic conflict is re-read before classification. Another replica
+/// may have installed this same binding, in which case clearing the lease-side
+/// intent would strand an adopted instance and manufacture a false NeverBound
+/// proof. Only a fresh read of the same name proving a foreign or already-held
+/// object returns [`ReservationOutcome::Occupied`]; absence remains retryable.
 async fn reserve_binding_instance(
     client: &Client,
     namespace: &str,
     binding: &LeaseBinding,
-) -> Result<bool, LeaseError> {
+) -> Result<ReservationOutcome, LeaseError> {
+    // Close the stale-reconcile window at the last boundary before an instance
+    // status mutation. A token creator or allocator that read Pending before a
+    // concurrent release cannot reserve after that release has moved the lease
+    // or its creation state to Closing.
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let lease = match leases.get(&binding.lease.name).await {
+        Ok(lease) => lease,
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return Ok(ReservationOutcome::Retry);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let token_ready = !binding.cleanup_mode.requires_receipt()
+        || status
+            .connect_token_creation
+            .as_ref()
+            .is_some_and(|creation| {
+                creation.phase == ConnectTokenCreationPhase::Ready
+                    && creation.identity.as_ref() == binding.connect_token.as_ref()
+            });
+    if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref()
+        || lease.metadata.deletion_timestamp.is_some()
+        || status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || !token_ready
+    {
+        // A terminal transition or exact adopted intent is not evidence that
+        // another subject occupied the instance. Preserve the lease-side
+        // handle; the terminal controller will adopt it into teardown.
+        return Ok(ReservationOutcome::Retry);
+    }
+    reserve_binding_instance_after_lease_fence(client, namespace, binding).await
+}
+
+/// Reserve an instance after the caller has closed or validated the exact
+/// lease-side creator fence. The ordinary bind path must use
+/// [`reserve_binding_instance`]; terminal close uses this only to force an
+/// already-selected free instance into the teardown path, eliminating the
+/// `NeverBound` versus stale-reserve ambiguity.
+async fn reserve_binding_instance_after_lease_fence(
+    client: &Client,
+    namespace: &str,
+    binding: &LeaseBinding,
+) -> Result<ReservationOutcome, LeaseError> {
     let instances_api: Api<ClusterInstance> = Api::namespaced(client.clone(), namespace);
     let instance = match instances_api.get(&binding.instance.name).await {
         Ok(instance) => instance,
-        Err(kube::Error::Api(ae)) if ae.code == 404 => return Ok(false),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            return Ok(ReservationOutcome::Retry);
+        }
         Err(err) => return Err(err.into()),
     };
-    if !instance_matches_binding_subject(&instance, binding) {
-        return Ok(false);
-    }
     let status = instance.status.clone().unwrap_or_default();
+    if !instance_matches_binding_subject(&instance, binding) {
+        return Ok(
+            if instance_carries_compatible_reservation(&instance, &status, binding) {
+                // Preserve the exact adopted pair even when another provenance
+                // field became inconsistent. Clearing the intent would manufacture
+                // NeverBound; a later lifecycle pass must repair or quarantine it.
+                ReservationOutcome::Retry
+            } else {
+                ReservationOutcome::Occupied
+            },
+        );
+    }
     let lease_ref_exact = status.lease_ref.as_ref().is_some_and(|reference| {
         reference.name == binding.lease.name && reference.uid == binding.lease.uid
     });
@@ -1274,19 +3560,75 @@ async fn reserve_binding_instance(
         && status.binding.as_ref() == Some(binding)
         && lease_ref_exact
     {
-        return Ok(true);
+        return Ok(ReservationOutcome::Reserved);
+    }
+    if status.binding.as_ref() == Some(binding)
+        && (status.phase == ClusterInstancePhase::Leased
+            || (status.phase == ClusterInstancePhase::Ready
+                && status.lease_ref.as_ref().is_none_or(|reference| {
+                    reference.name == binding.lease.name && reference.uid == binding.lease.uid
+                })))
+    {
+        // The reciprocal binding is the authority. A stale full-status writer
+        // may have dropped/reverted the display leaseRef or even the phase
+        // after adoption; repair those projections instead of clearing the
+        // lease-side intent and stranding capacity outside the verified
+        // teardown path. Other phases (notably Recycling/Quarantined) remain a
+        // retry so reservation can never roll teardown back to Leased.
+        let uid = instance
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("instance missing UID"))?;
+        let rv = instance
+            .resource_version()
+            .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
+        let patch = json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+            { "op": "test", "path": "/status/phase", "value": status.phase },
+            { "op": "test", "path": "/status/binding", "value": binding },
+            { "op": "add", "path": "/status/phase", "value": "Leased" },
+            { "op": "add", "path": "/status/leaseRef", "value": binding.lease }
+        ]));
+        return match instances_api
+            .patch_status(
+                &binding.instance.name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await
+        {
+            Ok(_) => Ok(ReservationOutcome::Reserved),
+            Err(error) if optimistic_conflict(&error) => Ok(ReservationOutcome::Retry),
+            Err(error) => Err(error.into()),
+        };
+    }
+    if status.binding.as_ref() == Some(binding) {
+        // Recycling/Quarantined (or any future non-reservable phase) is still
+        // an exact adopted handle. Preserve the lease intent so lifecycle can
+        // consume its receipt; never classify the same binding as occupied by
+        // somebody else.
+        return Ok(ReservationOutcome::Retry);
     }
 
     let is_free = status.phase == ClusterInstancePhase::Ready
         && status.binding.is_none()
         && status.lease_ref.is_none();
-    let is_provable_legacy_pair = status.phase == ClusterInstancePhase::Leased
-        && status.binding.is_none()
+    let is_provable_existing_pair = status.binding.is_none()
         && status.lease_ref.as_ref().is_some_and(|reference| {
-            reference.name == binding.lease.name && reference.uid.is_none()
+            reference.name == binding.lease.name
+                && (reference.uid == binding.lease.uid
+                    || (status.phase == ClusterInstancePhase::Leased && reference.uid.is_none()))
+        })
+        && (status.phase == ClusterInstancePhase::Leased
+            || status.phase == ClusterInstancePhase::Ready);
+    if !is_free && !is_provable_existing_pair {
+        return Ok(if status.binding.is_some() || status.lease_ref.is_some() {
+            ReservationOutcome::Occupied
+        } else {
+            ReservationOutcome::Retry
         });
-    if !is_free && !is_provable_legacy_pair {
-        return Ok(false);
     }
 
     let uid = instance
@@ -1297,11 +3639,15 @@ async fn reserve_binding_instance(
     let rv = instance
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
-    let expected_phase = if is_free { "Ready" } else { "Leased" };
+    let expected_phase = if is_free {
+        ClusterInstancePhase::Ready
+    } else {
+        status.phase.clone()
+    };
     let expected_lease_ref = if is_free {
         serde_json::Value::Null
     } else {
-        serde_json::json!({ "name": binding.lease.name })
+        serde_json::json!(status.lease_ref.as_ref())
     };
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": uid },
@@ -1322,9 +3668,165 @@ async fn reserve_binding_instance(
         )
         .await
     {
-        Ok(_) => Ok(true),
-        Err(err) if optimistic_conflict(&err) => Ok(false),
+        Ok(_) => Ok(ReservationOutcome::Reserved),
+        Err(err) if optimistic_conflict(&err) => {
+            let current = match instances_api.get(&binding.instance.name).await {
+                Ok(current) => current,
+                Err(kube::Error::Api(response)) if response.code == 404 => {
+                    return Ok(ReservationOutcome::Retry);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let status = current.status.as_ref().cloned().unwrap_or_default();
+            if !instance_matches_binding_subject(&current, binding) {
+                return Ok(
+                    if instance_carries_compatible_reservation(&current, &status, binding) {
+                        ReservationOutcome::Retry
+                    } else {
+                        ReservationOutcome::Occupied
+                    },
+                );
+            }
+            let lease_ref_exact = status.lease_ref.as_ref().is_some_and(|reference| {
+                reference.name == binding.lease.name && reference.uid == binding.lease.uid
+            });
+            if status.phase == ClusterInstancePhase::Leased
+                && status.binding.as_ref() == Some(binding)
+                && lease_ref_exact
+            {
+                Ok(ReservationOutcome::Reserved)
+            } else if status.binding.as_ref() == Some(binding) {
+                // Preserve every exact adopted pair. A fresh pass either
+                // repairs a stale Ready/leaseRef projection or observes the
+                // teardown/quarantine phase without ever clearing intent.
+                Ok(ReservationOutcome::Retry)
+            } else if status.phase == ClusterInstancePhase::Ready
+                && status.binding.is_none()
+                && status.lease_ref.is_none()
+            {
+                Ok(ReservationOutcome::Retry)
+            } else if status
+                .binding
+                .as_ref()
+                .is_some_and(|current| current != binding)
+                || status.lease_ref.as_ref().is_some_and(|reference| {
+                    reference.name != binding.lease.name
+                        || (reference.uid.is_some() && reference.uid != binding.lease.uid)
+                })
+            {
+                Ok(ReservationOutcome::Occupied)
+            } else {
+                Ok(ReservationOutcome::Retry)
+            }
+        }
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Close a connect-token attempt whose exact instance reservation lost.
+///
+/// `Closing` is persisted before deleting the exact Secret UID. A crash after
+/// deletion therefore resumes deletion/absence observation instead of trying
+/// to activate or recreate the credential. Verified binding intent is retained
+/// with the Closed attempt: it is an immutable audit handle, not a slot that
+/// may be silently rewritten to a different candidate.
+async fn close_abandoned_pending_binding(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<(), LeaseError> {
+    let status = lease.status.as_ref().cloned().unwrap_or_default();
+    let creation = status.connect_token_creation.as_ref().ok_or_else(|| {
+        LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding rollback has no token creation checkpoint"
+        ))
+    })?;
+    let identity = creation.identity.as_ref().ok_or_else(|| {
+        LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding rollback has no exact token identity"
+        ))
+    })?;
+    if status.phase != LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || binding.connect_token.as_ref() != Some(identity)
+    {
+        return Ok(());
+    }
+    let uid = lease_uid_for(lease)?;
+    let resource_version = lease
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+
+    if matches!(
+        creation.phase,
+        ConnectTokenCreationPhase::Reserved | ConnectTokenCreationPhase::Ready
+    ) {
+        let mut closing = creation.clone();
+        closing.phase = ConnectTokenCreationPhase::Closing;
+        let patch = json_patch(serde_json::json!([
+            { "op": "test", "path": "/metadata/uid", "value": uid },
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "test", "path": "/status/phase", "value": "Pending" },
+            { "op": "test", "path": "/status/binding", "value": binding },
+            { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+            { "op": "add", "path": "/status/connectTokenCreation", "value": closing }
+        ]));
+        return match leases
+            .patch_status(
+                &binding.lease.name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if optimistic_conflict(&error) => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    if creation.phase != ConnectTokenCreationPhase::Closing {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "verified binding rollback did not enter Closing"
+        )));
+    }
+
+    let check = crate::api::connect::delete_lease_connect_token_verified(
+        client,
+        namespace,
+        &binding.lease.name,
+        uid,
+        identity,
+    )
+    .await;
+    if check.result != crate::crd::CheckResult::Verified {
+        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+            "cannot clear a verified binding while its token footprint is unproven"
+        )));
+    }
+    let mut closed = creation.clone();
+    closed.phase = ConnectTokenCreationPhase::Closed;
+    closed.verified_absent_at = Some(chrono::Utc::now().to_rfc3339());
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/status/phase", "value": "Pending" },
+        { "op": "test", "path": "/status/binding", "value": binding },
+        { "op": "test", "path": "/status/connectTokenCreation", "value": creation },
+        { "op": "add", "path": "/status/connectTokenCreation", "value": closed }
+    ]));
+    match leases
+        .patch_status(
+            &binding.lease.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if optimistic_conflict(&error) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1349,13 +3851,17 @@ async fn clear_lease_binding_intent(
     let rv = lease
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
-    let patch = json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "test", "path": "/status/phase", "value": "Pending" },
-        { "op": "test", "path": "/status/binding", "value": binding },
-        { "op": "remove", "path": "/status/binding" }
-    ]));
+    if binding.cleanup_mode.requires_receipt() {
+        return close_abandoned_pending_binding(client, namespace, &lease, binding).await;
+    }
+    let operations = vec![
+        serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid }),
+        serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": rv }),
+        serde_json::json!({ "op": "test", "path": "/status/phase", "value": "Pending" }),
+        serde_json::json!({ "op": "test", "path": "/status/binding", "value": binding }),
+        serde_json::json!({ "op": "remove", "path": "/status/binding" }),
+    ];
+    let patch = json_patch(serde_json::Value::Array(operations));
     match leases_api
         .patch_status(
             &binding.lease.name,
@@ -1410,16 +3916,21 @@ async fn mark_instance_recycling(
     if status.phase == ClusterInstancePhase::Recycling {
         return Ok(true);
     }
-    if status.phase != ClusterInstancePhase::Leased {
+    // An exact reciprocal binding is still an adopted allocation if a stale
+    // profile write reverted only its phase to Ready. Release must route that
+    // instance through receipt-backed recycling; refusing the transition here
+    // would strand the binding precisely after the allocation gate closes.
+    if status.phase != ClusterInstancePhase::Leased && status.phase != ClusterInstancePhase::Ready {
         return Ok(false);
     }
+    let previous_phase = status.phase.clone();
     let rv = instance
         .resource_version()
         .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
     let patch = json_patch(serde_json::json!([
         { "op": "test", "path": "/metadata/uid", "value": binding.instance.uid },
         { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "test", "path": "/status/phase", "value": "Leased" },
+        { "op": "test", "path": "/status/phase", "value": previous_phase },
         { "op": "test", "path": "/status/binding", "value": binding },
         { "op": "add", "path": "/status/phase", "value": "Recycling" },
         { "op": "add", "path": "/status/idleSince", "value": null },
@@ -1501,6 +4012,29 @@ fn binding_from_observation(
         return Err("pool_owner_mismatch");
     }
 
+    let cleanup_mode = lease.spec.cleanup_mode.unwrap_or_default();
+    let creation_manifest = match instance_status.creation_manifest.as_ref() {
+        Some(manifest)
+            if manifest.validate().is_ok()
+                && manifest.instance.name == instance.name_any()
+                && manifest.instance.uid.as_deref() == Some(instance_uid.as_str())
+                && manifest.namespace == instance.namespace().unwrap_or_default()
+                && manifest.backend_type == backend.backend_type
+                && manifest.config_digest == backend.config_digest =>
+        {
+            Some(manifest.clone())
+        }
+        Some(_) if cleanup_mode.requires_receipt() => return Err("creation_manifest_invalid"),
+        None if cleanup_mode.requires_receipt() => return Err("creation_manifest_missing"),
+        _ => None,
+    };
+    let creation_manifest_digest = creation_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.digest().ok());
+    if cleanup_mode.requires_receipt() && creation_manifest_digest.is_none() {
+        return Err("creation_manifest_digest_failed");
+    }
+
     Ok(LeaseBinding {
         binding_id: uuid::Uuid::new_v4().to_string(),
         lease: ResourceRef {
@@ -1518,6 +4052,10 @@ fn binding_from_observation(
         },
         backend,
         instance_spec_digest: spec_digest,
+        cleanup_mode,
+        creation_manifest_digest,
+        creation_manifest,
+        connect_token: None,
     })
 }
 
@@ -1649,15 +4187,7 @@ async fn run_reaper<B: ClusterBackend>(
                     Ok(expires_at) => {
                         if now > expires_at.with_timezone(&chrono::Utc) {
                             warn!(lease = %name, "Reaper: force-expiring overdue lease");
-                            let patch = expired_status_patch(&status.conditions);
-                            if let Err(e) = leases_api
-                                .patch_status(
-                                    &name,
-                                    &PatchParams::apply("kobe-operator"),
-                                    &Patch::Merge(&patch),
-                                )
-                                .await
-                            {
+                            if let Err(e) = expire_lease_fenced(&leases_api, &lease).await {
                                 error!(
                                     lease = %name,
                                     "Reaper: failed to force-expire overdue lease: {e}"
@@ -1671,15 +4201,7 @@ async fn run_reaper<B: ClusterBackend>(
                             expires_at = %expires_at_str,
                             "Reaper: failed to parse expires_at, force-expiring lease: {e}"
                         );
-                        let patch = expired_status_patch(&status.conditions);
-                        if let Err(e) = leases_api
-                            .patch_status(
-                                &name,
-                                &PatchParams::apply("kobe-operator"),
-                                &Patch::Merge(&patch),
-                            )
-                            .await
-                        {
+                        if let Err(e) = expire_lease_fenced(&leases_api, &lease).await {
                             error!(
                                 lease = %name,
                                 "Reaper: failed to expire lease with corrupt timestamp: {e}"
@@ -1742,18 +4264,45 @@ fn prune_queues_against_live(
     evicted
 }
 
-/// Build the `{ "status": { ... } }` merge patch that transitions a lease to
-/// `Expired`, carrying the derived conditions (`Bound=False`, `Satisfiable`)
-/// alongside the phase. `prev` is the lease's on-disk conditions, used to
-/// preserve `lastTransitionTime` when a condition's status is unchanged.
-fn expired_status_patch(prev: &[ClusterLeaseCondition]) -> serde_json::Value {
-    let expired = ClusterLeaseStatus {
-        phase: LeasePhase::Expired,
-        ..Default::default()
-    };
-    let conditions =
-        derive_lease_conditions(&expired, prev, None, &chrono::Utc::now().to_rfc3339());
-    serde_json::json!({ "status": { "phase": "Expired", "conditions": conditions } })
+async fn expire_lease_fenced(
+    leases: &Api<ClusterLease>,
+    lease: &ClusterLease,
+) -> Result<ClusterLease, kube::Error> {
+    let uid =
+        lease.metadata.uid.as_deref().ok_or_else(|| {
+            kube::Error::Service(Box::new(std::io::Error::other("lease has no UID")))
+        })?;
+    let rv = lease.resource_version().ok_or_else(|| {
+        kube::Error::Service(Box::new(std::io::Error::other(
+            "lease has no resourceVersion",
+        )))
+    })?;
+    let mut status = lease.status.clone().unwrap_or_default();
+    let observed_phase = status.phase.clone();
+    status.phase = LeasePhase::Expired;
+    status.conditions = derive_lease_conditions(
+        &status,
+        lease
+            .status
+            .as_ref()
+            .map(|status| status.conditions.as_slice())
+            .unwrap_or(&[]),
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    let patch = json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+        { "op": "test", "path": "/status/phase", "value": observed_phase },
+        { "op": "add", "path": "/status", "value": status }
+    ]));
+    leases
+        .patch_status(
+            &lease.name_any(),
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
 }
 
 fn try_start_reconcile<'a, B: ClusterBackend>(
@@ -1885,6 +4434,7 @@ pub fn unsatisfiable_status(
         | Some(ClusterPoolPhase::Idle)
         | None => R::Warming,
         Some(ClusterPoolPhase::ScalingDown) => R::Degraded,
+        Some(ClusterPoolPhase::Quarantined) => R::Degraded,
     };
 
     let phase_str = phase
@@ -2125,7 +4675,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&ctx.client, "test-ns", &lease).await;
+        let result = reserve_ready_instance(&ctx.client, "test-ns", &lease, None).await;
         assert!(
             matches!(result, Ok(None)),
             "an instance with a deletionTimestamp must not be reserved, got {result:?}"
@@ -2202,7 +4752,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&client, "test-ns", &lease).await;
+        let result = reserve_ready_instance(&client, "test-ns", &lease, None).await;
         assert!(
             matches!(result, Ok(None)),
             "a Ready instance still carrying a leaseRef must not be reserved, got {result:?}"
@@ -2227,6 +4777,10 @@ mod tests {
             },
             backend: BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap(),
             instance_spec_digest: "0000000000000001".into(),
+            cleanup_mode: crate::crd::CleanupMode::Standard,
+            creation_manifest_digest: None,
+            creation_manifest: None,
+            connect_token: None,
         }
     }
 
@@ -2266,6 +4820,29 @@ mod tests {
                     "poolUid": "test-profile-uid",
                     "backend": BackendProvenance::from_config(&crate::crd::BackendConfig::default()).unwrap()
                 }
+            }
+        })
+    }
+
+    fn exact_pending_lease_for_binding(binding: &LeaseBinding) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": binding.lease.name,
+                "namespace": "test-ns",
+                "uid": binding.lease.uid,
+                "resourceVersion": "10",
+                "generation": 1
+            },
+            "spec": {
+                "poolRef": "test-profile",
+                "ttl": "1h",
+                "requester": { "type": "test:admin", "identity": "user@test.com" }
+            },
+            "status": {
+                "phase": "Pending",
+                "binding": binding
             }
         })
     }
@@ -2310,14 +4887,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let won = reserve_binding_instance(&client, "test-ns", &first)
+        let won = reserve_binding_instance_after_lease_fence(&client, "test-ns", &first)
             .await
             .unwrap();
-        let lost = reserve_binding_instance(&client, "test-ns", &second)
+        let lost = reserve_binding_instance_after_lease_fence(&client, "test-ns", &second)
             .await
             .unwrap();
-        assert!(won);
-        assert!(!lost);
+        assert_eq!(won, ReservationOutcome::Reserved);
+        assert_eq!(lost, ReservationOutcome::Retry);
 
         let requests = server.received_requests().await.unwrap();
         let patches: Vec<serde_json::Value> = requests
@@ -2344,6 +4921,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reservation_conflict_adopts_the_exact_binding_without_clearing_intent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        let ready = exact_instance_for_binding(None, "Ready");
+        let adopted = exact_instance_for_binding(Some(&binding), "Leased");
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_pending_lease_for_binding(&binding)),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(adopted))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{instance_path}/status")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "code": 409
+            })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reserve_binding_instance(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            ReservationOutcome::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_binding_already_in_teardown_is_retryable_not_foreign() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        let recycling = exact_instance_for_binding(Some(&binding), "Recycling");
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_pending_lease_for_binding(&binding)),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(recycling))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reserve_binding_instance(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            ReservationOutcome::Retry
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method != http::Method::PATCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_exact_binding_repairs_stale_ready_projection_instead_of_clearing_intent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        let mut adopted = exact_instance_for_binding(Some(&binding), "Ready");
+        adopted["status"]["leaseRef"] = serde_json::Value::Null;
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(exact_pending_lease_for_binding(&binding)),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(adopted.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{instance_path}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(adopted))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reserve_binding_instance(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            ReservationOutcome::Reserved
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method == http::Method::PATCH)
+            .expect("leaseRef repair patch");
+        let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/status/binding"
+                && operation["value"] == serde_json::to_value(&binding).unwrap()
+        }));
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status/leaseRef"
+                && operation["value"] == serde_json::to_value(&binding.lease).unwrap()
+        }));
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status/phase"
+                && operation["value"] == "Leased"
+        }));
+    }
+
+    #[tokio::test]
+    async fn resumed_composition_intent_must_match_outer_pool_authority() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let mut lease = authorized_sandbox_composition_handle(outer_name, "30");
+        lease
+            .metadata
+            .finalizers
+            .get_or_insert_default()
+            .push(TEARDOWN_RECEIPT_RETENTION_FINALIZER.into());
+        let mut binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        binding.pool = ResourceRef {
+            name: "child-pool".into(),
+            uid: Some("child-pool-uid-b".into()),
+        };
+        lease.status.as_mut().unwrap().binding = Some(binding);
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+                crate::controllers::sandbox::allocation_fence_name(outer_name)
+            )))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "leases",
+                    "sandbox-allocation-late-outer",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        assert!(
+            reserve_ready_instance(&ctx.client, "test-ns", &lease, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/secrets")
+                || request.method == http::Method::PATCH
+        }));
+    }
+
+    #[tokio::test]
     async fn replayed_lease_intent_resumes_only_the_same_exact_instance() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server = MockServer::start().await;
@@ -2355,21 +5152,29 @@ mod tests {
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(leased))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
         let mut lease = make_test_lease("lease-a", "Pending");
         Arc::make_mut(&mut lease).status.as_mut().unwrap().binding = Some(binding.clone());
-        let resumed = reserve_ready_instance(&client, "test-ns", &lease)
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resumed = reserve_ready_instance(&client, "test-ns", &lease, None)
             .await
             .unwrap();
         assert_eq!(resumed, Some(binding));
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
             requests.len(),
-            1,
-            "replay must not list or reserve another instance"
+            3,
+            "replay may revalidate the exact lease and instance but must not list or reserve another one"
         );
     }
 
@@ -2415,6 +5220,1560 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    fn delayed_sandbox_composition_handle(
+        outer_name: &str,
+        resource_version: &str,
+        fenced: bool,
+    ) -> ClusterLease {
+        let outer_uid = "late-outer-uid";
+        let child_name = crate::controllers::sandbox_child::internal_lease_name(outer_name);
+        let mut metadata = serde_json::json!({
+            "name": child_name,
+            "namespace": "test-ns",
+            "uid": "late-child-uid",
+            "resourceVersion": resource_version,
+            "generation": 1,
+            "labels": {
+                "app.kubernetes.io/managed-by": crate::sandbox::KOBE_MANAGED_BY,
+                crate::sandbox::SANDBOX_LEASE_UID_LABEL: outer_uid,
+            },
+        });
+        if fenced {
+            metadata["ownerReferences"] = serde_json::json!([]);
+            metadata["labels"][crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL] =
+                "true".into();
+            metadata["annotations"] = serde_json::json!({
+                crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION: outer_name,
+                crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION: outer_uid,
+                crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION:
+                    (chrono::Utc::now() + chrono::Duration::days(8)).to_rfc3339(),
+            });
+            metadata["finalizers"] = serde_json::json!([
+                crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+            ]);
+        } else {
+            // Rolling-upgrade shape emitted by the pre-fence producer. Only
+            // this exact sole legacy owner is migratable.
+            metadata["ownerReferences"] = serde_json::json!([{
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "SandboxLease",
+                "name": outer_name,
+                "uid": outer_uid,
+                "controller": true,
+            }]);
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": metadata,
+            "spec": {
+                "poolRef": "child-pool",
+                "ttl": "2h",
+                "requester": {
+                    "type": "kobe:sandbox-composition",
+                    "identity": "late-outer-uid"
+                },
+                "priority": 1000,
+                "cleanupMode": "VerifiedDestroy"
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap()
+    }
+
+    /// Exact metadata identity emitted by the base child-composition producer:
+    /// managed-by plus the sole outer controller owner, but no outer UID label,
+    /// retention annotations, tombstone label, or finalizer.
+    fn base_legacy_sandbox_composition_handle(
+        outer_name: &str,
+        resource_version: &str,
+    ) -> ClusterLease {
+        let mut value = serde_json::to_value(delayed_sandbox_composition_handle(
+            outer_name,
+            resource_version,
+            false,
+        ))
+        .unwrap();
+        value["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::sandbox::SANDBOX_LEASE_UID_LABEL);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_creating_404_remains_ambiguous_and_emits_no_write() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        let mut lease = (*make_test_lease("lease-a", "Released")).clone();
+        lease.metadata.resource_version = Some("10".into());
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.cluster_name = None;
+        status.binding = Some(binding.clone());
+        status.teardown_attempt_id = Some("teardown-1".into());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Creating,
+            identity: None,
+            verified_absent_at: None,
+        });
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = close_terminal_connect_token_creation(
+            &client,
+            "test-ns",
+            &lease,
+            lease.status.as_ref().unwrap(),
+            &binding,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(!unbound_release_proof_is_complete(
+            lease.status.as_ref().unwrap()
+        ));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            request.method != http::Method::POST
+                && request.method != http::Method::PATCH
+                && request.method != http::Method::DELETE
+        }));
+    }
+
+    #[tokio::test]
+    async fn terminal_prepared_closes_creator_and_retains_exact_intent_atomically() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        let mut lease = (*make_test_lease("lease-a", "Released")).clone();
+        lease.metadata.resource_version = Some("10".into());
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.cluster_name = None;
+        status.binding = Some(binding.clone());
+        status.teardown_attempt_id = Some("teardown-1".into());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Prepared,
+            identity: None,
+            verified_absent_at: None,
+        });
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            close_terminal_connect_token_creation(
+                &client,
+                "test-ns",
+                &lease,
+                lease.status.as_ref().unwrap(),
+                &binding,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "Prepared close must issue only its CAS");
+        let patch: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let operations = patch.as_array().unwrap();
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status/binding"
+                && operation["value"] == serde_json::to_value(&binding).unwrap()
+        }));
+        assert!(operations.iter().all(|operation| {
+            !(operation["op"] == "remove" && operation["path"] == "/status/binding")
+        }));
+        assert!(operations.iter().any(|operation| {
+            operation["path"] == "/status/connectTokenCreation"
+                && operation["value"]["phase"] == "closed"
+                && operation["value"]["verifiedAbsentAt"].is_string()
+        }));
+    }
+
+    #[tokio::test]
+    async fn lost_reservation_persists_closing_before_token_delete() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let identity = crate::crd::KubernetesResourceIdentity {
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            namespace: Some("test-ns".into()),
+            name: "lease-a-connect-token".into(),
+            uid: "token-uid".into(),
+        };
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        binding.connect_token = Some(identity.clone());
+        let mut lease = (*make_test_lease("lease-a", "Pending")).clone();
+        lease.metadata.resource_version = Some("10".into());
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.binding = Some(binding.clone());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Ready,
+            identity: Some(identity),
+            verified_absent_at: None,
+        });
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a/status",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        close_abandoned_pending_binding(&client, "test-ns", &lease, &binding)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method != http::Method::DELETE)
+        );
+        let patch: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(patch.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/connectTokenCreation"
+                && operation["value"]["phase"] == "closing"
+        }));
+    }
+
+    fn authority_unbound_lease() -> ClusterLease {
+        let mut lease = (*make_test_lease("lease-a", "Released")).clone();
+        lease.spec.cleanup_mode = Some(crate::crd::CleanupMode::VerifiedDestroy);
+        let status = lease.status.as_mut().unwrap();
+        status.cluster_name = None;
+        status.teardown_attempt_id = Some("teardown-1".into());
+        status.connect_token_creation = Some(ConnectTokenCreation {
+            attempt_id: "create-1".into(),
+            phase: ConnectTokenCreationPhase::Closed,
+            identity: None,
+            verified_absent_at: Some("2026-01-01T00:00:00Z".into()),
+        });
+        lease
+    }
+
+    #[test]
+    fn never_bound_proof_rejects_a_late_binding_intent() {
+        let mut lease = authority_unbound_lease();
+        let status = lease.status.as_mut().unwrap();
+        status.unbound_release_verified_at = Some("2026-01-01T00:00:00Z".into());
+        status.conditions.push(ClusterLeaseCondition {
+            condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+            status: "True".into(),
+            reason: "NeverBound".into(),
+            message: "release attempt teardown-1 proved no reciprocal allocation existed".into(),
+            last_transition_time: Some("2026-01-01T00:00:00Z".into()),
+        });
+        assert!(unbound_release_proof_is_complete(status));
+
+        status.binding = Some(exact_test_binding("lease-a", "lease-a-uid"));
+        assert!(
+            !unbound_release_proof_is_complete(status),
+            "a binding intent appearing after proof must fail closed"
+        );
+    }
+
+    #[test]
+    fn never_bound_proof_retains_the_exact_pre_create_intent() {
+        let mut lease = authority_unbound_lease();
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        {
+            let status = lease.status.as_mut().unwrap();
+            status.binding = Some(binding.clone());
+            status.unbound_release_verified_at = Some("2026-01-01T00:00:00Z".into());
+            status.conditions.push(ClusterLeaseCondition {
+                condition_type: ALLOCATION_ABSENT_CONDITION.into(),
+                status: "True".into(),
+                reason: "NeverBound".into(),
+                message: "release attempt teardown-1 proved no reciprocal allocation existed"
+                    .into(),
+                last_transition_time: Some("2026-01-01T00:00:00Z".into()),
+            });
+        }
+        let status = lease.status.as_ref().unwrap();
+
+        assert!(retained_unstarted_binding_matches_lease(&lease, status));
+        assert!(unbound_release_proof_is_complete(status));
+        assert!(unbound_release_proof_is_complete_for_lease(&lease, status));
+        assert_eq!(status.binding.as_ref(), Some(&binding));
+
+        let mut wrong_subject = lease.clone();
+        wrong_subject
+            .status
+            .as_mut()
+            .unwrap()
+            .binding
+            .as_mut()
+            .unwrap()
+            .lease
+            .uid = Some("other-lease-uid".into());
+        assert!(unbound_release_proof_is_complete(
+            wrong_subject.status.as_ref().unwrap()
+        ));
+        assert!(!unbound_release_proof_is_complete_for_lease(
+            &wrong_subject,
+            wrong_subject.status.as_ref().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_authority_refuses_never_bound_when_any_reciprocal_instance_exists() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let lease = authority_unbound_lease();
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![exact_instance_for_binding(
+                    Some(&binding),
+                    "Leased",
+                )]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "a reciprocal binding must keep NeverBound fail-closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_authority_refuses_a_non_pre_create_binding_intent() {
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        lease.status.as_mut().unwrap().binding = Some(exact_test_binding("lease-a", "lease-a-uid"));
+
+        assert!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .is_none(),
+            "only an exact VerifiedDestroy pre-create intent can become NeverBound"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_pre_create_intent_proves_exact_candidate_replacement_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        lease.status.as_mut().unwrap().binding = Some(binding);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut replacement = exact_instance_for_binding(None, "Ready");
+        replacement["metadata"]["uid"] = "replacement-instance-uid".into();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::testutil::k8s_list_response(vec![replacement])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "a same-name different-UID free instance is not the retained candidate"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == http::Method::GET)
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_creator_and_reserver_stop_at_the_terminal_lease_fence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        lease.metadata.resource_version = Some("10".into());
+        let mut binding = exact_test_binding("lease-a", "lease-a-uid");
+        binding.cleanup_mode = crate::crd::CleanupMode::VerifiedDestroy;
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/lease-a",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            complete_connect_token_creation(&client, "test-ns", &lease, &binding)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reserve_binding_instance(&client, "test-ns", &binding)
+                .await
+                .unwrap(),
+            ReservationOutcome::Retry
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the reserver performs a fresh lease GET"
+        );
+        assert!(requests.iter().all(|request| {
+            request.method == http::Method::GET
+                && !request.url.path().contains("/clusterinstances/")
+                && !request.url.path().contains("/secrets/")
+        }));
+    }
+
+    #[tokio::test]
+    async fn release_authority_can_prove_pre_allocation_attempt_only_after_full_list() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = authority_unbound_lease();
+        lease.status.as_mut().unwrap().connect_token_creation = None;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_authority_reuses_the_closed_creator_absence_timestamp() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let lease = authority_unbound_lease();
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(Vec::<serde_json::Value>::new()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            authority_never_bound_observation(&client, "test-ns", &lease)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "NeverBound must remain causally tied to the creator's exact Closed proof"
+        );
+    }
+
+    #[test]
+    fn receipt_acknowledgement_cannot_replay_an_old_attempt_or_boolean() {
+        let receipt = crate::crd::TeardownReceipt {
+            schema_version: crate::crd::TEARDOWN_RECEIPT_SCHEMA_VERSION,
+            attempt_id: "attempt-1".into(),
+            lease: ResourceRef {
+                name: "lease-a".into(),
+                uid: Some("lease-a-uid".into()),
+            },
+            instance: ResourceRef {
+                name: "instance-a".into(),
+                uid: Some("instance-a-uid".into()),
+            },
+            pool: ResourceRef {
+                name: "pool-a".into(),
+                uid: Some("pool-a-uid".into()),
+            },
+            backend_type: "k3s".into(),
+            config_digest: "config".into(),
+            instance_spec_digest: "instance-spec".into(),
+            creation_manifest_digest: "manifest".into(),
+            cleanup_mode: crate::crd::CleanupMode::VerifiedDestroy,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:01:00Z".into()),
+            checks: vec![crate::crd::TeardownCheck {
+                subject: crate::crd::TeardownSubject::ServerStatefulSet,
+                result: crate::crd::CheckResult::Verified,
+                reason: None,
+                verified: vec!["exact-sts".into()],
+            }],
+            retry_count: 0,
+            outcome: crate::crd::TeardownOutcome::Verified,
+        };
+        let mut lease = (*make_test_lease("lease-a", "Recycling")).clone();
+        let mut status = lease.status.clone().unwrap_or_default();
+        status.teardown_receipt = Some(receipt.clone());
+
+        lease.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION.into(),
+            "true".into(),
+        )]));
+        assert!(!teardown_receipt_acknowledged(&lease, &status));
+
+        let token = receipt.acknowledgement_token().unwrap();
+        lease
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(TEARDOWN_RECEIPT_ACKNOWLEDGED_ANNOTATION.into(), token);
+        assert!(teardown_receipt_acknowledged(&lease, &status));
+
+        status.teardown_receipt.as_mut().unwrap().attempt_id = "attempt-2".into();
+        assert!(!teardown_receipt_acknowledged(&lease, &status));
+    }
+
+    fn closed_outer_sandbox(outer_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "SandboxLease",
+            "metadata": {
+                "name": outer_name,
+                "namespace": "test-ns",
+                "uid": "late-outer-uid",
+                "resourceVersion": "outer-rv-20",
+                "generation": 1,
+                "finalizers": [crate::sandbox::SANDBOX_LEASE_FINALIZER]
+            },
+            "spec": {
+                "poolRef": { "name": "sandbox-pool", "uid": "pool-uid", "generation": 1 },
+                "ttl": "1h",
+                "requester": {
+                    "provider": "oidc", "type": "user",
+                    "issuer": "https://issuer.invalid", "identity": "alice"
+                }
+            },
+            "status": {
+                "phase": "Releasing",
+                "observedGeneration": 1,
+                "releaseCause": "Requested"
+            }
+        })
+    }
+
+    fn open_outer_sandbox(outer_name: &str) -> serde_json::Value {
+        let mut outer = closed_outer_sandbox(outer_name);
+        outer["metadata"]["annotations"] = serde_json::json!({
+            crate::api::sandbox::SANDBOX_ADMISSION_ANNOTATION:
+                crate::api::sandbox::SANDBOX_ADMISSION_ADMITTED
+        });
+        outer["status"] = serde_json::json!({
+            "phase": "Provisioning",
+            "observedGeneration": 1
+        });
+        outer["spec"]["placementAuthority"] = serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterPool",
+            "namespace": "test-ns",
+            "name": "child-pool",
+            "uid": "child-pool-uid-a",
+            "generation": 3
+        });
+        outer
+    }
+
+    fn child_cluster_pool(uid: &str, generation: i64) -> serde_json::Value {
+        let mut pool = make_test_profile();
+        pool["metadata"]["name"] = "child-pool".into();
+        pool["metadata"]["uid"] = uid.into();
+        pool["metadata"]["generation"] = generation.into();
+        pool
+    }
+
+    fn authorized_sandbox_composition_handle(
+        outer_name: &str,
+        resource_version: &str,
+    ) -> ClusterLease {
+        let mut lease = delayed_sandbox_composition_handle(outer_name, resource_version, false);
+        let identity = SandboxCompositionIdentity {
+            outer_name: outer_name.into(),
+            outer_uid: "late-outer-uid".into(),
+        };
+        let (labels, annotations, finalizers) =
+            sandbox_composition_retention_metadata(&lease, &identity, false);
+        lease.metadata.owner_references = Some(Vec::new());
+        lease.metadata.labels = Some(labels);
+        lease.metadata.annotations = Some(annotations);
+        lease.metadata.finalizers = Some(finalizers);
+        lease
+    }
+
+    #[tokio::test]
+    async fn exact_outer_authority_and_live_pool_authorize_composition() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = authorized_sandbox_composition_handle(outer_name, "10");
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+                crate::controllers::sandbox::allocation_fence_name(outer_name)
+            )))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "leases",
+                    "sandbox-allocation-late-outer",
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let SandboxCompositionGate::Authorized(authority) =
+            sandbox_composition_allocation_gate(&ctx.client, "test-ns", &lease).await
+        else {
+            panic!("exact live authority must authorize the composition");
+        };
+        assert_eq!(authority.uid, "child-pool-uid-a");
+        assert_eq!(authority.generation, 3);
+    }
+
+    /// The producer may read pool A and have its POST commit only after the
+    /// same name points at pool B. The consumer closes that handle before any
+    /// queue entry, binding intent, token, or instance observation.
+    #[tokio::test]
+    async fn same_name_pool_replacement_before_consumer_never_queues_or_binds() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = authorized_sandbox_composition_handle(outer_name, "10");
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-b", 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let identity = SandboxCompositionIdentity {
+            outer_name: outer_name.into(),
+            outer_uid: "late-outer-uid".into(),
+        };
+        let (labels, annotations, finalizers) =
+            sandbox_composition_retention_metadata(&lease, &identity, true);
+        let mut rejected = lease.clone();
+        rejected.metadata.owner_references = Some(Vec::new());
+        rejected.metadata.labels = Some(labels);
+        rejected.metadata.annotations = Some(annotations);
+        rejected.metadata.finalizers = Some(finalizers);
+        rejected.metadata.resource_version = Some("11".into());
+        Mock::given(method("PATCH"))
+            .and(path(child_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&rejected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut released = rejected;
+        released.metadata.resource_version = Some("12".into());
+        released.status.as_mut().unwrap().phase = LeasePhase::Released;
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(released))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx.clone()).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(1))
+        );
+        assert!(ctx.queues.read().await.values().all(Vec::is_empty));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/secrets")
+        }));
+        let status_patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_status_path
+            })
+            .expect("stale handle status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&status_patch.body).unwrap();
+        assert!(!operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/binding" || operation["value"]["phase"] == "Bound"
+        }));
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_composition_without_authority_never_enters_queue() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = authorized_sandbox_composition_handle(outer_name, "20");
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let mut legacy_outer = open_outer_sandbox(outer_name);
+        legacy_outer["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placementAuthority");
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(legacy_outer))
+            .mount(&server)
+            .await;
+
+        let identity = SandboxCompositionIdentity {
+            outer_name: outer_name.into(),
+            outer_uid: "late-outer-uid".into(),
+        };
+        let (labels, annotations, finalizers) =
+            sandbox_composition_retention_metadata(&lease, &identity, true);
+        let mut rejected = lease.clone();
+        rejected.metadata.labels = Some(labels);
+        rejected.metadata.annotations = Some(annotations);
+        rejected.metadata.finalizers = Some(finalizers);
+        rejected.metadata.resource_version = Some("21".into());
+        Mock::given(method("PATCH"))
+            .and(path(child_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&rejected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut released = rejected;
+        released.metadata.resource_version = Some("22".into());
+        released.status.as_mut().unwrap().phase = LeasePhase::Released;
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(released))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx.clone()).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(1))
+        );
+        assert!(ctx.queues.read().await.values().all(Vec::is_empty));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterpools")
+                || request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/secrets")
+        }));
+    }
+
+    /// A true base object has no UID label, so the exact sole ownerRef is the
+    /// only safe migration source. Even with an open outer lease, the consumer
+    /// must install the full owner-independent fence and end the pass before a
+    /// pool lookup, queue write, status write, or instance reservation.
+    #[tokio::test]
+    async fn base_legacy_sandbox_composition_is_migrated_before_open_queue() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = base_legacy_sandbox_composition_handle(outer_name, "10");
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let outer_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+        );
+        let fence_path = format!(
+            "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+            crate::controllers::sandbox::allocation_fence_name(outer_name)
+        );
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(outer_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(fence_path))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 404, "reason": "NotFound"
+            })))
+            .mount(&server)
+            .await;
+        let mut migrated = serde_json::to_value(&lease).unwrap();
+        migrated["metadata"]["resourceVersion"] = "11".into();
+        migrated["metadata"]["ownerReferences"] = serde_json::json!([]);
+        Mock::given(method("PATCH"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(migrated))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::await_change()
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path() == child_status_path
+        }));
+        let patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_path
+            })
+            .expect("base-handle migration patch");
+        let operations: Vec<serde_json::Value> = serde_json::from_slice(&patch.body).unwrap();
+        for (path, value) in [
+            ("/metadata/uid", serde_json::json!("late-child-uid")),
+            ("/metadata/resourceVersion", serde_json::json!("10")),
+        ] {
+            assert!(operations.iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == path
+                    && operation["value"] == value
+            }));
+        }
+        assert!(operations.iter().any(|operation| {
+            operation["path"] == "/metadata/ownerReferences"
+                && operation["value"] == serde_json::json!([])
+        }));
+        let labels = &operations
+            .iter()
+            .find(|operation| operation["path"] == "/metadata/labels")
+            .expect("UID/tombstone labels")["value"];
+        assert_eq!(
+            labels[crate::sandbox::SANDBOX_LEASE_UID_LABEL],
+            "late-outer-uid"
+        );
+        assert_eq!(
+            labels[crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL],
+            "true"
+        );
+        let annotations = &operations
+            .iter()
+            .find(|operation| operation["path"] == "/metadata/annotations")
+            .expect("outer identity and retention annotations")["value"];
+        assert_eq!(
+            annotations[crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION],
+            outer_name
+        );
+        assert!(
+            annotations
+                .get(crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).ok())
+                .is_some_and(|deadline| deadline > chrono::Utc::now())
+        );
+        assert!(operations.iter().any(|operation| {
+            operation["path"] == "/metadata/finalizers"
+                && operation["value"].as_array().is_some_and(|finalizers| {
+                    finalizers.iter().any(|finalizer| {
+                        finalizer
+                            == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+                    })
+                })
+        }));
+    }
+
+    /// A POST from the previous producer can commit after release published its
+    /// fence. The consumer must migrate/fence that exact legacy object and end
+    /// the pass before it ever lists or reserves capacity.
+    #[tokio::test]
+    async fn delayed_sandbox_composition_is_fenced_before_queue_or_reservation() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = delayed_sandbox_composition_handle(outer_name, "10", false);
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let outer_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+        );
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(outer_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(closed_outer_sandbox(outer_name)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(child_path.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(delayed_sandbox_composition_handle(outer_name, "11", true)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut released =
+            serde_json::to_value(delayed_sandbox_composition_handle(outer_name, "12", true))
+                .unwrap();
+        released["status"]["phase"] = "Released".into();
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(released))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(1))
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(!requests.iter().any(|request| {
+            request.url.path().contains("/clusterinstances")
+                || request.url.path().contains("/clusterpools/child-pool")
+        }));
+        let patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_path
+            })
+            .expect("retention fence patch");
+        let patch: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert!(patch.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/metadata/ownerReferences"
+                && operation["value"] == serde_json::json!([])
+        }));
+        assert!(patch.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/metadata/finalizers"
+                && operation["value"].as_array().is_some_and(|finalizers| {
+                    finalizers.iter().any(|finalizer| {
+                        finalizer
+                            == crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+                    })
+                })
+        }));
+    }
+
+    /// Once fenced, the same delayed handle becomes Released under UID/RV and
+    /// Pending-phase tests. It never enters the allocation queue.
+    #[tokio::test]
+    async fn fenced_delayed_sandbox_composition_is_terminalized_without_allocation() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let lease = delayed_sandbox_composition_handle(outer_name, "11", true);
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let outer_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+        );
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(outer_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(closed_outer_sandbox(outer_name)),
+            )
+            .mount(&server)
+            .await;
+        let mut released = serde_json::to_value(&lease).unwrap();
+        released["status"]["phase"] = "Released".into();
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(released))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
+            Action::requeue(std::time::Duration::from_secs(1))
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.path().contains("/clusterinstances"))
+        );
+        let patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_status_path
+            })
+            .expect("Released patch");
+        let operations: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/status/phase"
+                && operation["value"] == "Pending"
+        }));
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Released"
+        }));
+    }
+
+    /// Replica A can persist an intent and reserve an instance while replica B
+    /// closes the outer lease. Finalization re-runs the consumer gate after its
+    /// fresh GET, cannot publish `Bound`, and immediately moves the exact
+    /// reciprocal reservation to Recycling so no child-pool slot is stranded.
+    #[tokio::test]
+    async fn finalize_binding_recycles_a_composition_closed_after_intent() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let mut lease = delayed_sandbox_composition_handle(outer_name, "12", false);
+        lease.metadata.owner_references = Some(Vec::new());
+        let binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+        let instance_status_path = format!("{instance_path}/status");
+        let outer_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+        );
+        Mock::given(method("GET"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(outer_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(closed_outer_sandbox(outer_name)),
+            )
+            .mount(&server)
+            .await;
+        let instance = exact_instance_for_binding(Some(&binding), "Leased");
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(instance_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut fenced = serde_json::to_value(&lease).unwrap();
+        fenced["metadata"]["ownerReferences"] = serde_json::json!([]);
+        fenced["metadata"]["labels"]
+            [crate::controllers::sandbox_child::CHILD_HANDLE_TOMBSTONE_LABEL] = "true".into();
+        fenced["metadata"]["annotations"] = serde_json::json!({
+            crate::controllers::sandbox_child::CHILD_HANDLE_OUTER_NAME_ANNOTATION: outer_name,
+            crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION: "late-outer-uid",
+            crate::controllers::sandbox_child::CHILD_HANDLE_RETAIN_UNTIL_ANNOTATION:
+                (chrono::Utc::now() + chrono::Duration::days(8)).to_rfc3339(),
+        });
+        fenced["metadata"]["finalizers"] = serde_json::json!([
+            crate::controllers::sandbox_child::CHILD_HANDLE_RETENTION_FINALIZER
+        ]);
+        Mock::given(method("PATCH"))
+            .and(path(child_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fenced))
+            .expect(1)
+            .mount(&server)
+            .await;
+        fenced["status"]["phase"] = "Released".into();
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fenced))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bound = finalize_binding(&ctx, "test-ns", &binding, chrono::Utc::now())
+            .await
+            .expect("the exact stale reservation must be recycled");
+        assert!(!bound, "a closed composition must not become Bound");
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| {
+                    request.method == http::Method::PATCH && request.url.path() == child_status_path
+                })
+                .count(),
+            1,
+            "a closed composition must never publish Bound"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let released = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_status_path
+            })
+            .expect("Released handle patch");
+        let released: serde_json::Value = serde_json::from_slice(&released.body).unwrap();
+        assert!(released.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Released"
+        }));
+        assert!(!released.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Bound"
+        }));
+        let recycle = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == instance_status_path
+            })
+            .expect("exact instance recycle patch");
+        let operations: serde_json::Value = serde_json::from_slice(&recycle.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/phase" && operation["value"] == "Recycling"
+        }));
+    }
+
+    #[tokio::test]
+    async fn finalize_binding_recycles_authority_mismatch_without_publishing_bound() {
+        let (ctx, server) = test_lease_context().await;
+        let outer_name = "late-outer";
+        let mut lease = authorized_sandbox_composition_handle(outer_name, "40");
+        let mut binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        binding.pool = ResourceRef {
+            name: "child-pool".into(),
+            uid: Some("child-pool-uid-b".into()),
+        };
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        let child_path = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            lease.name_any()
+        );
+        let child_status_path = format!("{child_path}/status");
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+        let instance_status_path = format!("{instance_path}/status");
+        Mock::given(method("GET"))
+            .and(path(child_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/{outer_name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(open_outer_sandbox(outer_name)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools/child-pool",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(child_cluster_pool("child-pool-uid-a", 3)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/apis/coordination.k8s.io/v1/namespaces/test-ns/leases/{}",
+                crate::controllers::sandbox::allocation_fence_name(outer_name)
+            )))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "leases",
+                    "sandbox-allocation-late-outer",
+                )),
+            )
+            .mount(&server)
+            .await;
+        let instance = exact_instance_for_binding(Some(&binding), "Leased");
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(instance_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut quarantined = lease.clone();
+        quarantined.status.as_mut().unwrap().phase = LeasePhase::Quarantined;
+        Mock::given(method("PATCH"))
+            .and(path(child_status_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(quarantined))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            !finalize_binding(&ctx, "test-ns", &binding, chrono::Utc::now())
+                .await
+                .unwrap()
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        let lease_patch = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == child_status_path
+            })
+            .expect("quarantine status patch");
+        let operations: serde_json::Value = serde_json::from_slice(&lease_patch.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Quarantined"
+        }));
+        assert!(!operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status" && operation["value"]["phase"] == "Bound"
+        }));
+        let recycle = requests
+            .iter()
+            .find(|request| {
+                request.method == http::Method::PATCH && request.url.path() == instance_status_path
+            })
+            .expect("instance recycle patch");
+        let operations: serde_json::Value = serde_json::from_slice(&recycle.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["path"] == "/status/phase" && operation["value"] == "Recycling"
+        }));
+    }
+
+    #[tokio::test]
+    async fn already_bound_legacy_composition_remains_recoverable_without_authority() {
+        let (ctx, server) = test_lease_context().await;
+        let mut lease = authorized_sandbox_composition_handle("late-outer", "50");
+        lease.status.as_mut().unwrap().phase = LeasePhase::Bound;
+        let binding = exact_test_binding(&lease.name_any(), "late-child-uid");
+        lease.status.as_mut().unwrap().binding = Some(binding.clone());
+        let mut legacy_outer = open_outer_sandbox("late-outer");
+        legacy_outer["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("placementAuthority");
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxleases/late-outer",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(legacy_outer))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            sandbox_composition_finalization_is_authorized(
+                &ctx,
+                "test-ns",
+                &Api::namespaced(ctx.client.clone(), "test-ns"),
+                &lease,
+                &binding,
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+    }
+
+    /// A lost status response must be retryable, and the recovered write must
+    /// carry a durable NeverBound condition plus the exact attempt/timestamp
+    /// token that the outer Sandbox later ACKs.
+    #[tokio::test]
+    async fn never_bound_proof_survives_a_lost_response_and_restart() {
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let mut lease = delayed_sandbox_composition_handle("late-outer", "20", true);
+        lease
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(crate::controllers::sandbox_child::CHILD_HANDLE_STALE_REJECTED_ANNOTATION);
+        lease.status.as_mut().unwrap().phase = LeasePhase::Released;
+        lease.status.as_mut().unwrap().teardown_attempt_id = Some("attempt-1".into());
+        let path_value = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}/status",
+            lease.name_any()
+        );
+        Mock::given(method("PATCH"))
+            .and(path(path_value.clone()))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "kind": "Status", "status": "Failure", "code": 500,
+                "reason": "InternalError"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(path_value.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&lease))
+            .expect(1)
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        let leases: Api<ClusterLease> = Api::namespaced(client, "test-ns");
+        let status = lease.status.as_ref().unwrap();
+        let attempt = "attempt-1";
+        let verified_at = "2026-01-01T00:00:00Z";
+
+        assert!(
+            record_unbound_release_proof(&leases, &lease, status, attempt, verified_at)
+                .await
+                .is_err()
+        );
+        record_unbound_release_proof(&leases, &lease, status, attempt, verified_at)
+            .await
+            .expect("retry after a lost response");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let successful_retry: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let operations = successful_retry.as_array().unwrap();
+        let verified_at = operations
+            .iter()
+            .find(|operation| operation["path"] == "/status/unboundReleaseVerifiedAt")
+            .and_then(|operation| operation["value"].as_str())
+            .expect("durable proof timestamp")
+            .to_string();
+        let conditions = operations
+            .iter()
+            .find(|operation| operation["path"] == "/status/conditions")
+            .map(|operation| operation["value"].clone())
+            .expect("durable proof condition");
+        let mut restarted = status.clone();
+        restarted.unbound_release_verified_at = Some(verified_at);
+        restarted.conditions = serde_json::from_value(conditions).unwrap();
+        assert!(unbound_release_proof_is_complete(&restarted));
+        assert_eq!(
+            unbound_release_acknowledgement_token(&restarted),
+            restarted
+                .unbound_release_verified_at
+                .as_ref()
+                .map(|verified_at| format!("attempt-1:{verified_at}"))
+        );
+        assert!(operations.iter().any(|operation| {
+            operation["op"] == "test"
+                && operation["path"] == "/metadata/resourceVersion"
+                && operation["value"] == "20"
+        }));
+    }
+
+    #[test]
+    fn stale_rejection_is_consumable_only_with_the_complete_retention_identity() {
+        let exact = delayed_sandbox_composition_handle("late-outer", "20", true);
+        assert!(stale_sandbox_composition_was_rejected(&exact));
+
+        let mut missing_finalizer = exact.clone();
+        missing_finalizer.metadata.finalizers = None;
+        assert!(!stale_sandbox_composition_was_rejected(&missing_finalizer));
+
+        let mut foreign_name = exact.clone();
+        foreign_name.metadata.name = Some("kobe-sbx-someone-else".into());
+        assert!(!stale_sandbox_composition_was_rejected(&foreign_name));
+
+        let mut gc_dependent = exact;
+        gc_dependent.metadata.owner_references = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "kobe.kunobi.ninja/v1alpha1".into(),
+                kind: "SandboxLease".into(),
+                name: "late-outer".into(),
+                uid: "late-outer-uid".into(),
+                controller: Some(true),
+                block_owner_deletion: None,
+            },
+        ]);
+        assert!(!stale_sandbox_composition_was_rejected(&gc_dependent));
     }
 
     /// Build a minimal `ClusterPool` JSON value for K8s API responses.
@@ -2675,7 +7034,15 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_pending_lease_no_ready_clusters() {
         let (ctx, server) = test_lease_context().await;
-        let lease = make_test_lease("pending-1", "Pending");
+        let mut lease = make_test_lease("pending-1", "Pending");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/pending-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.as_ref()))
+            .mount(&server)
+            .await;
 
         // Mock the status PATCH that the reconciler issues to update queue position.
         Mock::given(method("PATCH"))
@@ -2685,7 +7052,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "pending-1", "namespace": "test-ns" },
+                "metadata": { "name": "pending-1", "namespace": "test-ns", "uid": "pending-1-uid", "resourceVersion": "11" },
                 "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Pending", "queuePosition": 1 }
@@ -2806,11 +7173,49 @@ mod tests {
             .mount(&server)
             .await;
 
+        let intent_response = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let intent_response_for_patch = intent_response.clone();
+        let lease_for_response = (*lease).clone();
         Mock::given(method("PATCH"))
             .and(path(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1/status",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .respond_with(move |request: &wiremock::Request| {
+                let operations: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("lease intent JSON Patch");
+                let binding = operations
+                    .as_array()
+                    .and_then(|operations| {
+                        operations.iter().find(|operation| {
+                            operation["op"] == "add" && operation["path"] == "/status/binding"
+                        })
+                    })
+                    .map(|operation| operation["value"].clone())
+                    .expect("intent patch carries binding");
+                let mut response = serde_json::to_value(&lease_for_response).unwrap();
+                response["metadata"]["resourceVersion"] = "11".into();
+                response["status"]["binding"] = binding;
+                *intent_response_for_patch.lock().unwrap() = Some(response.clone());
+                ResponseTemplate::new(200).set_body_json(response)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let intent_response_for_get = intent_response.clone();
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/bind-1",
+            ))
+            .respond_with(move |_request: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_json(
+                    intent_response_for_get
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("intent PATCH precedes lease fence GET"),
+                )
+            })
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -2822,7 +7227,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let binding = reserve_ready_instance(&ctx.client, "test-ns", &lease)
+        let binding = reserve_ready_instance(&ctx.client, "test-ns", &lease, None)
             .await
             .unwrap()
             .expect("ready instance should be reserved");
@@ -3059,7 +7464,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "expired-1", "namespace": "test-ns" },
+                "metadata": { "name": "expired-1", "namespace": "test-ns", "uid": "expired-1-uid", "resourceVersion": "10" },
                 "spec": {
                     "poolRef": "test-profile",
                     "ttl": "1h",
@@ -3076,6 +7481,14 @@ mod tests {
             }))
             .unwrap(),
         );
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/expired-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*lease))
+            .mount(&server)
+            .await;
 
         // Mock PATCH for status update to Expired.
         Mock::given(method("PATCH"))
@@ -3402,6 +7815,51 @@ mod tests {
                 .unwrap(),
             "generation drift on a live instance stays fenced"
         );
+    }
+
+    /// A reciprocal binding survives a stale profile phase projection. Once
+    /// release wins, that adopted instance must enter receipt-backed recycling
+    /// rather than being treated as free or stranded in Ready.
+    #[tokio::test]
+    async fn exact_adopted_binding_recycles_even_if_phase_was_reverted_to_ready() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let binding = exact_test_binding("lease-a", "lease-a-uid");
+        let ready = exact_instance_for_binding(Some(&binding), "Ready");
+        let instance_path =
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/pool-test-1";
+
+        Mock::given(method("GET"))
+            .and(path(instance_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{instance_path}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ready))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            mark_instance_recycling(&client, "test-ns", &binding)
+                .await
+                .unwrap()
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method == http::Method::PATCH)
+            .expect("recycling patch");
+        let operations: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(operations.as_array().unwrap().iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status/phase"
+                && operation["value"] == "Recycling"
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -4035,7 +8493,15 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_pending_no_ready_writes_message_for_failing_pool() {
         let (ctx, server) = test_lease_context().await;
-        let lease = make_test_lease("unsat-1", "Pending");
+        let mut lease = make_test_lease("unsat-1", "Pending");
+        Arc::make_mut(&mut lease).metadata.resource_version = Some("10".into());
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/unsat-1",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease.as_ref()))
+            .mount(&server)
+            .await;
 
         // queue-position + message PATCHes both target this /status path.
         Mock::given(method("PATCH"))
@@ -4045,7 +8511,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiVersion": "kobe.kunobi.ninja/v1alpha1",
                 "kind": "ClusterLease",
-                "metadata": { "name": "unsat-1", "namespace": "test-ns" },
+                "metadata": { "name": "unsat-1", "namespace": "test-ns", "uid": "unsat-1-uid", "resourceVersion": "11" },
                 "spec": { "poolRef": "test-profile", "ttl": "1h",
                            "requester": {"type": "test:admin", "identity": "u"}, "priority": 50 },
                 "status": { "phase": "Pending", "queuePosition": 1 }
@@ -4108,8 +8574,10 @@ mod tests {
                 && serde_json::from_slice::<serde_json::Value>(&r.body)
                     .ok()
                     .and_then(|b| {
-                        b.get("status")
-                            .and_then(|s| s.get("message"))
+                        b.as_array()?
+                            .iter()
+                            .find(|op| op["path"] == "/status/message")?
+                            .get("value")
                             .and_then(|m| m.as_str())
                             .map(|m| m.contains("phase=Failing") && !m.is_empty())
                     })
@@ -4128,7 +8596,13 @@ mod tests {
                 && serde_json::from_slice::<serde_json::Value>(&r.body)
                     .ok()
                     .and_then(|b| {
-                        let conds = b.get("status")?.get("conditions")?.as_array()?.clone();
+                        let conds = b
+                            .as_array()?
+                            .iter()
+                            .find(|op| op["path"] == "/status/conditions")?
+                            .get("value")?
+                            .as_array()?
+                            .clone();
                         let bound = conds
                             .iter()
                             .find(|c| c.get("type") == Some(&serde_json::json!("Bound")))?;

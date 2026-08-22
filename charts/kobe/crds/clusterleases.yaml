@@ -13,7 +13,19 @@ spec:
     singular: clusterlease
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.cleanupMode
+      name: Cleanup
+      type: string
+    - jsonPath: .status.teardownReceipt.outcome
+      name: Receipt
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -78,6 +90,11 @@ spec:
                   authorized only after the lease reaches `Bound` and the exact same value
                   exists on the referenced `ClusterInstance`.
 
+                  A `VerifiedDestroy` intent is write-once. If release closes it before
+                  token creation, the exact value remains alongside `NeverBound` proof so
+                  consumers can distinguish "intent retained, instance absent" from "no
+                  intent was ever recorded".
+
                   `clusterName` remains for compatibility and display, but must never be
                   used alone for access, mutation, rollback, release, or teardown.
                 nullable: true
@@ -132,6 +149,356 @@ spec:
                     type: object
                   bindingId:
                     description: Random immutable identifier unique to this reservation attempt.
+                    type: string
+                  cleanupMode:
+                    default: Standard
+                    description: |-
+                      Cleanup contract captured when the reservation was created.
+
+                      This is authoritative for teardown. Reading the mutable lease spec at
+                      teardown would allow a `VerifiedDestroy` lease to be downgraded after it
+                      had used the capacity. `serde(default)` keeps legacy Standard bindings
+                      readable, while the bind path writes this field for every new pair.
+                    enum:
+                    - Standard
+                    - VerifiedDestroy
+                    type: string
+                  connectToken:
+                    description: |-
+                      Exact lease-scoped connect-token Secret created before access is
+                      granted. Its UID is part of the reciprocal binding so a same-named
+                      replacement is never accepted, and verified teardown must prove this
+                      exact Secret absent before it can emit a terminal receipt.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        nullable: true
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  creationManifest:
+                    description: |-
+                      The immutable manifest itself, retained with the lease so a receipt
+                      consumer can reconstruct the controller-authenticated teardown scope
+                      after the `ClusterInstance` has been deleted. Required together with
+                      `creationManifestDigest` for `VerifiedDestroy`; absent for Standard.
+                    nullable: true
+                    properties:
+                      agentReplicas:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      backendType:
+                        description: Which backend to use for cluster provisioning.
+                        enum:
+                        - k3s
+                        - k0s
+                        - capi
+                        - vkobe
+                        - vcluster
+                        type: string
+                      clusterCidr:
+                        type: string
+                      configDigest:
+                        type: string
+                      datastore:
+                        properties:
+                          database:
+                            nullable: true
+                            type: string
+                          databaseOid:
+                            nullable: true
+                            type: string
+                          endpointDigest:
+                            description: SHA-256 of the non-secret connection location (scheme, host and port).
+                            nullable: true
+                            type: string
+                          mode:
+                            description: |-
+                              Structural OpenAPI projection of [`DatastoreProvenance`]. Kubernetes CRDs
+                              cannot express the tagged enum's two different `mode` constants in a single
+                              structural property, so the schema keeps the fields optional and the
+                              controller's [`TeardownCreationManifest::validate`] enforces the exact
+                              mode-specific contract before the manifest is trusted.
+                            enum:
+                            - embeddedSqlite
+                            - externalPostgres
+                            type: string
+                          role:
+                            nullable: true
+                            type: string
+                          roleOid:
+                            nullable: true
+                            type: string
+                          systemIdentifier:
+                            description: Live `pg_control_system().system_identifier` of the PostgreSQL cluster.
+                            nullable: true
+                            type: string
+                        required:
+                        - mode
+                        type: object
+                      instance:
+                        description: Reference to another Kobe-managed resource in the same namespace.
+                        properties:
+                          name:
+                            description: |-
+                              Resource name. Names are display and lookup handles, never sufficient
+                              authority on their own because Kubernetes permits name reuse.
+                            type: string
+                          uid:
+                            description: |-
+                              Kubernetes UID of the referenced object. New controller-written
+                              references always set this. `None` is accepted only so pre-UID-fence
+                              objects remain readable; security-sensitive consumers must fail closed
+                              or run the proof-based legacy migration before using the reference.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      namespace:
+                        type: string
+                      resources:
+                        items:
+                          description: |-
+                            One concrete Kubernetes resource created for the instance.
+
+                            Repeating the same subject is intentional: it records multiplicity (for
+                            example every server Pod and every PVC/PV) without weakening identity into a
+                            selector or wildcard.
+                          properties:
+                            controlRelation:
+                              description: How the live object proves the controller relationship.
+                              enum:
+                              - controllerOwner
+                              - instanceUidLabel
+                              - claimRef
+                              type: string
+                            controller:
+                              description: Exact identity that controlled creation of this object.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            resource:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            subject:
+                              description: |-
+                                One thing whose absence must be proven.
+
+                                Enumerated rather than free-text so a receipt cannot be satisfied by an
+                                unrecognised or invented subject, and so adding a resource to the teardown
+                                path is a deliberate, reviewable change to this list.
+                              enum:
+                              - agentDeployment
+                              - serverStatefulSet
+                              - serverPods
+                              - service
+                              - podDisruptionBudget
+                              - publisherConfigMap
+                              - registriesConfigMap
+                              - tokenSecret
+                              - kubeconfigSecret
+                              - cidrClaim
+                              - connectTokenSecret
+                              - datastoreCredentialSecret
+                              - serverDataPvcs
+                              - serverDataVolumes
+                              - database
+                              - databaseRole
+                              type: string
+                          required:
+                          - controlRelation
+                          - controller
+                          - resource
+                          - subject
+                          type: object
+                        type: array
+                      schemaVersion:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      sealedAt:
+                        type: string
+                      serverReplicas:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      serviceCidr:
+                        type: string
+                      storage:
+                        items:
+                          description: |-
+                            Live dynamic-storage facts captured while the PVC and PV are both bound.
+
+                            The StorageClass is referenced by exact UID and its reclaim policy is copied
+                            from the live object. A configured class name, a later lookup, or a boolean
+                            assertion is not enough to prove that deleting the claim destroys its data.
+                          properties:
+                            pv:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            pvReclaimPolicy:
+                              description: |-
+                                `PersistentVolume.spec.persistentVolumeReclaimPolicy` observed from the
+                                bound PV. The PV is the final authority for what happens to its data.
+                              type: string
+                            pvc:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            reclaimPolicy:
+                              description: '`StorageClass.reclaimPolicy` observed from the live class.'
+                              type: string
+                            storageClass:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                          required:
+                          - pv
+                          - pvReclaimPolicy
+                          - pvc
+                          - reclaimPolicy
+                          - storageClass
+                          type: object
+                        type: array
+                    required:
+                    - agentReplicas
+                    - backendType
+                    - clusterCidr
+                    - configDigest
+                    - datastore
+                    - instance
+                    - namespace
+                    - resources
+                    - schemaVersion
+                    - sealedAt
+                    - serverReplicas
+                    - serviceCidr
+                    type: object
+                  creationManifestDigest:
+                    description: |-
+                      Digest of the exact immutable creation manifest admitted at bind time.
+                      Required when `cleanupMode=VerifiedDestroy`; absent for legacy Standard
+                      bindings that predate creation manifests.
+                    nullable: true
                     type: string
                   instance:
                     description: UID- and generation-fenced identity of the bound `ClusterInstance`.
@@ -264,6 +631,66 @@ spec:
                   - type
                   type: object
                 type: array
+              connectTokenCreation:
+                description: |-
+                  Crash-safe state machine for creation of the lease-scoped connect
+                  token. `Prepared` is persisted before the create-capable reconcile;
+                  `Creating` is then persisted immediately before the one permitted
+                  Secret `POST`.
+                  `Reserved` records the exact Secret UID and closes the create name;
+                  every later operation is an exact-UID `PATCH` or `DELETE`, never a
+                  second create. Terminal release may certify `NeverBound` only after the
+                  same attempt reaches `Closed` with an observed-absence timestamp.
+                nullable: true
+                properties:
+                  attemptId:
+                    minLength: 1
+                    type: string
+                  identity:
+                    description: |-
+                      Exact identity of one Kubernetes object in a creation manifest.
+
+                      Names are not identities: Kubernetes permits delete-and-recreate under the
+                      same name. A UID is therefore mandatory for every recorded object, and a
+                      receipt must account for the canonical identity rather than only its kind or
+                      display name.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        nullable: true
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  phase:
+                    description: Monotonic states for [`ConnectTokenCreation`].
+                    enum:
+                    - prepared
+                    - creating
+                    - reserved
+                    - ready
+                    - closing
+                    - closed
+                    type: string
+                  verifiedAbsentAt:
+                    format: date-time
+                    nullable: true
+                    type: string
+                required:
+                - attemptId
+                - phase
+                type: object
               diagnosticsUrl:
                 description: URL to the diagnostic bundle captured on release.
                 nullable: true
@@ -314,6 +741,137 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
+              teardownAcknowledgement:
+                description: |-
+                  Authority-owned proof that a distinct consumer durably checkpointed
+                  this exact receipt or `NeverBound` attempt. The lifecycle controller
+                  may remove the retention finalizer only when this value matches the
+                  currently retained proof.
+                nullable: true
+                properties:
+                  acknowledgedAt:
+                    format: date-time
+                    type: string
+                  attemptId:
+                    minLength: 1
+                    type: string
+                  consumer:
+                    description: |-
+                      Exact identity of one Kubernetes object in a creation manifest.
+
+                      Names are not identities: Kubernetes permits delete-and-recreate under the
+                      same name. A UID is therefore mandatory for every recorded object, and a
+                      receipt must account for the canonical identity rather than only its kind or
+                      display name.
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        nullable: true
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  proof:
+                    description: Exact proof copied by the consumer before an authority may acknowledge it.
+                    properties:
+                      evidence:
+                        description: Exact immutable evidence object checkpointed by a consumer before ACK.
+                        nullable: true
+                        properties:
+                          generation:
+                            format: int64
+                            minimum: 1.0
+                            type: integer
+                          name:
+                            minLength: 1
+                            type: string
+                          resourceVersion:
+                            minLength: 1
+                            type: string
+                          uid:
+                            minLength: 1
+                            type: string
+                        required:
+                        - generation
+                        - name
+                        - resourceVersion
+                        - uid
+                        type: object
+                      kind:
+                        description: |-
+                          Discriminator for [`TeardownAcknowledgedProof`]. The optional payload
+                          fields intentionally live in one structural object: Kubernetes CRD schemas
+                          cannot merge internally-tagged enum variants that give `kind` different
+                          enum constraints. The `ClusterLease` CEL rule enforces the exact payload
+                          for each variant.
+                        enum:
+                        - receipt
+                        - neverBound
+                        type: string
+                      receiptToken:
+                        maxLength: 71
+                        minLength: 71
+                        nullable: true
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      unboundReleaseVerifiedAt:
+                        format: date-time
+                        nullable: true
+                        type: string
+                    required:
+                    - kind
+                    type: object
+                required:
+                - acknowledgedAt
+                - attemptId
+                - consumer
+                - proof
+                type: object
+              teardownAttemptId:
+                description: |-
+                  Durable nonce written before the first destructive request. Kept
+                  separate from the mutable InProgress-to-terminal receipt so consumers
+                  can verify that the terminal record belongs to the exact attempt the
+                  controller began, rather than trusting a nonce supplied by that record.
+                minLength: 1
+                nullable: true
+                type: string
+              teardownEvidence:
+                description: |-
+                  Exact immutable authority record corresponding to
+                  [`Self::teardown_receipt`]. Consumers never trust the status mirror
+                  without fetching this UID/generation/resourceVersion-fenced object.
+                nullable: true
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  resourceVersion:
+                    minLength: 1
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - generation
+                - name
+                - resourceVersion
+                - uid
+                type: object
               teardownReceipt:
                 description: |-
                   Durable proof that this lease's exact capacity was destroyed.
@@ -324,7 +882,10 @@ spec:
                 nullable: true
                 properties:
                   attemptId:
-                    description: Unique per attempt; retries produce new attempts, never edit old ones.
+                    description: |-
+                      Unique per attempt. Reconcile resumes an `InProgress` nonce unchanged;
+                      a later retry may replace a terminal receipt with a new attempt, but it
+                      never rewrites the identity of an active attempt.
                     type: string
                   backendType:
                     description: Backend identity and immutable provenance digest observed at bind time.
@@ -365,6 +926,7 @@ spec:
                           - kubeconfigSecret
                           - cidrClaim
                           - connectTokenSecret
+                          - datastoreCredentialSecret
                           - serverDataPvcs
                           - serverDataVolumes
                           - database
@@ -392,10 +954,23 @@ spec:
                       - subject
                       type: object
                     type: array
+                  cleanupMode:
+                    default: Standard
+                    description: |-
+                      Cleanup contract captured in the reciprocal binding. A receipt for a
+                      Standard teardown can never release VerifiedDestroy capacity.
+                    enum:
+                    - Standard
+                    - VerifiedDestroy
+                    type: string
                   completedAt:
                     nullable: true
                     type: string
                   configDigest:
+                    type: string
+                  creationManifestDigest:
+                    default: ''
+                    description: SHA-256 of the immutable controller-authenticated creation manifest.
                     type: string
                   instance:
                     description: Reference to another Kobe-managed resource in the same namespace.
@@ -442,6 +1017,7 @@ spec:
                   outcome:
                     description: Aggregate verdict for one teardown attempt.
                     enum:
+                    - inProgress
                     - verified
                     - quarantined
                     type: string
@@ -491,11 +1067,55 @@ spec:
                 - schemaVersion
                 - startedAt
                 type: object
+              unboundReleaseVerifiedAt:
+                description: |-
+                  API-server-observed proof that this exact terminal lease never acquired
+                  a reciprocal `ClusterInstance` binding. A pre-create binding intent may
+                  remain as immutable audit provenance; it must have no token identity and
+                  its creator must be `Closed`. The proof is meaningful only with the same
+                  status' immutable [`Self::teardown_attempt_id`] and is retained until the
+                  composing Sandbox explicitly acknowledges that attempt.
+                format: date-time
+                nullable: true
+                type: string
             type: object
         required:
         - spec
-        title: ClusterLease
+        title: ClusterLeaseValidated
         type: object
+        x-kubernetes-validations:
+        - message: spec.cleanupMode is immutable, including implicit Standard
+          rule: has(self.spec.cleanupMode) == has(oldSelf.spec.cleanupMode) && (!has(self.spec.cleanupMode) || self.spec.cleanupMode == oldSelf.spec.cleanupMode)
+        - message: spec.requester is immutable
+          rule: self.spec.requester == oldSelf.spec.requester
+        - message: status.teardownAttemptId changes only when a new InProgress retry is durably begun
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAttemptId) || (has(self.status) && self.status != null && has(self.status.teardownAttemptId) && (self.status.teardownAttemptId == oldSelf.status.teardownAttemptId || (has(oldSelf.status.teardownReceipt) && oldSelf.status.teardownReceipt.outcome != ''inProgress'' && has(self.status.teardownReceipt) && self.status.teardownReceipt.outcome == ''inProgress'' && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId)))'
+        - message: status.binding cleanupMode must match the immutable lease cleanup contract
+          rule: '!has(self.status) || self.status == null || !has(self.status.binding) || (has(self.spec.cleanupMode) ? self.status.binding.cleanupMode == self.spec.cleanupMode : self.status.binding.cleanupMode == ''Standard'')'
+        - message: VerifiedDestroy binding must carry complete UID/generation-fenced lease, instance, pool, backend, and creation provenance
+          rule: '!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != ''VerifiedDestroy'' || (self.status.binding.bindingId.size() > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && self.status.binding.lease.name == self.metadata.name && self.status.binding.instance.name.size() > 0 && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.pool.name == self.spec.poolRef && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest))'
+        - message: VerifiedDestroy binding provenance is write-once and its connect-token identity is monotonic
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != ''VerifiedDestroy'' || (has(self.status) && self.status != null && has(self.status.binding) && self.status.binding.bindingId == oldSelf.status.binding.bindingId && self.status.binding.lease == oldSelf.status.binding.lease && self.status.binding.instance == oldSelf.status.binding.instance && self.status.binding.pool == oldSelf.status.binding.pool && self.status.binding.backend == oldSelf.status.binding.backend && self.status.binding.instanceSpecDigest == oldSelf.status.binding.instanceSpecDigest && self.status.binding.cleanupMode == oldSelf.status.binding.cleanupMode && has(self.status.binding.creationManifestDigest) == has(oldSelf.status.binding.creationManifestDigest) && (!has(oldSelf.status.binding.creationManifestDigest) || self.status.binding.creationManifestDigest == oldSelf.status.binding.creationManifestDigest) && has(self.status.binding.creationManifest) == has(oldSelf.status.binding.creationManifest) && (!has(oldSelf.status.binding.creationManifest) || self.status.binding.creationManifest == oldSelf.status.binding.creationManifest) && (!has(oldSelf.status.binding.connectToken) || (has(self.status.binding.connectToken) && self.status.binding.connectToken == oldSelf.status.binding.connectToken)))'
+        - message: VerifiedDestroy clusterName must project the exact bound instance
+          rule: '!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != ''VerifiedDestroy'' || !has(self.status.clusterName) || self.status.clusterName == self.status.binding.instance.name'
+        - message: VerifiedDestroy clusterName is immutable once published
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != ''VerifiedDestroy'' || !has(oldSelf.status.clusterName) || (has(self.status) && self.status != null && has(self.status.clusterName) && self.status.clusterName == oldSelf.status.clusterName)'
+        - message: status.teardownReceipt must match the durable attempt and reciprocal binding cleanup contract
+          rule: '!has(self.status) || self.status == null || !has(self.status.teardownReceipt) || (has(self.status.binding) && has(self.status.teardownAttemptId) && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId && self.status.teardownReceipt.cleanupMode == self.status.binding.cleanupMode)'
+        - message: unbound release proof requires an attempt-bound NeverBound condition and either no intent or a retained pre-create intent
+          rule: '!has(self.status) || self.status == null || !has(self.status.unboundReleaseVerifiedAt) || (self.status.phase in [''Released'', ''Expired''] && has(self.status.teardownAttemptId) && (!has(self.status.binding) || (self.status.binding.cleanupMode == ''VerifiedDestroy'' && !has(self.status.binding.connectToken) && has(self.status.connectTokenCreation) && self.status.connectTokenCreation.phase == ''closed'' && !has(self.status.connectTokenCreation.identity) && has(self.status.connectTokenCreation.verifiedAbsentAt) && self.status.connectTokenCreation.verifiedAbsentAt == self.status.unboundReleaseVerifiedAt)) && !has(self.status.clusterName) && !has(self.status.teardownReceipt) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''AllocationAbsent'' && c.status == ''True'' && c.reason == ''NeverBound''))'
+        - message: status.teardownAcknowledgement is immutable once authority records it
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAcknowledgement) || (has(self.status) && self.status != null && has(self.status.teardownAcknowledgement) && self.status.teardownAcknowledgement == oldSelf.status.teardownAcknowledgement)'
+        - message: status.teardownAcknowledgement proof payload must match its kind
+          rule: '!has(self.status) || self.status == null || !has(self.status.teardownAcknowledgement) || ((self.status.teardownAcknowledgement.proof.kind == ''receipt'' && has(self.status.teardownAcknowledgement.proof.receiptToken) && has(self.status.teardownAcknowledgement.proof.evidence) && !has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)) || (self.status.teardownAcknowledgement.proof.kind == ''neverBound'' && !has(self.status.teardownAcknowledgement.proof.receiptToken) && !has(self.status.teardownAcknowledgement.proof.evidence) && has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)))'
+        - message: status.connectTokenCreation attempt changes only after the prior attempt is Closed
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.attemptId == oldSelf.status.connectTokenCreation.attemptId || (oldSelf.status.phase == ''Pending'' && !has(oldSelf.status.unboundReleaseVerifiedAt) && oldSelf.status.connectTokenCreation.phase == ''closed'' && self.status.connectTokenCreation.phase == ''prepared'')))'
+        - message: status.connectTokenCreation phase transitions are monotonic
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.phase == oldSelf.status.connectTokenCreation.phase || (oldSelf.status.connectTokenCreation.phase == ''prepared'' && self.status.connectTokenCreation.phase in [''creating'', ''closed'']) || (oldSelf.status.connectTokenCreation.phase == ''creating'' && self.status.connectTokenCreation.phase in [''reserved'', ''closing'']) || (oldSelf.status.connectTokenCreation.phase == ''reserved'' && self.status.connectTokenCreation.phase in [''ready'', ''closing'']) || (oldSelf.status.connectTokenCreation.phase == ''ready'' && self.status.connectTokenCreation.phase == ''closing'') || (oldSelf.status.connectTokenCreation.phase == ''closing'' && self.status.connectTokenCreation.phase == ''closed'') || (oldSelf.status.phase == ''Pending'' && !has(oldSelf.status.unboundReleaseVerifiedAt) && oldSelf.status.connectTokenCreation.phase == ''closed'' && self.status.connectTokenCreation.phase == ''prepared'')))'
+        - message: status.connectTokenCreation payload must match its phase
+          rule: '!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || ((self.status.connectTokenCreation.phase in [''prepared'', ''creating''] && !has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase in [''reserved'', ''ready'', ''closing''] && has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase == ''closed'' && has(self.status.connectTokenCreation.verifiedAbsentAt)))'
+        - message: an open connect-token creator must match the durable binding intent
+          rule: '!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || self.status.connectTokenCreation.phase == ''closed'' || (has(self.status.binding) && (has(self.status.connectTokenCreation.identity) == has(self.status.binding.connectToken)) && (!has(self.status.connectTokenCreation.identity) || self.status.connectTokenCreation.identity.uid == self.status.binding.connectToken.uid && self.status.connectTokenCreation.identity.kind == self.status.binding.connectToken.kind && self.status.connectTokenCreation.identity.apiVersion == self.status.binding.connectToken.apiVersion && self.status.connectTokenCreation.identity.name == self.status.binding.connectToken.name))'
     served: true
     storage: true
     subresources:

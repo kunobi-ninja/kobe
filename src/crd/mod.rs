@@ -3,9 +3,11 @@ pub mod bootstrap_config;
 pub mod cidr;
 #[allow(dead_code)]
 pub mod datastore;
+pub mod execution;
 pub mod instance;
 pub mod lease;
 pub mod profile;
+pub mod receipt;
 pub mod sandbox;
 // The verified-teardown vocabulary is defined ahead of the k3s provider and the
 // controllers that consume it, so these types have no callers in this change.
@@ -19,9 +21,11 @@ pub use bootstrap_config::*;
 pub use cidr::*;
 #[allow(unused_imports)]
 pub use datastore::*;
+pub use execution::*;
 pub use instance::*;
 pub use lease::*;
 pub use profile::*;
+pub use receipt::*;
 pub use sandbox::*;
 #[allow(unused_imports)]
 pub use teardown::*;

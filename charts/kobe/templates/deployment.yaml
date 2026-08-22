@@ -56,18 +56,53 @@ spec:
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           env:
+            {{- if .Values.teardownAuthority.separate }}
+            # Declaring this role DISABLES the in-process teardown authority,
+            # so it may only be set when a separate authority is actually
+            # deployed to take over.
+            - name: KOBE_PROCESS_ROLE
+              value: "control-plane"
+            {{- end }}
             - name: OPERATOR_NAMESPACE
               value: {{ .Values.operatorNamespace | quote }}
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Pod identity scopes serving-replica access-ledger recovery. It is
+            # not used to own a runtime-validation Claim.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: BIND_ADDR
               value: "0.0.0.0:{{ .Values.service.port }}"
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
+            # External mode performs read-only compatibility checks against an
+            # operator-installed Agent Sandbox v0.5.6 runtime.
+            - name: AGENT_SANDBOX_MODE
+              value: {{ .Values.agentSandbox.mode | default "disabled" | quote }}
+            - name: KOBE_SANDBOX_RESERVATION_NAMESPACE
+              value: {{ include "kobe.sandboxLedgerNamespace" . | quote }}
+            - name: KOBE_SANDBOX_LEDGER_POLICY_NAME
+              value: {{ include "kobe.sandboxLedgerPolicyName" . | quote }}
+            - name: KOBE_SANDBOX_LEDGER_OBJECT_LIMIT
+              value: {{ .Values.agentSandbox.reservationObjectLimit | quote }}
+            - name: KOBE_OPERATOR_SERVICE_ACCOUNT_USERNAME
+              value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kobe.serviceAccountName" .) | quote }}
+            # Retention window for terminal SandboxLease records. Always set,
+            # including in `disabled` mode, so switching the mode on does not
+            # also silently change the retention policy from whatever the
+            # operator wrote here to the built-in default.
+            - name: KOBE_SANDBOX_LEASE_RETENTION
+              value: {{ .Values.agentSandbox.leaseRetention | default "168h" | quote }}
             - name: POOL_SERVICE_ACCOUNT
               value: {{ .Values.poolServiceAccount | default (include "kobe.serviceAccountName" .) | quote }}
             - name: POOL_PUBLISHER_SERVICE_ACCOUNT

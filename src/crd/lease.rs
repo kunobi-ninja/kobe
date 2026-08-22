@@ -1,16 +1,17 @@
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::crd::LeaseBinding;
-use crate::crd::teardown::{CleanupMode, TeardownReceipt};
+use crate::crd::teardown::{CleanupMode, KubernetesResourceIdentity, TeardownReceipt};
+use crate::crd::{TeardownAcknowledgement, TeardownEvidenceReference};
 
 /// ClusterLease is the internal representation of a cluster lease.
 ///
 /// Created when a user/CI leases a cluster via the HTTP API.
 /// The lease controller binds it to a warm cluster, tracks TTL,
 /// and handles release/expiry/recycling.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, KubeSchema)]
 #[kube(
     group = "kobe.kunobi.ninja",
     version = "v1alpha1",
@@ -18,7 +19,43 @@ use crate::crd::teardown::{CleanupMode, TeardownReceipt};
     plural = "clusterleases",
     shortname = "cl",
     status = "ClusterLeaseStatus",
-    namespaced
+    namespaced,
+    validation = Rule::new("has(self.spec.cleanupMode) == has(oldSelf.spec.cleanupMode) && (!has(self.spec.cleanupMode) || self.spec.cleanupMode == oldSelf.spec.cleanupMode)")
+        .message("spec.cleanupMode is immutable, including implicit Standard"),
+    validation = Rule::new("self.spec.requester == oldSelf.spec.requester")
+        .message("spec.requester is immutable"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAttemptId) || (has(self.status) && self.status != null && has(self.status.teardownAttemptId) && (self.status.teardownAttemptId == oldSelf.status.teardownAttemptId || (has(oldSelf.status.teardownReceipt) && oldSelf.status.teardownReceipt.outcome != 'inProgress' && has(self.status.teardownReceipt) && self.status.teardownReceipt.outcome == 'inProgress' && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId)))")
+        .message("status.teardownAttemptId changes only when a new InProgress retry is durably begun"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || (has(self.spec.cleanupMode) ? self.status.binding.cleanupMode == self.spec.cleanupMode : self.status.binding.cleanupMode == 'Standard')")
+        .message("status.binding cleanupMode must match the immutable lease cleanup contract"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || (self.status.binding.bindingId.size() > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && self.status.binding.lease.name == self.metadata.name && self.status.binding.instance.name.size() > 0 && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.pool.name == self.spec.poolRef && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest))")
+        .message("VerifiedDestroy binding must carry complete UID/generation-fenced lease, instance, pool, backend, and creation provenance"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || (has(self.status) && self.status != null && has(self.status.binding) && self.status.binding.bindingId == oldSelf.status.binding.bindingId && self.status.binding.lease == oldSelf.status.binding.lease && self.status.binding.instance == oldSelf.status.binding.instance && self.status.binding.pool == oldSelf.status.binding.pool && self.status.binding.backend == oldSelf.status.binding.backend && self.status.binding.instanceSpecDigest == oldSelf.status.binding.instanceSpecDigest && self.status.binding.cleanupMode == oldSelf.status.binding.cleanupMode && has(self.status.binding.creationManifestDigest) == has(oldSelf.status.binding.creationManifestDigest) && (!has(oldSelf.status.binding.creationManifestDigest) || self.status.binding.creationManifestDigest == oldSelf.status.binding.creationManifestDigest) && has(self.status.binding.creationManifest) == has(oldSelf.status.binding.creationManifest) && (!has(oldSelf.status.binding.creationManifest) || self.status.binding.creationManifest == oldSelf.status.binding.creationManifest) && (!has(oldSelf.status.binding.connectToken) || (has(self.status.binding.connectToken) && self.status.binding.connectToken == oldSelf.status.binding.connectToken)))")
+        .message("VerifiedDestroy binding provenance is write-once and its connect-token identity is monotonic"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != 'VerifiedDestroy' || !has(self.status.clusterName) || self.status.clusterName == self.status.binding.instance.name")
+        .message("VerifiedDestroy clusterName must project the exact bound instance"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != 'VerifiedDestroy' || !has(oldSelf.status.clusterName) || (has(self.status) && self.status != null && has(self.status.clusterName) && self.status.clusterName == oldSelf.status.clusterName)")
+        .message("VerifiedDestroy clusterName is immutable once published"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.teardownReceipt) || (has(self.status.binding) && has(self.status.teardownAttemptId) && self.status.teardownReceipt.attemptId == self.status.teardownAttemptId && self.status.teardownReceipt.cleanupMode == self.status.binding.cleanupMode)")
+        .message("status.teardownReceipt must match the durable attempt and reciprocal binding cleanup contract"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.unboundReleaseVerifiedAt) || (self.status.phase in ['Released', 'Expired'] && has(self.status.teardownAttemptId) && (!has(self.status.binding) || (self.status.binding.cleanupMode == 'VerifiedDestroy' && !has(self.status.binding.connectToken) && has(self.status.connectTokenCreation) && self.status.connectTokenCreation.phase == 'closed' && !has(self.status.connectTokenCreation.identity) && has(self.status.connectTokenCreation.verifiedAbsentAt) && self.status.connectTokenCreation.verifiedAbsentAt == self.status.unboundReleaseVerifiedAt)) && !has(self.status.clusterName) && !has(self.status.teardownReceipt) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'))")
+        .message("unbound release proof requires an attempt-bound NeverBound condition and either no intent or a retained pre-create intent"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.teardownAcknowledgement) || (has(self.status) && self.status != null && has(self.status.teardownAcknowledgement) && self.status.teardownAcknowledgement == oldSelf.status.teardownAcknowledgement)")
+        .message("status.teardownAcknowledgement is immutable once authority records it"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.teardownAcknowledgement) || ((self.status.teardownAcknowledgement.proof.kind == 'receipt' && has(self.status.teardownAcknowledgement.proof.receiptToken) && has(self.status.teardownAcknowledgement.proof.evidence) && !has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)) || (self.status.teardownAcknowledgement.proof.kind == 'neverBound' && !has(self.status.teardownAcknowledgement.proof.receiptToken) && !has(self.status.teardownAcknowledgement.proof.evidence) && has(self.status.teardownAcknowledgement.proof.unboundReleaseVerifiedAt)))")
+        .message("status.teardownAcknowledgement proof payload must match its kind"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.attemptId == oldSelf.status.connectTokenCreation.attemptId || (oldSelf.status.phase == 'Pending' && !has(oldSelf.status.unboundReleaseVerifiedAt) && oldSelf.status.connectTokenCreation.phase == 'closed' && self.status.connectTokenCreation.phase == 'prepared')))")
+        .message("status.connectTokenCreation attempt changes only after the prior attempt is Closed"),
+    validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.connectTokenCreation) || (has(self.status) && self.status != null && has(self.status.connectTokenCreation) && (self.status.connectTokenCreation.phase == oldSelf.status.connectTokenCreation.phase || (oldSelf.status.connectTokenCreation.phase == 'prepared' && self.status.connectTokenCreation.phase in ['creating', 'closed']) || (oldSelf.status.connectTokenCreation.phase == 'creating' && self.status.connectTokenCreation.phase in ['reserved', 'closing']) || (oldSelf.status.connectTokenCreation.phase == 'reserved' && self.status.connectTokenCreation.phase in ['ready', 'closing']) || (oldSelf.status.connectTokenCreation.phase == 'ready' && self.status.connectTokenCreation.phase == 'closing') || (oldSelf.status.connectTokenCreation.phase == 'closing' && self.status.connectTokenCreation.phase == 'closed') || (oldSelf.status.phase == 'Pending' && !has(oldSelf.status.unboundReleaseVerifiedAt) && oldSelf.status.connectTokenCreation.phase == 'closed' && self.status.connectTokenCreation.phase == 'prepared')))")
+        .message("status.connectTokenCreation phase transitions are monotonic"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || ((self.status.connectTokenCreation.phase in ['prepared', 'creating'] && !has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase in ['reserved', 'ready', 'closing'] && has(self.status.connectTokenCreation.identity) && !has(self.status.connectTokenCreation.verifiedAbsentAt)) || (self.status.connectTokenCreation.phase == 'closed' && has(self.status.connectTokenCreation.verifiedAbsentAt)))")
+        .message("status.connectTokenCreation payload must match its phase"),
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.connectTokenCreation) || self.status.connectTokenCreation.phase == 'closed' || (has(self.status.binding) && (has(self.status.connectTokenCreation.identity) == has(self.status.binding.connectToken)) && (!has(self.status.connectTokenCreation.identity) || self.status.connectTokenCreation.identity.uid == self.status.binding.connectToken.uid && self.status.connectTokenCreation.identity.kind == self.status.binding.connectToken.kind && self.status.connectTokenCreation.identity.apiVersion == self.status.binding.connectToken.apiVersion && self.status.connectTokenCreation.identity.name == self.status.binding.connectToken.name))")
+        .message("an open connect-token creator must match the durable binding intent"),
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Cleanup","type":"string","jsonPath":".spec.cleanupMode"}"#,
+    printcolumn = r#"{"name":"Receipt","type":"string","jsonPath":".status.teardownReceipt.outcome"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterLeaseSpec {
@@ -77,6 +114,11 @@ pub struct ClusterLeaseStatus {
     /// authorized only after the lease reaches `Bound` and the exact same value
     /// exists on the referenced `ClusterInstance`.
     ///
+    /// A `VerifiedDestroy` intent is write-once. If release closes it before
+    /// token creation, the exact value remains alongside `NeverBound` proof so
+    /// consumers can distinguish "intent retained, instance absent" from "no
+    /// intent was ever recorded".
+    ///
     /// `clusterName` remains for compatibility and display, but must never be
     /// used alone for access, mutation, rollback, release, or teardown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,6 +139,48 @@ pub struct ClusterLeaseStatus {
     /// the evidence matters, and when #74's owning `SandboxLease` consumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teardown_receipt: Option<TeardownReceipt>,
+
+    /// Exact immutable authority record corresponding to
+    /// [`Self::teardown_receipt`]. Consumers never trust the status mirror
+    /// without fetching this UID/generation/resourceVersion-fenced object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_evidence: Option<TeardownEvidenceReference>,
+
+    /// Durable nonce written before the first destructive request. Kept
+    /// separate from the mutable InProgress-to-terminal receipt so consumers
+    /// can verify that the terminal record belongs to the exact attempt the
+    /// controller began, rather than trusting a nonce supplied by that record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub teardown_attempt_id: Option<String>,
+
+    /// Crash-safe state machine for creation of the lease-scoped connect
+    /// token. `Prepared` is persisted before the create-capable reconcile;
+    /// `Creating` is then persisted immediately before the one permitted
+    /// Secret `POST`.
+    /// `Reserved` records the exact Secret UID and closes the create name;
+    /// every later operation is an exact-UID `PATCH` or `DELETE`, never a
+    /// second create. Terminal release may certify `NeverBound` only after the
+    /// same attempt reaches `Closed` with an observed-absence timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_token_creation: Option<ConnectTokenCreation>,
+
+    /// API-server-observed proof that this exact terminal lease never acquired
+    /// a reciprocal `ClusterInstance` binding. A pre-create binding intent may
+    /// remain as immutable audit provenance; it must have no token identity and
+    /// its creator must be `Closed`. The proof is meaningful only with the same
+    /// status' immutable [`Self::teardown_attempt_id`] and is retained until the
+    /// composing Sandbox explicitly acknowledges that attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    pub unbound_release_verified_at: Option<String>,
+
+    /// Authority-owned proof that a distinct consumer durably checkpointed
+    /// this exact receipt or `NeverBound` attempt. The lifecycle controller
+    /// may remove the retention finalizer only when this value matches the
+    /// currently retained proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_acknowledgement: Option<TeardownAcknowledgement>,
 
     /// Position in the priority queue (0 = not queued, 1 = next).
     #[serde(default)]
@@ -143,6 +227,46 @@ pub struct ClusterLeaseStatus {
     /// (RFC 7396 / array-replacement).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<ClusterLeaseCondition>,
+}
+
+/// Durable lifecycle of the only create-capable connect-token operation.
+///
+/// Persisting this separately from [`LeaseBinding::connect_token`] matters for
+/// the crash window between a Secret `POST` and the status patch that records
+/// its UID. A restart in `Creating` observes the original attempt but never
+/// emits another `POST`; an ambiguous 404 therefore fails closed instead of
+/// certifying `NeverBound` while a delayed create could still arrive.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectTokenCreation {
+    #[schemars(length(min = 1))]
+    pub attempt_id: String,
+    pub phase: ConnectTokenCreationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<KubernetesResourceIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("format" = "date-time"))]
+    pub verified_absent_at: Option<String>,
+}
+
+/// Monotonic states for [`ConnectTokenCreation`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectTokenCreationPhase {
+    /// Durable binding intent exists, but no Secret create was dispatched.
+    Prepared,
+    /// The single empty-Secret create may be in flight or have an ambiguous
+    /// result. Reconcilers may observe this attempt, but must never retry its
+    /// `POST`.
+    Creating,
+    /// The exact empty Secret UID is durable, so no later `POST` is needed.
+    Reserved,
+    /// Token data was installed into the exact reserved Secret.
+    Ready,
+    /// Release has closed activation and is deleting the exact Secret.
+    Closing,
+    /// Exact Secret absence was observed for this attempt.
+    Closed,
 }
 
 /// One status condition on a `ClusterLease`. Mirrors the core/v1 condition
@@ -566,6 +690,8 @@ mod json_safety_tests {
                 backend_type: "k3s".into(),
                 config_digest: "cfg".into(),
                 instance_spec_digest: "spec".into(),
+                creation_manifest_digest: "manifest-digest".into(),
+                cleanup_mode: crate::crd::CleanupMode::VerifiedDestroy,
                 started_at: "2026-06-04T02:00:00Z".into(),
                 completed_at: Some("2026-06-04T02:01:00Z".into()),
                 checks: vec![crate::crd::TeardownCheck {
@@ -577,6 +703,11 @@ mod json_safety_tests {
                 retry_count: 0,
                 outcome: crate::crd::TeardownOutcome::Verified,
             }),
+            teardown_evidence: None,
+            teardown_attempt_id: Some("attempt-1".into()),
+            connect_token_creation: None,
+            unbound_release_verified_at: None,
+            teardown_acknowledgement: None,
         };
         let once = serde_json::to_value(&original).unwrap();
         let back: ClusterLeaseStatus = serde_json::from_value(once.clone()).unwrap();
@@ -617,6 +748,52 @@ mod json_safety_tests {
             "status subresource missing: {}",
             versions[0]["subresources"]
         );
+    }
+
+    #[test]
+    fn crd_makes_cleanup_mode_presence_and_value_immutable_at_the_root() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(ClusterLease::crd()).unwrap();
+        let rules =
+            crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["x-kubernetes-validations"]
+                .as_array()
+                .expect("root transition rules");
+        assert!(rules.iter().any(|rule| {
+            rule["rule"]
+                == "has(self.spec.cleanupMode) == has(oldSelf.spec.cleanupMode) && (!has(self.spec.cleanupMode) || self.spec.cleanupMode == oldSelf.spec.cleanupMode)"
+        }));
+        for expected in [
+            "status.binding.cleanupMode == self.spec.cleanupMode",
+            "status.teardownReceipt.attemptId == self.status.teardownAttemptId",
+            "c.type == 'AllocationAbsent' && c.status == 'True' && c.reason == 'NeverBound'",
+            "self.status.binding.bindingId == oldSelf.status.binding.bindingId",
+            "self.status.binding.connectToken == oldSelf.status.binding.connectToken",
+            "self.status.binding.lease.uid.size() > 0",
+            "self.status.binding.lease.name == self.metadata.name",
+            "self.status.binding.instance.uid.size() > 0",
+            "self.status.binding.pool.uid.size() > 0",
+            "self.status.binding.creationManifestDigest.size() > 0",
+            "self.status.clusterName == oldSelf.status.clusterName",
+            "self.status.clusterName == self.status.binding.instance.name",
+            "self.status.connectTokenCreation.verifiedAbsentAt == self.status.unboundReleaseVerifiedAt",
+            "self.status.phase in ['Released', 'Expired']",
+        ] {
+            assert!(rules.iter().any(|rule| {
+                rule["rule"]
+                    .as_str()
+                    .is_some_and(|rule| rule.contains(expected))
+            }));
+        }
+        assert!(rules.iter().any(|rule| {
+            rule["rule"].as_str().is_some_and(|rule| {
+                rule.contains("status.teardownAttemptId")
+                    && rule.contains("teardownReceipt.outcome == 'inProgress'")
+                    && rule.contains("teardownReceipt.attemptId == self.status.teardownAttemptId")
+            })
+        }));
+        let status = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"];
+        assert_eq!(status["teardownAttemptId"]["type"], "string");
     }
 
     #[test]

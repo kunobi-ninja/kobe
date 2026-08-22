@@ -165,6 +165,16 @@ pub struct SandboxAccessRule {
     /// Maximum active Sandbox leases for this identity, separate from Cluster
     /// lease concurrency.
     pub max_concurrent_leases: u32,
+    /// Maximum runtime TTL extensions per Sandbox lease.
+    ///
+    /// An extension can never move expiry past `max_ttl` measured from
+    /// readiness — the same ceiling the caller could have asked for at
+    /// creation — so this bounds how *incrementally* that ceiling is reached,
+    /// not how much runtime is available. Set `0` to forbid extension
+    /// outright, which is the way to require callers to commit to a TTL up
+    /// front.
+    #[serde(default = "default_max_extensions")]
+    pub max_extensions: u32,
     /// Aggregate per-Sandbox CPU and memory ceiling.
     pub resource_ceiling: SandboxResourceCeiling,
 }
@@ -313,6 +323,31 @@ mod tests {
         assert_eq!(rule.max_extensions, 0, "an explicit 0 must be honoured");
     }
 
+    /// A Sandbox grant written before extension existed keeps working and
+    /// picks up the same default as the Cluster rule. This widens nothing: an
+    /// extension is still capped by `maxTtl` from readiness, which is the
+    /// ceiling the caller could already have requested at creation.
+    #[test]
+    fn sandbox_max_extensions_defaults_to_two() {
+        let grant = serde_json::json!({
+            "pools": ["agent-*"],
+            "verbs": ["lease"],
+            "maxTtl": "1h",
+            "maxConcurrentLeases": 2,
+            "resourceCeiling": { "maxCpu": "2", "maxMemory": "4Gi" }
+        });
+        let rule: SandboxAccessRule = serde_json::from_value(grant.clone()).unwrap();
+        assert_eq!(rule.max_extensions, 2);
+
+        let mut forbidden = grant;
+        forbidden["maxExtensions"] = serde_json::json!(0);
+        let rule: SandboxAccessRule = serde_json::from_value(forbidden).unwrap();
+        assert_eq!(
+            rule.max_extensions, 0,
+            "an explicit 0 must forbid Sandbox extension outright"
+        );
+    }
+
     /// The identity template decides WHO a caller is taken to be. Defaulting
     /// to anything other than the subject claim would silently re-map every
     /// OIDC identity in a policy that omits it.
@@ -426,10 +461,11 @@ mod tests {
             }
         });
         let rule: AccessRule = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(
-            serde_json::to_value(rule).unwrap()["sandbox"],
-            value["sandbox"]
-        );
+        // `maxExtensions` is defaulted rather than optional, so a grant that
+        // omits it round-trips with the effective value made explicit.
+        let mut expected = value["sandbox"].clone();
+        expected["maxExtensions"] = serde_json::json!(2);
+        assert_eq!(serde_json::to_value(rule).unwrap()["sandbox"], expected);
 
         let mut invalid = value;
         invalid["sandbox"]["namespace"] = serde_json::json!("kube-system");

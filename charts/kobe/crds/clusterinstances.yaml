@@ -13,7 +13,19 @@ spec:
     singular: clusterinstance
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.leaseRef.name
+      name: Lease
+      type: string
+    - jsonPath: .status.creationManifest.schemaVersion
+      name: Manifest
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -704,6 +716,356 @@ spec:
                   bindingId:
                     description: Random immutable identifier unique to this reservation attempt.
                     type: string
+                  cleanupMode:
+                    default: Standard
+                    description: |-
+                      Cleanup contract captured when the reservation was created.
+
+                      This is authoritative for teardown. Reading the mutable lease spec at
+                      teardown would allow a `VerifiedDestroy` lease to be downgraded after it
+                      had used the capacity. `serde(default)` keeps legacy Standard bindings
+                      readable, while the bind path writes this field for every new pair.
+                    enum:
+                    - Standard
+                    - VerifiedDestroy
+                    type: string
+                  connectToken:
+                    description: |-
+                      Exact lease-scoped connect-token Secret created before access is
+                      granted. Its UID is part of the reciprocal binding so a same-named
+                      replacement is never accepted, and verified teardown must prove this
+                      exact Secret absent before it can emit a terminal receipt.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        nullable: true
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  creationManifest:
+                    description: |-
+                      The immutable manifest itself, retained with the lease so a receipt
+                      consumer can reconstruct the controller-authenticated teardown scope
+                      after the `ClusterInstance` has been deleted. Required together with
+                      `creationManifestDigest` for `VerifiedDestroy`; absent for Standard.
+                    nullable: true
+                    properties:
+                      agentReplicas:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      backendType:
+                        description: Which backend to use for cluster provisioning.
+                        enum:
+                        - k3s
+                        - k0s
+                        - capi
+                        - vkobe
+                        - vcluster
+                        type: string
+                      clusterCidr:
+                        type: string
+                      configDigest:
+                        type: string
+                      datastore:
+                        properties:
+                          database:
+                            nullable: true
+                            type: string
+                          databaseOid:
+                            nullable: true
+                            type: string
+                          endpointDigest:
+                            description: SHA-256 of the non-secret connection location (scheme, host and port).
+                            nullable: true
+                            type: string
+                          mode:
+                            description: |-
+                              Structural OpenAPI projection of [`DatastoreProvenance`]. Kubernetes CRDs
+                              cannot express the tagged enum's two different `mode` constants in a single
+                              structural property, so the schema keeps the fields optional and the
+                              controller's [`TeardownCreationManifest::validate`] enforces the exact
+                              mode-specific contract before the manifest is trusted.
+                            enum:
+                            - embeddedSqlite
+                            - externalPostgres
+                            type: string
+                          role:
+                            nullable: true
+                            type: string
+                          roleOid:
+                            nullable: true
+                            type: string
+                          systemIdentifier:
+                            description: Live `pg_control_system().system_identifier` of the PostgreSQL cluster.
+                            nullable: true
+                            type: string
+                        required:
+                        - mode
+                        type: object
+                      instance:
+                        description: Reference to another Kobe-managed resource in the same namespace.
+                        properties:
+                          name:
+                            description: |-
+                              Resource name. Names are display and lookup handles, never sufficient
+                              authority on their own because Kubernetes permits name reuse.
+                            type: string
+                          uid:
+                            description: |-
+                              Kubernetes UID of the referenced object. New controller-written
+                              references always set this. `None` is accepted only so pre-UID-fence
+                              objects remain readable; security-sensitive consumers must fail closed
+                              or run the proof-based legacy migration before using the reference.
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      namespace:
+                        type: string
+                      resources:
+                        items:
+                          description: |-
+                            One concrete Kubernetes resource created for the instance.
+
+                            Repeating the same subject is intentional: it records multiplicity (for
+                            example every server Pod and every PVC/PV) without weakening identity into a
+                            selector or wildcard.
+                          properties:
+                            controlRelation:
+                              description: How the live object proves the controller relationship.
+                              enum:
+                              - controllerOwner
+                              - instanceUidLabel
+                              - claimRef
+                              type: string
+                            controller:
+                              description: Exact identity that controlled creation of this object.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            resource:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            subject:
+                              description: |-
+                                One thing whose absence must be proven.
+
+                                Enumerated rather than free-text so a receipt cannot be satisfied by an
+                                unrecognised or invented subject, and so adding a resource to the teardown
+                                path is a deliberate, reviewable change to this list.
+                              enum:
+                              - agentDeployment
+                              - serverStatefulSet
+                              - serverPods
+                              - service
+                              - podDisruptionBudget
+                              - publisherConfigMap
+                              - registriesConfigMap
+                              - tokenSecret
+                              - kubeconfigSecret
+                              - cidrClaim
+                              - connectTokenSecret
+                              - datastoreCredentialSecret
+                              - serverDataPvcs
+                              - serverDataVolumes
+                              - database
+                              - databaseRole
+                              type: string
+                          required:
+                          - controlRelation
+                          - controller
+                          - resource
+                          - subject
+                          type: object
+                        type: array
+                      schemaVersion:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      sealedAt:
+                        type: string
+                      serverReplicas:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      serviceCidr:
+                        type: string
+                      storage:
+                        items:
+                          description: |-
+                            Live dynamic-storage facts captured while the PVC and PV are both bound.
+
+                            The StorageClass is referenced by exact UID and its reclaim policy is copied
+                            from the live object. A configured class name, a later lookup, or a boolean
+                            assertion is not enough to prove that deleting the claim destroys its data.
+                          properties:
+                            pv:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            pvReclaimPolicy:
+                              description: |-
+                                `PersistentVolume.spec.persistentVolumeReclaimPolicy` observed from the
+                                bound PV. The PV is the final authority for what happens to its data.
+                              type: string
+                            pvc:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                            reclaimPolicy:
+                              description: '`StorageClass.reclaimPolicy` observed from the live class.'
+                              type: string
+                            storageClass:
+                              description: |-
+                                Exact identity of one Kubernetes object in a creation manifest.
+
+                                Names are not identities: Kubernetes permits delete-and-recreate under the
+                                same name. A UID is therefore mandatory for every recorded object, and a
+                                receipt must account for the canonical identity rather than only its kind or
+                                display name.
+                              properties:
+                                apiVersion:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  nullable: true
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - apiVersion
+                              - kind
+                              - name
+                              - uid
+                              type: object
+                          required:
+                          - pv
+                          - pvReclaimPolicy
+                          - pvc
+                          - reclaimPolicy
+                          - storageClass
+                          type: object
+                        type: array
+                    required:
+                    - agentReplicas
+                    - backendType
+                    - clusterCidr
+                    - configDigest
+                    - datastore
+                    - instance
+                    - namespace
+                    - resources
+                    - schemaVersion
+                    - sealedAt
+                    - serverReplicas
+                    - serviceCidr
+                    type: object
+                  creationManifestDigest:
+                    description: |-
+                      Digest of the exact immutable creation manifest admitted at bind time.
+                      Required when `cleanupMode=VerifiedDestroy`; absent for legacy Standard
+                      bindings that predate creation manifests.
+                    nullable: true
+                    type: string
                   instance:
                     description: UID- and generation-fenced identity of the bound `ClusterInstance`.
                     properties:
@@ -784,13 +1146,10 @@ spec:
                   `kubectl` and ops tooling a familiar, machine-readable surface for
                   *why* the instance is where it is.
 
-                  `skip_serializing_if = "Vec::is_empty"` protects the list from
-                  cross-controller Merge-Patch erasure, same pattern as `spec_hash`:
-                  the profile controller (a separate status writer) re-emits status
-                  without conditions of its own, so an empty `Vec` must be omitted
-                  from the JSON entirely — otherwise a JSON Merge Patch carrying
-                  `"conditions": []` would replace the on-disk list with an empty
-                  one (RFC 7396 / array-replacement).
+                  The profile controller copies existing conditions when it has no new
+                  list, and the instance controller derives them centrally. Omitting an
+                  empty list remains wire-compatible with older merge-patch writers, where
+                  `"conditions": []` would erase the on-disk array.
                 items:
                   description: |-
                     One status condition on a `ClusterInstance`. Mirrors the core/v1
@@ -846,13 +1205,10 @@ spec:
                   treat the absence as "unknown / pre-provenance" and decide
                   per-policy whether to migrate or leave alone.
 
-                  `skip_serializing_if = "Option::is_none"` is critical here, same
-                  pattern as `spec_hash` above: every status patch from the
-                  instance controller constructs a fresh `ClusterInstanceStatus`
-                  where this field defaults to `None`. Without `skip_serializing_if`,
-                  the JSON Merge Patch would carry `"createdWith": null` and wipe
-                  the on-disk value (RFC 7396). Skipping the field on `None`
-                  preserves the original write through every subsequent patch.
+                  Current status writers explicitly copy this value from a fresh,
+                  UID/resourceVersion-fenced read before replacing status. The
+                  `skip_serializing_if` shape is retained for older merge-patch writers so
+                  `None` cannot serialize as a destructive RFC 7396 `null`.
                 nullable: true
                 properties:
                   backend:
@@ -960,6 +1316,7 @@ spec:
                       - kubeconfigSecret
                       - cidrClaim
                       - connectTokenSecret
+                      - datastoreCredentialSecret
                       - serverDataPvcs
                       - serverDataVolumes
                       - database
@@ -969,6 +1326,314 @@ spec:
                     type: array
                 required:
                 - operatorVersion
+                type: object
+              creationManifest:
+                description: |-
+                  Immutable controller-authenticated inventory of the exact k3s footprint.
+
+                  Written once after provisioning, while concrete UIDs, PostgreSQL OIDs,
+                  bound PVs, and the live StorageClass reclaim policy are observable. The
+                  CRD rejects changing or removing it afterwards. Verified teardown must
+                  fail closed while this is absent or invalid; it must never reconstruct a
+                  smaller manifest from teardown-time observations.
+                nullable: true
+                properties:
+                  agentReplicas:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  backendType:
+                    description: Which backend to use for cluster provisioning.
+                    enum:
+                    - k3s
+                    - k0s
+                    - capi
+                    - vkobe
+                    - vcluster
+                    type: string
+                  clusterCidr:
+                    type: string
+                  configDigest:
+                    type: string
+                  datastore:
+                    properties:
+                      database:
+                        nullable: true
+                        type: string
+                      databaseOid:
+                        nullable: true
+                        type: string
+                      endpointDigest:
+                        description: SHA-256 of the non-secret connection location (scheme, host and port).
+                        nullable: true
+                        type: string
+                      mode:
+                        description: |-
+                          Structural OpenAPI projection of [`DatastoreProvenance`]. Kubernetes CRDs
+                          cannot express the tagged enum's two different `mode` constants in a single
+                          structural property, so the schema keeps the fields optional and the
+                          controller's [`TeardownCreationManifest::validate`] enforces the exact
+                          mode-specific contract before the manifest is trusted.
+                        enum:
+                        - embeddedSqlite
+                        - externalPostgres
+                        type: string
+                      role:
+                        nullable: true
+                        type: string
+                      roleOid:
+                        nullable: true
+                        type: string
+                      systemIdentifier:
+                        description: Live `pg_control_system().system_identifier` of the PostgreSQL cluster.
+                        nullable: true
+                        type: string
+                    required:
+                    - mode
+                    type: object
+                  instance:
+                    description: Reference to another Kobe-managed resource in the same namespace.
+                    properties:
+                      name:
+                        description: |-
+                          Resource name. Names are display and lookup handles, never sufficient
+                          authority on their own because Kubernetes permits name reuse.
+                        type: string
+                      uid:
+                        description: |-
+                          Kubernetes UID of the referenced object. New controller-written
+                          references always set this. `None` is accepted only so pre-UID-fence
+                          objects remain readable; security-sensitive consumers must fail closed
+                          or run the proof-based legacy migration before using the reference.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  namespace:
+                    type: string
+                  resources:
+                    items:
+                      description: |-
+                        One concrete Kubernetes resource created for the instance.
+
+                        Repeating the same subject is intentional: it records multiplicity (for
+                        example every server Pod and every PVC/PV) without weakening identity into a
+                        selector or wildcard.
+                      properties:
+                        controlRelation:
+                          description: How the live object proves the controller relationship.
+                          enum:
+                          - controllerOwner
+                          - instanceUidLabel
+                          - claimRef
+                          type: string
+                        controller:
+                          description: Exact identity that controlled creation of this object.
+                          properties:
+                            apiVersion:
+                              type: string
+                            kind:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              nullable: true
+                              type: string
+                            uid:
+                              type: string
+                          required:
+                          - apiVersion
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                        resource:
+                          description: |-
+                            Exact identity of one Kubernetes object in a creation manifest.
+
+                            Names are not identities: Kubernetes permits delete-and-recreate under the
+                            same name. A UID is therefore mandatory for every recorded object, and a
+                            receipt must account for the canonical identity rather than only its kind or
+                            display name.
+                          properties:
+                            apiVersion:
+                              type: string
+                            kind:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              nullable: true
+                              type: string
+                            uid:
+                              type: string
+                          required:
+                          - apiVersion
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                        subject:
+                          description: |-
+                            One thing whose absence must be proven.
+
+                            Enumerated rather than free-text so a receipt cannot be satisfied by an
+                            unrecognised or invented subject, and so adding a resource to the teardown
+                            path is a deliberate, reviewable change to this list.
+                          enum:
+                          - agentDeployment
+                          - serverStatefulSet
+                          - serverPods
+                          - service
+                          - podDisruptionBudget
+                          - publisherConfigMap
+                          - registriesConfigMap
+                          - tokenSecret
+                          - kubeconfigSecret
+                          - cidrClaim
+                          - connectTokenSecret
+                          - datastoreCredentialSecret
+                          - serverDataPvcs
+                          - serverDataVolumes
+                          - database
+                          - databaseRole
+                          type: string
+                      required:
+                      - controlRelation
+                      - controller
+                      - resource
+                      - subject
+                      type: object
+                    type: array
+                  schemaVersion:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  sealedAt:
+                    type: string
+                  serverReplicas:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  serviceCidr:
+                    type: string
+                  storage:
+                    items:
+                      description: |-
+                        Live dynamic-storage facts captured while the PVC and PV are both bound.
+
+                        The StorageClass is referenced by exact UID and its reclaim policy is copied
+                        from the live object. A configured class name, a later lookup, or a boolean
+                        assertion is not enough to prove that deleting the claim destroys its data.
+                      properties:
+                        pv:
+                          description: |-
+                            Exact identity of one Kubernetes object in a creation manifest.
+
+                            Names are not identities: Kubernetes permits delete-and-recreate under the
+                            same name. A UID is therefore mandatory for every recorded object, and a
+                            receipt must account for the canonical identity rather than only its kind or
+                            display name.
+                          properties:
+                            apiVersion:
+                              type: string
+                            kind:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              nullable: true
+                              type: string
+                            uid:
+                              type: string
+                          required:
+                          - apiVersion
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                        pvReclaimPolicy:
+                          description: |-
+                            `PersistentVolume.spec.persistentVolumeReclaimPolicy` observed from the
+                            bound PV. The PV is the final authority for what happens to its data.
+                          type: string
+                        pvc:
+                          description: |-
+                            Exact identity of one Kubernetes object in a creation manifest.
+
+                            Names are not identities: Kubernetes permits delete-and-recreate under the
+                            same name. A UID is therefore mandatory for every recorded object, and a
+                            receipt must account for the canonical identity rather than only its kind or
+                            display name.
+                          properties:
+                            apiVersion:
+                              type: string
+                            kind:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              nullable: true
+                              type: string
+                            uid:
+                              type: string
+                          required:
+                          - apiVersion
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                        reclaimPolicy:
+                          description: '`StorageClass.reclaimPolicy` observed from the live class.'
+                          type: string
+                        storageClass:
+                          description: |-
+                            Exact identity of one Kubernetes object in a creation manifest.
+
+                            Names are not identities: Kubernetes permits delete-and-recreate under the
+                            same name. A UID is therefore mandatory for every recorded object, and a
+                            receipt must account for the canonical identity rather than only its kind or
+                            display name.
+                          properties:
+                            apiVersion:
+                              type: string
+                            kind:
+                              type: string
+                            name:
+                              type: string
+                            namespace:
+                              nullable: true
+                              type: string
+                            uid:
+                              type: string
+                          required:
+                          - apiVersion
+                          - kind
+                          - name
+                          - uid
+                          type: object
+                      required:
+                      - pv
+                      - pvReclaimPolicy
+                      - pvc
+                      - reclaimPolicy
+                      - storageClass
+                      type: object
+                    type: array
+                required:
+                - agentReplicas
+                - backendType
+                - clusterCidr
+                - configDigest
+                - datastore
+                - instance
+                - namespace
+                - resources
+                - schemaVersion
+                - sealedAt
+                - serverReplicas
+                - serviceCidr
                 type: object
               healthFailures:
                 default: 0
@@ -993,11 +1658,11 @@ spec:
                   Lease currently attached to this instance.
 
                   Intentionally NO `skip_serializing_if`: unlike the write-once
-                  `spec_hash`/`created_with` fields, `lease_ref` is *actively managed*.
-                  It is set at bind, retained through release/recycling as a teardown
-                  handle, and cleared only when an exact orphan reservation is safely
-                  returned to Ready. `None` is therefore a meaningful clear signal and
-                  must serialize as `null` rather than be omitted.
+                  `spec_hash`/`created_with` fields, `lease_ref` is *actively managed* for
+                  Standard bindings. A `VerifiedDestroy` reference is write-once and is
+                  retained through release/recycling as a teardown handle. `None` remains
+                  a meaningful clear signal for Standard and legacy cleanup, so it must
+                  serialize as `null` rather than be omitted.
                 nullable: true
                 properties:
                   name:
@@ -1025,12 +1690,9 @@ spec:
                   so it always describes the most recent transition rather than a
                   stale value.
 
-                  `skip_serializing_if = "Option::is_none"` protects it from
-                  cross-controller Merge-Patch erasure, same pattern as `spec_hash`:
-                  a writer that leaves this `None` (e.g. the profile controller, or
-                  a "ready / no message" instance-controller path) must omit the key
-                  entirely, otherwise a JSON Merge Patch carrying `"message": null`
-                  would wipe the on-disk value (RFC 7396).
+                  Current full-status writers copy the observed message when their local
+                  value is `None`; `skip_serializing_if` also protects compatibility with
+                  older merge-patch writers by omitting a destructive RFC 7396 `null`.
                 nullable: true
                 type: string
               network:
@@ -1087,16 +1749,11 @@ spec:
                   `pool::profile_spec_hash` for the encoding (`{:016x}` of a `u64`).
                   Equality comparison works directly via `==` on the string form.
 
-                  `skip_serializing_if` is critical: this field is owned by the profile
-                  controller (which writes `Some(...)` once at create time and on
-                  subsequent reconciles), but the instance controller carries it through
-                  every status patch via `spec_hash: status.spec_hash`. If the instance
-                  controller's `status` read happens before the profile controller's
-                  write, it holds `None` locally — and a JSON Merge Patch carrying
-                  `"specHash": null` would *remove* the field from disk per RFC 7396.
-                  Skipping serialization on `None` makes the field absent from the JSON
-                  instead, which JSON Merge Patch interprets as "preserve on-disk
-                  value" — closing the race regardless of which controller wins.
+                  The instance and profile controllers replace status only after a fresh
+                  read and copy this field forward under UID/resourceVersion tests.
+                  `skip_serializing_if` remains part of the wire-compatibility contract for
+                  older merge-patch writers: `None` is omitted rather than encoded as a
+                  destructive RFC 7396 `null`.
                 nullable: true
                 type: string
               stateSince:
@@ -1126,8 +1783,17 @@ spec:
             type: object
         required:
         - spec
-        title: ClusterInstance
+        title: ClusterInstanceValidated
         type: object
+        x-kubernetes-validations:
+        - message: status.creationManifest is immutable once sealed
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.creationManifest) || (has(self.status) && self.status != null && has(self.status.creationManifest) && self.status.creationManifest == oldSelf.status.creationManifest)'
+        - message: VerifiedDestroy instance binding must carry complete UID/generation-fenced reciprocal lease, instance, pool, backend, and creation provenance
+          rule: '!has(self.status) || self.status == null || !has(self.status.binding) || self.status.binding.cleanupMode != ''VerifiedDestroy'' || (self.status.binding.bindingId.size() > 0 && self.metadata.name == self.status.binding.instance.name && self.status.binding.instance.uid.size() > 0 && self.status.binding.instance.observedGeneration > 0 && has(self.status.binding.lease.uid) && self.status.binding.lease.uid.size() > 0 && has(self.status.binding.pool.uid) && self.status.binding.pool.uid.size() > 0 && self.status.binding.backend.configDigest.size() > 0 && self.status.binding.instanceSpecDigest.size() > 0 && has(self.status.binding.creationManifestDigest) && self.status.binding.creationManifestDigest.size() > 0 && has(self.status.binding.creationManifest) && has(self.spec.poolRef) && self.spec.poolRef.name == self.status.binding.pool.name && has(self.spec.poolRef.uid) && self.spec.poolRef.uid == self.status.binding.pool.uid && has(self.status.leaseRef) && self.status.leaseRef.name == self.status.binding.lease.name && has(self.status.leaseRef.uid) && self.status.leaseRef.uid == self.status.binding.lease.uid)'
+        - message: VerifiedDestroy instance binding is immutable once reserved
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != ''VerifiedDestroy'' || (has(self.status) && self.status != null && has(self.status.binding) && self.status.binding == oldSelf.status.binding)'
+        - message: VerifiedDestroy instance leaseRef is immutable once reserved
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.binding) || oldSelf.status.binding.cleanupMode != ''VerifiedDestroy'' || !has(oldSelf.status.leaseRef) || (has(self.status) && self.status != null && has(self.status.leaseRef) && self.status.leaseRef == oldSelf.status.leaseRef)'
     served: true
     storage: true
     subresources:

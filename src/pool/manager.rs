@@ -1112,6 +1112,13 @@ pub fn compute_pool_phase(
         return ClusterPoolPhase::Failing;
     }
 
+    // Quarantine is a pool-level health condition, not ordinary churn. Even a
+    // pool with other Ready/Leased members must not present as Healthy while it
+    // is retaining capacity whose teardown could not be proven.
+    if counts.quarantined > 0 {
+        return ClusterPoolPhase::Quarantined;
+    }
+
     // Active backoff window: waiting for retry.
     if consecutive_failures > 0
         && let Some(ts) = next_attempt_at
@@ -3400,10 +3407,10 @@ mod tests {
             quarantined: 1,
             ..Default::default()
         };
-        assert_ne!(
+        assert_eq!(
             compute_pool_phase(&profile, &holding, 0, None, chrono::Utc::now()),
-            crate::crd::ClusterPoolPhase::Idle,
-            "a pool holding unreclaimed capacity must not read as empty"
+            crate::crd::ClusterPoolPhase::Quarantined,
+            "Healthy/Idle must never coexist with unreclaimed capacity"
         );
     }
 

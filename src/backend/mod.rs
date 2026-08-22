@@ -24,7 +24,25 @@ use crate::crd::{
     Addon, BackendType, BootstrapConfig, BootstrapJobSpec, BootstrapRef, ClusterConfig,
     ClusterPool, InterInstanceSpread, PersistenceConfig, ReadinessGate, SpreadStrength,
 };
-use crate::crd::{TeardownCheck, TeardownSubject};
+use crate::crd::{
+    CreationManifestResource, DatastoreProvenance, StorageVolumeProvenance, TeardownCheck,
+    TeardownCreationManifest, TeardownSubject,
+};
+
+/// Backend-observed portion of a sealed creation manifest.
+///
+/// The controller adds its own instance UID, immutable backend digest, network
+/// allocation, and seal timestamp. `None` from a backend means the backend does
+/// not implement verified teardown; an error means the live footprint could not
+/// be observed completely and must not be guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCreationFootprint {
+    pub server_replicas: u32,
+    pub agent_replicas: u32,
+    pub resources: Vec<CreationManifestResource>,
+    pub storage: Vec<StorageVolumeProvenance>,
+    pub datastore: DatastoreProvenance,
+}
 
 /// Fetch, or create once, the per-cluster PostgreSQL password.
 ///
@@ -47,12 +65,20 @@ pub(crate) async fn ensure_datastore_password(
     name: &str,
     namespace: &str,
     labels: BTreeMap<String, String>,
+    owner: Option<&OwnerReference>,
 ) -> Result<String> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret_name = format!("{name}-datastore");
 
-    if let Some(existing) = read_datastore_password(&secrets, &secret_name).await? {
-        return Ok(existing);
+    match secrets.get(&secret_name).await {
+        Ok(existing) => {
+            if let Some(owner) = owner {
+                require_exact_owner(&existing.metadata, owner)?;
+            }
+            return datastore_password_from_secret(&existing, &secret_name);
+        }
+        Err(kube::Error::Api(response)) if response.code == 404 => {}
+        Err(error) => return Err(error).context("Failed to read datastore password Secret"),
     }
 
     let password = {
@@ -62,13 +88,21 @@ pub(crate) async fn ensure_datastore_password(
         hex::encode(bytes)
     };
 
+    let mut metadata = ObjectMeta {
+        name: Some(secret_name.clone()),
+        namespace: Some(namespace.to_string()),
+        labels: Some(labels),
+        ..Default::default()
+    };
+    if let Some(owner) = owner {
+        metadata.owner_references = Some(vec![owner.clone()]);
+        metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("kobe.kunobi.ninja/instance-uid".into(), owner.uid.clone());
+    }
     let secret = Secret {
-        metadata: ObjectMeta {
-            name: Some(secret_name.clone()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
+        metadata,
         string_data: Some({
             let mut data = BTreeMap::new();
             data.insert("password".to_string(), password.clone());
@@ -82,37 +116,47 @@ pub(crate) async fn ensure_datastore_password(
         Err(kube::Error::Api(ae)) if ae.code == 409 => {
             // Lost the race. The other writer's password is the one the role
             // will be created with, so adopt it rather than overwriting.
-            read_datastore_password(&secrets, &secret_name)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Secret {secret_name} vanished after a 409"))
+            let existing = secrets
+                .get(&secret_name)
+                .await
+                .with_context(|| format!("Secret {secret_name} vanished after a 409"))?;
+            if let Some(owner) = owner {
+                require_exact_owner(&existing.metadata, owner)?;
+            }
+            datastore_password_from_secret(&existing, &secret_name)
         }
         Err(e) => Err(e).with_context(|| format!("Failed to create Secret {secret_name}")),
     }
 }
 
-async fn read_datastore_password(
-    secrets: &Api<Secret>,
-    secret_name: &str,
-) -> Result<Option<String>> {
-    match secrets.get(secret_name).await {
-        Ok(existing) => {
-            let raw = existing
-                .data
-                .as_ref()
-                .and_then(|d| d.get("password"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Secret {secret_name} exists but has no `password` key")
-                })?;
-            let pw = String::from_utf8(raw.0.clone())
-                .with_context(|| format!("Secret {secret_name} password is not valid UTF-8"))?;
-            if pw.is_empty() {
-                anyhow::bail!("Secret {secret_name} has an empty password");
-            }
-            Ok(Some(pw))
-        }
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("Failed to read Secret {secret_name}")),
+fn require_exact_owner(metadata: &ObjectMeta, expected: &OwnerReference) -> Result<()> {
+    if metadata.owner_references.as_ref().is_some_and(|owners| {
+        owners.iter().any(|owner| {
+            owner.api_version == expected.api_version
+                && owner.kind == expected.kind
+                && owner.name == expected.name
+                && owner.uid == expected.uid
+                && owner.controller == Some(true)
+        })
+    }) {
+        Ok(())
+    } else {
+        anyhow::bail!("pre-existing Secret is not owned by the exact ClusterInstance UID")
     }
+}
+
+fn datastore_password_from_secret(secret: &Secret, secret_name: &str) -> Result<String> {
+    let raw = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("password"))
+        .ok_or_else(|| anyhow::anyhow!("Secret {secret_name} exists but has no `password` key"))?;
+    let password = String::from_utf8(raw.0.clone())
+        .with_context(|| format!("Secret {secret_name} password is not valid UTF-8"))?;
+    if password.is_empty() {
+        anyhow::bail!("Secret {secret_name} has an empty password");
+    }
+    Ok(password)
 }
 
 pub use capi::CapiBackend;
@@ -326,6 +370,152 @@ impl ClusterBackend for BackendDispatch {
             Self::Capi(b) => b.delete(name, namespace).await,
             Self::Vkobe(b) => b.delete(name, namespace).await,
             Self::Vcluster(b) => b.delete(name, namespace).await,
+        }
+    }
+
+    async fn delete_verified(
+        &self,
+        name: &str,
+        namespace: &str,
+        plan: &[TeardownSubject],
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        match self {
+            Self::K3s(b) => b.delete_verified(name, namespace, plan).await,
+            Self::K0s(b) => b.delete_verified(name, namespace, plan).await,
+            Self::Capi(b) => b.delete_verified(name, namespace, plan).await,
+            Self::Vkobe(b) => b.delete_verified(name, namespace, plan).await,
+            Self::Vcluster(b) => b.delete_verified(name, namespace, plan).await,
+        }
+    }
+
+    async fn delete_verified_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        match self {
+            Self::K3s(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.delete_verified_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+        }
+    }
+
+    async fn verify_absent_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> std::result::Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported> {
+        match self {
+            Self::K3s(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.verify_absent_manifest(name, namespace, manifest, attempt_id)
+                    .await
+            }
+        }
+    }
+
+    async fn capture_teardown_identities(
+        &self,
+        name: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>> {
+        match self {
+            Self::K3s(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::K0s(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::Capi(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::Vkobe(b) => b.capture_teardown_identities(name, namespace).await,
+            Self::Vcluster(b) => b.capture_teardown_identities(name, namespace).await,
+        }
+    }
+
+    async fn capture_creation_footprint(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> Result<Option<BackendCreationFootprint>> {
+        match self {
+            Self::K3s(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::K0s(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::Capi(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::Vkobe(b) => b.capture_creation_footprint(name, namespace, config).await,
+            Self::Vcluster(b) => b.capture_creation_footprint(name, namespace, config).await,
+        }
+    }
+
+    async fn validate_creation_manifest_for_bind(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> Result<()> {
+        match self {
+            Self::K3s(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::K0s(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::Capi(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::Vkobe(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+            Self::Vcluster(b) => {
+                b.validate_creation_manifest_for_bind(name, namespace, manifest)
+                    .await
+            }
+        }
+    }
+
+    fn supports_verified_destroy(&self) -> bool {
+        match self {
+            Self::K3s(b) => b.supports_verified_destroy(),
+            Self::K0s(b) => b.supports_verified_destroy(),
+            Self::Capi(b) => b.supports_verified_destroy(),
+            Self::Vkobe(b) => b.supports_verified_destroy(),
+            Self::Vcluster(b) => b.supports_verified_destroy(),
         }
     }
 
@@ -640,6 +830,42 @@ pub trait ClusterBackend: Send + Sync {
         async { Err(VerifiedDestroyUnsupported) }
     }
 
+    /// Verified teardown against the immutable concrete creation manifest.
+    /// Backends must not derive scope from teardown-time observations. The
+    /// `attempt_id` was persisted before the first destructive side effect and
+    /// must remain unchanged across retries; backends use it for deterministic
+    /// crash-safe tombstones and attempt-bound external evidence.
+    #[allow(dead_code)]
+    fn delete_verified_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
+    {
+        let _ = (name, namespace, manifest, attempt_id);
+        async { Err(VerifiedDestroyUnsupported) }
+    }
+
+    /// Re-observe the immutable manifest after a separate lifecycle controller
+    /// has issued deletion. This method is strictly read-only and is the trust
+    /// boundary used by the isolated receipt authority. `attempt_id` is the
+    /// immutable receipt attempt persisted before deletion, so external
+    /// evidence cannot be replayed from another teardown attempt.
+    #[allow(dead_code)]
+    fn verify_absent_manifest(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+        attempt_id: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<TeardownCheck>, VerifiedDestroyUnsupported>> + Send
+    {
+        let _ = (name, namespace, manifest, attempt_id);
+        async { Err(VerifiedDestroyUnsupported) }
+    }
+
     /// Capture the provisioner-assigned resource identities this instance owns.
     ///
     /// Called while the instance is healthy, NOT at teardown. Bound
@@ -659,6 +885,38 @@ pub trait ClusterBackend: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send {
         let _ = (name, namespace);
         async { Ok(Vec::new()) }
+    }
+
+    /// Capture the complete concrete creation footprint while it is live.
+    ///
+    /// A backend that cannot implement this returns `Ok(None)`. A backend that
+    /// can implement it must return an error on any missing UID, failed live
+    /// lookup, unbound volume, or otherwise uncertain fact; callers leave the
+    /// manifest absent and verified-destroy placement remains ineligible.
+    #[allow(dead_code)]
+    fn capture_creation_footprint(
+        &self,
+        name: &str,
+        namespace: &str,
+        config: &ClusterConfig,
+    ) -> impl std::future::Future<Output = Result<Option<BackendCreationFootprint>>> + Send {
+        let _ = (name, namespace, config);
+        async { Ok(None) }
+    }
+
+    /// Revalidate a sealed manifest immediately before a VerifiedDestroy bind.
+    /// A live lookup failure, UID/spec drift, lost datastore, or changed storage
+    /// policy must reject placement rather than create a lease already doomed
+    /// to quarantine.
+    #[allow(dead_code)]
+    fn validate_creation_manifest_for_bind(
+        &self,
+        name: &str,
+        namespace: &str,
+        manifest: &TeardownCreationManifest,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let _ = (name, namespace, manifest);
+        async { anyhow::bail!("backend cannot validate a verified-destroy manifest") }
     }
 
     /// Whether this backend can produce teardown evidence at all.
@@ -780,20 +1038,37 @@ pub trait ClusterBackend: Send + Sync {
 // backends. Each backend delegates to these rather than duplicating the logic.
 // ---------------------------------------------------------------------------
 
-/// Read the `{name}-kubeconfig` Secret from the host cluster.
-pub async fn read_kubeconfig_secret(
-    client: &Client,
-    name: &str,
-    namespace: &str,
-) -> Result<String> {
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret_name = format!("{name}-kubeconfig");
+/// Deterministic management-cluster Secret published for one instance.
+pub fn kubeconfig_secret_name(name: &str) -> String {
+    format!("{name}-kubeconfig")
+}
 
-    let secret = secrets
-        .get(&secret_name)
-        .await
-        .with_context(|| format!("Kubeconfig secret {secret_name} not found"))?;
+/// Extract the one canonical kubeconfig payload used by Sandbox composition.
+///
+/// The durable provenance digest commits to both this key contract and its
+/// bytes. Alternative or additional data keys are rejected so a later reader
+/// cannot select a different credential interpretation from the same Secret.
+pub fn checkpointed_kubeconfig_payload(secret: &Secret) -> Result<Vec<u8>> {
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Kubeconfig secret has no data"))?;
+    if data.len() != 1 || !data.contains_key("kubeconfig") {
+        anyhow::bail!("Kubeconfig secret must contain only the 'kubeconfig' key");
+    }
+    let kubeconfig_bytes = data
+        .get("kubeconfig")
+        .expect("the exact key was checked above");
+    Ok(kubeconfig_bytes.0.clone())
+}
 
+/// Extract kubeconfig bytes from an already identity-checked Secret.
+///
+/// Teardown callers first compare the Secret's exact UID against durable
+/// provenance and then pass that same GET response here. Keeping extraction
+/// separate from lookup prevents a second, unfenced GET from substituting a
+/// same-named credential between identity validation and use.
+pub fn kubeconfig_from_secret(secret: &Secret) -> Result<String> {
     let data = secret
         .data
         .as_ref()
@@ -804,8 +1079,24 @@ pub async fn read_kubeconfig_secret(
         .or_else(|| data.get("value"))
         .ok_or_else(|| anyhow::anyhow!("Kubeconfig secret has no 'kubeconfig' or 'value' key"))?;
 
-    let kubeconfig =
-        String::from_utf8(kubeconfig_bytes.0.clone()).context("Kubeconfig is not valid UTF-8")?;
+    String::from_utf8(kubeconfig_bytes.0.clone()).context("Kubeconfig is not valid UTF-8")
+}
+
+/// Read the `{name}-kubeconfig` Secret from the host cluster.
+pub async fn read_kubeconfig_secret(
+    client: &Client,
+    name: &str,
+    namespace: &str,
+) -> Result<String> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret_name = kubeconfig_secret_name(name);
+
+    let secret = secrets
+        .get(&secret_name)
+        .await
+        .with_context(|| format!("Kubeconfig secret {secret_name} not found"))?;
+
+    let kubeconfig = kubeconfig_from_secret(&secret)?;
 
     debug!(
         cluster = name,
@@ -816,8 +1107,12 @@ pub async fn read_kubeconfig_secret(
     Ok(kubeconfig)
 }
 
-/// Build a `kube::Client` targeting a virtual cluster from its kubeconfig YAML.
-pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Client> {
+/// Build a `kube::Config` targeting a virtual cluster from its kubeconfig YAML.
+///
+/// Separated from the client so a caller that must *re-authenticate* against
+/// the same cluster — #81 mints a per-lease token and needs the endpoint and
+/// trust anchors without the admin identity — can do so without re-parsing.
+pub async fn virtual_config_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Config> {
     let kubeconfig = kube::config::Kubeconfig::from_yaml(kubeconfig_yaml)?;
     let mut config = Config::from_custom_kubeconfig(kubeconfig, &Default::default())
         .await
@@ -825,6 +1120,12 @@ pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Cli
     // Virtual clusters use self-signed CAs; we trust them because we created them
     // and we're connecting cluster-internal (pod-to-service DNS).
     config.accept_invalid_certs = true;
+    Ok(config)
+}
+
+/// Build a `kube::Client` targeting a virtual cluster from its kubeconfig YAML.
+pub async fn virtual_client_from_kubeconfig(kubeconfig_yaml: &str) -> Result<Client> {
+    let config = virtual_config_from_kubeconfig(kubeconfig_yaml).await?;
     Client::try_from(config).context("Failed to create client from kubeconfig")
 }
 
@@ -1592,6 +1893,21 @@ mod tests {
             outcome,
             Err(VerifiedDestroyUnsupported),
             "an unimplemented backend must not return an empty (clean-looking) check list"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_dispatch_preserves_k3s_verified_destroy_capability() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let backend = BackendDispatch::K3s(k3s::K3sBackend::new(
+            client,
+            datastore::SharedDatastore::default(),
+        ));
+        assert!(
+            backend.supports_verified_destroy(),
+            "factory callers hold BackendDispatch, so delegation is load-bearing"
         );
     }
 

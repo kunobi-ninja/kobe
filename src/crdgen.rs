@@ -19,6 +19,10 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::ClusterInstance::crd()).unwrap()
         ),
+        "verifiedteardownevidence" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::VerifiedTeardownEvidence::crd()).unwrap()
+        ),
         "accesspolicies" => print!(
             "{}",
             serde_yaml_ng::to_string(&crd::AccessPolicy::crd()).unwrap()
@@ -47,6 +51,10 @@ fn main() {
             "{}",
             serde_yaml_ng::to_string(&crd::SandboxLease::crd()).unwrap()
         ),
+        "sandboxexecutions" => print!(
+            "{}",
+            serde_yaml_ng::to_string(&crd::SandboxExecution::crd()).unwrap()
+        ),
         _ => {
             print!(
                 "{}",
@@ -61,6 +69,11 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::ClusterInstance::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::VerifiedTeardownEvidence::crd()).unwrap()
             );
             println!("---");
             print!(
@@ -96,6 +109,11 @@ fn main() {
             print!(
                 "{}",
                 serde_yaml_ng::to_string(&crd::SandboxLease::crd()).unwrap()
+            );
+            println!("---");
+            print!(
+                "{}",
+                serde_yaml_ng::to_string(&crd::SandboxExecution::crd()).unwrap()
             );
         }
     }

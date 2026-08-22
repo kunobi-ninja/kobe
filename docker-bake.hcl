@@ -35,6 +35,12 @@ variable "LOCAL_CACHE_ROOT" {
   default = ".tmp/buildx-cache"
 }
 
+# Exact local-registry reference selected by hack/e2e.ts. The fallback is only
+# a harmless local tag; this target is absent from every normal/publish group.
+variable "SANDBOX_E2E_IMAGE" {
+  default = "kobe-sandbox-e2e:local"
+}
+
 # Generate the tag array. Each tag means exactly ONE thing:
 #
 #   dev        moving; head of main (the `IMAGE_TAG` slot — also how a local
@@ -70,11 +76,11 @@ function "tags" {
 # Groups
 # =============================================================================
 group "default" {
-  targets = ["operator", "kobe-sync"]
+  targets = ["operator", "kobe-sync", "runner"]
 }
 
 group "push" {
-  targets = ["operator-push", "kobe-sync-push"]
+  targets = ["operator-push", "kobe-sync-push", "runner-push"]
 }
 
 # =============================================================================
@@ -151,4 +157,51 @@ target "kobe-sync-push" {
   inherits = ["kobe-sync"]
   output   = ["type=registry"]
   # cache-to = ["type=registry,ref=${REGISTRY}/kobe-sync:buildcache,mode=max"]
+}
+
+# =============================================================================
+# kobe-runner image
+#
+# Deliberately NOT built from the shared `builder` context. The runner ships
+# inside an administrator's Sandbox image, so it is compiled statically against
+# musl with only its own (tiny) dependency tree — reusing the operator's
+# builder would both waste the whole kube/aws/sqlx compile and let the thing
+# that runs next to a tenant's workload inherit an operator dependency.
+# =============================================================================
+target "runner" {
+  dockerfile = "docker/runner.Dockerfile"
+  context    = "."
+  platforms  = [PLATFORM]
+  tags       = tags("kobe-runner")
+  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/runner"]
+  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/runner,mode=max"]
+  args = {
+    BUILD_VERSION = BUILD_VERSION
+    BUILD_COMMIT  = BUILD_COMMIT
+    BUILD_DATE    = BUILD_DATE
+  }
+}
+
+target "runner-push" {
+  inherits = ["runner"]
+  output   = ["type=registry"]
+}
+
+# =============================================================================
+# Sandbox conformance fixture
+#
+# Deliberately absent from both `default` and `push`: this combines the static
+# runner with a tiny shell userspace solely for live conformance. The harness
+# names an ephemeral local registry explicitly and builds this target itself.
+# =============================================================================
+target "sandbox-e2e" {
+  dockerfile = "docker/sandbox-e2e.Dockerfile"
+  context    = "."
+  contexts = {
+    runner = "target:runner"
+  }
+  platforms = [PLATFORM]
+  tags       = [SANDBOX_E2E_IMAGE]
+  cache-from = ["type=local,src=${LOCAL_CACHE_ROOT}/sandbox-e2e"]
+  cache-to   = ["type=local,dest=${LOCAL_CACHE_ROOT}/sandbox-e2e,mode=max"]
 }

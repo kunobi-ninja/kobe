@@ -10,20 +10,317 @@
 //! **SQL injection safety**: database names cannot be parameterized in DDL
 //! statements. We enforce a strict allowlist (`[a-zA-Z0-9_]`) and wrap names
 //! in double quotes.
+//!
+//! **Coordination boundary**: every administrative/DDL connection is pinned to
+//! the `postgres` database on one authoritative writable primary. PostgreSQL
+//! advisory locks are database- and physical-session-local; they are not WAL
+//! replicated. A load balancer that can route to a replica or another primary,
+//! or PgBouncer transaction/statement pooling that swaps the server session,
+//! breaks the coordination invariant. Direct connections and session pooling
+//! are supported. The `postgres` database must exist and accept the configured
+//! administrator credential or initial connection/reload fails closed.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use kunobi_reload::{BoxError, FromMount, Mount, ReloadStatus, Reloadable, watch};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Postgres, pool::PoolConnection};
 use tracing::{debug, info, warn};
+
+use sha2::{Digest, Sha256};
 
 /// Maximum length for a PostgreSQL identifier (63 bytes).
 const MAX_IDENT_LEN: usize = 63;
 
-/// One live PostgreSQL connection: the pool plus the base URL it was built from
-/// (the URL carries the current credential, and per-cluster endpoints are
-/// derived from it).
+/// Fixed coordination database for every administrative and DDL session.
+const ADMIN_DATABASE_PATH: &str = "/postgres";
+
+/// Rewrite only the database selected by the configured administrator DSN.
+///
+/// User, password, host, port, TLS/query options, and the original child-base
+/// URL are preserved. Pinning all pools here is required because PostgreSQL
+/// advisory-lock namespaces include the current database: two otherwise
+/// identical DSNs selecting different paths would not coordinate.
+fn admin_connection_url(base_url: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(base_url).context("Invalid PostgreSQL datastore URL")?;
+    parsed.set_path(ADMIN_DATABASE_PATH);
+    Ok(parsed.to_string())
+}
+
+/// Versioned domain for the application-level PostgreSQL lifecycle fence.
+///
+/// PostgreSQL advisory locks are voluntary: they serialize kobe's own DDL but
+/// cannot constrain an uncooperative superuser or provider control plane. The
+/// lock and exact catalog reads are necessary but not sufficient for verified
+/// destruction: the external-datastore placement gate remains closed until the
+/// OID/attempt-bound rename and DROP state machine is implemented explicitly.
+const LIFECYCLE_LOCK_DOMAIN: &[u8] = b"kobe-postgres-lifecycle-v1\0";
+
+/// Exact immutable PostgreSQL identities captured in a creation manifest.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedPostgresIdentity<'a> {
+    pub system_identifier: &'a str,
+    pub database: &'a str,
+    pub database_oid: &'a str,
+    pub role: &'a str,
+    pub role_oid: &'a str,
+}
+
+/// Independent post-destroy observation made while holding the lifecycle
+/// advisory lock. `true` requires the recorded OID, original name, and the
+/// deterministic attempt tombstone all to be absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedPostgresAbsence {
+    pub database: bool,
+    pub role: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresObjectKind {
+    Database,
+    Role,
+}
+
+impl PostgresObjectKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Database => "db",
+            Self::Role => "role",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogObject {
+    oid: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactCatalogState {
+    Absent,
+    Original,
+    Tombstone,
+    Mismatch,
+}
+
+/// Stable signed 64-bit key used by every kobe DDL path for one canonical
+/// database name. A digest avoids PostgreSQL's process-randomized client hash
+/// functions and keeps creation and teardown interoperable across restarts.
+fn lifecycle_lock_key(database: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(LIFECYCLE_LOCK_DOMAIN);
+    hasher.update(database.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes)
+}
+
+/// Deterministic, identifier-safe tombstone bound to an immutable OID and the
+/// durable teardown attempt. Retrying after a commit/lost-response uses the
+/// same name and resumes from catalog state instead of guessing.
+fn teardown_tombstone(
+    kind: PostgresObjectKind,
+    expected_oid: &str,
+    attempt_id: &str,
+) -> Result<String> {
+    let oid = expected_oid
+        .parse::<u32>()
+        .with_context(|| format!("Invalid PostgreSQL {} OID", kind.label()))?;
+    if oid == 0 {
+        bail!("PostgreSQL {} OID must be non-zero", kind.label());
+    }
+    if attempt_id.trim().is_empty() {
+        bail!("PostgreSQL teardown requires a durable attempt identifier");
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"kobe-postgres-tombstone-v1\0");
+    hasher.update(kind.label().as_bytes());
+    hasher.update([0]);
+    hasher.update(oid.to_be_bytes());
+    hasher.update([0]);
+    hasher.update(attempt_id.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let tombstone = format!("kobe_vd_{}_{oid:08x}_{}", kind.label(), &digest[..24]);
+    debug_assert!(tombstone.len() <= MAX_IDENT_LEN);
+    Ok(tombstone)
+}
+
+fn classify_exact_catalog(
+    rows: &[CatalogObject],
+    expected_oid: &str,
+    original: &str,
+    tombstone: &str,
+) -> ExactCatalogState {
+    let expected = rows.iter().filter(|row| row.oid == expected_oid).count();
+    let original_count = rows.iter().filter(|row| row.name == original).count();
+    let tombstone_count = rows.iter().filter(|row| row.name == tombstone).count();
+
+    if expected > 1 || original_count > 1 || tombstone_count > 1 {
+        return ExactCatalogState::Mismatch;
+    }
+    let expected_name = rows
+        .iter()
+        .find(|row| row.oid == expected_oid)
+        .map(|row| row.name.as_str());
+    match expected_name {
+        Some(name) if name == original && tombstone_count == 0 => ExactCatalogState::Original,
+        Some(name) if name == tombstone && original_count == 0 => ExactCatalogState::Tombstone,
+        Some(_) => ExactCatalogState::Mismatch,
+        None if original_count == 0 && tombstone_count == 0 => ExactCatalogState::Absent,
+        None => ExactCatalogState::Mismatch,
+    }
+}
+
+/// Acquire one physical connection and the session-scoped lifecycle fence.
+///
+/// The connection is marked `close_on_drop` *before* attempting the advisory
+/// lock. Cancellation, panic, or an early error therefore closes the session
+/// (and PostgreSQL releases its lock) instead of returning a locked connection
+/// to sqlx's pool. Lifecycle DDL is rare enough that replacing this connection
+/// is an intentional safety cost.
+async fn acquire_lifecycle_connection(
+    pool: &PgPool,
+    database: &str,
+) -> Result<(PoolConnection<Postgres>, i64)> {
+    let key = lifecycle_lock_key(database);
+    let mut connection = pool
+        .acquire()
+        .await
+        .context("Failed to acquire PostgreSQL lifecycle connection")?;
+    connection.close_on_drop();
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(&mut *connection)
+        .await
+        .context("Failed to acquire PostgreSQL lifecycle advisory lock")?;
+    if !acquired {
+        bail!("PostgreSQL lifecycle advisory lock is busy for {database}");
+    }
+    Ok((connection, key))
+}
+
+async fn finish_lifecycle_connection<T>(
+    mut connection: PoolConnection<Postgres>,
+    key: i64,
+    operation: Result<T>,
+) -> Result<T> {
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(&mut *connection)
+        .await;
+    let close = connection.close().await;
+
+    match unlocked {
+        Ok(true) => {}
+        Ok(false) => bail!("PostgreSQL lifecycle advisory lock was not held at release"),
+        Err(error) => {
+            return Err(error).context("Failed to release PostgreSQL lifecycle advisory lock");
+        }
+    }
+    close.context("Failed to close PostgreSQL lifecycle connection")?;
+    operation
+}
+
+async fn ensure_system_identifier(connection: &mut PgConnection, expected: &str) -> Result<()> {
+    if expected
+        .parse::<u64>()
+        .map_or(true, |identifier| identifier == 0)
+    {
+        bail!("Invalid expected PostgreSQL system identifier");
+    }
+    let observed: String =
+        sqlx::query_scalar("SELECT system_identifier::text FROM pg_control_system()")
+            .fetch_one(connection)
+            .await
+            .context("Failed to read PostgreSQL system identifier")?;
+    if observed != expected {
+        bail!("PostgreSQL cluster identity changed");
+    }
+    Ok(())
+}
+
+async fn database_catalog_state(
+    connection: &mut PgConnection,
+    expected_oid: &str,
+    original: &str,
+    tombstone: &str,
+) -> Result<(ExactCatalogState, Option<(bool, bool)>)> {
+    let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
+        r#"
+        SELECT oid::text,
+               datname,
+               datallowconn,
+               datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+        FROM pg_database
+        WHERE oid::text = $1 OR datname = $2 OR datname = $3
+        ORDER BY oid
+        "#,
+    )
+    .bind(expected_oid)
+    .bind(original)
+    .bind(tombstone)
+    .fetch_all(connection)
+    .await
+    .context("Failed to inspect exact PostgreSQL database identity")?;
+    let objects: Vec<CatalogObject> = rows
+        .iter()
+        .map(|(oid, name, _, _)| CatalogObject {
+            oid: oid.clone(),
+            name: name.clone(),
+        })
+        .collect();
+    let attributes = rows
+        .iter()
+        .find(|(oid, _, _, _)| oid == expected_oid)
+        .map(|(_, _, allow_connections, owned_by_current)| (*allow_connections, *owned_by_current));
+    Ok((
+        classify_exact_catalog(&objects, expected_oid, original, tombstone),
+        attributes,
+    ))
+}
+
+async fn role_catalog_state(
+    connection: &mut PgConnection,
+    expected_oid: &str,
+    original: &str,
+    tombstone: &str,
+) -> Result<(ExactCatalogState, Option<bool>)> {
+    let rows: Vec<(String, String, bool)> = sqlx::query_as(
+        r#"
+        SELECT oid::text, rolname, rolcanlogin
+        FROM pg_roles
+        WHERE oid::text = $1 OR rolname = $2 OR rolname = $3
+        ORDER BY oid
+        "#,
+    )
+    .bind(expected_oid)
+    .bind(original)
+    .bind(tombstone)
+    .fetch_all(connection)
+    .await
+    .context("Failed to inspect exact PostgreSQL role identity")?;
+    let objects: Vec<CatalogObject> = rows
+        .iter()
+        .map(|(oid, name, _)| CatalogObject {
+            oid: oid.clone(),
+            name: name.clone(),
+        })
+        .collect();
+    let can_login = rows
+        .iter()
+        .find(|(oid, _, _)| oid == expected_oid)
+        .map(|(_, _, can_login)| *can_login);
+    Ok((
+        classify_exact_catalog(&objects, expected_oid, original, tombstone),
+        can_login,
+    ))
+}
+
+/// One live PostgreSQL connection: an administrative pool pinned to `/postgres`
+/// plus the original configured URL used only to derive per-cluster endpoints.
 #[derive(Clone)]
 pub struct DatastoreConn {
     pub pool: PgPool,
@@ -32,7 +329,12 @@ pub struct DatastoreConn {
 
 impl DatastoreConn {
     async fn connect(base_url: String) -> std::result::Result<Self, BoxError> {
-        let pool = PgPool::connect(&base_url).await?;
+        // Both Static and Reloading construction flow through here. Never build
+        // the DDL pool from the caller-selected database path: advisory locks
+        // taken in different PostgreSQL databases do not share a namespace,
+        // and DROP DATABASE cannot target the current database.
+        let admin_url = admin_connection_url(&base_url)?;
+        let pool = PgPool::connect(&admin_url).await?;
         Ok(Self { pool, base_url })
     }
 }
@@ -71,9 +373,11 @@ pub enum SharedDatastore {
 }
 
 impl SharedDatastore {
-    /// The current `(pool, base_url)`, cloned, if a datastore is configured and
-    /// connected. Cheap (a `PgPool` clone is an `Arc` clone); re-read on every
-    /// use so a rotation is observed without restarting.
+    /// The current `(admin_pool, child_base_url)`, cloned, if a datastore is
+    /// configured and connected. The pool always selects `/postgres`; the URL
+    /// remains the original configured value so child endpoint derivation can
+    /// replace its database and credential. Cheap (a `PgPool` clone is an `Arc`
+    /// clone); re-read on every use so a rotation is observed without restart.
     pub fn current(&self) -> Option<(PgPool, String)> {
         match self {
             SharedDatastore::None => None,
@@ -103,8 +407,10 @@ impl SharedDatastore {
     /// - else `POSTGRES_URL` set → a static (non-reloading) connection;
     /// - else → no datastore.
     ///
-    /// A connection/watch failure logs and degrades to `None` (embedded store),
-    /// matching the previous best-effort behavior.
+    /// `/postgres` must exist and accept the configured credential. A static
+    /// connection failure logs and degrades to `None`; a reload failure retains
+    /// the prior pool and reports `Stale`. Both paths withhold the new datastore
+    /// rather than using a DSN-selected child database as a DDL authority.
     pub async fn from_env() -> Self {
         if let Ok(dir) = std::env::var("POSTGRES_URL_DIR") {
             // The FromMount/reloadable path (not .spawn) runs DatastoreConn::retire
@@ -184,6 +490,70 @@ pub fn sanitize_db_name(cluster_name: &str, prefix: &str) -> Result<String> {
     Ok(db_name)
 }
 
+/// Non-secret identity of the PostgreSQL server selected by a connection URL.
+///
+/// Credentials, database path, query parameters, and fragments are deliberately
+/// excluded. The resulting digest can be persisted in CR status and compared at
+/// teardown without publishing a password or silently treating a different
+/// server as the one that held the instance database.
+pub fn endpoint_identity_digest(base_url: &str) -> Result<String> {
+    let parsed = url::Url::parse(base_url).context("Invalid PostgreSQL datastore URL")?;
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("PostgreSQL datastore URL has no host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(5432);
+    let identity = format!("{}://{host}:{port}", parsed.scheme().to_ascii_lowercase());
+    Ok(hex::encode(Sha256::digest(identity.as_bytes())))
+}
+
+/// PostgreSQL cluster and per-instance object identities observed by one
+/// backend session and one statement snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterObjectIdentity {
+    pub system_identifier: String,
+    pub database_oid: Option<String>,
+    pub role_oid: Option<String>,
+}
+
+/// Capture the cluster, database and role identity without mixing observations
+/// from different pooled connections. This matters when a hostname is backed
+/// by more than one server: three independent pool queries could otherwise
+/// assemble provenance that never existed on any one PostgreSQL cluster.
+/// The system identifier is initialized with the cluster, so DNS repointing or
+/// an in-place reinitialization cannot masquerade as the original datastore.
+pub async fn cluster_object_identity(
+    pool: &PgPool,
+    cluster_name: &str,
+    prefix: &str,
+) -> Result<ClusterObjectIdentity> {
+    let name = sanitize_db_name(cluster_name, prefix)?;
+    let (system_identifier, database_oid, role_oid): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            r#"
+        SELECT control.system_identifier::text,
+               (SELECT oid::text FROM pg_database WHERE datname = $1),
+               (SELECT oid::text FROM pg_roles WHERE rolname = $1)
+        FROM pg_control_system() AS control
+        "#,
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .context("Failed to capture PostgreSQL cluster object identity")?;
+    if system_identifier
+        .parse::<u64>()
+        .map_or(true, |identifier| identifier == 0)
+    {
+        bail!("PostgreSQL returned an invalid system identifier");
+    }
+    Ok(ClusterObjectIdentity {
+        system_identifier,
+        database_oid,
+        role_oid,
+    })
+}
+
 /// True iff `code` is PostgreSQL's `duplicate_database` SQLSTATE (`42P04`),
 /// i.e. the `CREATE DATABASE` failed only because the database already exists.
 ///
@@ -203,22 +573,26 @@ fn is_duplicate_db_error(code: Option<&str>) -> bool {
 /// `wait_ready` timeout downstream) leaves the database in place, and the
 /// next reconcile would otherwise hit "already exists" → `Err` → `Failed`
 /// forever → recycle storm.
-pub async fn create_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
+async fn create_database_on_connection(
+    connection: &mut PgConnection,
+    cluster_name: &str,
+    prefix: &str,
+) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
     info!(db = %db_name, cluster = cluster_name, "Creating database");
 
     let sql = format!("CREATE DATABASE \"{db_name}\"");
-    match sqlx::query(&sql).execute(pool).await {
+    match sqlx::query(&sql).execute(&mut *connection).await {
         Ok(_) => {
             debug!(db = %db_name, "Database created");
-            revoke_public_connect(pool, &db_name).await
+            revoke_public_connect(connection, &db_name).await
         }
         Err(e) => {
             if let Some(dberr) = e.as_database_error()
                 && is_duplicate_db_error(dberr.code().as_deref())
             {
                 debug!(db = %db_name, "Database already exists, treating create as idempotent no-op");
-                return revoke_public_connect(pool, &db_name).await;
+                return revoke_public_connect(connection, &db_name).await;
             }
             Err(e).with_context(|| format!("Failed to create database {db_name}"))
         }
@@ -234,54 +608,70 @@ pub async fn create_database_from_template(
     prefix: &str,
 ) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
-    let template = sanitize_db_name(template_name, prefix)?;
-    info!(
-        db = %db_name,
-        template = %template,
-        "Creating database from template"
-    );
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &db_name).await?;
+    let operation = async {
+        let template = sanitize_db_name(template_name, prefix)?;
+        info!(
+            db = %db_name,
+            template = %template,
+            "Creating database from template"
+        );
 
-    let sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"");
-    sqlx::query(&sql)
-        .execute(pool)
-        .await
-        .with_context(|| format!("Failed to create database {db_name} from template {template}"))?;
+        let sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"");
+        sqlx::query(&sql)
+            .execute(&mut *connection)
+            .await
+            .with_context(|| {
+                format!("Failed to create database {db_name} from template {template}")
+            })?;
 
-    debug!(db = %db_name, "Database created from template");
-    Ok(())
+        debug!(db = %db_name, "Database created from template");
+        Ok(())
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
 /// Mark a database as a template so it can be used with `CREATE DATABASE ... TEMPLATE`.
 #[allow(dead_code)]
 pub async fn mark_as_template(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
-    info!(db = %db_name, "Marking database as template");
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &db_name).await?;
+    let operation = async {
+        info!(db = %db_name, "Marking database as template");
 
-    let sql = format!("ALTER DATABASE \"{db_name}\" WITH is_template = true");
-    sqlx::query(&sql)
-        .execute(pool)
-        .await
-        .with_context(|| format!("Failed to mark {db_name} as template"))?;
+        let sql = format!("ALTER DATABASE \"{db_name}\" WITH is_template = true");
+        sqlx::query(&sql)
+            .execute(&mut *connection)
+            .await
+            .with_context(|| format!("Failed to mark {db_name} as template"))?;
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
 /// Remove the template flag from a database (required before it can be dropped).
 #[allow(dead_code)]
 pub async fn unmark_template(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
-    info!(db = %db_name, "Unmarking database template flag");
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &db_name).await?;
+    let operation = async {
+        info!(db = %db_name, "Unmarking database template flag");
 
-    let sql = format!("ALTER DATABASE \"{db_name}\" WITH is_template = false");
-    sqlx::query(&sql)
-        .execute(pool)
-        .await
-        .with_context(|| format!("Failed to unmark {db_name} as template"))?;
+        let sql = format!("ALTER DATABASE \"{db_name}\" WITH is_template = false");
+        sqlx::query(&sql)
+            .execute(&mut *connection)
+            .await
+            .with_context(|| format!("Failed to unmark {db_name} template flag"))?;
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
-/// Drop a cluster's database, disconnecting any active sessions first.
 /// Take ownership of a cluster database back before dropping it.
 ///
 /// `ensure_cluster_role` transfers ownership to the per-cluster role so kine can
@@ -300,36 +690,57 @@ pub async fn reclaim_database_ownership(
     prefix: &str,
 ) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
-    sqlx::query(&format!(
-        "ALTER DATABASE \"{db_name}\" OWNER TO CURRENT_USER"
-    ))
-    .execute(pool)
-    .await
-    .with_context(|| format!("Failed to reclaim ownership of database {db_name}"))?;
-    debug!(db = %db_name, "Ownership reclaimed for drop");
-    Ok(())
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &db_name).await?;
+    let operation = async {
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{db_name}\" OWNER TO CURRENT_USER"
+        ))
+        .execute(&mut *connection)
+        .await
+        .with_context(|| format!("Failed to reclaim ownership of database {db_name}"))?;
+        debug!(db = %db_name, "Ownership reclaimed for drop");
+        Ok(())
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
+/// Drop a cluster database during legacy, non-verified cleanup.
+///
+/// This remains name-addressed and must never be used as verified teardown
+/// evidence. The lifecycle lock only serializes cooperating kobe DDL actors;
+/// it cannot fence an external PostgreSQL superuser.
 pub async fn drop_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let db_name = sanitize_db_name(cluster_name, prefix)?;
-    info!(db = %db_name, "Dropping database");
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &db_name).await?;
+    let operation = async {
+        info!(db = %db_name, "Dropping database");
 
-    // Terminate active connections to the database
-    let disconnect_sql = format!(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-    );
-    if let Err(e) = sqlx::query(&disconnect_sql).execute(pool).await {
-        warn!(db = %db_name, error = %e, "Failed to disconnect sessions (may not exist)");
-    }
-
-    let sql = format!("DROP DATABASE IF EXISTS \"{db_name}\"");
-    sqlx::query(&sql)
-        .execute(pool)
+        // Legacy cleanup has no immutable OID. It is still serialized with
+        // provisioning and verified destroy so kobe never supplies the
+        // uncooperative same-name actor excluded by the trust boundary.
+        if let Err(e) = sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind(&db_name)
+        .execute(&mut *connection)
         .await
-        .with_context(|| format!("Failed to drop database {db_name}"))?;
+        {
+            warn!(db = %db_name, error = %e, "Failed to disconnect sessions (may not exist)");
+        }
 
-    debug!(db = %db_name, "Database dropped");
-    Ok(())
+        let sql = format!("DROP DATABASE IF EXISTS \"{db_name}\"");
+        sqlx::query(&sql)
+            .execute(&mut *connection)
+            .await
+            .with_context(|| format!("Failed to drop database {db_name}"))?;
+
+        debug!(db = %db_name, "Database dropped");
+        Ok(())
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
 /// Drop PostgreSQL's default `CONNECT` grant to `PUBLIC` on a database.
@@ -342,11 +753,11 @@ pub async fn drop_database(pool: &PgPool, cluster_name: &str, prefix: &str) -> R
 /// require a second connection into the new database. PostgreSQL 15 removed
 /// that default grant; on 14 and older, or a cluster upgraded from one, a
 /// connected role could still create objects there. kobe targets 15+.
-async fn revoke_public_connect(pool: &PgPool, db_name: &str) -> Result<()> {
+async fn revoke_public_connect(connection: &mut PgConnection, db_name: &str) -> Result<()> {
     sqlx::query(&format!(
         "REVOKE CONNECT ON DATABASE \"{db_name}\" FROM PUBLIC"
     ))
-    .execute(pool)
+    .execute(connection)
     .await
     .with_context(|| format!("Failed to revoke PUBLIC connect on database {db_name}"))?;
     debug!(db = %db_name, "PUBLIC connect revoked");
@@ -406,8 +817,8 @@ pub fn cluster_endpoint_as_role(
 /// `REVOKE CONNECT ... FROM PUBLIC` matters because PostgreSQL grants CONNECT
 /// to PUBLIC on every new database by default. Without it, one cluster's role
 /// could still connect to another cluster's database.
-pub async fn ensure_cluster_role(
-    pool: &PgPool,
+async fn ensure_cluster_role_on_connection(
+    connection: &mut PgConnection,
     cluster_name: &str,
     prefix: &str,
     password: &str,
@@ -421,7 +832,7 @@ pub async fn ensure_cluster_role(
     let quoted_password = password.replace('\'', "''");
 
     let create = format!("CREATE ROLE \"{name}\" LOGIN PASSWORD '{quoted_password}'");
-    match sqlx::query(&create).execute(pool).await {
+    match sqlx::query(&create).execute(&mut *connection).await {
         Ok(_) => debug!(role = %name, "Role created"),
         Err(e) => {
             let duplicate = e
@@ -433,7 +844,7 @@ pub async fn ensure_cluster_role(
             debug!(role = %name, "Role exists; refreshing password");
             let alter = format!("ALTER ROLE \"{name}\" LOGIN PASSWORD '{quoted_password}'");
             sqlx::query(&alter)
-                .execute(pool)
+                .execute(&mut *connection)
                 .await
                 .with_context(|| format!("Failed to refresh password for role {name}"))?;
         }
@@ -444,19 +855,41 @@ pub async fn ensure_cluster_role(
     // is neither, so grant membership first or ownership transfer fails and
     // provisioning breaks outright.
     sqlx::query(&format!("GRANT \"{name}\" TO CURRENT_USER"))
-        .execute(pool)
+        .execute(&mut *connection)
         .await
         .with_context(|| format!("Failed to grant membership of {name} to the operator role"))?;
 
     // Ownership lets kine create its own tables in the database.
     sqlx::query(&format!("ALTER DATABASE \"{name}\" OWNER TO \"{name}\""))
-        .execute(pool)
+        .execute(&mut *connection)
         .await
         .with_context(|| format!("Failed to give {name} ownership of its database"))?;
 
     // PUBLIC connect is revoked in `create_database`, immediately after the
     // database exists, so there is no window here.
     Ok(name)
+}
+
+/// Provision the database and tenant role under one session advisory lock.
+///
+/// The password Secret is materialized by the caller first, before any tenant
+/// workload exists, and is retained on failure for an idempotent retry. Keeping
+/// both DDL phases on one physical session prevents verified teardown from
+/// interleaving between database creation and its role/ownership hardening.
+pub async fn provision_cluster_datastore(
+    pool: &PgPool,
+    cluster_name: &str,
+    prefix: &str,
+    password: &str,
+) -> Result<String> {
+    let name = sanitize_db_name(cluster_name, prefix)?;
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &name).await?;
+    let operation = async {
+        create_database_on_connection(&mut connection, cluster_name, prefix).await?;
+        ensure_cluster_role_on_connection(&mut connection, cluster_name, prefix, password).await
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
 /// Drop the per-cluster role. Call AFTER `drop_database`: PostgreSQL refuses to
@@ -498,17 +931,226 @@ pub async fn cluster_role_exists(pool: &PgPool, cluster_name: &str, prefix: &str
 
 pub async fn drop_cluster_role(pool: &PgPool, cluster_name: &str, prefix: &str) -> Result<()> {
     let name = sanitize_db_name(cluster_name, prefix)?;
-    info!(role = %name, "Dropping per-cluster datastore role");
-    sqlx::query(&format!("DROP ROLE IF EXISTS \"{name}\""))
-        .execute(pool)
-        .await
-        .with_context(|| format!("Failed to drop role {name}"))?;
+    let (mut connection, key) = acquire_lifecycle_connection(pool, &name).await?;
+    let operation = async {
+        info!(role = %name, "Dropping per-cluster datastore role");
+        sqlx::query(&format!("DROP ROLE IF EXISTS \"{name}\""))
+            .execute(&mut *connection)
+            .await
+            .with_context(|| format!("Failed to drop role {name}"))?;
+        Ok(())
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
+}
+
+fn validate_manifest_identifier(identifier: &str, kind: &str) -> Result<()> {
+    if identifier.is_empty()
+        || identifier.len() > MAX_IDENT_LEN
+        || !identifier
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        bail!("Manifest PostgreSQL {kind} name is not a safe identifier");
+    }
     Ok(())
+}
+
+/// Re-observe exact absence for receipt generation under the same lifecycle
+/// fence used by creation and destruction.
+///
+/// `true` requires the expected OID and both the original and deterministic
+/// attempt-tombstone names to be absent. A same-name replacement or an expected
+/// OID moved under a third name remains `false`; an unreadable/different
+/// PostgreSQL cluster is an error and therefore can never become proof.
+pub async fn verify_cluster_datastore_absence(
+    pool: &PgPool,
+    identity: VerifiedPostgresIdentity<'_>,
+    attempt_id: &str,
+) -> Result<VerifiedPostgresAbsence> {
+    validate_manifest_identifier(identity.database, "database")?;
+    validate_manifest_identifier(identity.role, "role")?;
+    let database_tombstone = teardown_tombstone(
+        PostgresObjectKind::Database,
+        identity.database_oid,
+        attempt_id,
+    )?;
+    let role_tombstone =
+        teardown_tombstone(PostgresObjectKind::Role, identity.role_oid, attempt_id)?;
+    let (mut connection, key) = acquire_lifecycle_connection(pool, identity.database).await?;
+    let operation = async {
+        ensure_system_identifier(&mut connection, identity.system_identifier).await?;
+        let (database, _) = database_catalog_state(
+            &mut connection,
+            identity.database_oid,
+            identity.database,
+            &database_tombstone,
+        )
+        .await?;
+        let (role, _) = role_catalog_state(
+            &mut connection,
+            identity.role_oid,
+            identity.role,
+            &role_tombstone,
+        )
+        .await?;
+        Ok(VerifiedPostgresAbsence {
+            database: database == ExactCatalogState::Absent,
+            role: role == ExactCatalogState::Absent,
+        })
+    }
+    .await;
+    finish_lifecycle_connection(connection, key, operation).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog(oid: &str, name: &str) -> CatalogObject {
+        CatalogObject {
+            oid: oid.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_lock_key_is_stable_and_name_scoped() {
+        assert_eq!(
+            lifecycle_lock_key("k3s_pool_0"),
+            lifecycle_lock_key("k3s_pool_0")
+        );
+        assert_ne!(
+            lifecycle_lock_key("k3s_pool_0"),
+            lifecycle_lock_key("k3s_pool_1")
+        );
+    }
+
+    #[test]
+    fn teardown_tombstone_is_attempt_oid_and_kind_bound() {
+        let first = teardown_tombstone(PostgresObjectKind::Database, "16384", "attempt-1").unwrap();
+        assert_eq!(
+            first,
+            teardown_tombstone(PostgresObjectKind::Database, "16384", "attempt-1").unwrap()
+        );
+        assert_ne!(
+            first,
+            teardown_tombstone(PostgresObjectKind::Database, "16384", "attempt-2").unwrap()
+        );
+        assert_ne!(
+            first,
+            teardown_tombstone(PostgresObjectKind::Database, "16385", "attempt-1").unwrap()
+        );
+        assert_ne!(
+            first,
+            teardown_tombstone(PostgresObjectKind::Role, "16384", "attempt-1").unwrap()
+        );
+        assert!(first.len() <= MAX_IDENT_LEN);
+        assert!(
+            first
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        );
+        assert!(teardown_tombstone(PostgresObjectKind::Database, "0", "attempt-1").is_err());
+        assert!(teardown_tombstone(PostgresObjectKind::Database, "16384", "").is_err());
+    }
+
+    #[test]
+    fn exact_catalog_classifier_accepts_only_original_tombstone_or_full_absence() {
+        let original = "k3s_c1";
+        let tombstone = "kobe_vd_db_00004000_deadbeef";
+        let oid = "16384";
+
+        assert_eq!(
+            classify_exact_catalog(&[catalog(oid, original)], oid, original, tombstone),
+            ExactCatalogState::Original
+        );
+        assert_eq!(
+            classify_exact_catalog(&[catalog(oid, tombstone)], oid, original, tombstone),
+            ExactCatalogState::Tombstone
+        );
+        assert_eq!(
+            classify_exact_catalog(&[], oid, original, tombstone),
+            ExactCatalogState::Absent
+        );
+
+        for rows in [
+            vec![catalog("999", original)],
+            vec![catalog("999", tombstone)],
+            vec![catalog(oid, "third_name")],
+            vec![catalog(oid, original), catalog("999", tombstone)],
+            vec![catalog(oid, tombstone), catalog("999", original)],
+        ] {
+            assert_eq!(
+                classify_exact_catalog(&rows, oid, original, tombstone),
+                ExactCatalogState::Mismatch,
+                "unsafe catalog state was accepted: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_dsns_with_different_users_and_paths_share_postgres_lock_namespace() {
+        let first_base =
+            "postgresql://admin_a:secret-a@primary.internal:5432/tenant_a?sslmode=require";
+        let second_base =
+            "postgresql://admin_b:secret-b@primary.internal:5432/tenant_b?application_name=kobe";
+
+        let first = url::Url::parse(&admin_connection_url(first_base).unwrap()).unwrap();
+        let second = url::Url::parse(&admin_connection_url(second_base).unwrap()).unwrap();
+
+        assert_eq!(first.path(), ADMIN_DATABASE_PATH);
+        assert_eq!(second.path(), ADMIN_DATABASE_PATH);
+        assert_eq!(first.host_str(), second.host_str());
+        assert_eq!(
+            first.port_or_known_default(),
+            second.port_or_known_default()
+        );
+        assert_eq!(first.username(), "admin_a");
+        assert_eq!(second.username(), "admin_b");
+        assert_eq!(first.password(), Some("secret-a"));
+        assert_eq!(second.password(), Some("secret-b"));
+        assert_eq!(first.query(), Some("sslmode=require"));
+        assert_eq!(second.query(), Some("application_name=kobe"));
+    }
+
+    #[test]
+    fn admin_normalization_does_not_replace_the_child_endpoint_base() {
+        let base =
+            "postgresql://admin:secret@primary.internal:5432/configured_path?sslmode=require";
+        let admin = url::Url::parse(&admin_connection_url(base).unwrap()).unwrap();
+        let child = url::Url::parse(
+            &cluster_endpoint_as_role(base, "pool-0", "k3s_", "tenant-secret").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(admin.path(), ADMIN_DATABASE_PATH);
+        assert_eq!(admin.username(), "admin");
+        assert_eq!(child.path(), "/k3s_pool_0");
+        assert_eq!(child.username(), "k3s_pool_0");
+        assert_eq!(child.password(), Some("tenant-secret"));
+        assert_eq!(child.query(), Some("sslmode=require"));
+        assert!(admin_connection_url("not a postgres URL").is_err());
+    }
+
+    #[test]
+    fn endpoint_identity_excludes_credentials_and_database_path() {
+        let first = endpoint_identity_digest(
+            "postgresql://operator:old-secret@db.internal:5432/postgres?sslmode=require",
+        )
+        .unwrap();
+        let rotated = endpoint_identity_digest(
+            "postgresql://other:new-secret@db.internal:5432/template?application_name=kobe",
+        )
+        .unwrap();
+        let other_host = endpoint_identity_digest(
+            "postgresql://operator:old-secret@other.internal:5432/postgres",
+        )
+        .unwrap();
+        assert_eq!(first, rotated);
+        assert_ne!(first, other_host);
+        assert!(!first.contains("secret"));
+    }
 
     #[test]
     fn shared_datastore_none_is_default_and_returns_no_connection() {

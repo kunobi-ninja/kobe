@@ -1,4 +1,4 @@
-//! Pure Agent Sandbox v0.5.4 `v1beta1` projections and lease invariants.
+//! Pure Agent Sandbox v0.5.6 `v1beta1` projections and lease invariants.
 //!
 //! This module has no Kubernetes client or reconciliation side effects. Pool
 //! controllers can render the restricted Kobe contract into upstream objects,
@@ -12,16 +12,19 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use k8s_openapi::api::core::v1::{Container, ContainerPort, PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{
+    Capabilities, Container, ContainerPort, PodSecurityContext, PodSpec, ResourceRequirements,
+    SeccompProfile, SecurityContext,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 use thiserror::Error;
 
 use crate::crd::{
-    ResolvedSandboxPlacement, SandboxLeasePhase, SandboxLeaseStatus, SandboxObjectReference,
-    SandboxPoolSpec, SandboxPoolValidationError, SandboxResourceCeiling, SandboxTargetProvenance,
-    SandboxTemplateSpec,
+    ResolvedSandboxPlacement, SandboxConditionStatus, SandboxLeasePhase, SandboxLeaseStatus,
+    SandboxObjectReference, SandboxPool, SandboxPoolSpec, SandboxPoolValidationError,
+    SandboxResourceCeiling, SandboxTargetProvenance, SandboxTemplateSpec,
 };
 
 pub const AGENT_SANDBOX_API_VERSION: &str = "extensions.agents.x-k8s.io/v1beta1";
@@ -29,17 +32,149 @@ pub const SANDBOX_TEMPLATE_KIND: &str = "SandboxTemplate";
 pub const SANDBOX_WARM_POOL_KIND: &str = "SandboxWarmPool";
 pub const SANDBOX_CLAIM_KIND: &str = "SandboxClaim";
 pub const KOBE_MANAGED_BY: &str = "kobe-operator";
+pub const SANDBOX_LEASE_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-lease-uid";
+/// Namespace inside an exclusive child cluster that holds Sandbox objects.
+///
+/// This is shared by placement and provenance validation: accepting a
+/// different namespace during recovery would let a damaged parent select a
+/// teardown path the controller never created.
+pub const CHILD_SANDBOX_NAMESPACE: &str = "kobe-sandbox";
+/// Holds a management `SandboxClaim` through the create-response/status-write
+/// gap. Release removes it only while atomically converting a live Claim into
+/// an inert tombstone, or the retained tombstone reaper removes it later.
+pub const SANDBOX_CLAIM_CLEANUP_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-claim-cleanup";
+/// Keeps a [`SandboxLease`](crate::crd::SandboxLease) present until Kobe has
+/// durably proved its complete footprint absent and released its reservations.
+///
+/// Admission stamps this on the initial CREATE, eliminating the controller
+/// race where a direct Kubernetes DELETE could otherwise bypass cleanup.
+pub const SANDBOX_LEASE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-cleanup";
 const KOBE_API_VERSION: &str = "kobe.kunobi.ninja/v1alpha1";
 const SANDBOX_API_VERSION: &str = "agents.x-k8s.io/v1beta1";
 const CORE_API_VERSION: &str = "v1";
+
+/// Require the durable, current-generation readiness certificate used by both
+/// HTTP admission and the final pre-Claim placement check.
+///
+/// Capacity counters and an upstream WarmPool's `readyReplicas` are
+/// observations, not a safety certificate. A pool is admissible only when one
+/// `Ready=True` condition and the enclosing status were both derived from the
+/// pool's current generation and backed by the terminal durable certification
+/// receipt. Missing, stale, duplicate, false, unknown, or receipt-less status
+/// all fail closed.
+pub fn require_current_sandbox_pool_ready(
+    pool: &SandboxPool,
+) -> Result<(), SandboxPoolReadinessError> {
+    let generation = pool
+        .metadata
+        .generation
+        .ok_or(SandboxPoolReadinessError::MissingGeneration)?;
+    let status = pool
+        .status
+        .as_ref()
+        .ok_or(SandboxPoolReadinessError::MissingStatus)?;
+    if status.observed_generation != Some(generation) {
+        return Err(SandboxPoolReadinessError::StaleStatus {
+            expected: generation,
+            observed: status.observed_generation,
+        });
+    }
+
+    let mut ready_conditions = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.condition_type == "Ready");
+    let ready = ready_conditions
+        .next()
+        .ok_or(SandboxPoolReadinessError::MissingReadyCondition)?;
+    if ready_conditions.next().is_some() {
+        return Err(SandboxPoolReadinessError::DuplicateReadyCondition);
+    }
+    if ready.observed_generation != Some(generation) {
+        return Err(SandboxPoolReadinessError::StaleReadyCondition {
+            expected: generation,
+            observed: ready.observed_generation,
+        });
+    }
+    if ready.status != SandboxConditionStatus::True {
+        return Err(SandboxPoolReadinessError::NotReady {
+            status: ready.status,
+            reason: ready.reason.clone(),
+        });
+    }
+    let certification = status
+        .certification
+        .as_ref()
+        .ok_or(SandboxPoolReadinessError::MissingCertification)?;
+    if certification.observed_generation != generation {
+        return Err(SandboxPoolReadinessError::StaleCertification {
+            expected: generation,
+            observed: certification.observed_generation,
+        });
+    }
+    if certification.phase != crate::crd::SandboxPoolCertificationPhase::Certified
+        || certification.certified_at.is_none()
+    {
+        return Err(SandboxPoolReadinessError::IncompleteCertification {
+            phase: certification.phase,
+        });
+    }
+    Ok(())
+}
+
+/// Why a SandboxPool cannot currently authorize new workload placement.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum SandboxPoolReadinessError {
+    #[error("SandboxPool has no metadata.generation")]
+    MissingGeneration,
+    #[error("SandboxPool has no status")]
+    MissingStatus,
+    #[error(
+        "SandboxPool status observed generation {observed:?}, expected current generation {expected}"
+    )]
+    StaleStatus {
+        expected: i64,
+        observed: Option<i64>,
+    },
+    #[error("SandboxPool status has no Ready condition")]
+    MissingReadyCondition,
+    #[error("SandboxPool status has duplicate Ready conditions")]
+    DuplicateReadyCondition,
+    #[error(
+        "SandboxPool Ready condition observed generation {observed:?}, expected current generation {expected}"
+    )]
+    StaleReadyCondition {
+        expected: i64,
+        observed: Option<i64>,
+    },
+    #[error("SandboxPool Ready condition is {status:?}: {reason}")]
+    NotReady {
+        status: SandboxConditionStatus,
+        reason: String,
+    },
+    #[error("SandboxPool status has no durable certification receipt")]
+    MissingCertification,
+    #[error(
+        "SandboxPool certification observed generation {observed}, expected current generation {expected}"
+    )]
+    StaleCertification { expected: i64, observed: i64 },
+    #[error("SandboxPool certification phase is {phase:?}, expected Certified")]
+    IncompleteCertification {
+        phase: crate::crd::SandboxPoolCertificationPhase,
+    },
+}
 
 /// Render one administrator-owned Kobe pool template into the pinned upstream
 /// Agent Sandbox contract.
 ///
 /// The projection is intentionally closed: it emits only declared containers,
 /// CPU/memory/ephemeral-storage resources, TCP ports, the administrator's
-/// RuntimeClass, and fixed secure policies. It cannot emit PVC templates,
-/// environment values, service accounts, arbitrary volumes, or caller metadata.
+/// RuntimeClass, and fixed Restricted-profile-compatible Pod/container
+/// security contexts. Every workload runs as Kobe's non-root UID/GID 65532,
+/// drops all capabilities, disables privilege escalation and service-account
+/// token/service-link injection, and uses RuntimeDefault seccomp. It cannot
+/// emit PVC templates, environment values, service accounts, arbitrary
+/// volumes, or caller metadata.
 pub fn build_sandbox_template(
     name: &str,
     namespace: &str,
@@ -74,6 +209,16 @@ pub fn build_sandbox_template(
                 args: (!container.args.is_empty()).then(|| container.args.clone()),
                 ports: (!ports.is_empty()).then_some(ports),
                 resources: Some(to_k8s_resources(&container.resources)),
+                security_context: Some(SecurityContext {
+                    allow_privilege_escalation: Some(false),
+                    capabilities: Some(Capabilities {
+                        drop: Some(vec!["ALL".to_string()]),
+                        ..Capabilities::default()
+                    }),
+                    privileged: Some(false),
+                    run_as_non_root: Some(true),
+                    ..SecurityContext::default()
+                }),
                 ..Default::default()
             }
         })
@@ -82,8 +227,19 @@ pub fn build_sandbox_template(
     let pod_spec = PodSpec {
         automount_service_account_token: Some(false),
         containers,
+        enable_service_links: Some(false),
         restart_policy: Some("Never".to_string()),
         runtime_class_name: pool.isolation.runtime_class_name().map(ToString::to_string),
+        security_context: Some(PodSecurityContext {
+            run_as_group: Some(65_532),
+            run_as_non_root: Some(true),
+            run_as_user: Some(65_532),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                ..SeccompProfile::default()
+            }),
+            ..PodSecurityContext::default()
+        }),
         ..Default::default()
     };
     let pod_spec = serde_json::to_value(pod_spec)?;
@@ -143,16 +299,30 @@ pub fn build_sandbox_warm_pool(
 
 /// Render one lease as a v1beta1 SandboxClaim.
 ///
-/// The initial claim intentionally omits `shutdownTime`: runtime TTL starts
-/// only after the upstream Sandbox becomes Ready. [`build_sandbox_claim_lifecycle_patch`]
-/// adds the absolute expiry later with a resourceVersion fence.
+/// The initial claim carries the already-persisted provisioning deadline as a
+/// shutdown backstop. Runtime TTL still starts only after the upstream Sandbox
+/// becomes Ready: [`build_sandbox_claim_lifecycle_patch`] then replaces this
+/// provisional bound with `readyAt + ttl` under a resourceVersion fence.
+///
+/// Putting the first bound in the POST body matters for cancellation safety. A
+/// request whose apiserver commit is delayed past outer-lease retention is
+/// already expired when it finally lands; it cannot create an unbounded orphan.
+///
+/// Every claim also carries the exact outer lease UID. Management placement
+/// deliberately has no owner reference: garbage collection must not remove the
+/// claim before the outer lease finalizer has verified teardown. Child claims
+/// may be owned by their same-cluster target Namespace, so deleting that
+/// exclusive Namespace still collects its upstream footprint.
 pub fn build_sandbox_claim(
     name: &str,
     namespace: &str,
     warm_pool_name: &str,
+    lease_uid: &str,
+    provisioning_deadline: DateTime<Utc>,
+    hold_for_explicit_cleanup: bool,
     owner_ref: Option<&OwnerReference>,
 ) -> DynamicObject {
-    managed_object(
+    let mut claim = managed_object(
         SANDBOX_CLAIM_KIND,
         name,
         namespace,
@@ -161,11 +331,19 @@ pub fn build_sandbox_claim(
             "spec": {
                 "warmPoolRef": { "name": warm_pool_name },
                 "lifecycle": {
+                    "shutdownTime": provisioning_deadline
+                        .to_rfc3339_opts(SecondsFormat::AutoSi, true),
                     "shutdownPolicy": "DeleteForeground"
                 }
             }
         }),
-    )
+    );
+    let labels = claim.metadata.labels.get_or_insert_default();
+    labels.insert(SANDBOX_LEASE_UID_LABEL.to_string(), lease_uid.to_string());
+    if hold_for_explicit_cleanup {
+        claim.metadata.finalizers = Some(vec![SANDBOX_CLAIM_CLEANUP_FINALIZER.to_string()]);
+    }
+    claim
 }
 
 /// Build the post-Ready merge patch that starts upstream expiry. Callers must
@@ -564,6 +742,44 @@ pub fn require_resolved_placement<'a>(
     Ok(placement)
 }
 
+/// Require placement/target provenance that can safely select a teardown path.
+///
+/// Progressive placement may record a partial target while it discovers
+/// objects. Admission repair is stricter: management placement must use the
+/// operator namespace and carry no child identities, while child placement
+/// must carry both the exact internal lease and bound instance. Every present
+/// reference is also checked for its canonical GVK, namespace, non-empty UID,
+/// and required generation. Without this proof, choosing either teardown path
+/// could release quota while the footprint belonging to the other path
+/// survives.
+pub fn require_release_safe_target_provenance<'a>(
+    status: &'a SandboxLeaseStatus,
+    management_namespace: &str,
+) -> Result<&'a SandboxTargetProvenance, SandboxProvenanceError> {
+    let placement = require_resolved_placement(status, management_namespace)?;
+    let target = status
+        .target
+        .as_ref()
+        .ok_or(SandboxProvenanceError::MissingTargetProvenance)?;
+    validate_target_provenance(target, placement, management_namespace)?;
+    match placement {
+        ResolvedSandboxPlacement::Management {} if target.namespace != management_namespace => {
+            return Err(SandboxProvenanceError::InvalidReference {
+                field: "namespace",
+                reason: "management target namespace does not match the operator namespace",
+            });
+        }
+        ResolvedSandboxPlacement::ChildCluster { .. }
+            if target.child_cluster_lease.is_none() || target.child_cluster_instance.is_none() =>
+        {
+            return Err(SandboxProvenanceError::IncompleteChildProvenance);
+        }
+        ResolvedSandboxPlacement::Management {} | ResolvedSandboxPlacement::ChildCluster { .. } => {
+        }
+    }
+    Ok(target)
+}
+
 /// Merge progressively discovered target references without permitting any
 /// existing identity to be changed or cleared. Equality covers API version,
 /// kind, namespace, name, UID, and generation, so delete/recreate name reuse is
@@ -579,6 +795,7 @@ pub fn merge_target_provenance(
     let Some(existing) = existing else {
         return Ok(proposed);
     };
+    validate_target_provenance(existing, placement, management_namespace)?;
     if existing.namespace != proposed.namespace {
         return Err(SandboxProvenanceError::NamespaceChanged);
     }
@@ -594,6 +811,16 @@ pub fn merge_target_provenance(
             "childClusterInstance",
             &existing.child_cluster_instance,
             proposed.child_cluster_instance,
+        )?,
+        child_cluster_kubeconfig_secret: merge_reference(
+            "childClusterKubeconfigSecret",
+            &existing.child_cluster_kubeconfig_secret,
+            proposed.child_cluster_kubeconfig_secret,
+        )?,
+        child_cluster_kubeconfig_sha256: merge_string(
+            "childClusterKubeconfigSha256",
+            &existing.child_cluster_kubeconfig_sha256,
+            proposed.child_cluster_kubeconfig_sha256,
         )?,
         sandbox_template: merge_reference(
             "sandboxTemplate",
@@ -612,6 +839,7 @@ pub fn merge_target_provenance(
         )?,
         sandbox: merge_reference("sandbox", &existing.sandbox, proposed.sandbox)?,
         pod: merge_reference("pod", &existing.pod, proposed.pod)?,
+        service: merge_reference("service", &existing.service, proposed.service)?,
     })
 }
 
@@ -647,9 +875,19 @@ fn validate_target_provenance(
     match placement {
         ResolvedSandboxPlacement::Management {}
             if provenance.child_cluster_lease.is_some()
-                || provenance.child_cluster_instance.is_some() =>
+                || provenance.child_cluster_instance.is_some()
+                || provenance.child_cluster_kubeconfig_secret.is_some()
+                || provenance.child_cluster_kubeconfig_sha256.is_some() =>
         {
             return Err(SandboxProvenanceError::UnexpectedChildReference);
+        }
+        ResolvedSandboxPlacement::ChildCluster { .. }
+            if provenance.namespace != CHILD_SANDBOX_NAMESPACE =>
+        {
+            return Err(SandboxProvenanceError::InvalidReference {
+                field: "namespace",
+                reason: "child target namespace does not match Kobe's fixed child namespace",
+            });
         }
         ResolvedSandboxPlacement::Management {} | ResolvedSandboxPlacement::ChildCluster { .. } => {
         }
@@ -671,6 +909,14 @@ fn validate_target_provenance(
             "ClusterInstance",
             Some(management_namespace),
             true,
+        ),
+        (
+            "childClusterKubeconfigSecret",
+            &provenance.child_cluster_kubeconfig_secret,
+            CORE_API_VERSION,
+            "Secret",
+            Some(management_namespace),
+            false,
         ),
         (
             "sandboxTemplate",
@@ -712,6 +958,14 @@ fn validate_target_provenance(
             Some(provenance.namespace.as_str()),
             false,
         ),
+        (
+            "service",
+            &provenance.service,
+            CORE_API_VERSION,
+            "Service",
+            Some(provenance.namespace.as_str()),
+            false,
+        ),
     ] {
         if let Some(reference) = reference {
             validate_reference(
@@ -722,6 +976,45 @@ fn validate_target_provenance(
                 target_namespace,
                 generation_required,
             )?;
+        }
+    }
+    match (
+        provenance.child_cluster_kubeconfig_secret.as_ref(),
+        provenance.child_cluster_kubeconfig_sha256.as_deref(),
+    ) {
+        (Some(secret), Some(digest)) => {
+            let Some(instance) = provenance.child_cluster_instance.as_ref() else {
+                return Err(SandboxProvenanceError::InvalidReference {
+                    field: "childClusterKubeconfigSecret",
+                    reason: "credential Secret requires a recorded child instance",
+                });
+            };
+            if secret.name != format!("{}-kubeconfig", instance.name)
+                || secret.namespace != instance.namespace
+                || secret.generation.is_some()
+            {
+                return Err(SandboxProvenanceError::InvalidReference {
+                    field: "childClusterKubeconfigSecret",
+                    reason: "credential Secret does not match the recorded child instance",
+                });
+            }
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(SandboxProvenanceError::InvalidReference {
+                    field: "childClusterKubeconfigSha256",
+                    reason: "credential payload digest is not lowercase SHA-256",
+                });
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(SandboxProvenanceError::InvalidReference {
+                field: "childClusterKubeconfigSecret",
+                reason: "credential Secret identity and payload digest must be recorded together",
+            });
         }
     }
     Ok(())
@@ -789,6 +1082,19 @@ fn merge_reference(
     }
 }
 
+fn merge_string(
+    field: &'static str,
+    existing: &Option<String>,
+    proposed: Option<String>,
+) -> Result<Option<String>, SandboxProvenanceError> {
+    match (existing, proposed) {
+        (None, proposed) => Ok(proposed),
+        (Some(_), None) => Err(SandboxProvenanceError::ReferenceCleared(field)),
+        (Some(current), Some(proposed)) if current == &proposed => Ok(Some(current.clone())),
+        (Some(_), Some(_)) => Err(SandboxProvenanceError::ReferenceChanged(field)),
+    }
+}
+
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum SandboxProvenanceError {
     #[error("Sandbox placement has not been resolved; no backend fallback is permitted")]
@@ -808,6 +1114,29 @@ pub enum SandboxProvenanceError {
     },
     #[error("management placement cannot record child-cluster references")]
     UnexpectedChildReference,
+    #[error("resolved Sandbox placement has no target provenance")]
+    MissingTargetProvenance,
+    #[error("childCluster placement requires exact lease and instance provenance")]
+    IncompleteChildProvenance,
+}
+
+/// Compute the absolute setup bound from the API-server creation timestamp.
+///
+/// Admission and reconciliation share this helper so neither can reset the
+/// clock after queueing, controller downtime, or a missing pool.
+pub fn sandbox_provisioning_deadline(
+    accepted_at: DateTime<Utc>,
+    provisioning_timeout: chrono::Duration,
+) -> Result<String, SandboxLifecycleError> {
+    if provisioning_timeout <= chrono::Duration::zero() {
+        return Err(SandboxLifecycleError::InvalidDuration(
+            "provisioning timeout",
+        ));
+    }
+    let deadline = accepted_at
+        .checked_add_signed(provisioning_timeout)
+        .ok_or(SandboxLifecycleError::TimestampOverflow)?;
+    Ok(deadline.to_rfc3339_opts(SecondsFormat::AutoSi, true))
 }
 
 /// Start bounded provisioning from the lease creation timestamp. Retrying with
@@ -818,15 +1147,17 @@ pub fn begin_sandbox_provisioning(
     accepted_at: DateTime<Utc>,
     provisioning_timeout: chrono::Duration,
 ) -> Result<SandboxLeaseStatus, SandboxLifecycleError> {
-    if provisioning_timeout <= chrono::Duration::zero() {
-        return Err(SandboxLifecycleError::InvalidDuration(
-            "provisioning timeout",
+    let deadline = sandbox_provisioning_deadline(accepted_at, provisioning_timeout)?;
+
+    if status
+        .provisioning_deadline
+        .as_deref()
+        .is_some_and(|persisted| persisted != deadline)
+    {
+        return Err(SandboxLifecycleError::PersistedTimestampChanged(
+            "provisioningDeadline",
         ));
     }
-    let deadline = accepted_at
-        .checked_add_signed(provisioning_timeout)
-        .ok_or(SandboxLifecycleError::TimestampOverflow)?
-        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
     if status.phase == SandboxLeasePhase::Provisioning {
         if status.provisioning_deadline.as_deref() == Some(deadline.as_str())
@@ -871,8 +1202,18 @@ pub fn mark_sandbox_ready(
         return Err(SandboxLifecycleError::ProvisioningDeadlineElapsed);
     }
     let ready_at_string = ready_at.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+    // One derivation, one writer. Granted extensions are an INPUT here rather
+    // than a competing write of `expiresAt`, so this stays idempotent across
+    // requeues and the caller's extension reaches the upstream backstop the
+    // controller stamps from the value returned below.
+    let granted = chrono::Duration::try_seconds(status.granted_extension_seconds)
+        .ok_or(SandboxLifecycleError::TimestampOverflow)?;
+    if granted < chrono::Duration::zero() {
+        return Err(SandboxLifecycleError::InvalidDuration("granted extension"));
+    }
     let expires_at = ready_at
         .checked_add_signed(runtime_ttl)
+        .and_then(|value| value.checked_add_signed(granted))
         .ok_or(SandboxLifecycleError::TimestampOverflow)?
         .to_rfc3339_opts(SecondsFormat::AutoSi, true);
 
@@ -935,8 +1276,10 @@ pub fn transition_sandbox_phase(
             | (SandboxLeasePhase::Releasing, SandboxLeasePhase::Released)
             | (SandboxLeasePhase::Releasing, SandboxLeasePhase::Expired)
             | (SandboxLeasePhase::Releasing, SandboxLeasePhase::Quarantined)
-            | (SandboxLeasePhase::Quarantined, SandboxLeasePhase::Released)
-            | (SandboxLeasePhase::Quarantined, SandboxLeasePhase::Expired)
+            // Quarantine is a retryable evidence hold, not an operator-only
+            // tomb. A retry may resume teardown, but quota still cannot move
+            // until the ordinary cleanup proof gate succeeds.
+            | (SandboxLeasePhase::Quarantined, SandboxLeasePhase::Releasing)
     );
     if allowed {
         Ok(next)
@@ -972,8 +1315,9 @@ pub enum SandboxLifecycleError {
 mod tests {
     use super::*;
     use crate::crd::{
-        SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary, SandboxIsolation,
-        SandboxPlacement, SandboxPortSpec, SandboxReadinessRequirements, SandboxResourceQuantity,
+        SandboxCondition, SandboxContainerResources, SandboxContainerSpec, SandboxExecutionCanary,
+        SandboxIsolation, SandboxPlacement, SandboxPoolStatus, SandboxPortSpec,
+        SandboxReadinessRequirements, SandboxResourceQuantity,
     };
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
@@ -1008,6 +1352,7 @@ mod tests {
                     container: "agent".into(),
                     port: 3000,
                 }],
+                runner_path: None,
             },
             isolation: SandboxIsolation::Gvisor {
                 runtime_class_name: "runsc".into(),
@@ -1030,6 +1375,165 @@ mod tests {
             controller: Some(true),
             block_owner_deletion: Some(true),
         }
+    }
+
+    fn pool_resource(status: Option<SandboxPoolStatus>) -> SandboxPool {
+        SandboxPool {
+            metadata: ObjectMeta {
+                name: Some("agents".into()),
+                namespace: Some("kobe".into()),
+                uid: Some("pool-uid".into()),
+                generation: Some(3),
+                ..Default::default()
+            },
+            spec: pool(),
+            status,
+        }
+    }
+
+    fn ready_condition(
+        status: SandboxConditionStatus,
+        observed_generation: Option<i64>,
+    ) -> SandboxCondition {
+        SandboxCondition {
+            condition_type: "Ready".into(),
+            status,
+            reason: "Certified".into(),
+            message: "all required certification gates passed".into(),
+            observed_generation,
+            last_transition_time: Some("2026-08-20T00:00:00Z".into()),
+        }
+    }
+
+    fn pool_certification(generation: i64) -> crate::crd::SandboxPoolCertificationStatus {
+        let object = |kind: &str, uid: &str| SandboxObjectReference {
+            api_version: if matches!(kind, "Pod" | "ConfigMap") {
+                "v1".into()
+            } else if kind == "Sandbox" {
+                "agents.x-k8s.io/v1beta1".into()
+            } else {
+                AGENT_SANDBOX_API_VERSION.into()
+            },
+            kind: kind.into(),
+            namespace: Some("targets".into()),
+            name: format!("cert-{}", kind.to_ascii_lowercase()),
+            uid: uid.into(),
+            generation: Some(1),
+        };
+        crate::crd::SandboxPoolCertificationStatus {
+            fingerprint: "a".repeat(64),
+            observed_generation: generation,
+            phase: crate::crd::SandboxPoolCertificationPhase::Certified,
+            sandbox_template: object("SandboxTemplate", "template-uid"),
+            sandbox_warm_pool: object("SandboxWarmPool", "warm-pool-uid"),
+            sandbox_claim: Some(object("SandboxClaim", "claim-uid")),
+            sandbox: Some(object("Sandbox", "sandbox-uid")),
+            pod: Some(object("Pod", "pod-uid")),
+            service: None,
+            persistent_volume_claims: vec![],
+            persistent_volumes: vec![],
+            teardown_fence: Some(object("ConfigMap", "fence-uid")),
+            baseline_idle_sandbox_uids: vec![],
+            drain_generation: Some(2),
+            replenish_generation: Some(3),
+            canary_passed_at: Some("2026-08-20T00:00:00Z".into()),
+            certified_at: Some("2026-08-20T00:01:00Z".into()),
+            message: None,
+        }
+    }
+
+    /// Admission authority comes only from a current-generation Ready=True
+    /// certificate; capacity counts and stale conditions cannot substitute.
+    #[test]
+    fn sandbox_pool_readiness_certificate_fails_closed() {
+        let certified = pool_resource(Some(SandboxPoolStatus {
+            observed_generation: Some(3),
+            ready: 2,
+            allocated: 1,
+            quarantined: 0,
+            placement_authority: None,
+            certification: Some(pool_certification(3)),
+            conditions: vec![ready_condition(SandboxConditionStatus::True, Some(3))],
+        }));
+        assert_eq!(require_current_sandbox_pool_ready(&certified), Ok(()));
+
+        let mut receiptless = certified.clone();
+        receiptless.status.as_mut().unwrap().certification = None;
+        assert_eq!(
+            require_current_sandbox_pool_ready(&receiptless),
+            Err(SandboxPoolReadinessError::MissingCertification)
+        );
+
+        let mut stale_receipt = certified.clone();
+        stale_receipt
+            .status
+            .as_mut()
+            .unwrap()
+            .certification
+            .as_mut()
+            .unwrap()
+            .observed_generation = 2;
+        assert!(matches!(
+            require_current_sandbox_pool_ready(&stale_receipt),
+            Err(SandboxPoolReadinessError::StaleCertification { .. })
+        ));
+
+        let missing_status = pool_resource(None);
+        assert_eq!(
+            require_current_sandbox_pool_ready(&missing_status),
+            Err(SandboxPoolReadinessError::MissingStatus)
+        );
+
+        let mut stale_status = certified.clone();
+        stale_status.status.as_mut().unwrap().observed_generation = Some(2);
+        assert!(matches!(
+            require_current_sandbox_pool_ready(&stale_status),
+            Err(SandboxPoolReadinessError::StaleStatus { .. })
+        ));
+
+        let mut missing_condition = certified.clone();
+        missing_condition
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .clear();
+        assert_eq!(
+            require_current_sandbox_pool_ready(&missing_condition),
+            Err(SandboxPoolReadinessError::MissingReadyCondition)
+        );
+
+        for status in [
+            SandboxConditionStatus::False,
+            SandboxConditionStatus::Unknown,
+        ] {
+            let mut not_ready = certified.clone();
+            not_ready.status.as_mut().unwrap().conditions = vec![ready_condition(status, Some(3))];
+            assert!(matches!(
+                require_current_sandbox_pool_ready(&not_ready),
+                Err(SandboxPoolReadinessError::NotReady { .. })
+            ));
+        }
+
+        let mut stale_condition = certified.clone();
+        stale_condition.status.as_mut().unwrap().conditions =
+            vec![ready_condition(SandboxConditionStatus::True, Some(2))];
+        assert!(matches!(
+            require_current_sandbox_pool_ready(&stale_condition),
+            Err(SandboxPoolReadinessError::StaleReadyCondition { .. })
+        ));
+
+        let mut duplicate = certified;
+        duplicate
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(ready_condition(SandboxConditionStatus::True, Some(3)));
+        assert_eq!(
+            require_current_sandbox_pool_ready(&duplicate),
+            Err(SandboxPoolReadinessError::DuplicateReadyCondition)
+        );
     }
 
     fn reference(kind: &str, name: &str, uid: &str) -> SandboxObjectReference {
@@ -1059,11 +1563,14 @@ mod tests {
             namespace: "targets".into(),
             child_cluster_lease: None,
             child_cluster_instance: None,
+            child_cluster_kubeconfig_secret: None,
+            child_cluster_kubeconfig_sha256: None,
             sandbox_template: Some(reference("SandboxTemplate", "agents", "template-uid")),
             sandbox_warm_pool: None,
             sandbox_claim: claim,
             sandbox: None,
             pod: None,
+            service: None,
         }
     }
 
@@ -1082,6 +1589,35 @@ mod tests {
         assert_eq!(
             value["spec"]["podTemplate"]["spec"]["automountServiceAccountToken"],
             false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["enableServiceLinks"],
+            false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsUser"],
+            65_532
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsGroup"],
+            65_532
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["runAsNonRoot"],
+            true
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["securityContext"]["seccompProfile"]["type"],
+            "RuntimeDefault"
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(
+            value["spec"]["podTemplate"]["spec"]["containers"][0]["securityContext"]["capabilities"]
+                ["drop"],
+            serde_json::json!(["ALL"])
         );
         assert_eq!(value["spec"]["envVarsInjectionPolicy"], "Disallowed");
         assert_eq!(value["spec"]["volumeClaimTemplatesPolicy"], "Disallowed");
@@ -1118,17 +1654,44 @@ mod tests {
     }
 
     #[test]
-    fn claim_projection_starts_ttl_only_after_ready() {
+    fn claim_projection_bounds_provisioning_then_starts_runtime_ttl_at_ready() {
+        let provisioning_deadline = DateTime::parse_from_rfc3339("2026-08-10T10:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let expires_at = DateTime::parse_from_rfc3339("2026-08-10T12:34:56Z")
             .unwrap()
             .with_timezone(&Utc);
-        let value = serde_json::to_value(build_sandbox_claim("lease-a", "targets", "agents", None))
-            .unwrap();
+        let value = serde_json::to_value(build_sandbox_claim(
+            "claim-a",
+            "targets",
+            "agents",
+            "lease-uid-a",
+            provisioning_deadline,
+            true,
+            None,
+        ))
+        .unwrap();
 
         assert_eq!(value["apiVersion"], AGENT_SANDBOX_API_VERSION);
         assert_eq!(value["kind"], SANDBOX_CLAIM_KIND);
         assert_eq!(value["spec"]["warmPoolRef"]["name"], "agents");
-        assert!(value["spec"]["lifecycle"].get("shutdownTime").is_none());
+        assert_eq!(
+            value["metadata"]["labels"][SANDBOX_LEASE_UID_LABEL],
+            "lease-uid-a"
+        );
+        assert!(
+            value["metadata"].get("ownerReferences").is_none(),
+            "a management claim must survive outer-lease GC until explicit proof"
+        );
+        assert_eq!(
+            value["metadata"]["finalizers"],
+            serde_json::json!([SANDBOX_CLAIM_CLEANUP_FINALIZER]),
+            "a management claim must not disappear before its UID checkpoint"
+        );
+        assert_eq!(
+            value["spec"]["lifecycle"]["shutdownTime"],
+            "2026-08-10T10:10:00Z"
+        );
         assert_eq!(
             value["spec"]["lifecycle"]["shutdownPolicy"],
             "DeleteForeground"
@@ -1154,6 +1717,42 @@ mod tests {
         ] {
             assert!(value["spec"].get(forbidden).is_none(), "found {forbidden}");
         }
+    }
+
+    /// A child claim may remain owned by its same-cluster Namespace. That
+    /// owner cannot race deletion of the outer management-cluster lease.
+    #[test]
+    fn child_claim_can_be_owned_by_its_remote_namespace() {
+        let owner = OwnerReference {
+            api_version: "v1".into(),
+            kind: "Namespace".into(),
+            name: "kobe-sandbox".into(),
+            uid: "namespace-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let value = serde_json::to_value(build_sandbox_claim(
+            "claim-a",
+            "targets",
+            "agents",
+            "lease-uid-a",
+            DateTime::parse_from_rfc3339("2026-08-10T10:10:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            false,
+            Some(&owner),
+        ))
+        .unwrap();
+
+        assert_eq!(value["metadata"]["ownerReferences"][0]["kind"], "Namespace");
+        assert_eq!(
+            value["metadata"]["ownerReferences"][0]["uid"],
+            "namespace-uid"
+        );
+        assert!(
+            value["metadata"].get("finalizers").is_none(),
+            "the remote Namespace already owns child-Claim cleanup"
+        );
     }
 
     #[test]
@@ -1343,6 +1942,26 @@ mod tests {
             Err(SandboxProvenanceError::ReferenceCleared("sandboxClaim"))
         );
 
+        let mut with_service = enriched.clone();
+        with_service.service = Some(SandboxObjectReference {
+            api_version: CORE_API_VERSION.into(),
+            kind: "Service".into(),
+            namespace: Some("targets".into()),
+            name: "sandbox-service".into(),
+            uid: "service-uid".into(),
+            generation: None,
+        });
+        assert_eq!(
+            merge_target_provenance(Some(&enriched), with_service.clone(), &placement, "kobe"),
+            Ok(with_service.clone())
+        );
+        let mut reused_service = with_service.clone();
+        reused_service.service.as_mut().unwrap().uid = "replacement-service-uid".into();
+        assert_eq!(
+            merge_target_provenance(Some(&with_service), reused_service, &placement, "kobe"),
+            Err(SandboxProvenanceError::ReferenceChanged("service"))
+        );
+
         let mut moved = enriched.clone();
         moved.namespace = "other".into();
         assert_eq!(
@@ -1359,6 +1978,77 @@ mod tests {
             merge_target_provenance(None, wrong_gvk, &placement, "kobe"),
             Err(SandboxProvenanceError::InvalidReference {
                 field: "sandboxClaim",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn child_kubeconfig_uid_and_payload_digest_are_one_monotonic_checkpoint() {
+        let placement = ResolvedSandboxPlacement::ChildCluster {
+            cluster_pool: cluster_pool_reference("kobe"),
+        };
+        let instance = SandboxObjectReference {
+            api_version: KOBE_API_VERSION.into(),
+            kind: "ClusterInstance".into(),
+            namespace: Some("kobe".into()),
+            name: "kobe-child".into(),
+            uid: "instance-uid".into(),
+            generation: Some(1),
+        };
+        let mut target = SandboxTargetProvenance {
+            namespace: CHILD_SANDBOX_NAMESPACE.into(),
+            child_cluster_lease: None,
+            child_cluster_instance: Some(instance),
+            child_cluster_kubeconfig_secret: Some(SandboxObjectReference {
+                api_version: CORE_API_VERSION.into(),
+                kind: "Secret".into(),
+                namespace: Some("kobe".into()),
+                name: "kobe-child-kubeconfig".into(),
+                uid: "secret-uid".into(),
+                generation: None,
+            }),
+            child_cluster_kubeconfig_sha256: Some("a".repeat(64)),
+            sandbox_template: None,
+            sandbox_warm_pool: None,
+            sandbox_claim: None,
+            sandbox: None,
+            pod: None,
+            service: None,
+        };
+        assert_eq!(
+            merge_target_provenance(Some(&target), target.clone(), &placement, "kobe"),
+            Ok(target.clone())
+        );
+
+        let mut changed = target.clone();
+        changed.child_cluster_kubeconfig_sha256 = Some("b".repeat(64));
+        assert_eq!(
+            merge_target_provenance(Some(&target), changed, &placement, "kobe"),
+            Err(SandboxProvenanceError::ReferenceChanged(
+                "childClusterKubeconfigSha256"
+            ))
+        );
+
+        let mut noncanonical = target.clone();
+        noncanonical
+            .child_cluster_kubeconfig_secret
+            .as_mut()
+            .unwrap()
+            .generation = Some(1);
+        assert!(matches!(
+            merge_target_provenance(None, noncanonical, &placement, "kobe"),
+            Err(SandboxProvenanceError::InvalidReference {
+                field: "childClusterKubeconfigSecret",
+                ..
+            })
+        ));
+
+        target.child_cluster_kubeconfig_sha256 = None;
+        assert!(matches!(
+            merge_target_provenance(None, target, &placement, "kobe"),
+            Err(SandboxProvenanceError::InvalidReference {
+                field: "childClusterKubeconfigSecret",
                 ..
             })
         ));
@@ -1386,10 +2076,56 @@ mod tests {
         assert!(provisioning.ready_at.is_none());
         assert!(provisioning.expires_at.is_none());
 
+        let mut stamped = SandboxLeaseStatus {
+            provisioning_deadline: Some("2026-08-10T10:10:00Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            begin_sandbox_provisioning(&stamped, 2, accepted_at, chrono::Duration::minutes(10),)
+                .unwrap()
+                .provisioning_deadline,
+            stamped.provisioning_deadline
+        );
+        stamped.provisioning_deadline = Some("2026-08-10T10:11:00Z".into());
+        assert_eq!(
+            begin_sandbox_provisioning(&stamped, 2, accepted_at, chrono::Duration::minutes(10),),
+            Err(SandboxLifecycleError::PersistedTimestampChanged(
+                "provisioningDeadline"
+            ))
+        );
+
         let ready =
             mark_sandbox_ready(&provisioning, 2, ready_at, chrono::Duration::hours(1)).unwrap();
         assert_eq!(ready.ready_at.as_deref(), Some("2026-08-10T10:03:00Z"));
         assert_eq!(ready.expires_at.as_deref(), Some("2026-08-10T11:03:00Z"));
+
+        // A granted extension is an INPUT to this derivation, so re-running the
+        // Ready transition over an extended lease is idempotent. It used to be
+        // a second write of `expiresAt`, which made every later pass fail as a
+        // changed timestamp - so the controller requeued forever and never
+        // re-stamped the upstream shutdown backstop, letting upstream destroy
+        // the workload at its ORIGINAL deadline while the lease advertised the
+        // extended one.
+        let mut extended = ready.clone();
+        extended.granted_extension_seconds = 1800;
+        extended.expires_at = Some("2026-08-10T11:33:00Z".into());
+        let reconciled =
+            mark_sandbox_ready(&extended, 2, ready_at, chrono::Duration::hours(1)).unwrap();
+        assert_eq!(
+            reconciled.expires_at.as_deref(),
+            Some("2026-08-10T11:33:00Z")
+        );
+
+        // And an expiry that does NOT match the derivation is still refused,
+        // so the guard against an out-of-band writer is not weakened by it.
+        let mut forged = extended.clone();
+        forged.expires_at = Some("2026-08-10T12:33:00Z".into());
+        assert_eq!(
+            mark_sandbox_ready(&forged, 2, ready_at, chrono::Duration::hours(1)),
+            Err(SandboxLifecycleError::PersistedTimestampChanged(
+                "readyAt/expiresAt"
+            ))
+        );
         assert_eq!(
             transition_sandbox_phase(
                 SandboxLeasePhase::Releasing,
@@ -1404,7 +2140,18 @@ mod tests {
                 SandboxLeasePhase::Released,
                 true,
             ),
-            Ok(SandboxLeasePhase::Released)
+            Err(SandboxLifecycleError::InvalidTransition {
+                current: SandboxLeasePhase::Quarantined,
+                next: SandboxLeasePhase::Released,
+            })
+        );
+        assert_eq!(
+            transition_sandbox_phase(
+                SandboxLeasePhase::Quarantined,
+                SandboxLeasePhase::Releasing,
+                false,
+            ),
+            Ok(SandboxLeasePhase::Releasing)
         );
     }
 }

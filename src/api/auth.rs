@@ -757,6 +757,7 @@ fn access_rule_to_policy(rule: &AccessRule) -> crate::api::policy::Policy {
                 verbs: grant.verbs.clone(),
                 max_ttl,
                 max_concurrent_leases: grant.max_concurrent_leases,
+                max_extensions: grant.max_extensions,
                 resource_ceiling: grant.resource_ceiling.clone(),
             })
         }),
@@ -1210,6 +1211,7 @@ mod tests {
                 ],
                 max_ttl: "30m".into(),
                 max_concurrent_leases: 3,
+                max_extensions: 2,
                 resource_ceiling: crate::crd::SandboxResourceCeiling {
                     max_cpu: "2".into(),
                     max_memory: "4Gi".into(),
@@ -1245,6 +1247,7 @@ mod tests {
                 verbs: vec![crate::crd::SandboxVerb::Lease],
                 max_ttl: "invalid".into(),
                 max_concurrent_leases: 3,
+                max_extensions: 2,
                 resource_ceiling: crate::crd::SandboxResourceCeiling {
                     max_cpu: "2".into(),
                     max_memory: "4Gi".into(),

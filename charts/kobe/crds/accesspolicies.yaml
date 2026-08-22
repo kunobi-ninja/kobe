@@ -179,6 +179,20 @@ spec:
                           format: uint32
                           minimum: 0.0
                           type: integer
+                        maxExtensions:
+                          default: 2
+                          description: |-
+                            Maximum runtime TTL extensions per Sandbox lease.
+
+                            An extension can never move expiry past `max_ttl` measured from
+                            readiness — the same ceiling the caller could have asked for at
+                            creation — so this bounds how *incrementally* that ceiling is reached,
+                            not how much runtime is available. Set `0` to forbid extension
+                            outright, which is the way to require callers to commit to a TTL up
+                            front.
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
                         maxTtl:
                           description: Maximum runtime TTL, starting only once the Sandbox is Ready.
                           minLength: 1

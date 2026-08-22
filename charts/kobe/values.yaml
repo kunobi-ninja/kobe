@@ -26,6 +26,15 @@ operatorNamespace: "kunobi-pool"
 # teardown may leave the database and role behind. They are harmless
 # (CONNECT is revoked from PUBLIC) but they accumulate.
 #
+# COORDINATION BOUNDARY. kobe always connects its administrative/DDL pool to
+# the `postgres` database, regardless of the path in this URL; that database
+# must exist and accept this credential or initial connection/reload is rejected.
+# The endpoint must resolve to one authoritative writable primary, never a
+# load-balanced read replica or multi-primary set. PostgreSQL advisory locks are
+# database/session-local and are not replicated through WAL. Connect directly or
+# use PgBouncer session pooling; transaction/statement pooling is unsupported
+# because it does not preserve the physical PostgreSQL session holding the lock.
+#
 # UPGRADE NOTE. Clusters provisioned before per-cluster roles existed still
 # hold the shared admin credential in their control-plane configuration, and
 # that credential reaches any other cluster's database. Recycle datastore-backed
@@ -54,6 +63,28 @@ serviceAccount:
   name: ""
   annotations: {}
 
+# Runs read-only teardown attestation and proof publication under a distinct
+# ServiceAccount and admission identity. Ordinary lifecycle remains in the
+# control-plane deployment.
+teardownAuthority:
+  # Run teardown-proof authority as a SEPARATE process with its own identity,
+  # so a compromised control plane cannot forge evidence that a cluster or
+  # sandbox was really destroyed.
+  #
+  # Default OFF. The split is not finished: the two ValidatingAdmissionPolicies
+  # the authority requires at startup are not rendered by this chart and its
+  # ServiceAccount has no RBAC, so enabling it CrashLoops the authority pod -
+  # and, worse, setting KOBE_PROCESS_ROLE=control-plane on the operator turns
+  # OFF the in-process authority that does work today, taking VerifiedDestroy
+  # and every childCluster sandbox with it. Turn this on only once the
+  # policies and RBAC ship.
+  separate: false
+  replicas: 1
+  # Pull secrets and the optional PostgreSQL URL Secret must exist in the
+  # dedicated authority namespace, not in the release namespace.
+  imagePullSecrets: []
+  postgresUrlSecretName: ""
+
 poolServiceAccount: ""
 poolPublisherServiceAccount: ""
 
@@ -78,6 +109,44 @@ containerSecurityContext:
 # Cluster-side defense-in-depth policies. These are opt-in because they
 # require Kubernetes features that may not be available in every cluster
 # (ValidatingAdmissionPolicy is GA in K8s 1.30+).
+# Upstream Agent Sandbox runtime (kubernetes-sigs/agent-sandbox).
+#
+# Kobe consumes SandboxTemplate / SandboxWarmPool / SandboxClaim from that
+# project. This selects how the runtime gets there.
+#
+#   disabled  (default) Sandbox features are off. Nothing is validated and no
+#             Sandbox API is served, so an upgrade never starts depending on a
+#             runtime you have not installed.
+#
+#   external  You install and upgrade Agent Sandbox v0.5.6 before enabling this
+#             mode. Kobe owns none of that installation and performs read-only
+#             API/schema compatibility checks. Child clusters may use a generic
+#             operator-authored BootstrapConfig explicitly referenced by their
+#             ClusterPool; Kobe does not ship or inject an installer.
+agentSandbox:
+  mode: disabled
+  # Aggregate object ceiling across every caller. This namespace contains only
+  # admission tokens plus distributed operation gates/principal ledgers, so
+  # the quota cannot starve unrelated leader elections. Each live Sandbox can
+  # add one gate and each principal with active operations one ledger. Four is
+  # the minimum useful ceiling: gate + quota + optional alias + principal.
+  reservationObjectLimit: 4096
+  # How long a SandboxLease that reached a clean terminal phase (`Released` or
+  # `Expired`) is kept before the record is deleted. Those phases stop
+  # consuming capacity when they are written, so this is not about reclaiming
+  # anything — it bounds the one-object-per-Sandbox-ever-leased growth of etcd,
+  # and it costs the audit record of who held what and whether cleanup was
+  # proven. Set it to however long you would want to be able to answer that
+  # question after the fact.
+  #
+  # `Quarantined` leases are NEVER retired by this sweep, at any window. That
+  # phase is what withholds a slot whose teardown nobody could prove; deleting
+  # it would hand the slot back on no evidence and take the record with it.
+  #
+  # Units are h/m/s (there is no `d`). Values under 1h are clamped to 1h, and
+  # anything unparseable falls back to the default rather than to zero.
+  leaseRetention: 168h
+
 clusterPolicies:
   # Restricts the operator's namespace deletion permission (granted
   # broadly by the ClusterRole, since RBAC cannot pattern-match names)

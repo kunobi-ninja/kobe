@@ -35,6 +35,50 @@ spec:
                 minLength: 1
                 nullable: true
                 type: string
+              placementAuthority:
+                description: |-
+                  Server-owned exact child `ClusterPool` identity copied from the admitted
+                  [`SandboxPoolStatus`]. It is absent for management placement and may not
+                  be added, removed, or changed after the `SandboxLease` CREATE. During a
+                  rolling controller upgrade, replicas built before this field fail to
+                  deserialize such leases and therefore fail closed; deploy the new reader
+                  before any child admission is enabled.
+                nullable: true
+                properties:
+                  apiVersion:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  kind:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  namespace:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  uid:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - generation
+                - kind
+                - name
+                - namespace
+                - uid
+                type: object
               poolRef:
                 description: |-
                   Exact SandboxPool admitted by Kobe. UID and generation fence pool
@@ -50,6 +94,7 @@ spec:
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   uid:
+                    maxLength: 128
                     minLength: 1
                     type: string
                 required:
@@ -93,15 +138,131 @@ spec:
           status:
             nullable: true
             properties:
+              allocationFence:
+                description: |-
+                  Exact management-cluster coordination `Lease` that closes allocation
+                  before teardown begins. Create paths must observe its absence inside a
+                  bounded final authorization window; release drains that window before
+                  it may checkpoint footprint absence.
+                nullable: true
+                properties:
+                  apiVersion:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  kind:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  namespace:
+                    maxLength: 63
+                    minLength: 1
+                    nullable: true
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  uid:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                - uid
+                type: object
+              childTeardownEvidence:
+                description: |-
+                  Exact immutable authority object copied in the same status checkpoint
+                  as [`Self::child_teardown_receipt_acknowledgement`]. A hash alone is not
+                  enough to release the producer's retained handle.
+                nullable: true
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  resourceVersion:
+                    minLength: 1
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - generation
+                - name
+                - resourceVersion
+                - uid
+                type: object
+              childTeardownMode:
+                description: |-
+                  Durable ordering proof selected before a bound child `ClusterLease` is
+                  released. The value is write-once: a restart must never reinterpret the
+                  same in-flight destroy as a successful reachable cleanup.
+                enum:
+                - ReachableCleanupV1
+                - VerifiedDestroyFallbackV1
+                nullable: true
+                type: string
+              childTeardownReceiptAcknowledgement:
+                description: |-
+                  Durable consumer acknowledgement of the exact internal ClusterLease
+                  teardown receipt. This is the receipt's SHA-256 acknowledgement token,
+                  written atomically with `FootprintAbsent=True` before the producer is
+                  ACKed or allowed to discard its full receipt bytes.
+                maxLength: 71
+                minLength: 71
+                nullable: true
+                pattern: ^sha256:[0-9a-f]{64}$
+                type: string
+              childUnboundReleaseProof:
+                description: |-
+                  Attempt-bound proof used when the internal ClusterLease reached a
+                  terminal phase before any reciprocal ClusterInstance binding existed.
+                  It is copied before the receipt authority acknowledges the child.
+                nullable: true
+                properties:
+                  attemptId:
+                    minLength: 1
+                    type: string
+                  verifiedAt:
+                    format: date-time
+                    type: string
+                required:
+                - attemptId
+                - verifiedAt
+                type: object
+              claimCleanupFence:
+                description: Durable management-Claim deletion fence understood by this controller.
+                enum:
+                - AdmissionOnlyV1
+                - FinalizerV1
+                nullable: true
+                type: string
               conditions:
                 items:
-                  description: Kubernetes-style condition with the generation from which it was derived.
+                  description: |-
+                    Kubernetes-style condition with the generation from which it was derived.
+                    Status lists are capped because CEL lifecycle proofs scan them on every
+                    status write.
                   properties:
                     lastTransitionTime:
                       format: date-time
                       nullable: true
                       type: string
                     message:
+                      maxLength: 32768
                       type: string
                     observedGeneration:
                       format: int64
@@ -109,6 +270,7 @@ spec:
                       nullable: true
                       type: integer
                     reason:
+                      maxLength: 128
                       type: string
                     status:
                       description: Kubernetes Condition status values.
@@ -118,6 +280,8 @@ spec:
                       - Unknown
                       type: string
                     type:
+                      maxLength: 63
+                      minLength: 1
                       type: string
                   required:
                   - message
@@ -125,6 +289,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
@@ -134,6 +299,33 @@ spec:
                 format: date-time
                 nullable: true
                 type: string
+              extensionsCount:
+                default: 0
+                description: |-
+                  Runtime TTL extensions already granted to this lease.
+
+                  Monotonic and never reset: the budget is spent per lease, not per
+                  reconcile or per API replica. Absent on leases admitted before
+                  extension existed, which reads as zero.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              grantedExtensionSeconds:
+                default: 0
+                description: |-
+                  Total granted extension, in seconds, added to the derived expiry.
+
+                  Expiry has exactly ONE derivation, `readyAt + spec.ttl + this`, and the
+                  lifecycle controller recomputes it on every Ready pass. Extension
+                  therefore moves this INPUT rather than writing `expiresAt` behind the
+                  controller's back: a second writer of a derived value made the Ready
+                  transition non-idempotent, so the controller rejected every later
+                  reconcile and stopped re-asserting the upstream shutdown backstop,
+                  leaving the workload to be destroyed at its original deadline while the
+                  lease still advertised the extended one.
+                format: int64
+                minimum: 0.0
+                type: integer
               observedGeneration:
                 format: int64
                 minimum: 0.0
@@ -157,9 +349,13 @@ spec:
                 nullable: true
                 properties:
                   clusterPool:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -168,16 +364,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -206,6 +407,61 @@ spec:
                 format: date-time
                 nullable: true
                 type: string
+              releaseCause:
+                description: |-
+                  Immutable reason the lease first entered `Releasing`. Persisted in the
+                  same status write as that phase so retries, later release requests, and
+                  controller restarts cannot change the terminal accounting outcome.
+                enum:
+                - Requested
+                - RuntimeTtl
+                - ProvisioningDeadline
+                - ModeDisabled
+                - null
+                nullable: true
+                type: string
+              sandboxClaimTombstone:
+                description: |-
+                  Exact management-cluster `SandboxClaim` retained as an inert release
+                  tombstone. This is separate from [`SandboxTargetProvenance::sandbox_claim`]:
+                  the original workload Claim may already be gone, while its same-named
+                  replacement has a different UID that must be checkpointed before it can
+                  fence delayed creates.
+                nullable: true
+                properties:
+                  apiVersion:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  kind:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  namespace:
+                    maxLength: 63
+                    minLength: 1
+                    nullable: true
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  uid:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                - uid
+                type: object
               target:
                 description: |-
                   Restart-safe, non-secret target provenance. Fields are filled monotonically:
@@ -213,10 +469,14 @@ spec:
                 nullable: true
                 properties:
                   childClusterInstance:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -225,16 +485,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -243,11 +508,17 @@ spec:
                     - name
                     - uid
                     type: object
-                  childClusterLease:
-                    description: Non-secret identity of one exact Kubernetes object.
+                  childClusterKubeconfigSecret:
+                    description: |-
+                      Exact management-cluster Secret whose bytes authenticate the child
+                      client. The Secret is checkpointed before its contents are first used,
+                      then re-read by UID and payload digest on every later pass. Only
+                      non-secret identity is persisted; kubeconfig bytes never enter status,
+                      logs, or API responses.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -256,16 +527,72 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  childClusterKubeconfigSha256:
+                    description: |-
+                      SHA-256 of the exact, sole `data.kubeconfig` payload read from
+                      [`Self::child_cluster_kubeconfig_secret`]. It is checkpointed in the
+                      same status write as the Secret UID and never changes. ResourceVersion
+                      may move on an idempotent publisher apply; payload identity may not.
+                    maxLength: 64
+                    minLength: 64
+                    nullable: true
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  childClusterLease:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -275,13 +602,19 @@ spec:
                     - uid
                     type: object
                   namespace:
+                    maxLength: 63
                     minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   pod:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -290,16 +623,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -309,10 +647,14 @@ spec:
                     - uid
                     type: object
                   sandbox:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -321,16 +663,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -340,10 +687,14 @@ spec:
                     - uid
                     type: object
                   sandboxClaim:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -352,16 +703,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -371,10 +727,14 @@ spec:
                     - uid
                     type: object
                   sandboxTemplate:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -383,16 +743,21 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -402,10 +767,14 @@ spec:
                     - uid
                     type: object
                   sandboxWarmPool:
-                    description: Non-secret identity of one exact Kubernetes object.
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
                     nullable: true
                     properties:
                       apiVersion:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       generation:
@@ -414,16 +783,61 @@ spec:
                         nullable: true
                         type: integer
                       kind:
+                        maxLength: 63
                         minLength: 1
                         type: string
                       name:
+                        maxLength: 253
                         minLength: 1
                         type: string
                       namespace:
+                        maxLength: 63
                         minLength: 1
                         nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                         type: string
                       uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  service:
+                    description: |-
+                      Exact headless Service created by Agent Sandbox when the pool exposes
+                      ports. Teardown uses this UID rather than assuming Claim disappearance
+                      proves every nested dependent is gone.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
                         minLength: 1
                         type: string
                     required:
@@ -438,8 +852,51 @@ spec:
             type: object
         required:
         - spec
-        title: SandboxLease
+        title: SandboxLeaseValidated
         type: object
+        x-kubernetes-validations:
+        - message: status.releaseCause is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.releaseCause) || (has(self.status) && self.status != null && has(self.status.releaseCause) && self.status.releaseCause == oldSelf.status.releaseCause)'
+        - message: status FootprintAbsent proof is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True'') || (has(self.status) && self.status != null && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
+        - message: status.childTeardownReceiptAcknowledgement is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownReceiptAcknowledgement) || (has(self.status) && self.status != null && has(self.status.childTeardownReceiptAcknowledgement) && self.status.childTeardownReceiptAcknowledgement == oldSelf.status.childTeardownReceiptAcknowledgement)'
+        - message: status.childTeardownEvidence is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownEvidence) || (has(self.status) && self.status != null && has(self.status.childTeardownEvidence) && self.status.childTeardownEvidence == oldSelf.status.childTeardownEvidence)'
+        - message: status.childUnboundReleaseProof is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childUnboundReleaseProof) || (has(self.status) && self.status != null && has(self.status.childUnboundReleaseProof) && self.status.childUnboundReleaseProof == oldSelf.status.childUnboundReleaseProof)'
+        - message: FootprintAbsent must be True and requires a releasing or clean terminal status with releaseCause
+          rule: '!has(self.status) || self.status == null || !has(self.status.conditions) || self.status.conditions.all(c, c.type != ''FootprintAbsent'' || (c.status == ''True'' && has(self.status.releaseCause) && self.status.phase in [''Releasing'', ''Released'', ''Expired'']))'
+        - message: status.target.childClusterKubeconfigSecret is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSecret) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret) && self.status.target.childClusterKubeconfigSecret == oldSelf.status.target.childClusterKubeconfigSecret)'
+        - message: status.target.childClusterKubeconfigSha256 is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.target) || !has(oldSelf.status.target.childClusterKubeconfigSha256) || (has(self.status) && self.status != null && has(self.status.target) && has(self.status.target.childClusterKubeconfigSha256) && self.status.target.childClusterKubeconfigSha256 == oldSelf.status.target.childClusterKubeconfigSha256)'
+        - message: child kubeconfig Secret identity and payload digest must be checkpointed together
+          rule: '!has(self.status) || self.status == null || !has(self.status.target) || (has(self.status.target.childClusterKubeconfigSecret) == has(self.status.target.childClusterKubeconfigSha256))'
+        - message: childClusterKubeconfigSecret must be the exact deterministic Secret for the recorded child instance
+          rule: '!has(self.status) || self.status == null || !has(self.status.target) || !has(self.status.target.childClusterKubeconfigSecret) || (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.target.childClusterInstance) && self.status.target.childClusterKubeconfigSecret.apiVersion == ''v1'' && self.status.target.childClusterKubeconfigSecret.kind == ''Secret'' && has(self.status.target.childClusterKubeconfigSecret.__namespace__) && has(self.status.target.childClusterInstance.__namespace__) && self.status.target.childClusterKubeconfigSecret.__namespace__ == self.status.target.childClusterInstance.__namespace__ && !has(self.status.target.childClusterKubeconfigSecret.generation) && self.status.target.childClusterKubeconfigSecret.name == self.status.target.childClusterInstance.name + ''-kubeconfig'' && self.status.target.childClusterKubeconfigSha256.matches(''^[0-9a-f]{64}$''))'
+        - message: status.childTeardownMode is immutable once recorded
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.childTeardownMode) || (has(self.status) && self.status != null && has(self.status.childTeardownMode) && self.status.childTeardownMode == oldSelf.status.childTeardownMode)'
+        - message: childTeardownMode requires exact child placement and kubeconfig Secret provenance
+          rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownMode) || (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.target) && has(self.status.target.childClusterKubeconfigSecret))'
+        - message: a child teardown receipt acknowledgement requires child placement
+          rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.placement) && self.status.placement.type == ''childCluster'')'
+        - message: a child teardown receipt acknowledgement requires FootprintAbsent=True in the same checkpoint
+          rule: '!has(self.status) || self.status == null || !has(self.status.childTeardownReceiptAcknowledgement) || (has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''FootprintAbsent'' && c.status == ''True''))'
+        - message: spec.placementAuthority is immutable
+          rule: '!has(oldSelf.spec.placementAuthority) ? !has(self.spec.placementAuthority) : (has(self.spec.placementAuthority) && self.spec.placementAuthority == oldSelf.spec.placementAuthority)'
+        - message: spec.placementAuthority must identify a ClusterPool
+          rule: '!has(self.spec.placementAuthority) || (self.spec.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.spec.placementAuthority.kind == ''ClusterPool'')'
+        - message: resolved placement must match the immutable admission placementAuthority
+          rule: '!has(self.status) || self.status == null || !has(self.status.placement) || ((self.status.placement.type == ''management'' && !has(self.spec.placementAuthority)) || (self.status.placement.type == ''childCluster'' && (!has(self.spec.placementAuthority) || (self.status.placement.clusterPool.apiVersion == self.spec.placementAuthority.apiVersion && self.status.placement.clusterPool.kind == self.spec.placementAuthority.kind && self.status.placement.clusterPool.__namespace__ == self.spec.placementAuthority.__namespace__ && self.status.placement.clusterPool.name == self.spec.placementAuthority.name && self.status.placement.clusterPool.uid == self.spec.placementAuthority.uid && has(self.status.placement.clusterPool.generation) && self.status.placement.clusterPool.generation == self.spec.placementAuthority.generation))))'
+        - message: child placement without placementAuthority may only preserve an exact legacy placement
+          rule: '!(has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == ''childCluster'' && !has(self.spec.placementAuthority)) || (has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == ''childCluster'' && !has(oldSelf.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)'
+        - message: legacy child placement without placementAuthority may not be removed or changed
+          rule: '!(has(oldSelf.status) && oldSelf.status != null && has(oldSelf.status.placement) && oldSelf.status.placement.type == ''childCluster'' && !has(oldSelf.spec.placementAuthority)) || (has(self.status) && self.status != null && has(self.status.placement) && self.status.placement.type == ''childCluster'' && !has(self.spec.placementAuthority) && self.status.placement == oldSelf.status.placement)'
+        - message: child receipt token and immutable evidence must be checkpointed together
+          rule: '!has(self.status) || self.status == null || (has(self.status.childTeardownReceiptAcknowledgement) == has(self.status.childTeardownEvidence))'
+        - message: NeverBound and receipt checkpoints are mutually exclusive and require child placement
+          rule: '!has(self.status) || self.status == null || !has(self.status.childUnboundReleaseProof) || (!has(self.status.childTeardownReceiptAcknowledgement) && !has(self.status.childTeardownEvidence) && has(self.status.placement) && self.status.placement.type == ''childCluster'')'
     served: true
     storage: true
     subresources:

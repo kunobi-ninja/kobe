@@ -11,6 +11,12 @@ description: All kobe CLI commands with flags and examples.
 |---|---|
 | `kobe status` | Show endpoint status, auth methods, and pool summary |
 | `kobe version` | Show CLI and endpoint versions |
+| `kobe sandbox run` | Create a sandbox, run one command, release it ([details](/commands/sandbox)) |
+| `kobe sandbox exec` | Run a command in a sandbox you already hold |
+| `kobe sandbox logs` | Read sandbox output or follow one execution's retained stdout/stderr |
+| `kobe sandbox cancel` | Cancel a running execution |
+| `kobe sandbox attach` | Open an interactive session in a sandbox |
+| `kobe sandbox port-forward` | Forward a declared sandbox port to a local one |
 | `kobe login` | Authenticate with the kobe service |
 | `kobe logout` | Remove stored credentials |
 | `kobe lease <pool>` | Lease a cluster from a pool |
@@ -33,6 +39,10 @@ kobe status
 Queries `GET /v1/status` on the configured endpoint. Shows the operator version, available auth methods, active sessions, and pool summary. Does not require authentication.
 
 Useful for verifying connectivity and checking which auth methods the endpoint accepts before logging in.
+
+Authenticated pool rows include the pool phase and a `quarantined` count. A
+non-zero count means cleanup evidence is incomplete and that capacity remains
+withheld; it is not reported as healthy or available.
 
 ---
 

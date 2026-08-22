@@ -1,0 +1,25 @@
+[package]
+name = "kobe-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Supervisor that runs one command inside a Kobe Sandbox and outlives the exec connection that started it"
+# Never published: the binary ships inside a Sandbox image, and the library
+# half exists only so Kobe and the runner cannot disagree about the wire
+# format. A published copy would be a second source of truth.
+publish = false
+
+[[bin]]
+name = "kobe-runner"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately tiny. This binary is copied into an administrator's Sandbox
+# image, so every dependency here is something a tenant's workload runs
+# alongside — and something that has to build for a static musl target.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
