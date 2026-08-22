@@ -977,6 +977,13 @@ fn queued_second_signal_cannot_skip_the_release_request() {
     let gate_for_server = Arc::clone(&response_gate);
     let deleted = Arc::new(AtomicBool::new(false));
     let released = Arc::clone(&deleted);
+    // Hold the release observation open. Without this the assertions below
+    // race: if the whole release future completes before the queued second
+    // signal is picked up, reporting `released: true` is honest, and the
+    // unconfirmed path this test exists to cover never runs.
+    let observation_gate = gate();
+    let gate_for_observation = Arc::clone(&observation_gate);
+    let observing = Arc::clone(&deleted);
     let server = Server::start(move |request, stream| {
         if request.method == "POST" && request.path == "/v1/sandbox-leases" {
             let (_, lease) = keyed_lease(&request.body);
@@ -993,6 +1000,11 @@ fn queued_second_signal_cannot_skip_the_release_request() {
             released.store(true, Ordering::SeqCst);
             reply(stream, 204, &[], "");
         } else if request.method == "GET" {
+            // Only the post-DELETE observation is held; a readiness poll
+            // before it must still answer.
+            if observing.load(Ordering::SeqCst) {
+                wait_gate(&gate_for_observation);
+            }
             let id = request.path.rsplit('/').next().unwrap();
             reply(stream, 200, &[], &lease_body(id, "Releasing"));
         } else {
@@ -1010,6 +1022,7 @@ fn queued_second_signal_cannot_skip_the_release_request() {
     signal(&child, libc::SIGTERM);
     open(&response_gate);
     let output = wait_output(child);
+    open(&observation_gate);
     assert_eq!(output.status.code(), Some(130));
     assert!(output.stderr.is_empty());
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
