@@ -67,6 +67,18 @@ serviceAccount:
 # ServiceAccount and admission identity. Ordinary lifecycle remains in the
 # control-plane deployment.
 teardownAuthority:
+  # Run teardown-proof authority as a SEPARATE process with its own identity,
+  # so a compromised control plane cannot forge evidence that a cluster or
+  # sandbox was really destroyed.
+  #
+  # Default OFF. The split is not finished: the two ValidatingAdmissionPolicies
+  # the authority requires at startup are not rendered by this chart and its
+  # ServiceAccount has no RBAC, so enabling it CrashLoops the authority pod -
+  # and, worse, setting KOBE_PROCESS_ROLE=control-plane on the operator turns
+  # OFF the in-process authority that does work today, taking VerifiedDestroy
+  # and every childCluster sandbox with it. Turn this on only once the
+  # policies and RBAC ship.
+  separate: false
   replicas: 1
   # Pull secrets and the optional PostgreSQL URL Secret must exist in the
   # dedicated authority namespace, not in the release namespace.

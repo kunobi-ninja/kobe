@@ -56,8 +56,13 @@ spec:
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           env:
+            {{- if .Values.teardownAuthority.separate }}
+            # Declaring this role DISABLES the in-process teardown authority,
+            # so it may only be set when a separate authority is actually
+            # deployed to take over.
             - name: KOBE_PROCESS_ROLE
               value: "control-plane"
+            {{- end }}
             - name: OPERATOR_NAMESPACE
               value: {{ .Values.operatorNamespace | quote }}
             - name: POD_NAMESPACE

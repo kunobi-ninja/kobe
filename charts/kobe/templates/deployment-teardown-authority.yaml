@@ -1,3 +1,4 @@
+{{- if .Values.teardownAuthority.separate }}
 {{- $authorityServiceAccount := include "kobe.teardownAuthorityServiceAccountName" . -}}
 {{- $generalServiceAccount := include "kobe.serviceAccountName" . -}}
 {{- $poolServiceAccount := .Values.poolServiceAccount | default $generalServiceAccount -}}
@@ -102,3 +103,4 @@ spec:
               - key: {{ .Values.postgres.urlSecret.key | quote }}
                 path: url
         {{- end }}
+{{- end }}

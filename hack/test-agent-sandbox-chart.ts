@@ -25,6 +25,7 @@ async function helm(
 	mode: string,
 	release = "kobe",
 	namespace = "kobe-system",
+	extra: string[] = [],
 ): Promise<string> {
 	const process = Bun.spawn(
 		[
@@ -36,6 +37,7 @@ async function helm(
 			namespace,
 			"--set",
 			`agentSandbox.mode=${mode}`,
+			...extra,
 		],
 		{ stdout: "pipe", stderr: "pipe" },
 	);
@@ -185,27 +187,48 @@ const [disabledYaml, externalYaml] = await Promise.all([
 ]);
 const disabled = parseDocuments(disabledYaml);
 const external = parseDocuments(externalYaml);
+// The split teardown authority is OPT-IN. Its required admission policies and
+// RBAC are not shipped yet, so rendering it by default CrashLoops the pod and,
+// because the operator would then declare KOBE_PROCESS_ROLE, also disables the
+// in-process authority that works today.
+const SPLIT = ["--set", "teardownAuthority.separate=true"];
+const externalSplit = parseDocuments(
+	await helm("external", "kobe", "kobe-system", SPLIT),
+);
+for (const [name, documents] of [
+	["disabled", disabled],
+	["external", external],
+] as const) {
+	invariant(
+		!objectNamed(documents, "Deployment", "kobe-teardown-authority"),
+		`${name} rendered the opt-in split authority by default`,
+	);
+	invariant(
+		!objectNamed(documents, "ServiceAccount", "kobe-teardown-authority"),
+		`${name} rendered the authority ServiceAccount without its namespace`,
+	);
+}
 
 // The proof process is structurally separate even when Agent Sandbox itself is
 // disabled. Admission/RBAC complete this boundary; these checks pin the pod,
 // namespace and identity contract that those controls refer to.
 const authority = objectNamed(
-	external,
+	externalSplit,
 	"Deployment",
 	"kobe-teardown-authority",
 );
-invariant(authority, "chart omitted the teardown-authority Deployment");
+invariant(authority, "the split authority did not render when enabled");
 const authorityNamespace = String(metadata(authority).namespace ?? "");
 invariant(
 	authorityNamespace !== "" && authorityNamespace !== "kobe-system",
 	"teardown authority shares the general operator namespace",
 );
 invariant(
-	objectNamed(external, "Namespace", authorityNamespace),
+	objectNamed(externalSplit, "Namespace", authorityNamespace),
 	"chart omitted the dedicated teardown-authority Namespace",
 );
 const authorityServiceAccount = objectNamed(
-	external,
+	externalSplit,
 	"ServiceAccount",
 	"kobe-teardown-authority",
 );
@@ -270,10 +293,7 @@ invariant(
 	"field authority policy and identity firewall share one name",
 );
 
-for (const [mode, documents] of [
-	["disabled", disabled],
-	["external", external],
-] as const) {
+for (const [mode, documents] of [["external", externalSplit]] as const) {
 	const deployment = objectNamed(documents, "Deployment", "kobe-teardown-authority");
 	invariant(deployment, `${mode} omitted the teardown-authority Deployment`);
 	const pod = ((deployment.spec as Record<string, unknown>).template as Record<
@@ -294,7 +314,9 @@ for (const [mode, documents] of [
 	);
 }
 
-const otherNamespace = parseDocuments(await helm("external", "kobe", "other-system"));
+const otherNamespace = parseDocuments(
+	await helm("external", "kobe", "other-system", SPLIT),
+);
 const otherAuthority = objectNamed(
 	otherNamespace,
 	"Deployment",
@@ -328,9 +350,33 @@ const controlPlaneEnv = new Map(
 		entry.value,
 	]),
 );
+// Declaring the role is what DISABLES the in-process authority, so by default
+// it must be absent - otherwise the chart turns off a working teardown path in
+// favour of one it does not deploy - and it must appear only alongside the
+// split authority that takes over.
 invariant(
-	controlPlaneEnv.get("KOBE_PROCESS_ROLE") === "control-plane",
-	"general Deployment did not select the lifecycle-only process role",
+	controlPlaneEnv.get("KOBE_PROCESS_ROLE") === undefined,
+	"default render declared the control-plane role without a split authority",
+);
+const splitOperator = objectNamed(externalSplit, "Deployment", "kobe");
+invariant(splitOperator, "split render omitted the control-plane Deployment");
+const splitEnv = new Map(
+	(
+		(
+			(
+				(
+					(splitOperator.spec as Record<string, unknown>).template as Record<
+						string,
+						unknown
+					>
+				).spec as Record<string, unknown>
+			).containers as Record<string, unknown>[]
+		)[0].env as Record<string, unknown>[]
+	).map((entry) => [String(entry.name), entry.value]),
+);
+invariant(
+	splitEnv.get("KOBE_PROCESS_ROLE") === "control-plane",
+	"split render did not hand the operator the lifecycle-only role",
 );
 
 const generalRole = objectNamed(external, "ClusterRole", "kobe");
