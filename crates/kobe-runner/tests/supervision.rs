@@ -196,7 +196,20 @@ fn read_stream(scratch: &Scratch, id: &str, stream: &str) -> Vec<u8> {
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 checks existence and permission without delivering
     // anything.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) != 0 } {
+        return false;
+    }
+    // Nothing in a CI container reaps orphans, so a SIGKILLed process can
+    // linger as a zombie that kill(2) still acknowledges. A zombie runs
+    // nothing: treat it as gone, exactly like the runner's own liveness check.
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                != Some('Z')
+        }
+        Err(_) => true,
+    }
 }
 
 fn wait_for_pid(pidfile: &Path) -> i32 {

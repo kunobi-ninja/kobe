@@ -383,10 +383,26 @@ fn supervisor_liveness(spool: &Spool, id: &str) -> SupervisorLiveness {
     };
     // SAFETY: signal 0 performs the permission and existence checks without
     // delivering anything.
-    if unsafe { libc::kill(pid, 0) == 0 } {
-        SupervisorLiveness::Alive
-    } else {
-        SupervisorLiveness::Lost
+    if unsafe { libc::kill(pid, 0) != 0 } {
+        return SupervisorLiveness::Lost;
+    }
+    // kill(2) still acknowledges an unreaped zombie, and no container
+    // guarantees that an orphaned supervisor's parent reaps it. A zombie can
+    // no longer supervise or commit a verdict, so reporting it Alive would
+    // leave the execution Running forever. Where /proc is absent this keeps
+    // the kill(2) answer.
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next());
+            if state == Some('Z') {
+                SupervisorLiveness::Lost
+            } else {
+                SupervisorLiveness::Alive
+            }
+        }
+        Err(_) => SupervisorLiveness::Alive,
     }
 }
 
