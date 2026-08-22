@@ -126,17 +126,23 @@ fn reply(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &s
         503 => "Service Unavailable",
         _ => "Response",
     };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    )
-    .unwrap();
-    for (name, value) in headers {
-        write!(stream, "{name}: {value}\r\n").unwrap();
-    }
-    write!(stream, "\r\n{body}").unwrap();
-    stream.flush().unwrap();
+    // Best-effort: a client that has already exited is a legitimate outcome in
+    // these tests - several deliberately abandon a request mid-flight to prove
+    // a signal path - so a closed peer must not panic the server thread and
+    // take the harness down with it through Drop's join().
+    let mut send = || -> std::io::Result<()> {
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        )?;
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n")?;
+        }
+        write!(stream, "\r\n{body}")?;
+        stream.flush()
+    };
+    let _ = send();
 }
 
 fn keyed_lease(body: &[u8]) -> (String, String) {
