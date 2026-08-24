@@ -993,7 +993,8 @@ pub async fn reconcile_lease(
                 crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
                 | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
             ) => {
-                return quarantine_unverifiable_gate(&lease, &ctx, "access_gate_unverifiable").await;
+                return quarantine_unverifiable_gate(&lease, &ctx, "access_gate_unverifiable")
+                    .await;
             }
             Err(crate::sandbox_access_ledger::AccessLedgerError::Kubernetes(kube::Error::Api(
                 response,

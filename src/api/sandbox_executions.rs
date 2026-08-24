@@ -57,8 +57,17 @@ pub const SANDBOX_EXECUTION_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-executi
 /// caller uses a fresh idempotency key for every command.
 pub const MAX_EXECUTIONS_PER_LEASE: usize = 256;
 
-/// Maximum process groups that may be active in one Sandbox at once.
-pub const MAX_ACTIVE_EXECUTIONS_PER_LEASE: usize = 8;
+/// Upper bound on ledger entries whose process group is known or possibly
+/// still running.
+///
+/// An execution that crossed Kubernetes `startedAt` holds its slot until the
+/// exact Sandbox target is destroyed — same-UID runner state cannot prove the
+/// group is gone — so this bound grows monotonically over a lease's life and
+/// is effectively a second lifetime budget. It therefore must not be smaller
+/// than [`MAX_EXECUTIONS_PER_LEASE`], or it would silently become THE lifetime
+/// budget: that is how a lease could once run only eight durable commands in
+/// its entire life while the extend feature advertised long-running sessions.
+pub const MAX_ACTIVE_EXECUTIONS_PER_LEASE: usize = MAX_EXECUTIONS_PER_LEASE;
 
 /// Per-stream runner retention used by Kobe.
 ///
@@ -170,7 +179,11 @@ impl ExecutionRequestError {
             Self::Invalid { .. } => StatusCode::BAD_REQUEST,
             Self::Denied(denied) => denied.http_status(),
             Self::Backend => StatusCode::SERVICE_UNAVAILABLE,
-            Self::LimitReached => StatusCode::TOO_MANY_REQUESTS,
+            // 409, not 429: the execution bounds are per-lease lifetime
+            // budgets. Nothing a retry does makes one succeed — the caller
+            // needs a new lease — and a 429 would tell an agent to back off
+            // and re-send forever.
+            Self::LimitReached => StatusCode::CONFLICT,
         }
     }
 
@@ -180,7 +193,7 @@ impl ExecutionRequestError {
             Self::Invalid { .. } => "invalid_request",
             Self::Denied(denied) => denied.reason_code(),
             Self::Backend => "backend_error",
-            Self::LimitReached => "execution_limit",
+            Self::LimitReached => "execution_limit_exhausted",
         }
     }
 }

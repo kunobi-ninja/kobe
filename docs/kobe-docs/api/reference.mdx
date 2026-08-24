@@ -484,8 +484,10 @@ be treated as permission to rerun effects automatically.
 
 Common failures are `400` for an invalid command, timeout, cwd, or idempotency
 key; `403`/`404` for unavailable lease access; `409` for key reuse with changed
-intent; `429` for the execution concurrency limit; `501` when the pool has no
-Kobe runner; and `503` when the execution store or target cannot be verified.
+intent and for the per-lifetime execution bound (`reason:
+execution_limit_exhausted` — retrying cannot succeed, request a new lease);
+`501` when the pool has no Kobe runner; and `503` when the execution store or
+target cannot be verified.
 
 ### `GET /v1/sandbox-leases/:id/executions/:execution`
 

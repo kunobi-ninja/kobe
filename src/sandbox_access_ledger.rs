@@ -2686,10 +2686,18 @@ mod tests {
                 ExecutionCapacity::Reserved
             );
         }
+        // The started-execution bound must never be the binding lifetime
+        // budget: an execution that crossed startedAt holds its slot until the
+        // exact target is destroyed, so any gap between the two bounds would
+        // silently shrink a lease's lifetime budget to this one.
+        assert_eq!(
+            crate::api::sandbox_executions::MAX_ACTIVE_EXECUTIONS_PER_LEASE,
+            crate::api::sandbox_executions::MAX_EXECUTIONS_PER_LEASE
+        );
         assert_eq!(
             reserve_execution_entry(
                 &mut entries,
-                "execution-active-overflow",
+                "execution-overflow",
                 &digest,
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
@@ -2697,36 +2705,7 @@ mod tests {
             ),
             ExecutionCapacity::LimitReached
         );
-        entries.get_mut("execution-0").unwrap().active = false;
-        assert_eq!(
-            reserve_execution_entry(
-                &mut entries,
-                "execution-after-terminal",
-                &digest,
-                "pod-uid",
-                "2026-08-20T00:00:00Z",
-                None,
-            ),
-            ExecutionCapacity::Reserved,
-            "a terminal process frees concurrency but not its history row"
-        );
 
-        for index in entries.len()..crate::api::sandbox_executions::MAX_EXECUTIONS_PER_LEASE {
-            for entry in entries.values_mut() {
-                entry.active = false;
-            }
-            assert_eq!(
-                reserve_execution_entry(
-                    &mut entries,
-                    &format!("execution-history-{index}"),
-                    &digest,
-                    "pod-uid",
-                    "2026-08-20T00:00:00Z",
-                    None,
-                ),
-                ExecutionCapacity::Reserved
-            );
-        }
         for entry in entries.values_mut() {
             entry.active = false;
         }
@@ -2743,7 +2722,8 @@ mod tests {
                 "2026-08-20T00:00:00Z",
                 None,
             ),
-            ExecutionCapacity::LimitReached
+            ExecutionCapacity::LimitReached,
+            "freeing concurrency cannot bypass the lifetime history bound"
         );
     }
 

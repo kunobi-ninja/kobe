@@ -190,11 +190,15 @@ cancellation, or reconnectability guarantees.
 Output from every durable execution is retained inside the container until the
 Sandbox is torn down and can be read back through
 `GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Kobe retains at most
-1 MiB of stdout and 1 MiB of stderr per execution, allows at most 8 executions
-to cross `startedAt` over one Sandbox target's lifetime, and accepts at most 256
-idempotency keys over one Sandbox lifetime. The stricter started-execution bound
-is required because same-UID runner state cannot safely prove that capacity is
-reusable. Requests beyond either execution limit return `429 Too Many Requests`.
+1 MiB of stdout and 1 MiB of stderr per execution, and accepts at most 256
+idempotency keys — durable executions — over one Sandbox lifetime. An execution
+that crossed `startedAt` holds its slot until that exact Sandbox target is
+destroyed, because same-UID runner state cannot safely prove capacity is
+reusable; the per-lifetime count is therefore the only execution budget, sized
+for long-running agent sessions rather than a small per-target batch.
+Requests beyond the limit return `409 Conflict` with reason
+`execution_limit_exhausted`: retrying cannot succeed, a new lease must be
+requested.
 
 Cancelling an execution asks the runner to terminate its whole process group,
 not only the process Kobe started. Lease release first closes new access, then
