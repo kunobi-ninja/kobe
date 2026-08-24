@@ -338,6 +338,7 @@ async fn create_sandbox_execution<B: ClusterBackend>(
         &requested,
         reservation_deadline,
         &state.shutdown,
+        state.sandbox_serving_replica.as_ref(),
     )
     .await
     {

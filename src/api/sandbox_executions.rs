@@ -367,6 +367,7 @@ pub async fn reserve_execution(
     request: &ExecutionRequest,
     deadline: tokio::time::Instant,
     shutdown: &tokio_util::sync::CancellationToken,
+    writer: Option<&crate::sandbox_access_ledger::ServingReplica>,
 ) -> Result<Reservation, ExecutionRequestError> {
     validate_request(request)?;
 
@@ -397,6 +398,7 @@ pub async fn reserve_execution(
             &name,
             &digest,
             &target.pod_uid,
+            writer,
         ) => capacity.map_err(|_| ExecutionRequestError::Backend)?,
     };
 
@@ -1023,6 +1025,7 @@ pub async fn run_execution_reaper(
     ledger_namespace: &str,
     interval: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
+    replica: Option<crate::sandbox_access_ledger::ServingReplica>,
 ) {
     let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), namespace);
     let leases: Api<SandboxLease> = Api::namespaced(client.clone(), namespace);
@@ -1065,7 +1068,15 @@ pub async fn run_execution_reaper(
             }
         }
 
-        reap_unbound_execution_capacity(&client, &leases, &executions, ledger_namespace, now).await;
+        reap_unbound_execution_capacity(
+            &client,
+            &leases,
+            &executions,
+            ledger_namespace,
+            now,
+            replica.as_ref(),
+        )
+        .await;
     }
     tracing::info!("Sandbox execution reaper shut down");
 }
@@ -1075,12 +1086,20 @@ pub async fn run_execution_reaper(
 /// A 404 never closes `Creating`: a late CREATE may still produce its finalised
 /// record. An exact record is adopted into the inactive manifest by CAS so a
 /// racing bind either wins first or can never start the runner afterward.
+///
+/// One exception exists once the setup grace has elapsed and a strong 404 is
+/// observed: a tombstone whose recorded writer this replica can prove dead
+/// ([`crate::sandbox_access_ledger::expire_orphaned_creating_execution`]) is
+/// resolved to Rejected. Only that writer could have bound a late object or
+/// started its runner, so whatever might still land is inert. Rows without a
+/// recorded writer stay fail-closed forever.
 async fn reap_unbound_execution_capacity(
     client: &kube::Client,
     leases: &Api<SandboxLease>,
     executions: &Api<SandboxExecution>,
     ledger_namespace: &str,
     now: chrono::DateTime<chrono::Utc>,
+    replica: Option<&crate::sandbox_access_ledger::ServingReplica>,
 ) {
     let listed = match leases.list(&ListParams::default()).await {
         Ok(listed) => listed,
@@ -1141,6 +1160,39 @@ async fn reap_unbound_execution_capacity(
                     continue;
                 }
             };
+            // The 404 alone proves nothing while the reserving process may
+            // still be alive. When this replica can prove that exact writer
+            // gone — same Pod name, different UID or boot — the tombstone's
+            // reason to exist is gone with it: only the writer could have bound
+            // the late object or started its runner. Without a recorded writer
+            // or without a replica identity here, the row stays fail-closed.
+            if observed.is_none()
+                && let Some(current) = replica
+                && entry.writer.is_some()
+            {
+                match crate::sandbox_access_ledger::expire_orphaned_creating_execution(
+                    client,
+                    ledger_namespace,
+                    &lease,
+                    &entry,
+                    current,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        tracing::warn!(
+                            execution = %entry.name,
+                            "retired an orphaned Creating execution tombstone after proving its writer gone"
+                        );
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(execution = %entry.name, error = %error, "could not retire an orphaned Creating execution tombstone");
+                        continue;
+                    }
+                }
+            }
             let observed_uid = observed.as_ref().map(|(_, uid)| uid.as_str());
             match crate::sandbox_access_ledger::expire_unbound_execution(
                 client,
@@ -2155,6 +2207,176 @@ mod tests {
         assert_eq!(body[0]["value"], "execution-uid");
         assert_eq!(body[1]["value"], "7");
         assert_eq!(body[3]["op"], "remove");
+    }
+
+    /// The reaper retires an orphaned Creating tombstone only through the
+    /// full fence: setup grace elapsed, the exact object is strongly absent,
+    /// and this replica proves the recorded writer dead. The row then leaves
+    /// Creating, unblocking the lease teardown it would otherwise wedge.
+    #[tokio::test]
+    async fn reaper_resolves_an_orphaned_creating_tombstone_after_writer_death() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        fn hex_digest(value: &str) -> String {
+            use sha2::{Digest as _, Sha256};
+            format!("{:x}", Sha256::digest(value.as_bytes()))
+        }
+        let gate_name = format!("kobe-access-g-{}", &hex_digest("lease-uid")[..40]);
+        let gate_path =
+            format!("/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{gate_name}");
+        let stale_writer = crate::sandbox_access_ledger::ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "old-pod-uid".into(),
+            boot_id: "boot-1".into(),
+        };
+        let entry = crate::sandbox_access_ledger::ExecutionManifestEntry {
+            name: "execution-a".into(),
+            request_digest: "d".repeat(64),
+            pod_uid: "pod-uid".into(),
+            // Long past EXECUTION_SETUP_GRACE relative to `now` below.
+            reserved_at: "2026-01-01T00:00:00Z".into(),
+            execution_uid: None,
+            creation_state: crate::sandbox_access_ledger::ExecutionCreationState::Creating,
+            active: true,
+            writer: Some(stale_writer.clone()),
+        };
+        let ledger_entry = serde_json::json!({
+            "requestDigest": entry.request_digest,
+            "podUid": entry.pod_uid,
+            "reservedAt": entry.reserved_at,
+            "creationState": "creating",
+            "active": true,
+            "writer": {
+                "namespace": stale_writer.namespace,
+                "podName": stale_writer.pod_name,
+                "podUid": stale_writer.pod_uid,
+                "bootId": stale_writer.boot_id,
+            }
+        });
+        let lease_object = serde_json::json!({
+            "apiVersion":"coordination.k8s.io/v1", "kind":"Lease",
+            "metadata":{
+                "name":gate_name, "namespace":"ledger", "uid":"gate-uid",
+                "resourceVersion":"1",
+                "labels":{
+                    "kobe.kunobi.ninja/sandbox-access-kind":"lease-gate",
+                    "kobe.kunobi.ninja/sandbox-lease-name":"sandbox-a",
+                    "kobe.kunobi.ninja/sandbox-access-lease-uid":"lease-uid"
+                },
+                "annotations":{
+                    "kobe.kunobi.ninja/sandbox-access-state":"open",
+                    "kobe.kunobi.ninja/sandbox-access-entries":"{}",
+                    "kobe.kunobi.ninja/sandbox-executions":
+                        serde_json::json!({"execution-a": ledger_entry}).to_string()
+                }
+            },
+            "spec":{}
+        });
+        let parent_path = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxleases";
+        Mock::given(method("GET"))
+            .and(path(parent_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion":"kobe.kunobi.ninja/v1alpha1", "kind":"SandboxLeaseList",
+                "metadata":{"resourceVersion":"1"},
+                "items":[{
+                    "apiVersion":"kobe.kunobi.ninja/v1alpha1", "kind":"SandboxLease",
+                    "metadata":{
+                        "name":"sandbox-a","namespace":"kobe-system","uid":"lease-uid",
+                        "annotations":{
+                            crate::sandbox_access_ledger::ACCESS_GATE_ANNOTATION:
+                                serde_json::to_string(
+                                    &crate::sandbox_access_ledger::AccessGateReference {
+                                        name: gate_name.clone(), uid: "gate-uid".into(),
+                                    },
+                                )
+                                .unwrap()
+                        }
+                    },
+                    "spec":{
+                        "poolRef":{"name":"pool","uid":"pool-uid","generation":1},
+                        "ttl":"1m",
+                        "requester":{"provider":"test","type":"oidc:user",
+                                     "issuer":"https://issuer.invalid","identity":"alice"}
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lease_object.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/kobe-system/sandboxexecutions/execution-a",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure",
+                "reason":"NotFound","code":404
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut patched = lease_object;
+        patched["metadata"]["resourceVersion"] = serde_json::json!("2");
+        patched["metadata"]["annotations"]["kobe.kunobi.ninja/sandbox-executions"] =
+            serde_json::json!({"execution-a": {
+                "requestDigest": entry.request_digest,
+                "podUid": entry.pod_uid,
+                "reservedAt": entry.reserved_at,
+                "creationState": "rejected",
+                "active": false
+            }})
+            .to_string()
+            .into();
+        Mock::given(method("PATCH"))
+            .and(path(&gate_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(patched))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let current = crate::sandbox_access_ledger::ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "current-pod-uid".into(),
+            boot_id: "boot-2".into(),
+        };
+        let leases: Api<SandboxLease> = Api::namespaced(client.clone(), "kobe-system");
+        let executions: Api<SandboxExecution> = Api::namespaced(client.clone(), "kobe-system");
+        reap_unbound_execution_capacity(
+            &client,
+            &leases,
+            &executions,
+            "ledger",
+            chrono::Utc::now(),
+            Some(&current),
+        )
+        .await;
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("the tombstone must be retired by CAS");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(body[3]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            value["execution-a"]["creationState"], "rejected",
+            "the tombstone must leave Creating so teardown can retire the row"
+        );
+        assert_eq!(value["execution-a"]["active"], false);
     }
 
     /// An exact destroy receipt proves the runner target absent, but the

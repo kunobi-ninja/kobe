@@ -547,6 +547,7 @@ async fn run() -> anyhow::Result<()> {
     let execution_reaper_ns = namespace.clone();
     let execution_reaper_reservation_ns = sandbox_reservation_namespace.clone();
     let execution_reaper_shutdown = shutdown.clone();
+    let execution_reaper_replica = sandbox_serving_replica.clone();
     let execution_reaper_handle = tokio::spawn(async move {
         api::sandbox_executions::run_execution_reaper(
             execution_reaper_client,
@@ -554,6 +555,7 @@ async fn run() -> anyhow::Result<()> {
             &execution_reaper_reservation_ns,
             std::time::Duration::from_secs(60),
             execution_reaper_shutdown,
+            execution_reaper_replica,
         )
         .await;
     });

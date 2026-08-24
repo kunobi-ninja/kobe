@@ -104,6 +104,16 @@ struct PrincipalEntry {
 /// absence proof because the workload can forge their spool. Entries remain
 /// until lease teardown, bounding retained history independently of how quickly
 /// commands finish.
+///
+/// `writer` records the exact serving replica that opened the row, giving the
+/// tombstone the same writer-liveness fence gate entries have: once that exact
+/// process is provably gone ([`stale_for_current_replica`]) and a strong 404
+/// observed the object absent, [`expire_orphaned_creating_execution`] can
+/// resolve the row — a late CREATE could still land, but only the writer's own
+/// resolve task could have bound it or started its runner, so the object it
+/// might still produce is inert. Rows predating the field, or written without a
+/// replica identity, keep the older fail-closed behavior and are never retired
+/// by this path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExecutionEntry {
@@ -115,6 +125,8 @@ struct ExecutionEntry {
     #[serde(default)]
     creation_state: ExecutionCreationState,
     active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer: Option<ServingReplica>,
 }
 
 impl ExecutionEntry {
@@ -164,6 +176,7 @@ fn reserve_execution_entry(
     request_digest: &str,
     pod_uid: &str,
     reserved_at: &str,
+    writer: Option<&ServingReplica>,
 ) -> ExecutionCapacity {
     if let Some(existing) = entries.get(execution_name) {
         if existing.request_digest != request_digest || existing.pod_uid != pod_uid {
@@ -194,6 +207,7 @@ fn reserve_execution_entry(
             execution_uid: None,
             creation_state: ExecutionCreationState::Creating,
             active: true,
+            writer: writer.cloned(),
         },
     );
     ExecutionCapacity::Reserved
@@ -209,6 +223,9 @@ pub struct ExecutionManifestEntry {
     pub execution_uid: Option<String>,
     pub creation_state: ExecutionCreationState,
     pub active: bool,
+    /// Exact serving replica that opened the reservation, when known. Rows
+    /// without one predate the writer fence and are never liveness-retired.
+    pub writer: Option<ServingReplica>,
 }
 
 fn execution_can_release_active_capacity(
@@ -1058,6 +1075,10 @@ async fn exact_gate_for_lease(
 /// CREATE is safe because the derived execution name and request digest are
 /// already durable here; a different request under the same name conflicts and
 /// no request can exceed either bound by racing another replica.
+///
+/// `writer` is recorded on the new row so startup recovery can later prove the
+/// reserving process gone; see [`expire_orphaned_creating_execution`]. Passing
+/// `None` keeps the legacy fail-closed row, which no liveness path may retire.
 pub async fn reserve_execution_capacity(
     client: &Client,
     ledger_namespace: &str,
@@ -1065,9 +1086,13 @@ pub async fn reserve_execution_capacity(
     execution_name: &str,
     request_digest: &str,
     pod_uid: &str,
+    writer: Option<&ServingReplica>,
 ) -> Result<ExecutionCapacity, AccessLedgerError> {
     if execution_name.is_empty() || request_digest.len() != 64 || pod_uid.is_empty() {
         return Err(AccessLedgerError::Invalid("execution reservation identity"));
+    }
+    if let Some(writer) = writer {
+        writer.validate()?;
     }
     let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
     for _ in 0..MAX_CAS_ATTEMPTS {
@@ -1087,6 +1112,7 @@ pub async fn reserve_execution_capacity(
             request_digest,
             pod_uid,
             &chrono::Utc::now().to_rfc3339(),
+            writer,
         );
         if outcome != ExecutionCapacity::Reserved {
             return Ok(outcome);
@@ -1244,6 +1270,7 @@ pub async fn execution_manifest(
                 execution_uid: entry.execution_uid,
                 creation_state,
                 active: entry.active,
+                writer: entry.writer,
             }
         })
         .collect())
@@ -1294,6 +1321,74 @@ pub async fn expire_unbound_execution(
         }
         entry.execution_uid = Some(uid.to_string());
         entry.creation_state = ExecutionCreationState::Bound;
+        entry.active = false;
+        match patch_execution_entries(&api, &gate, &previous, &entries).await {
+            Ok(_) => return Ok(true),
+            Err(AccessLedgerError::Kubernetes(error)) if optimistic_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AccessLedgerError::Contended)
+}
+
+/// Retire a `Creating` tombstone whose exact writer is provably gone.
+///
+/// The tombstone exists because an ambiguous CREATE might still land. Writer
+/// death changes that calculus: only the reserving replica's own resolve task
+/// could have bound the object or started its runner, and
+/// [`stale_for_current_replica`] proves that exact process cannot own a live
+/// connection anymore — same Pod name resolves to `current.pod_uid`, so an
+/// older boot or older-UID Pod is gone by Kubernetes name uniqueness. Whatever
+/// a late CREATE still produces is inert: never bound, never spawned, and
+/// already handled as an orphan record by the object-side reaper.
+///
+/// The caller must have observed a strong 404 for the exact object first; the
+/// row must match `expected` field-for-field so a same-named key replacement
+/// cannot be retired as somebody else's evidence. The row flips to `Rejected`
+/// with its active slot released — the same durable shape
+/// [`reject_execution_creation`] leaves — so teardown's existing retirement
+/// machinery takes it from there. Rows without a recorded writer, rows whose
+/// writer is not provably dead relative to `current`, and rows already bound
+/// are refused.
+pub async fn expire_orphaned_creating_execution(
+    client: &Client,
+    ledger_namespace: &str,
+    lease: &SandboxLease,
+    expected: &ExecutionManifestEntry,
+    current: &ServingReplica,
+) -> Result<bool, AccessLedgerError> {
+    current.validate()?;
+    if expected.execution_uid.is_some() {
+        return Err(AccessLedgerError::Invalid("bound execution reservation"));
+    }
+    let api: Api<Lease> = Api::namespaced(client.clone(), ledger_namespace);
+    for _ in 0..MAX_CAS_ATTEMPTS {
+        let gate = exact_gate_for_lease(&api, lease).await?;
+        let previous = gate
+            .annotations()
+            .get(EXECUTIONS_ANNOTATION)
+            .cloned()
+            .ok_or(AccessLedgerError::Invalid("executions annotation"))?;
+        let mut entries: BTreeMap<String, ExecutionEntry> = serde_json::from_str(&previous)?;
+        let entry = entries
+            .get_mut(&expected.name)
+            .ok_or(AccessLedgerError::Invalid("execution reservation"))?;
+        if entry.execution_uid.is_some()
+            || entry.request_digest != expected.request_digest
+            || entry.pod_uid != expected.pod_uid
+            || entry.reserved_at != expected.reserved_at
+            || entry.creation_state != ExecutionCreationState::Creating
+        {
+            return Err(AccessLedgerError::Invalid("execution reservation identity"));
+        }
+        let stale = entry
+            .writer
+            .as_ref()
+            .is_some_and(|writer| stale_for_current_replica(writer, current));
+        if !stale {
+            return Ok(false);
+        }
+        entry.creation_state = ExecutionCreationState::Rejected;
         entry.active = false;
         match patch_execution_entries(&api, &gate, &previous, &entries).await {
             Ok(_) => return Ok(true),
@@ -2274,6 +2369,59 @@ mod tests {
         .unwrap()
     }
 
+    fn gate_path(lease_uid: &str) -> String {
+        format!(
+            "/apis/coordination.k8s.io/v1/namespaces/ledger/leases/{}",
+            gate_name(lease_uid)
+        )
+    }
+
+    /// One unbound Creating tombstone, as the reaper observes it through
+    /// [`execution_manifest`], with an optional recorded writer.
+    fn manifest_entry_with_writer(writer: Option<&ServingReplica>) -> ExecutionManifestEntry {
+        ExecutionManifestEntry {
+            name: "execution-a".into(),
+            request_digest: "d".repeat(64),
+            pod_uid: "pod-uid".into(),
+            reserved_at: "2026-08-20T00:00:00Z".into(),
+            execution_uid: None,
+            creation_state: ExecutionCreationState::Creating,
+            active: true,
+            writer: writer.cloned(),
+        }
+    }
+
+    fn gate_with_creating_entry(writer: Option<&ServingReplica>) -> Value {
+        let entry = ExecutionEntry {
+            request_digest: "d".repeat(64),
+            pod_uid: "pod-uid".into(),
+            reserved_at: "2026-08-20T00:00:00Z".into(),
+            execution_uid: None,
+            creation_state: ExecutionCreationState::Creating,
+            active: true,
+            writer: writer.cloned(),
+        };
+        let existing = BTreeMap::from([("execution-a".to_string(), entry)]);
+        lease_object(
+            &gate_name("sandbox-uid"),
+            "gate-uid",
+            "1",
+            BTreeMap::from([
+                (LEDGER_KIND_LABEL.into(), GATE_KIND.into()),
+                (LEASE_NAME_LABEL.into(), "sandbox-a".into()),
+                (LEASE_UID_LABEL.into(), "sandbox-uid".into()),
+            ]),
+            BTreeMap::from([
+                (STATE_ANNOTATION.into(), OPEN.into()),
+                (ENTRIES_ANNOTATION.into(), "{}".into()),
+                (
+                    EXECUTIONS_ANNOTATION.into(),
+                    serde_json::to_string(&existing).unwrap(),
+                ),
+            ]),
+        )
+    }
+
     fn test_registration(replica: &ServingReplica) -> ReleaseRegistration {
         ReleaseRegistration {
             sandbox_name: "sandbox-a".into(),
@@ -2495,6 +2643,7 @@ mod tests {
                 &digest,
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
+                None,
             ),
             ExecutionCapacity::Reserved
         );
@@ -2505,6 +2654,7 @@ mod tests {
                 &digest,
                 "pod-uid",
                 "2026-08-20T00:01:00Z",
+                None,
             ),
             ExecutionCapacity::ExistingActive {
                 execution_uid: None
@@ -2518,6 +2668,7 @@ mod tests {
                 &"e".repeat(64),
                 "pod-uid",
                 "2026-08-20T00:01:00Z",
+                None,
             ),
             ExecutionCapacity::Conflict
         );
@@ -2530,6 +2681,7 @@ mod tests {
                     &digest,
                     "pod-uid",
                     "2026-08-20T00:00:00Z",
+                    None,
                 ),
                 ExecutionCapacity::Reserved
             );
@@ -2541,6 +2693,7 @@ mod tests {
                 &digest,
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
+                None,
             ),
             ExecutionCapacity::LimitReached
         );
@@ -2552,6 +2705,7 @@ mod tests {
                 &digest,
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
+                None,
             ),
             ExecutionCapacity::Reserved,
             "a terminal process frees concurrency but not its history row"
@@ -2568,6 +2722,7 @@ mod tests {
                     &digest,
                     "pod-uid",
                     "2026-08-20T00:00:00Z",
+                    None,
                 ),
                 ExecutionCapacity::Reserved
             );
@@ -2586,6 +2741,7 @@ mod tests {
                 &digest,
                 "pod-uid",
                 "2026-08-20T00:00:00Z",
+                None,
             ),
             ExecutionCapacity::LimitReached
         );
@@ -2674,6 +2830,7 @@ mod tests {
                 "execution-a",
                 &"d".repeat(64),
                 "pod-uid",
+                None,
             )
             .await
             .unwrap(),
@@ -2727,6 +2884,7 @@ mod tests {
                 execution_uid: None,
                 creation_state: ExecutionCreationState::Creating,
                 active: true,
+                writer: None,
             },
         )]);
         let object = lease_object(
@@ -2806,6 +2964,7 @@ mod tests {
                 execution_uid: None,
                 creation_state: ExecutionCreationState::Creating,
                 active: true,
+                writer: None,
             },
         )]);
         let object = lease_object(
@@ -2858,6 +3017,209 @@ mod tests {
         );
     }
 
+    /// A Creating tombstone whose recorded writer is provably gone — this
+    /// replica wears the same Pod name with a different boot — resolves to
+    /// Rejected with its active slot released, the same durable shape as a
+    /// definitive API rejection, so teardown's ordinary retirement takes over.
+    #[tokio::test]
+    async fn orphaned_creating_tombstone_is_retired_once_its_writer_is_gone() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let stale_boot_replica = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "pod-uid".into(),
+            boot_id: "boot-1".into(),
+        };
+        let current = ServingReplica {
+            boot_id: "boot-2".into(),
+            ..stale_boot_replica.clone()
+        };
+        let expected = manifest_entry_with_writer(Some(&stale_boot_replica));
+        let object = gate_with_creating_entry(expected.writer.as_ref());
+
+        Mock::given(method("GET"))
+            .and(path(gate_path("sandbox-uid")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(object.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(gate_path("sandbox-uid")))
+            .respond_with(PatchedExecutionLease { object })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            expire_orphaned_creating_execution(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                &expected,
+                &current,
+            )
+            .await
+            .unwrap()
+        );
+        let request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("tombstone retirement CAS");
+        let patch: Value = serde_json::from_slice(&request.body).unwrap();
+        let entries: BTreeMap<String, ExecutionEntry> =
+            serde_json::from_str(patch[3]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            entries["execution-a"].creation_state,
+            ExecutionCreationState::Rejected
+        );
+        assert!(!entries["execution-a"].active);
+        assert_eq!(entries["execution-a"].execution_uid, None);
+        assert_eq!(
+            entries["execution-a"].writer.as_ref(),
+            Some(&stale_boot_replica)
+        );
+    }
+
+    /// A live writer keeps its tombstone. This replica IS the writer, so the
+    /// CREATE may be in flight right now and the resolve task still owns bind
+    /// and spawn authority.
+    #[tokio::test]
+    async fn creating_tombstone_of_a_live_writer_is_never_retired() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let current = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "pod-uid".into(),
+            boot_id: "boot-1".into(),
+        };
+        let expected = manifest_entry_with_writer(Some(&current));
+        Mock::given(method("GET"))
+            .and(path(gate_path("sandbox-uid")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(gate_with_creating_entry(Some(&current))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            !expire_orphaned_creating_execution(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                &expected,
+                &current,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PATCH")
+        );
+    }
+
+    /// Only the writer's own successor boot may judge a tombstone orphaned. A
+    /// different Pod cannot prove anything about a process it never was, so it
+    /// refuses even when both Pods happen to serve simultaneously.
+    #[tokio::test]
+    async fn creating_tombstone_on_a_foreign_pod_is_never_retired_here() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let writer = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "pod-uid".into(),
+            boot_id: "boot-1".into(),
+        };
+        let foreign = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-1".into(),
+            pod_uid: "other-pod-uid".into(),
+            boot_id: "boot-9".into(),
+        };
+        let expected = manifest_entry_with_writer(Some(&writer));
+        Mock::given(method("GET"))
+            .and(path(gate_path("sandbox-uid")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(gate_with_creating_entry(Some(&writer))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            !expire_orphaned_creating_execution(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                &expected,
+                &foreign,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PATCH")
+        );
+    }
+
+    /// Rows predating the writer fence have no provable owner. They stay
+    /// fail-closed exactly like before the fence existed rather than being
+    /// retired on a guess.
+    #[tokio::test]
+    async fn legacy_creating_tombstone_without_a_writer_is_never_retired() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server);
+        let current = ServingReplica {
+            namespace: "kobe-system".into(),
+            pod_name: "kobe-0".into(),
+            pod_uid: "pod-uid".into(),
+            boot_id: "boot-2".into(),
+        };
+        let expected = manifest_entry_with_writer(None);
+        Mock::given(method("GET"))
+            .and(path(gate_path("sandbox-uid")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gate_with_creating_entry(None)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            !expire_orphaned_creating_execution(
+                &client,
+                "ledger",
+                &sandbox_lease(),
+                &expected,
+                &current,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PATCH")
+        );
+    }
+
     /// Teardown must remove each durable manifest row, not merely mark it
     /// inactive. Otherwise the next pass sees a missing bound record and
     /// quarantines, while an unbound inactive row loops forever.
@@ -2879,6 +3241,7 @@ mod tests {
                     ExecutionCreationState::Rejected
                 },
                 active: false,
+                writer: None,
             };
             let existing = BTreeMap::from([("execution-a".to_string(), entry.clone())]);
             let object = lease_object(
@@ -2926,6 +3289,7 @@ mod tests {
                             execution_uid: Some(execution_uid.into()),
                             creation_state: ExecutionCreationState::Bound,
                             active: false,
+                            writer: None,
                         },
                     )
                     .await
@@ -2944,6 +3308,7 @@ mod tests {
                         execution_uid: None,
                         creation_state: ExecutionCreationState::Rejected,
                         active: false,
+                        writer: None,
                     },
                 )
                 .await
