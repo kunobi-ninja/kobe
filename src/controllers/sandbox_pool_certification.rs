@@ -38,7 +38,7 @@ use crate::sandbox::{
 
 const WARM_POOL_LABEL: &str = "agents.x-k8s.io/warm-pool-sandbox";
 const TEMPLATE_REF_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-template-ref-hash";
-const SANDBOX_HASH_LABEL: &str = "agents.x-k8s.io/sandbox";
+const SANDBOX_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
 const CERTIFICATION_POOL_UID_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool-uid";
 const CERTIFICATION_POOL_GENERATION_LABEL: &str = "kobe.kunobi.ninja/sandbox-pool-generation";
 const TEARDOWN_FENCE_LABEL: &str = "kobe.kunobi.ninja/sandbox-teardown-fence";
@@ -2843,6 +2843,24 @@ mod tests {
             .unwrap()
             .remove(TEMPLATE_REF_HASH_LABEL);
         assert!(validate_pod_labels(&pod, "sandbox-one", "kobe-agents", &policy).is_err());
+    }
+
+    /// The workload labels must be the exact keys Agent Sandbox v0.5.6 puts on
+    /// Pods and Services. Every earlier test compared our constant against
+    /// itself, so a mistyped key passed every fixture while rejecting every
+    /// real upstream workload — which is how certification timed out for its
+    /// full 900-second window in live conformance while unit tests stayed
+    /// green.
+    #[test]
+    fn workload_label_keys_match_the_pinned_upstream_release() {
+        assert_eq!(
+            SANDBOX_HASH_LABEL, "agents.x-k8s.io/sandbox-name-hash",
+            "v0.5.6 labels Pods and Services with sandbox-name-hash (controllers/sandbox_controller.go sandboxLabel)"
+        );
+        assert_eq!(
+            TEMPLATE_REF_HASH_LABEL, "agents.x-k8s.io/sandbox-template-ref-hash",
+            "v0.5.6 propagates the template's self-label to Pods (SandboxTemplateRefHashLabel)"
+        );
     }
 
     #[test]
