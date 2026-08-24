@@ -172,8 +172,10 @@ async fn run() -> anyhow::Result<()> {
     // External mode is operator-owned. Before mounting Sandbox routes, perform
     // only read-only API/schema compatibility checks; startup must never create
     // a sacrificial Claim or assume one particular controller deployment.
+    // Transient apiserver faults retry inside a bounded window; only an absent
+    // or incompatible runtime aborts, immediately.
     if agent_sandbox_mode.enabled() {
-        match sandbox_runtime::validate_external_runtime(&client).await {
+        match sandbox_runtime::validate_external_runtime_with_retry(&client).await {
             Ok(()) => info!(?agent_sandbox_mode, "Agent Sandbox APIs validated"),
             Err(err) => {
                 error!(reason = err.reason_code(), "{err}");
