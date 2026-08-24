@@ -72,6 +72,9 @@ serde_yaml_ng = "0.10"
 toml = "0.8"
 json-patch = "4"
 sha2 = "0.10"
+# Sandbox attach query parsing: repeated `command=` keys must collect into
+# argv, which axum's Query (serde_urlencoded) cannot express.
+form_urlencoded = "1.2"
 
 # Auth
 jsonwebtoken = "9"

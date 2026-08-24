@@ -2672,6 +2672,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "form_urlencoded",
  "futures",
  "hex",
  "http 1.4.0",

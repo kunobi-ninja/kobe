@@ -6,7 +6,7 @@
 //! or expose upstream Agent Sandbox objects. Placement controllers in #73/#74
 //! own those transitions.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -1934,19 +1934,87 @@ async fn cancel_runner<B: ClusterBackend>(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Parsed `/attach` query.
+///
+/// Not deserialized by axum's `Query`: `Option<Vec<String>>` is unreachable
+/// under serde_urlencoded — every value arrives as a string, so
+/// `?tty=true&command=bash` is rejected as "invalid type: string" before the
+/// handler runs. argv is instead collected by [`parse_attach_query`], which
+/// folds repeated `command=` keys into one vector, exactly what the CLI emits.
+#[derive(Debug, Default)]
 struct SandboxAttachQuery {
     /// argv to run. Absent attaches to the container's existing process
     /// instead of starting a new one.
-    #[serde(default)]
     command: Option<Vec<String>>,
-    #[serde(default)]
     container: Option<String>,
     /// Allocate a terminal. Off by default: a TTY merges stderr into stdout
     /// and changes how the workload buffers, so it must be asked for.
-    #[serde(default)]
     tty: bool,
+    /// Whether `tty` appeared, so a repeated key can be rejected.
+    tty_set: bool,
+}
+
+/// Errors from [`parse_attach_query`], each a caller-side mistake.
+#[derive(Debug, PartialEq, Eq)]
+enum AttachQueryError {
+    UnknownParameter(String),
+    DuplicateParameter(&'static str),
+    InvalidBoolean,
+}
+
+impl AttachQueryError {
+    fn message(&self) -> String {
+        match self {
+            Self::UnknownParameter(name) => {
+                format!("unknown attach parameter: {name}")
+            }
+            Self::DuplicateParameter(name) => {
+                format!("attach parameter {name} may appear at most once")
+            }
+            Self::InvalidBoolean => "tty must be true or false".into(),
+        }
+    }
+}
+
+/// Fold the raw attach query string into [`SandboxAttachQuery`].
+///
+/// Repeated `command` keys append in order, so `?command=sh&command=-c`
+/// arrives as `["sh", "-c"]`. Percent-decoding follows form semantics
+/// (`%20` and `+` both decode to space), matching how every other
+/// urlencoded value on this API is read. Everything else is strict: an
+/// unknown key, a duplicated singleton key, or a non-boolean `tty` is an
+/// error rather than silently ignored input on an interactive channel.
+fn parse_attach_query(raw: Option<&str>) -> Result<SandboxAttachQuery, AttachQueryError> {
+    let mut query = SandboxAttachQuery::default();
+    for (key, value) in form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "command" => {
+                query
+                    .command
+                    .get_or_insert_with(Vec::new)
+                    .push(value.into_owned());
+            }
+            "container" => {
+                if query.container.is_some() {
+                    return Err(AttachQueryError::DuplicateParameter("container"));
+                }
+                query.container = Some(value.into_owned());
+            }
+            "tty" => {
+                if query.tty_set {
+                    return Err(AttachQueryError::DuplicateParameter("tty"));
+                }
+                query.tty = match value.as_ref() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(AttachQueryError::InvalidBoolean),
+                };
+                query.tty_set = true;
+            }
+            other => return Err(AttachQueryError::UnknownParameter(other.to_string())),
+        }
+    }
+    Ok(query)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2265,11 +2333,18 @@ async fn sandbox_attach<B: ClusterBackend>(
     State(state): State<AppState<B>>,
     identity: AuthIdentity,
     Path(id): Path<String>,
-    Query(query): Query<SandboxAttachQuery>,
+    RawQuery(query): RawQuery,
     upgrade: axum::extract::WebSocketUpgrade,
 ) -> Response {
     use crate::api::sandbox_credentials::SandboxOperation;
     use crate::api::sandbox_transport as transport;
+
+    let query = match parse_attach_query(query.as_deref()) {
+        Ok(query) => query,
+        Err(error) => {
+            return sandbox_error(StatusCode::BAD_REQUEST, error.message(), None);
+        }
+    };
 
     if let Some(command) = query.command.as_ref()
         && (command.is_empty() || command.iter().any(String::is_empty))
@@ -7507,6 +7582,53 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             sandbox_enabled: true,
         }
+    }
+
+    /// The attach query is parsed by hand because axum's `Query` cannot carry
+    /// repeated keys into `Option<Vec<String>>`: every value arrives as a
+    /// string, so the CLI's `?tty=true&command=bash` used to die inside the
+    /// extractor with "invalid type: string" and attach-with-command was
+    /// unreachable. These pins hold the wire contract open.
+    #[test]
+    fn attach_query_folds_repeated_command_keys_into_argv() {
+        let query = parse_attach_query(Some("tty=true&command=bash&command=-lc&command=echo%20hi"))
+            .unwrap();
+        assert_eq!(
+            query.command.as_deref(),
+            Some(&["bash".to_owned(), "-lc".to_owned(), "echo hi".to_owned()][..])
+        );
+        assert!(query.tty);
+    }
+
+    #[test]
+    fn attach_query_without_a_command_attaches_the_existing_process() {
+        for raw in [None, Some(""), Some("container=sidecar"), Some("tty=false")] {
+            let query = parse_attach_query(raw).unwrap();
+            assert_eq!(query.command, None, "{raw:?}");
+        }
+        let query = parse_attach_query(Some("container=sidecar")).unwrap();
+        assert_eq!(query.container.as_deref(), Some("sidecar"));
+    }
+
+    #[test]
+    fn attach_query_rejects_unknown_duplicate_and_nonboolean_values() {
+        assert_eq!(
+            parse_attach_query(Some("tty=true&extra=1")).unwrap_err(),
+            AttachQueryError::UnknownParameter("extra".into()),
+            "the old deny_unknown_fields behavior is preserved"
+        );
+        assert_eq!(
+            parse_attach_query(Some("container=a&container=b")).unwrap_err(),
+            AttachQueryError::DuplicateParameter("container")
+        );
+        assert_eq!(
+            parse_attach_query(Some("tty=1")).unwrap_err(),
+            AttachQueryError::InvalidBoolean
+        );
+        assert_eq!(
+            parse_attach_query(Some("tty=true&tty=false")).unwrap_err(),
+            AttachQueryError::DuplicateParameter("tty")
+        );
     }
 
     fn pool_json() -> serde_json::Value {
