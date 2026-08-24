@@ -39,7 +39,7 @@ variable "k3s_version" {
 }
 
 variable "allowed_api_cidr" {
-  description = "CIDR allowed on ports 22 + 6443. Empty = auto-detect caller's public IP via icanhazip.com. Set to \"0.0.0.0/0\" for public access (NOT recommended)."
+  description = "CIDR allowed on ports 22 + 6443. Empty = auto-detect the caller's public IPv4 via ipv4.icanhazip.com; set it explicitly if you have no IPv4 egress. Set to \"0.0.0.0/0\" for public access (NOT recommended)."
   type        = string
   default     = ""
 }

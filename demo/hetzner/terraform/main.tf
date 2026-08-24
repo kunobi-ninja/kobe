@@ -25,9 +25,14 @@ provider "hcloud" {
 }
 
 # Auto-detect caller's public IP unless allowed_api_cidr is set explicitly.
+# The v4-only host matters: the plain icanhazip.com name is dual-stack, so a
+# caller with working IPv6 gets an IPv6 address back and the "/32" below turns
+# it into a CIDR the Hetzner API rejects. Everything the demo does afterwards
+# (SSH, scp of the kubeconfig, the API tunnel) targets the server's IPv4
+# address anyway, so the IPv4 source is the one the firewall has to allow.
 data "http" "my_ip" {
   count = var.allowed_api_cidr == "" ? 1 : 0
-  url   = "https://icanhazip.com"
+  url   = "https://ipv4.icanhazip.com"
 }
 
 locals {
