@@ -658,6 +658,11 @@ fn pool_status(
         ready,
         allocated,
         quarantined,
+        // The resolved placement is mirrored into status so the CRD's
+        // placement invariants stay status-only: a spec-only edit carries the
+        // previous status over unchanged and must not be rejected for
+        // disagreeing with itself.
+        placement: Some(pool.spec.placement.clone()),
         placement_authority: None,
         certification: pool
             .status
@@ -9000,6 +9005,7 @@ pub(crate) mod tests {
                 ready: 0,
                 allocated: 0,
                 quarantined: 0,
+                placement: None,
                 placement_authority: None,
                 certification: None,
                 conditions: vec![SandboxCondition {

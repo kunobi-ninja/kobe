@@ -1451,6 +1451,7 @@ mod tests {
             ready: 2,
             allocated: 1,
             quarantined: 0,
+            placement: None,
             placement_authority: None,
             certification: Some(pool_certification(3)),
             conditions: vec![ready_condition(SandboxConditionStatus::True, Some(3))],

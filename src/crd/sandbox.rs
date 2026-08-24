@@ -37,9 +37,9 @@ use super::TeardownEvidenceReference;
         .message("exact certification references are immutable within one fingerprint"),
     validation = Rule::new("!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == 'certified' || (oldSelf.status.certification.phase in ['initialized', 'cleanupBlocked'] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))")
         .message("an active certification fingerprint cannot be abandoned before exact cleanup"),
-    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == 'childCluster' && self.status.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.status.placementAuthority.kind == 'ClusterPool' && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)")
+    validation = Rule::new("!has(self.status) || self.status == null || !has(self.status.placementAuthority) || !has(self.status.placement) || (self.status.placement.type == 'childCluster' && self.status.placementAuthority.apiVersion == 'kobe.kunobi.ninja/v1alpha1' && self.status.placementAuthority.kind == 'ClusterPool' && self.status.placementAuthority.name == self.status.placement.clusterPoolRef)")
         .message("placementAuthority must identify the exact child ClusterPool"),
-    validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == 'childCluster' && has(self.status.observedGeneration) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'False' && c.reason == 'CompositionEligible' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration)))")
+    validation = Rule::new("!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (has(self.status.placement) && self.status.placement.type == 'childCluster' && has(self.status.observedGeneration) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == 'Ready' && c.status == 'False' && c.reason == 'CompositionEligible' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration)))")
         .message("placementAuthority is published only with coherent CompositionEligible status"),
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Allocated","type":"integer","jsonPath":".status.allocated"}"#,
@@ -618,6 +618,19 @@ pub struct SandboxPoolStatus {
     /// capacity remains allocated until its complete footprint is proven absent.
     #[serde(default)]
     pub quarantined: u32,
+    /// The placement this Pool generation is being reconciled under, recorded
+    /// by the placement controller from `spec.placement`.
+    ///
+    /// Status-only on purpose: the placement CEL invariants compare authority
+    /// against this recorded value, never against `spec.placement`. Kubernetes
+    /// carries status over unchanged across a spec-only update, so a rule
+    /// reading spec would compare the new intent against the previous
+    /// generation's recorded state and reject every placement edit forever —
+    /// freezing a child pool's target even though nothing inconsistent had
+    /// been written. With the value mirrored here, an edit is admitted and the
+    /// controller's next reconcile brings status back in line with spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<SandboxPlacement>,
     /// Exact child `ClusterPool` proven composition-eligible for this Pool
     /// generation. Management placement and ineligible child pools omit it.
     /// This is discovery authority only: child `Ready` remains `False` until an
@@ -1189,6 +1202,7 @@ mod tests {
             ready: 3,
             allocated: 2,
             quarantined: 1,
+            placement: None,
             placement_authority: None,
             certification: None,
             conditions: vec![],
@@ -1778,6 +1792,41 @@ mod tests {
                     .expect("CEL validation rule")
                     .contains("metadata.namespace"),
                 "CRD CEL cannot address metadata.namespace"
+            );
+        }
+    }
+
+    /// The SandboxPool placement invariants are status-only.
+    ///
+    /// A rule that constrains `status.placementAuthority` against
+    /// `self.spec.placement` rejected every placement edit on a child pool,
+    /// permanently: PrepareForUpdate carries status over unchanged across a
+    /// spec-only edit, so the new spec was judged against the previous
+    /// generation's recorded authority and could never agree with it. These
+    /// pins keep the rules reading `status.placement` — the controller-recorded
+    /// mirror of what is being reconciled — so an edit is admitted and the next
+    /// reconcile brings status back in line with spec.
+    #[test]
+    fn sandbox_pool_placement_rules_are_status_only() {
+        let pool = serde_json::to_value(SandboxPool::crd()).unwrap();
+        let root = &pool["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        let validations = root["x-kubernetes-validations"].as_array().unwrap();
+        for message in [
+            "placementAuthority must identify the exact child ClusterPool",
+            "placementAuthority is published only with coherent CompositionEligible status",
+        ] {
+            let rule = validations
+                .iter()
+                .find(|validation| validation["message"] == message)
+                .and_then(|validation| validation["rule"].as_str())
+                .expect("pool placement CEL");
+            assert!(
+                !rule.contains("self.spec"),
+                "'{message}' must not read spec: a spec/status comparison freezes placement"
+            );
+            assert!(
+                rule.contains("self.status.placement"),
+                "'{message}' must compare against the status-recorded placement"
             );
         }
     }

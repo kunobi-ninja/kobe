@@ -839,6 +839,37 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              placement:
+                description: |-
+                  The placement this Pool generation is being reconciled under, recorded
+                  by the placement controller from `spec.placement`.
+
+                  Status-only on purpose: the placement CEL invariants compare authority
+                  against this recorded value, never against `spec.placement`. Kubernetes
+                  carries status over unchanged across a spec-only update, so a rule
+                  reading spec would compare the new intent against the previous
+                  generation's recorded state and reject every placement edit forever —
+                  freezing a child pool's target even though nothing inconsistent had
+                  been written. With the value mirrored here, an edit is admitted and the
+                  controller's next reconcile brings status back in line with spec.
+                nullable: true
+                properties:
+                  clusterPoolRef:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  type:
+                    enum:
+                    - management
+                    - childCluster
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: management must not set clusterPoolRef; childCluster must set it
+                  rule: (self.type == 'management' && !has(self.clusterPoolRef)) || (self.type == 'childCluster' && has(self.clusterPoolRef))
               placementAuthority:
                 description: |-
                   Exact child `ClusterPool` proven composition-eligible for this Pool
@@ -911,9 +942,9 @@ spec:
         - message: an active certification fingerprint cannot be abandoned before exact cleanup
           rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == ''certified'' || (oldSelf.status.certification.phase in [''initialized'', ''cleanupBlocked''] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))'
         - message: placementAuthority must identify the exact child ClusterPool
-          rule: '!has(self.status) || self.status == null || !has(self.status.placementAuthority) || (self.spec.placement.type == ''childCluster'' && self.status.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.status.placementAuthority.kind == ''ClusterPool'' && self.status.placementAuthority.name == self.spec.placement.clusterPoolRef)'
+          rule: '!has(self.status) || self.status == null || !has(self.status.placementAuthority) || !has(self.status.placement) || (self.status.placement.type == ''childCluster'' && self.status.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.status.placementAuthority.kind == ''ClusterPool'' && self.status.placementAuthority.name == self.status.placement.clusterPoolRef)'
         - message: placementAuthority is published only with coherent CompositionEligible status
-          rule: '!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (self.spec.placement.type == ''childCluster'' && has(self.status.observedGeneration) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''Ready'' && c.status == ''False'' && c.reason == ''CompositionEligible'' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration)))'
+          rule: '!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.observedGeneration) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''Ready'' && c.status == ''False'' && c.reason == ''CompositionEligible'' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration)))'
     served: true
     storage: true
     subresources:
