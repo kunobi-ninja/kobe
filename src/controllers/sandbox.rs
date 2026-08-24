@@ -992,11 +992,13 @@ pub async fn reconcile_lease(
             Err(
                 crate::sandbox_access_ledger::AccessLedgerError::Invalid(_)
                 | crate::sandbox_access_ledger::AccessLedgerError::Serialization(_),
-            ) => return quarantine_lease(&lease, &ctx, "access_gate_unverifiable").await,
+            ) => {
+                return quarantine_unverifiable_gate(&lease, &ctx, "access_gate_unverifiable").await;
+            }
             Err(crate::sandbox_access_ledger::AccessLedgerError::Kubernetes(kube::Error::Api(
                 response,
             ))) if response.code == 401 || response.code == 403 => {
-                return quarantine_lease(&lease, &ctx, "access_gate_forbidden").await;
+                return quarantine_unverifiable_gate(&lease, &ctx, "access_gate_forbidden").await;
             }
             Err(error) => {
                 warn!(lease = %name, error = %error, "could not verify admitted Sandbox access gate");
@@ -1588,6 +1590,10 @@ enum ReleaseReason {
     /// Legacy or corrupt Releasing state without the atomic cause checkpoint.
     /// This is quarantined before any destructive action.
     MissingCause,
+    /// A live lease whose own admission gate could not be verified. It is
+    /// stamped `Unverifiable` and torn down through the ordinary evidence path
+    /// rather than being held without a reachable exit.
+    Unverifiable,
 }
 
 impl ReleaseReason {
@@ -1598,6 +1604,7 @@ impl ReleaseReason {
             Self::ProvisioningDeadline => "ProvisioningDeadlineElapsed",
             Self::ModeDisabled => "ModeDisabled",
             Self::MissingCause => "ReleaseCauseMissing",
+            Self::Unverifiable => "IntegrityUnverifiable",
         }
     }
 
@@ -1609,6 +1616,7 @@ impl ReleaseReason {
                 Some(crate::crd::SandboxReleaseCause::ProvisioningDeadline)
             }
             Self::ModeDisabled => Some(crate::crd::SandboxReleaseCause::ModeDisabled),
+            Self::Unverifiable => Some(crate::crd::SandboxReleaseCause::Unverifiable),
             Self::MissingCause => None,
         }
     }
@@ -1619,6 +1627,7 @@ impl ReleaseReason {
             crate::crd::SandboxReleaseCause::RuntimeTtl => Self::RuntimeTtl,
             crate::crd::SandboxReleaseCause::ProvisioningDeadline => Self::ProvisioningDeadline,
             crate::crd::SandboxReleaseCause::ModeDisabled => Self::ModeDisabled,
+            crate::crd::SandboxReleaseCause::Unverifiable => Self::Unverifiable,
         }
     }
 
@@ -1630,7 +1639,13 @@ impl ReleaseReason {
     fn terminal_phase(self) -> crate::crd::SandboxLeasePhase {
         match self {
             Self::RuntimeTtl | Self::ProvisioningDeadline => crate::crd::SandboxLeasePhase::Expired,
-            Self::Requested | Self::ModeDisabled => crate::crd::SandboxLeasePhase::Released,
+            // Unverifiable is a system-taken teardown, not a caller request,
+            // but the terminal phases only distinguish given-back from taken:
+            // the durable `releaseCause` carries that distinction for billing
+            // and support.
+            Self::Requested | Self::ModeDisabled | Self::Unverifiable => {
+                crate::crd::SandboxLeasePhase::Released
+            }
             Self::MissingCause => unreachable!("missing release cause must quarantine"),
         }
     }
@@ -6945,6 +6960,39 @@ async fn quarantine_lease(
     ctx: &SandboxContext,
     reason: &str,
 ) -> Result<Action, SandboxPlacementError> {
+    quarantine_lease_with_cause(lease, ctx, reason, None).await
+}
+
+/// Quarantine a live lease whose own admission gate could not be verified.
+///
+/// These are the only quarantines that fire before any release decision, so
+/// the lease carries no durable release cause — and [`release_reason`] maps a
+/// cause-less quarantine to `None`, which wedged finalizer and quota forever:
+/// the Quarantined reconcile arm returned before any evidence retry. Stamping
+/// [`crate::crd::SandboxReleaseCause::Unverifiable`] in the same fenced write
+/// makes the intended path reachable: the next reconcile drives the ordinary
+/// evidence-gated teardown, which tears the workload down once it can prove
+/// what it must, or keeps retrying while it cannot.
+async fn quarantine_unverifiable_gate(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: &str,
+) -> Result<Action, SandboxPlacementError> {
+    quarantine_lease_with_cause(
+        lease,
+        ctx,
+        reason,
+        Some(crate::crd::SandboxReleaseCause::Unverifiable),
+    )
+    .await
+}
+
+async fn quarantine_lease_with_cause(
+    lease: &SandboxLease,
+    ctx: &SandboxContext,
+    reason: &str,
+    stamp_cause: Option<crate::crd::SandboxReleaseCause>,
+) -> Result<Action, SandboxPlacementError> {
     let name = lease.name_any();
     let mut next = lease.status.clone().unwrap_or_default();
     if footprint_absence_proven(&next) {
@@ -6958,6 +7006,11 @@ async fn quarantine_lease(
     )
     .map_err(|error| SandboxPlacementError::Invalid(error.to_string()))?;
     next.phase = phase;
+    // The first cause wins forever; stamping never overwrites one that a
+    // decided teardown already persisted.
+    if next.release_cause.is_none() {
+        next.release_cause = stamp_cause;
+    }
     next.conditions = with_cleanup_condition(
         lease,
         crate::crd::SandboxConditionStatus::False,
@@ -13282,6 +13335,93 @@ pub(crate) mod tests {
         );
     }
 
+    /// A live lease whose admission gate could not be verified is stamped
+    /// `Unverifiable` in the same fenced write that quarantines it. Without a
+    /// durable cause the Quarantined reconcile arm returned before any
+    /// evidence retry, wedging finalizer and quota forever; with one, the
+    /// intended evidence path becomes reachable.
+    #[tokio::test]
+    async fn unverifiable_gate_quarantine_stamps_a_durable_cause() {
+        let (ctx, server) = test_context().await;
+        mount_one_winning_status_patch(&server).await;
+        // Ready with no release signal: exactly the shape that reaches the
+        // pre-release gate check.
+        let lease = releasing_lease(crate::crd::SandboxLeasePhase::Ready);
+        assert!(lease.status.as_ref().unwrap().release_cause.is_none());
+
+        let quarantine = quarantine_unverifiable_gate(&lease, &ctx, "access_gate_unverifiable")
+            .await
+            .unwrap();
+        assert_eq!(
+            quarantine,
+            Action::requeue(std::time::Duration::from_secs(300))
+        );
+
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["phase"], "Quarantined");
+        assert_eq!(
+            statuses[0]["releaseCause"], "Unverifiable",
+            "the cause must land atomically with the phase"
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_release_cause_is_reachable_and_terminal() {
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Quarantined);
+        lease.status.as_mut().unwrap().release_cause =
+            Some(crate::crd::SandboxReleaseCause::Unverifiable);
+        assert!(
+            matches!(release_reason(&lease), Some(ReleaseReason::Unverifiable)),
+            "a stamped quarantine must re-enter teardown instead of being held cause-less"
+        );
+
+        let reason = ReleaseReason::Unverifiable;
+        assert_eq!(reason.as_str(), "IntegrityUnverifiable");
+        assert_eq!(
+            reason.persisted_cause(),
+            Some(crate::crd::SandboxReleaseCause::Unverifiable)
+        );
+        assert_eq!(
+            reason.terminal_phase(),
+            crate::crd::SandboxLeasePhase::Released
+        );
+    }
+
+    /// The only legal exit from `Quarantined` runs back through `Releasing`
+    /// with the persisted cause intact — the immutability guard must accept
+    /// its own stamp, and the terminal accounting keeps attributing the
+    /// teardown to the integrity fault rather than to a caller request.
+    #[tokio::test]
+    async fn unverifiable_quarantine_resumes_teardown_through_releasing() {
+        let (ctx, server) = test_context().await;
+        mount_one_winning_status_patch(&server).await;
+        let mut lease = releasing_lease(crate::crd::SandboxLeasePhase::Quarantined);
+        lease.status.as_mut().unwrap().release_cause =
+            Some(crate::crd::SandboxReleaseCause::Unverifiable);
+
+        let action = drive_release(&lease, &ctx, ReleaseReason::Unverifiable)
+            .await
+            .unwrap();
+        assert_eq!(action, Action::await_change());
+
+        let statuses: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(status_value_of)
+            .collect();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0]["phase"], "Releasing");
+        assert_eq!(statuses[0]["releaseCause"], "Unverifiable");
+    }
     /// `FootprintAbsent` is the restart boundary. Once present, reconciliation
     /// skips workload teardown but still removes the receipt-bearing internal
     /// handle explicitly before the reservation/terminal tail.

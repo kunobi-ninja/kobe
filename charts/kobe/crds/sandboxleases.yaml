@@ -412,11 +412,15 @@ spec:
                   Immutable reason the lease first entered `Releasing`. Persisted in the
                   same status write as that phase so retries, later release requests, and
                   controller restarts cannot change the terminal accounting outcome.
+                  `Unverifiable` means Kobe could not verify the lease's own admission
+                  gate: the lease is treated as unsafe to serve and torn down through the
+                  evidence-gated path rather than holding finalizer and quota forever.
                 enum:
                 - Requested
                 - RuntimeTtl
                 - ProvisioningDeadline
                 - ModeDisabled
+                - Unverifiable
                 - null
                 nullable: true
                 type: string

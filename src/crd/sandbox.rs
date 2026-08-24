@@ -813,6 +813,9 @@ pub struct SandboxLeaseStatus {
     /// Immutable reason the lease first entered `Releasing`. Persisted in the
     /// same status write as that phase so retries, later release requests, and
     /// controller restarts cannot change the terminal accounting outcome.
+    /// `Unverifiable` means Kobe could not verify the lease's own admission
+    /// gate: the lease is treated as unsafe to serve and torn down through the
+    /// evidence-gated path rather than holding finalizer and quota forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_cause: Option<SandboxReleaseCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -940,6 +943,13 @@ pub enum SandboxReleaseCause {
     RuntimeTtl,
     ProvisioningDeadline,
     ModeDisabled,
+    // Kobe could not verify the lease's own admission gate, so it cannot
+    // prove which principal holds the workload or drain its operations. Such
+    // a lease is treated as unsafe to serve and torn down through the
+    // ordinary evidence-gated path rather than holding finalizer and quota
+    // forever. Distinct from Requested so billing and support can see the
+    // capacity was taken by the system, not given back by the caller.
+    Unverifiable,
 }
 
 impl std::fmt::Display for SandboxLeasePhase {
@@ -1619,6 +1629,7 @@ mod tests {
                 "RuntimeTtl",
                 "ProvisioningDeadline",
                 "ModeDisabled",
+                "Unverifiable",
                 null
             ])
         );
