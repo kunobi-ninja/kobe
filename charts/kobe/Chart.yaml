@@ -117,5 +117,5 @@ annotations:
 dependencies:
   - name: etcd
     version: "~10.0"
-    repository: https://charts.bitnami.com/bitnami
+    repository: oci://registry-1.docker.io/bitnamicharts
     condition: etcd.bundled
