@@ -74,11 +74,20 @@ pub(crate) async fn extend_lease(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        let msg = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+        let msg = parsed
+            .as_ref()
             .and_then(|value| value["error"].as_str().map(str::to_string))
-            .unwrap_or(text);
-        anyhow::bail!("Failed to extend lease {lease_id} (HTTP {status}): {msg}");
+            .unwrap_or(text.clone());
+        // The server's bounded reason (`conflict_retryable`,
+        // `extension_budget_exhausted`, …) tells a script whether retrying
+        // could ever succeed, without parsing the human message.
+        let reason = parsed
+            .as_ref()
+            .and_then(|value| value["reason"].as_str())
+            .map(|reason| format!(" [{reason}]"))
+            .unwrap_or_default();
+        anyhow::bail!("Failed to extend lease {lease_id} (HTTP {status}){reason}: {msg}");
     }
 
     let extended: ExtendResponse = response.json().await?;

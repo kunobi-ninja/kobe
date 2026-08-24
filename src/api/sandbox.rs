@@ -213,7 +213,7 @@ fn execution_denied(
     if status == StatusCode::NOT_FOUND {
         return StatusCode::NOT_FOUND.into_response();
     }
-    sandbox_error(status, error.to_string(), None)
+    sandbox_error_with_reason(status, error.to_string(), None, error.reason_code())
 }
 
 /// Reserve and run one durable, idempotent command.
@@ -654,7 +654,12 @@ async fn run_with_runner<B: ClusterBackend>(
                 reason = failure.reason_code(),
                 "Sandbox access"
             );
-            return sandbox_error(failure.http_status(), failure.to_string(), None);
+            return sandbox_error_with_reason(
+                failure.http_status(),
+                failure.to_string(),
+                None,
+                failure.reason_code(),
+            );
         }
     };
 
@@ -765,7 +770,12 @@ async fn resume_wait_with_runner<B: ClusterBackend>(
             return (StatusCode::OK, Json(execution_response(&durable, None))).into_response();
         }
         Some(Err(failure)) => {
-            return sandbox_error(failure.http_status(), failure.to_string(), None);
+            return sandbox_error_with_reason(
+                failure.http_status(),
+                failure.to_string(),
+                None,
+                failure.reason_code(),
+            );
         }
         None => {
             let cancelled = runner::cancel(
@@ -838,7 +848,12 @@ async fn complete_wait_mode<B: ClusterBackend>(
             // Start was acknowledged, so the command may still be running.
             // Keep `Running`: a later GET can reconcile it, whereas settling
             // Unknown here would discard a recoverable outcome.
-            return sandbox_error(failure.http_status(), failure.to_string(), None);
+            return sandbox_error_with_reason(
+                failure.http_status(),
+                failure.to_string(),
+                None,
+                failure.reason_code(),
+            );
         }
         Err(WaitRunnerFailure::Revoked(cancelled)) => {
             record_revoked_outcome(state, record, cancelled).await;
@@ -957,7 +972,12 @@ async fn wait_output_response<B: ClusterBackend>(
         Some(Err(failure)) => {
             // The outcome is durable and exact; output retrieval is a separate
             // transport failure and must not rewrite it to Unknown.
-            return sandbox_error(failure.http_status(), failure.to_string(), None);
+            return sandbox_error_with_reason(
+                failure.http_status(),
+                failure.to_string(),
+                None,
+                failure.reason_code(),
+            );
         }
         None => {
             return sandbox_error(
@@ -1552,7 +1572,12 @@ async fn get_sandbox_execution_logs<B: ClusterBackend>(
                     reason = failure.reason_code(),
                     "Sandbox access"
                 );
-                return sandbox_error(failure.http_status(), failure.to_string(), None);
+                return sandbox_error_with_reason(
+                    failure.http_status(),
+                    failure.to_string(),
+                    None,
+                    failure.reason_code(),
+                );
             }
             None => {
                 return runner_output_revoked_response(
@@ -1925,10 +1950,11 @@ async fn cancel_runner<B: ClusterBackend>(
                 reason = failure.reason_code(),
                 "Sandbox access"
             );
-            RunnerCancellation::Handled(sandbox_error(
+            RunnerCancellation::Handled(sandbox_error_with_reason(
                 failure.http_status(),
                 failure.to_string(),
                 None,
+                failure.reason_code(),
             ))
         }
     }
@@ -2839,7 +2865,7 @@ fn access_denied_with(
         reason,
         "Sandbox access"
     );
-    sandbox_error(status, message, None)
+    sandbox_error_with_reason(status, message, None, reason)
 }
 
 fn access_denied(
@@ -2861,7 +2887,7 @@ fn access_denied(
         // No body: a message would distinguish "not yours" from "not there".
         return StatusCode::NOT_FOUND.into_response();
     }
-    sandbox_error(status, denied.to_string(), None)
+    sandbox_error_with_reason(status, denied.to_string(), None, denied.reason_code())
 }
 
 /// Caller-safe lease intent. Unknown fields are rejected so a caller cannot
@@ -2976,11 +3002,40 @@ struct SandboxLeaseSummary {
     expires_at: Option<String>,
 }
 
+/// Error body for every Sandbox route denial.
+///
+/// `reason` carries the bounded machine-readable code the server already
+/// computed for logs and audit records, so an agent can branch on *why*
+/// without parsing free text — mirroring the cluster API's
+/// `ErrorResponse.reason`. It is omitted where no bounded reason exists; the
+/// closed set served today:
+///
+/// | reason | HTTP | retryable |
+/// |---|---|---|
+/// | `not_found` | 404 | no |
+/// | `not_ready` | 409/503 | yes, once Ready or placed |
+/// | `expired` | 410/409 | no — request a new lease |
+/// | `target_unresolved` | 409 | yes, after placement completes |
+/// | `provenance_incomplete` | 503 | operator attention |
+/// | `pool_unresolvable` | 503 | operator attention |
+/// | `not_declared` | 400 | no |
+/// | `ambiguous_alias` | 409 | no — disambiguate |
+/// | `backend_error` | 503 | yes, transient |
+/// | `extension_budget_exhausted` | 409 | no |
+/// | `max_ttl_ceiling` | 409 | no |
+/// | `expiry_derivation_mismatch` | 409 | no |
+/// | `conflict_retryable` | 409 | yes, against current state |
+/// | `teardown_quarantined` | 409 | no — operator must resolve cleanup |
+/// | `runner_*` / `execution_*` codes | varies | per their meaning below |
 #[derive(Debug, Serialize)]
 struct SandboxErrorResponse {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// Bounded machine-readable denial reason. Omitted unless set by a path
+    /// that knows one; never free text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 /// Stable, non-retry handle returned when this process cannot finish deciding
@@ -3006,6 +3061,25 @@ fn sandbox_error(status: StatusCode, error: impl Into<String>, detail: Option<St
         Json(SandboxErrorResponse {
             error: error.into(),
             detail,
+            reason: None,
+        }),
+    )
+        .into_response()
+}
+
+/// [`sandbox_error`] for paths that have computed a bounded denial reason.
+fn sandbox_error_with_reason(
+    status: StatusCode,
+    error: impl Into<String>,
+    detail: Option<String>,
+    reason: &'static str,
+) -> Response {
+    (
+        status,
+        Json(SandboxErrorResponse {
+            error: error.into(),
+            detail,
+            reason: Some(reason),
         }),
     )
         .into_response()
@@ -4259,20 +4333,22 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
 
     let mut status = lease.status.clone().unwrap_or_default();
     if status.phase != SandboxLeasePhase::Ready {
-        return sandbox_error(
+        return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Sandbox lease is not Ready",
             Some(format!("current phase: {}", status.phase)),
+            "not_ready",
         );
     }
     if status.extensions_count >= grant.max_extensions {
-        return sandbox_error(
+        return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Maximum Sandbox lease extensions reached",
             Some(format!(
                 "{} of {} already used",
                 status.extensions_count, grant.max_extensions
             )),
+            "extension_budget_exhausted",
         );
     }
 
@@ -4315,10 +4391,11 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
     // write landed first, resurrect a lease whose workload upstream has
     // already destroyed.
     if current_expiry <= chrono::Utc::now() {
-        return sandbox_error(
+        return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Sandbox lease has already expired",
             Some("request a new lease instead of extending an elapsed one".into()),
+            "expired",
         );
     }
     // The ceiling is the LOWER of the caller's grant and the pool's own
@@ -4365,20 +4442,22 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
     let expected_expiry =
         ready_at + spec_ttl + chrono::Duration::seconds(status.granted_extension_seconds);
     if current_expiry != expected_expiry {
-        return sandbox_error(
+        return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Sandbox expiry does not match its derivation",
             Some("refusing to extend a lease whose expiry was written out of band".into()),
+            "expiry_derivation_mismatch",
         );
     }
 
     let new_expiry = current_expiry + extension;
     let ceiling = ready_at + grant.max_ttl.min(pool_max_ttl);
     if new_expiry > ceiling {
-        return sandbox_error(
+        return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Extension would exceed the maximum Sandbox TTL",
             Some(format!("maximum expiry is {}", ceiling.to_rfc3339())),
+            "max_ttl_ceiling",
         );
     }
 
@@ -4421,10 +4500,11 @@ async fn extend_sandbox_lease<B: ClusterBackend>(
         .await
     {
         if matches!(&err, kube::Error::Api(api) if api.code == 409 || api.code == 422) {
-            return sandbox_error(
+            return sandbox_error_with_reason(
                 StatusCode::CONFLICT,
                 "Sandbox lease changed during extension",
                 Some("retry the extension against the current lease".into()),
+                "conflict_retryable",
             );
         }
         return sandbox_infra_error("Failed to extend Sandbox lease", err);
@@ -4484,10 +4564,14 @@ async fn release_sandbox_lease<B: ClusterBackend>(
         .map(|status| status.phase)
         .unwrap_or_default();
     if phase == SandboxLeasePhase::Quarantined {
-        return sandbox_error(
+        // The cluster release path reports the identical condition as
+        // `TeardownQuarantined`; the sandbox path now carries the same bounded
+        // reason instead of free text alone.
+        return sandbox_error_with_reason(
             StatusCode::CONFLICT,
             "Sandbox cleanup is quarantined",
             Some("Cleanup remains uncertain; capacity has not been released".into()),
+            "teardown_quarantined",
         );
     }
     if matches!(
@@ -13657,6 +13741,16 @@ mod tests {
                 .iter()
                 .all(|request| request.method.as_str() != "PATCH")
         );
+        // The cluster release path reports this same condition as
+        // `TeardownQuarantined`; the sandbox path must carry the identical
+        // bounded reason so a client branches once, not per API flavor.
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["reason"], "teardown_quarantined");
     }
     /// A pool with no runner refuses every durable execution, and refuses it
     /// before the caller's idempotency key is spent.

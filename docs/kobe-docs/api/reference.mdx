@@ -265,6 +265,32 @@ Sandbox callers select an administrator-owned `SandboxPool`; they cannot send a
 Pod spec, namespace, RuntimeClass, environment values, mounts, PVCs, or target
 credentials. Responses never contain a management or child-cluster kubeconfig.
 
+### Sandbox error reasons
+
+Every Sandbox denial body is `{ "error": string, "detail"?: string,
+"reason"?: string }`. `reason` carries a bounded machine-readable code — the
+same condition reports the same code on the cluster and Sandbox paths (a
+quarantined release is `teardown_quarantined` everywhere) — so an agent or
+script can branch on *why* without parsing free text. It is omitted where no
+bounded reason exists. The closed set:
+
+| `reason` | Retryable |
+|---|---|
+| `not_found` | no |
+| `not_ready` | yes, once Ready or placed |
+| `expired` | no — request a new lease |
+| `target_unresolved` | yes, after placement completes |
+| `provenance_incomplete` | needs operator attention |
+| `pool_unresolvable` | needs operator attention |
+| `not_declared` | no |
+| `ambiguous_alias` | no — disambiguate first |
+| `backend_error` | yes, transient |
+| `extension_budget_exhausted` | no |
+| `max_ttl_ceiling` | no |
+| `expiry_derivation_mismatch` | no |
+| `conflict_retryable` | yes, against current state |
+| `teardown_quarantined` | no — resolve cleanup first |
+
 ### `POST /v1/sandbox-leases`
 
 Creates caller-safe Sandbox intent and returns `202 Accepted`. The response
