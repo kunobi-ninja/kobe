@@ -46,7 +46,6 @@ const TEARDOWN_FENCE_FINALIZER: &str = "kobe.kunobi.ninja/sandbox-teardown-fence
 const TEARDOWN_FENCE_DENIAL_MESSAGE: &str =
     "Sandbox teardown has fenced descendant creation for this controller owner UID";
 const REQUIRED_POOL_ACK_RELEASE: &str = "v0.5.6";
-const POST_FENCE_MUTATION_BLOCKER: &str = "The exact teardown fence exists and its VAP denial was proven with a dry-run descendant CREATE. Agent Sandbox v0.5.6 exposes SandboxWarmPool.status.observedGeneration, but installing that fence does not increment the WarmPool generation. A causal drain ACK therefore requires the separately approved exact transition: UID/resourceVersion-fenced scale-to-zero, wait for that generation plus zero replicas, foreground-delete the sacrificial Claim, prove exact descendant/storage absence, restore capacity, prove clean new UIDs, then remove the fence. observedGeneration alone is not teardown or storage proof";
 
 fn sandbox_resource() -> ApiResource {
     ApiResource {
@@ -65,6 +64,26 @@ fn claim_resource() -> ApiResource {
         api_version: AGENT_SANDBOX_API_VERSION.into(),
         kind: "SandboxClaim".into(),
         plural: "sandboxclaims".into(),
+    }
+}
+
+fn warm_pool_resource() -> ApiResource {
+    ApiResource {
+        group: "extensions.agents.x-k8s.io".into(),
+        version: "v1beta1".into(),
+        api_version: AGENT_SANDBOX_API_VERSION.into(),
+        kind: SANDBOX_WARM_POOL_KIND.into(),
+        plural: "sandboxwarmpools".into(),
+    }
+}
+
+fn pvc_resource() -> ApiResource {
+    ApiResource {
+        group: "".into(),
+        version: "v1".into(),
+        api_version: "v1".into(),
+        kind: "PersistentVolumeClaim".into(),
+        plural: "persistentvolumeclaims".into(),
     }
 }
 
@@ -426,6 +445,183 @@ async fn verify_teardown_fence_enforcement(
             "teardown-fence VAP denial could not be proven by dry-run CREATE: {error}"
         )),
     }
+}
+
+/// Outcome of one UID/resourceVersion-fenced write.
+enum FencedWrite {
+    Updated(Box<DynamicObject>),
+    /// The object changed underneath the CAS; the next reconcile re-reads it.
+    Contended,
+    /// A definitive fail-closed finding: identity drift or deletion in flight.
+    Blocked(String),
+}
+
+/// Outcome of proving one exact recorded identity absent.
+enum Absence {
+    Proven,
+    Present,
+    Blocked(String),
+}
+
+/// The recorded identity a given kind maps to inside one certification
+/// attempt. Claim and Sandbox are mandatory from `WorkloadCaptured` onward.
+fn identity_for_kind<'a>(
+    status: &'a SandboxPoolCertificationStatus,
+    kind: &str,
+) -> Option<&'a SandboxObjectReference> {
+    if kind == "SandboxClaim" {
+        status.sandbox_claim.as_ref()
+    } else if kind == SANDBOX_KIND {
+        status.sandbox.as_ref()
+    } else {
+        None
+    }
+}
+
+/// Scale the exact recorded WarmPool under a UID/resourceVersion CAS.
+///
+/// The write is the only mutation of a pass; `metadata.generation` on the
+/// accepted object is the drain/replenish generation whose
+/// `status.observedGeneration` ACK the later phases wait for. Identity fences
+/// run before the CAS so a same-named replacement can never be scaled as
+/// somebody else's capacity.
+async fn scale_warm_pool_fenced(
+    client: &Client,
+    namespace: &str,
+    recorded_warm_pool: &SandboxObjectReference,
+    replicas: u32,
+) -> Result<FencedWrite, String> {
+    let pools: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &warm_pool_resource());
+    let current = read_dynamic_exact(&pools, namespace, recorded_warm_pool).await?;
+    let (Some(uid), Some(resource_version)) = (current.uid(), current.resource_version()) else {
+        return Ok(FencedWrite::Blocked(
+            "recorded certification WarmPool has no UID/resourceVersion to fence".into(),
+        ));
+    };
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "test", "path": "/spec/replicas",
+          "value": current.data.pointer("/spec/replicas").cloned().unwrap_or(serde_json::Value::Null) },
+        { "op": "replace", "path": "/spec/replicas", "value": replicas }
+    ]));
+    match pools
+        .patch(
+            &recorded_warm_pool.name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(updated) => Ok(FencedWrite::Updated(Box::new(updated))),
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => {
+            Ok(FencedWrite::Contended)
+        }
+        Err(kube::Error::Api(response)) if response.code == 404 || response.code == 403 => {
+            Ok(FencedWrite::Blocked(format!(
+                "recorded certification WarmPool cannot be scaled: {response}"
+            )))
+        }
+        Err(error) => Err(format!("certification WarmPool scale failed: {error}")),
+    }
+}
+
+/// GET one dynamic object and enforce its exact recorded identity.
+///
+/// Transport failures are retryable (`Err`); a deleting, misplaced, or
+/// replaced object is a definitive fail-closed finding.
+async fn read_dynamic_exact(
+    api: &Api<DynamicObject>,
+    namespace: &str,
+    recorded: &SandboxObjectReference,
+) -> Result<DynamicObject, String> {
+    let object = api
+        .get(&recorded.name)
+        .await
+        .map_err(|error| match &error {
+            kube::Error::Api(response) if response.code == 404 || response.code == 403 => {
+                format!("recorded {} cannot be proven: {response}", recorded.kind)
+            }
+            _ => format!("recorded {} lookup failed: {error}", recorded.kind),
+        })?;
+    if object.metadata.deletion_timestamp.is_some()
+        || object.namespace().as_deref() != Some(namespace)
+        || object.uid().as_deref() != Some(recorded.uid.as_str())
+    {
+        return Err(format!(
+            "recorded {} is deleting or no longer matches its checkpointed identity",
+            recorded.kind
+        ));
+    }
+    Ok(object)
+}
+
+/// Whether one exact recorded object is provably absent from its namespace.
+///
+/// Presence with the same UID means the deletion has not completed; presence
+/// with any other UID means a replacement appeared, which the fence exists to
+/// make impossible and which must never be deleted around.
+async fn reference_absent(
+    client: &Client,
+    namespace: &str,
+    api_resource: &ApiResource,
+    recorded: &SandboxObjectReference,
+) -> Result<Absence, String> {
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, api_resource);
+    match api.get(&recorded.name).await {
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(Absence::Proven),
+        Err(kube::Error::Api(response)) if response.code == 403 => Ok(Absence::Blocked(format!(
+            "recorded {} absence cannot be proven: {response}",
+            recorded.kind
+        ))),
+        Err(error) => Err(format!(
+            "recorded {} absence check failed: {error}",
+            recorded.kind
+        )),
+        Ok(object) => {
+            if object.uid().as_deref() != Some(recorded.uid.as_str()) {
+                Ok(Absence::Blocked(format!(
+                    "recorded {} was replaced by same-named UID {} before absence was proven",
+                    recorded.kind,
+                    object.uid().unwrap_or_else(|| "<none>".into())
+                )))
+            } else {
+                Ok(Absence::Present)
+            }
+        }
+    }
+}
+
+/// Read the recorded teardown fence and return `(uid, resourceVersion)` after
+/// enforcing its exact checkpointed identity. The fence must not be deleting;
+/// the caller decides what its finalizer set must be.
+async fn read_fence_exact(
+    fences: &Api<ConfigMap>,
+    desired_fence: &ConfigMap,
+    status: &SandboxPoolCertificationStatus,
+) -> Result<(String, String), String> {
+    let recorded = status.teardown_fence.as_ref().ok_or_else(|| {
+        "certification checkpoint has no exact teardown fence reference".to_string()
+    })?;
+    let fence = fences
+        .get(desired_fence.name_any().as_str())
+        .await
+        .map_err(|error| format!("teardown fence lookup failed: {error}"))?;
+    if fence.metadata.deletion_timestamp.is_some()
+        || fence.uid().as_deref() != Some(recorded.uid.as_str())
+    {
+        return Err("same-named certification teardown fence is deleting or drifted".to_string());
+    }
+    let uid = fence
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| "teardown fence has no UID".to_string())?;
+    let resource_version = fence
+        .resource_version()
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| "teardown fence has no resourceVersion".to_string())?;
+    Ok((uid, resource_version))
 }
 
 fn dynamic_status_count(warm_pool: &DynamicObject, field: &str) -> Option<u32> {
@@ -1407,11 +1603,13 @@ async fn revalidate_captured_workload(
 
 /// Advance at most one durable certification transition.
 ///
-/// Agent Sandbox v0.5.6 supplies the `observedGeneration` needed for a causal
-/// WarmPool barrier, but the fence itself does not bump that generation. Until
-/// the explicitly approved scale-to-zero/delete/restore transition is wired,
-/// the state machine stops fail-closed with the exact Claim and immutable fence
-/// retained. It must not approximate the barrier with a sleep or list.
+/// The post-fence drain/restore transition is implemented exactly as the
+/// fence's own contract specifies: a UID/resourceVersion-fenced scale-to-zero,
+/// the v0.5.6 `observedGeneration` ACK plus zero ready replicas as a causal
+/// drain barrier, foreground deletion of the sacrificial Claim, exact
+/// descendant and storage absence, a fenced capacity restore with clean new
+/// UID proof, then fence release. `observedGeneration` alone is never treated
+/// as teardown or storage proof; every side effect checkpoints before the next.
 pub async fn reconcile_management_pool_certification(
     client: &Client,
     namespace: &str,
@@ -1803,11 +2001,44 @@ pub async fn reconcile_management_pool_certification(
                 Err(error) => Err(format!("certification fence lookup failed: {error}")),
             }
         }
-        SandboxPoolCertificationPhase::FenceInstalled => Ok(cleanup_blocked(
-            status,
-            validated.ready,
-            POST_FENCE_MUTATION_BLOCKER,
-        )),
+        // The post-fence drain/restore transition, exactly as the fence's own
+        // contract specifies. Each step checkpoints before its side effect;
+        // observedGeneration alone is never teardown or storage proof.
+        SandboxPoolCertificationPhase::FenceInstalled => {
+            fenced_scale_to_zero_drains(client, namespace, status, validated.ready).await
+        }
+        SandboxPoolCertificationPhase::DrainAcknowledged => {
+            drain_waits_for_the_causal_barrier(client, namespace, status, validated.ready).await
+        }
+        SandboxPoolCertificationPhase::ClaimDeleting => {
+            claim_deleting_foreground_deletes(client, namespace, status, validated.ready).await
+        }
+        SandboxPoolCertificationPhase::AbsenceProven => {
+            absence_proven_restores_capacity(
+                client,
+                namespace,
+                pool.spec.warm_capacity,
+                status,
+                validated.ready,
+            )
+            .await
+        }
+        SandboxPoolCertificationPhase::Replenished => {
+            replenished_proves_and_releases_the_fence(
+                client,
+                namespace,
+                pool.spec.warm_capacity,
+                status,
+                validated.ready,
+            )
+            .await
+        }
+        SandboxPoolCertificationPhase::FenceFinalizerRemoved => {
+            released_fence_is_deleted(client, namespace, status, validated.ready).await
+        }
+        SandboxPoolCertificationPhase::FenceDeleting => {
+            deleted_fence_completes_certification(client, namespace, status, validated.ready).await
+        }
         SandboxPoolCertificationPhase::Certified => {
             status.message = None;
             Ok(progress(
@@ -1830,16 +2061,546 @@ pub async fn reconcile_management_pool_certification(
                 .clone()
                 .unwrap_or_else(|| "certification cleanup is blocked".into()),
         )),
-        SandboxPoolCertificationPhase::DrainAcknowledged
-        | SandboxPoolCertificationPhase::ClaimDeleting
-        | SandboxPoolCertificationPhase::AbsenceProven
-        | SandboxPoolCertificationPhase::Replenished
-        | SandboxPoolCertificationPhase::FenceFinalizerRemoved
-        | SandboxPoolCertificationPhase::FenceDeleting => Ok(cleanup_blocked(
+    }
+}
+/// FenceInstalled: one fenced scale-to-zero write, then checkpoint the
+/// drain generation whose observedGeneration ACK the next phase waits for.
+async fn fenced_scale_to_zero_drains(
+    client: &Client,
+    namespace: &str,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    match scale_warm_pool_fenced(client, namespace, &status.sandbox_warm_pool, 0).await? {
+        FencedWrite::Updated(updated) => {
+            let updated = *updated;
+            let generation = updated
+                .metadata
+                .generation
+                .ok_or_else(|| "drained certification WarmPool has no generation".to_string())?;
+            status.drain_generation = Some(generation);
+            status.phase = SandboxPoolCertificationPhase::DrainAcknowledged;
+            status.message = None;
+            Ok(progress(
+                status,
+                ready,
+                false,
+                true,
+                "CertificationDrainRequested",
+                format!(
+                    "scale-to-zero written under a UID/resourceVersion fence; waiting for generation {generation} plus zero ready replicas"
+                ),
+            ))
+        }
+        FencedWrite::Contended => Ok(progress(
             status,
-            validated.ready,
-            "unsupported certification phase was observed without the approved v0.5.6 causal drain transition",
+            ready,
+            false,
+            false,
+            "CertificationDrainContended",
+            "the WarmPool changed during scale-to-zero; retrying against its current snapshot",
         )),
+        FencedWrite::Blocked(message) => Ok(cleanup_blocked(status, ready, message)),
+    }
+}
+
+/// DrainAcknowledged: wait without mutating until the exact recorded
+/// generation is observed AND both replica counters read zero.
+async fn drain_waits_for_the_causal_barrier(
+    client: &Client,
+    namespace: &str,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    let Some(drain_generation) = status.drain_generation else {
+        return Ok(cleanup_blocked(
+            status,
+            ready,
+            "DrainAcknowledged checkpoint has no exact WarmPool drain generation",
+        ));
+    };
+    let pools: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &warm_pool_resource());
+    let warm_pool = read_dynamic_exact(&pools, namespace, &status.sandbox_warm_pool).await?;
+    if !warm_pool_status_is_current(&warm_pool)
+        || warm_pool
+            .data
+            .pointer("/status/observedGeneration")
+            .and_then(serde_json::Value::as_i64)
+            != Some(drain_generation)
+    {
+        return Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationDraining",
+            format!("waiting for WarmPool generation {drain_generation} to be observed"),
+        ));
+    }
+    let (Some(replicas), Some(ready_replicas)) = (
+        dynamic_status_count(&warm_pool, "replicas"),
+        dynamic_status_count(&warm_pool, "readyReplicas"),
+    ) else {
+        return Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationDraining",
+            "WarmPool ACKed the drain but its replica counts are not observable yet",
+        ));
+    };
+    if replicas != 0 || ready_replicas != 0 {
+        return Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationDraining",
+            format!(
+                "waiting for the drained WarmPool to report zero replicas (now {replicas}/{ready_replicas})"
+            ),
+        ));
+    }
+    status.phase = SandboxPoolCertificationPhase::ClaimDeleting;
+    status.message = None;
+    Ok(progress(
+        status,
+        ready,
+        false,
+        false,
+        "CertificationDrained",
+        "causal drain barrier proven: current generation observed with zero ready replicas",
+    ))
+}
+
+/// ClaimDeleting: foreground-delete the exact sacrificial Claim under a UID
+/// precondition until it is provably gone.
+async fn claim_deleting_foreground_deletes(
+    client: &Client,
+    namespace: &str,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    let Some(recorded_claim) = status.sandbox_claim.clone() else {
+        return Ok(cleanup_blocked(
+            status,
+            ready,
+            "ClaimDeleting checkpoint has no exact SandboxClaim reference",
+        ));
+    };
+    match reference_absent(client, namespace, &claim_resource(), &recorded_claim).await? {
+        Absence::Proven => {}
+        Absence::Blocked(message) => {
+            return Ok(cleanup_blocked(status, ready, message));
+        }
+        Absence::Present => {
+            let params = kube::api::DeleteParams {
+                propagation_policy: Some(kube::api::PropagationPolicy::Foreground),
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(recorded_claim.uid.clone()),
+                    ..kube::api::Preconditions::default()
+                }),
+                ..kube::api::DeleteParams::default()
+            };
+            let claims: Api<DynamicObject> =
+                Api::namespaced_with(client.clone(), namespace, &claim_resource());
+            match claims.delete(&recorded_claim.name, &params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(kube::Error::Api(response)) if response.code == 409 => {
+                    return Ok(progress(
+                        status,
+                        ready,
+                        false,
+                        false,
+                        "CertificationClaimDeleting",
+                        "foreground Claim deletion is contended; retrying against the surviving object",
+                    ));
+                }
+                Err(kube::Error::Api(response)) if response.code == 403 => {
+                    return Ok(cleanup_blocked(
+                        status,
+                        ready,
+                        format!("foreground Claim deletion is forbidden: {response}"),
+                    ));
+                }
+                Err(error) => return Err(format!("certification Claim deletion failed: {error}")),
+            }
+            return Ok(progress(
+                status,
+                ready,
+                false,
+                true,
+                "CertificationClaimDeleting",
+                "foreground-deleting the exact sacrificial Claim",
+            ));
+        }
+    }
+    status.phase = SandboxPoolCertificationPhase::AbsenceProven;
+    status.message = None;
+    Ok(progress(
+        status,
+        ready,
+        false,
+        false,
+        "CertificationClaimGone",
+        "exact sacrificial Claim is absent; proving descendant and storage absence",
+    ))
+}
+
+/// AbsenceProven: prove every captured descendant and storage identity
+/// absent, then restore capacity under a fence and checkpoint its generation.
+async fn absence_proven_restores_capacity(
+    client: &Client,
+    namespace: &str,
+    warm_capacity: u32,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    for (api_resource, kind) in [
+        (claim_resource(), "SandboxClaim"),
+        (sandbox_resource(), SANDBOX_KIND),
+    ] {
+        let Some(recorded) = identity_for_kind(&status, kind) else {
+            return Ok(cleanup_blocked(
+                status,
+                ready,
+                format!("AbsenceProven checkpoint has no exact {kind} reference"),
+            ));
+        };
+        match reference_absent(client, namespace, &api_resource, recorded).await? {
+            Absence::Proven => {}
+            Absence::Present => {
+                return Ok(progress(
+                    status,
+                    ready,
+                    false,
+                    false,
+                    "CertificationAbsencePending",
+                    format!("waiting for recorded {kind} to finish terminating"),
+                ));
+            }
+            Absence::Blocked(message) => {
+                return Ok(cleanup_blocked(status, ready, message));
+            }
+        }
+    }
+    for recorded in status.persistent_volume_claims.iter() {
+        match reference_absent(client, namespace, &pvc_resource(), recorded).await? {
+            Absence::Proven => {}
+            Absence::Present => {
+                return Ok(progress(
+                    status,
+                    ready,
+                    false,
+                    false,
+                    "CertificationAbsencePending",
+                    "waiting for captured certification PVC to be reclaimed",
+                ));
+            }
+            Absence::Blocked(message) => {
+                return Ok(cleanup_blocked(status, ready, message));
+            }
+        }
+    }
+    for recorded in status.persistent_volumes.iter() {
+        let volumes: Api<k8s_openapi::api::core::v1::PersistentVolume> = Api::all(client.clone());
+        match volumes.get(&recorded.name).await {
+            Err(kube::Error::Api(response)) if response.code == 404 => {}
+            Err(kube::Error::Api(response)) if response.code == 403 => {
+                return Ok(cleanup_blocked(
+                    status,
+                    ready,
+                    format!("captured PV absence cannot be proven: {response}"),
+                ));
+            }
+            Err(error) => return Err(format!("captured PV absence check failed: {error}")),
+            Ok(volume) => {
+                if volume.uid().as_deref() != Some(recorded.uid.as_str()) {
+                    return Ok(cleanup_blocked(
+                        status,
+                        ready,
+                        "captured certification PV was replaced before absence was proven",
+                    ));
+                }
+                return Ok(progress(
+                    status,
+                    ready,
+                    false,
+                    false,
+                    "CertificationAbsencePending",
+                    "waiting for captured certification PV to be reclaimed",
+                ));
+            }
+        }
+    }
+    match scale_warm_pool_fenced(client, namespace, &status.sandbox_warm_pool, warm_capacity)
+        .await?
+    {
+        FencedWrite::Updated(updated) => {
+            let updated = *updated;
+            let generation = updated.metadata.generation.ok_or_else(|| {
+                "replenished certification WarmPool has no generation".to_string()
+            })?;
+            status.replenish_generation = Some(generation);
+            status.phase = SandboxPoolCertificationPhase::Replenished;
+            status.message = None;
+            Ok(progress(
+                status,
+                ready,
+                false,
+                true,
+                "CertificationRestoringCapacity",
+                format!(
+                    "descendant and storage absence proven; capacity restored and waiting for generation {generation}"
+                ),
+            ))
+        }
+        FencedWrite::Contended => Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationRestoreContended",
+            "the WarmPool changed during capacity restore; retrying against its current snapshot",
+        )),
+        FencedWrite::Blocked(message) => Ok(cleanup_blocked(status, ready, message)),
+    }
+}
+
+/// Replenished: wait for the replenish ACK plus full ready capacity, prove
+/// no replaced-generation UID survived, then release the fence's finalizer.
+async fn replenished_proves_and_releases_the_fence(
+    client: &Client,
+    namespace: &str,
+    warm_capacity: u32,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    let Some(replenish_generation) = status.replenish_generation else {
+        return Ok(cleanup_blocked(
+            status,
+            ready,
+            "Replenished checkpoint has no exact WarmPool replenish generation",
+        ));
+    };
+    let warm_pool_name = status.sandbox_warm_pool.name.as_str();
+    let pools: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &warm_pool_resource());
+    let warm_pool = read_dynamic_exact(&pools, namespace, &status.sandbox_warm_pool).await?;
+    if !warm_pool_status_is_current(&warm_pool)
+        || warm_pool
+            .data
+            .pointer("/status/observedGeneration")
+            .and_then(serde_json::Value::as_i64)
+            != Some(replenish_generation)
+    {
+        return Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationReplenishing",
+            format!("waiting for WarmPool generation {replenish_generation} to be observed"),
+        ));
+    }
+    let expected = u64::from(warm_capacity);
+    let ready_replicas = warm_pool
+        .data
+        .pointer("/status/readyReplicas")
+        .and_then(serde_json::Value::as_u64);
+    if ready_replicas != Some(expected) {
+        return Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationReplenishing",
+            format!(
+                "waiting for {expected} replenished ready replicas (now {:?})",
+                ready_replicas
+            ),
+        ));
+    }
+    let sandboxes: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &sandbox_resource());
+    let listed = sandboxes
+        .list(&ListParams::default().labels(&format!(
+            "{WARM_POOL_LABEL}={}",
+            upstream_name_hash(warm_pool_name)
+        )))
+        .await
+        .map_err(|error| format!("replenished Sandbox list failed: {error}"))?;
+    let mut forbidden: std::collections::BTreeSet<&str> = status
+        .baseline_idle_sandbox_uids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if let Some(sacrificed) = status.sandbox.as_ref() {
+        forbidden.insert(sacrificed.uid.as_str());
+    }
+    for sandbox in &listed.items {
+        let Some(uid) = sandbox.uid() else {
+            continue;
+        };
+        if forbidden.contains(uid.as_str()) {
+            return Ok(cleanup_blocked(
+                status,
+                ready,
+                format!("replenished capacity preserved replaced-generation Sandbox UID {uid}"),
+            ));
+        }
+    }
+    // The proof is complete only after every live UID was checked.
+    if listed.items.len() < usize::try_from(expected).unwrap_or(usize::MAX) {
+        return Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationReplenishing",
+            "waiting for the full replenished Sandbox set to be listable",
+        ));
+    }
+
+    let fences: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let desired_fence = certification_fence(namespace, &status)?;
+    let fence = read_fence_exact(&fences, &desired_fence, &status).await?;
+    let patch = crate::controllers::lease::json_patch(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": fence.0 },
+        { "op": "test", "path": "/metadata/finalizers",
+          "value": [TEARDOWN_FENCE_FINALIZER] },
+        { "op": "replace", "path": "/metadata/finalizers", "value": [] }
+    ]));
+    match fences
+        .patch(
+            &desired_fence.name_any(),
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Json::<()>(patch),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if crate::controllers::lease::optimistic_conflict(&error) => {
+            return Ok(progress(
+                status,
+                ready,
+                false,
+                false,
+                "CertificationFenceReleaseContended",
+                "the teardown fence changed while releasing its finalizer; retrying",
+            ));
+        }
+        Err(error) => return Err(format!("teardown fence finalizer release failed: {error}")),
+    }
+    status.phase = SandboxPoolCertificationPhase::FenceFinalizerRemoved;
+    status.message = None;
+    Ok(progress(
+        status,
+        ready,
+        false,
+        true,
+        "CertificationReplenished",
+        "capacity restored on a fresh generation with only new UIDs; releasing the exact teardown fence",
+    ))
+}
+
+/// FenceFinalizerRemoved: delete the released fence under UID/resourceVersion
+/// preconditions so absence on the next pass completes certification.
+async fn released_fence_is_deleted(
+    client: &Client,
+    namespace: &str,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    let fences: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let desired_fence = certification_fence(namespace, &status)?;
+    let (fence_uid, resource_version) = read_fence_exact(&fences, &desired_fence, &status).await?;
+    let params = kube::api::DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(fence_uid),
+            resource_version: Some(resource_version),
+        }),
+        ..kube::api::DeleteParams::default()
+    };
+    match fences.delete(&desired_fence.name_any(), &params).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(response)) if response.code == 404 => {}
+        Err(kube::Error::Api(response)) if response.code == 409 => {
+            return Ok(progress(
+                status,
+                ready,
+                false,
+                false,
+                "CertificationFenceTerminating",
+                "teardown fence deletion is contended; retrying against the surviving object",
+            ));
+        }
+        Err(kube::Error::Api(response)) if response.code == 403 => {
+            return Ok(cleanup_blocked(
+                status,
+                ready,
+                format!("teardown fence deletion is forbidden: {response}"),
+            ));
+        }
+        Err(error) => return Err(format!("teardown fence deletion failed: {error}")),
+    }
+    status.phase = SandboxPoolCertificationPhase::FenceDeleting;
+    status.message = None;
+    Ok(progress(
+        status,
+        ready,
+        false,
+        true,
+        "CertificationFenceDeleting",
+        "deleted the released teardown fence; absence confirms the next pass",
+    ))
+}
+
+/// FenceDeleting: confirmed fence absence is the final proof; stamp
+/// `certifiedAt` and enter `Certified`.
+async fn deleted_fence_completes_certification(
+    client: &Client,
+    namespace: &str,
+    mut status: SandboxPoolCertificationStatus,
+    ready: u32,
+) -> Result<ManagementPoolCertificationProgress, String> {
+    let fences: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let desired_fence = certification_fence(namespace, &status)?;
+    match fences.get(&desired_fence.name_any()).await {
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            status.certified_at = Some(chrono::Utc::now().to_rfc3339());
+            status.phase = SandboxPoolCertificationPhase::Certified;
+            status.message = None;
+            Ok(progress(
+                status,
+                ready,
+                true,
+                true,
+                "Certified",
+                "current-generation exact pool certification receipt is complete",
+            ))
+        }
+        Err(error) => Err(format!("teardown fence lookup failed: {error}")),
+        Ok(fence) => {
+            if fence.metadata.deletion_timestamp.is_some() {
+                return Ok(progress(
+                    status,
+                    ready,
+                    false,
+                    false,
+                    "CertificationFenceDeleting",
+                    "waiting for the released teardown fence to disappear",
+                ));
+            }
+            Ok(cleanup_blocked(
+                status,
+                ready,
+                "released teardown fence exists without a deletion timestamp",
+            ))
+        }
     }
 }
 
@@ -1894,7 +2655,7 @@ mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::ServiceSpec;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn pool(warm_capacity: u32) -> SandboxPool {
@@ -2215,29 +2976,458 @@ mod tests {
         assert!(attempt_has_live_cleanup(&active));
     }
 
-    #[test]
-    fn post_fence_blocker_retains_every_exact_cleanup_reference() {
-        let before = certification_status(SandboxPoolCertificationPhase::FenceInstalled);
-        let blocked = cleanup_blocked(before.clone(), 0, POST_FENCE_MUTATION_BLOCKER);
+    /// Fixture warm-pool object for the drain/restore phases: generation 8,
+    /// observed ACK 7, one ready replica.
+    fn certification_warm_pool() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": AGENT_SANDBOX_API_VERSION,
+            "kind": SANDBOX_WARM_POOL_KIND,
+            "metadata": {
+                "name": "cert-sandboxwarmpool",
+                "namespace": "kobe-system",
+                "uid": "warm-pool-uid",
+                "resourceVersion": "41",
+                "generation": 8
+            },
+            "spec": { "replicas": 1 },
+            "status": {
+                "observedGeneration": 7,
+                "replicas": 1,
+                "readyReplicas": 1
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn fenced_scale_to_zero_records_the_drain_generation() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(certification_warm_pool()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut updated = certification_warm_pool();
+                updated["spec"]["replicas"] = serde_json::json!(0);
+                updated["metadata"]["resourceVersion"] = serde_json::json!("42");
+                updated
+            }))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = fenced_scale_to_zero_drains(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::FenceInstalled),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::DrainAcknowledged
+        );
+        assert_eq!(progress.status.drain_generation, Some(8));
+        assert_eq!(progress.reason, "CertificationDrainRequested");
+
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method.as_str() == "PATCH")
+            .expect("fenced scale-to-zero");
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body[0]["value"], "warm-pool-uid");
+        assert_eq!(body[1]["value"], "41");
+        assert_eq!(body[3]["path"], "/spec/replicas");
+        assert_eq!(body[3]["value"], 0);
+    }
+
+    #[tokio::test]
+    async fn the_drain_barrier_waits_for_ack_and_zero_replicas() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Not yet observed: wait without mutating.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(certification_warm_pool()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let progress = drain_waits_for_the_causal_barrier(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::DrainAcknowledged),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::DrainAcknowledged
+        );
+        assert_eq!(progress.reason, "CertificationDraining");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() == "GET"),
+            "waiting must not write anything"
+        );
+
+        // Observed with zero replicas: advance.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut drained = certification_warm_pool();
+                drained["status"]["observedGeneration"] = serde_json::json!(8);
+                drained["status"]["replicas"] = serde_json::json!(0);
+                drained["status"]["readyReplicas"] = serde_json::json!(0);
+                drained
+            }))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let progress = drain_waits_for_the_causal_barrier(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::DrainAcknowledged),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::ClaimDeleting
+        );
+        assert_eq!(progress.reason, "CertificationDrained");
+    }
+
+    #[tokio::test]
+    async fn claim_deleting_foreground_deletes_the_exact_claim() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxclaims/cert-sandboxclaim",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION,
+                "kind": "SandboxClaim",
+                "metadata": {
+                    "name": "cert-sandboxclaim", "namespace": "kobe-system", "uid": "claim-uid"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxclaims/cert-sandboxclaim",
+            ))
+            .and(body_partial_json(serde_json::json!({
+                "preconditions": { "uid": "claim-uid" },
+                "propagationPolicy": "Foreground"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": AGENT_SANDBOX_API_VERSION, "kind": "SandboxClaim",
+                "metadata": {"name": "cert-sandboxclaim", "namespace": "kobe-system",
+                             "uid": "claim-uid", "deletionTimestamp": "2026-08-24T00:00:00Z"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = claim_deleting_foreground_deletes(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::ClaimDeleting),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::ClaimDeleting,
+            "the pass that issues the delete must not also claim absence"
+        );
+        assert_eq!(progress.reason, "CertificationClaimDeleting");
+    }
+
+    #[tokio::test]
+    async fn a_missing_claim_checkpoints_absence_proven() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxclaims/cert-sandboxclaim",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure",
+                "reason":"NotFound","code":404
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = claim_deleting_foreground_deletes(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::ClaimDeleting),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::AbsenceProven
+        );
+        assert_eq!(progress.reason, "CertificationClaimGone");
+    }
+
+    #[tokio::test]
+    async fn absence_proven_restores_capacity_under_a_fence() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        for (missing_path, group) in [
+            (
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxclaims/cert-sandboxclaim",
+                "claims",
+            ),
+            (
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxes/cert-sandbox",
+                "sandboxes",
+            ),
+        ] {
+            let _ = group;
+            Mock::given(method("GET"))
+                .and(path(missing_path))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "apiVersion":"v1","kind":"Status","status":"Failure",
+                    "reason":"NotFound","code":404
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(certification_warm_pool()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut restored = certification_warm_pool();
+                restored["spec"]["replicas"] = serde_json::json!(1);
+                restored["metadata"]["generation"] = serde_json::json!(9);
+                restored["metadata"]["resourceVersion"] = serde_json::json!("43");
+                restored
+            }))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let status = certification_status(SandboxPoolCertificationPhase::AbsenceProven);
+        let progress = absence_proven_restores_capacity(&client, "kobe-system", 1, status, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::Replenished
+        );
+        assert_eq!(progress.status.replenish_generation, Some(9));
+        assert_eq!(progress.reason, "CertificationRestoringCapacity");
+    }
+
+    #[tokio::test]
+    async fn replenished_capacity_must_be_generation_fresh_and_uid_clean() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // A preserved replaced-generation UID is fail-closed evidence.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut fresh = certification_warm_pool();
+                fresh["metadata"]["generation"] = serde_json::json!(9);
+                fresh["status"]["observedGeneration"] = serde_json::json!(9);
+                fresh["status"]["replicas"] = serde_json::json!(1);
+                fresh["status"]["readyReplicas"] = serde_json::json!(1);
+                fresh
+            }))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxes",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": SANDBOX_API_VERSION, "kind": "SandboxList",
+                "metadata": {"resourceVersion": "1"},
+                "items": [{
+                    "apiVersion": SANDBOX_API_VERSION, "kind": SANDBOX_KIND,
+                    "metadata": {
+                        "name": "idle-old", "namespace": "kobe-system", "uid": "old-idle-uid"
+                    },
+                    "status": {}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let blocked = replenished_proves_and_releases_the_fence(
+            &client,
+            "kobe-system",
+            1,
+            certification_status(SandboxPoolCertificationPhase::Replenished),
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             blocked.status.phase,
             SandboxPoolCertificationPhase::CleanupBlocked
         );
-        assert_eq!(blocked.status.sandbox_claim, before.sandbox_claim);
-        assert_eq!(blocked.status.sandbox, before.sandbox);
-        assert_eq!(blocked.status.pod, before.pod);
-        assert_eq!(blocked.status.service, before.service);
-        assert_eq!(blocked.status.teardown_fence, before.teardown_fence);
-        for required in [
-            "scale-to-zero",
-            "foreground-delete",
-            "descendant/storage absence",
-            "restore capacity",
-            "clean new UIDs",
-            "remove the fence",
-        ] {
-            assert!(blocked.message.contains(required), "missing {required}");
-        }
+        assert!(
+            blocked.message.contains("old-idle-uid"),
+            "the exact preserved UID names the failure: {}",
+            blocked.message
+        );
+
+        // All-new UIDs on an ACKed full-capacity generation release the fence.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut fresh = certification_warm_pool();
+                fresh["metadata"]["generation"] = serde_json::json!(9);
+                fresh["status"]["observedGeneration"] = serde_json::json!(9);
+                fresh["status"]["replicas"] = serde_json::json!(1);
+                fresh["status"]["readyReplicas"] = serde_json::json!(1);
+                fresh
+            }))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxes",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": SANDBOX_API_VERSION, "kind": "SandboxList",
+                "metadata": {"resourceVersion": "1"},
+                "items": [{
+                    "apiVersion": SANDBOX_API_VERSION, "kind": SANDBOX_KIND,
+                    "metadata": {
+                        "name": "idle-new", "namespace": "kobe-system", "uid": "fresh-idle-uid"
+                    },
+                    "status": {}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let fence_name = format!("kobe-cert-fence-{}", &"a".repeat(64)[..40]);
+        let fence_path = format!("/api/v1/namespaces/kobe-system/configmaps/{fence_name}");
+        Mock::given(method("GET"))
+            .and(path(fence_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {
+                    "name": fence_name.clone(), "namespace": "kobe-system",
+                    "uid": "fence-uid", "resourceVersion": "44",
+                    "finalizers": ["kobe.kunobi.ninja/sandbox-teardown-fence"]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(fence_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {
+                    "name": fence_name.clone(), "namespace": "kobe-system",
+                    "uid": "fence-uid", "resourceVersion": "45", "finalizers": []
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let progress = replenished_proves_and_releases_the_fence(
+            &client,
+            "kobe-system",
+            1,
+            certification_status(SandboxPoolCertificationPhase::Replenished),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::FenceFinalizerRemoved
+        );
+        assert_eq!(progress.reason, "CertificationReplenished");
+    }
+
+    #[tokio::test]
+    async fn confirmed_fence_absence_stamps_certified() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let fence_name = format!("kobe-cert-fence-{}", &"a".repeat(64)[..40]);
+        let fence_path = format!("/api/v1/namespaces/kobe-system/configmaps/{fence_name}");
+        Mock::given(method("GET"))
+            .and(path(fence_path.clone()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure",
+                "reason":"NotFound","code":404
+            })))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = deleted_fence_completes_certification(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::FenceDeleting),
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(progress.certified);
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::Certified
+        );
+        assert!(progress.status.certified_at.is_some());
     }
 
     #[tokio::test]
