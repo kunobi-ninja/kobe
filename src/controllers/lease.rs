@@ -4810,7 +4810,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = reserve_ready_instance(&client, "test-ns", &lease).await;
+        let result = reserve_ready_instance(&client, "test-ns", &lease, None).await;
         assert!(
             matches!(result, Ok(None)),
             "a Ready instance still carrying a binding must not be reserved, got {result:?}"
