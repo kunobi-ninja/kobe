@@ -1000,9 +1000,6 @@ async function loadImagesIntoKind(
 async function prepareHelm(): Promise<void> {
   step("Preparing Helm dependencies");
   const helm = await resolveTool("helm");
-  await runCommand([helm, "repo", "add", "bitnami", "https://charts.bitnami.com/bitnami"], {
-    allowFailure: true,
-  });
   await runCommand([helm, "dependency", "build", "./charts/kobe"], {
     step: "failed to build Helm chart dependencies",
   });

@@ -58,7 +58,7 @@ KUBECONFIG=<that-path> kubectl get nodes      # works (TLS tunnel)
 | `node_count` | `1` | 1 = single-node. >1 = 1 server + (n-1) agents. |
 | `ssh_public_key_path` | `~/.ssh/id_ed25519.pub` | Same key the kobe AccessPolicy expects. |
 | `k3s_version` | `v1.31.3+k3s1` | Match the inner pool's k3s. |
-| `allowed_api_cidr` | (auto-detect) | Restricts 22 + 6443 to caller IP. Set to `0.0.0.0/0` for public access (not recommended). |
+| `allowed_api_cidr` | (auto-detect) | Restricts 22 + 6443 to the caller's public IPv4 (detected via `ipv4.icanhazip.com`). Set it explicitly if you have no IPv4 egress, or to `0.0.0.0/0` for public access (not recommended). |
 
 To use a `terraform.tfvars`:
 

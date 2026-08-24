@@ -4759,6 +4759,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reserve_skips_ready_instance_with_stale_binding() {
+        // A Ready instance can lose its display-only leaseRef while retaining
+        // the authoritative binding. It is not free and must not become the
+        // first candidate that prevents the scheduler trying later instances.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let lease: ClusterLease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": "lease-new",
+                "namespace": "test-ns",
+                "uid": "lease-uid",
+                "resourceVersion": "10"
+            },
+            "spec": {
+                "poolRef": "test-profile",
+                "ttl": "1h",
+                "requester": { "type": "test:admin", "identity": "test" }
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": {
+                        "name": "pool-test-1",
+                        "namespace": "test-ns",
+                        "labels": { "kobe.kunobi.ninja/pool": "test-profile" }
+                    },
+                    "spec": { "poolRef": { "name": "test-profile" } },
+                    "status": {
+                        "phase": "Ready",
+                        "leaseRef": null,
+                        "binding": exact_test_binding("lease-old", "lease-old-uid")
+                    }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        let result = reserve_ready_instance(&client, "test-ns", &lease).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a Ready instance still carrying a binding must not be reserved, got {result:?}"
+        );
+    }
+
     fn exact_test_binding(lease_name: &str, lease_uid: &str) -> LeaseBinding {
         LeaseBinding {
             binding_id: format!("binding-{lease_name}"),

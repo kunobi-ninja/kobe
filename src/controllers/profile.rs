@@ -613,6 +613,70 @@ mod cluster_instance_tests {
         );
     }
 
+    #[tokio::test]
+    async fn ready_with_reservation_handle_is_not_claimable_capacity() {
+        let (ctx, server) = test_profile_context().await;
+        let mut stale_binding = instance_response_json(
+            "pool-test-profile-0",
+            "test-profile",
+            ClusterInstancePhase::Ready,
+            None,
+            0,
+        );
+        stale_binding["status"]["binding"] = serde_json::json!({
+            "bindingId": "binding-old",
+            "lease": { "name": "lease-old", "uid": "lease-old-uid" },
+            "instance": {
+                "name": "pool-test-profile-0",
+                "uid": "instance-uid",
+                "observedGeneration": 1
+            },
+            "pool": { "name": "test-profile", "uid": "pool-uid" },
+            "backend": {
+                "type": "k3s",
+                "configDigest": "0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "instanceSpecDigest": "002a000000000000"
+        });
+
+        let mut stale_lease_ref = instance_response_json(
+            "pool-test-profile-1",
+            "test-profile",
+            ClusterInstancePhase::Ready,
+            None,
+            0,
+        );
+        stale_lease_ref["status"]["leaseRef"] =
+            serde_json::json!({ "name": "lease-old", "uid": "lease-old-uid" });
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .and(query_param(
+                "labelSelector",
+                "kobe.kunobi.ninja/pool=test-profile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![stale_binding, stale_lease_ref]),
+            ))
+            .mount(&server)
+            .await;
+
+        let pool_state = build_pool_state(&ctx, "test-profile").await;
+        let counts = count_states(&pool_state, None);
+
+        assert_eq!(counts.ready, 0);
+        assert_eq!(counts.quarantined, 2);
+        assert!(
+            pool_state
+                .clusters
+                .values()
+                .all(|entry| entry.state == ClusterState::Quarantined),
+            "a Ready instance with either reservation handle must fail closed"
+        );
+    }
+
     /// A lease that binds mid-reconcile must not be undone by the
     /// end-of-reconcile status sync.
     ///
@@ -1533,7 +1597,16 @@ async fn build_pool_state(ctx: &ProfileContext, profile_name: &str) -> PoolState
     for instance in &instances {
         let cluster_name = instance.name_any();
         let status = instance.status.clone().unwrap_or_default();
-        let state = cluster_state_from_phase(&status.phase);
+        // Ready means claimable only when both reciprocal reservation handles
+        // are absent. If either survives a stale status write, fail closed in
+        // pool accounting so the member is neither advertised nor recycled.
+        let state = if status.phase == ClusterInstancePhase::Ready
+            && (status.lease_ref.is_some() || status.binding.is_some())
+        {
+            ClusterState::Quarantined
+        } else {
+            cluster_state_from_phase(&status.phase)
+        };
 
         // #189: a Creating instance whose backend reported its guest Pods are
         // Unschedulable stamps a known prefix on `status.message`. Surface it
