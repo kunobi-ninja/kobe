@@ -175,7 +175,6 @@ jobs:
 
       - name: Verify Helm chart renders
         run: |
-          helm repo add bitnami https://charts.bitnami.com/bitnami
           helm dependency build charts/kobe/
           helm template kobe charts/kobe/ --debug > /dev/null
 
@@ -430,7 +429,6 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           helm registry login registry-1.docker.io -u "$DOCKERHUB_USER" -p "$DOCKERHUB_TOKEN"
-          helm repo add bitnami https://charts.bitnami.com/bitnami
           helm dependency build charts/kobe
           helm package charts/kobe
           helm push kobe-*.tgz oci://registry-1.docker.io/zondax
