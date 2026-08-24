@@ -130,12 +130,21 @@ test-sandbox-conformance:
 # placements; the exhaustive suite above remains the nightly/manual gate.
 # Keeping the selection here (instead of adding a second implementation)
 # prevents the fast and exhaustive contracts from drifting.
+#
+# libtest exits 0 when an exact filter matches nothing, so a scenario renamed
+# or deleted would be silently skipped while the gate stayed green. Two guards
+# close that: this loop requires each invocation to report exactly "1 passed",
+# and tests/sandbox_conformance.rs's suite_shape parses this same list and
+# asserts every name is a declared scenario. Editing one side without the
+# other fails.
 [group('test')]
 test-sandbox-conformance-pr:
     #!/usr/bin/env bash
     set -euo pipefail
     export KOBE_SANDBOX_E2E=1
     export KOBE_SANDBOX_HARNESS="${KOBE_SANDBOX_HARNESS:-bun run ./hack/e2e.ts}"
+    summary="$(mktemp)"
+    trap 'rm -f "$summary"' EXIT
     for scenario in \
       an_execution_returns_the_exact_remote_exit_code \
       detached_logs_resume_and_cancel_stops_the_process \
@@ -149,7 +158,11 @@ test-sandbox-conformance-pr:
       crash_after_ack_before_status_recovers_the_original_outcome \
       release_rejects_further_access \
       natural_expiry_rejects_further_access; do
-      cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --test-threads=1
+      cargo test --test sandbox_conformance "$scenario" -- --ignored --exact --test-threads=1 2>&1 | tee "$summary"
+      grep -qE '^test result: ok\. +1 passed;' "$summary" || {
+        echo "scenario '$scenario' did not report exactly one passing test — renamed or deleted?" >&2
+        exit 1
+      }
     done
 
 # Local e2e environment entrypoint

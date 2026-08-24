@@ -2048,4 +2048,69 @@ mod suite_shape {
              guarded is deletion, not addition"
         );
     }
+
+    /// The PR gate (`just test-sandbox-conformance-pr`) selects scenarios by
+    /// exact name, and libtest exits 0 when a filter matches nothing — so a
+    /// scenario renamed or deleted here would be silently skipped while the
+    /// gate stayed green. The recipe itself now demands "1 passed" per run;
+    /// this test closes the loop from the other side by parsing that same
+    /// justfile list and asserting every name it selects is a scenario this
+    /// file actually declares. Renames must touch both, or CI fails fast in
+    /// the cheap unit pass instead of never.
+    #[test]
+    fn every_pr_gate_scenario_exists_in_the_suite() {
+        let justfile = include_str!("../justfile");
+        let list = justfile
+            .split("for scenario in \\")
+            .nth(1)
+            .and_then(|rest| rest.split("; do").next())
+            .expect("the PR gate's scenario list is marked in the justfile");
+        let names: Vec<&str> = list
+            .lines()
+            .map(|line| line.trim().trim_end_matches('\\').trim())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert!(
+            names.len() >= 12,
+            "the PR gate should keep at least its current twelve scenarios; found {}: {:?}",
+            names.len(),
+            names
+        );
+
+        let source = include_str!("sandbox_conformance.rs");
+        let declared = declared_scenarios(source);
+        for name in names {
+            assert!(
+                declared.iter().any(|scenario| scenario == name),
+                "the PR gate lists scenario '{name}', but no such test exists in this file; \
+                 update both the justfile list and the suite together"
+            );
+        }
+    }
+
+    /// Scenario names as the compiler sees them: the identifiers handed to
+    /// `both_placements!`, since the test functions they expand into never
+    /// appear literally in this file. A hand-rolled scan rather than a regex
+    /// dependency, for one pattern.
+    fn declared_scenarios(source: &str) -> Vec<String> {
+        source
+            .match_indices("both_placements!(")
+            .filter_map(|(start, _)| {
+                // The macro forwards doc comments, so they sit between the
+                // paren and the name; skip whitespace and `///` lines.
+                let mut rest = source[start + "both_placements!(".len()..].trim_start();
+                while rest.starts_with("///") {
+                    rest = match rest.split_once('\n') {
+                        Some((_, tail)) => tail.trim_start(),
+                        None => "",
+                    };
+                }
+                let ident: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                (!ident.is_empty()).then_some(ident)
+            })
+            .collect()
+    }
 }
