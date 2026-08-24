@@ -1165,14 +1165,16 @@ async fn reserve_ready_instance(
             instance
                 .status
                 .as_ref()
-                // A genuinely-free instance is Ready AND carries no leaseRef. The
-                // extra leaseRef check prevents a double-lease: if a stale write
-                // (e.g. the profile controller syncing an out-of-date in-memory
-                // phase) reverts an already-Leased instance to Ready while leaving
-                // its leaseRef set, selecting it here would bind the same cluster
-                // to a second tenant. Requiring leaseRef == None excludes that
-                // case while still admitting all genuinely-idle instances.
-                .map(|s| s.phase == ClusterInstancePhase::Ready && s.lease_ref.is_none())
+                // A genuinely-free instance is Ready AND carries neither
+                // reciprocal reservation handle. A stale write can leave either
+                // leaseRef or binding behind while reverting the phase to Ready;
+                // selecting that instance would either double-lease it or make the
+                // first occupied candidate block every free candidate after it.
+                .map(|s| {
+                    s.phase == ClusterInstancePhase::Ready
+                        && s.lease_ref.is_none()
+                        && s.binding.is_none()
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -2206,6 +2208,64 @@ mod tests {
         assert!(
             matches!(result, Ok(None)),
             "a Ready instance still carrying a leaseRef must not be reserved, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_skips_ready_instance_with_stale_binding() {
+        // A Ready instance can lose its display-only leaseRef while retaining
+        // the authoritative binding. It is not free and must not become the
+        // first candidate that prevents the scheduler trying later instances.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let lease: ClusterLease = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": "lease-new",
+                "namespace": "test-ns",
+                "uid": "lease-uid",
+                "resourceVersion": "10"
+            },
+            "spec": {
+                "poolRef": "test-profile",
+                "ttl": "1h",
+                "requester": { "type": "test:admin", "identity": "test" }
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": {
+                        "name": "pool-test-1",
+                        "namespace": "test-ns",
+                        "labels": { "kobe.kunobi.ninja/pool": "test-profile" }
+                    },
+                    "spec": { "poolRef": { "name": "test-profile" } },
+                    "status": {
+                        "phase": "Ready",
+                        "leaseRef": null,
+                        "binding": exact_test_binding("lease-old", "lease-old-uid")
+                    }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        let result = reserve_ready_instance(&client, "test-ns", &lease).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a Ready instance still carrying a binding must not be reserved, got {result:?}"
         );
     }
 
