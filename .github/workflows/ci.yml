@@ -503,6 +503,17 @@ jobs:
             done
           fi
           kubectl --context "$CTX" get clusterrole -o yaml 2>/dev/null | grep -B6 -A6 "pods/exec" || true
+          # can-i answers authorization only; admission and the kubelet leg can
+          # still 403 an allowed request. Reproduce the canary's actual exec —
+          # -v=8 prints the response body, which names the real denier.
+          POD="$(kubectl --context "$CTX" get pods -n kobe-system -o name 2>/dev/null | grep 'kobe-e2e-sandbox-management' | head -1)"
+          if [ -n "$POD" ]; then
+            echo "probe exec as admin into $POD:"
+            kubectl --context "$CTX" exec -n kobe-system "$POD" -c workspace -v=8 -- /bin/true 2>&1 | tail -30 || true
+            echo "probe exec as the operator SA into $POD:"
+            kubectl --context "$CTX" exec -n kobe-system "$POD" -c workspace -v=8 \
+              --as "system:serviceaccount:kobe-system:${SA:-kobe}" -- /bin/true 2>&1 | tail -30 || true
+          fi
           kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 400 --all-containers || true
           mkdir -p /tmp/kind-logs
           mise exec -- kind export logs /tmp/kind-logs --name "$E2E_CLUSTER" || true
