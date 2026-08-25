@@ -1081,17 +1081,41 @@ fn validate_certification_claim(
                 .unwrap_or("<absent>")
         ));
     }
-    let observed_spec = claim.data.get("spec");
-    if observed_spec != desired.data.get("spec") {
+    let observed_spec = normalize_claim_spec(claim.data.get("spec"));
+    let desired_spec = normalize_claim_spec(desired.data.get("spec"));
+    if observed_spec != desired_spec {
         return Err(format!(
             "certification Claim spec drifted from the exact Pool: observed {}, desired {}",
-            serde_json::to_string(observed_spec.unwrap_or(&serde_json::Value::Null))
-                .unwrap_or_else(|_| "<unserializable>".into()),
-            serde_json::to_string(desired.data.get("spec").unwrap_or(&serde_json::Value::Null))
-                .unwrap_or_else(|_| "<unserializable>".into()),
+            serde_json::to_string(&observed_spec).unwrap_or_else(|_| "<unserializable>".into()),
+            serde_json::to_string(&desired_spec).unwrap_or_else(|_| "<unserializable>".into()),
         ));
     }
     Ok(())
+}
+
+/// The upstream runtime persists defaulted-but-empty containers (for example
+/// `additionalPodMetadata: {}`) that carry no pod-facing payload. Pruning empty
+/// objects before the exact comparison forgives only those; any non-empty
+/// addition or mutation still fails closed.
+fn normalize_claim_spec(spec: Option<&serde_json::Value>) -> serde_json::Value {
+    fn prune(value: &serde_json::Value) -> Option<serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => {
+                let pruned: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .filter_map(|(key, child)| prune(child).map(|kept| (key.clone(), kept)))
+                    .collect();
+                if pruned.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(pruned))
+                }
+            }
+            other => Some(other.clone()),
+        }
+    }
+    spec.and_then(prune)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
 }
 
 async fn resolve_idle_sandbox(
@@ -2787,6 +2811,39 @@ mod tests {
             Some("kobe-agents")
         );
         assert!(claim.data.pointer("/spec/lifecycle/shutdownTime").is_none());
+    }
+
+    /// The upstream runtime persists `additionalPodMetadata: {}` on stored
+    /// Claims even though kobe never asked for it. Empty containers must not
+    /// read as tampering, while any non-empty payload still fails closed.
+    #[test]
+    fn certification_claim_tolerates_empty_defaulted_containers_only() {
+        let pool = pool(0);
+        let desired = certification_claim(&pool, "kobe-system", "kobe-agents").unwrap();
+
+        let mut observed = desired.clone();
+        observed.data["spec"]["additionalPodMetadata"] = serde_json::json!({});
+        validate_certification_claim(&pool, &desired, &observed).unwrap();
+
+        observed.data["spec"]["additionalPodMetadata"] =
+            serde_json::json!({ "labels": {}, "annotations": {} });
+        validate_certification_claim(&pool, &desired, &observed).unwrap();
+
+        observed.data["spec"]["additionalPodMetadata"] =
+            serde_json::json!({ "labels": { "escape": "hatch" } });
+        let error = validate_certification_claim(&pool, &desired, &observed).unwrap_err();
+        assert!(
+            error.contains("certification Claim spec drifted"),
+            "{error}"
+        );
+
+        let mut mutated = desired.clone();
+        mutated.data["spec"]["lifecycle"]["shutdownPolicy"] = serde_json::json!("Retain");
+        let error = validate_certification_claim(&pool, &desired, &mutated).unwrap_err();
+        assert!(
+            error.contains("certification Claim spec drifted"),
+            "{error}"
+        );
     }
 
     #[test]
