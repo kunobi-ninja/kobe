@@ -335,7 +335,10 @@ hostReaper:
   # Enough leaked directories exhaust the kernel cgroup hierarchy and prevent
   # unrelated Pods from starting with `no space left on device`.
   cgroupCleanup:
-    enabled: true
+    # Opt in only after the selected host-reaper image includes the cgroup
+    # cleanup flags. GitRepository consumers may reconcile chart changes from
+    # main while still pinning an older released image.
+    enabled: false
     mtimeSkip: 5m
   dryRun: false
   # If true, the reaper container starts with KOBE_REAPER_DISABLE=1 set,
