@@ -106,13 +106,32 @@ impl SandboxOperation {
             // `get` on `pods` as well: the caller verifies the Pod's UID before
             // touching it, and that read must not need a broader rule.
             Self::Logs => &[("pods", "get"), ("pods/log", "get")],
-            Self::Exec => &[("pods", "get"), ("pods/exec", "get")],
+            // Upgrade subresources carry BOTH verbs. kube-rs sends the
+            // WebSocket upgrade as a GET, which apiservers before 1.35
+            // authorize as `get` — but 1.35's
+            // `AuthorizePodWebsocketUpgradeCreatePermission` (default on,
+            // KEP-4006) closed that read-verb escalation and demands `create`
+            // for any upgrade. `resourceNames` still pins both verbs to the
+            // one Pod: an upgrade request names its target in the URL.
+            Self::Exec => &[
+                ("pods", "get"),
+                ("pods/exec", "get"),
+                ("pods/exec", "create"),
+            ],
             // A bare attach (no command) calls `pods/attach`, a DIFFERENT
             // subresource from exec. Sharing the exec identity meant that path
             // was a guaranteed 403 on a socket that had already upgraded
             // cleanly, so the caller saw an opaque transport error.
-            Self::Attach => &[("pods", "get"), ("pods/attach", "get")],
-            Self::PortForward => &[("pods", "get"), ("pods/portforward", "get")],
+            Self::Attach => &[
+                ("pods", "get"),
+                ("pods/attach", "get"),
+                ("pods/attach", "create"),
+            ],
+            Self::PortForward => &[
+                ("pods", "get"),
+                ("pods/portforward", "get"),
+                ("pods/portforward", "create"),
+            ],
         }
     }
 
@@ -1761,17 +1780,19 @@ mod tests {
         }
     }
 
-    /// The granted verb must be the one the request actually sends.
-    /// The chart must grant the operator the verb its own exec actually uses.
+    /// The chart must grant the operator every verb its own exec can need.
     ///
-    /// REVIEW FINDING (expected to fail). Same root cause as
+    /// Same root cause as
     /// [`the_minted_role_grants_the_verb_the_request_actually_uses`], one layer
     /// out. The readiness canary at `controllers/sandbox_canary.rs:206` execs
     /// with the **operator's own** client for management-placement pools, so it
-    /// is governed by `charts/kobe/templates/rbac.yaml`, which grants
-    /// `pods/exec: create`. The WebSocket upgrade authorizes as `get`, so the
-    /// canary 403s, `evaluate_readiness_canary` reports `Inconclusive`, and the
-    /// lease requeues until its provisioning deadline instead of going Ready.
+    /// is governed by `charts/kobe/templates/rbac.yaml`. Which verb the
+    /// apiserver demands depends on its version: pre-1.35 authorizes the GET
+    /// WebSocket upgrade as `get`, while 1.35's
+    /// `AuthorizePodWebsocketUpgradeCreatePermission` (default on) demands
+    /// `create` for any connection upgrade. Granting only one verb 403s the
+    /// canary on the other side of that boundary and fail-closes certification
+    /// at `CleanupBlocked` — proven live against kind v1.36.
     ///
     /// A missing verb is a runtime 403 no unit test sees; asserting it against
     /// the chart text is the only place it can be caught before a cluster.
@@ -1790,8 +1811,14 @@ mod tests {
             .expect("the pods/exec rule declares verbs");
         assert!(
             verbs.contains("\"get\""),
-            "kube-rs upgrades pods/exec over a GET, which authorizes as `get`, \
-             but the chart grants {}",
+            "kube-rs upgrades pods/exec over a GET, which pre-1.35 apiservers \
+             authorize as `get`, but the chart grants {}",
+            verbs.trim()
+        );
+        assert!(
+            verbs.contains("\"create\""),
+            "1.35's AuthorizePodWebsocketUpgradeCreatePermission authorizes \
+             every connection upgrade as `create`, but the chart grants {}",
             verbs.trim()
         );
     }

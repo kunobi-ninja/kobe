@@ -104,15 +104,18 @@ rules:
   # `pods/exec` is a powerful verb, so what bounds it matters: the argv comes
   # from the `SandboxPool` spec, which only an administrator can write, and a
   # lease selects a pool and nothing else. No caller input reaches this.
-  # `get`, not `create`. kube-rs builds exec, attach and port-forward as GET
-  # requests — they are WebSocket upgrades — and the apiserver derives the RBAC
-  # verb from the HTTP method. `create` is what kubectl's SPDY POST needs, and
-  # granting only that 403s every one of these calls, including the readiness
-  # canary, which runs under this identity. A failure no unit test can see,
-  # because RBAC only applies against a real apiserver.
+  # BOTH `get` and `create`, because the required verb depends on the server
+  # version. kube-rs builds exec, attach and port-forward as GET WebSocket
+  # upgrades, which apiservers before 1.35 authorize as `get` — but 1.35's
+  # `AuthorizePodWebsocketUpgradeCreatePermission` gate (default on, KEP-4006)
+  # closed that read-verb escalation and requires `create` on any connection
+  # upgrade. Granting only one verb 403s these calls on the other side of that
+  # boundary, including the readiness canary, which runs under this identity —
+  # a failure no unit test can see, because RBAC and that gate only apply
+  # against a real apiserver.
   - apiGroups: [""]
     resources: ["pods/exec", "pods/attach", "pods/portforward"]
-    verbs: ["get"]
+    verbs: ["get", "create"]
   # Sandbox log reads (#81). Separate from `pods` above because `pods/log` is
   # its own resource to RBAC — and worth stating explicitly: this is the verb
   # that lets the operator return a workload's own output to its lease holder.
