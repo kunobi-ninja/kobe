@@ -358,13 +358,16 @@ fn certification_fence(
     status: &SandboxPoolCertificationStatus,
 ) -> Result<ConfigMap, String> {
     let mut data = BTreeMap::new();
-    for reference in [
-        Some(&status.sandbox_warm_pool),
-        status.sandbox_claim.as_ref(),
-        status.sandbox.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
+    // Only the teardown TARGETS — the sacrificial Claim and its Sandbox — are
+    // fenced. The WarmPool's UID must stay out: upstream's reconcile writes
+    // `status.observedGeneration` only after a pass with no errors, so fencing
+    // WarmPool-owned creates wedges the very ACK the drain and replenish
+    // barriers wait for (and the fence is immutable, so the restore leg could
+    // never replenish). A new-UID warm member cannot perturb the proofs —
+    // every absence and clean-UID check is pinned to the recorded UIDs.
+    for reference in [status.sandbox_claim.as_ref(), status.sandbox.as_ref()]
+        .into_iter()
+        .flatten()
     {
         data.insert(reference.uid.clone(), "blocked".into());
     }
@@ -3016,6 +3019,27 @@ mod tests {
             certified_at: None,
             message: None,
         }
+    }
+
+    /// Upstream only writes `status.observedGeneration` after an error-free
+    /// reconcile, and its reconcile errors on any denied create — so a fence
+    /// that blocks WarmPool-owned creates deadlocks the drain and replenish
+    /// ACKs the protocol waits for. Only the teardown targets may be fenced.
+    #[test]
+    fn the_fence_blocks_teardown_targets_but_never_the_warm_pool() {
+        let fence = certification_fence(
+            "kobe-system",
+            &certification_status(SandboxPoolCertificationPhase::CanaryPassed),
+        )
+        .unwrap();
+        let data = fence.data.unwrap();
+        assert!(data.contains_key("claim-uid"));
+        assert!(data.contains_key("sandbox-uid"));
+        assert!(
+            !data.contains_key("warm-pool-uid"),
+            "fencing the WarmPool UID starves upstream's status ACK and makes \
+             the fenced restore unreplenishable"
+        );
     }
 
     #[test]

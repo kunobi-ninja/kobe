@@ -401,6 +401,34 @@ struct WarmPoolObservation {
 /// proves their exact Pool owner and reads the WarmPool controller's
 /// `replicas`/`readyReplicas`. A create/apply response is not reused as
 /// readiness evidence: it may predate the upstream controller's status write.
+/// True while a certification protocol attempt is between its fence install
+/// and the fence's confirmed removal. In that window the pool's WarmPool is
+/// deliberately drained and restored by the protocol itself, so the outer
+/// freshness and full-capacity gates describe states the protocol cannot be
+/// in — enforcing them starves the very arms that would leave the window.
+fn certification_protocol_in_flight(pool: &SandboxPool) -> bool {
+    pool.status
+        .as_ref()
+        .and_then(|status| status.certification.as_ref())
+        .is_some_and(|certification| certification_phase_is_in_flight(&certification.phase))
+}
+
+fn certification_phase_is_in_flight(
+    phase: &crate::crd::sandbox::SandboxPoolCertificationPhase,
+) -> bool {
+    use crate::crd::sandbox::SandboxPoolCertificationPhase as Phase;
+    matches!(
+        phase,
+        Phase::FenceInstalled
+            | Phase::DrainAcknowledged
+            | Phase::ClaimDeleting
+            | Phase::AbsenceProven
+            | Phase::Replenished
+            | Phase::FenceFinalizerRemoved
+            | Phase::FenceDeleting
+    )
+}
+
 async fn observe_management_pool(
     ctx: &SandboxContext,
     pool: &SandboxPool,
@@ -525,10 +553,15 @@ async fn observe_management_pool(
             warm_pool.name_any()
         ))
     })?;
-    if status
-        .get("observedGeneration")
-        .and_then(serde_json::Value::as_i64)
-        != Some(warm_pool_generation)
+    // Mid-protocol, the certification arms scale the WarmPool themselves and
+    // wait for the exact drain/replenish generation with their own barriers;
+    // demanding currency here would block those arms from ever running while
+    // upstream is still catching up to the protocol's own writes.
+    if !certification_protocol_in_flight(pool)
+        && status
+            .get("observedGeneration")
+            .and_then(serde_json::Value::as_i64)
+            != Some(warm_pool_generation)
     {
         return Err(SandboxPlacementError::Invalid(format!(
             "SandboxWarmPool {} has not observed generation {warm_pool_generation}",
@@ -819,8 +852,12 @@ pub async fn reconcile_pool(
             return Err(error);
         }
     };
-    let certification = if observation.replicas != pool.spec.warm_capacity
-        || observation.ready_replicas != pool.spec.warm_capacity
+    // The full-capacity gate applies only to STARTING (or re-validating) a
+    // certification. Mid-protocol the arms drain the pool to zero and restore
+    // it by design, so their own barriers — not this gate — decide progress.
+    let certification = if !certification_protocol_in_flight(&pool)
+        && (observation.replicas != pool.spec.warm_capacity
+            || observation.ready_replicas != pool.spec.warm_capacity)
     {
         Err(format!(
             "WarmPool has replicas={}/readyReplicas={}, expected {} exact Ready members",
@@ -9002,6 +9039,41 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         (ctx, server)
+    }
+
+    /// The outer freshness and full-capacity gates must stand down exactly
+    /// while the certification protocol owns the WarmPool (fence installed
+    /// through fence deletion) — the protocol drains and restores capacity
+    /// itself, so enforcing "warm and observed" there starves its own arms.
+    /// Entry, canary, terminal and blocked phases keep the strict gates.
+    #[test]
+    fn only_fence_to_unfence_phases_relax_the_outer_gates() {
+        use crate::crd::sandbox::SandboxPoolCertificationPhase as Phase;
+        for (phase, in_flight) in [
+            (Phase::Initialized, false),
+            (Phase::ClaimCreated, false),
+            (Phase::WorkloadCaptured, false),
+            (Phase::CanaryPassed, false),
+            (Phase::FenceInstalled, true),
+            (Phase::DrainAcknowledged, true),
+            (Phase::ClaimDeleting, true),
+            (Phase::AbsenceProven, true),
+            (Phase::Replenished, true),
+            (Phase::FenceFinalizerRemoved, true),
+            (Phase::FenceDeleting, true),
+            (Phase::Certified, false),
+            (Phase::CleanupBlocked, false),
+        ] {
+            assert_eq!(
+                super::certification_phase_is_in_flight(&phase),
+                in_flight,
+                "{phase:?}"
+            );
+        }
+        let mut pool = management_pool("pool-uid", 1);
+        assert!(!super::certification_protocol_in_flight(&pool));
+        pool.status = None;
+        assert!(!super::certification_protocol_in_flight(&pool));
     }
 
     fn quantity(cpu: &str, memory: &str, ephemeral_storage: &str) -> SandboxResourceQuantity {
