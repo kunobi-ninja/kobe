@@ -1059,16 +1059,37 @@ fn validate_certification_claim(
         (CERTIFICATION_POOL_UID_LABEL, pool_uid.as_str()),
     ];
     let generation_label = pool_generation.to_string();
-    if required_labels
-        .iter()
-        .any(|(key, value)| labels.get(*key).map(String::as_str) != Some(*value))
-        || labels
-            .get(CERTIFICATION_POOL_GENERATION_LABEL)
-            .map(String::as_str)
-            != Some(generation_label.as_str())
-        || claim.data.get("spec") != desired.data.get("spec")
+    for (key, value) in required_labels {
+        if labels.get(key).map(String::as_str) != Some(value) {
+            return Err(format!(
+                "certification Claim metadata drifted from the exact Pool: label {key} is {:?}, expected {value:?}",
+                labels.get(key).map(String::as_str).unwrap_or("<absent>")
+            ));
+        }
+    }
+    if labels
+        .get(CERTIFICATION_POOL_GENERATION_LABEL)
+        .map(String::as_str)
+        != Some(generation_label.as_str())
     {
-        return Err("certification Claim metadata or spec drifted from the exact Pool".into());
+        return Err(format!(
+            "certification Claim metadata drifted from the exact Pool: label {} is {:?}, expected {generation_label:?}",
+            CERTIFICATION_POOL_GENERATION_LABEL,
+            labels
+                .get(CERTIFICATION_POOL_GENERATION_LABEL)
+                .map(String::as_str)
+                .unwrap_or("<absent>")
+        ));
+    }
+    let observed_spec = claim.data.get("spec");
+    if observed_spec != desired.data.get("spec") {
+        return Err(format!(
+            "certification Claim spec drifted from the exact Pool: observed {}, desired {}",
+            serde_json::to_string(observed_spec.unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_else(|_| "<unserializable>".into()),
+            serde_json::to_string(desired.data.get("spec").unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_else(|_| "<unserializable>".into()),
+        ));
     }
     Ok(())
 }
