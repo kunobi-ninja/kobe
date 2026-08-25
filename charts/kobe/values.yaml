@@ -330,6 +330,13 @@ hostReaper:
   leaseRoot: /var/lib/kobe/leases
   reconcileInterval: 30s
   mtimeSkip: 120s
+  # Nested privileged k3s members using the cgroupfs driver can leave empty
+  # `/sys/fs/cgroup/k8s.io/<container-id>` directories behind when recycled.
+  # Enough leaked directories exhaust the kernel cgroup hierarchy and prevent
+  # unrelated Pods from starting with `no space left on device`.
+  cgroupCleanup:
+    enabled: true
+    mtimeSkip: 5m
   dryRun: false
   # If true, the reaper container starts with KOBE_REAPER_DISABLE=1 set,
   # turning the sweep loop into a no-op (logs once per interval).
