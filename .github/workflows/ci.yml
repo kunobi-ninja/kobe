@@ -464,23 +464,6 @@ jobs:
             *) echo "unknown backend ${{ matrix.backend }}" >&2; exit 1 ;;
           esac
 
-      - name: Diagnostics on failure
-        if: failure()
-        run: |
-          CTX=kind-$E2E_CLUSTER
-          kubectl --context "$CTX" get pods,clusterinstances,clusterpools,sandboxpools,sandboxleases -A -o wide || true
-          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 200 --all-containers || true
-          mkdir -p /tmp/kind-logs
-          mise exec -- kind export logs /tmp/kind-logs --name "$E2E_CLUSTER" || true
-
-      - name: Upload kind logs
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: kind-logs-${{ github.run_id }}-${{ matrix.backend }}
-          path: /tmp/kind-logs
-          if-no-files-found: ignore
-
       # Dual-placement Sandbox conformance (#76). Runs only on the k3s leg:
       # child placement REQUIRES a receipt-capable k3s pool, so the other
       # backends have nothing to compare against and would report a skip that
@@ -498,6 +481,39 @@ jobs:
           else
             mise exec -- just test-sandbox-conformance-pr
           fi
+
+      # After BOTH gates: a `failure()` step placed before a step is skipped
+      # for good once execution passes it, so sitting between the smoke gate
+      # and the Sandbox gate left the Sandbox gate's failures with no
+      # diagnostics at all.
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          CTX=kind-$E2E_CLUSTER
+          kubectl --context "$CTX" get pods,clusterinstances,clusterpools,sandboxpools,sandboxleases -A -o wide || true
+          kubectl --context "$CTX" get sandboxpools -A -o yaml || true
+          # Answer the RBAC question a 403 leaves open: which identity, which
+          # verb. The operator's SA is the only identity the canary execs with.
+          SA="$(kubectl --context "$CTX" get deploy -n kobe-system -l app.kubernetes.io/name=kobe -o jsonpath='{.items[0].spec.template.spec.serviceAccountName}' 2>/dev/null || true)"
+          if [ -n "$SA" ]; then
+            for verb in get create; do
+              echo "auth can-i $verb pods/exec as system:serviceaccount:kobe-system:$SA:"
+              kubectl --context "$CTX" auth can-i "$verb" pods --subresource=exec \
+                --as "system:serviceaccount:kobe-system:$SA" -A || true
+            done
+          fi
+          kubectl --context "$CTX" get clusterrole -o yaml 2>/dev/null | grep -B6 -A6 "pods/exec" || true
+          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 400 --all-containers || true
+          mkdir -p /tmp/kind-logs
+          mise exec -- kind export logs /tmp/kind-logs --name "$E2E_CLUSTER" || true
+
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-logs-${{ github.run_id }}-${{ matrix.backend }}
+          path: /tmp/kind-logs
+          if-no-files-found: ignore
 
       # Always tear down so kind clusters never leak on the persistent runner.
       - name: Tear down the e2e harness
