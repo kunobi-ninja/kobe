@@ -1020,14 +1020,14 @@ impl LeaseUnsatisfiableReason {
     }
 }
 
-/// A lease could not be satisfied at request time (503 pre-flight) or remained
-/// unbound in the controller's no-Ready-cluster branch, keyed by the bounded
-/// [`LeaseUnsatisfiableReason`]. Makes a pool that "can never satisfy a lease"
-/// visible instead of leaving the lease hung in `Pending` forever.
+/// Unsatisfiable demand events: a request-time 503 pre-flight rejection, or a
+/// Pending lease entering an unsatisfiable condition / changing reason. The
+/// controller path is edge-triggered, so its ~5s requeue does not inflate the
+/// counter. Keyed by the bounded [`LeaseUnsatisfiableReason`].
 pub static LEASE_UNSATISFIABLE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "kobe_lease_unsatisfiable_total",
-        "Leases that could not be satisfied, by profile and reason",
+        "Unsatisfiable demand events, by profile and reason",
         &["profile", "reason"]
     )
     .unwrap()

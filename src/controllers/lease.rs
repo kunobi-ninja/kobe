@@ -374,11 +374,13 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                     .and_then(|p| p.status);
                 let (message, reason) = unsatisfiable_status(&lease.spec.pool_ref, &pool_status);
 
-                // Only count genuinely-unsatisfiable demand. A healthy-but-warming
-                // pool (reason=Warming) is a normal cold-start, not an exhaustion
-                // event — counting it on every ~5s requeue tick would swamp the
-                // alert signal with normal warm-ups (#189 review).
-                if reason != crate::metrics::LeaseUnsatisfiableReason::Warming {
+                // Count the edge, not every ~5s reconcile of the same Pending
+                // lease. Request-time preflight rejections are counted in the
+                // API; here we count only entry into an unsatisfiable condition
+                // or a change of reason. Warming is a normal cold-start.
+                if reason != crate::metrics::LeaseUnsatisfiableReason::Warming
+                    && entered_unsatisfiable_condition(&status.conditions, reason)
+                {
                     crate::metrics::LEASE_UNSATISFIABLE_TOTAL
                         .with_label_values(&[lease.spec.pool_ref.as_str(), reason.as_str()])
                         .inc();
@@ -1852,6 +1854,22 @@ pub fn derive_lease_conditions(
             message,
         ),
     ]
+}
+
+/// Whether this reconcile is entering a new unsatisfiable state.
+///
+/// A steady `Satisfiable=False` condition with the same typed reason is not a
+/// new demand event. This keeps `kobe_lease_unsatisfiable_total` independent of
+/// controller requeue frequency while still counting reason transitions.
+fn entered_unsatisfiable_condition(
+    previous: &[ClusterLeaseCondition],
+    reason: crate::metrics::LeaseUnsatisfiableReason,
+) -> bool {
+    !previous.iter().any(|condition| {
+        condition.condition_type == "Satisfiable"
+            && condition.status == "False"
+            && condition.reason == reason.condition_reason()
+    })
 }
 
 /// Build a human-readable lease `status.message` and classify the
@@ -4280,6 +4298,28 @@ mod tests {
         let sat = lease_cond(&conds, "Satisfiable");
         assert_eq!(sat.status, "False");
         assert_eq!(sat.reason, "Warming");
+    }
+
+    #[test]
+    fn unsatisfiable_metric_counts_edges_and_reason_changes_only() {
+        use crate::metrics::LeaseUnsatisfiableReason as R;
+        let previous = vec![ClusterLeaseCondition {
+            condition_type: "Satisfiable".into(),
+            status: "False".into(),
+            reason: "PoolExhausted".into(),
+            message: String::new(),
+            last_transition_time: None,
+        }];
+
+        assert!(!entered_unsatisfiable_condition(
+            &previous,
+            R::PoolExhausted
+        ));
+        assert!(entered_unsatisfiable_condition(
+            &previous,
+            R::CapacityBlocked
+        ));
+        assert!(entered_unsatisfiable_condition(&[], R::PoolExhausted));
     }
 
     #[test]
