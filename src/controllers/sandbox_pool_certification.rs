@@ -453,6 +453,12 @@ async fn verify_teardown_fence_enforcement(
 /// Outcome of one UID/resourceVersion-fenced write.
 enum FencedWrite {
     Updated(Box<DynamicObject>),
+    /// The object already carries the target value. Mutated passes drop the
+    /// returned certification status by design (the next strong GET is the
+    /// checkpoint), so a scale arm re-runs after its write — this variant is
+    /// how the re-run converges: checkpoint the observed object without
+    /// writing again.
+    AlreadyAtTarget(Box<DynamicObject>),
     /// The object changed underneath the CAS; the next reconcile re-reads it.
     Contended,
     /// A definitive fail-closed finding: identity drift or deletion in flight.
@@ -497,6 +503,14 @@ async fn scale_warm_pool_fenced(
     let pools: Api<DynamicObject> =
         Api::namespaced_with(client.clone(), namespace, &warm_pool_resource());
     let current = read_dynamic_exact(&pools, namespace, recorded_warm_pool).await?;
+    if current
+        .data
+        .pointer("/spec/replicas")
+        .and_then(serde_json::Value::as_u64)
+        == Some(u64::from(replicas))
+    {
+        return Ok(FencedWrite::AlreadyAtTarget(Box::new(current)));
+    }
     let (Some(uid), Some(resource_version)) = (current.uid(), current.resource_version()) else {
         return Ok(FencedWrite::Blocked(
             "recorded certification WarmPool has no UID/resourceVersion to fence".into(),
@@ -627,12 +641,18 @@ async fn read_fence_exact(
     Ok((uid, resource_version))
 }
 
+/// Read one WarmPool status counter, treating an ABSENT field as zero.
+///
+/// Upstream serializes its counters with `omitempty`, so a drained pool
+/// reports zero replicas by omitting the field entirely — the drain barrier
+/// would otherwise wait forever for a zero that can never appear. Callers
+/// gate on the generation ACK first, so absence here is never "status not
+/// written yet". A present-but-malformed value still reads as unobservable.
 fn dynamic_status_count(warm_pool: &DynamicObject, field: &str) -> Option<u32> {
-    warm_pool
-        .data
-        .pointer(&format!("/status/{field}"))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
+    match warm_pool.data.pointer(&format!("/status/{field}")) {
+        None => Some(0),
+        Some(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+    }
 }
 
 fn warm_pool_status_is_current(warm_pool: &DynamicObject) -> bool {
@@ -2116,30 +2136,38 @@ pub async fn reconcile_management_pool_certification(
 async fn fenced_scale_to_zero_drains(
     client: &Client,
     namespace: &str,
-    mut status: SandboxPoolCertificationStatus,
+    status: SandboxPoolCertificationStatus,
     ready: u32,
 ) -> Result<ManagementPoolCertificationProgress, String> {
+    // A mutated pass drops the returned status by design, so the write and
+    // its checkpoint are two passes: Updated performs the write (and the
+    // dropped status is recomputed next pass), while the AlreadyAtTarget
+    // re-run is the pass whose phase transition actually persists.
+    let checkpoint = |updated: Box<DynamicObject>,
+                      mutated: bool,
+                      mut status: SandboxPoolCertificationStatus|
+     -> Result<ManagementPoolCertificationProgress, String> {
+        let generation = updated
+            .metadata
+            .generation
+            .ok_or_else(|| "drained certification WarmPool has no generation".to_string())?;
+        status.drain_generation = Some(generation);
+        status.phase = SandboxPoolCertificationPhase::DrainAcknowledged;
+        status.message = None;
+        Ok(progress(
+            status,
+            ready,
+            false,
+            mutated,
+            "CertificationDrainRequested",
+            format!(
+                "scale-to-zero written under a UID/resourceVersion fence; waiting for generation {generation} plus zero ready replicas"
+            ),
+        ))
+    };
     match scale_warm_pool_fenced(client, namespace, &status.sandbox_warm_pool, 0).await? {
-        FencedWrite::Updated(updated) => {
-            let updated = *updated;
-            let generation = updated
-                .metadata
-                .generation
-                .ok_or_else(|| "drained certification WarmPool has no generation".to_string())?;
-            status.drain_generation = Some(generation);
-            status.phase = SandboxPoolCertificationPhase::DrainAcknowledged;
-            status.message = None;
-            Ok(progress(
-                status,
-                ready,
-                false,
-                true,
-                "CertificationDrainRequested",
-                format!(
-                    "scale-to-zero written under a UID/resourceVersion fence; waiting for generation {generation} plus zero ready replicas"
-                ),
-            ))
-        }
+        FencedWrite::Updated(updated) => checkpoint(updated, true, status),
+        FencedWrite::AlreadyAtTarget(updated) => checkpoint(updated, false, status),
         FencedWrite::Contended => Ok(progress(
             status,
             ready,
@@ -2304,7 +2332,7 @@ async fn absence_proven_restores_capacity(
     client: &Client,
     namespace: &str,
     warm_capacity: u32,
-    mut status: SandboxPoolCertificationStatus,
+    status: SandboxPoolCertificationStatus,
     ready: u32,
 ) -> Result<ManagementPoolCertificationProgress, String> {
     for (api_resource, kind) in [
@@ -2384,28 +2412,35 @@ async fn absence_proven_restores_capacity(
             }
         }
     }
+    // Same two-pass shape as the drain: the mutated write's status is
+    // dropped, and the AlreadyAtTarget re-run persists the transition.
+    let checkpoint = |updated: Box<DynamicObject>,
+                      mutated: bool,
+                      mut status: SandboxPoolCertificationStatus|
+     -> Result<ManagementPoolCertificationProgress, String> {
+        let generation = updated
+            .metadata
+            .generation
+            .ok_or_else(|| "replenished certification WarmPool has no generation".to_string())?;
+        status.replenish_generation = Some(generation);
+        status.phase = SandboxPoolCertificationPhase::Replenished;
+        status.message = None;
+        Ok(progress(
+            status,
+            ready,
+            false,
+            mutated,
+            "CertificationRestoringCapacity",
+            format!(
+                "descendant and storage absence proven; capacity restored and waiting for generation {generation}"
+            ),
+        ))
+    };
     match scale_warm_pool_fenced(client, namespace, &status.sandbox_warm_pool, warm_capacity)
         .await?
     {
-        FencedWrite::Updated(updated) => {
-            let updated = *updated;
-            let generation = updated.metadata.generation.ok_or_else(|| {
-                "replenished certification WarmPool has no generation".to_string()
-            })?;
-            status.replenish_generation = Some(generation);
-            status.phase = SandboxPoolCertificationPhase::Replenished;
-            status.message = None;
-            Ok(progress(
-                status,
-                ready,
-                false,
-                true,
-                "CertificationRestoringCapacity",
-                format!(
-                    "descendant and storage absence proven; capacity restored and waiting for generation {generation}"
-                ),
-            ))
-        }
+        FencedWrite::Updated(updated) => checkpoint(updated, true, status),
+        FencedWrite::AlreadyAtTarget(updated) => checkpoint(updated, false, status),
         FencedWrite::Contended => Ok(progress(
             status,
             ready,
@@ -3326,6 +3361,55 @@ mod tests {
         assert_eq!(progress.reason, "CertificationClaimGone");
     }
 
+    /// A mutated pass drops the arm's returned status, so every scale arm
+    /// re-runs once after its write. The re-run must converge — checkpoint
+    /// the observed generation WITHOUT writing again — or the phase can
+    /// never persist and the arm scales forever.
+    #[tokio::test]
+    async fn a_scale_rerun_checkpoints_without_writing_again() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut drained = certification_warm_pool();
+                drained["spec"]["replicas"] = serde_json::json!(0);
+                drained
+            }))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = fenced_scale_to_zero_drains(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::FenceInstalled),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::DrainAcknowledged
+        );
+        assert_eq!(progress.status.drain_generation, Some(8));
+        assert!(
+            !progress.mutated,
+            "an already-at-target pass must persist its checkpoint, not requeue as a mutation"
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PATCH"),
+            "no write may be issued when the WarmPool already carries the target"
+        );
+    }
+
     #[tokio::test]
     async fn absence_proven_restores_capacity_under_a_fence() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3354,7 +3438,13 @@ mod tests {
             .and(path(
                 "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(certification_warm_pool()))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                // At AbsenceProven the drain barrier has already proven the
+                // pool empty, so the live WarmPool is at zero.
+                let mut drained = certification_warm_pool();
+                drained["spec"]["replicas"] = serde_json::json!(0);
+                drained
+            }))
             .mount(&server)
             .await;
         Mock::given(method("PATCH"))

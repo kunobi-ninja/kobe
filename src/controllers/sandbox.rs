@@ -535,17 +535,20 @@ async fn observe_management_pool(
                 warm_pool.name_any()
             ))
         })?;
-    let count = |field: &'static str| {
-        status
-            .get(field)
-            .and_then(serde_json::Value::as_u64)
+    // Upstream serializes its counters with `omitempty`: a zero-member pool
+    // omits the field entirely, so absence IS the zero reading. Only a
+    // present-but-malformed value is an invalid observation.
+    let count = |field: &'static str| match status.get(field) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
             .and_then(|value| u32::try_from(value).ok())
             .ok_or_else(|| {
                 SandboxPlacementError::Invalid(format!(
                     "SandboxWarmPool {} has invalid status.{field}",
                     warm_pool.name_any()
                 ))
-            })
+            }),
     };
     let warm_pool_generation = warm_pool.metadata.generation.ok_or_else(|| {
         SandboxPlacementError::Invalid(format!(
@@ -824,15 +827,22 @@ pub async fn reconcile_pool(
     })?;
 
     let observation = match async {
-        ensure_upstream_pool_objects(
-            &ctx.client,
-            &ctx.namespace,
-            &name,
-            &pool.spec,
-            // Owner-referenced here, where the parent SandboxPool actually exists.
-            &owner,
-        )
-        .await?;
+        // Mid-protocol the certification arms own the WarmPool: re-asserting
+        // spec.replicas = warmCapacity here would undo every drain one beat
+        // after it lands, churning upstream through delete/create cycles
+        // forever. The arms' UID/resourceVersion fences carry the identity
+        // protection for that window.
+        if !certification_protocol_in_flight(&pool) {
+            ensure_upstream_pool_objects(
+                &ctx.client,
+                &ctx.namespace,
+                &name,
+                &pool.spec,
+                // Owner-referenced here, where the parent SandboxPool actually exists.
+                &owner,
+            )
+            .await?;
+        }
         observe_management_pool(&ctx, &pool).await
     }
     .await
