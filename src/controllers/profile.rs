@@ -187,13 +187,16 @@ mod cluster_instance_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(observed("2")))
             .mount(&server)
             .await;
-        // First status write loses the race; the retry must land.
+        // First status write loses the race. The apiserver reports a failed
+        // JSON-patch `test` op as 422 with EMPTY causes — not 409 — which is
+        // exactly the live shape a 409-only retry sat out.
         Mock::given(method("PATCH"))
             .and(path(format!("{base}/inst-1/status")))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
                 "kind": "Status", "apiVersion": "v1", "status": "Failure",
-                "reason": "Conflict", "code": 409,
-                "message": "the object has been modified"
+                "reason": "Invalid", "code": 422,
+                "message": "the server rejected our request due to an error in our request",
+                "details": { "causes": [] }
             })))
             .up_to_n_times(1)
             .expect(1)
@@ -2067,7 +2070,12 @@ async fn ensure_cluster_instance(
             }
             .await;
             match attempt {
-                Err(kube::Error::Api(ref response)) if response.code == 409 && attempts < 5 => {
+                // A failed `test` op arrives as 422-with-empty-causes, not
+                // 409 — proven live when the first shipped retry (409-only)
+                // sat out the exact race it existed for.
+                Err(ref error)
+                    if crate::controllers::lease::optimistic_conflict(error) && attempts < 5 =>
+                {
                     continue;
                 }
                 other => break other,
