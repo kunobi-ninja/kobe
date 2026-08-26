@@ -2,15 +2,20 @@
 //!
 //! # One suite, two placements
 //!
-//! Every scenario here runs **twice**: once against a management-placement
-//! pool, once against a child-cluster pool. That is the entire design. Two
-//! copies of a suite would prove nothing about equivalence — they would drift,
-//! and the drift would be invisible until somebody's child-placed Sandbox
-//! behaved differently from the one they tested against.
+//! Every scenario here runs its behaviour against a management-placement pool
+//! and then proves the child-cluster pool's **current ship-state boundary**:
+//! child placement has no in-child certification and teardown receipt
+//! protocol yet, so its pool must refuse every lease fail-closed — and each
+//! scenario asserts exactly that refusal for the lease it would otherwise
+//! run under. When in-child certification lands, the child arm goes back to
+//! executing the scenario itself, restoring full equivalence coverage.
 //!
-//! So each scenario takes a [`Placement`] and nothing else changes: same
-//! requests, same assertions, same expected status shapes. A behaviour that
-//! differs between placements fails here rather than in production.
+//! The one-suite shape is still the point: two copies of a suite would prove
+//! nothing about equivalence — they would drift, and the drift would be
+//! invisible until somebody's child-placed Sandbox behaved differently from
+//! the one they tested against. Each scenario takes a [`Placement`] and
+//! nothing else changes: same requests, same assertions, same expected
+//! status shapes.
 //!
 //! # Only the public contract
 //!
@@ -113,14 +118,46 @@ macro_rules! both_placements {
         #[ignore = "requires a live Kobe endpoint; see the module docs"]
         async fn $name() {
             require_e2e();
-            for placement in [Placement::Management, Placement::ChildCluster] {
-                let scenario: fn(Placement) -> _ = $body;
-                scenario(placement)
-                    .await
-                    .unwrap_or_else(|error| panic!("[{}] {error:#}", placement.label()));
-            }
+            let scenario: fn(Placement) -> _ = $body;
+            scenario(Placement::Management)
+                .await
+                .unwrap_or_else(|error| panic!("[{}] {error:#}", Placement::Management.label()));
+            // Child placement deliberately ships fail-closed: no in-child
+            // certification and teardown receipt protocol exists yet, so the
+            // honest child-placement property every scenario can prove today
+            // is that the uncertified pool REFUSES the lease the scenario
+            // would otherwise run under. When in-child certification lands,
+            // this arm goes back to running the scenario itself.
+            assert_child_placement_refuses_leases()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("[{}] {error:#}", Placement::ChildCluster.label())
+                });
         }
     };
+}
+
+/// The child-placement ship-state boundary, proven at the API surface: an
+/// uncertified pool must refuse admission with the fail-closed 503 before any
+/// pending lease exists — never accept-and-strand.
+async fn assert_child_placement_refuses_leases() -> anyhow::Result<()> {
+    let api = Api::as_caller(token());
+    let (status, body) = api
+        .json(
+            reqwest::Method::POST,
+            "/v1/sandbox-leases",
+            Some(serde_json::json!({
+                "pool": pool_for(Placement::ChildCluster),
+                "ttl": "5m"
+            })),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "an uncertified child pool must refuse leases fail-closed with 503, \
+         got HTTP {status} {body}"
+    );
+    Ok(())
 }
 
 fn require_e2e() {

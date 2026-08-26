@@ -1961,6 +1961,44 @@ export function sandboxPoolCertificationBlocker(
   return `SandboxPool/${name} is fail-closed at ${ready.reason}: ${ready.message ?? "no detail"}`;
 }
 
+/// Child placement's converged terminal until in-child certification exists:
+/// current-generation status with Ready=False and reason CompositionEligible.
+/// CleanupBlocked stays a hard failure; every other reason keeps reconciling.
+async function waitForChildFailClosedBoundary(args: Args, name: string): Promise<void> {
+  const deadline = Date.now() + args.timeoutSeconds * 1000;
+  let lastError = `SandboxPool/${name} has not reported its fail-closed boundary`;
+  while (Date.now() < deadline) {
+    let current: ConformanceObject;
+    try {
+      current = await kubectlJson<ConformanceObject>(args, [
+        "get", "sandboxpool.kobe.kunobi.ninja", name, "-n", args.namespace,
+      ]);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await Bun.sleep(1_000);
+      continue;
+    }
+    const generation = current.metadata?.generation;
+    const ready = (current.status?.conditions ?? []).find((condition) => condition.type === "Ready");
+    requireConformance(
+      !(ready?.reason === "CleanupBlocked" && ready.observedGeneration === generation),
+      `SandboxPool/${name} is fail-closed at CleanupBlocked: ${ready?.message ?? "no detail"}`,
+    );
+    if (
+      generation !== undefined
+      && current.status?.observedGeneration === generation
+      && ready?.observedGeneration === generation
+      && ready.status === "False"
+      && ready.reason === "CompositionEligible"
+    ) {
+      return;
+    }
+    lastError = `SandboxPool/${name} has not converged on CompositionEligible (now ${ready?.reason ?? "none"}: ${ready?.message ?? ""})`;
+    await Bun.sleep(1_000);
+  }
+  throw new Error(`${lastError} (timed out after ${args.timeoutSeconds}s)`);
+}
+
 async function waitForCertifiedPool(args: Args, name: string): Promise<void> {
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   let lastError = `SandboxPool/${name} has not reported certification`;
@@ -2095,10 +2133,15 @@ async function sandboxConformancePreflight(args: Args): Promise<void> {
     "--for=jsonpath={.status.ready}=1", `--timeout=${args.timeoutSeconds}s`,
   ], { step: `ClusterPool/${DEMO_K3S_POOL} did not retain one Ready child fixture` });
 
-  for (const name of [DEMO_SANDBOX_POOL_MANAGEMENT, DEMO_SANDBOX_POOL_CHILD]) {
-    await waitForCertifiedPool(args, name);
-  }
-  step("Both Sandbox placements and both caller policies are certified");
+  await waitForCertifiedPool(args, DEMO_SANDBOX_POOL_MANAGEMENT);
+  // Child placement's decided ship-state is fail-closed: no in-child
+  // certification and teardown receipt protocol exists yet, so the child
+  // pool's converged, honest terminal is CompositionEligible with Ready
+  // withheld — demanding "certified" here would demand a protocol the
+  // product deliberately does not have. The suite proves the matching API
+  // boundary (child leases are refused) on every scenario.
+  await waitForChildFailClosedBoundary(args, DEMO_SANDBOX_POOL_CHILD);
+  step("Management placement is certified; child placement holds its fail-closed boundary");
 }
 
 async function down(args: Args): Promise<void> {
