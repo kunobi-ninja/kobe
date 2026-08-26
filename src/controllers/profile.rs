@@ -150,6 +150,89 @@ mod cluster_instance_tests {
         .unwrap()
     }
 
+    /// The instance controller routinely wins the first status write right
+    /// after CREATE. Losing that optimistic race must not skip the initial
+    /// status patch: `created_with` is written here and nowhere else, and a
+    /// pool-managed instance without backend provenance is refused deletion
+    /// fail-closed — a permanent recycle wedge, seen live in conformance.
+    #[tokio::test]
+    async fn initial_provenance_patch_retries_a_lost_optimistic_race() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let instances_api: Api<ClusterInstance> = Api::namespaced(client, "test-ns");
+        let mut profile = (*make_test_profile("p", 1, 2)).clone();
+        profile.metadata.uid = Some("pool-uid".into());
+
+        let base = "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances";
+        let observed = |rv: &str| {
+            serde_json::json!({
+                "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                "kind": "ClusterInstance",
+                "metadata": {
+                    "name": "inst-1", "namespace": "test-ns",
+                    "uid": "instance-uid", "resourceVersion": rv
+                },
+                "spec": { "poolRef": { "name": "p", "uid": "pool-uid" } }
+            })
+        };
+        Mock::given(method("POST"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(201).set_body_json(observed("1")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/inst-1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(observed("2")))
+            .mount(&server)
+            .await;
+        // First status write loses the race; the retry must land.
+        Mock::given(method("PATCH"))
+            .and(path(format!("{base}/inst-1/status")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Conflict", "code": 409,
+                "message": "the object has been modified"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{base}/inst-1/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(observed("3")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        ensure_cluster_instance(
+            &instances_api,
+            &profile,
+            "inst-1",
+            &crate::pool::RenderContext::with_kobe_sync_image("zondax/kobe-sync:test"),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let patches: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 2, "the lost race must be retried");
+        let body: serde_json::Value = serde_json::from_slice(&patches[1].body).unwrap();
+        assert!(
+            body[2]["value"]["createdWith"]["backend"].is_object(),
+            "the landed status must carry backend provenance, got: {}",
+            body[2]["value"]
+        );
+    }
+
     #[test]
     fn backoff_populates_last_failure_reason_when_failing() {
         // attempted up to index 3, only reached Ready at 1 → 2 failures.
@@ -1935,45 +2018,61 @@ async fn ensure_cluster_instance(
     };
 
     if created {
-        let patch_result = async {
-            let observed = instances_api.get(cluster_name).await?;
-            let uid = observed.metadata.uid.as_deref().ok_or_else(|| {
-                kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
-            })?;
-            let rv = observed.resource_version().ok_or_else(|| {
-                kube::Error::Service(Box::new(std::io::Error::other(
-                    "instance has no resourceVersion",
-                )))
-            })?;
-            let mut status = match observed.status {
-                Some(status) => status,
-                None => initial_status.clone(),
-            };
-            // The instance controller may win immediately after CREATE. Start
-            // from that fresh status and fill only the profile-owned immutable
-            // provenance; never roll provisioning/bootstrap state back to the
-            // initial Creating snapshot under a newer resourceVersion.
-            if status.spec_hash.is_none() {
-                status.spec_hash = initial_status.spec_hash.clone();
+        // Retried on optimistic 409s: the instance controller routinely wins
+        // the first status write right after CREATE, and losing that race
+        // must not skip this patch — `created_with` is written here and
+        // nowhere else (the periodic sync backfills only `spec_hash`), and a
+        // pool-managed instance without backend provenance is refused
+        // deletion fail-closed, wedging recycle permanently.
+        let mut attempts = 0;
+        let patch_result = loop {
+            attempts += 1;
+            let attempt = async {
+                let observed = instances_api.get(cluster_name).await?;
+                let uid = observed.metadata.uid.as_deref().ok_or_else(|| {
+                    kube::Error::Service(Box::new(std::io::Error::other("instance has no UID")))
+                })?;
+                let rv = observed.resource_version().ok_or_else(|| {
+                    kube::Error::Service(Box::new(std::io::Error::other(
+                        "instance has no resourceVersion",
+                    )))
+                })?;
+                let mut status = match observed.status {
+                    Some(status) => status,
+                    None => initial_status.clone(),
+                };
+                // The instance controller may win immediately after CREATE. Start
+                // from that fresh status and fill only the profile-owned immutable
+                // provenance; never roll provisioning/bootstrap state back to the
+                // initial Creating snapshot under a newer resourceVersion.
+                if status.spec_hash.is_none() {
+                    status.spec_hash = initial_status.spec_hash.clone();
+                }
+                if status.created_with.is_none() {
+                    status.created_with = initial_status.created_with.clone();
+                }
+                let patch = crate::controllers::lease::json_patch(serde_json::json!([
+                    { "op": "test", "path": "/metadata/uid", "value": uid },
+                    { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
+                    { "op": "add", "path": "/status", "value": status }
+                ]));
+                instances_api
+                    .patch_status(
+                        cluster_name,
+                        &PatchParams::default(),
+                        &Patch::<()>::Json(patch),
+                    )
+                    .await?;
+                Ok::<(), kube::Error>(())
             }
-            if status.created_with.is_none() {
-                status.created_with = initial_status.created_with.clone();
+            .await;
+            match attempt {
+                Err(kube::Error::Api(ref response)) if response.code == 409 && attempts < 5 => {
+                    continue;
+                }
+                other => break other,
             }
-            let patch = crate::controllers::lease::json_patch(serde_json::json!([
-                { "op": "test", "path": "/metadata/uid", "value": uid },
-                { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-                { "op": "add", "path": "/status", "value": status }
-            ]));
-            instances_api
-                .patch_status(
-                    cluster_name,
-                    &PatchParams::default(),
-                    &Patch::<()>::Json(patch),
-                )
-                .await?;
-            Ok::<(), kube::Error>(())
-        }
-        .await;
+        };
         if let Err(err) = patch_result {
             // Best-effort: the periodic sync will retry. Log so an operator
             // upgrade race is visible rather than silently leaving a hash
