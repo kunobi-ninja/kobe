@@ -34,7 +34,7 @@
 //! lease it belonged to is gone.
 
 use super::sandbox_access::backend_denied;
-use k8s_openapi::api::authentication::v1::{BoundObjectReference, TokenRequest, TokenRequestSpec};
+use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -523,15 +523,19 @@ pub async fn mint_scoped_token(
             // server, which is the only thing it should ever authenticate to.
             audiences: vec![],
             expiration_seconds: Some(TOKEN_LIFETIME_SECONDS),
-            // The API server invalidates this credential when this exact Pod
-            // identity disappears. Binding by UID prevents a same-named Pod
-            // replacement from inheriting an already-issued token.
-            bound_object_ref: Some(BoundObjectReference {
-                api_version: Some("v1".to_string()),
-                kind: Some("Pod".to_string()),
-                name: Some(target.pod_name.clone()),
-                uid: Some(target.pod_uid.clone()),
-            }),
+            // Deliberately UNBOUND. Binding to the target Pod — the original
+            // design, for invalidation-on-pod-death — is rejected by current
+            // apiservers: a pod-bound token must be for the ServiceAccount
+            // the pod itself runs as ("cannot bind token for serviceaccount
+            // ... to pod running with different serviceaccount name", proven
+            // live on v1.36), and minting under the pod's shared identity
+            // instead would let two leases' RoleBindings stack on one
+            // principal — a cross-tenant grant. Revocation rests on the
+            // remaining fences: deleting the per-lease ServiceAccount at
+            // release invalidates its tokens (the apiserver checks the SA's
+            // UID), every operation re-verifies the Pod UID before
+            // connecting, and the token dies on its own short expiry.
+            bound_object_ref: None,
         },
         status: None,
     };
@@ -1037,12 +1041,6 @@ mod tests {
                 "spec": {
                     "audiences": [],
                     "expirationSeconds": TOKEN_LIFETIME_SECONDS,
-                    "boundObjectRef": {
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "name": target.pod_name,
-                        "uid": target.pod_uid,
-                    },
                 },
                 "status": {
                     "expirationTimestamp": valid_expiry,
@@ -1094,14 +1092,12 @@ mod tests {
             .find(|request| request.url.path().ends_with("/token"))
             .expect("TokenRequest was issued");
         let body: Value = token_request.body_json().unwrap();
-        assert_eq!(
-            body["spec"]["boundObjectRef"],
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "name": "sbx-0",
-                "uid": "pod-uid",
-            })
+        assert!(
+            body["spec"]["boundObjectRef"].is_null(),
+            "tokens must be minted unbound: pod-binding is rejected for a \
+             foreign ServiceAccount, and binding under the pod's own shared \
+             identity would stack tenants on one principal; got {}",
+            body["spec"]
         );
     }
 
@@ -1126,12 +1122,6 @@ mod tests {
                 "spec": {
                     "audiences": [],
                     "expirationSeconds": TOKEN_LIFETIME_SECONDS,
-                    "boundObjectRef": {
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "name": target.pod_name,
-                        "uid": target.pod_uid,
-                    },
                 },
                 "status": {
                     "expirationTimestamp": excessive_expiry,
@@ -1289,12 +1279,6 @@ mod tests {
                 "spec": {
                     "audiences": [],
                     "expirationSeconds": TOKEN_LIFETIME_SECONDS,
-                    "boundObjectRef": {
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "name": target.pod_name,
-                        "uid": target.pod_uid,
-                    },
                 },
                 "status": {
                     "expirationTimestamp": valid_expiry,
