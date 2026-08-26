@@ -33,6 +33,7 @@
 //! CRD, a response, an event or a log is a token somebody can replay after the
 //! lease it belonged to is gone.
 
+use super::sandbox_access::backend_denied;
 use k8s_openapi::api::authentication::v1::{BoundObjectReference, TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
@@ -323,27 +324,30 @@ where
         Err(kube::Error::Api(response)) if response.code == 404 => {
             match api.create(&PostParams::default(), desired).await {
                 Ok(created) => {
-                    owned_credential_fence(&created, name, target)
-                        .map_err(|()| SandboxAccessDenied::Backend)?;
+                    owned_credential_fence(&created, name, target).map_err(|()| {
+                        backend_denied(&"credential object is not owned by the exact target")
+                    })?;
                     if managed_label_matches(&created) && shape_matches(&created) {
                         return Ok(());
                     }
-                    return Err(SandboxAccessDenied::Backend);
+                    return Err(backend_denied(
+                        &"freshly created credential object has a drifted shape",
+                    ));
                 }
                 // A concurrent creator won. Re-read it and apply the same
                 // ownership proof; never turn the conflict into adoption.
                 Err(kube::Error::Api(response)) if response.code == 409 => api
                     .get(name)
                     .await
-                    .map_err(|_| SandboxAccessDenied::Backend)?,
-                Err(_) => return Err(SandboxAccessDenied::Backend),
+                    .map_err(|error| backend_denied(&error))?,
+                Err(error) => return Err(backend_denied(&error)),
             }
         }
-        Err(_) => return Err(SandboxAccessDenied::Backend),
+        Err(error) => return Err(backend_denied(&error)),
     };
 
     let (uid, resource_version) = owned_credential_fence(&observed, name, target)
-        .map_err(|()| SandboxAccessDenied::Backend)?;
+        .map_err(|()| backend_denied(&"credential object is not owned by the exact target"))?;
     if managed_label_matches(&observed) && shape_matches(&observed) {
         return Ok(());
     }
@@ -377,13 +381,16 @@ where
     let converged = api
         .patch(name, &PatchParams::default(), &Patch::Json::<()>(patch))
         .await
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+        .map_err(|error| backend_denied(&error))?;
 
-    owned_credential_fence(&converged, name, target).map_err(|()| SandboxAccessDenied::Backend)?;
+    owned_credential_fence(&converged, name, target)
+        .map_err(|()| backend_denied(&"credential object is not owned by the exact target"))?;
     if managed_label_matches(&converged) && shape_matches(&converged) {
         Ok(())
     } else {
-        Err(SandboxAccessDenied::Backend)
+        Err(backend_denied(
+            &"converged credential object has a drifted shape",
+        ))
     }
 }
 
@@ -538,9 +545,11 @@ pub async fn mint_scoped_token(
     let issued = accounts
         .create_token_request(&name, &PostParams::default(), &request)
         .await
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+        .map_err(|error| backend_denied(&error))?;
     let received_at = chrono::Utc::now();
-    let status = issued.status.ok_or(SandboxAccessDenied::Backend)?;
+    let status = issued
+        .status
+        .ok_or_else(|| backend_denied(&"TokenRequest returned no status"))?;
     // Kubernetes parses the wire value into `Time`; parsing its canonical RFC
     // 3339 representation here also keeps the temporal comparison in one clock
     // type instead of relying on ordering across time-library versions.
@@ -551,7 +560,9 @@ pub async fn mint_scoped_token(
             received_at,
         )
     {
-        return Err(SandboxAccessDenied::Backend);
+        return Err(backend_denied(
+            &"TokenRequest returned an empty token or an unacceptable expiration",
+        ));
     }
 
     Ok(status.token)
@@ -738,7 +749,7 @@ pub async fn operator_config() -> Result<&'static kube::Config, SandboxAccessDen
         .get_or_try_init(|| async {
             kube::Config::infer()
                 .await
-                .map_err(|_| SandboxAccessDenied::Backend)
+                .map_err(|error| backend_denied(&error))
         })
         .await
 }
@@ -768,7 +779,7 @@ pub async fn scoped_client(
     };
     config.default_namespace = target.namespace.clone();
 
-    kube::Client::try_from(config).map_err(|_| SandboxAccessDenied::Backend)
+    kube::Client::try_from(config).map_err(|error| backend_denied(&error))
 }
 
 #[cfg(test)]

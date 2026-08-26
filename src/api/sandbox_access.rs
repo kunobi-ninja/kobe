@@ -121,6 +121,22 @@ pub enum SandboxAccessDenied {
     Backend,
 }
 
+/// Collapse a backend failure into the caller-facing `Backend` denial while
+/// keeping its cause and exact raise site in the operator log.
+///
+/// The audit record deliberately reports only `backend_error`, and the enum
+/// deliberately carries nothing — but with ~30 raise sites that opacity used
+/// to extend to the operator too: the first live conformance scenario died on
+/// an anonymous "sandbox lookup failed" that no log line could localize.
+/// Callers with an error that may embed secret material (kubeconfig reads)
+/// pass a redacted static message instead.
+#[track_caller]
+pub(crate) fn backend_denied(error: &dyn std::fmt::Display) -> SandboxAccessDenied {
+    let site = std::panic::Location::caller();
+    tracing::warn!(%error, %site, "sandbox access denied by a backend failure");
+    SandboxAccessDenied::Backend
+}
+
 impl SandboxAccessDenied {
     /// Bounded reason code for audit records and metrics.
     ///
@@ -372,7 +388,7 @@ pub async fn resolve_alias(
 ) -> Result<String, SandboxAccessDenied> {
     let candidates = crate::api::sandbox::leases_with_alias(client, namespace, alias, identity)
         .await
-        .map_err(|_| SandboxAccessDenied::Backend)?;
+        .map_err(|error| backend_denied(&error))?;
 
     match candidates.len() {
         1 => Ok(candidates.into_iter().next().expect("length checked")),
@@ -410,7 +426,7 @@ pub async fn resolve_sandbox_target(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return Err(SandboxAccessDenied::NotFound);
         }
-        Err(_) => return Err(SandboxAccessDenied::Backend),
+        Err(error) => return Err(backend_denied(&error)),
     };
     if !crate::api::sandbox::principal_owns_lease(&lease, identity) {
         // Same answer as absent. A caller who can tell these apart can
@@ -424,7 +440,7 @@ pub async fn resolve_sandbox_target(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return Err(SandboxAccessDenied::PoolUnresolvable);
         }
-        Err(_) => return Err(SandboxAccessDenied::Backend),
+        Err(error) => return Err(backend_denied(&error)),
     };
 
     let target = target_from_provenance(&lease, &pool, chrono::Utc::now())?;
@@ -470,7 +486,7 @@ pub async fn resolve_target_cluster(
     if target.placement == TargetPlacement::Management {
         let config = crate::api::sandbox_credentials::operator_config()
             .await
-            .map_err(|_| SandboxAccessDenied::Backend)?
+            .map_err(|error| backend_denied(&error))?
             .clone();
         return Ok(TargetCluster {
             admin: client.clone(),
@@ -504,7 +520,7 @@ pub async fn resolve_target_cluster(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return Err(SandboxAccessDenied::TargetUnresolved);
         }
-        Err(_) => return Err(SandboxAccessDenied::Backend),
+        Err(error) => return Err(backend_denied(&error)),
     };
     if current.uid().as_deref() != Some(recorded_lease.uid.as_str()) {
         return Err(SandboxAccessDenied::TargetUnresolved);
@@ -530,11 +546,11 @@ pub async fn resolve_target_cluster(
     let kubeconfig =
         crate::backend::read_kubeconfig_secret(client, &recorded_instance.name, namespace)
             .await
-            .map_err(|_| SandboxAccessDenied::Backend)?;
+            .map_err(|_| backend_denied(&"kubeconfig secret read failed (context redacted)"))?;
     let config = crate::backend::virtual_config_from_kubeconfig(&kubeconfig)
         .await
-        .map_err(|_| SandboxAccessDenied::Backend)?;
-    let admin = kube::Client::try_from(config.clone()).map_err(|_| SandboxAccessDenied::Backend)?;
+        .map_err(|error| backend_denied(&error))?;
+    let admin = kube::Client::try_from(config.clone()).map_err(|error| backend_denied(&error))?;
 
     Ok(TargetCluster { admin, config })
 }
@@ -595,7 +611,7 @@ pub async fn read_sandbox_logs(
         Err(kube::Error::Api(error)) if error.code == 404 => {
             return Err(SandboxAccessDenied::TargetUnresolved);
         }
-        Err(_) => return Err(SandboxAccessDenied::Backend),
+        Err(error) => return Err(backend_denied(&error)),
     };
     // The name resolved; the identity must too.
     if pod.uid().as_deref() != Some(target.pod_uid.as_str()) {
@@ -612,7 +628,7 @@ pub async fn read_sandbox_logs(
     };
     pods.logs(&target.pod_name, &params)
         .await
-        .map_err(|_| SandboxAccessDenied::Backend)
+        .map_err(|error| backend_denied(&error))
 }
 
 /// The largest command output one exec response may carry.
@@ -760,8 +776,8 @@ pub async fn exec_capped_until(
 ) -> Result<RawExecOutput, SandboxAccessDenied> {
     tokio::select! {
         biased;
-        _ = shutdown.cancelled() => Err(SandboxAccessDenied::Backend),
-        _ = tokio::time::sleep_until(deadline) => Err(SandboxAccessDenied::Backend),
+        _ = shutdown.cancelled() => Err(backend_denied(&"exec aborted: the operator is shutting down")),
+        _ = tokio::time::sleep_until(deadline) => Err(backend_denied(&"exec preempted at its execution deadline")),
         result = exec_capped_inner(client, target, container, command, stdin, output_cap) => result,
     }
 }
@@ -801,13 +817,13 @@ async fn exec_capped_inner(
     let mut attached = AbortExecOnDrop(
         pods.exec(&target.pod_name, command, &params)
             .await
-            .map_err(|_| SandboxAccessDenied::Backend)?,
+            .map_err(|error| backend_denied(&error))?,
     );
 
     if let Some(input) = stdin {
         use tokio::io::AsyncWriteExt;
         let Some(mut writer) = attached.0.stdin() else {
-            return Err(SandboxAccessDenied::Backend);
+            return Err(backend_denied(&"exec channel has no stdin writer"));
         };
         // A failed write is not swallowed: the command on the other end is
         // waiting for a request it will now never get, and reporting success
@@ -815,11 +831,11 @@ async fn exec_capped_inner(
         writer
             .write_all(input)
             .await
-            .map_err(|_| SandboxAccessDenied::Backend)?;
+            .map_err(|error| backend_denied(&error))?;
         writer
             .shutdown()
             .await
-            .map_err(|_| SandboxAccessDenied::Backend)?;
+            .map_err(|error| backend_denied(&error))?;
     }
 
     let stdout_stream = attached.0.stdout();
@@ -827,7 +843,7 @@ async fn exec_capped_inner(
     let status = attached
         .0
         .take_status()
-        .ok_or(SandboxAccessDenied::Backend)?;
+        .ok_or_else(|| backend_denied(&"exec channel has no status stream"))?;
 
     // Drain both bounded pipes while waiting for status. Reading stdout to EOF
     // before touching stderr deadlocks when the command fills stderr's pipe
