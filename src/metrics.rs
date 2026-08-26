@@ -103,6 +103,35 @@ pub static QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Age in seconds of the oldest currently-Pending lease in each profile.
+///
+/// This complements [`QUEUE_DEPTH`]: depth answers "how many are waiting",
+/// while age distinguishes a harmless short burst from a queue that is no
+/// longer making progress. The `/metrics` inventory sweep sets it to zero
+/// when a profile has no pending leases.
+pub static LEASE_OLDEST_PENDING_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_lease_oldest_pending_age_seconds",
+        "Age in seconds of the oldest currently-Pending lease",
+        &["profile"]
+    )
+    .unwrap()
+});
+
+/// Age in seconds of the oldest currently-Creating instance in each profile.
+///
+/// Age starts at the current phase's `stateSince`, not object creation, so a
+/// recycled object does not retain time spent in earlier lifecycle phases.
+/// The `/metrics` inventory sweep sets it to zero when no instance is Creating.
+pub static INSTANCE_OLDEST_CREATING_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "kobe_instance_oldest_creating_age_seconds",
+        "Age in seconds of the oldest currently-Creating instance",
+        &["profile"]
+    )
+    .unwrap()
+});
+
 /// Health check result counters.
 ///
 /// Labels: `profile`, `result` (pass, fail).
@@ -186,11 +215,9 @@ pub static INSTANCE_CREATE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// Buckets cover 5s → 20min so we can tell apart "fast bootstrap",
 /// "slow but successful", and "hit the install timeout".
 ///
-/// **Currently registered but not observed**: needs a
-/// `status.bootstrapStartedAt` field on `ClusterInstanceStatus` to
-/// compute duration precisely; `state_since` is reused across many
-/// transitions and gives a wrong answer. Tracked as follow-up —
-/// declared now so alerts can reference it without churn.
+/// Observed from the durable `status.bootstrapStartedAt` timestamp at
+/// bootstrap success or failure. `stateSince` is deliberately not used: it
+/// also includes unrelated control-plane readiness time.
 pub static INSTANCE_BOOTSTRAP_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "kobe_instance_bootstrap_duration_seconds",
@@ -209,12 +236,8 @@ pub static INSTANCE_BOOTSTRAP_DURATION: LazyLock<HistogramVec> = LazyLock::new(|
 /// Buckets sub-second to 5s; reconciles past 5s usually mean a kube
 /// API call timed out and we want the +Inf bucket to count those.
 ///
-/// **Currently registered but not observed**: instrumenting
-/// `reconcile_profile` cleanly requires either inner-function
-/// extraction (function is ~250 lines, scope blew up) or a
-/// procedural-macro wrapper. Tracked as follow-up — the metric is
-/// declared so dashboards / alerts can reference it without churn
-/// when the observer lands.
+/// Observed by an RAII timer in `reconcile_profile`; early `?` returns are
+/// recorded as `outcome="error"`, while successful reconciles are `ok`.
 pub static POOL_RECONCILE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "kobe_pool_reconcile_duration_seconds",
@@ -997,14 +1020,14 @@ impl LeaseUnsatisfiableReason {
     }
 }
 
-/// A lease could not be satisfied at request time (503 pre-flight) or remained
-/// unbound in the controller's no-Ready-cluster branch, keyed by the bounded
-/// [`LeaseUnsatisfiableReason`]. Makes a pool that "can never satisfy a lease"
-/// visible instead of leaving the lease hung in `Pending` forever.
+/// Unsatisfiable demand events: a request-time 503 pre-flight rejection, or a
+/// Pending lease entering an unsatisfiable condition / changing reason. The
+/// controller path is edge-triggered, so its ~5s requeue does not inflate the
+/// counter. Keyed by the bounded [`LeaseUnsatisfiableReason`].
 pub static LEASE_UNSATISFIABLE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "kobe_lease_unsatisfiable_total",
-        "Leases that could not be satisfied, by profile and reason",
+        "Unsatisfiable demand events, by profile and reason",
         &["profile", "reason"]
     )
     .unwrap()
@@ -1092,12 +1115,8 @@ pub static IPAM_POOL_CAPACITY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// Number of `CIDRClaim`s currently `Bound`. Pair with
 /// `kobe_ipam_pool_capacity` for fill-ratio alerts.
 ///
-/// **Currently registered but not observed**: needs a periodic gauge
-/// sync against the live claim inventory. The IPAM controller's
-/// per-claim reconciles increment counters but don't have visibility
-/// into the global Bound count without an extra API call. Defer to a
-/// follow-up that adds a periodic sync sweep (similar to
-/// `sync_cluster_instance_statuses` in profile.rs).
+/// Updated by the `/metrics` inventory sweep, which already performs live API
+/// reads to avoid exporting stale per-replica inventory.
 pub static IPAM_POOL_ALLOCATED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "kobe_ipam_pool_allocated",
@@ -1305,7 +1324,7 @@ pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
 
 /// RAII timer for histograms with a 3-axis `[label1, label2, outcome]`
 /// shape. The outcome is decided at drop time via [`Timer::finish`];
-/// dropping without calling `finish()` records `outcome="aborted"`
+/// dropping without calling `finish()` records `outcome="error"`
 /// (the most common cause is a panic or `?` early-return through the
 /// Timer's lifetime, which is exactly what we want to count).
 ///
@@ -1317,13 +1336,6 @@ pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
 /// timer.finish(InstanceCreateOutcome::Ready.as_str());
 /// ```
 ///
-/// Currently unused — the in-tree call sites instrument by computing
-/// elapsed-from-creation_timestamp at terminal transitions, which
-/// works without RAII. `Timer` is kept for the upcoming
-/// `POOL_RECONCILE_DURATION` instrumentation (where elapsed-from-
-/// creation_timestamp doesn't apply because reconcile isn't an
-/// object lifecycle).
-#[allow(dead_code)]
 pub struct Timer<'a, const N: usize> {
     histogram: &'a HistogramVec,
     base_labels: [&'a str; N],
@@ -1331,7 +1343,6 @@ pub struct Timer<'a, const N: usize> {
     finished: bool,
 }
 
-#[allow(dead_code)]
 impl<'a, const N: usize> Timer<'a, N> {
     pub fn start(histogram: &'a HistogramVec, base_labels: [&'a str; N]) -> Self {
         Self {
@@ -1358,7 +1369,7 @@ impl<'a, const N: usize> Timer<'a, N> {
 impl<const N: usize> Drop for Timer<'_, N> {
     fn drop(&mut self) {
         if !self.finished {
-            self.observe("aborted");
+            self.observe("error");
         }
     }
 }
@@ -1385,6 +1396,8 @@ pub fn init() {
     LazyLock::force(&CLAIMS_TOTAL);
     LazyLock::force(&CLAIM_BIND_DURATION);
     LazyLock::force(&QUEUE_DEPTH);
+    LazyLock::force(&LEASE_OLDEST_PENDING_AGE_SECONDS);
+    LazyLock::force(&INSTANCE_OLDEST_CREATING_AGE_SECONDS);
     LazyLock::force(&HEALTH_CHECKS_TOTAL);
     LazyLock::force(&RECONCILIATIONS_TOTAL);
     LazyLock::force(&PROVISION_METHOD);
@@ -1525,6 +1538,34 @@ mod tests {
         assert!(
             output.contains("test-profile"),
             "gather() should contain the label value 'test-profile' after increment"
+        );
+    }
+
+    /// A reconcile that exits normally records `ok`; an early return that
+    /// drops its timer records `error`, so slow failures do not disappear.
+    #[test]
+    fn timer_records_finished_and_error_paths() {
+        let profile = "_timer_test";
+        let ok_before = POOL_RECONCILE_DURATION
+            .with_label_values(&[profile, "ok"])
+            .get_sample_count();
+        Timer::start(&POOL_RECONCILE_DURATION, [profile]).finish("ok");
+        assert_eq!(
+            POOL_RECONCILE_DURATION
+                .with_label_values(&[profile, "ok"])
+                .get_sample_count(),
+            ok_before + 1
+        );
+
+        let error_before = POOL_RECONCILE_DURATION
+            .with_label_values(&[profile, "error"])
+            .get_sample_count();
+        drop(Timer::start(&POOL_RECONCILE_DURATION, [profile]));
+        assert_eq!(
+            POOL_RECONCILE_DURATION
+                .with_label_values(&[profile, "error"])
+                .get_sample_count(),
+            error_before + 1
         );
     }
 

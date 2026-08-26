@@ -6,7 +6,9 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// Initialize the tracing subscriber with optional OpenTelemetry export.
 ///
 /// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, spans are exported via OTLP gRPC.
-/// When unset, only the fmt/JSON layer is active (current behavior preserved).
+/// The Helm chart exposes this through `telemetry.otlp`; `OTEL_SERVICE_NAME`
+/// and standard OpenTelemetry resource attributes distinguish deployments in
+/// a shared backend. When unset, only the fmt/JSON layer is active.
 ///
 /// Returns the tracer provider handle for graceful shutdown (flush on drop).
 pub fn init() -> Result<Option<SdkTracerProvider>> {

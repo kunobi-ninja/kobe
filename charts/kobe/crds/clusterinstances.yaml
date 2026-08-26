@@ -771,6 +771,16 @@ spec:
                 - lease
                 - pool
                 type: object
+              bootstrapStartedAt:
+                description: |-
+                  When the currently active bootstrap was first observed, in RFC3339.
+
+                  Retained after completion as lifecycle evidence; a later bootstrap
+                  overwrites it when `activeBootstrap` changes. `None` is omitted so a
+                  profile-controller status patch cannot erase an instance-controller
+                  timestamp in a Merge Patch race.
+                nullable: true
+                type: string
               bootstrapped:
                 default: false
                 description: Whether all configured bootstrap steps have completed successfully.

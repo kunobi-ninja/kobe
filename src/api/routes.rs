@@ -25,8 +25,8 @@ use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{
-    ClusterLease, ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase,
-    Requester,
+    CIDRClaim, CIDRClaimPhase, ClusterInstance, ClusterInstancePhase, ClusterLease,
+    ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase, Requester,
 };
 use crate::lease_binding::{BindingResolutionError, BindingResolveMode, resolve_lease_binding};
 use crate::metrics;
@@ -2627,11 +2627,50 @@ async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) ->
         }
     };
 
+    let leases_api: Api<ClusterLease> = Api::namespaced(state.client.clone(), &state.namespace);
+    let leases = match leases_api.list(&ListParams::default()).await {
+        Ok(leases) => leases,
+        Err(e) => {
+            tracing::warn!("Failed to list leases for metrics endpoint: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "failed to list leases").into_response();
+        }
+    };
+
+    let instances_api: Api<ClusterInstance> =
+        Api::namespaced(state.client.clone(), &state.namespace);
+    let instances = match instances_api.list(&ListParams::default()).await {
+        Ok(instances) => instances,
+        Err(e) => {
+            tracing::warn!("Failed to list instances for metrics endpoint: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "failed to list instances").into_response();
+        }
+    };
+
+    let claims_api: Api<CIDRClaim> = Api::namespaced(state.client.clone(), &state.namespace);
+    let claims = match claims_api.list(&ListParams::default()).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            tracing::warn!("Failed to list CIDR claims for metrics endpoint: {e}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "failed to list CIDR claims",
+            )
+                .into_response();
+        }
+    };
+
     metrics::POOL_CLUSTERS.reset();
     metrics::QUEUE_DEPTH.reset();
+    metrics::LEASE_OLDEST_PENDING_AGE_SECONDS.reset();
+    metrics::INSTANCE_OLDEST_CREATING_AGE_SECONDS.reset();
+
+    let mut oldest_pending = std::collections::HashMap::<String, i64>::new();
+    let mut oldest_creating = std::collections::HashMap::<String, i64>::new();
 
     for profile in profiles.iter() {
         let name = profile.name_any();
+        oldest_pending.insert(name.clone(), 0);
+        oldest_creating.insert(name.clone(), 0);
         let status = profile.status.clone().unwrap_or_default();
         metrics::POOL_CLUSTERS
             .with_label_values(&[name.as_str(), "creating"])
@@ -2652,6 +2691,66 @@ async fn metrics_handler<B: ClusterBackend>(State(state): State<AppState<B>>) ->
             .with_label_values(&[name.as_str()])
             .set(status.queue_depth as i64);
     }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for lease in leases.iter() {
+        if lease.status.as_ref().map(|s| &s.phase) != Some(&LeasePhase::Pending) {
+            continue;
+        }
+        let age = lease
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|ts| ((now_ms - ts.0.as_millisecond()).max(0)) / 1000)
+            .unwrap_or(0);
+        oldest_pending
+            .entry(lease.spec.pool_ref.clone())
+            .and_modify(|current| *current = (*current).max(age))
+            .or_insert(age);
+    }
+
+    for instance in instances.iter() {
+        let Some(status) = instance.status.as_ref() else {
+            continue;
+        };
+        if status.phase != ClusterInstancePhase::Creating {
+            continue;
+        }
+        let age = metrics::elapsed_secs_since_rfc3339(status.state_since.as_deref())
+            .unwrap_or(0.0)
+            .floor() as i64;
+        let profile = instance
+            .spec
+            .pool_ref
+            .as_ref()
+            .map(|reference| reference.name.clone())
+            .unwrap_or_else(|| "standalone".to_string());
+        oldest_creating
+            .entry(profile)
+            .and_modify(|current| *current = (*current).max(age))
+            .or_insert(age);
+    }
+
+    for (profile, age) in oldest_pending {
+        metrics::LEASE_OLDEST_PENDING_AGE_SECONDS
+            .with_label_values(&[profile.as_str()])
+            .set(age);
+    }
+    for (profile, age) in oldest_creating {
+        metrics::INSTANCE_OLDEST_CREATING_AGE_SECONDS
+            .with_label_values(&[profile.as_str()])
+            .set(age);
+    }
+
+    let allocated = claims
+        .iter()
+        .filter(|claim| {
+            claim.status.as_ref().map(|status| &status.phase) == Some(&CIDRClaimPhase::Bound)
+        })
+        .count() as i64;
+    metrics::IPAM_POOL_ALLOCATED
+        .with_label_values(&[] as &[&str])
+        .set(allocated);
 
     let body = metrics::gather();
     (
@@ -3657,6 +3756,15 @@ mod tests {
             .and(path_regex(
                 "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/clusterpools",
             ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![exact_connect_pool_json()]),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/(clusterleases|clusterinstances|cidrclaims)",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(&empty_list))
             .mount(&server)
             .await;
@@ -3680,6 +3788,97 @@ mod tests {
             ct.contains("text/plain"),
             "Expected text/plain content-type, got: {ct}"
         );
+
+        let body = response_text(resp).await;
+        assert!(body.contains("kobe_ipam_pool_allocated 0"));
+        assert!(body.contains("kobe_lease_oldest_pending_age_seconds"));
+        assert!(body.contains("kobe_instance_oldest_creating_age_seconds"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_exports_live_ages_and_ipam_occupancy() {
+        let (app, server) = test_app().await;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let two_minutes_ago = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        let lists = [
+            (
+                "clusterpools",
+                crate::testutil::k8s_list_response(vec![exact_connect_pool_json()]),
+            ),
+            (
+                "clusterleases",
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterLease",
+                    "metadata": { "name": "lease-waiting", "namespace": "test-ns", "creationTimestamp": two_minutes_ago },
+                    "spec": {
+                        "poolRef": "ci-small",
+                        "ttl": "1h",
+                        "requester": { "type": "test:ci", "identity": "test" }
+                    },
+                    "status": { "phase": "Pending" }
+                })]),
+            ),
+            (
+                "clusterinstances",
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterInstance",
+                    "metadata": { "name": "ci-small-0", "namespace": "test-ns" },
+                    "spec": { "poolRef": { "name": "ci-small" } },
+                    "status": { "phase": "Creating", "stateSince": two_minutes_ago }
+                })]),
+            ),
+            (
+                "cidrclaims",
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "CIDRClaim",
+                    "metadata": { "name": "ci-small-0", "namespace": "test-ns" },
+                    "spec": {},
+                    "status": { "phase": "Bound" }
+                })]),
+            ),
+        ];
+        for (resource, response) in lists {
+            Mock::given(method("GET"))
+                .and(path_regex(format!(
+                    "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/.*/{resource}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .mount(&server)
+                .await;
+        }
+
+        let resp = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_text(resp).await;
+
+        let value = |series: &str| -> f64 {
+            body.lines()
+                .find(|line| line.starts_with(series))
+                .and_then(|line| line.rsplit_once(' '))
+                .and_then(|(_, value)| value.parse().ok())
+                .unwrap_or_else(|| panic!("missing metric series {series}"))
+        };
+        assert_eq!(value("kobe_ipam_pool_allocated"), 1.0);
+        for series in [
+            "kobe_lease_oldest_pending_age_seconds{profile=\"ci-small\"}",
+            "kobe_instance_oldest_creating_age_seconds{profile=\"ci-small\"}",
+        ] {
+            let age = value(series);
+            assert!((119.0..=122.0).contains(&age), "unexpected age {age}");
+        }
     }
 
     #[tokio::test]

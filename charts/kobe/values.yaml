@@ -125,6 +125,16 @@ signoz:
   path: /metrics
   # port: defaults to service.port (the http port serving /metrics)
 
+# Distributed tracing via OTLP/gRPC. Metrics continue to use the annotated
+# /metrics scrape above; set endpoint only when an OTLP collector is reachable.
+telemetry:
+  otlp:
+    endpoint: "" # e.g. http://signoz-otel-collector.signoz:4317
+    serviceName: kobe-operator
+    # Comma-separated OpenTelemetry resource attributes, for example:
+    # deployment.environment.name=production,k8s.cluster.name=zur1-worker1
+    resourceAttributes: ""
+
 # Prometheus-Operator ServiceMonitor. Only useful on clusters that actually run
 # a Prometheus selecting it; our SigNoz clusters use the `signoz.*` annotations
 # above instead, so leave this disabled there.
