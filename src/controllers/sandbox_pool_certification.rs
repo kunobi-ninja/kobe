@@ -633,32 +633,30 @@ async fn reference_absent(
 /// Read the recorded teardown fence and return `(uid, resourceVersion)` after
 /// enforcing its exact checkpointed identity. The fence must not be deleting;
 /// the caller decides what its finalizer set must be.
+/// Read the recorded teardown fence: `Ok(None)` when it is gone, the exact
+/// object when its UID matches, and fail-closed on a same-named replacement.
+///
+/// Deletion state is deliberately NOT an error here — the release and
+/// deletion arms run after mutated passes whose status transition was
+/// dropped, so a terminating or absent fence is their own already-converged
+/// write, and each caller judges that state for its phase.
 async fn read_fence_exact(
     fences: &Api<ConfigMap>,
     desired_fence: &ConfigMap,
     status: &SandboxPoolCertificationStatus,
-) -> Result<(String, String), String> {
+) -> Result<Option<ConfigMap>, String> {
     let recorded = status.teardown_fence.as_ref().ok_or_else(|| {
         "certification checkpoint has no exact teardown fence reference".to_string()
     })?;
-    let fence = fences
-        .get(desired_fence.name_any().as_str())
-        .await
-        .map_err(|error| format!("teardown fence lookup failed: {error}"))?;
-    if fence.metadata.deletion_timestamp.is_some()
-        || fence.uid().as_deref() != Some(recorded.uid.as_str())
-    {
-        return Err("same-named certification teardown fence is deleting or drifted".to_string());
+    let fence = match fences.get(desired_fence.name_any().as_str()).await {
+        Ok(fence) => fence,
+        Err(kube::Error::Api(response)) if response.code == 404 => return Ok(None),
+        Err(error) => return Err(format!("teardown fence lookup failed: {error}")),
+    };
+    if fence.uid().as_deref() != Some(recorded.uid.as_str()) {
+        return Err("same-named certification teardown fence is not the recorded object".into());
     }
-    let uid = fence
-        .uid()
-        .filter(|uid| !uid.is_empty())
-        .ok_or_else(|| "teardown fence has no UID".to_string())?;
-    let resource_version = fence
-        .resource_version()
-        .filter(|version| !version.is_empty())
-        .ok_or_else(|| "teardown fence has no resourceVersion".to_string())?;
-    Ok((uid, resource_version))
+    Ok(Some(fence))
 }
 
 /// Read one WarmPool status counter, treating an ABSENT field as zero.
@@ -2570,9 +2568,49 @@ async fn replenished_proves_and_releases_the_fence(
 
     let fences: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     let desired_fence = certification_fence(namespace, &status)?;
-    let fence = read_fence_exact(&fences, &desired_fence, &status).await?;
+    // A mutated pass drops the returned status, so the release write and its
+    // checkpoint are two passes: the re-run finds the finalizer already gone
+    // (or the fence already reaped) and persists the transition without
+    // writing again — the earlier "contended forever" wedge.
+    let released = |mut status: SandboxPoolCertificationStatus| {
+        status.phase = SandboxPoolCertificationPhase::FenceFinalizerRemoved;
+        status.message = None;
+        Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationReplenished",
+            "capacity restored on a fresh generation with only new UIDs; the exact teardown fence is released",
+        ))
+    };
+    let Some(fence) = read_fence_exact(&fences, &desired_fence, &status).await? else {
+        return released(status);
+    };
+    if fence
+        .metadata
+        .finalizers
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return released(status);
+    }
+    if fence.metadata.deletion_timestamp.is_some() {
+        // Deleting while still holding the finalizer is not this protocol's
+        // own write; keep the fail-closed posture.
+        return Ok(cleanup_blocked(
+            status,
+            ready,
+            "teardown fence is deleting while its finalizer is still held",
+        ));
+    }
+    let fence_uid = fence
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| "teardown fence has no UID".to_string())?;
     let patch = crate::controllers::lease::json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": fence.0 },
+        { "op": "test", "path": "/metadata/uid", "value": fence_uid },
         { "op": "test", "path": "/metadata/finalizers",
           "value": [TEARDOWN_FENCE_FINALIZER] },
         { "op": "replace", "path": "/metadata/finalizers", "value": [] }
@@ -2620,7 +2658,34 @@ async fn released_fence_is_deleted(
 ) -> Result<ManagementPoolCertificationProgress, String> {
     let fences: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     let desired_fence = certification_fence(namespace, &status)?;
-    let (fence_uid, resource_version) = read_fence_exact(&fences, &desired_fence, &status).await?;
+    // Converge when a dropped mutated pass already deleted it: an absent or
+    // terminating fence is this arm's own completed write.
+    let deleted = |mut status: SandboxPoolCertificationStatus| {
+        status.phase = SandboxPoolCertificationPhase::FenceDeleting;
+        status.message = None;
+        Ok(progress(
+            status,
+            ready,
+            false,
+            false,
+            "CertificationFenceDeleting",
+            "the released teardown fence is already deleting; absence confirms the next pass",
+        ))
+    };
+    let Some(fence) = read_fence_exact(&fences, &desired_fence, &status).await? else {
+        return deleted(status);
+    };
+    if fence.metadata.deletion_timestamp.is_some() {
+        return deleted(status);
+    }
+    let fence_uid = fence
+        .uid()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| "teardown fence has no UID".to_string())?;
+    let resource_version = fence
+        .resource_version()
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| "teardown fence has no resourceVersion".to_string())?;
     let params = kube::api::DeleteParams {
         preconditions: Some(kube::api::Preconditions {
             uid: Some(fence_uid),
@@ -2677,11 +2742,14 @@ async fn deleted_fence_completes_certification(
             status.certified_at = Some(chrono::Utc::now().to_rfc3339());
             status.phase = SandboxPoolCertificationPhase::Certified;
             status.message = None;
+            // No write happened on this pass — flagging it mutated would drop
+            // this very transition on the outer requeue, so Certified could
+            // never persist.
             Ok(progress(
                 status,
                 ready,
                 true,
-                true,
+                false,
                 "Certified",
                 "current-generation exact pool certification receipt is complete",
             ))
@@ -3695,6 +3763,125 @@ mod tests {
             SandboxPoolCertificationPhase::Certified
         );
         assert!(progress.status.certified_at.is_some());
+        assert!(
+            !progress.mutated,
+            "the absence proof writes nothing; a mutated flag here would drop \
+             the Certified transition on every pass"
+        );
+    }
+
+    /// A mutated pass drops the arm's returned status, so the fence release
+    /// and deletion arms re-run after their writes landed. Each re-run must
+    /// persist its phase transition without writing again, or the tail of the
+    /// protocol retries its own completed work forever — the live
+    /// CertificationFenceReleaseContended wedge.
+    #[tokio::test]
+    async fn fence_tail_reruns_converge_without_rewriting() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let fence_name = format!("kobe-cert-fence-{}", &"a".repeat(64)[..40]);
+        let fence_path = format!("/api/v1/namespaces/kobe-system/configmaps/{fence_name}");
+        // Deletion-arm re-run: the fence is already gone.
+        Mock::given(method("GET"))
+            .and(path(fence_path.clone()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure",
+                "reason":"NotFound","code":404
+            })))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = released_fence_is_deleted(
+            &client,
+            "kobe-system",
+            certification_status(SandboxPoolCertificationPhase::FenceFinalizerRemoved),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::FenceDeleting
+        );
+        assert!(!progress.mutated);
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "DELETE"),
+            "an absent fence must not be deleted again"
+        );
+
+        // Release-arm re-run: the finalizer is already gone.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxwarmpools/cert-sandboxwarmpool",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut replenished = certification_warm_pool();
+                replenished["metadata"]["generation"] = serde_json::json!(9);
+                replenished["status"]["observedGeneration"] = serde_json::json!(9);
+                replenished
+            }))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/kobe-system/sandboxes",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "agents.x-k8s.io/v1beta1",
+                "kind": "SandboxList",
+                "metadata": {},
+                "items": [{
+                    "apiVersion": "agents.x-k8s.io/v1beta1",
+                    "kind": "Sandbox",
+                    "metadata": { "name": "fresh", "namespace": "kobe-system", "uid": "fresh-uid" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(fence_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": fence_name, "namespace": "kobe-system",
+                    "uid": "fence-uid", "resourceVersion": "7"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = crate::testutil::mock_k8s_client(&server);
+
+        let progress = replenished_proves_and_releases_the_fence(
+            &client,
+            "kobe-system",
+            1,
+            certification_status(SandboxPoolCertificationPhase::Replenished),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress.status.phase,
+            SandboxPoolCertificationPhase::FenceFinalizerRemoved
+        );
+        assert!(!progress.mutated);
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "PATCH"),
+            "an already-released fence must not be patched again"
+        );
     }
 
     #[tokio::test]
