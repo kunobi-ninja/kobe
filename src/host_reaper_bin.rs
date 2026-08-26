@@ -24,6 +24,7 @@ mod reaper;
 use clap::Parser;
 use kube::Client;
 use reaper::{
+    cgroups::reap_empty_container_cgroups,
     sweep::{SweepParams, sweep_once},
     unmount::LibcUnmount,
 };
@@ -53,6 +54,14 @@ struct Args {
     /// Don't touch entries newer than this.
     #[arg(long, value_parser = parse_duration, default_value = "120s")]
     mtime_skip: Duration,
+
+    /// Host cgroup-v2 container root to clean. Omit to disable cgroup cleanup.
+    #[arg(long)]
+    cgroup_root: Option<PathBuf>,
+
+    /// Don't touch empty container cgroups newer than this.
+    #[arg(long, value_parser = parse_duration, default_value = "5m")]
+    cgroup_mtime_skip: Duration,
 
     /// Log what would happen, don't act.
     #[arg(long, default_value_t = false)]
@@ -101,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
         live_set_path = ?args.live_set_path,
         reconcile_interval_secs = args.reconcile_interval.as_secs(),
         mtime_skip_secs = args.mtime_skip.as_secs(),
+        cgroup_root = ?args.cgroup_root,
+        cgroup_mtime_skip_secs = args.cgroup_mtime_skip.as_secs(),
         dry_run = args.dry_run,
         one_shot = args.one_shot,
         "kobe-host-reaper starting"
@@ -125,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     let skip_get = std::env::var("KOBE_REAPER_SKIP_GET").as_deref() == Ok("1");
 
     loop {
-        match sweep_once(
+        let lease_cleaned = match sweep_once(
             &client,
             &unmounter,
             &SweepParams {
@@ -139,9 +150,29 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(n) if n > 0 => info!(cleaned = n, "sweep tick done"),
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "sweep tick failed"),
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "lease-root sweep tick failed");
+                0
+            }
+        };
+        let cgroups_cleaned = match args.cgroup_root.as_deref() {
+            Some(root) => match reap_empty_container_cgroups(
+                root,
+                std::time::SystemTime::now(),
+                args.cgroup_mtime_skip,
+                args.dry_run,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = %e, "container cgroup sweep tick failed");
+                    0
+                }
+            },
+            None => 0,
+        };
+        if lease_cleaned > 0 || cgroups_cleaned > 0 {
+            info!(lease_cleaned, cgroups_cleaned, "sweep tick done");
         }
         if args.one_shot {
             break;

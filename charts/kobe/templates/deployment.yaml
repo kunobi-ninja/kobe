@@ -83,6 +83,16 @@ spec:
               value: "0.0.0.0:{{ .Values.service.port }}"
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- if .Values.telemetry.otlp.endpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otlp.endpoint | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.telemetry.otlp.serviceName | quote }}
+            {{- if .Values.telemetry.otlp.resourceAttributes }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ .Values.telemetry.otlp.resourceAttributes | quote }}
+            {{- end }}
+            {{- end }}
             - name: KOBE_SYNC_IMAGE
               value: {{ include "kobe.syncImage" . | quote }}
             # External mode performs read-only compatibility checks against an

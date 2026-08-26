@@ -37,6 +37,10 @@ spec:
             - --live-set-path=/etc/kobe/live/instances
             - --reconcile-interval={{ .Values.hostReaper.reconcileInterval }}
             - --mtime-skip={{ .Values.hostReaper.mtimeSkip }}
+            {{- if .Values.hostReaper.cgroupCleanup.enabled }}
+            - --cgroup-root=/host-cgroup/k8s.io
+            - --cgroup-mtime-skip={{ .Values.hostReaper.cgroupCleanup.mtimeSkip }}
+            {{- end }}
             {{- if .Values.hostReaper.dryRun }}
             - --dry-run
             {{- end }}
@@ -64,6 +68,10 @@ spec:
             - name: live-set
               mountPath: /etc/kobe/live
               readOnly: true
+            {{- if .Values.hostReaper.cgroupCleanup.enabled }}
+            - name: host-cgroup
+              mountPath: /host-cgroup
+            {{- end }}
       volumes:
         - name: lease-root
           hostPath:
@@ -72,4 +80,10 @@ spec:
         - name: live-set
           configMap:
             name: kobe-live-instances
+        {{- if .Values.hostReaper.cgroupCleanup.enabled }}
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        {{- end }}
 {{- end }}

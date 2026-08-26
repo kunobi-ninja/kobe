@@ -318,6 +318,15 @@ pub struct ClusterInstanceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_bootstrap: Option<String>,
 
+    /// When the currently active bootstrap was first observed, in RFC3339.
+    ///
+    /// Retained after completion as lifecycle evidence; a later bootstrap
+    /// overwrites it when `activeBootstrap` changes. `None` is omitted so a
+    /// profile-controller status patch cannot erase an instance-controller
+    /// timestamp in a Merge Patch race.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_started_at: Option<String>,
+
     /// When the instance became idle and eligible for scale-down.
     ///
     /// Intentionally NO `skip_serializing_if` (same reasoning as `lease_ref`):
@@ -567,6 +576,7 @@ mod tests {
             }),
             binding: None,
             active_bootstrap: Some("flux".into()),
+            bootstrap_started_at: Some("2026-01-02T03:03:00Z".into()),
             idle_since: Some("2026-01-02T03:04:05Z".into()),
             state_since: Some("2026-01-02T03:04:06Z".into()),
             health_failures: 3,
@@ -626,7 +636,8 @@ mod tests {
         }
     }
 
-    /// `spec_hash`, `created_with`, `message` and `active_bootstrap` are
+    /// `spec_hash`, `created_with`, `message`, `active_bootstrap` and
+    /// `bootstrap_started_at` are
     /// owned by another writer (the profile controller) or are purely
     /// informational. The instance controller round-trips them through
     /// every status patch, so a `None` MUST be omitted — emitting
@@ -643,6 +654,7 @@ mod tests {
             "binding",
             "message",
             "activeBootstrap",
+            "bootstrapStartedAt",
             "network",
         ] {
             assert!(
@@ -687,6 +699,7 @@ mod tests {
             keys,
             vec![
                 "activeBootstrap",
+                "bootstrapStartedAt",
                 "bootstrapped",
                 "conditions",
                 "createdWith",

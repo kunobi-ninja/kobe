@@ -111,6 +111,26 @@ fn observe_instance_create(
         .inc();
 }
 
+/// Record one terminal bootstrap duration from the durable activation
+/// timestamp. Missing fields mean no bootstrap was active (or the object
+/// predates this telemetry), so no misleading zero-duration sample is emitted.
+fn observe_instance_bootstrap(
+    instance: &ClusterInstance,
+    status: &ClusterInstanceStatus,
+    outcome: crate::metrics::InstanceCreateOutcome,
+) {
+    let (Some(bootstrap), Some(elapsed)) = (
+        status.active_bootstrap.as_deref(),
+        crate::metrics::elapsed_secs_since_rfc3339(status.bootstrap_started_at.as_deref()),
+    ) else {
+        return;
+    };
+
+    crate::metrics::INSTANCE_BOOTSTRAP_DURATION
+        .with_label_values(&[profile_label(instance), bootstrap, outcome.as_str()])
+        .observe(elapsed);
+}
+
 /// Increment the recycle counter with a typed reason. The Recycling
 /// transition itself is performed by the caller; this only records
 /// the metric.
@@ -568,6 +588,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 lease_ref: status.lease_ref.clone(),
                                 binding: status.binding.clone(),
                                 active_bootstrap: None,
+                                bootstrap_started_at: status.bootstrap_started_at.clone(),
                                 idle_since: status.idle_since.clone(),
                                 state_since: Some(chrono::Utc::now().to_rfc3339()),
                                 health_failures: status.health_failures,
@@ -715,6 +736,16 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
             if ready {
                 match reconcile_instance_bootstraps(&ctx, &config, &instance, &name, &ns).await {
                     Ok(Some(active_bootstrap)) => {
+                        let bootstrap_started_at = if status.active_bootstrap.as_deref()
+                            == Some(active_bootstrap.as_str())
+                        {
+                            status
+                                .bootstrap_started_at
+                                .clone()
+                                .or_else(|| Some(chrono::Utc::now().to_rfc3339()))
+                        } else {
+                            Some(chrono::Utc::now().to_rfc3339())
+                        };
                         let message = Some(format!("running bootstrap '{active_bootstrap}'"));
                         patch_instance_status(
                             &instances_api,
@@ -725,6 +756,7 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                                 bootstrapped: false,
                                 lease_ref: status.lease_ref,
                                 active_bootstrap: Some(active_bootstrap),
+                                bootstrap_started_at,
                                 idle_since: None,
                                 state_since: status.state_since,
                                 health_failures: 0,
@@ -737,6 +769,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         Ok(Action::requeue(std::time::Duration::from_secs(5)))
                     }
                     Ok(None) => {
+                        observe_instance_bootstrap(
+                            &instance,
+                            &status,
+                            crate::metrics::InstanceCreateOutcome::Ready,
+                        );
                         observe_instance_create(
                             &instance,
                             &config.backend.backend_type,
@@ -768,6 +805,11 @@ async fn reconcile_instance<B: ClusterBackend + Clone + 'static>(
                         observe_instance_create(
                             &instance,
                             &config.backend.backend_type,
+                            crate::metrics::InstanceCreateOutcome::Failed,
+                        );
+                        observe_instance_bootstrap(
+                            &instance,
+                            &status,
                             crate::metrics::InstanceCreateOutcome::Failed,
                         );
                         // Bootstrap-specific counter so an alert can
@@ -3951,6 +3993,44 @@ mod tests {
             message: Some("hello".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn bootstrap_duration_records_only_durable_active_bootstraps() {
+        let instance =
+            standalone_instance("bootstrap-metric", ClusterInstancePhase::Creating, true, 0);
+        let mut status = ClusterInstanceStatus {
+            active_bootstrap: Some("flux".into()),
+            bootstrap_started_at: Some(
+                (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
+            ),
+            ..Default::default()
+        };
+        let metric = crate::metrics::INSTANCE_BOOTSTRAP_DURATION.with_label_values(&[
+            "standalone",
+            "flux",
+            "ready",
+        ]);
+        let before = metric.get_sample_count();
+
+        observe_instance_bootstrap(
+            &instance,
+            &status,
+            crate::metrics::InstanceCreateOutcome::Ready,
+        );
+        assert_eq!(metric.get_sample_count(), before + 1);
+
+        status.bootstrap_started_at = None;
+        observe_instance_bootstrap(
+            &instance,
+            &status,
+            crate::metrics::InstanceCreateOutcome::Ready,
+        );
+        assert_eq!(
+            metric.get_sample_count(),
+            before + 1,
+            "missing durable start time must not emit a fake zero-duration sample"
+        );
     }
 
     #[test]

@@ -994,6 +994,11 @@ async fn reconcile_profile(
     ctx: Arc<ProfileContext>,
 ) -> Result<Action, ProfileError> {
     let name = profile.name_any();
+    // The timer's Drop records `error` for every early `?` return. Keeping
+    // it here makes the full reconcile path observable without manually
+    // instrumenting each exit.
+    let reconcile_timer =
+        crate::metrics::Timer::start(&crate::metrics::POOL_RECONCILE_DURATION, [name.as_str()]);
     let ns = profile.namespace().unwrap_or_else(|| ctx.namespace.clone());
 
     info!(profile = %name, "Reconciling profile");
@@ -1501,6 +1506,7 @@ async fn reconcile_profile(
     // persisted (signals snapshotted above before `backoff` was consumed).
     emit_pool_failure_metrics(&name, &pool_failure_signals);
 
+    reconcile_timer.finish("ok");
     Ok(Action::requeue(std::time::Duration::from_secs(30)))
 }
 

@@ -194,6 +194,16 @@ signoz:
   path: /metrics
   # port: defaults to service.port (the http port serving /metrics)
 
+# Distributed tracing via OTLP/gRPC. Metrics continue to use the annotated
+# /metrics scrape above; set endpoint only when an OTLP collector is reachable.
+telemetry:
+  otlp:
+    endpoint: "" # e.g. http://signoz-otel-collector.signoz:4317
+    serviceName: kobe-operator
+    # Comma-separated OpenTelemetry resource attributes, for example:
+    # deployment.environment.name=production,k8s.cluster.name=zur1-worker1
+    resourceAttributes: ""
+
 # Prometheus-Operator ServiceMonitor. Only useful on clusters that actually run
 # a Prometheus selecting it; our SigNoz clusters use the `signoz.*` annotations
 # above instead, so leave this disabled there.
@@ -399,6 +409,16 @@ hostReaper:
   leaseRoot: /var/lib/kobe/leases
   reconcileInterval: 30s
   mtimeSkip: 120s
+  # Nested privileged k3s members using the cgroupfs driver can leave empty
+  # `/sys/fs/cgroup/k8s.io/<container-id>` directories behind when recycled.
+  # Enough leaked directories exhaust the kernel cgroup hierarchy and prevent
+  # unrelated Pods from starting with `no space left on device`.
+  cgroupCleanup:
+    # Opt in only after the selected host-reaper image includes the cgroup
+    # cleanup flags. GitRepository consumers may reconcile chart changes from
+    # main while still pinning an older released image.
+    enabled: false
+    mtimeSkip: 5m
   dryRun: false
   # If true, the reaper container starts with KOBE_REAPER_DISABLE=1 set,
   # turning the sweep loop into a no-op (logs once per interval).
