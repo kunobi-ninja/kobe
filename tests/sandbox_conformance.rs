@@ -947,6 +947,12 @@ both_placements!(
         // Streaming operations use a real WebSocket handshake. A plain HTTP
         // GET could be rejected by Axum before Kobe resolves the lease and
         // would therefore prove nothing about tenant isolation.
+        //
+        // Exit 125, not 1: attach never passes a remote exit through (there
+        // is no remote command), and the CLI's contract reserves 125 for its
+        // own failures precisely so they cannot collide with a command's
+        // exit. The isolation property is carried by the REQUIRED 404 in the
+        // output — the denial must be indistinguishable from absence.
         let attach = harness(&[
             "attach-pty",
             "--target",
@@ -956,7 +962,7 @@ both_placements!(
             "--expect",
             "404",
             "--expect-exit",
-            "1",
+            "125",
             "--timeout",
             "30",
             "--",
