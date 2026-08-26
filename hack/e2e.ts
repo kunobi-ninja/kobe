@@ -1148,7 +1148,7 @@ ${placement}
       - name: workspace
         image: ${fixture.imageRef}
         command: ["/bin/sh", "-c"]
-        args: ["trap 'exit 0' TERM INT; while :; do sleep 3600; done"]
+        args: ["trap 'exit 0' TERM INT; while :; do sleep 1; done"]
         resources:
           requests:
             cpu: "50m"
@@ -1197,7 +1197,7 @@ spec:
         pools: ["${DEMO_SANDBOX_POOL_MANAGEMENT}", "${DEMO_SANDBOX_POOL_CHILD}"]
         verbs: ["lease", "exec", "logs", "port-forward", "release"]
         maxTtl: "20m"
-        maxConcurrentLeases: 4
+        maxConcurrentLeases: 8
         resourceCeiling:
           maxCpu: "1"
           maxMemory: "512Mi"
@@ -1245,7 +1245,7 @@ ${sandboxFixture ? `      sandbox:
         pools: ["${DEMO_SANDBOX_POOL_MANAGEMENT}", "${DEMO_SANDBOX_POOL_CHILD}"]
         verbs: ["lease", "exec", "logs", "port-forward", "release"]
         maxTtl: "20m"
-        maxConcurrentLeases: 4
+        maxConcurrentLeases: 8
         resourceCeiling:
           maxCpu: "1"
           maxMemory: "512Mi"
