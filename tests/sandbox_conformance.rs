@@ -369,13 +369,30 @@ struct LeasedSandbox {
 impl LeasedSandbox {
     async fn create(placement: Placement, ttl: &str) -> anyhow::Result<Self> {
         let api = Api::as_caller(token());
-        let (status, body) = api
-            .json(
-                reqwest::Method::POST,
-                "/v1/sandbox-leases",
-                Some(serde_json::json!({ "pool": pool_for(placement), "ttl": ttl })),
-            )
-            .await?;
+        // Quota is deliberately held until a released lease's teardown is
+        // VERIFIED, so scenarios queued back-to-back can momentarily meet the
+        // concurrency ceiling while earlier releases finish tearing down.
+        // Queue on the clean 429 rather than failing — a teardown that never
+        // frees its reservation still fails here, loudly, at the deadline.
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let (status, body) = loop {
+            let (status, body) = api
+                .json(
+                    reqwest::Method::POST,
+                    "/v1/sandbox-leases",
+                    Some(serde_json::json!({ "pool": pool_for(placement), "ttl": ttl })),
+                )
+                .await?;
+            if status.as_u16() != 429 {
+                break (status, body);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "sandbox quota never freed within 240s of queued creates; \
+                 an earlier release's teardown is holding its reservation: {body}"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
         anyhow::ensure!(
             status.is_success(),
             "could not create a sandbox: HTTP {status} {body}"
@@ -661,6 +678,11 @@ impl LeasedSandbox {
             "could not release: HTTP {status} {body}"
         );
         self.released = true;
+        // Deliberately NOT awaited to terminal cleanup: the revocation
+        // scenarios observe the mid-teardown window this call opens (the 409
+        // on a Releasing lease, the revoked attach stream), and quota freed
+        // by finished teardowns is `create`'s concern — it queues on the
+        // clean 429 until an earlier release's reservation drops.
         Ok(())
     }
 }
