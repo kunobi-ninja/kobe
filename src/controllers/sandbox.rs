@@ -406,14 +406,14 @@ struct WarmPoolObservation {
 /// deliberately drained and restored by the protocol itself, so the outer
 /// freshness and full-capacity gates describe states the protocol cannot be
 /// in — enforcing them starves the very arms that would leave the window.
-fn certification_protocol_in_flight(pool: &SandboxPool) -> bool {
+pub(crate) fn certification_protocol_in_flight(pool: &SandboxPool) -> bool {
     pool.status
         .as_ref()
         .and_then(|status| status.certification.as_ref())
         .is_some_and(|certification| certification_phase_is_in_flight(&certification.phase))
 }
 
-fn certification_phase_is_in_flight(
+pub(crate) fn certification_phase_is_in_flight(
     phase: &crate::crd::sandbox::SandboxPoolCertificationPhase,
 ) -> bool {
     use crate::crd::sandbox::SandboxPoolCertificationPhase as Phase;
@@ -517,7 +517,28 @@ async fn observe_management_pool(
         pool.spec.warm_capacity,
         Some(&owner),
     )?;
-    if warm_pool.data.get("spec") != desired_warm_pool.data.get("spec") {
+    // Between fence install and fence deletion the certification arms own
+    // `spec.replicas` (drain to zero, restore to capacity), so the exact
+    // comparison accepts the live value for that one field. Every other
+    // field must still match the Pool byte-for-byte.
+    let mut desired_spec = desired_warm_pool
+        .data
+        .get("spec")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if certification_protocol_in_flight(pool)
+        && let Some(desired_map) = desired_spec.as_object_mut()
+    {
+        match warm_pool.data.pointer("/spec/replicas").cloned() {
+            Some(live) => {
+                desired_map.insert("replicas".into(), live);
+            }
+            None => {
+                desired_map.remove("replicas");
+            }
+        }
+    }
+    if warm_pool.data.get("spec") != Some(&desired_spec) {
         return Err(SandboxPlacementError::Invalid(format!(
             "SandboxWarmPool {} spec does not match SandboxPool {}",
             warm_pool.name_any(),

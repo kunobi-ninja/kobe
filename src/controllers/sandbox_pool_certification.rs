@@ -251,7 +251,27 @@ fn validate_pool_objects(
     if template.data.get("spec") != desired_template.data.get("spec") {
         return Err("SandboxTemplate spec drifted from the current Pool generation".into());
     }
-    if warm_pool.data.get("spec") != desired_warm_pool.data.get("spec") {
+    // The protocol's own arms scale `spec.replicas` between fence install and
+    // fence deletion, so mid-protocol the exact comparison accepts the live
+    // value for that one field; everything else must still match.
+    let mut desired_warm_pool_spec = desired_warm_pool
+        .data
+        .get("spec")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if super::sandbox::certification_protocol_in_flight(pool)
+        && let Some(desired_map) = desired_warm_pool_spec.as_object_mut()
+    {
+        match warm_pool.data.pointer("/spec/replicas").cloned() {
+            Some(live) => {
+                desired_map.insert("replicas".into(), live);
+            }
+            None => {
+                desired_map.remove("replicas");
+            }
+        }
+    }
+    if warm_pool.data.get("spec") != Some(&desired_warm_pool_spec) {
         return Err("SandboxWarmPool spec drifted from the current Pool generation".into());
     }
     Ok((template_uid, warm_pool_uid))
@@ -2936,6 +2956,43 @@ mod tests {
             .unwrap_err()
             .contains("immutable lease provenance")
         );
+    }
+
+    /// The drain and restore arms scale `spec.replicas` themselves, so a
+    /// drained WarmPool mid-protocol is the protocol's own signature, not
+    /// drift. Outside the protocol the same state IS drift, and any other
+    /// field stays exact even mid-protocol.
+    #[test]
+    fn a_mid_protocol_drain_is_not_spec_drift() {
+        let mut pool = pool(1);
+        let owner = pool.controller_owner_ref(&()).unwrap();
+        let mut template =
+            build_sandbox_template("kobe-agents", "kobe-system", &pool.spec, Some(&owner)).unwrap();
+        template.metadata.uid = Some("template-uid".into());
+        template.metadata.generation = Some(2);
+        let mut warm_pool =
+            build_sandbox_warm_pool("kobe-agents", "kobe-system", "kobe-agents", 1, Some(&owner))
+                .unwrap();
+        warm_pool.metadata.uid = Some("warm-pool-uid".into());
+        warm_pool.metadata.generation = Some(3);
+        warm_pool.data["spec"]["replicas"] = serde_json::json!(0);
+
+        let error = validate_pool_objects(&pool, "kobe-system", &template, &warm_pool, None, None)
+            .unwrap_err();
+        assert!(error.contains("SandboxWarmPool spec drifted"), "{error}");
+
+        pool.status = Some(crate::crd::SandboxPoolStatus {
+            certification: Some(certification_status(
+                SandboxPoolCertificationPhase::DrainAcknowledged,
+            )),
+            ..Default::default()
+        });
+        validate_pool_objects(&pool, "kobe-system", &template, &warm_pool, None, None).unwrap();
+
+        warm_pool.data["spec"]["sandboxTemplateRef"] = serde_json::json!({ "name": "intruder" });
+        let error = validate_pool_objects(&pool, "kobe-system", &template, &warm_pool, None, None)
+            .unwrap_err();
+        assert!(error.contains("SandboxWarmPool spec drifted"), "{error}");
     }
 
     #[test]
