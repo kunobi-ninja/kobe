@@ -1583,8 +1583,8 @@ both_placements!(
             first["state"] == "Unknown"
                 && first["reason"] == "runner_forgot_execution"
                 && first["exitCode"].is_null()
-                && first["stdout"] == ""
-                && first["stderr"] == "",
+                && first.get("stdout").is_none()
+                && first.get("stderr").is_none(),
             "pre-target retry did not fail closed to the exact Unknown: {first}"
         );
         let (second_status, second) = sandbox.exec(&argv, KEY).await?;
