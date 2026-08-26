@@ -49,11 +49,19 @@ pub fn client_frame(channel: u8, payload: &[u8]) -> Message {
 }
 
 /// A terminal resize, as the server expects it.
-pub fn resize_frame(width: u16, height: u16) -> Message {
-    client_frame(
+///
+/// A newly allocated or minimized pseudo-terminal may temporarily report a
+/// zero dimension. The server correctly refuses that as not being a terminal,
+/// so the client must wait for the next usable size instead of ending its own
+/// session with a protocol violation.
+pub fn resize_frame(width: u16, height: u16) -> Option<Message> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(client_frame(
         CHANNEL_RESIZE,
         format!(r#"{{"width":{width},"height":{height}}}"#).as_bytes(),
-    )
+    ))
 }
 
 /// What an inbound frame turned out to be.
@@ -213,8 +221,11 @@ pub async fn attach(
     // The initial size, before anything is typed: a shell that starts thinking
     // the terminal is 80x24 renders its first prompt wrong, and no later
     // resize event will arrive to correct it if the window never changes.
-    if tty && let Ok((width, height)) = crossterm::terminal::size() {
-        socket.send(resize_frame(width, height)).await.ok();
+    if tty
+        && let Ok((width, height)) = crossterm::terminal::size()
+        && let Some(frame) = resize_frame(width, height)
+    {
+        socket.send(frame).await.ok();
     }
 
     let reason = pump_terminal(&mut socket, tty).await?;
@@ -302,7 +313,9 @@ async fn pump_terminal(socket: &mut Socket, tty: bool) -> Result<String> {
                     // window. Without it, resizing mid-session leaves a shell
                     // drawing to a width that no longer exists.
                     Event::Resize(width, height) => {
-                        socket.send(resize_frame(width, height)).await?;
+                        if let Some(frame) = resize_frame(width, height) {
+                            socket.send(frame).await?;
+                        }
                     }
                     _ => {}
                 }
@@ -523,11 +536,20 @@ mod tests {
         };
         assert_eq!(framed.as_ref(), &[CHANNEL_STDIN, b'h', b'i']);
 
-        let Message::Binary(resize) = resize_frame(120, 40) else {
+        let Some(Message::Binary(resize)) = resize_frame(120, 40) else {
             panic!("frames are binary");
         };
         assert_eq!(resize[0], CHANNEL_RESIZE);
         assert_eq!(&resize[1..], br#"{"width":120,"height":40}"#);
+    }
+
+    /// A transient zero-sized PTY must not make the client send a frame the
+    /// server is required to reject.
+    #[test]
+    fn zero_terminal_dimensions_are_not_sent() {
+        assert!(resize_frame(0, 24).is_none());
+        assert!(resize_frame(80, 0).is_none());
+        assert!(resize_frame(0, 0).is_none());
     }
 
     /// The client tolerates channels it does not know; the server does not.
