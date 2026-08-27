@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
+use kobe_state_machine::{
+    BindingState as ModelBindingState, FinalizationDecision, InstancePhase as ModelInstancePhase,
+    LeasePhase as ModelLeasePhase, exact_binding_finalization,
+};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher::Config;
@@ -1183,7 +1187,15 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
     {
         match backfill_legacy_binding(&ctx.client, &ns, &lease).await? {
             Some(binding) => {
-                let bound = finalize_binding(&ctx, &ns, &binding, created_at_for(&lease)).await?;
+                // Keep the retrying finalizer future off the already-large
+                // reconcile state machine's stack frame.
+                let bound = Box::pin(finalize_binding(
+                    &ctx,
+                    &ns,
+                    &binding,
+                    created_at_for(&lease),
+                ))
+                .await?;
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 return Ok(Action::requeue(std::time::Duration::from_secs(if bound {
                     60
@@ -1302,7 +1314,9 @@ async fn reconcile_lease<B: ClusterBackend + Clone + 'static>(
                 // write fails or the process stops, the next reconcile sees
                 // the same lease-side intent and finishes the same pair. It
                 // must not roll back on an uncertain response.
-                let bound = finalize_binding(&ctx, &ns, &binding, created_at).await?;
+                // Keep the retrying finalizer future off the already-large
+                // reconcile state machine's stack frame.
+                let bound = Box::pin(finalize_binding(&ctx, &ns, &binding, created_at)).await?;
                 remove_from_queue(&ctx.queues, &lease.spec.pool_ref, &name).await;
                 Ok(Action::requeue(std::time::Duration::from_secs(if bound {
                     60
@@ -2055,6 +2069,42 @@ async fn sandbox_composition_finalization_is_authorized<B: ClusterBackend>(
     }
 }
 
+const FINALIZE_BINDING_ATTEMPTS: usize = 3;
+
+fn model_lease_phase(phase: &LeasePhase) -> ModelLeasePhase {
+    match phase {
+        LeasePhase::Pending => ModelLeasePhase::Pending,
+        LeasePhase::Bound => ModelLeasePhase::Bound,
+        LeasePhase::Released => ModelLeasePhase::Released,
+        LeasePhase::Expired => ModelLeasePhase::Expired,
+        LeasePhase::Recycling => ModelLeasePhase::Recycling,
+        LeasePhase::Quarantined => ModelLeasePhase::Quarantined,
+    }
+}
+
+fn model_instance_phase(phase: &ClusterInstancePhase) -> ModelInstancePhase {
+    match phase {
+        ClusterInstancePhase::Creating => ModelInstancePhase::Creating,
+        ClusterInstancePhase::Ready => ModelInstancePhase::Ready,
+        ClusterInstancePhase::Leased => ModelInstancePhase::Leased,
+        ClusterInstancePhase::Recycling => ModelInstancePhase::Recycling,
+        ClusterInstancePhase::Unhealthy => ModelInstancePhase::Unhealthy,
+        ClusterInstancePhase::Failed => ModelInstancePhase::Failed,
+        ClusterInstancePhase::Quarantined => ModelInstancePhase::Quarantined,
+    }
+}
+
+fn model_binding_state(
+    observed: Option<&LeaseBinding>,
+    expected: &LeaseBinding,
+) -> ModelBindingState {
+    match observed {
+        Some(binding) if binding == expected => ModelBindingState::Expected,
+        None => ModelBindingState::Absent,
+        Some(_) => ModelBindingState::Foreign,
+    }
+}
+
 /// Complete a previously persisted two-sided reservation.
 ///
 /// Returns `true` only when `Bound` is already or successfully published. If a
@@ -2070,145 +2120,190 @@ async fn finalize_binding<B: ClusterBackend>(
     created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool, LeaseError> {
     let leases_api: Api<ClusterLease> = Api::namespaced(ctx.client.clone(), namespace);
-    let lease = leases_api.get(&binding.lease.name).await?;
-    if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref() {
-        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-            "lease UID changed while finalizing binding"
-        )));
-    }
-    let status = lease.status.clone().unwrap_or_default();
-    let already_bound =
-        status.phase == LeasePhase::Bound && status.binding.as_ref() == Some(binding);
-    if !already_bound
-        && (status.phase != LeasePhase::Pending || status.binding.as_ref() != Some(binding))
-    {
-        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-            "lease binding intent changed before finalization"
-        )));
-    }
-    if !sandbox_composition_finalization_is_authorized(
-        ctx,
-        namespace,
-        &leases_api,
-        &lease,
-        binding,
-        already_bound,
-    )
-    .await?
-    {
-        return Ok(false);
-    }
-
     let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), namespace);
-    let instance = instances.get(&binding.instance.name).await?;
-    if !instance_matches_binding_subject(&instance, binding)
-        || instance.status.as_ref().is_none_or(|status| {
-            status.phase != ClusterInstancePhase::Leased || status.binding.as_ref() != Some(binding)
-        })
-    {
-        return Err(LeaseError::Lifecycle(anyhow::anyhow!(
-            "instance reciprocal binding changed before finalization"
-        )));
-    }
-    validate_binding_eligibility(ctx.factory.as_ref(), namespace, &lease, &instance, binding)
-        .await
-        .map_err(LeaseError::Lifecycle)?;
-    if binding.cleanup_mode.requires_receipt() {
-        crate::api::connect::ensure_lease_connect_token(&ctx.client, namespace, &lease, binding)
+    for attempt in 1..=FINALIZE_BINDING_ATTEMPTS {
+        let lease = leases_api.get(&binding.lease.name).await?;
+        if lease.metadata.uid.as_deref() != binding.lease.uid.as_deref() {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "lease UID changed while finalizing binding"
+            )));
+        }
+        let status = lease.status.clone().unwrap_or_default();
+        let lease_binding_state = model_binding_state(status.binding.as_ref(), binding);
+        let already_bound =
+            status.phase == LeasePhase::Bound && lease_binding_state == ModelBindingState::Expected;
+        if !already_bound
+            && (status.phase != LeasePhase::Pending
+                || lease_binding_state != ModelBindingState::Expected)
+        {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "lease binding intent changed before finalization"
+            )));
+        }
+        if !sandbox_composition_finalization_is_authorized(
+            ctx,
+            namespace,
+            &leases_api,
+            &lease,
+            binding,
+            already_bound,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        let instance = instances.get(&binding.instance.name).await?;
+        if !instance_matches_binding_subject(&instance, binding) {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "instance reciprocal binding changed before finalization"
+            )));
+        }
+        let instance_status = instance.status.clone().unwrap_or_default();
+        let decision = exact_binding_finalization(
+            model_lease_phase(&status.phase),
+            model_binding_state(status.binding.as_ref(), binding),
+            model_instance_phase(&instance_status.phase),
+            model_binding_state(instance_status.binding.as_ref(), binding),
+        );
+        if decision == FinalizationDecision::Superseded {
+            return Err(LeaseError::Lifecycle(anyhow::anyhow!(
+                "exact reciprocal binding changed before finalization"
+            )));
+        }
+        debug_assert_eq!(
+            already_bound,
+            decision == FinalizationDecision::AlreadyBound
+        );
+        validate_binding_eligibility(ctx.factory.as_ref(), namespace, &lease, &instance, binding)
             .await
             .map_err(LeaseError::Lifecycle)?;
-    }
-    if already_bound {
-        return Ok(true);
-    }
+        if binding.cleanup_mode.requires_receipt() {
+            crate::api::connect::ensure_lease_connect_token(
+                &ctx.client,
+                namespace,
+                &lease,
+                binding,
+            )
+            .await
+            .map_err(LeaseError::Lifecycle)?;
+        }
+        if already_bound {
+            return Ok(true);
+        }
 
-    let lease_uid = binding
-        .lease
-        .uid
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("binding missing lease UID"))?;
-    let lease_rv = lease
-        .resource_version()
-        .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
-    let ttl = parse_duration(&lease.spec.ttl).unwrap_or_else(|| chrono::Duration::hours(1));
-    let now = chrono::Utc::now();
-    let expires_at = now + ttl;
-    let max_extensions = ctx
-        .authenticator
-        .policy_for_requester_type(&lease.spec.requester.requester_type)
-        .await
-        .map(|policy| policy.max_extensions)
-        .unwrap_or(2);
-    let mut new_status = ClusterLeaseStatus {
-        phase: LeasePhase::Bound,
-        cluster_name: Some(binding.instance.name.clone()),
-        binding: Some(binding.clone()),
-        bound_at: Some(now.to_rfc3339()),
-        expires_at: Some(expires_at.to_rfc3339()),
-        queue_position: 0,
-        diagnostics_url: None,
-        extensions_count: 0,
-        max_extensions,
-        message: None,
-        conditions: Vec::new(),
-        teardown_receipt: None,
-        teardown_evidence: None,
-        teardown_attempt_id: None,
-        connect_token_creation: status.connect_token_creation.clone(),
-        unbound_release_verified_at: None,
-        teardown_acknowledgement: None,
-    };
-    new_status.conditions =
-        derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
+        let lease_uid = binding
+            .lease
+            .uid
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("binding missing lease UID"))?;
+        let lease_rv = lease
+            .resource_version()
+            .ok_or_else(|| anyhow::anyhow!("lease missing resourceVersion"))?;
+        let ttl = parse_duration(&lease.spec.ttl).unwrap_or_else(|| chrono::Duration::hours(1));
+        let now = chrono::Utc::now();
+        let expires_at = now + ttl;
+        let max_extensions = ctx
+            .authenticator
+            .policy_for_requester_type(&lease.spec.requester.requester_type)
+            .await
+            .map(|policy| policy.max_extensions)
+            .unwrap_or(2);
+        let mut new_status = ClusterLeaseStatus {
+            phase: LeasePhase::Bound,
+            cluster_name: Some(binding.instance.name.clone()),
+            binding: Some(binding.clone()),
+            bound_at: Some(now.to_rfc3339()),
+            expires_at: Some(expires_at.to_rfc3339()),
+            queue_position: 0,
+            diagnostics_url: None,
+            extensions_count: 0,
+            max_extensions,
+            message: None,
+            conditions: Vec::new(),
+            teardown_receipt: None,
+            teardown_evidence: None,
+            teardown_attempt_id: None,
+            connect_token_creation: status.connect_token_creation.clone(),
+            unbound_release_verified_at: None,
+            teardown_acknowledgement: None,
+        };
+        new_status.conditions =
+            derive_lease_conditions(&new_status, &status.conditions, None, &now.to_rfc3339());
 
-    // Re-read the outer and exact live pool immediately before publishing
-    // `Bound`. This closes replacement races during instance/token validation.
-    if !sandbox_composition_finalization_is_authorized(
-        ctx,
-        namespace,
-        &leases_api,
-        &lease,
-        binding,
-        false,
-    )
-    .await?
-    {
-        return Ok(false);
-    }
-
-    let patch = json_patch(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": lease_uid },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv },
-        { "op": "test", "path": "/status/phase", "value": "Pending" },
-        { "op": "test", "path": "/status/binding", "value": binding },
-        { "op": "add", "path": "/status", "value": new_status }
-    ]));
-    leases_api
-        .patch_status(
-            &binding.lease.name,
-            &PatchParams::default(),
-            &Patch::<()>::Json(patch),
+        // Re-read the outer and exact live pool immediately before publishing
+        // `Bound`. This closes replacement races during instance/token validation.
+        if !sandbox_composition_finalization_is_authorized(
+            ctx,
+            namespace,
+            &leases_api,
+            &lease,
+            binding,
+            false,
         )
-        .await?;
+        .await?
+        {
+            return Ok(false);
+        }
 
-    let bind_duration = (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
-    crate::metrics::CLAIM_BIND_DURATION
-        .with_label_values(&[lease.spec.pool_ref.as_str()])
-        .observe(bind_duration);
-    crate::metrics::LEASE_QUEUE_WAIT_SECONDS
-        .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
-        .observe(bind_duration);
-    crate::metrics::CLAIMS_TOTAL
-        .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
-        .inc();
-    info!(
-        lease = %binding.lease.name,
-        cluster = %binding.instance.name,
-        expires_at = %expires_at,
-        bind_seconds = bind_duration,
-        "Lease bound to exact ClusterInstance"
-    );
-    Ok(true)
+        let mut operations = vec![
+            serde_json::json!({ "op": "test", "path": "/metadata/uid", "value": lease_uid }),
+            serde_json::json!({ "op": "test", "path": "/metadata/resourceVersion", "value": lease_rv }),
+            serde_json::json!({ "op": "test", "path": "/status/phase", "value": "Pending" }),
+            serde_json::json!({ "op": "test", "path": "/status/binding", "value": binding }),
+            serde_json::json!({ "op": "add", "path": "/status/phase", "value": "Bound" }),
+            serde_json::json!({ "op": "add", "path": "/status/clusterName", "value": binding.instance.name }),
+            serde_json::json!({ "op": "add", "path": "/status/boundAt", "value": new_status.bound_at }),
+            serde_json::json!({ "op": "add", "path": "/status/expiresAt", "value": new_status.expires_at }),
+            serde_json::json!({ "op": "add", "path": "/status/queuePosition", "value": 0 }),
+            serde_json::json!({ "op": "add", "path": "/status/extensionsCount", "value": 0 }),
+            serde_json::json!({ "op": "add", "path": "/status/maxExtensions", "value": max_extensions }),
+            serde_json::json!({ "op": "add", "path": "/status/conditions", "value": new_status.conditions }),
+        ];
+        if status.message.is_some() {
+            operations.push(serde_json::json!({ "op": "remove", "path": "/status/message" }));
+        }
+        let patch = json_patch(serde_json::Value::Array(operations));
+        match leases_api
+            .patch_status(
+                &binding.lease.name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(patch),
+            )
+            .await
+        {
+            Ok(_) => {
+                let bind_duration =
+                    (chrono::Utc::now() - created_at).num_milliseconds() as f64 / 1000.0;
+                crate::metrics::CLAIM_BIND_DURATION
+                    .with_label_values(&[lease.spec.pool_ref.as_str()])
+                    .observe(bind_duration);
+                crate::metrics::LEASE_QUEUE_WAIT_SECONDS
+                    .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
+                    .observe(bind_duration);
+                crate::metrics::CLAIMS_TOTAL
+                    .with_label_values(&[lease.spec.pool_ref.as_str(), "bound"])
+                    .inc();
+                info!(
+                    lease = %binding.lease.name,
+                    cluster = %binding.instance.name,
+                    expires_at = %expires_at,
+                    bind_seconds = bind_duration,
+                    "Lease bound to exact ClusterInstance"
+                );
+                return Ok(true);
+            }
+            Err(error) if optimistic_conflict(&error) && attempt < FINALIZE_BINDING_ATTEMPTS => {
+                debug!(
+                    lease = %binding.lease.name,
+                    attempt,
+                    "binding finalization lost a race; re-reading both sides before retry"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    unreachable!("bounded binding-finalization loop always returns")
 }
 
 /// Message stamped on a lease whose binding could not be verified.
@@ -4921,6 +5016,107 @@ mod tests {
                 "binding": binding
             }
         })
+    }
+
+    #[tokio::test]
+    async fn finalize_binding_rereads_both_sides_and_retries_a_lost_race() {
+        let (ctx, server) = test_lease_context().await;
+        let binding = exact_test_binding("lease-finalize", "lease-finalize-uid");
+        let stale = exact_pending_lease_for_binding(&binding);
+        let mut fresh = stale.clone();
+        fresh["metadata"]["resourceVersion"] = "11".into();
+        let mut bound = fresh.clone();
+        bound["metadata"]["resourceVersion"] = "12".into();
+        bound["status"]["phase"] = "Bound".into();
+        bound["status"]["clusterName"] = binding.instance.name.clone().into();
+        let instance = exact_instance_for_binding(Some(&binding), "Leased");
+        let lease_endpoint = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterleases/{}",
+            binding.lease.name
+        );
+        let instance_endpoint = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+            binding.instance.name
+        );
+
+        Mock::given(method("GET"))
+            .and(path(lease_endpoint.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&stale))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(lease_endpoint.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fresh))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(instance_endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&instance))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{lease_endpoint}/status")))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Invalid",
+                "message": "fence lost",
+                "details": { "causes": [] },
+                "code": 422
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{lease_endpoint}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&bound))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            finalize_binding(&ctx, "test-ns", &binding, chrono::Utc::now())
+                .await
+                .expect("fresh reciprocal pair must finalize")
+        );
+        let patches: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(patches.len(), 2);
+        for (patch, resource_version) in patches.iter().zip(["10", "11"]) {
+            let operations = patch.as_array().unwrap();
+            assert!(operations.iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == resource_version
+            }));
+            assert!(operations.iter().any(|operation| {
+                operation["op"] == "add"
+                    && operation["path"] == "/status/phase"
+                    && operation["value"] == "Bound"
+            }));
+            assert!(
+                operations
+                    .iter()
+                    .all(|operation| operation["path"] != "/status"),
+                "finalization must not replace unrelated status fields"
+            );
+        }
     }
 
     #[tokio::test]

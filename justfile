@@ -28,6 +28,19 @@ lint:
 test:
     cargo test
 
+# Prove the exact-binding recovery matrix with Kani. The model lives in a
+# minimal shared crate so Kani verifies the same function the operator calls.
+[group('test')]
+test-instance-state-machine-kani:
+    cargo kani -p kobe-state-machine --harness recovery_apply_requires_the_exact_leased_subject --harness teardown_phases_are_never_reopened_by_recovery --harness bound_publication_requires_two_exact_reciprocal_sides --harness terminal_leases_never_publish_bound
+
+# Mutation gate for every production branch in the exact-binding recovery
+# function. A viable mutant surviving this command means the matrix tests are
+# not strong enough.
+[group('test')]
+test-instance-state-machine-mutations:
+    cargo mutants -p kobe-state-machine --re 'exact_binding_(recovery|finalization)' --timeout 60
+
 # Build all binaries (operator + kobe-sync + cli)
 [group('build')]
 build:

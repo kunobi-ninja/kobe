@@ -9,6 +9,9 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, PodSpec, PodTemplateSpec, SecretVolumeSource, Volume, VolumeMount,
 };
+use kobe_state_machine::{
+    BindingState, InstancePhase, RecoveryDecision, RecoveryTransition, exact_binding_recovery,
+};
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::core::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
@@ -1328,18 +1331,22 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                     phase = %lease_status.phase,
                     "Exact bound lease is terminating; recycling instance"
                 );
-                observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
-                let mut next = status.clone();
-                next.phase = ClusterInstancePhase::Recycling;
-                next.idle_since = None;
-                next.state_since = Some(chrono::Utc::now().to_rfc3339());
-                next.message = Some(format!(
-                    "recycling: exact lease '{}' is {}",
-                    binding.lease.name, lease_status.phase
-                ));
                 // Keep lease_ref + binding until verified teardown deletes the
                 // exact instance; they are cleanup handles, not idle state.
-                patch_exact_binding_status(ctx, instance, binding, next).await?;
+                let outcome = patch_exact_binding_transition(
+                    ctx,
+                    instance,
+                    binding,
+                    ExactBindingTransition::RecycleTerminalLease {
+                        lease_name: binding.lease.name.clone(),
+                        lease_phase: lease_status.phase,
+                        transitioned_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                )
+                .await?;
+                if outcome == ExactBindingWriteOutcome::Applied {
+                    observe_recycle(instance, crate::metrics::RecycleReason::LeaseReleased);
+                }
                 return Ok(Action::requeue(std::time::Duration::from_secs(10)));
             }
 
@@ -1361,14 +1368,15 @@ async fn evaluate_leased_instance<B: ClusterBackend + Clone>(
                 reason = "exact_lease_gone",
                 "Releasing only the exact orphan reservation"
             );
-            let mut next = status.clone();
-            next.phase = ClusterInstancePhase::Ready;
-            next.lease_ref = None;
-            next.binding = None;
-            next.idle_since = Some(chrono::Utc::now().to_rfc3339());
-            next.state_since = Some(chrono::Utc::now().to_rfc3339());
-            next.message = Some("ready; exact orphan reservation released".into());
-            patch_exact_binding_status(ctx, instance, binding, next).await?;
+            patch_exact_binding_transition(
+                ctx,
+                instance,
+                binding,
+                ExactBindingTransition::ReleaseOrphan {
+                    transitioned_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await?;
             Ok(Action::requeue(std::time::Duration::from_secs(5)))
         }
         Err(err) => {
@@ -1460,49 +1468,199 @@ async fn patch_instance_message_fenced<B: ClusterBackend>(
     Ok(())
 }
 
-async fn patch_exact_binding_status<B: ClusterBackend>(
+const EXACT_BINDING_WRITE_ATTEMPTS: usize = 3;
+
+fn recovery_phase(phase: &ClusterInstancePhase) -> InstancePhase {
+    match phase {
+        ClusterInstancePhase::Creating => InstancePhase::Creating,
+        ClusterInstancePhase::Ready => InstancePhase::Ready,
+        ClusterInstancePhase::Leased => InstancePhase::Leased,
+        ClusterInstancePhase::Recycling => InstancePhase::Recycling,
+        ClusterInstancePhase::Unhealthy => InstancePhase::Unhealthy,
+        ClusterInstancePhase::Failed => InstancePhase::Failed,
+        ClusterInstancePhase::Quarantined => InstancePhase::Quarantined,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ExactBindingTransition {
+    RecycleTerminalLease {
+        lease_name: String,
+        lease_phase: LeasePhase,
+        transitioned_at: String,
+    },
+    ReleaseOrphan {
+        transitioned_at: String,
+    },
+}
+
+impl ExactBindingTransition {
+    fn kind(&self) -> RecoveryTransition {
+        match self {
+            Self::RecycleTerminalLease { .. } => RecoveryTransition::RecycleTerminalLease,
+            Self::ReleaseOrphan { .. } => RecoveryTransition::ReleaseOrphan,
+        }
+    }
+
+    fn apply(&self, current: &ClusterInstanceStatus) -> ClusterInstanceStatus {
+        let mut next = current.clone();
+        match self {
+            Self::RecycleTerminalLease {
+                lease_name,
+                lease_phase,
+                transitioned_at,
+            } => {
+                next.phase = ClusterInstancePhase::Recycling;
+                next.idle_since = None;
+                next.state_since = Some(transitioned_at.clone());
+                next.message = Some(format!(
+                    "recycling: exact lease '{lease_name}' is {lease_phase}"
+                ));
+            }
+            Self::ReleaseOrphan { transitioned_at } => {
+                next.phase = ClusterInstancePhase::Ready;
+                next.lease_ref = None;
+                next.binding = None;
+                next.idle_since = Some(transitioned_at.clone());
+                next.state_since = Some(transitioned_at.clone());
+                next.message = Some("ready; exact orphan reservation released".into());
+            }
+        }
+        next
+    }
+
+    /// Emit only fields owned by this lifecycle transition. Replacing the
+    /// complete status makes an otherwise safe retry depend on the serialized
+    /// shape of every unrelated status field; a focused JSON Patch keeps the
+    /// exact UID/RV/binding fences without reopening that livelock surface.
+    fn patch_operations(&self, next: &ClusterInstanceStatus) -> Vec<serde_json::Value> {
+        let mut operations = vec![
+            serde_json::json!({ "op": "add", "path": "/status/phase", "value": next.phase }),
+            serde_json::json!({ "op": "add", "path": "/status/idleSince", "value": next.idle_since }),
+            serde_json::json!({ "op": "add", "path": "/status/stateSince", "value": next.state_since }),
+            serde_json::json!({ "op": "add", "path": "/status/message", "value": next.message }),
+            serde_json::json!({ "op": "add", "path": "/status/conditions", "value": next.conditions }),
+        ];
+        if matches!(self, Self::ReleaseOrphan { .. }) {
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": "/status/leaseRef",
+                "value": null
+            }));
+            operations.push(serde_json::json!({
+                "op": "remove",
+                "path": "/status/binding"
+            }));
+        }
+        operations
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactBindingWriteOutcome {
+    Applied,
+    AlreadyApplied,
+    Superseded,
+}
+
+/// Apply one exact-binding state transition and prove progress after a lost
+/// optimistic race.
+///
+/// A 409/422 is not treated as success: the controller re-reads the object,
+/// re-evaluates the pure transition matrix, and retries against the fresh
+/// resourceVersion. This prevents a quiet livelock when no competing write
+/// actually committed (the failure mode that exhausted the int-pro pool).
+async fn patch_exact_binding_transition<B: ClusterBackend>(
     ctx: &InstanceContext<B>,
     instance: &ClusterInstance,
     binding: &crate::crd::LeaseBinding,
-    mut next: ClusterInstanceStatus,
-) -> Result<(), InstanceError> {
-    let uid = instance
+    transition: ExactBindingTransition,
+) -> Result<ExactBindingWriteOutcome, InstanceError> {
+    let expected_uid = instance
         .metadata
         .uid
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("instance missing UID"))?;
-    let rv = instance
-        .resource_version()
-        .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
-    let prev = instance
-        .status
-        .as_ref()
-        .map(|current| current.conditions.as_slice())
-        .unwrap_or(&[]);
-    next.conditions = derive_instance_conditions(&next, prev, &chrono::Utc::now().to_rfc3339());
-    let patch: json_patch::Patch = serde_json::from_value(serde_json::json!([
-        { "op": "test", "path": "/metadata/uid", "value": uid },
-        { "op": "test", "path": "/metadata/resourceVersion", "value": rv },
-        { "op": "test", "path": "/status/binding", "value": binding },
-        { "op": "add", "path": "/status", "value": next }
-    ]))
-    .expect("exact binding JSON Patch is static");
     let namespace = instance
         .namespace()
         .unwrap_or_else(|| ctx.namespace.clone());
     let instances: Api<ClusterInstance> = Api::namespaced(ctx.client.clone(), &namespace);
-    tolerate_lost_race(
-        instances
+    let mut current = instance.clone();
+
+    for attempt in 1..=EXACT_BINDING_WRITE_ATTEMPTS {
+        if current.metadata.uid.as_deref() != Some(expected_uid.as_str()) {
+            return Ok(ExactBindingWriteOutcome::Superseded);
+        }
+        let status = current.status.as_ref().cloned().unwrap_or_default();
+        let binding_state = match status.binding.as_ref() {
+            Some(observed) if observed == binding => BindingState::Expected,
+            None => BindingState::Absent,
+            Some(_) => BindingState::Foreign,
+        };
+        match exact_binding_recovery(
+            recovery_phase(&status.phase),
+            binding_state,
+            status.lease_ref.is_none(),
+            transition.kind(),
+        ) {
+            RecoveryDecision::AlreadyApplied => {
+                return Ok(ExactBindingWriteOutcome::AlreadyApplied);
+            }
+            RecoveryDecision::Superseded => {
+                return Ok(ExactBindingWriteOutcome::Superseded);
+            }
+            RecoveryDecision::Apply => {}
+        }
+
+        let rv = current
+            .resource_version()
+            .ok_or_else(|| anyhow::anyhow!("instance missing resourceVersion"))?;
+        let mut next = transition.apply(&status);
+        next.conditions =
+            derive_instance_conditions(&next, &status.conditions, &chrono::Utc::now().to_rfc3339());
+        let mut operations = vec![
+            serde_json::json!(
+            { "op": "test", "path": "/metadata/uid", "value": expected_uid }
+            ),
+            serde_json::json!(
+            { "op": "test", "path": "/metadata/resourceVersion", "value": rv }
+            ),
+            serde_json::json!(
+            { "op": "test", "path": "/status/phase", "value": status.phase }
+            ),
+            serde_json::json!(
+            { "op": "test", "path": "/status/binding", "value": binding }
+            ),
+        ];
+        operations.extend(transition.patch_operations(&next));
+        let patch: json_patch::Patch = serde_json::from_value(serde_json::Value::Array(operations))
+            .expect("exact binding JSON Patch is static");
+
+        match instances
             .patch_status(
-                &instance.name_any(),
+                &current.name_any(),
                 &PatchParams::default(),
                 &Patch::<()>::Json(patch),
             )
-            .await,
-        &instance.name_any(),
-        "exact_binding_status",
-    )?;
-    Ok(())
+            .await
+        {
+            Ok(_) => return Ok(ExactBindingWriteOutcome::Applied),
+            Err(error)
+                if crate::controllers::lease::optimistic_conflict(&error)
+                    && attempt < EXACT_BINDING_WRITE_ATTEMPTS =>
+            {
+                debug!(
+                    instance = %current.name_any(),
+                    attempt,
+                    "exact-binding write lost a race; re-reading before retry"
+                );
+                current = instances.get(&current.name_any()).await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    unreachable!("bounded exact-binding write loop always returns")
 }
 
 /// Inject a per-backend default readiness gate when a pool declares
@@ -4323,6 +4481,62 @@ mod tests {
         assert!(!reservation_grace_elapsed(Some("garbage"), now, grace));
     }
 
+    #[test]
+    fn exact_binding_transitions_preserve_or_clear_only_owned_state() {
+        let binding = teardown_surface_binding();
+        let current = ClusterInstanceStatus {
+            phase: ClusterInstancePhase::Leased,
+            provisioned: true,
+            bootstrapped: true,
+            lease_ref: Some(binding.lease.clone()),
+            binding: Some(binding.clone()),
+            spec_hash: Some("immutable-spec-hash".into()),
+            teardown_identities: vec!["pv-uid".into()],
+            ..Default::default()
+        };
+        let recycled = ExactBindingTransition::RecycleTerminalLease {
+            lease_name: binding.lease.name.clone(),
+            lease_phase: LeasePhase::Expired,
+            transitioned_at: "2026-08-27T10:00:00Z".into(),
+        }
+        .apply(&current);
+        assert_eq!(recycled.phase, ClusterInstancePhase::Recycling);
+        assert_eq!(recycled.binding, current.binding);
+        assert_eq!(recycled.lease_ref, current.lease_ref);
+        assert_eq!(recycled.spec_hash, current.spec_hash);
+        assert_eq!(recycled.teardown_identities, current.teardown_identities);
+        let recycle_patch = ExactBindingTransition::RecycleTerminalLease {
+            lease_name: binding.lease.name.clone(),
+            lease_phase: LeasePhase::Expired,
+            transitioned_at: "2026-08-27T10:00:00Z".into(),
+        }
+        .patch_operations(&recycled);
+        assert!(recycle_patch.iter().all(|operation| {
+            operation["path"] != "/status/binding"
+                && operation["path"] != "/status/leaseRef"
+                && operation["path"] != "/status"
+        }));
+
+        let release_transition = ExactBindingTransition::ReleaseOrphan {
+            transitioned_at: "2026-08-27T10:00:00Z".into(),
+        };
+        let released = release_transition.apply(&current);
+        assert_eq!(released.phase, ClusterInstancePhase::Ready);
+        assert!(released.binding.is_none());
+        assert!(released.lease_ref.is_none());
+        assert_eq!(released.spec_hash, current.spec_hash);
+        assert_eq!(released.teardown_identities, current.teardown_identities);
+        let release_patch = release_transition.patch_operations(&released);
+        assert!(release_patch.iter().any(|operation| {
+            operation["op"] == "remove" && operation["path"] == "/status/binding"
+        }));
+        assert!(release_patch.iter().any(|operation| {
+            operation["op"] == "add"
+                && operation["path"] == "/status/leaseRef"
+                && operation["value"].is_null()
+        }));
+    }
+
     async fn test_instance_context() -> (Arc<InstanceContext<MockBackend>>, MockServer, MockBackend)
     {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -4446,6 +4660,212 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn leased_surface_instance(
+        binding: &crate::crd::LeaseBinding,
+        resource_version: &str,
+    ) -> ClusterInstance {
+        let mut instance = teardown_surface_instance(binding);
+        instance.metadata.resource_version = Some(resource_version.into());
+        let status = instance.status.as_mut().unwrap();
+        status.phase = ClusterInstancePhase::Leased;
+        status.provisioned = true;
+        status.bootstrapped = true;
+        status.message = Some("ready".into());
+        instance
+    }
+
+    #[tokio::test]
+    async fn exact_binding_transition_rereads_and_retries_a_lost_race() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let stale = leased_surface_instance(&binding, "24");
+        let fresh = leased_surface_instance(&binding, "25");
+        let mut recycled = fresh.clone();
+        recycled.metadata.resource_version = Some("26".into());
+        recycled.status.as_mut().unwrap().phase = ClusterInstancePhase::Recycling;
+        let endpoint = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+            binding.instance.name
+        );
+
+        Mock::given(method("PATCH"))
+            .and(path(format!("{endpoint}/status")))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Invalid",
+                "message": "the server rejected our request due to an error in our request",
+                "details": { "causes": [] },
+                "code": 422
+            })))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(endpoint.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fresh))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{endpoint}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&recycled))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = patch_exact_binding_transition(
+            &ctx,
+            &stale,
+            &binding,
+            ExactBindingTransition::RecycleTerminalLease {
+                lease_name: binding.lease.name.clone(),
+                lease_phase: LeasePhase::Expired,
+                transitioned_at: "2026-08-27T10:00:00Z".into(),
+            },
+        )
+        .await
+        .expect("fresh exact subject must make progress");
+        assert_eq!(outcome, ExactBindingWriteOutcome::Applied);
+
+        let patches: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(patches.len(), 2);
+        for (patch, resource_version) in patches.iter().zip(["24", "25"]) {
+            assert!(patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == resource_version
+            }));
+            assert_eq!(
+                patch
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|operation| {
+                        operation["op"] == "add" && operation["path"] == "/status/phase"
+                    })
+                    .unwrap()["value"],
+                "Recycling"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_binding_transition_fails_loudly_after_bounded_conflicts() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let stale = leased_surface_instance(&binding, "24");
+        let fresh = leased_surface_instance(&binding, "25");
+        let endpoint = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+            binding.instance.name
+        );
+        Mock::given(method("PATCH"))
+            .and(path(format!("{endpoint}/status")))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Invalid",
+                "message": "fence lost",
+                "details": { "causes": [] },
+                "code": 422
+            })))
+            .expect(EXACT_BINDING_WRITE_ATTEMPTS as u64)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fresh))
+            .expect((EXACT_BINDING_WRITE_ATTEMPTS - 1) as u64)
+            .mount(&server)
+            .await;
+
+        let result = patch_exact_binding_transition(
+            &ctx,
+            &stale,
+            &binding,
+            ExactBindingTransition::RecycleTerminalLease {
+                lease_name: binding.lease.name.clone(),
+                lease_phase: LeasePhase::Released,
+                transitioned_at: "2026-08-27T10:00:00Z".into(),
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "repeated conflicts must not become success"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_binding_transition_never_retries_over_a_foreign_binding() {
+        let (ctx, server, _) = test_instance_context().await;
+        let binding = teardown_surface_binding();
+        let stale = leased_surface_instance(&binding, "24");
+        let mut replacement_binding = binding.clone();
+        replacement_binding.binding_id = "replacement-binding".into();
+        let replacement = leased_surface_instance(&replacement_binding, "25");
+        let endpoint = format!(
+            "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterinstances/{}",
+            binding.instance.name
+        );
+        Mock::given(method("PATCH"))
+            .and(path(format!("{endpoint}/status")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "reason": "Conflict",
+                "message": "fence lost",
+                "code": 409
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&replacement))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = patch_exact_binding_transition(
+            &ctx,
+            &stale,
+            &binding,
+            ExactBindingTransition::RecycleTerminalLease {
+                lease_name: binding.lease.name.clone(),
+                lease_phase: LeasePhase::Released,
+                transitioned_at: "2026-08-27T10:00:00Z".into(),
+            },
+        )
+        .await
+        .expect("foreign bindings are a safe supersession");
+        assert_eq!(outcome, ExactBindingWriteOutcome::Superseded);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.method.as_str() == "PATCH")
+                .count(),
+            1
+        );
     }
 
     #[test]
