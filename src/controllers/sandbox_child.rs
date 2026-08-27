@@ -473,6 +473,7 @@ pub fn build_internal_cluster_lease(
             pool_ref: cluster_pool_ref.to_string(),
             ttl: format!("{}s", lifetime.as_secs()),
             requester,
+            metadata: None,
             priority: default_internal_priority(),
             cleanup_mode: Some(CleanupMode::VerifiedDestroy),
         },

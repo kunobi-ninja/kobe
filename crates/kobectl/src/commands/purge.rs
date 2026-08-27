@@ -395,6 +395,7 @@ mod tests {
             requester: None,
             kubeconfig_path: None,
             alias: None,
+            metadata: None,
         };
 
         assert!(is_active_lease(&base));
@@ -426,6 +427,7 @@ mod tests {
             requester: None,
             kubeconfig_path: None,
             alias: None,
+            metadata: None,
         };
         let sandbox = LeaseSummary {
             id: "sandbox-agent".to_string(),
@@ -454,6 +456,7 @@ mod tests {
             requester: None,
             kubeconfig_path: None,
             alias: None,
+            metadata: None,
         };
         let leases = vec![
             LeaseSummary {

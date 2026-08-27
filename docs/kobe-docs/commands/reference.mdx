@@ -85,7 +85,7 @@ Removes the stored session token and credentials from the local config. The next
 ## `kobe lease`
 
 ```sh
-kobe lease <pool> [--ttl <duration>] [--kubeconfig <path>] [--no-wait]
+kobe lease <pool> [--ttl <duration>] [--kubeconfig <path>] [--metadata-json <json|@path>] [--no-wait]
 ```
 
 Creates a lease from the specified pool. The pool's `resourceKind` determines
@@ -97,6 +97,8 @@ kobe lease ci-small
 kobe lease ci-small --ttl 30m
 kobe lease ci-small --kubeconfig /tmp/kube.yaml
 kobe lease agents --ttl 30m
+kobe lease ci-small --metadata-json '{"github":{"actor":"lenij","pullRequest":3835}}'
+kobe lease ci-small --metadata-json @lease-metadata.json
 kobe lease ci-small --no-wait
 ```
 
@@ -110,6 +112,11 @@ Prints the lease ID, resource kind, capabilities, and expiry on success.
 | `--kubeconfig` | `~/.kube/kobe-<id>` | Cluster resources only: path to write the kubeconfig. |
 | `--no-wait` | disabled | Return after creating the lease instead of waiting for readiness. |
 | `--wait-timeout` | unset | Maximum time to wait for the lease to become usable. |
+| `--metadata-json` | unset | Opaque descriptive JSON object, passed inline or read from `@path`. Metadata is bounded by the server and never affects lease behavior. |
+
+Metadata is stored with the lease and returned to its owner. Do not include
+credentials or secrets; cluster administrators can inspect it.
+When `--ensure` reuses an existing named lease, that lease keeps its original metadata.
 
 ---
 

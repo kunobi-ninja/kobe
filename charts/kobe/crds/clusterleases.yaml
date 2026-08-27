@@ -46,6 +46,17 @@ spec:
                 - VerifiedDestroy
                 nullable: true
                 type: string
+              metadata:
+                description: |-
+                  Caller-supplied descriptive context for this lease.
+
+                  Kobe stores this JSON object as opaque, untrusted data. It never affects
+                  authorization, quota, priority, scheduling, or lifecycle decisions. The
+                  HTTP API bounds its encoded size and nesting depth before creation, and
+                  no lease API mutates it afterwards. Do not place credentials or other
+                  secrets here: lease owners and cluster administrators can read it.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
               poolRef:
                 description: Which profile's pool to lease from.
                 type: string

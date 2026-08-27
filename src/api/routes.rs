@@ -421,6 +421,10 @@ struct CreateLeaseRequest {
     /// it can name "which lease" in scripts (`kobe extend pr-106 30m`).
     #[serde(default)]
     alias: Option<String>,
+    /// Optional caller-supplied descriptive JSON. This is stored verbatim but
+    /// has no authorization, scheduling, or lifecycle semantics.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -442,6 +446,10 @@ struct LeaseResponse {
     effective_ttl: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     alias: Option<String>,
+    /// Caller-supplied descriptive metadata. Present only on the owner's lease
+    /// responses; shared pool listings redact it for other tenants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
     /// Human-readable explanation of the lease's current state (#189), echoed
     /// from `ClusterLeaseStatus.message` — primarily why a Pending lease has
     /// not bound yet (pool health). Omitted when empty.
@@ -456,6 +464,68 @@ struct LeaseResponse {
 
 fn is_zero(v: &u32) -> bool {
     *v == 0
+}
+
+const MAX_LEASE_METADATA_BYTES: usize = 8 * 1024;
+const MAX_LEASE_METADATA_TOP_LEVEL_KEYS: usize = 32;
+const MAX_LEASE_METADATA_DEPTH: usize = 4;
+const MAX_LEASE_METADATA_NODES: usize = 128;
+
+/// Validate the caller-controlled lease metadata envelope before persisting it.
+///
+/// The byte bound protects the CRD and API responses; the shape bounds keep a
+/// small payload from becoming pathologically nested. Values remain opaque and
+/// untrusted after validation: no controller may derive behavior from them.
+fn validate_lease_metadata(metadata: &serde_json::Value) -> Result<(), String> {
+    let object = metadata
+        .as_object()
+        .ok_or_else(|| "Metadata must be a JSON object".to_string())?;
+
+    if object.len() > MAX_LEASE_METADATA_TOP_LEVEL_KEYS {
+        return Err(format!(
+            "Metadata may contain at most {MAX_LEASE_METADATA_TOP_LEVEL_KEYS} top-level keys"
+        ));
+    }
+
+    let encoded_len = serde_json::to_vec(metadata)
+        .map_err(|error| format!("Metadata could not be encoded: {error}"))?
+        .len();
+    if encoded_len > MAX_LEASE_METADATA_BYTES {
+        return Err(format!(
+            "Metadata may be at most {MAX_LEASE_METADATA_BYTES} bytes when encoded as JSON"
+        ));
+    }
+
+    fn visit(value: &serde_json::Value, depth: usize, nodes: &mut usize) -> Result<(), String> {
+        if depth > MAX_LEASE_METADATA_DEPTH {
+            return Err(format!(
+                "Metadata may be nested at most {MAX_LEASE_METADATA_DEPTH} levels deep"
+            ));
+        }
+        *nodes += 1;
+        if *nodes > MAX_LEASE_METADATA_NODES {
+            return Err(format!(
+                "Metadata may contain at most {MAX_LEASE_METADATA_NODES} JSON values"
+            ));
+        }
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, depth + 1, nodes)?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    visit(value, depth + 1, nodes)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut nodes = 0;
+    visit(metadata, 1, &mut nodes)
 }
 
 #[derive(Serialize)]
@@ -477,6 +547,10 @@ struct LeaseSummary {
     /// Caller-supplied alias, if any (#107 P2).
     #[serde(skip_serializing_if = "Option::is_none")]
     alias: Option<String>,
+    /// Caller-supplied descriptive metadata. Redacted alongside `requester`
+    /// and `alias` when a shared-pool listing contains another tenant's lease.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
 }
 
 /// Query parameters for `GET /v1/leases` (#107 P2).
@@ -1140,6 +1214,20 @@ async fn create_lease<B: ClusterBackend>(
             .into_response();
     }
 
+    if let Some(metadata) = req.metadata.as_ref()
+        && let Err(detail) = validate_lease_metadata(metadata)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid lease metadata".to_string(),
+                detail: Some(detail),
+                reason: None,
+            }),
+        )
+            .into_response();
+    }
+
     let ttl_str = req.ttl.as_deref().unwrap_or("1h");
     let requested_ttl = match parse_duration(ttl_str) {
         Some(d) => d,
@@ -1265,6 +1353,7 @@ async fn create_lease<B: ClusterBackend>(
         &identity,
         policy.default_priority,
         req.alias.as_deref(),
+        req.metadata.clone(),
     );
 
     if let Err(e) = leases_api.create(&PostParams::default(), &lease).await {
@@ -1361,6 +1450,7 @@ async fn create_lease<B: ClusterBackend>(
         diagnostics_url: None,
         effective_ttl: None,
         alias: req.alias.clone(),
+        metadata: req.metadata,
         message: None,
         conditions: Vec::new(),
     };
@@ -1406,6 +1496,7 @@ async fn list_leases<B: ClusterBackend>(
                         diagnostics_url: status.diagnostics_url,
                         requester: None,
                         alias,
+                        metadata: c.spec.metadata.as_deref().cloned(),
                     }
                 })
                 .collect();
@@ -1541,6 +1632,7 @@ async fn get_lease<B: ClusterBackend>(
                     diagnostics_url: status.diagnostics_url,
                     effective_ttl: None,
                     alias,
+                    metadata: lease.spec.metadata.map(|metadata| *metadata),
                     // #189: surface why a Pending lease isn't binding (pool health).
                     message: status.message,
                     // #189: structured conditions companion to `message`.
@@ -2609,32 +2701,7 @@ async fn list_pool_leases<B: ClusterBackend>(
                     let status = c.status.clone().unwrap_or_default();
                     matches!(status.phase, LeasePhase::Pending | LeasePhase::Bound)
                 })
-                .map(|c| {
-                    let status = c.status.clone().unwrap_or_default();
-                    // Only disclose the requester identity for the caller's OWN
-                    // leases. A pool can be shared across tenants (the shipped
-                    // GitHub policy grants every repo the `e2e-*` pattern), so
-                    // returning every requester would let any one tenant enumerate
-                    // the others' identities. The pool-utilization view (counts,
-                    // phases, expiries) is preserved; only foreign identities are
-                    // redacted.
-                    let own = c.spec.requester.identity == identity.identity;
-                    let requester = own.then(|| c.spec.requester.identity.clone());
-                    // Scope the alias like the requester: never expose another
-                    // tenant's caller-chosen lease name.
-                    let alias = if own { lease_alias(c) } else { None };
-                    LeaseSummary {
-                        id: c.name_any(),
-                        phase: status.phase.to_string(),
-                        profile: c.spec.pool_ref.clone(),
-                        cluster_name: status.cluster_name,
-                        expires_at: status.expires_at,
-                        queue_position: status.queue_position,
-                        diagnostics_url: None,
-                        requester,
-                        alias,
-                    }
-                })
+                .map(|c| pool_lease_summary(c, &identity.identity))
                 .collect();
 
             (StatusCode::OK, Json(summaries)).into_response()
@@ -2644,6 +2711,28 @@ async fn list_pool_leases<B: ClusterBackend>(
             "Failed to list pool leases",
             e,
         ),
+    }
+}
+
+/// Summarize one active pool lease without crossing tenant boundaries.
+/// Utilization fields are shared, while requester-controlled identity, alias,
+/// and metadata are disclosed only when the caller owns the lease.
+fn pool_lease_summary(lease: &ClusterLease, caller_identity: &str) -> LeaseSummary {
+    let status = lease.status.clone().unwrap_or_default();
+    let own = lease.spec.requester.identity == caller_identity;
+    LeaseSummary {
+        id: lease.name_any(),
+        phase: status.phase.to_string(),
+        profile: lease.spec.pool_ref.clone(),
+        cluster_name: status.cluster_name,
+        expires_at: status.expires_at,
+        queue_position: status.queue_position,
+        diagnostics_url: None,
+        requester: own.then(|| lease.spec.requester.identity.clone()),
+        alias: own.then(|| lease_alias(lease)).flatten(),
+        metadata: own
+            .then(|| lease.spec.metadata.as_deref().cloned())
+            .flatten(),
     }
 }
 
@@ -3117,6 +3206,7 @@ fn lease_alias(lease: &ClusterLease) -> Option<String> {
     lease.metadata.labels.as_ref()?.get(ALIAS_LABEL).cloned()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_lease_crd(
     lease_id: &str,
     namespace: &str,
@@ -3125,6 +3215,7 @@ fn build_lease_crd(
     identity: &AuthIdentity,
     priority: u32,
     alias: Option<&str>,
+    metadata: Option<serde_json::Value>,
 ) -> ClusterLease {
     let mut labels = std::collections::BTreeMap::new();
     labels.insert("kobe.kunobi.ninja/profile".to_string(), profile.to_string());
@@ -3150,6 +3241,7 @@ fn build_lease_crd(
                 requester_type: identity.requester_type.clone(),
                 identity: identity.identity.clone(),
             },
+            metadata: metadata.map(Box::new),
             priority,
             // Callers cannot request verified teardown: it is an internal
             // composition detail of #74's child placement, not tenant-facing
@@ -3429,6 +3521,7 @@ mod tests {
             &identity,
             80,
             None,
+            None,
         );
 
         assert_eq!(claim.spec.pool_ref, "e2e-basic");
@@ -3454,7 +3547,16 @@ mod tests {
     #[test]
     fn test_build_lease_crd_stamps_alias_label() {
         let identity = test_identity();
-        let claim = build_lease_crd("lease-1", "ns", "p", "1h", &identity, 50, Some("pr-106"));
+        let claim = build_lease_crd(
+            "lease-1",
+            "ns",
+            "p",
+            "1h",
+            &identity,
+            50,
+            Some("pr-106"),
+            None,
+        );
         assert_eq!(
             claim
                 .metadata
@@ -3470,7 +3572,16 @@ mod tests {
     #[test]
     fn test_build_lease_crd_labels() {
         let identity = test_identity();
-        let claim = build_lease_crd("lease-xyz", "ns1", "e2e-full", "30m", &identity, 50, None);
+        let claim = build_lease_crd(
+            "lease-xyz",
+            "ns1",
+            "e2e-full",
+            "30m",
+            &identity,
+            50,
+            None,
+            None,
+        );
 
         let labels = claim
             .metadata
@@ -3490,9 +3601,90 @@ mod tests {
     }
 
     #[test]
+    fn lease_metadata_is_preserved_without_becoming_a_kubernetes_label() {
+        let identity = test_identity();
+        let metadata = serde_json::json!({
+            "github": {"actor": "lenij", "pullRequest": 3835, "runId": 123456789},
+            "purpose": "e2e"
+        });
+        let lease = build_lease_crd(
+            "lease-metadata",
+            "ns",
+            "ci",
+            "1h",
+            &identity,
+            50,
+            None,
+            Some(metadata.clone()),
+        );
+
+        assert_eq!(lease.spec.metadata.as_deref(), Some(&metadata));
+        assert_eq!(
+            lease.metadata.labels.as_ref().map(|labels| labels.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn lease_metadata_validation_accepts_bounded_json_objects() {
+        let metadata = serde_json::json!({
+            "github": {"actor": "lenij", "pr": 3835},
+            "tags": ["e2e", "pull-request"]
+        });
+        assert_eq!(validate_lease_metadata(&metadata), Ok(()));
+        assert_eq!(validate_lease_metadata(&serde_json::json!({})), Ok(()));
+    }
+
+    #[test]
+    fn lease_metadata_validation_rejects_unbounded_or_non_object_values() {
+        assert!(validate_lease_metadata(&serde_json::json!(["not", "an", "object"])).is_err());
+
+        let too_deep = serde_json::json!({"a": {"b": {"c": {"d": true}}}});
+        assert!(validate_lease_metadata(&too_deep).is_err());
+
+        let too_many_values = serde_json::json!({"values": vec![0; MAX_LEASE_METADATA_NODES]});
+        assert!(validate_lease_metadata(&too_many_values).is_err());
+
+        let too_large = serde_json::json!({"value": "x".repeat(MAX_LEASE_METADATA_BYTES)});
+        assert!(validate_lease_metadata(&too_large).is_err());
+
+        let too_many_keys = serde_json::Value::Object(
+            (0..=MAX_LEASE_METADATA_TOP_LEVEL_KEYS)
+                .map(|index| (format!("key-{index}"), serde_json::Value::Null))
+                .collect(),
+        );
+        assert!(validate_lease_metadata(&too_many_keys).is_err());
+    }
+
+    #[test]
+    fn pool_lease_summary_redacts_foreign_metadata_with_identity_and_alias() {
+        let identity = test_identity();
+        let lease = build_lease_crd(
+            "lease-private",
+            "ns",
+            "ci",
+            "1h",
+            &identity,
+            50,
+            Some("pr-3835"),
+            Some(serde_json::json!({"actor": "lenij"})),
+        );
+
+        let own = pool_lease_summary(&lease, &identity.identity);
+        assert_eq!(own.requester.as_deref(), Some(identity.identity.as_str()));
+        assert_eq!(own.alias.as_deref(), Some("pr-3835"));
+        assert_eq!(own.metadata, Some(serde_json::json!({"actor": "lenij"})));
+
+        let foreign = pool_lease_summary(&lease, "repo:other/repo:ref:refs/heads/main");
+        assert!(foreign.requester.is_none());
+        assert!(foreign.alias.is_none());
+        assert!(foreign.metadata.is_none());
+    }
+
+    #[test]
     fn test_build_lease_crd_status_is_none() {
         let identity = test_identity();
-        let claim = build_lease_crd("lease-001", "ns", "dev", "2h", &identity, 100, None);
+        let claim = build_lease_crd("lease-001", "ns", "dev", "2h", &identity, 100, None, None);
 
         // The CRD is created without status; the controller sets it later
         assert!(
@@ -3504,8 +3696,8 @@ mod tests {
     #[test]
     fn test_build_lease_crd_different_priority() {
         let identity = test_identity();
-        let claim_low = build_lease_crd("c1", "ns", "p", "1h", &identity, 10, None);
-        let claim_high = build_lease_crd("c2", "ns", "p", "1h", &identity, 200, None);
+        let claim_low = build_lease_crd("c1", "ns", "p", "1h", &identity, 10, None, None);
+        let claim_high = build_lease_crd("c2", "ns", "p", "1h", &identity, 200, None, None);
 
         assert_eq!(claim_low.spec.priority, 10);
         assert_eq!(claim_high.spec.priority, 200);
@@ -5180,6 +5372,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_lease_rejects_invalid_metadata_before_cluster_calls() {
+        let (state, server) = preflight_state().await;
+        let response = create_lease::<crate::testutil::MockBackend>(
+            State(state),
+            test_identity(),
+            Json(CreateLeaseRequest {
+                profile: "e2e-basic".to_string(),
+                ttl: None,
+                alias: None,
+                metadata: Some(serde_json::json!(["not", "an", "object"])),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"].as_str(), Some("Invalid lease metadata"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_create_lease_against_failing_pool_returns_503_with_retry_after_and_reason() {
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
@@ -5224,6 +5437,7 @@ mod tests {
                 profile: "e2e-basic".to_string(),
                 ttl: None,
                 alias: None,
+                metadata: None,
             }),
         )
         .await;
@@ -5296,6 +5510,10 @@ mod tests {
             .mount(&server)
             .await;
 
+        let metadata = serde_json::json!({
+            "github": {"actor": "lenij", "pullRequest": 3835},
+            "purpose": "e2e"
+        });
         let response = create_lease::<crate::testutil::MockBackend>(
             State(state),
             test_identity(),
@@ -5303,6 +5521,7 @@ mod tests {
                 profile: "e2e-basic".to_string(),
                 ttl: None,
                 alias: None,
+                metadata: Some(metadata.clone()),
             }),
         )
         .await;
@@ -5318,6 +5537,17 @@ mod tests {
         );
         let body = response_json(response).await;
         assert_eq!(body["phase"].as_str(), Some("Pending"));
+        assert_eq!(body["metadata"], metadata);
+
+        let create = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method == http::Method::POST)
+            .expect("the accepted request must create one ClusterLease");
+        let created: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+        assert_eq!(created["spec"]["metadata"], metadata);
     }
 
     #[test]

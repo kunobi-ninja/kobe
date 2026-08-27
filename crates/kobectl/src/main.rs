@@ -130,9 +130,14 @@ enum Commands {
         /// reference it by name later: `kobe extend pr-106 30m`.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Attach an opaque JSON object to the lease. Pass inline JSON or
+        /// `@path` to read it from a file. Metadata is descriptive only.
+        #[arg(long, value_name = "JSON|@PATH")]
+        metadata_json: Option<String>,
         /// Idempotent (#107 P3): with --name, reuse the existing active lease of
         /// that name (extending its TTL) instead of failing on the duplicate —
         /// "lease again means renew". Safe to call unconditionally at job start.
+        /// Reused leases keep their original metadata.
         #[arg(long, requires = "name")]
         ensure: bool,
         /// Heartbeat-extend the lease until interrupted (#107 P3). Re-extends by
@@ -150,6 +155,10 @@ enum Commands {
         /// Lease TTL / heartbeat window
         #[arg(long, default_value = "1h")]
         ttl: String,
+        /// Attach an opaque JSON object to the lease. Pass inline JSON or
+        /// `@path` to read it from a file. Metadata is descriptive only.
+        #[arg(long, value_name = "JSON|@PATH")]
+        metadata_json: Option<String>,
         /// Command to run (after `--`), with the lease kubeconfig in KUBECONFIG.
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -382,6 +391,7 @@ async fn main() -> anyhow::Result<()> {
             wait_timeout,
             kubeconfig,
             name,
+            metadata_json,
             ensure,
             keepalive,
         } => {
@@ -392,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
                 wait_timeout: wait_timeout.as_deref(),
                 kubeconfig_path: kubeconfig.as_deref(),
                 name: name.as_deref(),
+                metadata_json: metadata_json.as_deref(),
                 ensure,
                 keepalive,
                 target_override: target,
@@ -400,10 +411,16 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Commands::WithLease { pool, ttl, cmd } => {
+        Commands::WithLease {
+            pool,
+            ttl,
+            metadata_json,
+            cmd,
+        } => {
             commands::with_lease(commands::WithLeaseCommand {
                 pool: pool.as_deref(),
                 ttl: &ttl,
+                metadata_json: metadata_json.as_deref(),
                 cmd: &cmd,
                 target_override: target,
                 endpoint_override: endpoint,

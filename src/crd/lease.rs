@@ -68,6 +68,19 @@ pub struct ClusterLeaseSpec {
     /// Identity of the requester.
     pub requester: Requester,
 
+    /// Caller-supplied descriptive context for this lease.
+    ///
+    /// Kobe stores this JSON object as opaque, untrusted data. It never affects
+    /// authorization, quota, priority, scheduling, or lifecycle decisions. The
+    /// HTTP API bounds its encoded size and nesting depth before creation, and
+    /// no lease API mutates it afterwards. Do not place credentials or other
+    /// secrets here: lease owners and cluster administrators can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::crd::json_object_schema")]
+    // Keep recursive caller data behind a pointer so controller async frames
+    // do not grow with serde_json::Value's enum representation.
+    pub metadata: Option<Box<serde_json::Value>>,
+
     /// Lease priority for queue ordering.
     /// Higher values are served first.
     #[serde(default = "default_priority")]

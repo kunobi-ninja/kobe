@@ -252,6 +252,7 @@ async fn enrich_leases(
                 requester: lease.requester,
                 kubeconfig_path,
                 alias: lease.alias,
+                metadata: detail.metadata.or(lease.metadata),
             }),
             Err(_) => enriched.push(LeaseSummary {
                 kubeconfig_path,

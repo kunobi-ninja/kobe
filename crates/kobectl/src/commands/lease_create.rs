@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use serde_yaml_ng::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,6 +21,8 @@ pub struct LeaseCreateCommand<'a> {
     pub kubeconfig_path: Option<&'a str>,
     /// #107 P2: optional alias for the lease.
     pub name: Option<&'a str>,
+    /// Optional inline JSON object or `@path` containing caller metadata.
+    pub metadata_json: Option<&'a str>,
     /// #107 P3: with `name`, reuse+extend an existing active lease of that name.
     pub ensure: bool,
     /// #107 P3: heartbeat-extend the lease until interrupted.
@@ -38,6 +41,8 @@ pub(crate) struct LeaseAcceptedResponse {
     queue_position: u32,
     #[serde(default)]
     pub(crate) effective_ttl: Option<String>,
+    #[serde(default)]
+    pub(crate) metadata: Option<JsonValue>,
 }
 
 #[derive(Serialize)]
@@ -55,6 +60,8 @@ struct LeaseCreateOutput {
     effective_ttl: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kubeconfig_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<JsonValue>,
 }
 
 const CLUSTER_CAPABILITIES: &[&str] = &["kubeconfig", "extend", "release"];
@@ -67,12 +74,14 @@ pub(crate) async fn create_lease_request(
     pool: &str,
     ttl: &str,
     alias: Option<&str>,
+    metadata: Option<&JsonValue>,
 ) -> Result<LeaseAcceptedResponse> {
     let endpoint = config.endpoint.as_str();
     let body_json = serde_json::json!({
         "profile": pool,
         "ttl": ttl,
         "alias": alias,
+        "metadata": metadata,
     });
     let body_bytes = serde_json::to_vec(&body_json)?;
     // Body signing not yet supported server-side (extractor doesn't have body access).
@@ -111,6 +120,7 @@ pub(crate) async fn create_lease_request(
 pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(command.target_override, command.endpoint_override)?;
+    let metadata = parse_metadata_json(command.metadata_json)?;
 
     // Determine which lease to operate on: an existing active one (#107 P3
     // `--ensure` idempotent renew), else a fresh create.
@@ -179,6 +189,9 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
                 if command.kubeconfig_path.is_some() {
                     anyhow::bail!("Sandbox leases do not provide a kubeconfig");
                 }
+                if metadata.is_some() {
+                    anyhow::bail!("Sandbox leases do not accept --metadata-json");
+                }
                 return super::sandbox::lease(
                     &config,
                     super::sandbox::LeaseCommand {
@@ -193,8 +206,14 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
                 )
                 .await;
             }
-            let accepted =
-                create_lease_request(&config, &pool.name, command.ttl, command.name).await?;
+            let accepted = create_lease_request(
+                &config,
+                &pool.name,
+                command.ttl,
+                command.name,
+                metadata.as_ref(),
+            )
+            .await?;
             if command.no_wait {
                 return emit_pending_output(&accepted, command.output);
             }
@@ -333,6 +352,7 @@ fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -
             queue_position: accepted.queue_position,
             effective_ttl: accepted.effective_ttl.clone(),
             kubeconfig_path: None,
+            metadata: accepted.metadata.clone(),
         })?,
     }
 
@@ -373,10 +393,35 @@ fn emit_ready_output(
             queue_position: ready.queue_position,
             effective_ttl,
             kubeconfig_path: Some(kubeconfig_path.display().to_string()),
+            metadata: ready.metadata.clone(),
         })?,
     }
 
     Ok(())
+}
+
+/// Parse `--metadata-json` from an inline object or `@path` without assigning
+/// any meaning to its keys. The server remains authoritative for size and
+/// nesting bounds, but rejecting non-objects locally avoids a network roundtrip.
+pub(crate) fn parse_metadata_json(input: Option<&str>) -> Result<Option<JsonValue>> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let raw = if let Some(path) = input.strip_prefix('@') {
+        if path.is_empty() {
+            anyhow::bail!("--metadata-json @PATH requires a file path");
+        }
+        std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("failed to read metadata JSON from {path}: {error}"))?
+    } else {
+        input.to_string()
+    };
+    let metadata: JsonValue = serde_json::from_str(&raw)
+        .map_err(|error| anyhow::anyhow!("invalid --metadata-json: {error}"))?;
+    if !metadata.is_object() {
+        anyhow::bail!("--metadata-json must contain a JSON object");
+    }
+    Ok(Some(metadata))
 }
 
 pub(crate) async fn wait_for_usable_lease(
@@ -592,6 +637,7 @@ mod tests {
             cluster_name: Some("pool-ci-small-1".to_string()),
             expires_at: Some("2026-01-01T00:00:00Z".to_string()),
             queue_position: 0,
+            metadata: None,
             kubeconfig: Some("apiVersion: v1".to_string()),
         };
 
@@ -623,6 +669,30 @@ mod tests {
         assert_eq!(parse_cli_duration(""), None);
         assert_eq!(parse_cli_duration("10"), None);
         assert_eq!(parse_cli_duration("5d"), None);
+    }
+
+    #[test]
+    fn metadata_json_accepts_inline_objects_and_files() {
+        let inline = parse_metadata_json(Some(r#"{"actor":"lenij","pr":3835}"#))
+            .unwrap()
+            .unwrap();
+        assert_eq!(inline["actor"], "lenij");
+        assert_eq!(inline["pr"], 3835);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        std::fs::write(&path, r#"{"purpose":"e2e"}"#).unwrap();
+        let from_file = parse_metadata_json(Some(&format!("@{}", path.display())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_file["purpose"], "e2e");
+    }
+
+    #[test]
+    fn metadata_json_rejects_invalid_json_and_non_objects() {
+        assert!(parse_metadata_json(Some("not-json")).is_err());
+        assert!(parse_metadata_json(Some("[]")).is_err());
+        assert!(parse_metadata_json(Some("@")).is_err());
     }
 
     #[test]

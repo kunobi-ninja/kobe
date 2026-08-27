@@ -50,7 +50,16 @@ Creates a lease from the specified pool. Returns `202 Accepted` immediately with
 ```json
 {
   "profile": "ci-small",
-  "ttl": "30m"
+  "ttl": "30m",
+  "alias": "pr-3835",
+  "metadata": {
+    "github": {
+      "actor": "lenij",
+      "pullRequest": 3835,
+      "runId": 123456789
+    },
+    "purpose": "e2e"
+  }
 }
 ```
 
@@ -58,6 +67,15 @@ Creates a lease from the specified pool. Returns `202 Accepted` immediately with
 |---|---|---|---|
 | `profile` | string | Yes | Pool name to lease from |
 | `ttl` | string | No | Requested TTL (e.g. `"30m"`, `"1h"`). Defaults to the pool's `spec.ttl`. Capped by AccessPolicy `maxTtl`. |
+| `alias` | string | No | DNS-label name unique among the requester's active leases. |
+| `metadata` | object | No | Opaque caller context. Maximum 8 KiB encoded JSON, 32 top-level keys, four nesting levels, and 128 JSON values. |
+
+`metadata` is descriptive, untrusted, and creation-time only: the lease API
+does not expose an update operation. It never affects authorization, quota,
+priority, scheduling, or lifecycle behavior. Do not include credentials or
+secrets: the lease owner and cluster administrators can read it. Shared pool
+listings redact another tenant's metadata together with its requester identity
+and alias.
 
 **Response** — `202 Accepted`
 
@@ -67,7 +85,16 @@ Creates a lease from the specified pool. Returns `202 Accepted` immediately with
   "phase": "Pending",
   "profile": "ci-small",
   "queue_position": 0,
-  "effective_ttl": "30m"
+  "effective_ttl": "30m",
+  "alias": "pr-3835",
+  "metadata": {
+    "github": {
+      "actor": "lenij",
+      "pullRequest": 3835,
+      "runId": 123456789
+    },
+    "purpose": "e2e"
+  }
 }
 ```
 
@@ -89,7 +116,7 @@ Once bound, `GET /v1/leases/:id` returns:
 
 | Status | Meaning |
 |---|---|
-| `400` | Invalid profile name or TTL format |
+| `400` | Invalid profile name, alias, TTL, or metadata |
 | `403` | Profile not allowed for your identity |
 | `429` | Concurrent lease limit reached, or server overloaded |
 

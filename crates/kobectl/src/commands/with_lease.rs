@@ -10,13 +10,14 @@ use tokio::sync::oneshot;
 use super::OutputFormat;
 use super::config::{CliConfig, ResolvedConfig};
 use super::keepalive::heartbeat_until;
-use super::lease_create::{create_lease_request, wait_for_usable_lease};
+use super::lease_create::{create_lease_request, parse_metadata_json, wait_for_usable_lease};
 use super::pools::fetch_pool_for_config_with_output;
 use super::release::release_lease;
 
 pub struct WithLeaseCommand<'a> {
     pub pool: Option<&'a str>,
     pub ttl: &'a str,
+    pub metadata_json: Option<&'a str>,
     pub cmd: &'a [String],
     pub target_override: Option<&'a str>,
     pub endpoint_override: Option<&'a str>,
@@ -57,7 +58,9 @@ pub async fn with_lease(command: WithLeaseCommand<'_>) -> Result<()> {
     if verbose {
         eprintln!("Leasing '{}' for the wrapped command...", pool.name);
     }
-    let accepted = create_lease_request(&config, &pool.name, command.ttl, None).await?;
+    let metadata = parse_metadata_json(command.metadata_json)?;
+    let accepted =
+        create_lease_request(&config, &pool.name, command.ttl, None, metadata.as_ref()).await?;
     let lease_id = accepted.id.clone();
 
     // Everything past creation must release the lease, even on error or signal.
