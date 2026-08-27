@@ -14,6 +14,7 @@ on:
       - "charts/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Justfile"
       - "docker/**"
       - "docker-bake.hcl"
       - "hack/**"
@@ -114,6 +115,12 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Tests
+        # Sandbox admission/teardown tests poll deeply nested futures on the
+        # libtest thread; the default 2MiB spawned-thread stack overflows in
+        # Linux debug builds ("fatal runtime error: stack overflow"). Match
+        # the 8MiB the production runtime workers are configured with.
+        env:
+          RUST_MIN_STACK: "8388608"
         run: cargo test --workspace
 
       # The release gate itself only runs on tag pushes (version-consistency),
@@ -177,16 +184,128 @@ jobs:
         run: |
           helm dependency build charts/kobe/
           helm template kobe charts/kobe/ --debug > /dev/null
+          helm lint charts/kobe/ --set agentSandbox.mode=external
+          helm template kobe charts/kobe/ \
+            --set agentSandbox.mode=external \
+            --debug > /dev/null
+          mise exec -- bun run hack/test-agent-sandbox-chart.ts
 
       - name: Verify CRDs match generated output
         run: |
-          for crd in clusterpools clusterleases clusterinstances bootstrapconfigs accesspolicies kobestores cidrclaims cidrpools sandboxpools sandboxleases; do
+          # Derive the gate from the shipped chart instead of maintaining a
+          # second list that can silently omit a new CRD.
+          for crd_path in charts/kobe/crds/*.yaml; do
+            crd="${crd_path##*/}"
+            crd="${crd%.yaml}"
             cargo run --quiet --bin crdgen -- "$crd" > "/tmp/${crd}-generated.yaml"
-            diff -u "/tmp/${crd}-generated.yaml" "charts/kobe/crds/${crd}.yaml" || {
+            diff -u "/tmp/${crd}-generated.yaml" "$crd_path" || {
               echo "::error::CRD '${crd}' is out of date. Run 'cargo run --bin crdgen -- ${crd} > charts/kobe/crds/${crd}.yaml' to update."
               exit 1
             }
           done
+
+  # Real API-server contract for SandboxLease status and the admission ledger.
+  # Unit tests pin JSON Patch/CEL/object shape; this job proves Kubernetes
+  # rejects stale status writers, release-cause mutation, tenant reservation
+  # writes, and namespace object growth beyond the configured quota. No Kobe
+  # image, Helm release, or external Agent Sandbox runtime is involved.
+  sandbox-apiserver-contract:
+    name: Sandbox API-server Contract
+    runs-on: kunobi-runners
+    timeout-minutes: 15
+    env:
+      SANDBOX_CONTRACT_CLUSTER: sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}
+      # The `runner` context is unavailable while GitHub evaluates job-level
+      # env. The run/attempt pair still makes this host path unique.
+      KUBECONFIG: /tmp/sandbox-api-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up pinned contract-test tools
+        uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+
+      - name: Install bun, kind and kubectl
+        run: mise install bun kind kubectl
+
+      - name: Create kind and install the Sandbox CRDs
+        run: |
+          mise exec -- kind create cluster --name "$SANDBOX_CONTRACT_CLUSTER" --wait 120s
+          CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
+          mise exec -- kubectl --context "$CONTEXT" apply \
+            -f charts/kobe/crds/sandboxleases.yaml \
+            -f charts/kobe/crds/sandboxpools.yaml
+          mise exec -- kubectl --context "$CONTEXT" wait \
+            --for=condition=Established \
+            crd/sandboxleases.kobe.kunobi.ninja \
+            crd/sandboxpools.kobe.kunobi.ninja \
+            --timeout=60s
+
+      - name: Verify SandboxLease fences and admission-ledger isolation
+        run: |
+          export KOBE_SANDBOX_APISERVER_CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
+          mise exec -- bun run ./hack/test-sandbox-apiserver.ts
+
+      - name: Tear down contract cluster
+        if: always()
+        run: mise exec -- kind delete cluster --name "$SANDBOX_CONTRACT_CLUSTER" || true
+
+  # Proves the pinned release fixture against a real cluster: a live warm
+  # Claim survives the operator-side v0.5.4 -> v0.5.6 rollout, then the pinned
+  # controller, conversion webhook and exact Claim -> Sandbox -> Pod lifecycle
+  # are healthy. The script owns a uniquely named Kind cluster and refuses to
+  # reuse one.
+  sandbox-runtime-contract:
+    name: Agent Sandbox Runtime Contract
+    runs-on: kunobi-runners
+    timeout-minutes: 20
+    env:
+      SANDBOX_RUNTIME_CLUSTER: sandbox-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up pinned runtime-contract tools
+        uses: jdx/mise-action@v4
+        with:
+          install: false
+          cache: true
+
+      - name: Install bun, kind and kubectl
+        run: mise install bun kind kubectl
+
+      - name: Install Helm and chart dependencies
+        uses: azure/setup-helm@v5
+
+      - name: Upgrade and exercise the pinned v0.5.6 runtime
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm dependency build charts/kobe/
+          mise exec -- bun run ./hack/test-agent-sandbox-runtime.ts
+
+      # A force-cancel can prevent the script's own finally-style cleanup. Only
+      # delete when the exact cluster presents the ownership marker written by
+      # this run; a collision or unrelated cluster is deliberately untouched.
+      - name: Recover an interrupted contract cluster
+        if: always()
+        run: |
+          CONTRACT_KUBECONFIG="$RUNNER_TEMP/$SANDBOX_RUNTIME_CLUSTER.kubeconfig"
+          CONTRACT_CONTEXT="kind-$SANDBOX_RUNTIME_CLUSTER"
+          MARKER="$(mise exec -- kubectl \
+            --kubeconfig "$CONTRACT_KUBECONFIG" \
+            --context "$CONTRACT_CONTEXT" \
+            --request-timeout=5s \
+            get namespace kobe-runtime-contract \
+            -o jsonpath='{.metadata.labels.kobe\.kunobi\.ninja/contract-cluster}' \
+            2>/dev/null || true)"
+          if [ "$MARKER" = "$SANDBOX_RUNTIME_CLUSTER" ]; then
+            mise exec -- kind delete cluster \
+              --name "$SANDBOX_RUNTIME_CLUSTER" \
+              --kubeconfig "$CONTRACT_KUBECONFIG"
+          elif [ -n "$MARKER" ]; then
+            echo "::warning::Refusing cleanup: ownership marker is $MARKER"
+          fi
 
   docker-dry-run:
     if: github.event_name == 'pull_request'
@@ -244,9 +363,9 @@ jobs:
   # (name suffixed by backend) and always tears it down. `fail-fast: false` so
   # one backend's failure doesn't mask the others.
   #
-  # PHASE 2 (#10): the k3s leg — the production backend — also runs on every
-  # push to main and on release tags, so a conformance regression is caught
-  # before (main) or at (tag) the release boundary instead of a day later.
+  # PHASE 2 (#10): the k3s leg — the production backend — runs on every PR,
+  # push to main and release tag, so a conformance regression is caught before
+  # merge and again at the release boundary instead of a day later.
   # The full matrix (k3s + both vkobe datastores) stays nightly + manual; the
   # vkobe legs run the same gate across etcd + kine/sqlite, vcluster runs
   # nightly against the upstream loft-sh chart (#31), and k0s joins with the
@@ -263,12 +382,13 @@ jobs:
   # like `docker-dry-run`, this needs the host Docker socket for kind + buildx.
   conformance:
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      ${{ github.event_name == 'pull_request'
+          || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
           || (github.event_name == 'push'
               && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) }}
     needs: [checks]
     runs-on: kunobi-runners
-    timeout-minutes: 45
+    timeout-minutes: 180
     # The vkobe backend is ON HOLD (see docs/kobe-docs/how-it-works/
     # runtime-strategy.mdx) and its legs currently fail on a real behavior
     # tracked in #36 (pool creates no members in the kind harness). Keep them
@@ -279,9 +399,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # k3s-only on push (fast feedback on the production backend); the full
-        # matrix nightly / on manual dispatch.
-        backend: ${{ fromJSON(github.event_name == 'push' && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine", "vcluster", "k0s"]') }}
+        # k3s-only on PR/push (fast feedback on the production backend); the
+        # full backend matrix remains nightly / manual.
+        backend: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '["k3s"]' || '["k3s", "vkobe-etcd", "vkobe-kine", "vcluster", "k0s"]') }}
+    env:
+      E2E_CLUSTER: e2e-${{ github.run_id }}-${{ matrix.backend }}
+      KOBE_ENDPOINT: http://127.0.0.1:8080
+      KOBE_TOKEN: e2e-dev-token
+      KOBE_TOKEN_OTHER: e2e-other-token
+      KOBE_SANDBOX_POOL_MANAGEMENT: e2e-sandbox-management-trusted
+      KOBE_SANDBOX_POOL_CHILD: e2e-sandbox-child-k3s-trusted
+      KOBE_SANDBOX_HARNESS: bun run ./hack/e2e.ts
+      KOBE_BIN: ${{ github.workspace }}/target/debug/kobe
     steps:
       - uses: actions/checkout@v7
 
@@ -312,15 +441,22 @@ jobs:
         # every pool is applied regardless. Scale-to-zero pools provision only
         # in their own leg, so pre-loading their images in every leg would be a
         # pull each other leg never uses.
-        run: mise exec -- bun run ./hack/e2e.ts up --cluster e2e-${{ github.run_id }}-${{ matrix.backend }} --backend ${{ matrix.backend }}
+        run: |
+          SANDBOX_ARGS=()
+          if [ "${{ matrix.backend }}" = k3s ]; then
+            SANDBOX_ARGS+=(--sandbox-conformance)
+          fi
+          mise exec -- bun run ./hack/e2e.ts up \
+            --cluster "$E2E_CLUSTER" \
+            --backend "${{ matrix.backend }}" \
+            "${SANDBOX_ARGS[@]}"
 
       # The smoke recipes differ by backend (k3s takes the cluster name; the
       # vkobe recipes target their pool against the current kind context).
       - name: Run the ${{ matrix.backend }} conformance smoke gate
         run: |
-          CLUSTER=e2e-${{ github.run_id }}-${{ matrix.backend }}
           case "${{ matrix.backend }}" in
-            k3s)        mise exec -- just test-smoke-k3s "$CLUSTER" ;;
+            k3s)        mise exec -- just test-smoke-k3s "$E2E_CLUSTER" ;;
             vkobe-etcd) mise exec -- just test-smoke-vkobe ;;
             vkobe-kine) mise exec -- just test-smoke-vkobe-kine ;;
             vcluster)   mise exec -- just test-smoke-vcluster ;;
@@ -328,14 +464,59 @@ jobs:
             *) echo "unknown backend ${{ matrix.backend }}" >&2; exit 1 ;;
           esac
 
+      # Dual-placement Sandbox conformance (#76). Runs only on the k3s leg:
+      # child placement REQUIRES a receipt-capable k3s pool, so the other
+      # backends have nothing to compare against and would report a skip that
+      # reads as a pass.
+      #
+      - name: Sandbox conformance (management + child)
+        if: matrix.backend == 'k3s'
+        run: |
+          mise exec -- cargo build -p kobectl --bin kobe
+          mise exec -- bun run ./hack/e2e.ts sandbox-conformance-preflight \
+            --cluster "$E2E_CLUSTER" \
+            --timeout 900
+          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            mise exec -- just test-sandbox-conformance
+          else
+            mise exec -- just test-sandbox-conformance-pr
+          fi
+
+      # After BOTH gates: a `failure()` step placed before a step is skipped
+      # for good once execution passes it, so sitting between the smoke gate
+      # and the Sandbox gate left the Sandbox gate's failures with no
+      # diagnostics at all.
       - name: Diagnostics on failure
         if: failure()
         run: |
-          CTX=kind-e2e-${{ github.run_id }}-${{ matrix.backend }}
-          kubectl --context "$CTX" get pods,clusterinstances,clusterpools -A -o wide || true
-          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 200 --all-containers || true
+          CTX=kind-$E2E_CLUSTER
+          kubectl --context "$CTX" get pods,clusterinstances,clusterpools,sandboxpools,sandboxleases -A -o wide || true
+          kubectl --context "$CTX" get sandboxpools -A -o yaml || true
+          # Answer the RBAC question a 403 leaves open: which identity, which
+          # verb. The operator's SA is the only identity the canary execs with.
+          SA="$(kubectl --context "$CTX" get deploy -n kobe-system -l app.kubernetes.io/name=kobe -o jsonpath='{.items[0].spec.template.spec.serviceAccountName}' 2>/dev/null || true)"
+          if [ -n "$SA" ]; then
+            for verb in get create; do
+              echo "auth can-i $verb pods/exec as system:serviceaccount:kobe-system:$SA:"
+              kubectl --context "$CTX" auth can-i "$verb" pods --subresource=exec \
+                --as "system:serviceaccount:kobe-system:$SA" -A || true
+            done
+          fi
+          kubectl --context "$CTX" get clusterrole -o yaml 2>/dev/null | grep -B6 -A6 "pods/exec" || true
+          # can-i answers authorization only; admission and the kubelet leg can
+          # still 403 an allowed request. Reproduce the canary's actual exec —
+          # -v=8 prints the response body, which names the real denier.
+          POD="$(kubectl --context "$CTX" get pods -n kobe-system -o name 2>/dev/null | grep 'kobe-e2e-sandbox-management' | head -1)"
+          if [ -n "$POD" ]; then
+            echo "probe exec as admin into $POD:"
+            kubectl --context "$CTX" exec -n kobe-system "$POD" -c workspace -v=8 -- /bin/true 2>&1 | tail -30 || true
+            echo "probe exec as the operator SA into $POD:"
+            kubectl --context "$CTX" exec -n kobe-system "$POD" -c workspace -v=8 \
+              --as "system:serviceaccount:kobe-system:${SA:-kobe}" -- /bin/true 2>&1 | tail -30 || true
+          fi
+          kubectl --context "$CTX" logs -n kobe-system -l app.kubernetes.io/name=kobe --tail 400 --all-containers || true
           mkdir -p /tmp/kind-logs
-          mise exec -- kind export logs /tmp/kind-logs --name e2e-${{ github.run_id }}-${{ matrix.backend }} || true
+          mise exec -- kind export logs /tmp/kind-logs --name "$E2E_CLUSTER" || true
 
       - name: Upload kind logs
         if: failure()
@@ -348,7 +529,7 @@ jobs:
       # Always tear down so kind clusters never leak on the persistent runner.
       - name: Tear down the e2e harness
         if: always()
-        run: mise exec -- bun run ./hack/e2e.ts down --cluster e2e-${{ github.run_id }}-${{ matrix.backend }}
+        run: mise exec -- bun run ./hack/e2e.ts down --cluster "$E2E_CLUSTER"
 
   publish:
     # Pushes the operator/sync container images. On a RELEASE TAG, gate the image
@@ -359,9 +540,9 @@ jobs:
     # The REF gate is load-bearing: this job used to key only off
     # `event_name != 'pull_request'`, so `workflow_dispatch` on ANY branch
     # published from that branch. Dispatch is the documented way to exercise
-    # conformance (which never runs on pull_request) before merging a backend
-    # change — so validating a branch silently republished the shared tags from
-    # unmerged code. Validation and publication are now separate concerns:
+    # the full backend and exhaustive Sandbox matrices before merging a backend
+    # change — so validating a branch must not republish shared tags from
+    # unmerged code. Validation and publication are separate concerns:
     # dispatch a branch to test it, and only main / a release tag ships.
     # Dispatch on main still publishes, which is the remedy for tags left
     # pointing somewhere wrong.

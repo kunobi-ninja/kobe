@@ -1,0 +1,202 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxexecutions.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: SandboxExecution
+    plural: sandboxexecutions
+    shortNames:
+    - sbxe
+    singular: sandboxexecution
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .status.exitCode
+      name: Exit
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SandboxExecutionSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              One command's durable record.
+
+              Current records are deliberately **not** owner-referenced to their
+              `SandboxLease`. A foreground delete could garbage-collect an owner-referenced
+              record before Kobe had cancelled its process group, erasing the only durable
+              evidence that teardown still had work to do. Instead every record carries a
+              cleanup finalizer and exact lease identity; the lease controller removes the
+              record explicitly before it releases workload or capacity. History still
+              ends with the Sandbox, but never ahead of process termination.
+            properties:
+              detached:
+                default: false
+                description: |-
+                  Whether the caller requested a detached handle instead of waiting for
+                  the result. This controls response timing, not runner supervision.
+                type: boolean
+              idempotencyKey:
+                description: Caller-supplied key. Two requests with this key are the same request.
+                maxLength: 253
+                minLength: 1
+                type: string
+              leaseName:
+                description: |-
+                  The lease's API name. Optional only for records written by an older
+                  Kobe; current records persist name and UID together so background
+                  reconciliation never has to discover a parent from mutable labels.
+                maxLength: 253
+                minLength: 1
+                nullable: true
+                type: string
+              leaseUid:
+                description: |-
+                  The lease this ran under, by UID. An execution never outlives its exact
+                  lease: a same-named successor is a different Sandbox, and answering its
+                  caller with this record would describe somebody else's command.
+                minLength: 1
+                type: string
+              podUid:
+                description: |-
+                  The Pod it ran in, by UID. Recorded so a replaced Pod invalidates the
+                  record rather than silently re-pointing it.
+                minLength: 1
+                type: string
+              requestDigest:
+                description: |-
+                  SHA-256 over the canonical request. Never the request itself: a command
+                  line routinely carries secrets, and object status is readable by anyone
+                  with `get`, replicated to every etcd member, and included in backups.
+                maxLength: 64
+                minLength: 64
+                type: string
+              runnerManaged:
+                description: |-
+                  Whether `kobe-runner` supervises this execution and cancellation must
+                  therefore be confirmed by that runner.
+
+                  Optional for upgrade compatibility. Records created before wait mode
+                  moved to the runner omit it; for those, only detached executions were
+                  runner-managed.
+                nullable: true
+                type: boolean
+              target:
+                description: |-
+                  Exact runner address captured before the command can start.
+
+                  Pool configuration is pinned by generation at admission, but it may be
+                  unavailable during release. Persisting this non-secret address lets
+                  teardown cancel the same runner/Pod without trusting a replacement pool
+                  or re-deriving a target from mutable names. Optional only for legacy
+                  records; every current runner-managed execution requires it.
+                nullable: true
+                properties:
+                  container:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  namespace:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  podName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  podUid:
+                    minLength: 1
+                    type: string
+                  runnerPath:
+                    maxLength: 255
+                    minLength: 1
+                    pattern: ^/[A-Za-z0-9._/-]*$
+                    type: string
+                required:
+                - container
+                - namespace
+                - podName
+                - podUid
+                - runnerPath
+                type: object
+              timeout:
+                description: Wall-clock bound the runner enforces.
+                minLength: 1
+                type: string
+            required:
+            - idempotencyKey
+            - leaseUid
+            - podUid
+            - requestDigest
+            - timeout
+            type: object
+          status:
+            nullable: true
+            properties:
+              exitCode:
+                description: |-
+                  The remote process's exact exit code. Absent unless the command actually
+                  ran to completion — a synthesised zero would be indistinguishable from
+                  a real success.
+                format: int32
+                nullable: true
+                type: integer
+              finishedAt:
+                format: date-time
+                nullable: true
+                type: string
+              reason:
+                description: |-
+                  Bounded reason code. Never a raw backend message, and never any part of
+                  the command's own output.
+                maxLength: 64
+                nullable: true
+                type: string
+              startedAt:
+                format: date-time
+                nullable: true
+                type: string
+              state:
+                default: Queued
+                description: Where an execution is.
+                enum:
+                - Running
+                - Succeeded
+                - Queued
+                - Failed
+                - Cancelled
+                - TimedOut
+                - Unknown
+                type: string
+              verdictDeadline:
+                description: |-
+                  Legacy diagnostic deadline from the first durable-execution rollout.
+
+                  Retained for stored-object compatibility. Current Kobe versions never
+                  convert `Running` to a terminal state by time alone; an exact runner
+                  report or target-destruction receipt is required.
+                format: date-time
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: SandboxExecutionValidated
+        type: object
+        x-kubernetes-validations:
+        - message: SandboxExecution spec is immutable
+          rule: self.spec == oldSelf.spec
+    served: true
+    storage: true
+    subresources:
+      status: {}

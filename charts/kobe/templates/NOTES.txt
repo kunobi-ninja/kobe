@@ -25,3 +25,14 @@ To create a cluster pool:
       version: "v1.31.3+k3s1"
       servers: 1
   EOF
+{{- if ne .Values.agentSandbox.mode "disabled" }}
+
+Sandbox admission ledger:
+
+  Namespace: {{ include "kobe.sandboxLedgerNamespace" . }}
+  Object limit: {{ .Values.agentSandbox.reservationObjectLimit }} coordination Leases
+
+The ledger namespace and its admission policy/quota are retained on Helm
+uninstall. Do not delete them until every SandboxLease and reservation is
+verified absent. The ledger namespace must not be shared with other controllers.
+{{- end }}

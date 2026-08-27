@@ -696,6 +696,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
  "axum-core",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -714,8 +715,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1104,6 +1107,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags",
  "crossterm_winapi",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
@@ -2668,6 +2672,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "form_urlencoded",
  "futures",
  "hex",
  "http 1.4.0",
@@ -2677,6 +2682,7 @@ dependencies = [
  "json-patch",
  "jsonwebtoken 9.3.1",
  "k8s-openapi",
+ "kobe-runner",
  "kube",
  "kunobi-auth",
  "kunobi-ha",
@@ -2718,6 +2724,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kobe-runner"
+version = "0.40.1"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kobectl"
 version = "0.40.1"
 dependencies = [
@@ -2726,16 +2743,22 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "futures-util",
  "kunobi-auth",
+ "libc",
  "ratatui",
  "reqwest 0.12.28",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -5369,8 +5392,12 @@ checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5626,6 +5653,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.2",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",

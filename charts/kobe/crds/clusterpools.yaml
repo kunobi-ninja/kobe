@@ -26,6 +26,9 @@ spec:
     - jsonPath: .status.creating
       name: Creating
       type: integer
+    - jsonPath: .status.quarantined
+      name: Quarantined
+      type: integer
     - jsonPath: .status.consecutiveFailures
       name: Failures
       type: integer
@@ -909,6 +912,7 @@ spec:
                   `ready`, `consecutiveFailures`) for programmatic decisions.
                 enum:
                 - Healthy
+                - Quarantined
                 - ScalingUp
                 - ScalingDown
                 - Backoff

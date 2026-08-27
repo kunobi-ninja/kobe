@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 use rand::Rng;
 use reqwest::{Certificate, Identity};
@@ -14,9 +14,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 use serde_yaml_ng::Value;
 
-use crate::crd::ClusterLease;
+use crate::crd::{
+    CheckResult, ClusterLease, KubernetesResourceIdentity, LeaseBinding, TeardownCheck,
+    TeardownSubject,
+};
 
 const CONNECT_TOKEN_KEY: &str = "token";
+const CONNECT_TOKEN_ATTEMPT_ANNOTATION: &str = "kobe.kunobi.ninja/connect-token-creation-attempt";
 
 // `Clone` is cheap: `reqwest::Client` is internally `Arc`, and the two
 // `String`s are short. The connect-proxy per-lease cache clones a
@@ -402,11 +406,13 @@ mod no_verify {
     }
 }
 
-pub(crate) async fn ensure_lease_connect_token(
+/// Create the lease-scoped token before publishing a reciprocal binding and
+/// return the exact Secret identity that must be persisted in that binding.
+pub(crate) async fn provision_lease_connect_token(
     client: &Client,
     namespace: &str,
     lease: &ClusterLease,
-) -> Result<String> {
+) -> Result<KubernetesResourceIdentity> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let name = connect_secret_name(&lease.name_any());
     let lease_uid = lease
@@ -418,7 +424,7 @@ pub(crate) async fn ensure_lease_connect_token(
     match secrets.get(&name).await {
         Ok(secret) => {
             require_connect_token_owner(&secret, &lease.name_any(), &lease_uid)?;
-            read_token(&secret)
+            connect_token_identity(&secret, namespace)
         }
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
             let token = random_token();
@@ -447,14 +453,14 @@ pub(crate) async fn ensure_lease_connect_token(
             };
 
             match secrets.create(&PostParams::default(), &secret).await {
-                Ok(_) => Ok(token),
+                Ok(created) => connect_token_identity(&created, namespace),
                 Err(kube::Error::Api(ae)) if ae.code == 409 => {
                     let existing = secrets
                         .get(&name)
                         .await
                         .with_context(|| format!("Failed to read existing connect token {name}"))?;
                     require_connect_token_owner(&existing, &lease.name_any(), &lease_uid)?;
-                    read_token(&existing)
+                    connect_token_identity(&existing, namespace)
                 }
                 Err(e) => Err(e).with_context(|| format!("Failed to create connect token {name}")),
             }
@@ -463,12 +469,259 @@ pub(crate) async fn ensure_lease_connect_token(
     }
 }
 
+/// Reserve the deterministic connect-token Secret name without installing a
+/// credential.
+///
+/// The caller must invoke this exactly once, immediately after it successfully
+/// transitions a durable [`crate::crd::ConnectTokenCreation`] from `Prepared`
+/// to `Creating`. A restart in `Creating` must use
+/// [`observe_reserved_lease_connect_token`] and never call this function: an
+/// unknown create result is not safe to retry because a delayed first `POST`
+/// could otherwise recreate the name after teardown proved a transient 404.
+pub(crate) async fn reserve_lease_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    attempt_id: &str,
+) -> Result<KubernetesResourceIdentity> {
+    if attempt_id.trim().is_empty() {
+        anyhow::bail!("connect-token creation attempt is empty");
+    }
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let name = connect_secret_name(&lease.name_any());
+    let lease_uid = lease
+        .metadata
+        .uid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Lease {} has no UID", lease.name_any()))?;
+
+    let validate = |secret: &Secret| -> Result<KubernetesResourceIdentity> {
+        require_connect_token_owner(secret, &lease.name_any(), &lease_uid)?;
+        if secret
+            .annotations()
+            .get(CONNECT_TOKEN_ATTEMPT_ANNOTATION)
+            .map(String::as_str)
+            != Some(attempt_id)
+        {
+            anyhow::bail!("connect-token Secret belongs to a different creation attempt");
+        }
+        connect_token_identity(secret, namespace)
+    };
+
+    match secrets.get(&name).await {
+        Ok(secret) => validate(&secret),
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            let secret = Secret {
+                metadata: ObjectMeta {
+                    name: Some(name.clone()),
+                    namespace: Some(namespace.to_string()),
+                    owner_references: Some(vec![OwnerReference {
+                        api_version: "kobe.kunobi.ninja/v1alpha1".to_string(),
+                        kind: "ClusterLease".to_string(),
+                        name: lease.name_any(),
+                        uid: lease_uid.clone(),
+                        controller: Some(false),
+                        block_owner_deletion: Some(false),
+                    }]),
+                    annotations: Some(
+                        [(
+                            CONNECT_TOKEN_ATTEMPT_ANNOTATION.to_string(),
+                            attempt_id.to_string(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..Default::default()
+                },
+                // Intentionally no `data`/`stringData`: reserving the name is
+                // not granting access. Activation happens only after this UID
+                // is durable in lease status.
+                type_: Some("Opaque".to_string()),
+                ..Default::default()
+            };
+            match secrets.create(&PostParams::default(), &secret).await {
+                Ok(created) => validate(&created),
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    let existing = secrets
+                        .get(&name)
+                        .await
+                        .with_context(|| format!("Failed to read reserved connect token {name}"))?;
+                    validate(&existing)
+                }
+                Err(error) => {
+                    Err(error).with_context(|| format!("Failed to reserve connect token {name}"))
+                }
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("Failed to read connect token {name}")),
+    }
+}
+
+/// Observe the result of an already-dispatched token reservation without ever
+/// creating it again. `None` is deliberately inconclusive while the durable
+/// attempt is `Creating`; only an exact observed UID can advance it.
+pub(crate) async fn observe_reserved_lease_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    attempt_id: &str,
+) -> Result<Option<KubernetesResourceIdentity>> {
+    let lease_uid = lease
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Lease {} has no UID", lease.name_any()))?;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret = match secrets.get(&connect_secret_name(&lease.name_any())).await {
+        Ok(secret) => secret,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
+        Err(error) => return Err(error).context("connect-token reservation lookup failed"),
+    };
+    require_connect_token_owner(&secret, &lease.name_any(), lease_uid)?;
+    if secret
+        .annotations()
+        .get(CONNECT_TOKEN_ATTEMPT_ANNOTATION)
+        .map(String::as_str)
+        != Some(attempt_id)
+    {
+        anyhow::bail!("connect-token Secret belongs to a different creation attempt");
+    }
+    connect_token_identity(&secret, namespace).map(Some)
+}
+
+/// Install token bytes into an already-reserved exact Secret.
+///
+/// This function never creates. It re-reads the lease immediately before the
+/// patch and requires the same Pending binding and Reserved attempt. Release
+/// may still win after that read; in that interleaving the credential never
+/// authorizes access because the lease cannot become Bound, and the release's
+/// exact-UID delete orders after or conflicts with this patch.
+pub(crate) async fn activate_reserved_lease_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease_name: &str,
+    lease_uid: &str,
+    binding: &LeaseBinding,
+    attempt_id: &str,
+) -> Result<String> {
+    let leases: Api<ClusterLease> = Api::namespaced(client.clone(), namespace);
+    let lease = leases.get(lease_name).await?;
+    let status = lease
+        .status
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("lease has no durable connect-token creation status"))?;
+    let creation = status
+        .connect_token_creation
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("lease has no durable connect-token creation attempt"))?;
+    let expected = binding
+        .connect_token
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("verified binding has no reserved connect-token UID"))?;
+    if lease.metadata.uid.as_deref() != Some(lease_uid)
+        || status.phase != crate::crd::LeasePhase::Pending
+        || status.binding.as_ref() != Some(binding)
+        || creation.attempt_id != attempt_id
+        || creation.phase != crate::crd::ConnectTokenCreationPhase::Reserved
+        || creation.identity.as_ref() != Some(expected)
+    {
+        anyhow::bail!("connect-token activation fence is closed");
+    }
+
+    require_connect_token_identity_shape(expected, namespace, lease_name)?;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret = secrets.get(&expected.name).await?;
+    require_connect_token_owner(&secret, lease_name, lease_uid)?;
+    if connect_token_identity(&secret, namespace)? != *expected
+        || secret
+            .annotations()
+            .get(CONNECT_TOKEN_ATTEMPT_ANNOTATION)
+            .map(String::as_str)
+            != Some(attempt_id)
+    {
+        anyhow::bail!("reserved connect-token identity changed before activation");
+    }
+    if let Ok(token) = read_token(&secret) {
+        return Ok(token);
+    }
+
+    let resource_version = secret
+        .resource_version()
+        .ok_or_else(|| anyhow::anyhow!("reserved connect-token Secret has no resourceVersion"))?;
+    let token = random_token();
+    let patch: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/metadata/uid", "value": expected.uid },
+        { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+        { "op": "add", "path": "/stringData", "value": { CONNECT_TOKEN_KEY: token } }
+    ]))
+    .expect("connect-token activation JSON Patch must be well formed");
+    let activated = secrets
+        .patch(
+            &expected.name,
+            &PatchParams::default(),
+            &Patch::<()>::Json(patch),
+        )
+        .await
+        .context("failed to activate reserved connect-token Secret")?;
+    if let Ok(stored) = read_token(&activated) {
+        return Ok(stored);
+    }
+    // Some apiservers omit the write-only stringData projection from the
+    // response; the stored `data` from a fresh GET is authoritative.
+    let stored = secrets
+        .get(&expected.name)
+        .await
+        .context("failed to re-read activated connect-token Secret")?;
+    if connect_token_identity(&stored, namespace)? != *expected {
+        anyhow::bail!("activated connect-token identity changed after patch");
+    }
+    read_token(&stored)
+}
+
+/// Read an already-provisioned token for a Bound lease. New bindings must carry
+/// the exact Secret UID; this function never recreates such a Secret after
+/// teardown. A legacy Standard binding may still lazily provision once so an
+/// in-place operator upgrade does not revoke every existing lease.
+pub(crate) async fn ensure_lease_connect_token(
+    client: &Client,
+    namespace: &str,
+    lease: &ClusterLease,
+    binding: &LeaseBinding,
+) -> Result<String> {
+    let expected = match binding.connect_token.as_ref() {
+        Some(expected) => expected.clone(),
+        None if !binding.cleanup_mode.requires_receipt() => {
+            provision_lease_connect_token(client, namespace, lease).await?
+        }
+        None => anyhow::bail!("verified binding has no connect-token footprint"),
+    };
+    require_connect_token_identity_shape(&expected, namespace, &lease.name_any())?;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let secret = secrets
+        .get(&expected.name)
+        .await
+        .with_context(|| format!("Failed to read connect token {}", expected.name))?;
+    require_connect_token_owner(
+        &secret,
+        &lease.name_any(),
+        lease
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Lease {} has no UID", lease.name_any()))?,
+    )?;
+    if connect_token_identity(&secret, namespace)? != expected {
+        anyhow::bail!("connect token Secret identity changed after binding");
+    }
+    read_token(&secret)
+}
+
 pub(crate) async fn validate_lease_connect_token(
     client: &Client,
     namespace: &str,
     lease_id: &str,
     presented_token: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<ValidatedConnectToken>> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let name = connect_secret_name(lease_id);
     match secrets.get(&name).await {
@@ -479,7 +732,10 @@ pub(crate) async fn validate_lease_connect_token(
                 return Ok(None);
             };
             if kunobi_auth::secret_eq(&read_token(&secret)?, presented_token) {
-                Ok(Some(lease_uid.to_string()))
+                Ok(Some(ValidatedConnectToken {
+                    lease_uid: lease_uid.to_string(),
+                    identity: connect_token_identity(&secret, namespace)?,
+                }))
             } else {
                 Ok(None)
             }
@@ -487,6 +743,12 @@ pub(crate) async fn validate_lease_connect_token(
         Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(None),
         Err(e) => Err(e).with_context(|| format!("Failed to read connect token {name}")),
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedConnectToken {
+    pub lease_uid: String,
+    pub identity: KubernetesResourceIdentity,
 }
 
 /// Explicitly delete the lease's connect-token Secret.
@@ -531,8 +793,192 @@ pub(crate) async fn delete_lease_connect_token(
     }
 }
 
-fn connect_secret_name(lease_id: &str) -> String {
+/// Delete and then observe absence of the exact connect-token Secret recorded
+/// in the reciprocal binding. The returned check is suitable for the durable
+/// teardown receipt: only an observed 404 for this UID is `Verified`.
+pub(crate) async fn delete_lease_connect_token_verified(
+    client: &Client,
+    namespace: &str,
+    lease_id: &str,
+    lease_uid: &str,
+    expected: &KubernetesResourceIdentity,
+) -> TeardownCheck {
+    let verified = vec![expected.canonical_id()];
+    let result = async {
+        require_connect_token_identity_shape(expected, namespace, lease_id)?;
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+        let current = match secrets.get(&expected.name).await {
+            Ok(secret) => Some(secret),
+            Err(kube::Error::Api(response)) if response.code == 404 => None,
+            Err(error) => return Err(error).context("connect-token lookup failed"),
+        };
+        if let Some(secret) = current {
+            require_connect_token_owner(&secret, lease_id, lease_uid)?;
+            if connect_token_identity(&secret, namespace)? != *expected {
+                anyhow::bail!("connect-token same-name replacement detected");
+            }
+            let delete_params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: Some(expected.uid.clone()),
+                    resource_version: secret.resource_version(),
+                }),
+                ..Default::default()
+            };
+            match secrets.delete(&expected.name, &delete_params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(error) => return Err(error).context("connect-token delete failed"),
+            }
+        }
+
+        // DELETE acceptance is not proof. Wait briefly for an observed 404;
+        // every retry remains UID-fenced and a replacement is an error.
+        for _ in 0..20 {
+            match secrets.get(&expected.name).await {
+                Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
+                Ok(secret) => {
+                    if secret.metadata.uid.as_deref() != Some(expected.uid.as_str()) {
+                        anyhow::bail!("connect-token same-name replacement detected");
+                    }
+                }
+                Err(error) => return Err(error).context("connect-token absence proof failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        anyhow::bail!("connect-token still present after delete")
+    }
+    .await;
+
+    match result {
+        Ok(()) => TeardownCheck {
+            subject: TeardownSubject::ConnectTokenSecret,
+            result: CheckResult::Verified,
+            reason: None,
+            verified,
+        },
+        Err(error) => {
+            tracing::warn!(lease = lease_id, error = %error, "connect-token absence is unproven");
+            TeardownCheck {
+                subject: TeardownSubject::ConnectTokenSecret,
+                result: CheckResult::Unknown,
+                reason: Some("connect_token_unproven".into()),
+                verified: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Read-only exact-UID absence proof used by the isolated receipt authority.
+/// It never deletes or creates: a live object, same-name replacement, or API
+/// error remains `Unknown` until the lifecycle controller has completed its
+/// separately authorized deletion.
+pub(crate) async fn observe_lease_connect_token_absent(
+    client: &Client,
+    namespace: &str,
+    lease_id: &str,
+    expected: &KubernetesResourceIdentity,
+) -> TeardownCheck {
+    let verified = vec![expected.canonical_id()];
+    let result = async {
+        require_connect_token_identity_shape(expected, namespace, lease_id)?;
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+        match secrets.get(&expected.name).await {
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Ok(secret) if secret.metadata.uid.as_deref() == Some(expected.uid.as_str()) => {
+                anyhow::bail!("connect-token exact object is still present")
+            }
+            Ok(_) => anyhow::bail!("connect-token same-name replacement detected"),
+            Err(error) => Err(error).context("connect-token absence lookup failed"),
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => TeardownCheck {
+            subject: TeardownSubject::ConnectTokenSecret,
+            result: CheckResult::Verified,
+            reason: None,
+            verified,
+        },
+        Err(error) => {
+            tracing::debug!(lease = lease_id, error = %error, "receipt authority could not prove connect-token absent");
+            TeardownCheck {
+                subject: TeardownSubject::ConnectTokenSecret,
+                result: CheckResult::Unknown,
+                reason: Some("connect_token_unproven".into()),
+                verified: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Revoke a token created before a verified binding intent became durable.
+/// There is no binding footprint yet, so authenticate it through the exact
+/// lease owner UID, derive its live UID, and use the same observed-absence
+/// proof before allowing the receipt-retention finalizer to be removed.
+pub(crate) async fn delete_unbound_lease_connect_token_verified(
+    client: &Client,
+    namespace: &str,
+    lease_id: &str,
+    lease_uid: &str,
+) -> Result<()> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let name = connect_secret_name(lease_id);
+    let secret = match secrets.get(&name).await {
+        Ok(secret) => secret,
+        Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
+        Err(error) => return Err(error).context("unbound connect-token lookup failed"),
+    };
+    require_connect_token_owner(&secret, lease_id, lease_uid)?;
+    let identity = connect_token_identity(&secret, namespace)?;
+    let check =
+        delete_lease_connect_token_verified(client, namespace, lease_id, lease_uid, &identity)
+            .await;
+    if check.result == CheckResult::Verified {
+        Ok(())
+    } else {
+        anyhow::bail!("unbound connect-token absence remains unproven")
+    }
+}
+
+pub(crate) fn connect_secret_name(lease_id: &str) -> String {
     format!("{lease_id}-connect-token")
+}
+
+fn connect_token_identity(secret: &Secret, namespace: &str) -> Result<KubernetesResourceIdentity> {
+    Ok(KubernetesResourceIdentity {
+        api_version: "v1".into(),
+        kind: "Secret".into(),
+        namespace: Some(namespace.to_string()),
+        name: secret
+            .metadata
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Connect token Secret has no name"))?,
+        uid: secret
+            .metadata
+            .uid
+            .clone()
+            .filter(|uid| !uid.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Connect token Secret has no UID"))?,
+    })
+}
+
+pub(crate) fn require_connect_token_identity_shape(
+    identity: &KubernetesResourceIdentity,
+    namespace: &str,
+    lease_id: &str,
+) -> Result<()> {
+    if identity.api_version == "v1"
+        && identity.kind == "Secret"
+        && identity.namespace.as_deref() == Some(namespace)
+        && identity.name == connect_secret_name(lease_id)
+        && !identity.uid.trim().is_empty()
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("connect-token footprint is malformed")
+    }
 }
 
 fn connect_token_owner_uid<'a>(secret: &'a Secret, lease_name: &str) -> Option<&'a str> {
@@ -577,6 +1023,67 @@ fn random_token() -> String {
 mod tests {
     use super::*;
 
+    fn token_secret(uid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "lease-a-connect-token",
+                "namespace": "test-ns",
+                "uid": uid,
+                "resourceVersion": "7",
+                "ownerReferences": [{
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "ClusterLease",
+                    "name": "lease-a",
+                    "uid": "lease-uid",
+                    "controller": false
+                }]
+            },
+            "data": { "token": "dG9rZW4=" }
+        })
+    }
+
+    fn token_identity(uid: &str) -> KubernetesResourceIdentity {
+        KubernetesResourceIdentity {
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            namespace: Some("test-ns".into()),
+            name: "lease-a-connect-token".into(),
+            uid: uid.into(),
+        }
+    }
+
+    fn verified_lease() -> ClusterLease {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+            "kind": "ClusterLease",
+            "metadata": {
+                "name": "lease-a",
+                "namespace": "test-ns",
+                "uid": "lease-uid",
+                "resourceVersion": "3"
+            },
+            "spec": {
+                "poolRef": "pool-a",
+                "ttl": "1h",
+                "requester": { "type": "kobe:sandbox-composition", "identity": "kobe-operator" },
+                "cleanupMode": "VerifiedDestroy"
+            },
+            "status": { "phase": "Pending" }
+        }))
+        .unwrap()
+    }
+
+    fn reserved_token_secret(uid: &str, attempt: &str) -> serde_json::Value {
+        let mut secret = token_secret(uid);
+        secret["metadata"]["annotations"] = serde_json::json!({
+            CONNECT_TOKEN_ATTEMPT_ANNOTATION: attempt
+        });
+        secret.as_object_mut().unwrap().remove("data");
+        secret
+    }
+
     #[test]
     fn build_connect_kubeconfig_uses_lease_scoped_names() {
         let kubeconfig = build_connect_kubeconfig(
@@ -593,6 +1100,180 @@ mod tests {
         assert!(kubeconfig.contains("user: lease-abc"));
         assert!(kubeconfig.contains("token: token-123"));
         assert!(!kubeconfig.contains("current-context: default"));
+    }
+
+    #[tokio::test]
+    async fn verified_token_delete_rejects_a_same_named_replacement_without_delete() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_secret("replacement-uid")))
+            .mount(&server)
+            .await;
+
+        let check = delete_lease_connect_token_verified(
+            &client,
+            "test-ns",
+            "lease-a",
+            "lease-uid",
+            &token_identity("original-uid"),
+        )
+        .await;
+        assert_eq!(check.result, CheckResult::Unknown);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method != http::Method::DELETE)
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_token_delete_requires_an_observed_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let secret_path = "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token";
+        Mock::given(method("GET"))
+            .and(path(secret_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_secret("token-uid")))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(secret_path))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(secret_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_secret("token-uid")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity = token_identity("token-uid");
+        let check = delete_lease_connect_token_verified(
+            &client,
+            "test-ns",
+            "lease-a",
+            "lease-uid",
+            &identity,
+        )
+        .await;
+        assert_eq!(check.result, CheckResult::Verified);
+        assert_eq!(check.verified, vec![identity.canonical_id()]);
+    }
+
+    #[tokio::test]
+    async fn reservation_posts_one_empty_secret_for_the_durable_attempt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let secret_path = "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token";
+        Mock::given(method("GET"))
+            .and(path(secret_path))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/namespaces/test-ns/secrets"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(reserved_token_secret("token-uid", "attempt-1")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let identity =
+            reserve_lease_connect_token(&client, "test-ns", &verified_lease(), "attempt-1")
+                .await
+                .unwrap();
+        assert_eq!(identity, token_identity("token-uid"));
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|request| request.method == http::Method::POST)
+            .expect("one create-capable request");
+        let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert!(body.get("data").is_none());
+        assert!(body.get("stringData").is_none());
+        assert_eq!(
+            body["metadata"]["annotations"][CONNECT_TOKEN_ATTEMPT_ANNOTATION],
+            "attempt-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_restart_observes_404_without_reposting() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v1/namespaces/test-ns/secrets/lease-a-connect-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(crate::testutil::k8s_not_found(
+                    "secrets",
+                    "lease-a-connect-token",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(
+            observe_reserved_lease_connect_token(
+                &client,
+                "test-ns",
+                &verified_lease(),
+                "attempt-1",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method != http::Method::POST),
+            "a restart in Creating must never retry the POST"
+        );
     }
 
     #[test]

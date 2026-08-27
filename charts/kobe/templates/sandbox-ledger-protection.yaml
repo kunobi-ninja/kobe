@@ -1,0 +1,132 @@
+{{- if ne .Values.agentSandbox.mode "disabled" }}
+{{- $ledgerNamespace := include "kobe.sandboxLedgerNamespace" . -}}
+# This namespace is the Sandbox admission CAS ledger. It is retained because
+# deleting the namespace would free quota tokens before workload teardown was
+# proved, allowing over-admission during an uninstall or mode transition.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ledgerNamespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+    kobe.kunobi.ninja/sandbox-ledger: "true"
+---
+# Predictable reservation names are safe only when no tenant can mutate them.
+# Because the namespace above is dedicated, denying every other identity here
+# cannot interfere with unrelated controllers or leader elections.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    # Spell out the API-server defaults because startup validates the stored,
+    # defaulted object rather than the pre-admission Helm payload.
+    matchPolicy: Equivalent
+    namespaceSelector: {}
+    objectSelector: {}
+    resourceRules:
+      - apiGroups: ["coordination.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["leases"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        scope: "*"
+  matchConditions:
+    - name: only-sandbox-ledger-namespace
+      expression: 'request.namespace == {{ $ledgerNamespace | quote }}'
+  validations:
+    - expression: >-
+        request.userInfo.username ==
+        "system:serviceaccount:{{ .Release.Namespace }}:{{ include "kobe.serviceAccountName" . }}"
+      message: "only the kobe operator ServiceAccount may mutate Sandbox admission reservations"
+      reason: Forbidden
+    # Startup submits this exact name with dryRun=All and requires this policy
+    # to reject it. Merely observing a type-checked policy object does not prove
+    # that the ValidatingAdmissionPolicy admission plugin is enabled.
+    - expression: >-
+        request.operation != "CREATE" ||
+        object.metadata.name != "kobe-ledger-policy-enforcement-canary"
+      message: "Sandbox ledger admission-policy enforcement canary"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  validationActions: [Deny]
+---
+# Per-principal policy bounds one caller; this separate object-count quota
+# bounds aggregate etcd growth across arbitrarily many identities.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  namespace: {{ $ledgerNamespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  hard:
+    count/leases.coordination.k8s.io: {{ .Values.agentSandbox.reservationObjectLimit | quote }}
+    # A zero ConfigMap allowance lets startup prove, with dryRun=All, that the
+    # ResourceQuota admission plugin is enforcing this namespace. No ConfigMap
+    # can persist here.
+    count/configmaps: "0"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  namespace: {{ $ledgerNamespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    # Admission reservations are immutable objects; distributed Sandbox access
+    # gates additionally use UID/resourceVersion-fenced JSON Patch to serialize
+    # entry and teardown close operations across replicas.
+    verbs: ["get", "list", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get"]
+  # Required only for the dry-run quota-enforcement canary. The zero quota
+  # above makes every real or dry-run ConfigMap CREATE fail admission.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  namespace: {{ $ledgerNamespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kobe.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "kobe.sandboxLedgerPolicyName" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

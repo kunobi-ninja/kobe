@@ -27,6 +27,8 @@ pub struct SandboxPolicy {
     pub verbs: Vec<SandboxVerb>,
     pub max_ttl: chrono::Duration,
     pub max_concurrent_leases: u32,
+    /// Runtime TTL extensions allowed per Sandbox lease, bounded by `max_ttl`.
+    pub max_extensions: u32,
     pub resource_ceiling: SandboxResourceCeiling,
 }
 
@@ -183,6 +185,7 @@ mod tests {
                 verbs: vec![SandboxVerb::Lease, SandboxVerb::Release],
                 max_ttl: chrono::Duration::minutes(30),
                 max_concurrent_leases: 3,
+                max_extensions: 2,
                 resource_ceiling: SandboxResourceCeiling {
                     max_cpu: "2".into(),
                     max_memory: "4Gi".into(),

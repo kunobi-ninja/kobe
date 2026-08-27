@@ -9,6 +9,19 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+{{- if .Values.teardownAuthority.separate }}
+---
+# Only rendered with the split authority, whose Namespace is rendered under
+# the same condition: a ServiceAccount in a namespace the chart does not
+# create fails the install.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+  namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+{{- end }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -47,11 +60,79 @@ rules:
   - apiGroups: ["kobe.kunobi.ninja"]
     resources: ["sandboxpools"]
     verbs: ["get", "list", "watch"]
-  # Sandbox callers create lease intent through the HTTP API. Lifecycle
-  # controllers, not admission, own the status subresource.
+  # The control plane may authenticate evidence but cannot write it.
   - apiGroups: ["kobe.kunobi.ninja"]
-    resources: ["sandboxleases"]
+    resources: ["verifiedteardownevidence"]
+    verbs: ["get", "list", "watch"]
+  # Pool reconciliation publishes exact allocation counts and a fail-closed
+  # readiness certificate. Keep status authority separate from pool spec:
+  # the operator may report observations but cannot rewrite administrator
+  # isolation, images, placement, or resource policy.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxpools/status"]
+    verbs: ["get", "patch", "update"]
+  # Sandbox callers create lease intent through the HTTP API. Lifecycle
+  # controllers, not admission, own the status subresource — which needs its
+  # own rule: `/status` is a separate resource to RBAC, so a controller with
+  # `patch` on `sandboxleases` alone still 403s on every phase transition.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxleases", "sandboxleases/status"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Durable execution records (#82). A bounded access-ledger CAS reserves
+  # capacity first; the derived-name CREATE and exact UID bind then ensure two
+  # concurrent retries cannot spawn the same idempotency key twice.
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["sandboxexecutions", "sandboxexecutions/status"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # Upstream objects for real SandboxPool/SandboxLease placement. Agent Sandbox
+  # itself is operator-installed; Kobe mutates only exact-provenance product
+  # objects. `delete` is required for tenant lease cleanup, not validation.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools", "sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The upstream `Sandbox` object itself, in the CORE Agent Sandbox group.
+  # Read-only: Kobe creates Sandboxes only indirectly, through claims. It is
+  # read to find the Pod behind a claim, via upstream's own `status.selector`.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+  # The readiness canary runs an administrator-declared command inside the
+  # Sandbox. Upstream `Ready` describes the container, not the agent in it —
+  # a crash-looped or wedged agent satisfies it, and believing it starts a
+  # paid runtime TTL on a Sandbox that cannot serve.
+  #
+  # `pods/exec` is a powerful verb, so what bounds it matters: the argv comes
+  # from the `SandboxPool` spec, which only an administrator can write, and a
+  # lease selects a pool and nothing else. No caller input reaches this.
+  # BOTH `get` and `create`, because the required verb depends on the server
+  # version. kube-rs builds exec, attach and port-forward as GET WebSocket
+  # upgrades, which apiservers before 1.35 authorize as `get` — but 1.35's
+  # `AuthorizePodWebsocketUpgradeCreatePermission` gate (default on, KEP-4006)
+  # closed that read-verb escalation and requires `create` on any connection
+  # upgrade. Granting only one verb 403s these calls on the other side of that
+  # boundary, including the readiness canary, which runs under this identity —
+  # a failure no unit test can see, because RBAC and that gate only apply
+  # against a real apiserver.
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach", "pods/portforward"]
+    verbs: ["get", "create"]
+  # Sandbox log reads (#81). Separate from `pods` above because `pods/log` is
+  # its own resource to RBAC — and worth stating explicitly: this is the verb
+  # that lets the operator return a workload's own output to its lease holder.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Per-lease scoped credentials (#81). Kobe mints a ServiceAccount whose Role
+  # names exactly one Pod, then a short-lived token for it, and reaches the
+  # tenant's Sandbox as THAT identity rather than as itself.
+  #
+  # `serviceaccounts/token` is the mint. It is bounded by RBAC's own escalation
+  # rule: a Role may only be created granting permissions the creator already
+  # holds, so this cannot manufacture authority the operator lacks — it can
+  # only hand out less.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
   # Core resources for virtual cluster lifecycle
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods", "pods/status", "events", "persistentvolumeclaims", "endpoints"]
@@ -101,21 +182,35 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
-  # Leader election, AND the Sandbox admission ledger.
-  #
-  # `list` and `delete` are load-bearing for admission, not leader election:
-  # quota and alias reservations are coordination Leases, released by deleting
-  # them and found by listing on the owning lease's UID label. Without both,
-  # every release 403s and a caller's quota is consumed permanently on the
-  # first teardown — a failure no unit test sees, because it only exists once
-  # real RBAC applies.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # The creation manifest captures the exact live StorageClass UID and
+  # reclaimPolicy for every bound PV. A configured class name is not proof that
+  # deletion reclaims data, and a failed lookup must leave verified teardown
+  # ineligible rather than guessing.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
   # CRD discovery (Velero detection)
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get"]
+  # Startup proves the Sandbox ledger's fail-closed admission policy and Deny
+  # binding before serving Sandbox routes. Read-only: the chart, not the
+  # operator process, owns these cluster-scoped security controls.
+  {{- if ne .Values.agentSandbox.mode "disabled" }}
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    verbs: ["get"]
+  # Do not trust the configured username: prove the Kubernetes client is
+  # authenticated as that exact ServiceAccount before admitting Sandboxes.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["selfsubjectreviews"]
+    verbs: ["create"]
+  # Prove the running ServiceAccount can perform every coordination-Lease verb
+  # used by reservation cleanup and distributed Sandbox access CAS.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -130,6 +225,38 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: {{ include "kobe.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election lives in the operator namespace. Keep it namespace-scoped;
+# Sandbox reservation access is a separate Role in the dedicated ledger
+# namespace, so neither responsibility grants coordination-Lease authority
+# cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kobe.fullname" . }}-leader-election
+  namespace: {{ .Values.operatorNamespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kobe.fullname" . }}-leader-election
+  namespace: {{ .Values.operatorNamespace }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kobe.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "kobe.fullname" . }}-leader-election
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1

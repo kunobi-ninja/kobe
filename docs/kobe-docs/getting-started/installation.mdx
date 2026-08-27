@@ -155,9 +155,16 @@ Helm does not upgrade objects from a chart's `crds/` directory. Before upgrading
 an existing Kobe release to a version that adds CRDs, apply the new chart's CRD
 manifests explicitly, then upgrade the operator.
 
-`SandboxPool` and `SandboxLease` are deliberately not operator startup
-prerequisites, so existing cluster-lease endpoints can remain available during
-a staged upgrade. Until both Sandbox CRDs are installed and established, the
-Sandbox API is unavailable; a `503 Service Unavailable` means Kobe could not
-verify Sandbox admission against Kubernetes. Install the CRDs before enabling
-Sandbox API clients.
+`SandboxPool`, `SandboxLease` and `SandboxExecution` are deliberately not
+operator startup prerequisites, so existing cluster-lease endpoints can remain
+available during a staged upgrade. Until the Sandbox CRDs are installed and
+established, the Sandbox API is unavailable; a `503 Service Unavailable` means
+Kobe could not verify Sandbox admission against Kubernetes. Install the CRDs
+before enabling Sandbox API clients.
+
+The three are checked per endpoint rather than all at once, so a partial
+install degrades legibly instead of failing everything: leasing needs
+`SandboxPool` and `SandboxLease`, and the execution endpoints additionally
+need `SandboxExecution`. A cluster with the first two but not the third can
+still lease and connect — only `POST /v1/sandbox-leases/{id}/executions` and
+its siblings report the missing CRD, and they say which one.

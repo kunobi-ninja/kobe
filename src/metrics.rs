@@ -34,8 +34,8 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use prometheus::{
-    Encoder, HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge_vec,
+    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, TextEncoder,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge_vec,
 };
 
 /// Build identity of the running process, as the conventional info-gauge: the
@@ -1318,6 +1318,20 @@ pub static CONNECT_PROXY_CACHE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
     .unwrap()
 });
 
+/// Sandbox admission attempts refused by the per-principal rate limiter.
+///
+/// Unlabelled on purpose. The only dimension anyone would want here is *which*
+/// principal, and that is precisely the high-cardinality identifier this module
+/// forbids as a label; the throttle already logs the identity, so traces answer
+/// "who" and this series answers "how much, and is it growing".
+pub static SANDBOX_ADMISSION_RATE_LIMITED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "kobe_sandbox_admission_rate_limited_total",
+        "Sandbox lease admission attempts refused by the per-principal rate limit"
+    )
+    .unwrap()
+});
+
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
@@ -1425,6 +1439,10 @@ pub fn init() {
     // Connect proxy
     LazyLock::force(&CONNECT_PROXY_REQUEST_DURATION);
     LazyLock::force(&CONNECT_PROXY_CACHE_TOTAL);
+    // Sandbox admission. Registered up front so an alert on
+    // `rate(kobe_sandbox_admission_rate_limited_total[5m])` reads zero rather
+    // than "no data" until the first throttle.
+    LazyLock::force(&SANDBOX_ADMISSION_RATE_LIMITED_TOTAL);
     // Lease timing
     LazyLock::force(&LEASE_QUEUE_WAIT_SECONDS);
     LazyLock::force(&LEASE_HOLD_SECONDS);

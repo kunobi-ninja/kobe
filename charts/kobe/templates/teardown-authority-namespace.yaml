@@ -1,0 +1,13 @@
+{{- if .Values.teardownAuthority.separate }}
+# The authority ServiceAccount and pod live in a deterministic dedicated
+# namespace so the admission firewall has one exact scope. The namespace is
+# only the structural half of the boundary: the chart is not safe to install
+# unless fail-closed admission also denies the general identity here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "kobe.teardownAuthorityNamespace" . }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    kobe.kunobi.ninja/teardown-authority: "true"
+{{- end }}

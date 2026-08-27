@@ -6,14 +6,61 @@ description: Define bounded, administrator-owned Agent Sandbox templates and pla
 # Sandbox pools
 
 <Callout type="warn">
-  `SandboxPool` and `SandboxLease` are alpha APIs. Kobe admits lease intent, but
-  a lease remains `Pending` until a compatible Agent Sandbox placement
-  controller is enabled.
+  `SandboxPool` and `SandboxLease` are alpha APIs. Set
+  `agentSandbox.mode=external` only after installing Agent Sandbox v0.5.6
+  yourself. Kobe validates its consumed APIs read-only before mounting the
+  Sandbox HTTP API; `disabled` mounts no Sandbox endpoints.
 </Callout>
 
 Administrators author `SandboxPool` objects. API callers only choose an allowed
 pool, TTL, and optional alias; they cannot provide a Pod spec, namespace,
 RuntimeClass, environment values, mounts, PVCs, or target credentials.
+
+## Runtime ownership
+
+`agentSandbox.mode` has two values:
+
+- `disabled` is the default. Kobe renders no upstream Agent Sandbox resources
+  and serves no new Sandbox API work. Lifecycle controllers continue cleanup
+  for leases admitted before the mode changed.
+- `external` installs, upgrades, and uninstalls nothing. The operator owns the
+  Agent Sandbox v0.5.6 core, extensions, CRDs, controller, and webhook.
+
+Kobe checks that all four consumed CRDs are established, serve the expected
+`v1beta1` APIs, and expose the v0.5.6 WarmPool generation field. Validation is
+GET-only: it does not inspect one particular Deployment topology and does not
+create a temporary `SandboxClaim`. Consequently, API compatibility does not
+prove that the external controller is healthy. The actual Claim for a requested
+lease still fails closed during provisioning, and its administrator-declared
+readiness command must pass before that lease becomes Ready.
+
+Kobe does not provide an Agent-Sandbox-specific child bootstrap. An operator
+may create a normal `BootstrapConfig` and reference it explicitly from the
+child `ClusterPool`, or provide the runtime through another provisioning path:
+
+```yaml
+spec:
+  bootstraps:
+    - name: my-agent-sandbox-v0-5-6
+```
+
+`BootstrapConfig` is generic operator input. Kobe does not create, inject, or
+require a special name or bundle digest. Before writing Sandbox objects inside
+an allocated child, Kobe performs the same read-only API compatibility check.
+
+<Callout type="info">
+  If a cluster still runs v0.5.4 or another incompatible release, upgrade it to
+  v0.5.6 before enabling `external`. Update operator-authored child bootstrap
+  content at the same time and recycle or upgrade older children according to
+  your pool policy. Kobe never performs this upgrade; it rejects a child whose
+  APIs are incompatible.
+</Callout>
+
+Agent Sandbox does not install gVisor, Kata, node runtimes, or RuntimeClasses.
+This release certifies only `trusted-runc`, for trusted workloads. The `gvisor`
+and `kata` schema values are reserved for a future isolation qualification
+under issue #14; selecting either keeps the pool `Ready=False` even when the
+named RuntimeClass exists. Kobe never downgrades either tier silently to runc.
 
 ## Example
 
@@ -51,8 +98,7 @@ spec:
         container: workspace
         port: 8080
   isolation:
-    tier: gvisor
-    runtimeClassName: gvisor
+    tier: trusted-runc
   readiness:
     canary:
       argv: ["/usr/local/bin/agent", "healthcheck"]
@@ -61,7 +107,105 @@ spec:
 
 Every container must declare CPU, memory, and ephemeral-storage requests and
 limits. `defaultContainer` and each exposed port must refer to a declared
-container. Canary `argv` is executed directly, without an implicit shell.
+container. Kobe runs every Sandbox container as UID/GID `65532`, drops all
+Linux capabilities, disables privilege escalation, and applies the
+`RuntimeDefault` seccomp profile. Images must therefore work as that non-root
+user and must not require writable root-owned paths. Canary `argv` is executed
+directly, without an implicit shell.
+
+## Admission ledger namespace
+
+Sandbox quota slots, aliases, and distributed operation gates are coordination
+`Lease` objects. When Sandbox mode is enabled, the chart creates a dedicated
+namespace named from the immutable Helm release identity
+(`<release>-sandbox-ledger-<hash>`) with:
+
+- a `ValidatingAdmissionPolicy` that permits Lease mutations only from the
+  exact Kobe operator ServiceAccount;
+- a namespace-wide Lease object quota, configured by
+  `agentSandbox.reservationObjectLimit` (default `4096`, minimum `4`); and
+- namespace-scoped operator RBAC. The chart grants tenants no access there,
+  and the admission policy denies every non-operator Lease create, update, or
+  delete even if another administrator grants broader RBAC.
+
+The namespace, policy, binding, and quota are retained on Helm uninstall.
+Before admission, Kobe creates one exact access gate per Sandbox; admission
+then adds one quota token and, when requested, one alias token. Each principal
+with active operations adds one shared principal ledger. This is why values
+below the documented minimum cannot represent one fully usable aliased lease.
+Deleting any of them while a `SandboxLease` is live can free its admission slot
+or erase the proof that all API replicas drained before teardown. Remove
+retained ledger resources only after every Sandbox lease, reservation, and
+operation gate has been verified absent. The admission policy
+requires Kubernetes 1.30 or newer with the `ValidatingAdmissionPolicy` and
+`ResourceQuota` admission plugins enabled. Before serving Sandbox routes, Kobe
+confirms its authenticated ServiceAccount identity and proves both plugins with
+server-side dry-run requests that must be denied; startup fails if either
+control is inactive.
+
+The namespace is intentionally not configurable. Moving it would both reset
+admission capacity and leave retained old reservations outside the active
+policy. The namespace contains no resources other than this ledger.
+
+## Durable execution
+
+Kobe uses the same supervisor for wait-mode and detached commands. A raw
+Kubernetes exec cannot apply a working directory without a shell, cannot always
+recover the exact exit code, and dies with its connection. A pool therefore
+offers the durable execution API only if its image ships `kobe-runner` and the
+template says where:
+
+```yaml
+template:
+  defaultContainer: workspace
+  runnerPath: /kobe-runner
+```
+
+Copy the binary into your own agent image:
+
+```dockerfile
+COPY --from=zondax/kobe-runner:latest /kobe-runner /kobe-runner
+RUN install -d -o 65532 -g 65532 -m 0700 /var/run/kobe/executions
+USER 65532:65532
+```
+
+Replace `65532:65532` with the UID and GID your workload uses. The directory must
+exist and be writable by that identity; ordinary non-root users cannot create
+new directories directly under `/var/run`. The runner is a static binary with
+no dependencies on the base image, and at runtime it needs no privileges beyond
+starting a process and writing the execution spool.
+
+That spool is not an isolation boundary. The runner and workload use the same
+container identity, so the workload can remove or replace its files. Kobe never
+restores spawn authority from a missing spool and never uses a runner report as
+proof that target capacity is safe to reuse. An execution that crossed
+`startedAt` therefore holds one active slot until that exact Sandbox target is
+destroyed.
+
+Without `runnerPath`, `POST /v1/sandbox-leases/{id}/executions` returns
+`501 Not Implemented` in both modes. That is deliberate: selecting wait mode
+must not silently remove working-directory, exact-exit-code, process-group
+cancellation, or reconnectability guarantees.
+
+Output from every durable execution is retained inside the container until the
+Sandbox is torn down and can be read back through
+`GET /v1/sandbox-leases/{id}/executions/{execution}/logs`. Kobe retains at most
+1 MiB of stdout and 1 MiB of stderr per execution, and accepts at most 256
+idempotency keys — durable executions — over one Sandbox lifetime. An execution
+that crossed `startedAt` holds its slot until that exact Sandbox target is
+destroyed, because same-UID runner state cannot safely prove capacity is
+reusable; the per-lifetime count is therefore the only execution budget, sized
+for long-running agent sessions rather than a small per-target batch.
+Requests beyond the limit return `409 Conflict` with reason
+`execution_limit_exhausted`: retrying cannot succeed, a new lease must be
+requested.
+
+Cancelling an execution asks the runner to terminate its whole process group,
+not only the process Kobe started. Lease release first closes new access, then
+asks every recorded runner to cancel. Runner state remains tenant-controlled,
+so Kobe retains each started execution record and slot, destroys the exact
+Sandbox target, and retires them only after target absence is proven. Execution
+records are deleted with that Sandbox rather than kept as history after it ends.
 
 ## Placement and isolation
 
@@ -75,9 +219,10 @@ placement:
   clusterPoolRef: ci-sandbox
 ```
 
-Isolation tier `trusted-runc` must omit `runtimeClassName`. Hardened tiers
-`gvisor` and `kata` require the exact administrator-selected RuntimeClass name.
-Lease callers cannot override either placement or isolation.
+Isolation tier `trusted-runc` must omit `runtimeClassName`. Reserved tiers
+`gvisor` and `kata` require the exact administrator-selected RuntimeClass name,
+but remain ineligible until issue #14 qualifies their complete runtime and node
+contract. Lease callers cannot override either placement or isolation.
 
 See the [API reference](/docs/api/reference#sandbox-leases) for lease operations
 and [authentication and authorization](/docs/auth/overview) for Sandbox policy

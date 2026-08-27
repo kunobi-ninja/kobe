@@ -17,6 +17,12 @@ spec:
     - jsonPath: .status.ready
       name: Ready
       type: integer
+    - jsonPath: .status.allocated
+      name: Allocated
+      type: integer
+    - jsonPath: .status.quarantined
+      name: Quarantined
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -26,7 +32,13 @@ spec:
         description: Auto-generated derived type for SandboxPoolSpec via `CustomResource`
         properties:
           spec:
-            description: Administrator-owned class of Agent Sandbox capacity.
+            description: |-
+              Administrator-owned class of Agent Sandbox capacity.
+
+              Root CRD CEL can couple the status generation markers to one another, but
+              Kubernetes does not expose `metadata.generation` to CRD validation rules.
+              The API and controllers therefore revalidate those markers against the
+              live object's generation before they admit work or trust readiness.
             properties:
               defaultTtl:
                 description: TTL used when a lease request omits one.
@@ -93,7 +105,10 @@ spec:
                   canary:
                     properties:
                       argv:
-                        description: Direct argv vector; no implicit shell expansion.
+                        description: |-
+                          Direct argv vector; no implicit shell expansion. Certification may
+                          execute this more than once after a controller crash or lost status
+                          response, so the command must be idempotent and safe to retry.
                         items:
                           maxLength: 4096
                           minLength: 1
@@ -240,6 +255,24 @@ spec:
                       type: object
                     maxItems: 64
                     type: array
+                  runnerPath:
+                    description: |-
+                      Absolute path to `kobe-runner` inside `defaultContainer`, when the
+                      administrator's image ships one.
+
+                      Absent means this pool does not offer detached execution, and the API
+                      says so rather than approximating it. A detached execution that actually
+                      dies with its connection is worse than none, because the caller has
+                      already built on the guarantee it appeared to offer.
+
+                      A constrained path rather than free text: it becomes `argv[0]` of an
+                      exec, so anything that could carry an argument, a shell metacharacter or
+                      a nul is refused by the schema before it can reach one.
+                    maxLength: 255
+                    minLength: 1
+                    nullable: true
+                    pattern: ^/[A-Za-z0-9._/-]*$
+                    type: string
                 required:
                 - containers
                 - defaultContainer
@@ -278,18 +311,498 @@ spec:
             properties:
               allocated:
                 default: 0
+                description: |-
+                  Admitted leases whose immutable pool UID matches this pool and whose
+                  current phase consumes capacity.
                 format: uint32
                 minimum: 0.0
                 type: integer
+              certification:
+                description: |-
+                  Restart-safe certification attempt for this exact Pool generation.
+
+                  The controller checkpoints object identities before crossing each
+                  external side effect. A non-terminal attempt is deliberately retained:
+                  abandoning its exact Claim or teardown fence would make a controller
+                  restart capable of leaking capacity or admitting against stale proof.
+                nullable: true
+                properties:
+                  baselineIdleSandboxUids:
+                    description: |-
+                      WarmPool-owned Sandbox UIDs present before the sacrificial Claim. Clean
+                      replenishment must exclude the claimed Sandbox and preserve none of a
+                      replaced generation's identities.
+                    items:
+                      maxLength: 128
+                      minLength: 1
+                      type: string
+                    maxItems: 256
+                    type: array
+                  canaryPassedAt:
+                    format: date-time
+                    maxLength: 64
+                    nullable: true
+                    type: string
+                  certifiedAt:
+                    format: date-time
+                    maxLength: 64
+                    nullable: true
+                    type: string
+                  drainGeneration:
+                    description: |-
+                      WarmPool generation created by the post-fence scale-to-zero write. The
+                      v0.5.6 `observedGeneration` ACK is meaningful only for this exact value.
+                    format: int64
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
+                  fingerprint:
+                    description: |-
+                      SHA-256 over the Pool UID/generation, exact Template/WarmPool identity,
+                      pinned runtime version, and canonical canary requirements.
+                    maxLength: 64
+                    minLength: 64
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  message:
+                    description: |-
+                      Human-readable fail-closed reason. In `CleanupBlocked`, this is the
+                      exact causal proof that the controller could not obtain.
+                    maxLength: 4096
+                    nullable: true
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  persistentVolumeClaims:
+                    description: |-
+                      Exact PVC/PV identities seen before teardown. Empty means the closed
+                      Pool template proved that no durable volumes can be created.
+                    items:
+                      description: |-
+                        Non-secret identity of one exact Kubernetes object. String fields use the
+                        Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                        finite admission cost instead of being rejected by the API server.
+                      properties:
+                        apiVersion:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        generation:
+                          format: int64
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                        kind:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          maxLength: 63
+                          minLength: 1
+                          nullable: true
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        uid:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - uid
+                      type: object
+                    maxItems: 16
+                    type: array
+                  persistentVolumes:
+                    items:
+                      description: |-
+                        Non-secret identity of one exact Kubernetes object. String fields use the
+                        Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                        finite admission cost instead of being rejected by the API server.
+                      properties:
+                        apiVersion:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        generation:
+                          format: int64
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                        kind:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          maxLength: 63
+                          minLength: 1
+                          nullable: true
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        uid:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - uid
+                      type: object
+                    maxItems: 16
+                    type: array
+                  phase:
+                    description: |-
+                      Durable phase of one management-pool certification attempt.
+
+                      `Certified` is the only phase that may accompany Pool `Ready=True`.
+                      `CleanupBlocked` is fail-closed and retains every exact reference needed to
+                      resume or investigate cleanup. Child placement does not use this state
+                      until an equivalent in-child receipt protocol exists.
+                    enum:
+                    - initialized
+                    - claimCreated
+                    - workloadCaptured
+                    - canaryPassed
+                    - fenceInstalled
+                    - drainAcknowledged
+                    - claimDeleting
+                    - absenceProven
+                    - replenished
+                    - fenceFinalizerRemoved
+                    - fenceDeleting
+                    - certified
+                    - cleanupBlocked
+                    type: string
+                  pod:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  replenishGeneration:
+                    description: WarmPool generation created when restoring the configured capacity.
+                    format: int64
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
+                  sandbox:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandboxClaim:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandboxTemplate:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  sandboxWarmPool:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  service:
+                    description: |-
+                      Non-secret identity of one exact Kubernetes object. String fields use the
+                      Kubernetes name/identity ceilings so root-level CEL comparisons have a
+                      finite admission cost instead of being rejected by the API server.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                  teardownFence:
+                    description: Immutable parameter object for the teardown ValidatingAdmissionPolicy.
+                    nullable: true
+                    properties:
+                      apiVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      generation:
+                        format: int64
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      kind:
+                        maxLength: 63
+                        minLength: 1
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      namespace:
+                        maxLength: 63
+                        minLength: 1
+                        nullable: true
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - uid
+                    type: object
+                required:
+                - fingerprint
+                - observedGeneration
+                - phase
+                - sandboxTemplate
+                - sandboxWarmPool
+                type: object
+                x-kubernetes-validations:
+                - message: workload and later certification phases require exact Claim, Sandbox and Pod references
+                  rule: self.phase in ['initialized', 'claimCreated', 'cleanupBlocked'] || (has(self.sandboxClaim) && has(self.sandbox) && has(self.pod))
+                - message: post-fence certification phases require the exact teardown fence reference
+                  rule: '!(self.phase in [''fenceInstalled'', ''drainAcknowledged'', ''claimDeleting'', ''absenceProven'', ''replenished'', ''fenceFinalizerRemoved'', ''fenceDeleting'', ''certified'']) || has(self.teardownFence)'
+                - message: post-canary certification phases require the durable canary timestamp
+                  rule: '!(self.phase in [''canaryPassed'', ''fenceInstalled'', ''drainAcknowledged'', ''claimDeleting'', ''absenceProven'', ''replenished'', ''fenceFinalizerRemoved'', ''fenceDeleting'', ''certified'']) || has(self.canaryPassedAt)'
+                - message: Certified requires a durable certification timestamp
+                  rule: self.phase != 'certified' || has(self.certifiedAt)
+                - message: drain acknowledgement and later phases require the exact WarmPool drain generation
+                  rule: '!(self.phase in [''drainAcknowledged'', ''claimDeleting'', ''absenceProven'', ''replenished'', ''fenceFinalizerRemoved'', ''fenceDeleting'', ''certified'']) || has(self.drainGeneration)'
+                - message: replenishment and terminal phases require the exact restored WarmPool generation
+                  rule: '!(self.phase in [''replenished'', ''fenceFinalizerRemoved'', ''fenceDeleting'', ''certified'']) || has(self.replenishGeneration)'
               conditions:
+                description: |-
+                  Current-generation pool certification. `Ready=True` authorizes new
+                  leases; missing, stale, `False`, or `Unknown` conditions fail closed.
+                  Replica counters alone never authorize admission.
                 items:
-                  description: Kubernetes-style condition with the generation from which it was derived.
+                  description: |-
+                    Kubernetes-style condition with the generation from which it was derived.
+                    Status lists are capped because CEL lifecycle proofs scan them on every
+                    status write.
                   properties:
                     lastTransitionTime:
                       format: date-time
                       nullable: true
                       type: string
                     message:
+                      maxLength: 32768
                       type: string
                     observedGeneration:
                       format: int64
@@ -297,6 +810,7 @@ spec:
                       nullable: true
                       type: integer
                     reason:
+                      maxLength: 128
                       type: string
                     status:
                       description: Kubernetes Condition status values.
@@ -306,6 +820,8 @@ spec:
                       - Unknown
                       type: string
                     type:
+                      maxLength: 63
+                      minLength: 1
                       type: string
                   required:
                   - message
@@ -313,6 +829,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
@@ -322,16 +839,112 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              placement:
+                description: |-
+                  The placement this Pool generation is being reconciled under, recorded
+                  by the placement controller from `spec.placement`.
+
+                  Status-only on purpose: the placement CEL invariants compare authority
+                  against this recorded value, never against `spec.placement`. Kubernetes
+                  carries status over unchanged across a spec-only update, so a rule
+                  reading spec would compare the new intent against the previous
+                  generation's recorded state and reject every placement edit forever —
+                  freezing a child pool's target even though nothing inconsistent had
+                  been written. With the value mirrored here, an edit is admitted and the
+                  controller's next reconcile brings status back in line with spec.
+                nullable: true
+                properties:
+                  clusterPoolRef:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  type:
+                    enum:
+                    - management
+                    - childCluster
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - message: management must not set clusterPoolRef; childCluster must set it
+                  rule: (self.type == 'management' && !has(self.clusterPoolRef)) || (self.type == 'childCluster' && has(self.clusterPoolRef))
+              placementAuthority:
+                description: |-
+                  Exact child `ClusterPool` proven composition-eligible for this Pool
+                  generation. Management placement and ineligible child pools omit it.
+                  This is discovery authority only: child `Ready` remains `False` until an
+                  in-child certification and teardown receipt protocol exists.
+                nullable: true
+                properties:
+                  apiVersion:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  generation:
+                    format: int64
+                    minimum: 1.0
+                    type: integer
+                  kind:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  namespace:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  uid:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                required:
+                - apiVersion
+                - generation
+                - kind
+                - name
+                - namespace
+                - uid
+                type: object
+              quarantined:
+                default: 0
+                description: |-
+                  Subset of `allocated` leases in the `Quarantined` phase. Quarantined
+                  capacity remains allocated until its complete footprint is proven absent.
+                format: uint32
+                minimum: 0.0
+                type: integer
               ready:
                 default: 0
+                description: |-
+                  Clean, idle upstream Sandboxes reported by the exact reconciled
+                  WarmPool's `readyReplicas`; allocated and quarantined capacity is not
+                  counted as ready.
                 format: uint32
                 minimum: 0.0
                 type: integer
             type: object
         required:
         - spec
-        title: SandboxPool
+        title: SandboxPoolValidated
         type: object
+        x-kubernetes-validations:
+        - message: Ready=True requires a coherent observed-generation durable Certified receipt
+          rule: '!has(self.status) || self.status == null || !has(self.status.conditions) || !self.status.conditions.exists(c, c.type == ''Ready'' && c.status == ''True'') || (has(self.status.observedGeneration) && self.status.conditions.exists(c, c.type == ''Ready'' && c.status == ''True'' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration) && has(self.status.certification) && self.status.certification.phase == ''certified'' && self.status.certification.observedGeneration == self.status.observedGeneration && has(self.status.certification.certifiedAt))'
+        - message: exact certification references are immutable within one fingerprint
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint != self.status.certification.fingerprint || (oldSelf.status.certification.sandboxTemplate == self.status.certification.sandboxTemplate && oldSelf.status.certification.sandboxWarmPool == self.status.certification.sandboxWarmPool && (!has(oldSelf.status.certification.sandboxClaim) || (has(self.status.certification.sandboxClaim) && oldSelf.status.certification.sandboxClaim == self.status.certification.sandboxClaim)) && (!has(oldSelf.status.certification.sandbox) || (has(self.status.certification.sandbox) && oldSelf.status.certification.sandbox == self.status.certification.sandbox)) && (!has(oldSelf.status.certification.pod) || (has(self.status.certification.pod) && oldSelf.status.certification.pod == self.status.certification.pod)) && (!has(oldSelf.status.certification.service) || (has(self.status.certification.service) && oldSelf.status.certification.service == self.status.certification.service)) && (!has(oldSelf.status.certification.persistentVolumeClaims) || (has(self.status.certification.persistentVolumeClaims) && oldSelf.status.certification.persistentVolumeClaims == self.status.certification.persistentVolumeClaims)) && (!has(oldSelf.status.certification.persistentVolumes) || (has(self.status.certification.persistentVolumes) && oldSelf.status.certification.persistentVolumes == self.status.certification.persistentVolumes)) && (!has(oldSelf.status.certification.baselineIdleSandboxUids) || (has(self.status.certification.baselineIdleSandboxUids) && oldSelf.status.certification.baselineIdleSandboxUids == self.status.certification.baselineIdleSandboxUids)) && (!has(oldSelf.status.certification.teardownFence) || (has(self.status.certification.teardownFence) && oldSelf.status.certification.teardownFence == self.status.certification.teardownFence)) && (!has(oldSelf.status.certification.drainGeneration) || (has(self.status.certification.drainGeneration) && oldSelf.status.certification.drainGeneration == self.status.certification.drainGeneration)) && (!has(oldSelf.status.certification.replenishGeneration) || (has(self.status.certification.replenishGeneration) && oldSelf.status.certification.replenishGeneration == self.status.certification.replenishGeneration)) && (!has(oldSelf.status.certification.canaryPassedAt) || (has(self.status.certification.canaryPassedAt) && oldSelf.status.certification.canaryPassedAt == self.status.certification.canaryPassedAt)) && (!has(oldSelf.status.certification.certifiedAt) || (has(self.status.certification.certifiedAt) && oldSelf.status.certification.certifiedAt == self.status.certification.certifiedAt)))))'
+        - message: an active certification fingerprint cannot be abandoned before exact cleanup
+          rule: '!has(oldSelf.status) || oldSelf.status == null || !has(oldSelf.status.certification) || (has(self.status) && self.status != null && has(self.status.certification) && (oldSelf.status.certification.fingerprint == self.status.certification.fingerprint || oldSelf.status.certification.phase == ''certified'' || (oldSelf.status.certification.phase in [''initialized'', ''cleanupBlocked''] && !has(oldSelf.status.certification.sandboxClaim) && !has(oldSelf.status.certification.sandbox) && !has(oldSelf.status.certification.teardownFence))))'
+        - message: placementAuthority must identify the exact child ClusterPool
+          rule: '!has(self.status) || self.status == null || !has(self.status.placementAuthority) || !has(self.status.placement) || (self.status.placement.type == ''childCluster'' && self.status.placementAuthority.apiVersion == ''kobe.kunobi.ninja/v1alpha1'' && self.status.placementAuthority.kind == ''ClusterPool'' && self.status.placementAuthority.name == self.status.placement.clusterPoolRef)'
+        - message: placementAuthority is published only with coherent CompositionEligible status
+          rule: '!has(self.status) || self.status == null || (has(self.status.placementAuthority) == (has(self.status.placement) && self.status.placement.type == ''childCluster'' && has(self.status.observedGeneration) && has(self.status.conditions) && self.status.conditions.exists(c, c.type == ''Ready'' && c.status == ''False'' && c.reason == ''CompositionEligible'' && has(c.observedGeneration) && c.observedGeneration == self.status.observedGeneration)))'
     served: true
     storage: true
     subresources:

@@ -1,0 +1,106 @@
+{{- if .Values.teardownAuthority.separate }}
+{{- $authorityServiceAccount := include "kobe.teardownAuthorityServiceAccountName" . -}}
+{{- $generalServiceAccount := include "kobe.serviceAccountName" . -}}
+{{- $poolServiceAccount := .Values.poolServiceAccount | default $generalServiceAccount -}}
+{{- $publisherServiceAccount := .Values.poolPublisherServiceAccount | default (printf "%s-pool-publisher" (include "kobe.fullname" .)) -}}
+{{- if or (eq $authorityServiceAccount $generalServiceAccount) (eq $authorityServiceAccount $poolServiceAccount) (eq $authorityServiceAccount $publisherServiceAccount) -}}
+{{- fail "teardown authority ServiceAccount must differ from the operator, pool, and pool-publisher identities" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kobe.fullname" . }}-teardown-authority
+  namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+  labels:
+    helm.sh/chart: {{ include "kobe.chart" . }}
+    {{- include "kobe.teardownAuthoritySelectorLabels" . | nindent 4 }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.teardownAuthority.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "kobe.teardownAuthoritySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kobe.teardownAuthoritySelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $authorityServiceAccount }}
+      {{- with .Values.teardownAuthority.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+        - name: teardown-authority
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: KOBE_PROCESS_ROLE
+              value: "teardown-authority"
+            - name: AGENT_SANDBOX_MODE
+              value: "disabled"
+            - name: OPERATOR_NAMESPACE
+              value: {{ .Values.operatorNamespace | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: KOBE_TEARDOWN_AUTHORITY_USERNAME
+              value: {{ printf "system:serviceaccount:%s:%s" (include "kobe.teardownAuthorityNamespace" .) (include "kobe.teardownAuthorityServiceAccountName" .) | quote }}
+            - name: KOBE_TEARDOWN_AUTHORITY_POLICY_NAME
+              value: {{ include "kobe.teardownAuthorityPolicyName" . | quote }}
+            - name: KOBE_TEARDOWN_AUTHORITY_FIREWALL_POLICY_NAME
+              value: {{ include "kobe.teardownAuthorityFirewallPolicyName" . | quote }}
+            - name: KOBE_CONTROL_PLANE_USERNAME
+              value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kobe.serviceAccountName" .) | quote }}
+            - name: KOBE_SYNC_IMAGE
+              value: {{ include "kobe.syncImage" . | quote }}
+            - name: POOL_SERVICE_ACCOUNT
+              value: {{ .Values.poolServiceAccount | default (include "kobe.serviceAccountName" .) | quote }}
+            - name: POOL_PUBLISHER_SERVICE_ACCOUNT
+              value: {{ .Values.poolPublisherServiceAccount | default (printf "%s-pool-publisher" (include "kobe.fullname" .)) | quote }}
+            - name: KUBECONFIG_PUBLISHER_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+            - name: HELM_CACHE_HOME
+              value: /tmp/helm/cache
+            - name: HELM_CONFIG_HOME
+              value: /tmp/helm/config
+            - name: HELM_DATA_HOME
+              value: /tmp/helm/data
+            {{- if .Values.postgres.urlSecret.name }}
+            - name: POSTGRES_URL_DIR
+              value: {{ .Values.postgres.urlSecret.mountPath | quote }}
+            {{- else if .Values.postgres.url }}
+            - name: POSTGRES_URL
+              value: {{ .Values.postgres.url | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.postgres.urlSecret.name }}
+            - name: postgres-url
+              mountPath: {{ .Values.postgres.urlSecret.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.postgres.urlSecret.name }}
+        - name: postgres-url
+          secret:
+            secretName: {{ .Values.teardownAuthority.postgresUrlSecretName | default .Values.postgres.urlSecret.name | quote }}
+            items:
+              - key: {{ .Values.postgres.urlSecret.key | quote }}
+                path: url
+        {{- end }}
+{{- end }}

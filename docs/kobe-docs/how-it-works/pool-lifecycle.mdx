@@ -11,6 +11,7 @@ Every virtual cluster in a pool is represented by a `ClusterInstance`. The opera
 
 ```
 Creating -> Ready -> Leased -> Recycling -> [destroyed]
+                            \-> Quarantined
                                                  |
                                                  v
                                           [replacement: Creating]
@@ -40,17 +41,32 @@ Callers can extend a lease up to `maxExtensions` times (default: 2) using `PATCH
 
 The lease has been released or expired. The operator destroys the instance and immediately creates a replacement. The replacement enters `Creating` and works through the readiness pipeline before becoming `Ready` again.
 
+### Quarantined
+
+Verified cleanup could not prove that every exact resource is absent. The
+instance remains unavailable and still counts against pool capacity; the pool
+phase is also `Quarantined`, never `Healthy`. Operators should inspect the
+`ClusterInstance` and `ClusterLease` receipt before retrying cleanup.
+
+`ClusterLease.spec.cleanupMode` is write-once. `Standard` is the default.
+`VerifiedDestroy` requires an immutable creation manifest, exact Kubernetes
+UIDs and connect-token deletion evidence. It is currently eligible only for
+k3s instances using embedded SQLite; unsupported backends or external
+PostgreSQL are rejected before binding rather than silently downgraded.
+
 ## Pool status
 
 The operator reports aggregate counts on the `ClusterPool` status:
 
 ```yaml
 status:
+  phase: Healthy
   ready: 2      # clusters in Ready phase
   leased: 1     # clusters in Leased phase
   creating: 1   # clusters in Creating phase
   recycling: 0  # clusters being torn down and replaced
   unhealthy: 0  # clusters marked unhealthy
+  quarantined: 0 # cleanup could not be proven; still consumes capacity
   queueDepth: 0 # leases waiting for capacity
 ```
 

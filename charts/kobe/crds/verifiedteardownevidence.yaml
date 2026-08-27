@@ -1,0 +1,265 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: verifiedteardownevidence.kobe.kunobi.ninja
+spec:
+  group: kobe.kunobi.ninja
+  names:
+    categories: []
+    kind: VerifiedTeardownEvidence
+    plural: verifiedteardownevidence
+    shortNames:
+    - vte
+    singular: verifiedteardownevidence
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.lease.name
+      name: Lease
+      type: string
+    - jsonPath: .spec.attemptId
+      name: Attempt
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for VerifiedTeardownEvidenceSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              attemptId:
+                description: |-
+                  Durable attempt nonce, duplicated outside the receipt for indexing and
+                  admission validation.
+                minLength: 1
+                type: string
+              lease:
+                description: Exact ClusterLease capability this record certifies.
+                properties:
+                  name:
+                    description: |-
+                      Resource name. Names are display and lookup handles, never sufficient
+                      authority on their own because Kubernetes permits name reuse.
+                    type: string
+                  uid:
+                    description: |-
+                      Kubernetes UID of the referenced object. New controller-written
+                      references always set this. `None` is accepted only so pre-UID-fence
+                      objects remain readable; security-sensitive consumers must fail closed
+                      or run the proof-based legacy migration before using the reference.
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
+              receipt:
+                description: Full terminal receipt produced by the isolated teardown authority.
+                properties:
+                  attemptId:
+                    description: |-
+                      Unique per attempt. Reconcile resumes an `InProgress` nonce unchanged;
+                      a later retry may replace a terminal receipt with a new attempt, but it
+                      never rewrites the identity of an active attempt.
+                    type: string
+                  backendType:
+                    description: Backend identity and immutable provenance digest observed at bind time.
+                    type: string
+                  checks:
+                    items:
+                      description: Evidence for one subject.
+                      properties:
+                        reason:
+                          description: |-
+                            Bounded, non-secret reason code (e.g. `pv_still_present`,
+                            `datastore_unreachable`). Never a raw provider response.
+                          nullable: true
+                          type: string
+                        result:
+                          description: Outcome of proving one subject absent.
+                          enum:
+                          - verified
+                          - notApplicable
+                          - unknown
+                          type: string
+                        subject:
+                          description: |-
+                            One thing whose absence must be proven.
+
+                            Enumerated rather than free-text so a receipt cannot be satisfied by an
+                            unrecognised or invented subject, and so adding a resource to the teardown
+                            path is a deliberate, reviewable change to this list.
+                          enum:
+                          - agentDeployment
+                          - serverStatefulSet
+                          - serverPods
+                          - service
+                          - podDisruptionBudget
+                          - publisherConfigMap
+                          - registriesConfigMap
+                          - tokenSecret
+                          - kubeconfigSecret
+                          - cidrClaim
+                          - connectTokenSecret
+                          - datastoreCredentialSecret
+                          - serverDataPvcs
+                          - serverDataVolumes
+                          - database
+                          - databaseRole
+                          type: string
+                        verified:
+                          description: |-
+                            The concrete resources this check actually looked at.
+
+                            A [`TeardownSubject`] is a category. On its own,
+                            `Database = Verified` asserts that *a* database is gone without saying
+                            which — so a receipt could be satisfied by checking the wrong one, or by
+                            checking one of several when the footprint had more. Recording the exact
+                            identities makes the claim auditable after the fact, which is the whole
+                            point of keeping evidence that outlives the instance.
+
+                            Names only: object names, PV names, the database and role identifiers.
+                            Never connection strings, credentials, or anything that would turn a
+                            receipt into a secret.
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - result
+                      - subject
+                      type: object
+                    type: array
+                  cleanupMode:
+                    default: Standard
+                    description: |-
+                      Cleanup contract captured in the reciprocal binding. A receipt for a
+                      Standard teardown can never release VerifiedDestroy capacity.
+                    enum:
+                    - Standard
+                    - VerifiedDestroy
+                    type: string
+                  completedAt:
+                    nullable: true
+                    type: string
+                  configDigest:
+                    type: string
+                  creationManifestDigest:
+                    default: ''
+                    description: SHA-256 of the immutable controller-authenticated creation manifest.
+                    type: string
+                  instance:
+                    description: Reference to another Kobe-managed resource in the same namespace.
+                    properties:
+                      name:
+                        description: |-
+                          Resource name. Names are display and lookup handles, never sufficient
+                          authority on their own because Kubernetes permits name reuse.
+                        type: string
+                      uid:
+                        description: |-
+                          Kubernetes UID of the referenced object. New controller-written
+                          references always set this. `None` is accepted only so pre-UID-fence
+                          objects remain readable; security-sensitive consumers must fail closed
+                          or run the proof-based legacy migration before using the reference.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  instanceSpecDigest:
+                    type: string
+                  lease:
+                    description: |-
+                      Exact subjects this receipt is about. A same-named replacement is a
+                      mismatch, not successful absence.
+                    properties:
+                      name:
+                        description: |-
+                          Resource name. Names are display and lookup handles, never sufficient
+                          authority on their own because Kubernetes permits name reuse.
+                        type: string
+                      uid:
+                        description: |-
+                          Kubernetes UID of the referenced object. New controller-written
+                          references always set this. `None` is accepted only so pre-UID-fence
+                          objects remain readable; security-sensitive consumers must fail closed
+                          or run the proof-based legacy migration before using the reference.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  outcome:
+                    description: Aggregate verdict for one teardown attempt.
+                    enum:
+                    - inProgress
+                    - verified
+                    - quarantined
+                    type: string
+                  pool:
+                    description: Reference to another Kobe-managed resource in the same namespace.
+                    properties:
+                      name:
+                        description: |-
+                          Resource name. Names are display and lookup handles, never sufficient
+                          authority on their own because Kubernetes permits name reuse.
+                        type: string
+                      uid:
+                        description: |-
+                          Kubernetes UID of the referenced object. New controller-written
+                          references always set this. `None` is accepted only so pre-UID-fence
+                          objects remain readable; security-sensitive consumers must fail closed
+                          or run the proof-based legacy migration before using the reference.
+                        nullable: true
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  retryCount:
+                    default: 0
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  schemaVersion:
+                    description: |-
+                      Schema version, so a consumer can refuse evidence it does not understand
+                      rather than misread an older shape as complete.
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  startedAt:
+                    type: string
+                required:
+                - attemptId
+                - backendType
+                - checks
+                - configDigest
+                - instance
+                - instanceSpecDigest
+                - lease
+                - outcome
+                - pool
+                - schemaVersion
+                - startedAt
+                type: object
+            required:
+            - attemptId
+            - lease
+            - receipt
+            type: object
+        required:
+        - spec
+        title: VerifiedTeardownEvidenceValidated
+        type: object
+        x-kubernetes-validations:
+        - message: verified teardown evidence is immutable
+          rule: self.spec == oldSelf.spec
+        - message: evidence identity must match its embedded receipt
+          rule: self.spec.attemptId == self.spec.receipt.attemptId && self.spec.lease.name == self.spec.receipt.lease.name && has(self.spec.lease.uid) == has(self.spec.receipt.lease.uid) && (!has(self.spec.lease.uid) || self.spec.lease.uid == self.spec.receipt.lease.uid)
+        - message: only a VerifiedDestroy terminal receipt can be authoritative evidence
+          rule: self.spec.receipt.outcome == 'verified' && self.spec.receipt.cleanupMode == 'VerifiedDestroy'
+    served: true
+    storage: true
+    subresources: {}

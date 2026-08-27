@@ -54,6 +54,7 @@ spec:
         verbs: [lease, exec, logs, port-forward, release]
         maxTtl: 2h
         maxConcurrentLeases: 2
+        maxExtensions: 2
         resourceCeiling:
           maxCpu: "4"
           maxMemory: 8Gi
@@ -75,6 +76,13 @@ The `sandbox` block scopes `SandboxPool` names and verbs separately from cluster
 pools. `lease` permits create plus read/list of the caller's own Sandbox leases;
 `release` is independently revocable. `exec`, `logs`, and `port-forward` are
 consumed by the restricted Sandbox execution API.
+
+The Sandbox block carries its own `maxExtensions`, defaulting to `2`, governing
+`PATCH /v1/sandbox-leases/:id`. An extension can never move expiry past
+`maxTtl` measured from readiness — the ceiling the caller could have asked for
+at creation — so it changes how incrementally that ceiling is reached, not how
+much runtime exists. Set `0` to forbid extension and require callers to commit
+to a TTL up front.
 
 `resourceCeiling.maxCpu` and `maxMemory` are Kubernetes quantities compared
 against the sum of all container limits in the selected `SandboxPool`. Invalid

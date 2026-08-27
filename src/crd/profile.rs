@@ -190,6 +190,7 @@ pub struct CapiConfig {
     printcolumn = r#"{"name":"Ready",    "type":"integer", "jsonPath":".status.ready"}"#,
     printcolumn = r#"{"name":"Leased",   "type":"integer", "jsonPath":".status.leased"}"#,
     printcolumn = r#"{"name":"Creating", "type":"integer", "jsonPath":".status.creating"}"#,
+    printcolumn = r#"{"name":"Quarantined","type":"integer","jsonPath":".status.quarantined"}"#,
     printcolumn = r#"{"name":"Failures", "type":"integer", "jsonPath":".status.consecutiveFailures"}"#,
     printcolumn = r#"{"name":"Age",      "type":"date",    "jsonPath":".metadata.creationTimestamp"}"#
 )]
@@ -1454,6 +1455,9 @@ pub struct DiagnosticsConfig {
 pub enum ClusterPoolPhase {
     /// At-or-above `minReady` ready clusters, or actively serving leases.
     Healthy,
+    /// At least one member is held because exact teardown evidence is missing.
+    /// This is never reported as Healthy even when other members are Ready.
+    Quarantined,
     /// Creating clusters to reach `minReady` — either on first arrival
     /// (no prior instances) or refilling after a scale-down / lease churn.
     /// No consecutive failures.
