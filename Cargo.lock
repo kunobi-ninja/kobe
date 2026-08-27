@@ -2683,6 +2683,7 @@ dependencies = [
  "jsonwebtoken 9.3.1",
  "k8s-openapi",
  "kobe-runner",
+ "kobe-state-machine",
  "kube",
  "kunobi-auth",
  "kunobi-ha",
@@ -2733,6 +2734,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "kobe-state-machine"
+version = "0.40.1"
 
 [[package]]
 name = "kobectl"

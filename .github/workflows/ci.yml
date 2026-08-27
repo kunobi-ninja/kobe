@@ -14,7 +14,7 @@ on:
       - "charts/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "Justfile"
+      - "justfile"
       - "docker/**"
       - "docker-bake.hcl"
       - "hack/**"
@@ -203,6 +203,51 @@ jobs:
               exit 1
             }
           done
+
+  lifecycle-state-machine:
+    name: Lifecycle State Machine (Kani + mutations)
+    runs-on: kunobi-runners
+    # Bare ARC runners intentionally carry no compiler/linker. Use the same
+    # build environment as the main Rust gate so installing Kani has `cc`.
+    container:
+      image: rust:1.94-bookworm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # The pure crate deliberately supports Rust 1.93: Kani 0.67's verifier
+      # toolchain is one release behind Kobe's 1.94.1 operator MSRV. The
+      # operator imports this exact function, so the proof cannot drift into a
+      # second model that production never calls.
+      # The upstream composite action executes its installer from the ARC host
+      # action path, which is not mounted into job containers. Install the same
+      # pinned verifier directly so the proof runs in the controlled image.
+      - name: Install pinned Kani verifier
+        run: |
+          cargo install kani-verifier --version 0.67.0 --locked
+          cargo-kani setup
+
+      - name: Prove exact-binding recovery invariants
+        run: |
+          cargo kani \
+            -p kobe-state-machine \
+            --harness recovery_apply_requires_the_exact_leased_subject \
+            --harness teardown_phases_are_never_reopened_by_recovery \
+            --harness bound_publication_requires_two_exact_reciprocal_sides \
+            --harness terminal_leases_never_publish_bound
+
+      # Mutation testing checks the tests themselves: every viable mutation of
+      # a production decision branch must be caught. Keep this narrow so it is
+      # a seconds-scale required gate rather than a second workspace test run.
+      - name: Mutation-test every recovery decision branch
+        run: |
+          if ! command -v cargo-mutants >/dev/null 2>&1; then
+            cargo install cargo-mutants --version 27.0.0 --locked
+          fi
+          cargo mutants \
+            -p kobe-state-machine \
+            --re 'exact_binding_(recovery|finalization)' \
+            --timeout 60
 
   # Real API-server contract for SandboxLease status and the admission ledger.
   # Unit tests pin JSON Patch/CEL/object shape; this job proves Kubernetes
@@ -546,11 +591,12 @@ jobs:
     # dispatch a branch to test it, and only main / a release tag ships.
     # Dispatch on main still publishes, which is the remedy for tags left
     # pointing somewhere wrong.
-    needs: [checks, version-consistency]
+    needs: [checks, lifecycle-state-machine, version-consistency]
     if: >-
       ${{ always() && github.event_name != 'pull_request'
           && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
           && needs.checks.result == 'success'
+          && needs['lifecycle-state-machine'].result == 'success'
           && (!startsWith(github.ref, 'refs/tags/v') || needs['version-consistency'].result == 'success') }}
     runs-on: kunobi-runners
     timeout-minutes: 20

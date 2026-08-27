@@ -1,0 +1,10 @@
+[package]
+name = "kobe-state-machine"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.93"
+license.workspace = true
+description = "Pure, model-checkable lifecycle state machines for Kobe"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
