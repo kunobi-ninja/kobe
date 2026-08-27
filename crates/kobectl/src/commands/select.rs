@@ -175,6 +175,7 @@ mod tests {
             requester: None,
             kubeconfig_path: None,
             alias: None,
+            metadata: None,
         }
     }
 

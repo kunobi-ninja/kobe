@@ -28,6 +28,9 @@ pub(crate) struct LeaseSummary {
     /// Caller-supplied alias (#107 P2), selectable interchangeably with the id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Caller-supplied descriptive JSON metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +49,8 @@ pub(crate) struct LeaseDetail {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub queue_position: u32,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub kubeconfig: Option<String>,
 }
