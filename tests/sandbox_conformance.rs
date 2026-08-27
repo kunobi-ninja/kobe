@@ -1000,7 +1000,16 @@ both_placements!(
         // 404 and never 403, for the same reason as above: a 403 confirms the
         // lease exists, which is enough to enumerate another tenant's leases
         // by guessing ids.
-        for path in [format!("{lease}/attach"), format!("{lease}/port-forward")] {
+        //
+        // port-forward also requires `?port=`: Axum extracts the query before
+        // the handler runs, so a request without it 400s on deserialize and
+        // never reaches prepare_upgrade. That 400 is the same for every id
+        // (real or guessed) and proves nothing about isolation — same trap as
+        // a plain GET vs a WebSocket upgrade.
+        for path in [
+            format!("{lease}/attach"),
+            format!("{lease}/port-forward?port=http"),
+        ] {
             let (status, response) = stranger.upgrade_status(&path).await?;
             anyhow::ensure!(
                 status.as_u16() == 404,
