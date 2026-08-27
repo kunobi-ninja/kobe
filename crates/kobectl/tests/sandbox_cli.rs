@@ -1442,17 +1442,24 @@ fn queued_second_signal_cannot_skip_the_release_request() {
     open(&response_gate);
     let output = wait_output(child);
     open(&observation_gate);
-    assert_eq!(output.status.code(), Some(130));
     assert!(output.stderr.is_empty());
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["signal"], "SIGINT");
     assert_eq!(json["cleanup"]["released"], false);
-    assert!(
-        json["cleanup"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("second SIGTERM")
-    );
+    let cleanup_error = json["cleanup"]["error"].as_str().unwrap();
+    // Different pending Unix signals have no cross-signal delivery order.
+    // Whichever one the runtime observes first remains the process outcome;
+    // the other must interrupt only the observation after DELETE was sent.
+    match json["signal"].as_str().unwrap() {
+        "SIGINT" => {
+            assert_eq!(output.status.code(), Some(130));
+            assert!(cleanup_error.contains("second SIGTERM"));
+        }
+        "SIGTERM" => {
+            assert_eq!(output.status.code(), Some(143));
+            assert!(cleanup_error.contains("second SIGINT"));
+        }
+        signal => panic!("unexpected signal outcome: {signal}"),
+    }
     assert!(
         deleted.load(Ordering::SeqCst),
         "the queued second signal must not skip DELETE"
