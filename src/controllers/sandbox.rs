@@ -190,6 +190,16 @@ enum ExecutionCleanupAdvance {
     Quarantine(&'static str),
 }
 
+/// Re-list execution cleanup state after one durable child-resource mutation.
+///
+/// The lifecycle controller watches [`SandboxLease`] objects, not the access
+/// ledger Lease or [`crate::crd::SandboxExecution`] records mutated by cleanup.
+/// `Action::await_change()` would therefore strand a lease after a successful
+/// checkpoint when no unrelated parent update happens to wake it.
+fn execution_cleanup_checkpoint_action() -> Action {
+    Action::requeue(std::time::Duration::from_secs(1))
+}
+
 fn execution_cleanup_advance(
     outcome: crate::api::sandbox_executions::ExecutionCleanupOutcome,
 ) -> ExecutionCleanupAdvance {
@@ -4507,7 +4517,7 @@ async fn drive_release(
         ) {
             ExecutionCleanupAdvance::Continue | ExecutionCleanupAdvance::DestroyTarget => {}
             ExecutionCleanupAdvance::Checkpointed => {
-                return Ok(Action::await_change());
+                return Ok(execution_cleanup_checkpoint_action());
             }
             ExecutionCleanupAdvance::Retry => {
                 return Ok(Action::requeue(std::time::Duration::from_secs(15)));
@@ -4574,7 +4584,7 @@ async fn drive_release(
             {
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
-                    return Ok(Action::await_change());
+                    return Ok(execution_cleanup_checkpoint_action());
                 }
                 crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
                 | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction =>
@@ -5320,7 +5330,7 @@ async fn cleanup_child_executions_after_proof(
     match outcome {
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => Ok(None),
         crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
-            Ok(Some(Action::await_change()))
+            Ok(Some(execution_cleanup_checkpoint_action()))
         }
         crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
             // This function runs only after exact target-absence proof. Reaching
@@ -5994,7 +6004,7 @@ async fn release_bound_child_composition(
                     ) {
                         ExecutionCleanupAdvance::Continue => {}
                         ExecutionCleanupAdvance::Checkpointed => {
-                            return Ok(Action::await_change());
+                            return Ok(execution_cleanup_checkpoint_action());
                         }
                         ExecutionCleanupAdvance::DestroyTarget => {
                             // Preserve Unknown and its capacity, but do not
@@ -6507,7 +6517,7 @@ async fn finish_child_release_after_proof(
         match outcome {
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Clean => {}
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Checkpointed => {
-                return Ok(Action::await_change());
+                return Ok(execution_cleanup_checkpoint_action());
             }
             crate::api::sandbox_executions::ExecutionCleanupOutcome::Retry
             | crate::api::sandbox_executions::ExecutionCleanupOutcome::AwaitTargetDestruction => {
@@ -12070,7 +12080,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            Action::await_change()
+            execution_cleanup_checkpoint_action()
         );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests_to(&server, "GET", CLAIM_PATH).await, 0);
@@ -16387,7 +16397,7 @@ current-context: child
 
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            Action::await_change()
+            execution_cleanup_checkpoint_action()
         );
         assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
         let statuses: Vec<_> = server
