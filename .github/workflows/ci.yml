@@ -272,26 +272,40 @@ jobs:
           install: false
           cache: true
 
-      - name: Install bun, kind and kubectl
-        run: mise install bun kind kubectl
+      - name: Install bun, Helm, kind and kubectl
+        run: mise install bun helm kind kubectl
 
-      - name: Create kind and install the Sandbox CRDs
+      - name: Create kind and install the contract CRDs
         run: |
           mise exec -- kind create cluster --name "$SANDBOX_CONTRACT_CLUSTER" --wait 120s
           CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
           mise exec -- kubectl --context "$CONTEXT" apply \
+            -f charts/kobe/crds/clusterinstances.yaml \
+            -f charts/kobe/crds/clusterleases.yaml \
             -f charts/kobe/crds/sandboxleases.yaml \
-            -f charts/kobe/crds/sandboxpools.yaml
+            -f charts/kobe/crds/sandboxpools.yaml \
+            -f charts/kobe/crds/verifiedteardownevidence.yaml
           mise exec -- kubectl --context "$CONTEXT" wait \
             --for=condition=Established \
+            crd/clusterinstances.kobe.kunobi.ninja \
+            crd/clusterleases.kobe.kunobi.ninja \
             crd/sandboxleases.kobe.kunobi.ninja \
             crd/sandboxpools.kobe.kunobi.ninja \
+            crd/verifiedteardownevidence.kobe.kunobi.ninja \
             --timeout=60s
+
+      - name: Materialize pinned Helm dependency
+        run: mise exec -- helm dependency build charts/kobe/
 
       - name: Verify SandboxLease fences and admission-ledger isolation
         run: |
           export KOBE_SANDBOX_APISERVER_CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
           mise exec -- bun run ./hack/test-sandbox-apiserver.ts
+
+      - name: Verify split teardown-authority isolation
+        run: |
+          export KOBE_SANDBOX_APISERVER_CONTEXT="kind-$SANDBOX_CONTRACT_CLUSTER"
+          mise exec -- bun run ./hack/test-teardown-authority-apiserver.ts
 
       - name: Tear down contract cluster
         if: always()

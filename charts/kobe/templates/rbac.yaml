@@ -226,6 +226,102 @@ roleRef:
   kind: ClusterRole
   name: {{ include "kobe.fullname" . }}
   apiGroup: rbac.authorization.k8s.io
+{{- if .Values.teardownAuthority.separate }}
+---
+# The authority observes teardown footprints and writes proof only. It cannot
+# create, update, or delete workload resources, lifecycle specs, or immutable
+# evidence that already exists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["clusterpools", "sandboxleases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["clusterinstances", "clusterleases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["clusterinstances/status", "clusterleases/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["kobe.kunobi.ninja"]
+    resources: ["verifiedteardownevidence"]
+    verbs: ["get", "list", "watch", "create"]
+  # Read the exact provisioned footprint and its immutable identities. The
+  # authority cannot mutate any of these workload or storage resources.
+  - apiGroups: [""]
+    resources: ["configmaps", "endpoints", "persistentvolumeclaims", "persistentvolumes", "pods", "secrets", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    verbs: ["get"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["selfsubjectreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+    namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election is the authority's only write permission outside proof
+# status/evidence, and is confined to its dedicated namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}-leader-election
+  namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}-leader-election
+  namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}
+    namespace: {{ include "kobe.teardownAuthorityNamespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "kobe.teardownAuthorityServiceAccountName" . }}-leader-election
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 ---
 # Leader election lives in the operator namespace. Keep it namespace-scoped;
 # Sandbox reservation access is a separate Role in the dedicated ledger

@@ -168,3 +168,16 @@ install degrades legibly instead of failing everything: leasing needs
 need `SandboxExecution`. A cluster with the first two but not the third can
 still lease and connect — only `POST /v1/sandbox-leases/{id}/executions` and
 its siblings report the missing CRD, and they say which one.
+
+### Separate teardown authority
+
+On Kubernetes 1.30 or newer, set `teardownAuthority.separate=true` to run
+teardown proof production under a dedicated ServiceAccount. Helm installs two
+fail-closed `ValidatingAdmissionPolicy` boundaries: ordinary lifecycle code
+cannot forge or erase protected evidence, and it cannot replace the authority
+namespace or cluster-scoped RBAC. The authority validates the live policies,
+bindings, and its authenticated identity before it starts.
+
+The default remains the compatibility single-process mode for older API
+servers. In that mode, the ordinary control plane also publishes teardown
+evidence, so it does not provide the same identity separation.
