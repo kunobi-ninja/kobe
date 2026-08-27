@@ -1420,7 +1420,7 @@ fn queued_second_signal_cannot_skip_the_release_request() {
             panic!("signals before create response must skip execution: {request:?}");
         }
     });
-    let (_directory, child) = spawn_child(
+    let (_directory, mut child) = spawn_child(
         &server.endpoint(),
         &[
             "sandbox", "run", "agents", "--output", "json", "--", "/agent",
@@ -1428,6 +1428,16 @@ fn queued_second_signal_cannot_skip_the_release_request() {
     );
     stage_rx.recv_timeout(WAIT).unwrap();
     signal(&child, libc::SIGINT);
+    // SIGINT and SIGTERM are distinct POSIX signals, but their delivery order
+    // is not the order of two adjacent kill(2) calls. Give the runtime one
+    // scheduling turn to consume the intended first signal before queueing the
+    // second; otherwise this test sometimes asserts SIGINT while legitimately
+    // observing SIGTERM first on a loaded CI runner.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the first signal must keep waiting for the create response and cleanup"
+    );
     signal(&child, libc::SIGTERM);
     open(&response_gate);
     let output = wait_output(child);
