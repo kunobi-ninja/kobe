@@ -352,6 +352,30 @@ impl Api {
         let value = serde_json::from_str(&text).unwrap_or(Value::Null);
         Ok((status, value))
     }
+
+    /// Open a real WebSocket handshake and report only how it was answered.
+    ///
+    /// The headers matter. A plain GET is rejected by Axum's WebSocket
+    /// extractor before Kobe ever resolves the lease, so it proves nothing
+    /// about tenant isolation. A well-formed upgrade reaches Kobe's own
+    /// authorization, which is the boundary under test. Nothing here speaks
+    /// the WebSocket protocol — the status alone carries the property.
+    async fn upgrade_status(&self, path: &str) -> anyhow::Result<(reqwest::StatusCode, String)> {
+        let response = self
+            .client
+            .get(format!("{}{path}", self.endpoint))
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONNECTION, "Upgrade")
+            .header(reqwest::header::UPGRADE, "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            // Any 16 random bytes, base64-encoded. The value is never checked
+            // by a request that is meant to be refused before it upgrades.
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await?;
+        let status = response.status();
+        Ok((status, response.text().await.unwrap_or_default()))
+    }
 }
 
 /// A sandbox that releases itself, whatever the scenario does.
@@ -966,15 +990,31 @@ both_placements!(
             );
         }
 
-        // Streaming operations use a real WebSocket handshake. A plain HTTP
-        // GET could be rejected by Axum before Kobe resolves the lease and
-        // would therefore prove nothing about tenant isolation.
+        // Streaming operations upgrade before they carry data, so the
+        // handshake is where isolation has to hold. These go straight at the
+        // API with well-formed upgrade headers: the unified CLI now resolves
+        // a lease against the caller's own leases first (see below), so
+        // driving these through it would never reach the server and would
+        // leave the upgrade path unproven.
         //
-        // Exit 125, not 1: attach never passes a remote exit through (there
-        // is no remote command), and the CLI's contract reserves 125 for its
-        // own failures precisely so they cannot collide with a command's
-        // exit. The isolation property is carried by the REQUIRED 404 in the
-        // output — the denial must be indistinguishable from absence.
+        // 404 and never 403, for the same reason as above: a 403 confirms the
+        // lease exists, which is enough to enumerate another tenant's leases
+        // by guessing ids.
+        for path in [format!("{lease}/attach"), format!("{lease}/port-forward")] {
+            let (status, response) = stranger.upgrade_status(&path).await?;
+            anyhow::ensure!(
+                status.as_u16() == 404,
+                "upgrade {path} answered HTTP {status} to a stranger, expected 404: {response}"
+            );
+        }
+
+        // And the CLI refuses before it ever opens a connection. Resolution is
+        // scoped to the caller's own leases, so a stranger's selector matches
+        // nothing and the denial stays indistinguishable from absence.
+        //
+        // Exit 125, not 1: attach never passes a remote exit through (there is
+        // no remote command), and the CLI's contract reserves 125 for its own
+        // failures precisely so they cannot collide with a command's exit.
         let attach = harness(&[
             "attach-pty",
             "--target",
@@ -982,7 +1022,7 @@ both_placements!(
             "--lease",
             &sandbox.id,
             "--expect",
-            "404",
+            "no lease matches",
             "--expect-exit",
             "125",
             "--timeout",
@@ -994,27 +1034,13 @@ both_placements!(
         ])
         .await?;
         anyhow::ensure!(
-            attach.contains("404"),
+            attach.contains("no lease matches"),
             "stranger attach did not fail as an undiscoverable lease: {attach}"
         );
-        let forward = harness(&[
-            "port-forward",
-            "--target",
-            "e2e-other",
-            "--lease",
-            &sandbox.id,
-            "--port",
-            "http",
-            "--expect-http-status",
-            "404",
-            "--timeout",
-            "30",
-        ])
-        .await?;
-        anyhow::ensure!(
-            forward.contains("HTTP 404"),
-            "stranger port-forward did not fail as an undiscoverable lease: {forward}"
-        );
+        // No second CLI leg for port-forward: it refuses in the same
+        // resolution step as attach, before any transport is chosen, so it
+        // would re-prove this line rather than add to it. Its server-side
+        // refusal is asserted against the upgrade above.
 
         // And the sandbox is untouched: the stranger's exec did not run.
         let (_, evidence) = sandbox
