@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use super::config::CliConfig;
 use super::extend::extend_lease;
-use super::leases::LeaseDetail;
+use super::leases::{LeaseDetail, LeaseSummary, fetch_lease};
 use super::picker::{PickerItem, run_picker};
-use super::pools::fetch_pools_for_config;
+use super::pools::{PoolSummary, fetch_pool_for_config_with_output, fetch_pools_for_config};
 use super::state::record_kubeconfig;
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
 
@@ -45,6 +45,8 @@ pub(crate) struct LeaseAcceptedResponse {
 struct LeaseCreateOutput {
     id: String,
     phase: String,
+    resource_kind: &'static str,
+    capabilities: &'static [&'static str],
     profile: String,
     cluster_name: Option<String>,
     expires_at: Option<String>,
@@ -54,6 +56,8 @@ struct LeaseCreateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     kubeconfig_path: Option<String>,
 }
+
+const CLUSTER_CAPABILITIES: &[&str] = &["kubeconfig", "extend", "release"];
 
 /// POST `/v1/leases` and return the accepted (Pending) lease. Shared by the
 /// `lease` command and `with-lease` (#107 P3). `alias` becomes the lease's
@@ -110,26 +114,87 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
 
     // Determine which lease to operate on: an existing active one (#107 P3
     // `--ensure` idempotent renew), else a fresh create.
-    let (lease_id, profile, effective_ttl, renewed) = match ensure_existing(&config, &command)
-        .await?
+    let existing = ensure_existing(&config, &command).await?;
+    if let Some(existing) = existing.as_ref()
+        && existing.is_sandbox()
     {
-        Some((id, profile)) => {
+        if command.kubeconfig_path.is_some() {
+            anyhow::bail!("Sandbox leases do not provide a kubeconfig");
+        }
+        let expires = extend_lease(&config, &existing.id, command.ttl).await?;
+        if command.output == OutputFormat::Text {
+            eprintln!(
+                "Lease '{}' already active as {} — renewed (expires {expires})",
+                command.name.unwrap_or_default(),
+                existing.id
+            );
+        }
+        let detail = fetch_lease(&config, &existing.id).await?;
+        super::sandbox::emit_lease_output(
+            &detail.id,
+            &detail.phase,
+            &detail.profile,
+            Some(command.ttl),
+            command.name,
+            detail.expires_at.as_deref(),
+            command.output,
+        )?;
+        if command.keepalive {
+            let stop = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+            super::keepalive::heartbeat_until(
+                &config,
+                &existing.id,
+                command.ttl,
+                stop,
+                command.output == OutputFormat::Text,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    let (lease_id, profile, effective_ttl, renewed) = match existing {
+        Some(existing) => {
             // Reuse + extend instead of failing the duplicate alias.
-            let expires = extend_lease(&config, &id, command.ttl).await?;
+            let expires = extend_lease(&config, &existing.id, command.ttl).await?;
             if command.output == OutputFormat::Text {
                 eprintln!(
-                    "Lease '{}' already active as {id} — renewed (expires {expires})",
-                    command.name.unwrap_or_default()
+                    "Lease '{}' already active as {} — renewed (expires {expires})",
+                    command.name.unwrap_or_default(),
+                    existing.id
                 );
             }
-            (id, profile, None, true)
+            (existing.id, existing.profile, None, true)
         }
         None => {
             let pool = match command.pool {
-                Some(pool) => pool.to_string(),
+                Some(pool) => {
+                    fetch_pool_for_config_with_output(&config, pool, command.output).await?
+                }
                 None => select_pool_for_lease(&config, command.output).await?,
             };
-            let accepted = create_lease_request(&config, &pool, command.ttl, command.name).await?;
+            if pool.is_sandbox() {
+                if command.kubeconfig_path.is_some() {
+                    anyhow::bail!("Sandbox leases do not provide a kubeconfig");
+                }
+                return super::sandbox::lease(
+                    &config,
+                    super::sandbox::LeaseCommand {
+                        pool: &pool.name,
+                        ttl: Some(command.ttl),
+                        alias: command.name,
+                        no_wait: command.no_wait,
+                        wait_timeout: command.wait_timeout,
+                        keepalive: command.keepalive,
+                        output: command.output,
+                    },
+                )
+                .await;
+            }
+            let accepted =
+                create_lease_request(&config, &pool.name, command.ttl, command.name).await?;
             if command.no_wait {
                 return emit_pending_output(&accepted, command.output);
             }
@@ -189,35 +254,33 @@ pub async fn lease_create(command: LeaseCreateCommand<'_>) -> Result<()> {
 async fn ensure_existing(
     config: &super::config::ResolvedConfig,
     command: &LeaseCreateCommand<'_>,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<LeaseSummary>> {
     if !command.ensure {
         return Ok(None);
     }
     let Some(name) = command.name else {
         return Ok(None);
     };
-    Ok(super::leases::find_active_lease_by_alias(config, name)
-        .await?
-        .map(|l| (l.id, l.profile)))
+    super::leases::find_active_lease_by_alias(config, name).await
 }
 
 async fn select_pool_for_lease(
     config: &super::config::ResolvedConfig,
     output: OutputFormat,
-) -> Result<String> {
+) -> Result<PoolSummary> {
     let pools = fetch_pools_for_config(config).await?;
     if pools.is_empty() {
         anyhow::bail!("No pools available");
     }
 
     if output == OutputFormat::Json {
-        return Ok(pools[0].name.clone());
+        return Ok(pools[0].clone());
     }
 
     let items: Vec<PickerItem> = pools
         .iter()
         .map(|pool| PickerItem {
-            primary: pool.name.clone(),
+            primary: format!("{}  {}", pool.name, pool.resource_kind),
             secondary: format!(
                 "ready={} leased={} creating={} queue={}  {}",
                 pool.ready,
@@ -241,7 +304,7 @@ async fn select_pool_for_lease(
         "Use ↑/↓ and Enter. Press q or Esc to cancel.",
         &items,
     )?;
-    Ok(pools[idx].name.clone())
+    Ok(pools[idx].clone())
 }
 
 fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -> Result<()> {
@@ -249,6 +312,7 @@ fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -
         OutputFormat::Text => {
             println!("Lease:   {}", accepted.id);
             println!("Pool:    {}", accepted.profile);
+            println!("Kind:    Cluster");
             println!("Status:  pending");
             if accepted.queue_position > 0 {
                 println!("Queue:   #{}", accepted.queue_position);
@@ -256,10 +320,13 @@ fn emit_pending_output(accepted: &LeaseAcceptedResponse, output: OutputFormat) -
             if let Some(ttl) = accepted.effective_ttl.as_deref() {
                 println!("TTL:     {ttl}");
             }
+            println!("Actions: {}", CLUSTER_CAPABILITIES.join(", "));
         }
         OutputFormat::Json => print_json(&LeaseCreateOutput {
             id: accepted.id.clone(),
             phase: accepted.phase.clone(),
+            resource_kind: "Cluster",
+            capabilities: CLUSTER_CAPABILITIES,
             profile: accepted.profile.clone(),
             cluster_name: None,
             expires_at: None,
@@ -283,6 +350,7 @@ fn emit_ready_output(
             println!("Cluster: {}", ready.cluster_name.as_deref().unwrap_or("-"));
             println!("Lease:   {}", ready.id);
             println!("Pool:    {}", ready.profile);
+            println!("Kind:    Cluster");
             if let Some(expires_at) = ready.expires_at.as_deref() {
                 println!("Expires: {expires_at}");
             }
@@ -290,12 +358,15 @@ fn emit_ready_output(
                 println!("TTL:     {ttl}");
             }
             println!("Config:  {}", kubeconfig_path.display());
+            println!("Actions: {}", CLUSTER_CAPABILITIES.join(", "));
             println!();
             println!("export KUBECONFIG={}", kubeconfig_path.display());
         }
         OutputFormat::Json => print_json(&LeaseCreateOutput {
             id: ready.id.clone(),
             phase: ready.phase.clone(),
+            resource_kind: "Cluster",
+            capabilities: CLUSTER_CAPABILITIES,
             profile: ready.profile.clone(),
             cluster_name: ready.cluster_name.clone(),
             expires_at: ready.expires_at.clone(),
@@ -515,6 +586,8 @@ mod tests {
         let detail = LeaseDetail {
             id: "lease-1".to_string(),
             phase: "Bound".to_string(),
+            resource_kind: "Cluster".to_string(),
+            capabilities: vec!["kubeconfig".to_string()],
             profile: "ci-small".to_string(),
             cluster_name: Some("pool-ci-small-1".to_string()),
             expires_at: Some("2026-01-01T00:00:00Z".to_string()),

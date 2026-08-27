@@ -176,7 +176,9 @@ Returns `404` if no bundle exists.
 
 ## `GET /v1/pools`
 
-Lists all pools accessible to your identity, including their policy and capacity summary.
+Lists every pool accessible to your identity, regardless of resource kind.
+`resourceKind` identifies what a lease allocates and `capabilities` identifies
+the operations available to the caller.
 
 **Response** — `200 OK`
 
@@ -184,6 +186,8 @@ Lists all pools accessible to your identity, including their policy and capacity
 [
   {
     "name": "ci-small",
+    "resourceKind": "Cluster",
+    "capabilities": ["lease", "kubeconfig", "extend", "release"],
     "phase": "Healthy",
     "ready": 3,
     "leased": 1,
@@ -212,6 +216,8 @@ Returns status for a single pool.
 ```json
 {
   "name": "ci-small",
+  "resourceKind": "Cluster",
+  "capabilities": ["lease", "kubeconfig", "extend", "release"],
   "phase": "Healthy",
   "ready": 3,
   "leased": 1,

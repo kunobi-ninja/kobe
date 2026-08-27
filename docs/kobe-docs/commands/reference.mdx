@@ -11,16 +11,16 @@ description: All kobe CLI commands with flags and examples.
 |---|---|
 | `kobe status` | Show endpoint status, auth methods, and pool summary |
 | `kobe version` | Show CLI and endpoint versions |
-| `kobe sandbox run` | Create a sandbox, run one command, release it ([details](/commands/sandbox)) |
-| `kobe sandbox exec` | Run a command in a sandbox you already hold |
-| `kobe sandbox logs` | Read sandbox output or follow one execution's retained stdout/stderr |
-| `kobe sandbox cancel` | Cancel a running execution |
-| `kobe sandbox attach` | Open an interactive session in a sandbox |
-| `kobe sandbox port-forward` | Forward a declared sandbox port to a local one |
+| `kobe run` | Lease an executable resource, run one command, release it ([details](/commands/sandbox)) |
+| `kobe exec` | Run a command in a lease that supports `exec` |
+| `kobe logs` | Read output from a lease that supports `logs` |
+| `kobe cancel` | Cancel a running execution |
+| `kobe attach` | Open an interactive session through an `attach` capability |
+| `kobe port-forward` | Forward a declared port through a `port-forward` capability |
 | `kobe login` | Authenticate with the kobe service |
 | `kobe logout` | Remove stored credentials |
-| `kobe lease <pool>` | Lease a cluster from a pool |
-| `kobe release <lease-id>` | Release a leased cluster |
+| `kobe lease <pool>` | Lease the resource provided by a pool |
+| `kobe release <lease-id>` | Release a lease |
 | `kobe config view` | Print current configuration |
 | `kobe config edit` | Open the configuration TUI |
 | `kobe config list` | List named targets |
@@ -88,24 +88,27 @@ Removes the stored session token and credentials from the local config. The next
 kobe lease <pool> [--ttl <duration>] [--kubeconfig <path>] [--no-wait]
 ```
 
-Creates a lease from the specified pool. By default the CLI waits until the lease is `Bound` and writes the kubeconfig to disk.
+Creates a lease from the specified pool. The pool's `resourceKind` determines
+what is allocated and which actions are available. Cluster leases write a
+kubeconfig; executable resources expose actions such as `exec` and `logs`.
 
 ```sh
 kobe lease ci-small
 kobe lease ci-small --ttl 30m
 kobe lease ci-small --kubeconfig /tmp/kube.yaml
+kobe lease agents --ttl 30m
 kobe lease ci-small --no-wait
 ```
 
-Prints the lease ID and expiry on success. The cluster is ready to use as soon as the command returns.
+Prints the lease ID, resource kind, capabilities, and expiry on success.
 
 **Flags**
 
 | Flag | Default | Description |
 |---|---|---|
 | `--ttl` | pool default | Requested lease TTL. Capped by AccessPolicy `maxTtl`. |
-| `--kubeconfig` | `~/.kube/kobe-<id>` | Path to write the kubeconfig. |
-| `--no-wait` | disabled | Return after creating the lease instead of waiting for kubeconfig. |
+| `--kubeconfig` | `~/.kube/kobe-<id>` | Cluster resources only: path to write the kubeconfig. |
+| `--no-wait` | disabled | Return after creating the lease instead of waiting for readiness. |
 | `--wait-timeout` | unset | Maximum time to wait for the lease to become usable. |
 
 ---
@@ -126,7 +129,9 @@ The current CLI does not expose a standalone `kobe leases` command anymore. Use 
 kobe release <lease-id>
 ```
 
-Releases a lease immediately. The cluster is destroyed and a replacement is queued in the pool. Use this when your CI job finishes before the TTL expires — it helps the pool refill faster for subsequent jobs.
+Releases a lease immediately. Kobe performs the cleanup required by that
+resource kind and makes the pool capacity reusable. Use this when work finishes
+before the TTL expires.
 
 ```sh
 kobe release lease-a1b2c3d4e5f6

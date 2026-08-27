@@ -1,8 +1,8 @@
-//! `kobe sandbox` — exec, logs, cancel, and run (#84).
+//! Capability adapters for `kobe exec`, `logs`, `cancel`, and `run` (#84).
 //!
 //! # Two audiences, one contract
 //!
-//! A human runs `kobe sandbox exec` and reads the output. An agent runs the
+//! A human runs `kobe exec` and reads the output. An agent runs the
 //! same command with `--output json` and parses it. The agent is the harder
 //! consumer and the one that decides the design: it needs the **exact remote
 //! exit code**, stdout and stderr kept apart, and a transport failure that
@@ -89,8 +89,8 @@ pub struct ExecOutput {
 
 pub const SANDBOX_CLI_API_VERSION: &str = "kobe.sandbox/v1";
 
-/// Emit a machine-readable sandbox CLI failure when command dispatch itself
-/// fails. Human diagnostics never share stderr with `--output json`.
+/// Emit a machine-readable executable-resource failure when command dispatch
+/// itself fails. Human diagnostics never share stderr with `--output json`.
 pub fn emit_cli_error(error: &anyhow::Error) -> Result<()> {
     emit_client_error(&format!("{error:#}"), CLI_FAILURE_EXIT)
 }
@@ -98,8 +98,8 @@ pub fn emit_cli_error(error: &anyhow::Error) -> Result<()> {
 /// Emit a stable machine envelope for a command-line syntax error.
 ///
 /// Clap normally exits before `main` and writes human diagnostics to stderr.
-/// The entry point diverts only `sandbox ... --output json` parse failures here
-/// so machine mode keeps the same versioned shape even before dispatch.
+/// The entry point diverts executable-resource `--output json` parse failures
+/// here so machine mode keeps the same versioned shape before dispatch.
 pub fn emit_cli_parse_error(error: &str, process_exit_code: i32) -> Result<()> {
     emit_client_error(error, process_exit_code)
 }
@@ -192,7 +192,7 @@ pub async fn exec(
     let config = config.resolve(target_override, endpoint_override)?;
 
     if argv.is_empty() {
-        anyhow::bail!("a command is required: kobe sandbox exec <lease> -- <argv...>");
+        anyhow::bail!("a command is required: kobe exec <lease> -- <argv...>");
     }
 
     let result = exec_once(
@@ -312,7 +312,7 @@ where
 /// Print the result in the requested form.
 ///
 /// Text mode writes the command's own stdout and stderr to *this* process's
-/// stdout and stderr, so `kobe sandbox exec ... | grep` behaves the way anyone
+/// stdout and stderr, so `kobe exec ... | grep` behaves the way anyone
 /// would expect. JSON mode keeps them as separate fields for the same reason:
 /// a consumer that cannot tell a tool's diagnostics from its output cannot
 /// parse either.
@@ -384,15 +384,51 @@ struct CreateLeaseBody<'a> {
     pool: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     ttl: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alias: Option<&'a str>,
     idempotency_key: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SandboxLeaseResponse {
     id: String,
     phase: String,
+    #[serde(default)]
+    pool: String,
+    #[serde(default)]
+    ttl: String,
+    #[serde(default)]
+    effective_ttl: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseOutput<'a> {
+    api_version: &'static str,
+    id: &'a str,
+    phase: &'a str,
+    pool: &'a str,
+    resource_kind: &'static str,
+    capabilities: &'static [&'static str],
+    ttl: Option<&'a str>,
+    alias: Option<&'a str>,
+    expires_at: Option<&'a str>,
+}
+
+const SANDBOX_CAPABILITIES: &[&str] = &[
+    "exec",
+    "cancel",
+    "logs",
+    "attach",
+    "port-forward",
+    "extend",
+    "release",
+];
 
 /// One stable schema for every `sandbox run --output json` outcome.
 ///
@@ -614,6 +650,135 @@ pub struct RunCommand<'a> {
     pub output: OutputFormat,
 }
 
+/// Persistent Sandbox allocation behind the resource-neutral `kobe lease`
+/// command. Storage and admission remain Sandbox-specific; the public
+/// lifecycle does not.
+pub(crate) struct LeaseCommand<'a> {
+    pub pool: &'a str,
+    pub ttl: Option<&'a str>,
+    pub alias: Option<&'a str>,
+    pub no_wait: bool,
+    pub wait_timeout: Option<&'a str>,
+    pub keepalive: bool,
+    pub output: OutputFormat,
+}
+
+pub(crate) async fn lease(config: &ResolvedConfig, command: LeaseCommand<'_>) -> Result<()> {
+    let key = new_idempotency_key();
+    let expected_lease = lease_id_for_create_key(&key);
+    let post_started = std::cell::Cell::new(false);
+    let lease_id = match create_sandbox_lease(
+        config,
+        CreateLeaseBody {
+            pool: command.pool,
+            ttl: command.ttl,
+            alias: command.alias,
+            idempotency_key: &key,
+        },
+        &expected_lease,
+        command.output,
+        &post_started,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(failure) if failure.may_have_committed => {
+            anyhow::bail!(
+                "Sandbox lease {expected_lease} may have been created: {:#}",
+                failure.error
+            )
+        }
+        Err(failure) => return Err(failure.error),
+    };
+
+    if command.no_wait {
+        return emit_lease_output(
+            &lease_id,
+            "Pending",
+            command.pool,
+            command.ttl,
+            command.alias,
+            None,
+            command.output,
+        );
+    }
+
+    if command.output == OutputFormat::Text {
+        eprintln!("Waiting for lease {lease_id} to become ready...");
+    }
+    let ready_timeout = match command.wait_timeout {
+        Some(value) => super::lease_create::parse_cli_duration(value)
+            .ok_or_else(|| anyhow::anyhow!("Invalid --wait-timeout '{value}'"))?,
+        None => READY_TIMEOUT,
+    };
+    let ready = wait_until_ready(config, &lease_id, command.output, ready_timeout)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message()))?;
+    emit_lease_output(
+        &ready.id,
+        &ready.phase,
+        command.pool,
+        ready.effective_ttl.as_deref().or(command.ttl),
+        ready.alias.as_deref().or(command.alias),
+        ready.expires_at.as_deref(),
+        command.output,
+    )?;
+
+    if command.keepalive {
+        let ttl = command.ttl.unwrap_or(ready.ttl.as_str());
+        if ttl.is_empty() {
+            anyhow::bail!("Sandbox lease did not report a TTL for --keepalive");
+        }
+        let stop = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        super::keepalive::heartbeat_until(
+            config,
+            &lease_id,
+            ttl,
+            stop,
+            command.output == OutputFormat::Text,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_lease_output(
+    id: &str,
+    phase: &str,
+    pool: &str,
+    ttl: Option<&str>,
+    alias: Option<&str>,
+    expires_at: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    match output {
+        OutputFormat::Text => {
+            println!("Lease:   {id}");
+            println!("Pool:    {pool}");
+            println!("Kind:    Sandbox");
+            println!("Status:  {}", phase.to_ascii_lowercase());
+            if let Some(expires_at) = expires_at {
+                println!("Expires: {expires_at}");
+            }
+            println!("Actions: {}", SANDBOX_CAPABILITIES.join(", "));
+            Ok(())
+        }
+        OutputFormat::Json => print_json(&LeaseOutput {
+            api_version: SANDBOX_CLI_API_VERSION,
+            id,
+            phase,
+            pool,
+            resource_kind: "Sandbox",
+            capabilities: SANDBOX_CAPABILITIES,
+            ttl,
+            alias,
+            expires_at,
+        }),
+    }
+}
+
 /// Create, execute and release as one bounded, signal-aware state machine.
 ///
 /// The first SIGINT/SIGTERM changes the command outcome but never skips cleanup.
@@ -635,8 +800,7 @@ pub async fn run(command: RunCommand<'_>) -> Result<i32> {
     } = command;
     let mut envelope = RunEnvelope::empty();
     if argv.is_empty() {
-        envelope.error =
-            Some("a command is required: kobe sandbox run <pool> -- <argv...>".to_string());
+        envelope.error = Some("a command is required: kobe run <pool> -- <argv...>".to_string());
         return emit_run_envelope(&envelope, output);
     }
     let config = match CliConfig::load()
@@ -662,9 +826,12 @@ pub async fn run(command: RunCommand<'_>) -> Result<i32> {
     let post_started = std::cell::Cell::new(false);
     let create = create_sandbox_lease(
         &config,
-        pool,
-        ttl,
-        &create_key,
+        CreateLeaseBody {
+            pool,
+            ttl,
+            alias: None,
+            idempotency_key: &create_key,
+        },
         &expected_lease,
         output,
         &post_started,
@@ -825,7 +992,7 @@ async fn run_in_lease(
     timeout: Option<&str>,
     output: OutputFormat,
 ) -> std::result::Result<ExecutionResponse, RunExecutionError> {
-    wait_until_ready(config, lease, output).await?;
+    let _ = wait_until_ready(config, lease, output, READY_TIMEOUT).await?;
     exec_once_for_run(
         config,
         lease,
@@ -895,20 +1062,14 @@ enum CreateHeaderFailure {
 
 async fn create_sandbox_lease(
     config: &ResolvedConfig,
-    pool: &str,
-    ttl: Option<&str>,
-    idempotency_key: &str,
+    request: CreateLeaseBody<'_>,
     expected_lease: &str,
     output: OutputFormat,
     post_started: &std::cell::Cell<bool>,
 ) -> std::result::Result<String, CreateFailure> {
     let path = "/v1/sandbox-leases";
-    let body = serde_json::to_vec(&CreateLeaseBody {
-        pool,
-        ttl,
-        idempotency_key,
-    })
-    .map_err(|error| CreateFailure::definite(anyhow::Error::from(error)))?;
+    let body = serde_json::to_vec(&request)
+        .map_err(|error| CreateFailure::definite(anyhow::Error::from(error)))?;
     let deadline = tokio::time::Instant::now() + CREATE_TIMEOUT;
 
     let mut attempt = 0;
@@ -1148,8 +1309,9 @@ async fn wait_until_ready(
     config: &ResolvedConfig,
     lease: &str,
     output: OutputFormat,
-) -> std::result::Result<(), RunExecutionError> {
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    ready_timeout: std::time::Duration,
+) -> std::result::Result<SandboxLeaseResponse, RunExecutionError> {
+    let deadline = tokio::time::Instant::now() + ready_timeout;
     loop {
         let path = format!("/v1/sandbox-leases/{lease}");
         let token = tokio::time::timeout_at(
@@ -1193,7 +1355,7 @@ async fn wait_until_ready(
             .context("could not parse the sandbox lease response")
             .map_err(RunExecutionError::Failure)?;
         match current.phase.as_str() {
-            "Ready" => return Ok(()),
+            "Ready" => return Ok(current),
             "Released" | "Expired" | "Quarantined" => {
                 return Err(RunExecutionError::Failure(anyhow::anyhow!(
                     "sandbox {lease} ended in {} before it was ready",
@@ -1982,7 +2144,12 @@ mod tests {
             ssh_fingerprint: None,
         };
         let started = tokio::time::Instant::now();
-        let result = wait_until_ready(&config, "sandbox-stalled", OutputFormat::Json);
+        let result = wait_until_ready(
+            &config,
+            "sandbox-stalled",
+            OutputFormat::Json,
+            READY_TIMEOUT,
+        );
         tokio::pin!(result);
         while !request_seen.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::select! {

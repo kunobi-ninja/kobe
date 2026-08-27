@@ -1,21 +1,22 @@
 ---
-title: Sandbox commands
-description: Run commands inside a leased agent sandbox, from a shell or from an agent.
+title: Executable resource commands
+description: Lease and operate resources according to the capabilities exposed by their pool.
 ---
 
-# Sandbox commands
+# Executable resource commands
 
-A **sandbox** is one agent environment leased from a `SandboxPool`. These
-commands run work inside it. None of them produces a kubeconfig, a token, or
-any other credential for the cluster underneath — a sandbox lease is the right
-to run commands in one container, and nothing more.
+A pool declares its `resourceKind` and capabilities. The lease lifecycle is
+common to every resource: `kobe lease`, `status`, `extend`, and `release`.
+Commands such as `exec`, `logs`, and `attach` work when the selected lease
+advertises the matching capability. A Sandbox is one such executable resource;
+it never exposes credentials for the Kubernetes cluster underneath it.
 
-## `kobe sandbox run`
+## `kobe run`
 
 Create a sandbox, run one command in it, and release it.
 
 ```bash
-kobe sandbox run agents --ttl 30m -- /agent analyse ./repo
+kobe run agents --ttl 30m -- /agent analyse ./repo
 ```
 
 This is the command to reach for from CI or a script: it owns the create,
@@ -40,7 +41,7 @@ response-body reads, and polling waits all consume that same bound.
 
 ```bash
 set -e
-kobe sandbox run agents -- /agent test   # non-zero here fails the script
+kobe run agents -- /agent test   # non-zero here fails the script
 ```
 
 **Cleanup is reported separately from the result.** If the command succeeded
@@ -71,13 +72,13 @@ A cleanup failure never rewrites a remote exit code: a command that returned
 `0` still returns `0`, while the warning remains in `cleanup` (and on stderr in
 text mode). Headless callers should check both.
 
-## `kobe sandbox exec`
+## `kobe exec`
 
 Run a command in a sandbox you already hold.
 
 ```bash
-kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c -- /agent status
-kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c --cwd /work --timeout 5m -- ./build.sh
+kobe exec sandbox-a1b2c3d4e5f60718293a4b5c -- /agent status
+kobe exec sandbox-a1b2c3d4e5f60718293a4b5c --cwd /work --timeout 5m -- ./build.sh
 ```
 
 `argv` is sent **as-is**. There is no shell, so there are no quoting rules of
@@ -85,22 +86,22 @@ Kobe's own to learn — and no way for an argument to become a shell operator:
 
 ```bash
 # Runs a program whose name contains a semicolon. It does not run two commands.
-kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c -- './weird;name'
+kobe exec sandbox-a1b2c3d4e5f60718293a4b5c -- './weird;name'
 ```
 
 If you need a shell, ask for one explicitly — then its quoting is yours to
 reason about:
 
 ```bash
-kobe sandbox exec sandbox-a1b2c3d4e5f60718293a4b5c -- /bin/sh -lc 'a && b'
+kobe exec sandbox-a1b2c3d4e5f60718293a4b5c -- /bin/sh -lc 'a && b'
 ```
 
-## `kobe sandbox logs`
+## `kobe logs`
 
 A bounded tail of the sandbox's own output.
 
 ```bash
-kobe sandbox logs sandbox-a1b2c3d4e5f60718293a4b5c --tail 500
+kobe logs sandbox-a1b2c3d4e5f60718293a4b5c --tail 500
 ```
 
 The tail is capped server-side. Asking for more than the cap returns the cap
@@ -110,8 +111,8 @@ Pass an execution id to recover its retained stdout and stderr after a
 disconnect:
 
 ```bash
-kobe sandbox logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
-kobe sandbox logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4 --follow
+kobe logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
+kobe logs sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4 --follow
 ```
 
 Follow mode resumes stdout and stderr from separate offsets and stops only
@@ -121,10 +122,10 @@ follow mode emits one compact, versioned object per line (NDJSON); each object
 carries `state`, `stdout`, and `stderr` windows with `nextOffset`, `more`, and
 `truncated`.
 
-## `kobe sandbox cancel`
+## `kobe cancel`
 
 ```bash
-kobe sandbox cancel sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
+kobe cancel sandbox-a1b2c3d4e5f60718293a4b5c --execution sbxe-91c4
 ```
 
 Reports the state that **actually** applies. An execution that had already
@@ -137,7 +138,7 @@ Use `--output json`. The fields are versioned by `apiVersion`, which changes
 only on a breaking change:
 
 ```bash
-result=$(kobe sandbox run agents --output json -- /agent analyse)
+result=$(kobe run agents --output json -- /agent analyse)
 code=$?
 
 echo "$result" | jq -r '.stdout'
@@ -152,7 +153,7 @@ independent by design.
 `stdout` and `stderr` are always separate fields. A consumer that cannot tell
 a tool's diagnostics from its output cannot reliably parse either.
 
-For `sandbox run`, JSON mode always emits exactly one
+For `run`, JSON mode always emits exactly one
 `kobe.sandbox/v1` envelope to stdout, including client and command-line syntax
 errors. Human diagnostics are not mixed into stderr. JSON mode is also
 non-interactive: it never opens an OIDC browser login or asks whether to trust
@@ -202,14 +203,14 @@ An `Unknown` state means Kobe could not establish what happened: the command
 may have run, so an automatic retry may repeat its effects. Deciding what to do
 is yours.
 
-## `kobe sandbox attach`
+## `kobe attach`
 
 An interactive session inside the sandbox.
 
 ```bash
-kobe sandbox attach dev                      # attach to the running process
-kobe sandbox attach dev -- /bin/bash         # start a shell instead
-kobe sandbox attach dev --no-tty < input.txt # pipe input, no terminal
+kobe attach dev                      # attach to the running process
+kobe attach dev -- /bin/bash         # start a shell instead
+kobe attach dev --no-tty -- command  # run without allocating a terminal
 ```
 
 The terminal goes into raw mode, so **Ctrl-C reaches your workload** rather
@@ -226,13 +227,13 @@ released, or a limit was reached — `kobe` prints the reason and exits `125`:
 kobe: session ended: idle_timeout
 ```
 
-## `kobe sandbox port-forward`
+## `kobe port-forward`
 
 Forward a **pool-declared** port to a local one.
 
 ```bash
-kobe sandbox port-forward dev 8080:http    # by declared name
-kobe sandbox port-forward dev 8080:3000    # by declared number
+kobe port-forward dev 8080:http    # by declared name
+kobe port-forward dev 8080:3000    # by declared number
 ```
 
 Only ports the pool published resolve. Anything else is refused — without
@@ -246,7 +247,7 @@ and the sandbox behind it is yours alone.
 
 With `--output json`, the listener and per-connection failures are flushed as
 versioned NDJSON events on stdout; authentication is non-interactive and no
-human diagnostics are written to stderr. `sandbox attach` is interactive and
+human diagnostics are written to stderr. `attach` is interactive and
 therefore rejects JSON mode with a structured client error.
 
 One connection is forwarded at a time. Each local connection needs its own
@@ -266,7 +267,7 @@ Any command that takes a lease id also takes an **alias** — the name you gave
 the sandbox when you created it:
 
 ```bash
-kobe sandbox exec dev -- /agent status
+kobe exec dev -- /agent status
 ```
 
 Aliases are yours. Two people using `dev` never collide: resolution is scoped

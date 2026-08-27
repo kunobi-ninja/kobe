@@ -6,7 +6,7 @@ use commands::OutputFormat;
 #[derive(Parser)]
 #[command(
     name = "kobe",
-    about = "Kubernetes cluster pool manager",
+    about = "Pooled resource lease manager",
     version = commands::cli_version()
 )]
 struct Cli {
@@ -45,7 +45,63 @@ enum Commands {
         #[arg(long)]
         device: bool,
     },
-    /// Sandbox operations: run commands in a leased agent environment.
+    /// Lease an executable resource, run one command, and release it.
+    Run {
+        pool: String,
+        #[arg(long)]
+        ttl: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        timeout: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Run a command in a lease that supports `exec`.
+    Exec {
+        lease: String,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        timeout: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Read logs from a lease that supports `logs`.
+    Logs {
+        lease: String,
+        #[arg(long, conflicts_with = "tail")]
+        execution: Option<String>,
+        #[arg(long, requires = "execution")]
+        follow: bool,
+        #[arg(long, conflicts_with = "execution")]
+        tail: Option<i64>,
+    },
+    /// Cancel an execution owned by a compatible lease.
+    Cancel {
+        lease: String,
+        #[arg(long)]
+        execution: String,
+    },
+    /// Attach to a lease that supports `attach`.
+    Attach {
+        lease: String,
+        #[arg(long)]
+        container: Option<String>,
+        #[arg(long)]
+        no_tty: bool,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Forward a declared port from a compatible lease.
+    PortForward {
+        lease: String,
+        spec: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
+    /// Deprecated compatibility namespace for the original Sandbox CLI.
+    #[command(hide = true)]
     Sandbox {
         #[command(subcommand)]
         action: SandboxAction,
@@ -54,9 +110,9 @@ enum Commands {
     /// tokens at the IdP (RFC 7009) so a leaked token can't outlive
     /// `kobe logout`.
     Logout,
-    /// Lease a cluster from a pool and wait until it is ready
+    /// Lease a resource from a pool and wait until it is ready
     Lease {
-        /// Pool name (e.g. ci-small)
+        /// Pool name (e.g. ci-small or agents)
         pool: Option<String>,
         /// Lease TTL
         #[arg(long, default_value = "1h")]
@@ -67,7 +123,7 @@ enum Commands {
         /// Maximum time to wait for the lease to become usable (e.g. 30s, 5m, 1h)
         #[arg(long, value_name = "DURATION", conflicts_with = "no_wait")]
         wait_timeout: Option<String>,
-        /// Write kubeconfig to this path (default: ~/.kube/kobe-{pool}-{short-lease}.yaml)
+        /// Cluster resources only: write kubeconfig to this path
         #[arg(long = "kubeconfig", value_name = "PATH")]
         kubeconfig: Option<String>,
         /// Name this lease (#107 P2). Unique among your active leases, so you can
@@ -84,7 +140,7 @@ enum Commands {
         #[arg(long, conflicts_with = "no_wait")]
         keepalive: bool,
     },
-    /// Run a command while holding a lease, auto-releasing on exit (#107 P3).
+    /// Run a command with a kubeconfig-capable lease, then release it (#107 P3).
     ///
     /// Creates a lease, heartbeat-extends it for the command's lifetime, then
     /// releases it (even on failure/signal). `kobe with-lease --ttl 1h -- kubectl get pods`.
@@ -110,12 +166,12 @@ enum Commands {
         #[arg(long, default_value = "30m")]
         ttl: String,
     },
-    /// Release a cluster lease
+    /// Release a lease
     Release {
         /// Lease ID
         lease_id: Option<String>,
     },
-    /// Release all active leases and remove local Kobe lease kubeconfigs
+    /// Release all active leases and remove local cluster kubeconfigs
     Purge {
         /// Skip the confirmation prompt
         #[arg(long, short = 'y')]
@@ -135,11 +191,7 @@ enum Commands {
     },
 }
 
-/// Sandbox operations.
-///
-/// Separate from cluster leases on purpose: a Sandbox is one agent
-/// environment, not a cluster, and nothing here can produce a kubeconfig or a
-/// credential for the cluster underneath it.
+/// Kind-specific adapters retained behind the hidden compatibility namespace.
 #[derive(Subcommand)]
 enum SandboxAction {
     /// Run a command in an existing sandbox and return its exact exit code.
@@ -203,8 +255,7 @@ enum SandboxAction {
         lease: String,
         #[arg(long)]
         container: Option<String>,
-        /// Run without a terminal. Useful when piping input, where raw mode
-        /// would be meaningless.
+        /// Run without allocating a terminal.
         #[arg(long)]
         no_tty: bool,
         /// Command to run instead of attaching. Everything after `--`.
@@ -307,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
         {
             error.exit()
         }
-        Err(error) if requests_sandbox_json(&args) => {
+        Err(error) if requests_resource_json(&args) => {
             let code = error.exit_code();
             commands::sandbox::emit_cli_parse_error(&error.to_string(), code)?;
             std::process::exit(code)
@@ -362,112 +413,134 @@ async fn main() -> anyhow::Result<()> {
         Commands::Extend { target: lease, ttl } => {
             commands::extend(lease.as_deref(), &ttl, target, endpoint, output).await
         }
-        // These return the REMOTE command's exit code, so the process exits
-        // with it rather than with a generic success. `set -e` in a caller's
-        // script depends on exactly this.
-        Commands::Sandbox { action } => {
-            let code = match action {
-                SandboxAction::Exec {
-                    lease,
-                    cwd,
-                    timeout,
-                    command,
-                } => {
-                    commands::sandbox::exec(
-                        &lease,
-                        &command,
-                        cwd.as_deref(),
-                        timeout.as_deref(),
-                        target,
-                        endpoint,
-                        output,
-                    )
-                    .await
-                }
+        Commands::Run {
+            pool,
+            ttl,
+            cwd,
+            timeout,
+            command,
+        } => {
+            if let Err(error) =
+                commands::require_pool_capability(&pool, "exec", target, endpoint, output).await
+            {
+                exit_resource_error(error, output);
+            }
+            dispatch_resource_action(
                 SandboxAction::Run {
                     pool,
                     ttl,
                     cwd,
                     timeout,
                     command,
-                } => {
-                    commands::sandbox::run(commands::sandbox::RunCommand {
-                        pool: &pool,
-                        ttl: ttl.as_deref(),
-                        argv: &command,
-                        cwd: cwd.as_deref(),
-                        timeout: timeout.as_deref(),
-                        target_override: target,
-                        endpoint_override: endpoint,
-                        output,
-                    })
+                },
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::Exec {
+            lease,
+            cwd,
+            timeout,
+            command,
+        } => {
+            let lease =
+                commands::require_lease_capability(&lease, "exec", target, endpoint, output)
                     .await
-                }
+                    .unwrap_or_else(|error| exit_resource_error(error, output));
+            dispatch_resource_action(
+                SandboxAction::Exec {
+                    lease,
+                    cwd,
+                    timeout,
+                    command,
+                },
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::Logs {
+            lease,
+            execution,
+            follow,
+            tail,
+        } => {
+            let lease =
+                commands::require_lease_capability(&lease, "logs", target, endpoint, output)
+                    .await
+                    .unwrap_or_else(|error| exit_resource_error(error, output));
+            dispatch_resource_action(
                 SandboxAction::Logs {
                     lease,
                     execution,
                     follow,
                     tail,
-                } => commands::sandbox::logs(
-                    &lease,
-                    tail,
-                    execution.as_deref(),
-                    follow,
-                    target,
-                    endpoint,
-                    output,
-                )
-                .await
-                .map(|()| 0),
-                SandboxAction::Cancel { lease, execution } => {
-                    commands::sandbox::cancel(&lease, &execution, target, endpoint, output)
-                        .await
-                        .map(|()| 0)
-                }
+                },
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::Cancel { lease, execution } => {
+            let lease =
+                commands::require_lease_capability(&lease, "cancel", target, endpoint, output)
+                    .await
+                    .unwrap_or_else(|error| exit_resource_error(error, output));
+            dispatch_resource_action(
+                SandboxAction::Cancel { lease, execution },
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::Attach {
+            lease,
+            container,
+            no_tty,
+            command,
+        } => {
+            let lease =
+                commands::require_lease_capability(&lease, "attach", target, endpoint, output)
+                    .await
+                    .unwrap_or_else(|error| exit_resource_error(error, output));
+            dispatch_resource_action(
                 SandboxAction::Attach {
                     lease,
                     container,
                     no_tty,
                     command,
-                } => {
-                    commands::sandbox_transport::attach(
-                        &lease,
-                        &command,
-                        container.as_deref(),
-                        !no_tty,
-                        target,
-                        endpoint,
-                        output,
-                    )
-                    .await
-                }
-                SandboxAction::PortForward { lease, spec, bind } => {
-                    match commands::sandbox_transport::split_forward_spec(&spec) {
-                        Ok((local, remote)) => {
-                            commands::sandbox_transport::port_forward(
-                                &lease, local, &remote, &bind, target, endpoint, output,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            };
-            match code {
-                Ok(0) => Ok(()),
-                Ok(code) => std::process::exit(code),
-                Err(error) => {
-                    if output == OutputFormat::Json {
-                        // Machine mode owns stdout exclusively; mixing a human
-                        // stderr diagnostic into an agent pipeline makes the
-                        // invocation impossible to consume deterministically.
-                        let _ = commands::sandbox::emit_cli_error(&error);
-                    } else {
-                        eprintln!("kobe: {error:#}");
-                    }
-                    std::process::exit(commands::sandbox::CLI_FAILURE_EXIT)
-                }
-            }
+                },
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::PortForward { lease, spec, bind } => {
+            let lease = commands::require_lease_capability(
+                &lease,
+                "port-forward",
+                target,
+                endpoint,
+                output,
+            )
+            .await
+            .unwrap_or_else(|error| exit_resource_error(error, output));
+            dispatch_resource_action(
+                SandboxAction::PortForward { lease, spec, bind },
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        Commands::Sandbox { action } => {
+            dispatch_resource_action(action, target, endpoint, output).await
         }
         Commands::Release { lease_id } => {
             commands::release(lease_id.as_deref(), target, endpoint, output).await
@@ -518,7 +591,120 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn requests_sandbox_json(args: &[std::ffi::OsString]) -> bool {
+/// Dispatch one capability-specific resource action. Kind-specific API routes
+/// stay behind this boundary; the public command hierarchy remains flat.
+async fn dispatch_resource_action(
+    action: SandboxAction,
+    target: Option<&str>,
+    endpoint: Option<&str>,
+    output: OutputFormat,
+) -> anyhow::Result<()> {
+    // These return the REMOTE command's exit code, so the process exits with
+    // it rather than with generic success. `set -e` depends on exactly this.
+    let code = match action {
+        SandboxAction::Exec {
+            lease,
+            cwd,
+            timeout,
+            command,
+        } => {
+            commands::sandbox::exec(
+                &lease,
+                &command,
+                cwd.as_deref(),
+                timeout.as_deref(),
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        SandboxAction::Run {
+            pool,
+            ttl,
+            cwd,
+            timeout,
+            command,
+        } => {
+            commands::sandbox::run(commands::sandbox::RunCommand {
+                pool: &pool,
+                ttl: ttl.as_deref(),
+                argv: &command,
+                cwd: cwd.as_deref(),
+                timeout: timeout.as_deref(),
+                target_override: target,
+                endpoint_override: endpoint,
+                output,
+            })
+            .await
+        }
+        SandboxAction::Logs {
+            lease,
+            execution,
+            follow,
+            tail,
+        } => commands::sandbox::logs(
+            &lease,
+            tail,
+            execution.as_deref(),
+            follow,
+            target,
+            endpoint,
+            output,
+        )
+        .await
+        .map(|()| 0),
+        SandboxAction::Cancel { lease, execution } => {
+            commands::sandbox::cancel(&lease, &execution, target, endpoint, output)
+                .await
+                .map(|()| 0)
+        }
+        SandboxAction::Attach {
+            lease,
+            container,
+            no_tty,
+            command,
+        } => {
+            commands::sandbox_transport::attach(
+                &lease,
+                &command,
+                container.as_deref(),
+                !no_tty,
+                target,
+                endpoint,
+                output,
+            )
+            .await
+        }
+        SandboxAction::PortForward { lease, spec, bind } => {
+            match commands::sandbox_transport::split_forward_spec(&spec) {
+                Ok((local, remote)) => {
+                    commands::sandbox_transport::port_forward(
+                        &lease, local, &remote, &bind, target, endpoint, output,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    match code {
+        Ok(0) => Ok(()),
+        Ok(code) => std::process::exit(code),
+        Err(error) => exit_resource_error(error, output),
+    }
+}
+
+fn exit_resource_error(error: anyhow::Error, output: OutputFormat) -> ! {
+    if output == OutputFormat::Json {
+        let _ = commands::sandbox::emit_cli_error(&error);
+    } else {
+        eprintln!("kobe: {error:#}");
+    }
+    std::process::exit(commands::sandbox::CLI_FAILURE_EXIT)
+}
+
+fn requests_resource_json(args: &[std::ffi::OsString]) -> bool {
     let args: Vec<_> = args
         .iter()
         .map(|argument| argument.to_string_lossy())
@@ -566,7 +752,10 @@ fn requests_sandbox_json(args: &[std::ffi::OsString]) -> bool {
             index += 1;
             continue;
         }
-        return argument == "sandbox";
+        return matches!(
+            argument.as_ref(),
+            "sandbox" | "run" | "exec" | "logs" | "cancel" | "attach" | "port-forward"
+        );
     }
     false
 }
@@ -586,21 +775,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sandbox_json_parse_errors_are_detected_before_clap_exits() {
+    fn resource_json_parse_errors_are_detected_before_clap_exits() {
         for args in [
+            vec!["kobe", "run", "agents", "--output", "json"],
+            vec!["kobe", "--output=json", "exec", "lease-1"],
             vec!["kobe", "sandbox", "run", "agents", "--output", "json"],
             vec!["kobe", "--output=json", "sandbox", "run", "agents"],
             vec!["kobe", "sandbox", "run", "agents", "-o=json"],
             vec!["kobe", "sandbox", "run", "agents", "-ojson"],
         ] {
             let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-            assert!(requests_sandbox_json(&args));
+            assert!(requests_resource_json(&args));
         }
         let text: Vec<std::ffi::OsString> = ["kobe", "sandbox", "run", "agents"]
             .into_iter()
             .map(Into::into)
             .collect();
-        assert!(!requests_sandbox_json(&text));
+        assert!(!requests_resource_json(&text));
         for args in [
             vec!["kobe", "--target", "sandbox", "status", "--output", "json"],
             vec![
@@ -608,7 +799,7 @@ mod tests {
             ],
         ] {
             let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-            assert!(!requests_sandbox_json(&args));
+            assert!(!requests_resource_json(&args));
         }
     }
 
@@ -618,7 +809,6 @@ mod tests {
     fn execution_logs_accept_execution_and_follow_options() {
         let cli = Cli::try_parse_from([
             "kobe",
-            "sandbox",
             "logs",
             "sandbox-1",
             "--execution",
@@ -627,17 +817,14 @@ mod tests {
         ])
         .unwrap();
 
-        let Commands::Sandbox {
-            action:
-                SandboxAction::Logs {
-                    lease,
-                    execution,
-                    follow,
-                    tail,
-                },
+        let Commands::Logs {
+            lease,
+            execution,
+            follow,
+            tail,
         } = cli.command
         else {
-            panic!("expected sandbox logs")
+            panic!("expected resource logs")
         };
         assert_eq!(lease, "sandbox-1");
         assert_eq!(execution.as_deref(), Some("sbxe-1"));
@@ -652,7 +839,6 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "kobe",
-                "sandbox",
                 "logs",
                 "sandbox-1",
                 "--execution",
@@ -662,6 +848,18 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(Cli::try_parse_from(["kobe", "sandbox", "logs", "sandbox-1", "--follow"]).is_err());
+        assert!(Cli::try_parse_from(["kobe", "logs", "sandbox-1", "--follow"]).is_err());
+    }
+
+    #[test]
+    fn legacy_sandbox_namespace_remains_parseable_but_hidden() {
+        let cli =
+            Cli::try_parse_from(["kobe", "sandbox", "exec", "sandbox-1", "--", "true"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Sandbox {
+                action: SandboxAction::Exec { .. }
+            }
+        ));
     }
 }

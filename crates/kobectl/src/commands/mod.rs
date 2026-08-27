@@ -35,6 +35,81 @@ pub use status::status;
 pub use version::version;
 pub use with_lease::{WithLeaseCommand, with_lease};
 
+/// Resolve a pool before any mutating shortcut and verify that the selected
+/// resource kind exposes the requested operation.
+pub async fn require_pool_capability(
+    pool: &str,
+    capability: &str,
+    target_override: Option<&str>,
+    endpoint_override: Option<&str>,
+    output: OutputFormat,
+) -> anyhow::Result<()> {
+    let config = config::CliConfig::load()?.resolve(target_override, endpoint_override)?;
+    let pool = pools::fetch_pool_for_config_with_output(&config, pool, output).await?;
+    if !pool.supports(capability) {
+        anyhow::bail!(
+            "pool {} allocates {} resources, which do not support {capability}; available capabilities: {}",
+            pool.name,
+            pool.resource_kind,
+            pool.capabilities.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Resolve an exact ID, alias, or unique pool selector and reject an
+/// incompatible operation before it reaches a kind-specific route.
+pub async fn require_lease_capability(
+    selector: &str,
+    capability: &str,
+    target_override: Option<&str>,
+    endpoint_override: Option<&str>,
+    output: OutputFormat,
+) -> anyhow::Result<String> {
+    let config = config::CliConfig::load()?.resolve(target_override, endpoint_override)?;
+    let leases = leases::fetch_all_leases_with_output(&config, output).await?;
+    let by_id: Vec<_> = leases.iter().filter(|lease| lease.id == selector).collect();
+    let by_alias: Vec<_> = leases
+        .iter()
+        .filter(|lease| lease.alias.as_deref() == Some(selector))
+        .collect();
+    let by_pool: Vec<_> = leases
+        .iter()
+        .filter(|lease| lease.profile == selector)
+        .collect();
+    let matches = if !by_id.is_empty() {
+        by_id
+    } else if !by_alias.is_empty() {
+        by_alias
+    } else {
+        by_pool
+    };
+    let lease = match matches.as_slice() {
+        [lease] => lease,
+        [] => anyhow::bail!("no lease matches '{selector}'"),
+        many => anyhow::bail!(
+            "'{selector}' matches multiple leases: {}",
+            many.iter()
+                .map(|lease| lease.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    if !lease
+        .capabilities
+        .iter()
+        .any(|candidate| candidate == capability)
+    {
+        anyhow::bail!(
+            "lease {} is a {} resource and does not support {capability}; available capabilities: {}",
+            lease.id,
+            lease.resource_kind,
+            lease.capabilities.join(", ")
+        );
+    }
+    Ok(lease.id.clone())
+}
+
 use config::{AuthMode, ResolvedConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +157,19 @@ pub(crate) async fn get_auth_header_noninteractive(
 ) -> anyhow::Result<Option<String>> {
     get_auth_header_with_interaction(config, method, path, body, AuthInteraction::NonInteractive)
         .await
+}
+
+pub(crate) async fn get_auth_header_for_output(
+    config: &ResolvedConfig,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    output: OutputFormat,
+) -> anyhow::Result<Option<String>> {
+    match output {
+        OutputFormat::Text => get_auth_header(config, method, path, body).await,
+        OutputFormat::Json => get_auth_header_noninteractive(config, method, path, body).await,
+    }
 }
 
 async fn get_auth_header_with_interaction(

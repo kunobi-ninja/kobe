@@ -2,13 +2,18 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::config::ResolvedConfig;
-use super::{authed_client, get_auth_header, with_auth};
+use super::{OutputFormat, authed_client, get_auth_header, get_auth_header_for_output, with_auth};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LeaseSummary {
     pub id: String,
     pub phase: String,
+    #[serde(default = "default_resource_kind")]
+    pub resource_kind: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(alias = "pool")]
     pub profile: String,
     #[serde(default)]
     pub cluster_name: Option<String>,
@@ -29,6 +34,11 @@ pub(crate) struct LeaseSummary {
 pub(crate) struct LeaseDetail {
     pub id: String,
     pub phase: String,
+    #[serde(default = "default_resource_kind")]
+    pub resource_kind: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(alias = "pool")]
     pub profile: String,
     #[serde(default)]
     pub cluster_name: Option<String>,
@@ -38,6 +48,16 @@ pub(crate) struct LeaseDetail {
     pub queue_position: u32,
     #[serde(default)]
     pub kubeconfig: Option<String>,
+}
+
+fn default_resource_kind() -> String {
+    "Cluster".to_string()
+}
+
+impl LeaseSummary {
+    pub(crate) fn is_sandbox(&self) -> bool {
+        self.resource_kind.eq_ignore_ascii_case("sandbox") || self.id.starts_with("sandbox-")
+    }
 }
 
 pub(crate) async fn fetch_leases_path(
@@ -59,6 +79,80 @@ pub(crate) async fn fetch_leases_path(
     Ok(response.json().await?)
 }
 
+async fn fetch_sandbox_leases_with_output(
+    config: &ResolvedConfig,
+    output: OutputFormat,
+) -> Result<Vec<LeaseSummary>> {
+    let path = "/v1/sandbox-leases";
+    let endpoint = config.endpoint.as_str();
+    let token = get_auth_header_for_output(config, "GET", path, b"", output).await?;
+    let response = with_auth(
+        super::authed_client().get(format!("{endpoint}{path}")),
+        &token,
+    )
+    .send()
+    .await?;
+    let status = response.status();
+    if matches!(status.as_u16(), 403 | 404 | 501) {
+        return Ok(Vec::new());
+    }
+    if !status.is_success() {
+        anyhow::bail!("Failed to list Sandbox leases (HTTP {status})");
+    }
+    let mut leases: Vec<LeaseSummary> = response.json().await?;
+    for lease in &mut leases {
+        lease.resource_kind = "Sandbox".to_string();
+        lease.capabilities = vec![
+            "exec".to_string(),
+            "cancel".to_string(),
+            "logs".to_string(),
+            "attach".to_string(),
+            "port-forward".to_string(),
+            "extend".to_string(),
+            "release".to_string(),
+        ];
+    }
+    Ok(leases)
+}
+
+/// Return every lease kind through one client-side inventory. The server keeps
+/// kind-specific storage and authorization routes; callers should not need to
+/// know that to select, inspect, extend, or release a lease.
+pub(crate) async fn fetch_all_leases(config: &ResolvedConfig) -> Result<Vec<LeaseSummary>> {
+    fetch_all_leases_with_output(config, OutputFormat::Text).await
+}
+
+pub(crate) async fn fetch_all_leases_with_output(
+    config: &ResolvedConfig,
+    output: OutputFormat,
+) -> Result<Vec<LeaseSummary>> {
+    let mut leases = if output == OutputFormat::Text {
+        fetch_leases_path(config, "/v1/leases").await?
+    } else {
+        let path = "/v1/leases";
+        let endpoint = config.endpoint.as_str();
+        let token = get_auth_header_for_output(config, "GET", path, b"", output).await?;
+        let response = with_auth(authed_client().get(format!("{endpoint}{path}")), &token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to list leases (HTTP {})", response.status());
+        }
+        response.json().await?
+    };
+    for lease in &mut leases {
+        lease.resource_kind = "Cluster".to_string();
+        lease.capabilities = vec![
+            "kubeconfig".to_string(),
+            "extend".to_string(),
+            "release".to_string(),
+        ];
+    }
+    leases.extend(fetch_sandbox_leases_with_output(config, output).await?);
+    leases.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(leases)
+}
+
 /// A lease is terminal once it no longer refers to a live/pending cluster.
 pub(crate) fn is_terminal_phase(phase: &str) -> bool {
     matches!(
@@ -74,7 +168,7 @@ pub(crate) async fn find_active_lease_by_alias(
     config: &ResolvedConfig,
     alias: &str,
 ) -> Result<Option<LeaseSummary>> {
-    let found = fetch_leases_path(config, "/v1/leases")
+    let found = fetch_all_leases(config)
         .await?
         .into_iter()
         .find(|l| l.alias.as_deref() == Some(alias) && !is_terminal_phase(&l.phase));
@@ -82,7 +176,12 @@ pub(crate) async fn find_active_lease_by_alias(
 }
 
 pub(crate) async fn fetch_lease(config: &ResolvedConfig, lease_id: &str) -> Result<LeaseDetail> {
-    let path = format!("/v1/leases/{lease_id}");
+    let sandbox = lease_id.starts_with("sandbox-");
+    let path = if sandbox {
+        format!("/v1/sandbox-leases/{lease_id}")
+    } else {
+        format!("/v1/leases/{lease_id}")
+    };
     let endpoint = config.endpoint.as_str();
     let token = get_auth_header(config, "GET", &path, b"").await?;
 
@@ -98,7 +197,20 @@ pub(crate) async fn fetch_lease(config: &ResolvedConfig, lease_id: &str) -> Resu
         );
     }
 
-    Ok(response.json().await?)
+    let mut detail: LeaseDetail = response.json().await?;
+    if sandbox {
+        detail.resource_kind = "Sandbox".to_string();
+        detail.capabilities = vec![
+            "exec".to_string(),
+            "cancel".to_string(),
+            "logs".to_string(),
+            "attach".to_string(),
+            "port-forward".to_string(),
+            "extend".to_string(),
+            "release".to_string(),
+        ];
+    }
+    Ok(detail)
 }
 
 pub(crate) fn format_relative_time(iso: &str) -> String {
