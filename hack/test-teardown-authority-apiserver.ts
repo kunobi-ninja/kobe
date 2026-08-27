@@ -86,6 +86,50 @@ function policyExpressions(policy: Document): string[] {
 		.map((validation) => String(validation.expression));
 }
 
+/// The kind a validation is written for, read from its own resource guard.
+///
+/// Every expression opens by excluding the resources it does not apply to, so
+/// the guard names the one type whose fields it then reads.
+function guardedKind(expression: string): string | undefined {
+	if (expression.includes("!= 'verifiedteardownevidence'")) return "VerifiedTeardownEvidence";
+	if (expression.includes("!= 'clusterleases'")) return "ClusterLease";
+	if (expression.includes("!= 'clusterinstances'")) return "ClusterInstance";
+	return undefined;
+}
+
+/// Fail on type errors against the kind an expression targets, and only that
+/// kind.
+///
+/// The API server checks every expression against every type the policy
+/// matches, so one policy spanning ClusterLease, ClusterInstance and
+/// VerifiedTeardownEvidence always reports a field guard as an error on the
+/// two types that do not carry that field. Those reports are noise: the
+/// expression's own `request.resource.resource` guard already excluded them at
+/// admission time.
+///
+/// An error against the targeted kind is the opposite — a misspelled or
+/// removed field that would make the guard silently vacuous — so it still
+/// fails the gate.
+function offTargetWarnings(warnings: unknown, expressions: string[]): string[] {
+	if (!Array.isArray(warnings)) return [];
+	const fatal: string[] = [];
+	for (const warning of warnings as Record<string, unknown>[]) {
+		const index = Number(/\[(\d+)\]/.exec(String(warning.fieldRef))?.[1] ?? -1);
+		const kind = guardedKind(expressions[index] ?? "");
+		if (kind === undefined) {
+			fatal.push(`${warning.fieldRef}: no resource guard to check against`);
+			continue;
+		}
+		// Warnings arrive as one text block per kind, each headed by the type.
+		const blocks = String(warning.warning).split(/(?=kobe\.kunobi\.ninja\/v1alpha1, Kind=)/);
+		const targeted = blocks.find((block) => block.includes(`Kind=${kind}:`));
+		if (targeted && /ERROR:/.test(targeted)) {
+			fatal.push(`${warning.fieldRef} does not type-check against ${kind}: ${targeted}`);
+		}
+	}
+	return fatal;
+}
+
 async function waitForAcceptedPolicy(name: string): Promise<void> {
 	const deadline = Date.now() + 60_000;
 	while (Date.now() < deadline) {
@@ -96,8 +140,9 @@ async function waitForAcceptedPolicy(name: string): Promise<void> {
 		if (result.exitCode === 0) {
 			const policy = JSON.parse(result.stdout);
 			const warnings = policy.status?.typeChecking?.expressionWarnings;
-			if (Array.isArray(warnings) && warnings.length > 0) {
-				throw new Error(`${name} type-check warnings: ${JSON.stringify(warnings)}`);
+			const fatal = offTargetWarnings(warnings, policyExpressions(policy));
+			if (fatal.length > 0) {
+				throw new Error(`${name} type-check warnings: ${JSON.stringify(fatal)}`);
 			}
 			const accepted = policy.status?.conditions?.some(
 				(condition: Record<string, unknown>) =>
