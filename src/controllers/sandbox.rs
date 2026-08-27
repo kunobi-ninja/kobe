@@ -15555,7 +15555,7 @@ current-context: child
 
         assert_eq!(
             reconcile_lease(Arc::new(lease), ctx).await.unwrap(),
-            Action::await_change()
+            execution_cleanup_checkpoint_action()
         );
         assert_eq!(requests_to(&server, "PATCH", &gate_path).await, 1);
         assert_eq!(
