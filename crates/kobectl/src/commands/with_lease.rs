@@ -11,6 +11,7 @@ use super::OutputFormat;
 use super::config::{CliConfig, ResolvedConfig};
 use super::keepalive::heartbeat_until;
 use super::lease_create::{create_lease_request, wait_for_usable_lease};
+use super::pools::fetch_pool_for_config_with_output;
 use super::release::release_lease;
 
 pub struct WithLeaseCommand<'a> {
@@ -38,17 +39,25 @@ pub async fn with_lease(command: WithLeaseCommand<'_>) -> Result<()> {
 
     // with-lease is non-interactive (it wraps a command), so the pool must be
     // explicit rather than prompted.
-    let pool = command
+    let pool_name = command
         .pool
         .context("with-lease requires a pool: kobe with-lease <pool> --ttl 1h -- <cmd>")?;
+    let pool = fetch_pool_for_config_with_output(&config, pool_name, command.output).await?;
+    if !pool.supports("kubeconfig") {
+        anyhow::bail!(
+            "pool {} allocates {} resources, which do not support with-lease; use `kobe run` for executable resources",
+            pool.name,
+            pool.resource_kind
+        );
+    }
     if command.cmd.is_empty() {
         anyhow::bail!("with-lease requires a command after `--`");
     }
 
     if verbose {
-        eprintln!("Leasing '{pool}' for the wrapped command...");
+        eprintln!("Leasing '{}' for the wrapped command...", pool.name);
     }
-    let accepted = create_lease_request(&config, pool, command.ttl, None).await?;
+    let accepted = create_lease_request(&config, &pool.name, command.ttl, None).await?;
     let lease_id = accepted.id.clone();
 
     // Everything past creation must release the lease, even on error or signal.

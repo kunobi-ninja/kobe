@@ -1,4 +1,4 @@
-//! `kobe sandbox attach` and `port-forward` — the client half (#84).
+//! `kobe attach` and `port-forward` — the executable-resource client half (#84).
 //!
 //! # Framing
 //!

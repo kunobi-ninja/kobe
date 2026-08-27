@@ -278,6 +278,68 @@ fn run_server(
 }
 
 #[test]
+fn flat_exec_routes_an_executable_lease_without_a_kind_namespace() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                "id": "sandbox-test",
+                "phase": "Ready",
+                "pool": "agents",
+                "alias": "dev"
+                }])
+                .to_string(),
+            ),
+            ("POST", "/v1/sandbox-leases/sandbox-test/executions") => {
+                reply(stream, 200, &[], &execution_body("Succeeded", Some(0)))
+            }
+            _ => panic!("unexpected flat exec request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &server.endpoint(),
+        &["exec", "dev", "--", "/agent", "status"],
+    );
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
+}
+
+#[test]
+fn flat_exec_rejects_a_cluster_lease_by_capability() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                    "id": "lease-cluster",
+                    "phase": "Bound",
+                    "profile": "ci-small"
+                }])
+                .to_string(),
+            ),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 403, &[], ""),
+            _ => panic!("unsupported capability must not reach execution: {request:?}"),
+        }
+    });
+    let (_directory, child) =
+        spawn_child(&server.endpoint(), &["exec", "lease-cluster", "--", "true"]);
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does not support exec"), "{stderr}");
+    assert!(stderr.contains("kubeconfig, extend, release"), "{stderr}");
+}
+
+#[test]
 fn run_uses_one_json_envelope_for_terminal_and_release_outcomes() {
     for (remote_state, remote_exit, release_status, expected_exit, outcome, released) in [
         ("Succeeded", Some(0), 204, 0, "success", true),

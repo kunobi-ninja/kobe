@@ -2,27 +2,48 @@ use anyhow::Result;
 use serde::Serialize;
 
 use super::config::{CliConfig, ResolvedConfig};
+use super::extend::is_sandbox_lease;
 use super::select::{OnAmbiguous, resolve_lease_id};
 use super::state::remove_kubeconfig;
 use super::{OutputFormat, authed_client, get_auth_header, print_json, with_auth};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
+    Released,
+    NotFound,
+}
+
 /// Release a lease by id over `DELETE /v1/leases/{id}`, treating 404 as success
 /// (already gone). Also drops the local kubeconfig record. Used by `with-lease`
 /// (#107 P3) for guaranteed cleanup on exit.
-pub(crate) async fn release_lease(config: &ResolvedConfig, lease_id: &str) -> Result<()> {
+pub(crate) async fn release_lease(
+    config: &ResolvedConfig,
+    lease_id: &str,
+) -> Result<ReleaseOutcome> {
     let endpoint = config.endpoint.as_str();
-    let path = format!("/v1/leases/{lease_id}");
+    let sandbox = is_sandbox_lease(lease_id);
+    let path = if sandbox {
+        format!("/v1/sandbox-leases/{lease_id}")
+    } else {
+        format!("/v1/leases/{lease_id}")
+    };
     let token = get_auth_header(config, "DELETE", &path, b"").await?;
     let client = authed_client();
     let response = with_auth(client.delete(format!("{endpoint}{path}")), &token)
         .send()
         .await?;
-    let _ = remove_kubeconfig(&config.endpoint, lease_id);
     let status = response.status();
-    if !status.is_success() && status.as_u16() != 404 {
+    let outcome = if status.is_success() {
+        ReleaseOutcome::Released
+    } else if status.as_u16() == 404 {
+        ReleaseOutcome::NotFound
+    } else {
         anyhow::bail!("Failed to release lease {lease_id} (HTTP {status})");
+    };
+    if !sandbox {
+        let _ = remove_kubeconfig(&config.endpoint, lease_id);
     }
-    Ok(())
+    Ok(outcome)
 }
 
 #[derive(Serialize)]
@@ -48,53 +69,22 @@ pub async fn release(
         Some(id) => id.to_string(),
         None => resolve_lease_id(&config, None, output, OnAmbiguous::FirstActive).await?,
     };
-    let endpoint = config.endpoint.as_str();
-    let path = format!("/v1/leases/{selected_lease}");
-    let token = get_auth_header(&config, "DELETE", &path, b"").await?;
-
-    let client = authed_client();
-    let response = with_auth(
-        client.delete(format!("{endpoint}/v1/leases/{selected_lease}")),
-        &token,
-    )
-    .send()
-    .await?;
-
-    if response.status().is_success() {
-        if let Err(err) = remove_kubeconfig(&config.endpoint, &selected_lease) {
-            eprintln!(
-                "Warning: failed to remove local kubeconfig for {}: {err}",
-                selected_lease
-            );
+    let outcome = release_lease(&config, &selected_lease).await?;
+    match (outcome, output) {
+        (ReleaseOutcome::Released, OutputFormat::Text) => {
+            println!("Released lease {}", selected_lease)
         }
-        match output {
-            OutputFormat::Text => println!("Released lease {}", selected_lease),
-            OutputFormat::Json => print_json(&ReleaseOutput {
-                lease_id: &selected_lease,
-                status: "released",
-            })?,
-        }
-    } else if response.status().as_u16() == 404 {
-        if let Err(err) = remove_kubeconfig(&config.endpoint, &selected_lease) {
-            eprintln!(
-                "Warning: failed to remove local kubeconfig for {}: {err}",
-                selected_lease
-            );
-        }
-        match output {
-            OutputFormat::Text => {
-                println!(
-                    "Lease {} not found (already released or expired)",
-                    selected_lease
-                )
-            }
-            OutputFormat::Json => print_json(&ReleaseOutput {
-                lease_id: &selected_lease,
-                status: "not_found",
-            })?,
-        }
-    } else {
-        anyhow::bail!("Failed to release lease (HTTP {})", response.status());
+        (ReleaseOutcome::NotFound, OutputFormat::Text) => println!(
+            "Lease {} not found (already released or expired)",
+            selected_lease
+        ),
+        (outcome, OutputFormat::Json) => print_json(&ReleaseOutput {
+            lease_id: &selected_lease,
+            status: match outcome {
+                ReleaseOutcome::Released => "released",
+                ReleaseOutcome::NotFound => "not_found",
+            },
+        })?,
     }
 
     Ok(())

@@ -10,7 +10,7 @@ use anyhow::Result;
 use super::OutputFormat;
 use super::config::ResolvedConfig;
 use super::leases::{
-    LeaseSummary, fetch_leases_path, lease_cluster_label, lease_phase_label, lease_when_label,
+    LeaseSummary, fetch_all_leases, lease_cluster_label, lease_phase_label, lease_when_label,
 };
 use super::picker::{PickerItem, run_picker};
 
@@ -111,7 +111,7 @@ pub(crate) async fn resolve_lease_id(
     output: OutputFormat,
     on_ambiguous: OnAmbiguous,
 ) -> Result<String> {
-    let active: Vec<LeaseSummary> = fetch_leases_path(config, "/v1/leases")
+    let active: Vec<LeaseSummary> = fetch_all_leases(config)
         .await?
         .into_iter()
         .filter(is_active)
@@ -130,7 +130,8 @@ pub(crate) async fn resolve_lease_id(
                         lease_when_label(lease)
                     ),
                     secondary: format!(
-                        "phase: {}   cluster: {}",
+                        "kind: {}   phase: {}   resource: {}",
+                        lease.resource_kind,
                         lease_phase_label(lease),
                         lease_cluster_label(lease)
                     ),
@@ -165,6 +166,8 @@ mod tests {
         LeaseSummary {
             id: id.to_string(),
             phase: phase.to_string(),
+            resource_kind: "Cluster".to_string(),
+            capabilities: vec!["kubeconfig".to_string()],
             profile: profile.to_string(),
             cluster_name: None,
             expires_at: None,

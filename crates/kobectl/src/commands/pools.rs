@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::config::ResolvedConfig;
 use super::leases::LeaseSummary;
-use super::{authed_client, get_auth_header, with_auth};
+use super::{OutputFormat, authed_client, get_auth_header, get_auth_header_for_output, with_auth};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,6 +22,12 @@ pub(crate) struct PoolPolicySummary {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PoolSummary {
     pub name: String,
+    /// Resource allocated by this pool. Older endpoints omitted the field and
+    /// served Cluster pools only, so Cluster is the compatibility default.
+    #[serde(default = "default_resource_kind")]
+    pub resource_kind: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub phase: Option<String>,
     pub ready: u32,
@@ -41,6 +47,39 @@ pub(crate) struct PoolSummary {
     pub policy: Option<PoolPolicySummary>,
 }
 
+fn default_resource_kind() -> String {
+    "Cluster".to_string()
+}
+
+impl PoolSummary {
+    pub(crate) fn is_sandbox(&self) -> bool {
+        self.resource_kind.eq_ignore_ascii_case("sandbox")
+    }
+
+    pub(crate) fn supports(&self, capability: &str) -> bool {
+        if self.capabilities.is_empty() {
+            return if self.is_sandbox() {
+                matches!(
+                    capability,
+                    "lease"
+                        | "exec"
+                        | "cancel"
+                        | "logs"
+                        | "attach"
+                        | "port-forward"
+                        | "extend"
+                        | "release"
+                )
+            } else {
+                matches!(capability, "lease" | "kubeconfig" | "extend" | "release")
+            };
+        }
+        self.capabilities
+            .iter()
+            .any(|candidate| candidate == capability)
+    }
+}
+
 pub(crate) async fn fetch_pools_for_config(config: &ResolvedConfig) -> Result<Vec<PoolSummary>> {
     let endpoint = config.endpoint.as_str();
     let token = get_auth_header(config, "GET", "/v1/pools", b"").await?;
@@ -54,6 +93,32 @@ pub(crate) async fn fetch_pools_for_config(config: &ResolvedConfig) -> Result<Ve
         anyhow::bail!("Failed to list pools (HTTP {})", response.status());
     }
 
+    Ok(response.json().await?)
+}
+
+pub(crate) async fn fetch_pool_for_config_with_output(
+    config: &ResolvedConfig,
+    name: &str,
+    output: OutputFormat,
+) -> Result<PoolSummary> {
+    let endpoint = config.endpoint.as_str();
+    let path = format!("/v1/pools/{name}");
+    let token = get_auth_header_for_output(config, "GET", &path, b"", output).await?;
+    let response = with_auth(
+        super::authed_client().get(format!("{endpoint}{path}")),
+        &token,
+    )
+    .send()
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value["error"].as_str().map(str::to_string))
+            .unwrap_or(body);
+        anyhow::bail!("Failed to resolve pool {name} (HTTP {status}): {message}");
+    }
     Ok(response.json().await?)
 }
 
@@ -103,7 +168,7 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], i
         }
 
         let phase = pool.phase.as_deref().unwrap_or("Unknown");
-        println!("{indent}{}  {phase}", pool.name);
+        println!("{indent}{}  {}  {phase}", pool.name, pool.resource_kind);
         println!(
             "{indent}  ready {}  leased {}  creating {}  recycling {}  quarantined {}  queue {}",
             pool.ready,
@@ -115,6 +180,9 @@ pub(crate) fn print_pool_table(pools: &[PoolSummary], leases: &[LeaseSummary], i
         );
         if let Some(policy) = format_policy(pool) {
             println!("{indent}  {policy}");
+        }
+        if !pool.capabilities.is_empty() {
+            println!("{indent}  actions {}", pool.capabilities.join(", "));
         }
         if let Some(count) = recycling_leases.get(&pool.name)
             && *count > 0
@@ -142,11 +210,28 @@ mod tests {
         .expect("legacy pool payload should deserialize");
 
         assert_eq!(pool.leased, 1);
+        assert_eq!(pool.resource_kind, "Cluster");
+        assert!(pool.supports("kubeconfig"));
         assert_eq!(pool.creating, 0);
         assert_eq!(pool.recycling, 0);
         assert_eq!(pool.unhealthy, 0);
         assert_eq!(pool.queue_depth, 0);
         assert!(pool.policy.is_none());
+    }
+
+    #[test]
+    fn typed_pool_exposes_only_advertised_capabilities() {
+        let pool: PoolSummary = serde_json::from_value(serde_json::json!({
+            "name": "agents",
+            "resourceKind": "Sandbox",
+            "capabilities": ["lease", "exec", "logs"],
+            "ready": 1,
+            "leased": 0
+        }))
+        .unwrap();
+        assert!(pool.is_sandbox());
+        assert!(pool.supports("exec"));
+        assert!(!pool.supports("kubeconfig"));
     }
 
     #[test]

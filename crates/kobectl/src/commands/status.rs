@@ -3,7 +3,7 @@ use serde::Serialize;
 
 use super::config::{AuthMode, CliConfig};
 use super::leases::{
-    LeaseSummary, fetch_lease, fetch_leases_path, lease_cluster_label, lease_phase_label,
+    LeaseSummary, fetch_all_leases, fetch_lease, lease_cluster_label, lease_phase_label,
     lease_when_label,
 };
 use super::pools::{PoolSummary, fetch_pools_for_config, print_pool_table};
@@ -111,9 +111,7 @@ pub async fn status(
             Ok(pools) => (pools, None),
             Err(err) => (Vec::new(), Some(err.to_string())),
         };
-        let leases = fetch_leases_path(&config, "/v1/leases")
-            .await
-            .unwrap_or_default();
+        let leases = fetch_all_leases(&config).await.unwrap_or_default();
         (pools, pools_error, leases)
     };
     let leases = enrich_leases(&config, leases).await;
@@ -186,13 +184,16 @@ pub async fn status(
     } else {
         for lease in &leases {
             println!(
-                "  {:<24}  {:<12}  {:<8}  {}",
+                "  {:<32}  {:<12}  {:<9}  {:<12}  {}",
                 lease.id,
                 lease.profile,
+                lease.resource_kind,
                 lease_phase_label(lease),
                 lease_when_label(lease)
             );
-            println!("    cluster: {}", lease_cluster_label(lease));
+            if !lease.is_sandbox() {
+                println!("    cluster: {}", lease_cluster_label(lease));
+            }
             if let Some(kubeconfig_path) = lease.kubeconfig_path.as_deref() {
                 println!("    config:  {kubeconfig_path}");
             }
@@ -238,6 +239,8 @@ async fn enrich_leases(
             Ok(detail) => enriched.push(LeaseSummary {
                 id: detail.id,
                 phase: detail.phase,
+                resource_kind: detail.resource_kind,
+                capabilities: detail.capabilities,
                 profile: detail.profile,
                 cluster_name: detail.cluster_name.or(lease.cluster_name),
                 expires_at: detail.expires_at.or(lease.expires_at),

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::config::CliConfig;
-use super::leases::{LeaseSummary, fetch_leases_path};
+use super::leases::{LeaseSummary, fetch_all_leases};
 use super::state::{
     endpoint_kubeconfigs, find_orphan_kubeconfigs, forget_endpoint_kubeconfigs, forget_kubeconfig,
     local_kubeconfig_candidates, remove_kubeconfig,
@@ -28,7 +28,7 @@ pub async fn purge(
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
 
-    let leases = fetch_leases_path(&config, "/v1/leases").await?;
+    let leases = fetch_all_leases(&config).await?;
     let active_leases: Vec<LeaseSummary> = leases
         .iter()
         .filter(|l| is_active_lease(l))
@@ -65,14 +65,16 @@ pub async fn purge(
     let client = authed_client();
     let mut released = Vec::new();
     for lease in &active_leases {
-        let path = format!("/v1/leases/{}", lease.id);
+        let path = release_path(lease);
         let token = get_auth_header(&config, "DELETE", &path, b"").await?;
         let response = with_auth(client.delete(format!("{endpoint}{path}")), &token)
             .send()
             .await?;
         match response.status().as_u16() {
             200..=299 | 404 => {
-                let _ = remove_kubeconfig(endpoint, &lease.id);
+                if !lease.is_sandbox() {
+                    let _ = remove_kubeconfig(endpoint, &lease.id);
+                }
                 released.push(lease.id.clone());
             }
             status => anyhow::bail!("Failed to purge lease {} (HTTP {status})", lease.id),
@@ -124,6 +126,14 @@ pub async fn purge(
     }
 
     Ok(())
+}
+
+fn release_path(lease: &LeaseSummary) -> String {
+    if lease.is_sandbox() {
+        format!("/v1/sandbox-leases/{}", lease.id)
+    } else {
+        format!("/v1/leases/{}", lease.id)
+    }
 }
 
 /// Remove only kubeconfigs whose lease no longer exists server-side. Active
@@ -376,6 +386,8 @@ mod tests {
         let base = LeaseSummary {
             id: "lease-1".to_string(),
             phase: "Bound".to_string(),
+            resource_kind: "Cluster".to_string(),
+            capabilities: vec!["kubeconfig".to_string()],
             profile: "ci".to_string(),
             cluster_name: None,
             expires_at: None,
@@ -401,6 +413,31 @@ mod tests {
     }
 
     #[test]
+    fn purge_dispatches_release_by_resource_kind() {
+        let cluster = LeaseSummary {
+            id: "lease-cluster".to_string(),
+            phase: "Bound".to_string(),
+            resource_kind: "Cluster".to_string(),
+            capabilities: vec!["release".to_string()],
+            profile: "ci".to_string(),
+            cluster_name: None,
+            expires_at: None,
+            queue_position: 0,
+            requester: None,
+            kubeconfig_path: None,
+            alias: None,
+        };
+        let sandbox = LeaseSummary {
+            id: "sandbox-agent".to_string(),
+            resource_kind: "Sandbox".to_string(),
+            profile: "agents".to_string(),
+            ..cluster.clone()
+        };
+        assert_eq!(release_path(&cluster), "/v1/leases/lease-cluster");
+        assert_eq!(release_path(&sandbox), "/v1/sandbox-leases/sandbox-agent");
+    }
+
+    #[test]
     fn live_lease_ids_treats_recycling_as_live() {
         // Recycling leases must be considered live for orphan detection,
         // otherwise we delete a kubeconfig whose cluster is still mid-teardown
@@ -408,6 +445,8 @@ mod tests {
         let base = LeaseSummary {
             id: String::new(),
             phase: String::new(),
+            resource_kind: "Cluster".to_string(),
+            capabilities: vec!["kubeconfig".to_string()],
             profile: "ci".to_string(),
             cluster_name: None,
             expires_at: None,

@@ -21,13 +21,13 @@ use crate::api::connect::{
     BackendAccess, backend_access_from_kubeconfig, build_backend_tls_config,
     build_connect_kubeconfig, ensure_lease_connect_token, validate_lease_connect_token,
 };
-use crate::api::policy::{self, format_duration, is_pool_allowed, policy_for};
+use crate::api::policy::{self, format_duration, is_pool_allowed, is_sandbox_allowed, policy_for};
 use crate::backend::{BackendFactory, ClusterBackend};
 use crate::controllers::lease::extend_lease_ttl;
 use crate::crd::{
     CIDRClaim, CIDRClaimPhase, ClusterInstance, ClusterInstancePhase, ClusterLease,
-    ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, ClusterPoolPhase, LeaseBinding,
-    LeasePhase, Requester,
+    ClusterLeaseCondition, ClusterLeaseSpec, ClusterPool, LeaseBinding, LeasePhase, Requester,
+    SandboxPool, SandboxVerb,
 };
 use crate::lease_binding::{BindingResolutionError, BindingResolveMode, resolve_lease_binding};
 use crate::metrics;
@@ -522,8 +522,10 @@ struct PoolPolicyResponse {
 #[serde(rename_all = "camelCase")]
 struct ProfileResponse {
     name: String,
+    resource_kind: &'static str,
+    capabilities: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<ClusterPoolPhase>,
+    phase: Option<String>,
     ready: u32,
     leased: u32,
     creating: u32,
@@ -601,11 +603,17 @@ fn pool_policy_response(profile: &ClusterPool) -> PoolPolicyResponse {
     }
 }
 
-fn profile_response(profile: &ClusterPool) -> ProfileResponse {
+fn profile_response(profile: &ClusterPool, policy: &policy::Policy) -> ProfileResponse {
     let status = profile.status.clone().unwrap_or_default();
+    let mut capabilities = vec!["lease", "kubeconfig", "release"];
+    if policy.max_extensions > 0 {
+        capabilities.push("extend");
+    }
     ProfileResponse {
         name: profile.name_any(),
-        phase: status.phase,
+        resource_kind: "Cluster",
+        capabilities,
+        phase: status.phase.map(|phase| format!("{phase:?}")),
         ready: status.ready,
         leased: status.leased,
         creating: status.creating,
@@ -614,6 +622,57 @@ fn profile_response(profile: &ClusterPool) -> ProfileResponse {
         quarantined: status.quarantined,
         queue_depth: status.queue_depth,
         policy: pool_policy_response(profile),
+    }
+}
+
+fn sandbox_pool_response(pool: &SandboxPool, policy: &policy::Policy) -> ProfileResponse {
+    let status = pool.status.clone().unwrap_or_default();
+    let mut capabilities = vec!["lease"];
+    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::Exec, policy) {
+        capabilities.extend(["exec", "cancel", "attach"]);
+    }
+    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::Logs, policy) {
+        capabilities.push("logs");
+    }
+    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::PortForward, policy) {
+        capabilities.push("port-forward");
+    }
+    if is_sandbox_allowed(&pool.name_any(), SandboxVerb::Release, policy) {
+        capabilities.push("release");
+    }
+    if policy
+        .sandbox
+        .as_ref()
+        .is_some_and(|grant| grant.max_extensions > 0)
+    {
+        capabilities.push("extend");
+    }
+    let phase = if crate::sandbox::require_current_sandbox_pool_ready(pool).is_ok() {
+        "Ready"
+    } else {
+        "NotReady"
+    };
+    ProfileResponse {
+        name: pool.name_any(),
+        resource_kind: "Sandbox",
+        capabilities,
+        phase: Some(phase.to_string()),
+        ready: status.ready,
+        leased: status.allocated,
+        creating: 0,
+        recycling: 0,
+        unhealthy: 0,
+        quarantined: status.quarantined,
+        queue_depth: 0,
+        policy: PoolPolicyResponse {
+            mode: "sandbox".to_string(),
+            ttl: pool.spec.default_ttl.clone(),
+            warm_target: pool.spec.warm_capacity,
+            max_clusters: None,
+            scale_up_threshold: None,
+            scale_down_after: None,
+            queue_timeout: Some(pool.spec.provisioning_timeout.clone()),
+        },
     }
 }
 
@@ -2408,15 +2467,43 @@ async fn list_pools<B: ClusterBackend>(
     identity: AuthIdentity,
 ) -> Response {
     let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    let policy = policy_for(&identity);
 
     match profiles_api.list(&ListParams::default()).await {
         Ok(profiles) => {
-            let policy = policy_for(&identity);
-            let response: Vec<ProfileResponse> = profiles
+            let mut response: Vec<ProfileResponse> = profiles
                 .iter()
                 .filter(|p| is_pool_allowed(&p.name_any(), &policy))
-                .map(profile_response)
+                .map(|profile| profile_response(profile, &policy))
                 .collect();
+
+            if state.sandbox_enabled {
+                let sandbox_pools: Api<SandboxPool> =
+                    Api::namespaced(state.client.clone(), &state.namespace);
+                match sandbox_pools.list(&ListParams::default()).await {
+                    Ok(pools) => response.extend(
+                        pools
+                            .iter()
+                            .filter(|pool| {
+                                is_sandbox_allowed(&pool.name_any(), SandboxVerb::Lease, &policy)
+                            })
+                            .map(|pool| sandbox_pool_response(pool, &policy)),
+                    ),
+                    Err(error) => {
+                        return infra_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to list Sandbox pools",
+                            error,
+                        );
+                    }
+                }
+            }
+
+            response.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.resource_kind.cmp(right.resource_kind))
+            });
 
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -2435,28 +2522,67 @@ async fn get_pool<B: ClusterBackend>(
     Path(name): Path<String>,
 ) -> Response {
     let policy = policy_for(&identity);
-    if !is_pool_allowed(&name, &policy) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
     let profiles_api: Api<ClusterPool> = Api::namespaced(state.client.clone(), &state.namespace);
+    let cluster = match profiles_api.get_opt(&name).await {
+        Ok(cluster) => cluster,
+        Err(error) => {
+            return infra_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get Cluster pool",
+                error,
+            );
+        }
+    };
+    let sandbox = if state.sandbox_enabled {
+        let pools: Api<SandboxPool> = Api::namespaced(state.client.clone(), &state.namespace);
+        match pools.get_opt(&name).await {
+            Ok(pool) => pool,
+            Err(error) => {
+                return infra_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to get Sandbox pool",
+                    error,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
-    match profiles_api.get(&name).await {
-        Ok(profile) => (StatusCode::OK, Json(profile_response(&profile))).into_response(),
-        Err(kube::Error::Api(ref ae)) if ae.code == 404 => (
+    let cluster_allowed = cluster.as_ref().filter(|_| is_pool_allowed(&name, &policy));
+    let sandbox_allowed = sandbox
+        .as_ref()
+        .filter(|_| is_sandbox_allowed(&name, SandboxVerb::Lease, &policy));
+    match (cluster_allowed, sandbox_allowed) {
+        (Some(_), Some(_)) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Pool name '{name}' is ambiguous across Cluster and Sandbox resources"
+                ),
+                detail: Some("Pool names must be unique across resource kinds".to_string()),
+                reason: None,
+            }),
+        )
+            .into_response(),
+        (Some(profile), None) => {
+            (StatusCode::OK, Json(profile_response(profile, &policy))).into_response()
+        }
+        (None, Some(pool)) => {
+            (StatusCode::OK, Json(sandbox_pool_response(pool, &policy))).into_response()
+        }
+        (None, None) if cluster.is_some() || sandbox.is_some() => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+        (None, None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: "Profile not found".to_string(),
+                error: "Pool not found".to_string(),
                 detail: None,
                 reason: None,
             }),
         )
             .into_response(),
-        Err(e) => infra_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to get profile",
-            e,
-        ),
     }
 }
 
