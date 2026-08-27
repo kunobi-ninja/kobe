@@ -215,7 +215,7 @@ type Args = {
   settleMs: number;
   /// Substring the attached session must produce for the run to pass.
   expect?: string;
-  /// Exit code `kobe sandbox attach` must terminate with.
+  /// Exit code `kobe attach` must terminate with.
   expectExit?: number;
   /// HTTP status an upgraded port-forward handshake must be refused with.
   expectHttpStatus?: number;
@@ -225,7 +225,7 @@ type Args = {
   resizeAfter?: string;
   /// Pool-declared remote port driven by the port-forward harness.
   remotePort: string;
-  /// Argv handed to `kobe sandbox attach ... -- <argv>`, after a bare `--`.
+  /// Argv handed to `kobe attach ... -- <argv>`, after a bare `--`.
   attachArgv: string[];
 };
 
@@ -670,10 +670,10 @@ function printHelpAndExit(): never {
   info("  bun run ./hack/e2e.ts attach-pty --lease ID [--send KEYS]... [--expect TEXT] [--expect-exit N]");
   info("                                   [--resize WIDTHxHEIGHT --resize-after TEXT]");
   info("                                   [--kobe PATH] [--settle MS] [--send-delay MS] [-- ARGV...]");
-  info("      Drive `kobe sandbox attach` through a real pty. --send accepts \\r \\n \\t \\e \\xNN.");
+  info("      Drive `kobe attach` through a real pty. --send accepts \\r \\n \\t \\e \\xNN.");
   info("");
   info("  bun run ./hack/e2e.ts port-forward --lease ID [--port NAME] [--expect TEXT] [--kobe PATH]");
-  info("      Drive a real loopback connection through `kobe sandbox port-forward`.");
+  info("      Drive a real loopback connection through `kobe port-forward`.");
   process.exit(0);
 }
 
@@ -3163,7 +3163,7 @@ const PTY_SPAWN = "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spa
 ///
 /// The resize is deliberately out-of-band. Sending an escape sequence through
 /// stdin would test a shell convention, not the terminal-size ioctl that
-/// `kobe sandbox attach` observes and forwards on channel 4.
+/// `kobe attach` observes and forwards on channel 4.
 const RESIZABLE_PTY_SPAWN = String.raw`
 import fcntl, os, pty, select, signal, struct, sys, termios
 
@@ -3209,7 +3209,7 @@ sys.exit(os.waitstatus_to_exitcode(status))
 
 /// Wrap a command so it runs with a controlling terminal.
 ///
-/// A pty is not a convenience here, it is the only option. `kobe sandbox attach`
+/// A pty is not a convenience here, it is the only option. `kobe attach`
 /// reads keys through crossterm's event stream, which uses stdin only when
 /// `isatty(0)` and otherwise opens `/dev/tty` — so a pipe on stdin is not read
 /// at all, and in CI, where there is no controlling terminal to fall back to,
@@ -3267,7 +3267,6 @@ async function attachPty(args: Args): Promise<void> {
     args.kobeBin,
     "--target",
     args.cliTarget,
-    "sandbox",
     "attach",
     args.lease,
     ...(args.attachArgv.length > 0 ? ["--", ...args.attachArgv] : []),
@@ -3383,7 +3382,7 @@ async function attachPty(args: Args): Promise<void> {
     throw new Error(`the attached session never produced ${JSON.stringify(args.expect)} within ${args.timeoutSeconds}s`);
   }
   if (args.expectExit !== undefined && exitCode !== args.expectExit) {
-    throw new Error(`kobe sandbox attach exited ${exitCode}, expected ${args.expectExit}`);
+    throw new Error(`kobe attach exited ${exitCode}, expected ${args.expectExit}`);
   }
   step("Attached session satisfied every assertion");
 }
@@ -3414,7 +3413,6 @@ async function portForward(args: Args): Promise<void> {
     args.kobeBin,
     "--target",
     args.cliTarget,
-    "sandbox",
     "port-forward",
     args.lease,
     `0:${args.remotePort}`,
@@ -3460,12 +3458,12 @@ async function portForward(args: Args): Promise<void> {
       address = forwardingAddress(stdout, args.lease, args.remotePort);
       if (address) break;
       if (exited !== undefined) {
-        throw new Error(`kobe sandbox port-forward exited ${exited} before listening:\n${stdout}${stderr}`);
+        throw new Error(`kobe port-forward exited ${exited} before listening:\n${stdout}${stderr}`);
       }
       await Bun.sleep(100);
     }
     if (!address) {
-      throw new Error(`kobe sandbox port-forward did not listen within ${args.timeoutSeconds}s:\n${stdout}${stderr}`);
+      throw new Error(`kobe port-forward did not listen within ${args.timeoutSeconds}s:\n${stdout}${stderr}`);
     }
 
     if (args.expectHttpStatus !== undefined) {

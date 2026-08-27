@@ -331,10 +331,10 @@ test("the pty wrapper passes argv through without a shell in between", () => {
   // Every argument stays its own argv element. Building one shell string
   // instead would make a lease alias containing a quote executable, and the
   // aliases are caller-supplied.
-  const cmd = ptyCommand("python3", ["kobe", "sandbox", "attach", "it's mine"]);
+  const cmd = ptyCommand("python3", ["kobe", "attach", "it's mine"]);
 
   expect(cmd.slice(0, 2)).toEqual(["python3", "-c"]);
-  expect(cmd.slice(3)).toEqual(["kobe", "sandbox", "attach", "it's mine"]);
+  expect(cmd.slice(3)).toEqual(["kobe", "attach", "it's mine"]);
 });
 
 test("the pty wrapper exits with the attached command's own status", () => {

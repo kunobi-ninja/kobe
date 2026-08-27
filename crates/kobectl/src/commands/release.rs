@@ -61,12 +61,17 @@ pub async fn release(
 ) -> Result<()> {
     let config = CliConfig::load()?;
     let config = config.resolve(target_override, endpoint_override)?;
-    // An explicit id is used verbatim (the server handles 404 gracefully, so
-    // releasing a just-expired id still works). Otherwise resolve against the
-    // active leases, falling back to the first one in non-interactive mode to
-    // preserve the prior behavior.
+    // Generated ids identify their kind and remain usable after the lease has
+    // disappeared from the active inventory, so keep sending those verbatim.
+    // Every other explicit value is a selector: resolve aliases and unique
+    // pool names across all lease kinds before choosing the DELETE endpoint.
+    // This keeps `kobe release dev` symmetric with `exec dev` and `extend dev`
+    // without giving up idempotent release of an already-expired concrete id.
     let selected_lease = match lease_id {
-        Some(id) => id.to_string(),
+        Some(id) if is_self_identifying_lease_id(id) => id.to_string(),
+        Some(selector) => {
+            resolve_lease_id(&config, Some(selector), output, OnAmbiguous::Reject).await?
+        }
         None => resolve_lease_id(&config, None, output, OnAmbiguous::FirstActive).await?,
     };
     let outcome = release_lease(&config, &selected_lease).await?;
@@ -88,4 +93,8 @@ pub async fn release(
     }
 
     Ok(())
+}
+
+fn is_self_identifying_lease_id(value: &str) -> bool {
+    value.starts_with("lease-") || is_sandbox_lease(value)
 }

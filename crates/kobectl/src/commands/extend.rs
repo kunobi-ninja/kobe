@@ -107,11 +107,10 @@ pub async fn extend(
     // Mutating command: never act on an arbitrary lease when the choice is
     // ambiguous and we cannot prompt.
     //
-    // An explicit Sandbox lease id resolves itself. Sending it through the
-    // cluster resolver would fail with "no active lease matching", because
-    // that resolver only lists `/v1/leases`. Sandbox alias and pool
-    // resolution, and the interactive picker, still cover cluster leases
-    // only — they need a unified listing, which belongs with `kobe status`.
+    // An explicit Sandbox lease id resolves itself even after it disappears
+    // from the active inventory. Every other value goes through the unified
+    // lease selector, which matches active ids, aliases and unique pool names
+    // across both resource kinds.
     let lease_id = match target {
         Some(target) if is_sandbox_lease(target) => target.to_string(),
         target => resolve_lease_id(&config, target, output, OnAmbiguous::Reject).await?,

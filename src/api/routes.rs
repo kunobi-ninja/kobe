@@ -4672,6 +4672,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pools_returns_mixed_kinds_with_effective_capabilities() {
+        use crate::api::policy::SandboxPolicy;
+        use crate::crd::{SandboxResourceCeiling, SandboxVerb};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = wiremock::MockServer::start().await;
+        let client = crate::testutil::mock_k8s_client(&server);
+        let state = AppState {
+            client,
+            backend: crate::testutil::MockBackend::new(),
+            namespace: "test-ns".to_string(),
+            sandbox_reservation_namespace: "test-ns".to_string(),
+            sandbox_serving_replica: None,
+            authenticator: Arc::new(crate::api::auth::JwtAuthenticator::new("test".to_string())),
+            factory: None,
+            datastore: Default::default(),
+            connect_cache: Default::default(),
+            sandbox_admission_limiter: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            sandbox_enabled: true,
+        };
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/clusterpools",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![exact_connect_pool_json()]),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/apis/kobe.kunobi.ninja/v1alpha1/namespaces/test-ns/sandboxpools",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                crate::testutil::k8s_list_response(vec![serde_json::json!({
+                    "apiVersion": "kobe.kunobi.ninja/v1alpha1",
+                    "kind": "SandboxPool",
+                    "metadata": {
+                        "name": "agent-small",
+                        "namespace": "test-ns",
+                        "uid": "sandbox-pool-uid",
+                        "generation": 1
+                    },
+                    "spec": {
+                        "warmCapacity": 1,
+                        "defaultTtl": "1h",
+                        "maxTtl": "4h",
+                        "provisioningTimeout": "10m",
+                        "placement": { "type": "management" },
+                        "template": {
+                            "defaultContainer": "agent",
+                            "containers": [{
+                                "name": "agent",
+                                "image": "example.invalid/agent@sha256:abc",
+                                "resources": {
+                                    "requests": {
+                                        "cpu": "500m",
+                                        "memory": "512Mi",
+                                        "ephemeralStorage": "512Mi"
+                                    },
+                                    "limits": {
+                                        "cpu": "1",
+                                        "memory": "1Gi",
+                                        "ephemeralStorage": "1Gi"
+                                    }
+                                }
+                            }],
+                            "exposedPorts": [{
+                                "name": "http",
+                                "container": "agent",
+                                "port": 3000
+                            }]
+                        },
+                        "isolation": { "tier": "trusted-runc" },
+                        "readiness": {
+                            "canary": { "argv": ["/bin/true"], "timeout": "30s" }
+                        }
+                    }
+                })]),
+            ))
+            .mount(&server)
+            .await;
+
+        let mut identity = test_identity();
+        identity.policy.allowed_pools = vec!["ci-*".to_string()];
+        identity.policy.sandbox = Some(SandboxPolicy {
+            allowed_pools: vec!["agent-*".to_string()],
+            verbs: vec![
+                SandboxVerb::Lease,
+                SandboxVerb::Exec,
+                SandboxVerb::Logs,
+                SandboxVerb::Release,
+            ],
+            max_ttl: chrono::Duration::hours(4),
+            max_concurrent_leases: 2,
+            max_extensions: 0,
+            resource_ceiling: SandboxResourceCeiling {
+                max_cpu: "2".to_string(),
+                max_memory: "2Gi".to_string(),
+            },
+        });
+
+        let response = list_pools::<crate::testutil::MockBackend>(State(state), identity).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let pools = body.as_array().unwrap();
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0]["name"], "agent-small");
+        assert_eq!(pools[0]["resourceKind"], "Sandbox");
+        let sandbox_capabilities = pools[0]["capabilities"].as_array().unwrap();
+        for capability in ["lease", "exec", "cancel", "attach", "logs", "release"] {
+            assert!(sandbox_capabilities.contains(&serde_json::json!(capability)));
+        }
+        assert!(!sandbox_capabilities.contains(&serde_json::json!("port-forward")));
+        assert!(!sandbox_capabilities.contains(&serde_json::json!("extend")));
+        assert_eq!(pools[1]["name"], "ci-small");
+        assert_eq!(pools[1]["resourceKind"], "Cluster");
+        assert!(
+            pools[1]["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("kubeconfig"))
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_lease_requires_auth() {
         let (app, _server) = test_app().await;
 

@@ -161,6 +161,7 @@ enum Commands {
     /// (or, with `--output json`, the command errors and lists candidates).
     Extend {
         /// Lease id or pool to extend (optional when you hold one lease)
+        #[arg(id = "lease_selector")]
         target: Option<String>,
         /// Duration to add to the current expiry (e.g. 30m, 1h)
         #[arg(long, default_value = "30m")]
@@ -861,5 +862,25 @@ mod tests {
                 action: SandboxAction::Exec { .. }
             }
         ));
+    }
+
+    #[test]
+    fn extend_selector_is_distinct_from_the_global_target() {
+        let cli = Cli::try_parse_from([
+            "kobe",
+            "--target",
+            "production",
+            "extend",
+            "dev",
+            "--ttl",
+            "30m",
+        ])
+        .unwrap();
+        assert_eq!(cli.target.as_deref(), Some("production"));
+        let Commands::Extend { target, ttl } = cli.command else {
+            panic!("expected extend")
+        };
+        assert_eq!(target.as_deref(), Some("dev"));
+        assert_eq!(ttl, "30m");
     }
 }
