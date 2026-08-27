@@ -175,6 +175,33 @@ fn execution_body(state: &str, exit_code: Option<i32>) -> String {
     .to_string()
 }
 
+fn pool_body(name: &str, resource_kind: &str, capabilities: &[&str]) -> String {
+    json!({
+        "name": name,
+        "resourceKind": resource_kind,
+        "capabilities": capabilities,
+        "phase": "Ready",
+        "ready": 1,
+        "leased": 0,
+        "creating": 0,
+        "recycling": 0,
+        "unhealthy": 0,
+        "quarantined": 0,
+        "queueDepth": 0
+    })
+    .to_string()
+}
+
+fn sandbox_inventory() -> String {
+    json!([{
+        "id": "sandbox-test",
+        "phase": "Ready",
+        "pool": "agents",
+        "alias": "dev"
+    }])
+    .to_string()
+}
+
 fn spawn_child(endpoint: &str, args: &[&str]) -> (tempfile::TempDir, Child) {
     spawn_child_with_auth(endpoint, "none", args)
 }
@@ -245,7 +272,18 @@ fn run_server(
     let state = state.to_string();
     let server = Server::start(move |request, stream| {
         let mut current = observed.lock().unwrap();
-        if request.method == "POST" && request.path == "/v1/sandbox-leases" {
+        if request.method == "GET" && request.path == "/v1/pools/agents" {
+            reply(
+                stream,
+                200,
+                &[],
+                &pool_body(
+                    "agents",
+                    "Sandbox",
+                    &["lease", "exec", "logs", "cancel", "attach", "port-forward"],
+                ),
+            );
+        } else if request.method == "POST" && request.path == "/v1/sandbox-leases" {
             current.creates += 1;
             let (_, lease) = keyed_lease(&request.body);
             current.lease = Some(lease.clone());
@@ -305,7 +343,13 @@ fn flat_exec_routes_an_executable_lease_without_a_kind_namespace() {
         &["exec", "dev", "--", "/agent", "status"],
     );
     let output = wait_output(child);
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
 }
@@ -340,6 +384,308 @@ fn flat_exec_rejects_a_cluster_lease_by_capability() {
 }
 
 #[test]
+fn flat_release_resolves_a_sandbox_alias_before_dispatch() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                    "id": "sandbox-test",
+                    "phase": "Ready",
+                    "pool": "agents",
+                    "alias": "dev"
+                }])
+                .to_string(),
+            ),
+            ("DELETE", "/v1/sandbox-leases/sandbox-test") => reply(stream, 204, &[], ""),
+            _ => panic!("release must resolve the alias before dispatch: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(&server.endpoint(), &["release", "dev"]);
+    let output = wait_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("sandbox-test"));
+}
+
+#[test]
+fn flat_capability_commands_resolve_aliases_without_a_kind_namespace() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/sandbox-leases/sandbox-test/logs?tail=5") => {
+                reply(stream, 200, &[], "sandbox log\n")
+            }
+            ("DELETE", "/v1/sandbox-leases/sandbox-test/executions/sbxe-test") => {
+                reply(stream, 200, &[], &execution_body("Cancelled", None))
+            }
+            _ => panic!("unexpected flat capability request: {request:?}"),
+        }
+    });
+
+    for (args, expected) in [
+        (vec!["logs", "dev", "--tail", "5"], "sandbox log"),
+        (
+            vec!["cancel", "dev", "--execution", "sbxe-test"],
+            "sbxe-test is Cancelled",
+        ),
+    ] {
+        let (_directory, child) = spawn_child(&server.endpoint(), &args);
+        let output = wait_output(child);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let (_directory, child) =
+        spawn_child(&server.endpoint(), &["attach", "dev", "--output", "json"]);
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stderr.is_empty());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["outcome"], "clientError");
+    assert!(envelope["error"].as_str().unwrap().contains("interactive"));
+}
+
+#[test]
+fn flat_lease_dispatches_from_the_pool_resource_kind() {
+    let cluster_server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools/ci") => reply(
+                stream,
+                200,
+                &[],
+                &pool_body("ci", "Cluster", &["lease", "kubeconfig", "release"]),
+            ),
+            ("POST", "/v1/leases") => reply(
+                stream,
+                202,
+                &[],
+                &json!({
+                    "id": "lease-cluster",
+                    "phase": "Pending",
+                    "profile": "ci",
+                    "queuePosition": 1,
+                    "effectiveTtl": "1h"
+                })
+                .to_string(),
+            ),
+            _ => panic!("unexpected Cluster lease request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &cluster_server.endpoint(),
+        &["lease", "ci", "--no-wait", "--output", "json"],
+    );
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(0));
+    let created: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(created["resourceKind"], "Cluster");
+    assert_eq!(created["id"], "lease-cluster");
+
+    let sandbox_server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/pools/agents") => reply(
+                stream,
+                200,
+                &[],
+                &pool_body("agents", "Sandbox", &["lease", "exec", "release"]),
+            ),
+            ("POST", "/v1/sandbox-leases") => {
+                let (_, lease) = keyed_lease(&request.body);
+                let location = format!("/v1/sandbox-leases/{lease}");
+                reply(
+                    stream,
+                    202,
+                    &[("Location", &location)],
+                    &lease_body(&lease, "Pending"),
+                );
+            }
+            _ => panic!("unexpected Sandbox lease request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &sandbox_server.endpoint(),
+        &["lease", "agents", "--no-wait", "--output", "json"],
+    );
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(0));
+    let created: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(created["resourceKind"], "Sandbox");
+    assert!(created["id"].as_str().unwrap().starts_with("sandbox-"));
+}
+
+#[test]
+fn flat_extend_and_purge_route_both_resource_kinds() {
+    let extend_server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("PATCH", "/v1/sandbox-leases/sandbox-test") => reply(
+                stream,
+                200,
+                &[],
+                &json!({ "expiresAt": "2030-01-01T00:00:00Z" }).to_string(),
+            ),
+            _ => panic!("unexpected extend request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &extend_server.endpoint(),
+        &["extend", "dev", "--ttl", "30m", "--output", "json"],
+    );
+    let output = wait_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let extended: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(extended["leaseId"], "sandbox-test");
+
+    let deleted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed = Arc::clone(&deleted);
+    let purge_server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                    "id": "lease-cluster",
+                    "phase": "Bound",
+                    "profile": "ci"
+                }])
+                .to_string(),
+            ),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("DELETE", "/v1/leases/lease-cluster")
+            | ("DELETE", "/v1/sandbox-leases/sandbox-test") => {
+                observed.lock().unwrap().push(request.path);
+                reply(stream, 204, &[], "");
+            }
+            _ => panic!("unexpected purge request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(
+        &purge_server.endpoint(),
+        &["purge", "--yes", "--output", "json"],
+    );
+    let output = wait_output(child);
+    assert_eq!(output.status.code(), Some(0));
+    let purged: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(purged["releasedLeases"].as_array().unwrap().len(), 2);
+    let deleted = deleted.lock().unwrap();
+    assert!(deleted.contains(&"/v1/leases/lease-cluster".to_string()));
+    assert!(deleted.contains(&"/v1/sandbox-leases/sandbox-test".to_string()));
+}
+
+#[test]
+fn flat_status_reports_one_mixed_pool_and_lease_inventory() {
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/status") => {
+                reply(stream, 200, &[], &json!({ "version": "test" }).to_string())
+            }
+            ("GET", "/v1/pools") => reply(
+                stream,
+                200,
+                &[],
+                &json!([
+                    serde_json::from_str::<Value>(&pool_body(
+                        "agents",
+                        "Sandbox",
+                        &["lease", "exec", "release"]
+                    ))
+                    .unwrap(),
+                    serde_json::from_str::<Value>(&pool_body(
+                        "ci",
+                        "Cluster",
+                        &["lease", "kubeconfig", "release"]
+                    ))
+                    .unwrap()
+                ])
+                .to_string(),
+            ),
+            ("GET", "/v1/leases") => reply(
+                stream,
+                200,
+                &[],
+                &json!([{
+                    "id": "lease-cluster",
+                    "phase": "Bound",
+                    "profile": "ci"
+                }])
+                .to_string(),
+            ),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            ("GET", "/v1/leases/lease-cluster") => reply(
+                stream,
+                200,
+                &[],
+                &json!({
+                    "id": "lease-cluster",
+                    "phase": "Bound",
+                    "profile": "ci",
+                    "clusterName": "pool-ci-1"
+                })
+                .to_string(),
+            ),
+            ("GET", "/v1/sandbox-leases/sandbox-test") => reply(
+                stream,
+                200,
+                &[],
+                &json!({
+                    "id": "sandbox-test",
+                    "phase": "Ready",
+                    "pool": "agents"
+                })
+                .to_string(),
+            ),
+            _ => panic!("unexpected status request: {request:?}"),
+        }
+    });
+    let (_directory, child) = spawn_child(&server.endpoint(), &["status", "--output", "json"]);
+    let output = wait_output(child);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["pools"].as_array().unwrap().len(), 2);
+    assert_eq!(status["leases"].as_array().unwrap().len(), 2);
+    let kinds: HashSet<_> = status["leases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|lease| lease["resourceKind"].as_str())
+        .collect();
+    assert_eq!(kinds, HashSet::from(["Cluster", "Sandbox"]));
+}
+
+#[test]
 fn run_uses_one_json_envelope_for_terminal_and_release_outcomes() {
     for (remote_state, remote_exit, release_status, expected_exit, outcome, released) in [
         ("Succeeded", Some(0), 204, 0, "success", true),
@@ -351,9 +697,7 @@ fn run_uses_one_json_envelope_for_terminal_and_release_outcomes() {
         let (server, requests) = run_server(remote_state, remote_exit, release_status);
         let (_directory, child) = spawn_child(
             &server.endpoint(),
-            &[
-                "sandbox", "run", "agents", "--output", "json", "--", "/agent",
-            ],
+            &["run", "agents", "--output", "json", "--", "/agent"],
         );
         let output = wait_output(child);
         assert_eq!(output.status.code(), Some(expected_exit), "{remote_state}");
@@ -663,15 +1007,19 @@ fn json_parse_errors_use_the_versioned_envelope_and_never_stderr() {
 fn json_attach_is_refused_and_port_forward_errors_are_machine_events() {
     let calls = Arc::new(Mutex::new(0usize));
     let observed = Arc::clone(&calls);
-    let server = Server::start(move |_request, stream| {
-        *observed.lock().unwrap() += 1;
-        reply(stream, 403, &[], "forward denied");
+    let server = Server::start(move |request, stream| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v1/leases") => reply(stream, 200, &[], "[]"),
+            ("GET", "/v1/sandbox-leases") => reply(stream, 200, &[], &sandbox_inventory()),
+            _ => {
+                *observed.lock().unwrap() += 1;
+                reply(stream, 403, &[], "forward denied");
+            }
+        }
     });
 
-    let (_directory, child) = spawn_child(
-        &server.endpoint(),
-        &["sandbox", "attach", "sandbox-test", "--output", "json"],
-    );
+    let (_directory, child) =
+        spawn_child(&server.endpoint(), &["attach", "dev", "--output", "json"]);
     let output = wait_output(child);
     assert_eq!(output.status.code(), Some(125));
     assert!(output.stderr.is_empty());
@@ -683,14 +1031,7 @@ fn json_attach_is_refused_and_port_forward_errors_are_machine_events() {
 
     let (_directory, mut child) = spawn_child(
         &server.endpoint(),
-        &[
-            "sandbox",
-            "port-forward",
-            "sandbox-test",
-            "0:http",
-            "--output",
-            "json",
-        ],
+        &["port-forward", "dev", "0:http", "--output", "json"],
     );
     let stdout = child.stdout.take().unwrap();
     let (line_tx, line_rx) = mpsc::channel();
