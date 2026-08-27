@@ -2660,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "kobe-operator"
-version = "0.40.1"
+version = "0.40.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "kobe-runner"
-version = "0.40.1"
+version = "0.40.2"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2737,11 +2737,11 @@ dependencies = [
 
 [[package]]
 name = "kobe-state-machine"
-version = "0.40.1"
+version = "0.40.2"
 
 [[package]]
 name = "kobectl"
-version = "0.40.1"
+version = "0.40.2"
 dependencies = [
  "anyhow",
  "chrono",
