@@ -71,13 +71,10 @@ teardownAuthority:
   # so a compromised control plane cannot forge evidence that a cluster or
   # sandbox was really destroyed.
   #
-  # Default OFF. The split is not finished: the two ValidatingAdmissionPolicies
-  # the authority requires at startup are not rendered by this chart and its
-  # ServiceAccount has no RBAC, so enabling it CrashLoops the authority pod -
-  # and, worse, setting KOBE_PROCESS_ROLE=control-plane on the operator turns
-  # OFF the in-process authority that does work today, taking VerifiedDestroy
-  # and every childCluster sandbox with it. Turn this on only once the
-  # policies and RBAC ship.
+  # Opt in on Kubernetes 1.30+ to deploy the dedicated RBAC, both fail-closed
+  # ValidatingAdmissionPolicies, and the authority process together. The
+  # authority verifies this exact live contract before starting. The default
+  # keeps the backwards-compatible single-process mode for older API servers.
   separate: false
   replicas: 1
   # Pull secrets and the optional PostgreSQL URL Secret must exist in the

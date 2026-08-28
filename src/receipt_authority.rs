@@ -297,7 +297,7 @@ fn required_authority_expressions(username: &str) -> Vec<String> {
         ));
     }
     expressions.push(
-        "request.resource.resource != 'clusterleases' || request.operation == 'DELETE' || !has(object.status) || !has(object.status.connectTokenCreation) || object.status.connectTokenCreation.phase == 'closed' || (has(object.status.binding) && (has(object.status.connectTokenCreation.identity) == has(object.status.binding.connectToken)) && (!has(object.status.connectTokenCreation.identity) || object.status.connectTokenCreation.identity == object.status.binding.connectToken))"
+        "request.resource.resource != 'clusterleases' || request.operation == 'DELETE' || !has(object.status) || !has(object.status.connectTokenCreation) || object.status.connectTokenCreation.phase == 'closed' || (has(object.status.binding) && (has(object.status.connectTokenCreation.identity) == has(object.status.binding.connectToken)) && (!has(object.status.connectTokenCreation.identity) || object.status.connectTokenCreation.identity.apiVersion == object.status.binding.connectToken.apiVersion && object.status.connectTokenCreation.identity.kind == object.status.binding.connectToken.kind && object.status.connectTokenCreation.identity.name == object.status.binding.connectToken.name && object.status.connectTokenCreation.identity.uid == object.status.binding.connectToken.uid && (has(object.status.connectTokenCreation.identity.namespace) == has(object.status.binding.connectToken.namespace)) && (!has(object.status.connectTokenCreation.identity.namespace) || object.status.connectTokenCreation.identity.namespace == object.status.binding.connectToken.namespace)))"
             .into(),
     );
     expressions.push(format!(

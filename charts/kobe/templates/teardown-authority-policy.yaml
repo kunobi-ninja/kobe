@@ -1,0 +1,193 @@
+{{- if .Values.teardownAuthority.separate }}
+{{- $authorityUsername := printf "system:serviceaccount:%s:%s" (include "kobe.teardownAuthorityNamespace" .) (include "kobe.teardownAuthorityServiceAccountName" .) -}}
+{{- $controlPlaneUsername := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kobe.serviceAccountName" .) -}}
+{{- $authorityNamespace := include "kobe.teardownAuthorityNamespace" . -}}
+{{- $policyName := include "kobe.teardownAuthorityPolicyName" . -}}
+{{- $firewallName := include "kobe.teardownAuthorityFirewallPolicyName" . -}}
+# Kubernetes RBAC cannot separate individual fields on a status subresource.
+# This fail-closed policy makes the dedicated teardown authority the sole
+# writer of proof fields while preventing it from acquiring lifecycle power.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $policyName }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kobe.kunobi.ninja"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources:
+          - verifiedteardownevidence
+          - clusterleases
+          - clusterleases/status
+          - clusterinstances
+          - clusterinstances/status
+  validations:
+    - expression: >-
+        request.resource.resource != 'verifiedteardownevidence' || request.userInfo.username == {{ $authorityUsername | quote }}
+      message: "only the teardown authority may create teardown evidence"
+      reason: Forbidden
+    - expression: >-
+        request.userInfo.username != {{ $authorityUsername | quote }} || !(request.resource.resource in ['clusterleases', 'clusterinstances']) || request.subResource == 'status'
+      message: "the teardown authority may mutate lease and instance status only"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.teardownReceipt)) : (((!has(oldObject.status) || !has(oldObject.status.teardownReceipt)) && (!has(object.status) || !has(object.status.teardownReceipt))) || (has(oldObject.status) && has(oldObject.status.teardownReceipt) && has(object.status) && has(object.status.teardownReceipt) && object.status.teardownReceipt == oldObject.status.teardownReceipt)))
+      message: "only the teardown authority may change status.teardownReceipt"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.teardownEvidence)) : (((!has(oldObject.status) || !has(oldObject.status.teardownEvidence)) && (!has(object.status) || !has(object.status.teardownEvidence))) || (has(oldObject.status) && has(oldObject.status.teardownEvidence) && has(object.status) && has(object.status.teardownEvidence) && object.status.teardownEvidence == oldObject.status.teardownEvidence)))
+      message: "only the teardown authority may change status.teardownEvidence"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.teardownAttemptId)) : (((!has(oldObject.status) || !has(oldObject.status.teardownAttemptId)) && (!has(object.status) || !has(object.status.teardownAttemptId))) || (has(oldObject.status) && has(oldObject.status.teardownAttemptId) && has(object.status) && has(object.status.teardownAttemptId) && object.status.teardownAttemptId == oldObject.status.teardownAttemptId)))
+      message: "only the teardown authority may change status.teardownAttemptId"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.unboundReleaseVerifiedAt)) : (((!has(oldObject.status) || !has(oldObject.status.unboundReleaseVerifiedAt)) && (!has(object.status) || !has(object.status.unboundReleaseVerifiedAt))) || (has(oldObject.status) && has(oldObject.status.unboundReleaseVerifiedAt) && has(object.status) && has(object.status.unboundReleaseVerifiedAt) && object.status.unboundReleaseVerifiedAt == oldObject.status.unboundReleaseVerifiedAt)))
+      message: "only the teardown authority may change status.unboundReleaseVerifiedAt"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.teardownAcknowledgement)) : (((!has(oldObject.status) || !has(oldObject.status.teardownAcknowledgement)) && (!has(object.status) || !has(object.status.teardownAcknowledgement))) || (has(oldObject.status) && has(oldObject.status.teardownAcknowledgement) && has(object.status) && has(object.status.teardownAcknowledgement) && object.status.teardownAcknowledgement == oldObject.status.teardownAcknowledgement)))
+      message: "only the teardown authority may change status.teardownAcknowledgement"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterinstances' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.creationManifest)) : (((!has(oldObject.status) || !has(oldObject.status.creationManifest)) && (!has(object.status) || !has(object.status.creationManifest))) || (has(oldObject.status) && has(oldObject.status.creationManifest) && has(object.status) && has(object.status.creationManifest) && object.status.creationManifest == oldObject.status.creationManifest)))
+      message: "only the teardown authority may change status.creationManifest"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterinstances' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.teardownIdentities)) : (((!has(oldObject.status) || !has(oldObject.status.teardownIdentities)) && (!has(object.status) || !has(object.status.teardownIdentities))) || (has(oldObject.status) && has(oldObject.status.teardownIdentities) && has(object.status) && has(object.status.teardownIdentities) && object.status.teardownIdentities == oldObject.status.teardownIdentities)))
+      message: "only the teardown authority may change status.teardownIdentities"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.binding)) : (((!has(oldObject.status) || !has(oldObject.status.binding)) && (!has(object.status) || !has(object.status.binding))) || (has(oldObject.status) && has(oldObject.status.binding) && has(object.status) && has(object.status.binding) && object.status.binding == oldObject.status.binding)))
+      message: "the teardown authority may not change lifecycle binding"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.clusterName)) : (((!has(oldObject.status) || !has(oldObject.status.clusterName)) && (!has(object.status) || !has(object.status.clusterName))) || (has(oldObject.status) && has(oldObject.status.clusterName) && has(object.status) && has(object.status.clusterName) && object.status.clusterName == oldObject.status.clusterName)))
+      message: "the teardown authority may not change lifecycle clusterName"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.phase)) : (((!has(oldObject.status) || !has(oldObject.status.phase)) && (!has(object.status) || !has(object.status.phase))) || (has(oldObject.status) && has(oldObject.status.phase) && has(object.status) && has(object.status.phase) && object.status.phase == oldObject.status.phase)))
+      message: "the teardown authority may not change lifecycle phase"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.connectTokenCreation)) : (((!has(oldObject.status) || !has(oldObject.status.connectTokenCreation)) && (!has(object.status) || !has(object.status.connectTokenCreation))) || (has(oldObject.status) && has(oldObject.status.connectTokenCreation) && has(object.status) && has(object.status.connectTokenCreation) && object.status.connectTokenCreation == oldObject.status.connectTokenCreation)))
+      message: "the teardown authority may not change lifecycle connectTokenCreation"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterinstances' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.binding)) : (((!has(oldObject.status) || !has(oldObject.status.binding)) && (!has(object.status) || !has(object.status.binding))) || (has(oldObject.status) && has(oldObject.status.binding) && has(object.status) && has(object.status.binding) && object.status.binding == oldObject.status.binding)))
+      message: "the teardown authority may not change instance lifecycle binding"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterinstances' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.leaseRef)) : (((!has(oldObject.status) || !has(oldObject.status.leaseRef)) && (!has(object.status) || !has(object.status.leaseRef))) || (has(oldObject.status) && has(oldObject.status.leaseRef) && has(object.status) && has(object.status.leaseRef) && object.status.leaseRef == oldObject.status.leaseRef)))
+      message: "the teardown authority may not change instance lifecycle leaseRef"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterinstances' || request.userInfo.username != {{ $authorityUsername | quote }} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.phase)) : (((!has(oldObject.status) || !has(oldObject.status.phase)) && (!has(object.status) || !has(object.status.phase))) || (has(oldObject.status) && has(oldObject.status.phase) && has(object.status) && has(object.status.phase) && object.status.phase == oldObject.status.phase)))
+      message: "the teardown authority may not change instance lifecycle phase"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.operation == 'DELETE' || !has(object.status) || !has(object.status.connectTokenCreation) || object.status.connectTokenCreation.phase == 'closed' || (has(object.status.binding) && (has(object.status.connectTokenCreation.identity) == has(object.status.binding.connectToken)) && (!has(object.status.connectTokenCreation.identity) || object.status.connectTokenCreation.identity.apiVersion == object.status.binding.connectToken.apiVersion && object.status.connectTokenCreation.identity.kind == object.status.binding.connectToken.kind && object.status.connectTokenCreation.identity.name == object.status.binding.connectToken.name && object.status.connectTokenCreation.identity.uid == object.status.binding.connectToken.uid && (has(object.status.connectTokenCreation.identity.namespace) == has(object.status.binding.connectToken.namespace)) && (!has(object.status.connectTokenCreation.identity.namespace) || object.status.connectTokenCreation.identity.namespace == object.status.binding.connectToken.namespace)))
+      message: "connect-token creation and binding identity must remain reciprocal"
+      reason: Invalid
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.userInfo.username == {{ $authorityUsername | quote }} || request.operation == 'DELETE' || ((oldObject == null || !has(oldObject.status) || !has(oldObject.status.conditions) ? [] : oldObject.status.conditions.filter(c, c.type == 'AllocationAbsent')) == (!has(object.status) || !has(object.status.conditions) ? [] : object.status.conditions.filter(c, c.type == 'AllocationAbsent')))
+      message: "only the teardown authority may change AllocationAbsent evidence"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'clusterleases' || request.operation != 'UPDATE' || !has(oldObject.metadata.finalizers) || !oldObject.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention') || (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention')) || (has(oldObject.status) && has(oldObject.status.teardownAcknowledgement) && has(object.status) && has(object.status.teardownAcknowledgement) && object.status.teardownAcknowledgement == oldObject.status.teardownAcknowledgement)
+      message: "receipt retention cannot be removed before exact acknowledgement"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $policyName }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $policyName }}
+  validationActions: [Deny]
+---
+# The general control plane can create namespaced and cluster-scoped RBAC for
+# backends. This independent firewall prevents that identity from using those
+# powers to replace the authority namespace, identity, or binding.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $firewallName }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["configmaps", "endpoints", "events", "persistentvolumeclaims", "replicationcontrollers", "secrets", "serviceaccounts", "serviceaccounts/token", "services", "pods", "pods/status", "pods/ephemeralcontainers"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["jobs", "jobs/status", "cronjobs"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["ingresses", "networkpolicies"]
+      - apiGroups: ["policy"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["poddisruptionbudgets"]
+      - apiGroups: ["coordination.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["leases"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["roles", "rolebindings"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["namespaces"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["clusterroles", "clusterrolebindings"]
+  validations:
+    - expression: >-
+        request.userInfo.username != {{ $controlPlaneUsername | quote }} || request.resource.resource in ['namespaces', 'clusterroles', 'clusterrolebindings'] || request.namespace != {{ $authorityNamespace | quote }}
+      message: "the control plane may not mutate the teardown-authority namespace"
+      reason: Forbidden
+    - expression: >-
+        request.userInfo.username != {{ $controlPlaneUsername | quote }} || request.resource.resource != 'namespaces' || request.name != {{ $authorityNamespace | quote }}
+      message: "the control plane may not replace the teardown-authority namespace"
+      reason: Forbidden
+    - expression: >-
+        request.userInfo.username != {{ $controlPlaneUsername | quote }} || request.resource.group != 'rbac.authorization.k8s.io' || !(request.resource.resource in ['clusterroles', 'clusterrolebindings'])
+      message: "the control plane may not replace cluster-scoped authority RBAC"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $firewallName }}
+  labels:
+    {{- include "kobe.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $firewallName }}
+  validationActions: [Deny]
+{{- end }}

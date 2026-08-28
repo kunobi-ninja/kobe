@@ -91,6 +91,26 @@ function annotations(
 	return (metadata(document).annotations ?? {}) as Record<string, unknown>;
 }
 
+function normalizeExpression(expression: string): string {
+	return expression.split(/\s+/).filter(Boolean).join(" ");
+}
+
+function unchangedStatusFieldExpression(
+	resource: string,
+	field: string,
+	username: string,
+): string {
+	return `request.resource.resource != '${resource}' || request.userInfo.username == ${JSON.stringify(username)} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.${field})) : (((!has(oldObject.status) || !has(oldObject.status.${field})) && (!has(object.status) || !has(object.status.${field}))) || (has(oldObject.status) && has(oldObject.status.${field}) && has(object.status) && has(object.status.${field}) && object.status.${field} == oldObject.status.${field})))`;
+}
+
+function authorityCannotChangeStatusFieldExpression(
+	resource: string,
+	field: string,
+	username: string,
+): string {
+	return `request.resource.resource != '${resource}' || request.userInfo.username != ${JSON.stringify(username)} || request.operation == 'DELETE' || (oldObject == null ? (!has(object.status) || !has(object.status.${field})) : (((!has(oldObject.status) || !has(oldObject.status.${field})) && (!has(object.status) || !has(object.status.${field}))) || (has(oldObject.status) && has(oldObject.status.${field}) && has(object.status) && has(object.status.${field}) && object.status.${field} == oldObject.status.${field})))`;
+}
+
 function objectNamed(
 	documents: Record<string, unknown>[],
 	kind: string,
@@ -291,6 +311,198 @@ for (const [name, value] of [
 invariant(
 	authorityPolicyName !== firewallPolicyName,
 	"field authority policy and identity firewall share one name",
+);
+
+const authorityPolicy = objectNamed(
+	externalSplit,
+	"ValidatingAdmissionPolicy",
+	authorityPolicyName,
+);
+invariant(authorityPolicy, "split authority omitted its field-protection policy");
+const authorityPolicySpec = authorityPolicy.spec as Record<string, unknown>;
+invariant(
+	authorityPolicySpec.failurePolicy === "Fail",
+	"authority field-protection policy is not fail-closed",
+);
+const authorityPolicyRules = (
+	authorityPolicySpec.matchConstraints as Record<string, unknown>
+).resourceRules as Record<string, unknown>[];
+invariant(
+	authorityPolicyRules.some(
+		(rule) =>
+			Array.isArray(rule.apiGroups) &&
+			rule.apiGroups.length === 1 &&
+			rule.apiGroups[0] === "kobe.kunobi.ninja" &&
+			Array.isArray(rule.apiVersions) &&
+			rule.apiVersions.length === 1 &&
+			rule.apiVersions[0] === "v1alpha1" &&
+			Array.isArray(rule.operations) &&
+			["CREATE", "UPDATE", "DELETE"].every((operation) =>
+				rule.operations.includes(operation),
+			) &&
+			Array.isArray(rule.resources) &&
+			[
+				"verifiedteardownevidence",
+				"clusterleases",
+				"clusterleases/status",
+				"clusterinstances",
+				"clusterinstances/status",
+			].every((resource) => rule.resources.includes(resource)),
+	),
+	"authority policy does not cover every proof-bearing resource and operation",
+);
+const authorityExpressions = (
+	authorityPolicySpec.validations as Record<string, unknown>[]
+).map((validation) => normalizeExpression(String(validation.expression)));
+const quotedAuthority = JSON.stringify(authorityUsername);
+const expectedAuthorityExpressions = [
+	`request.resource.resource != 'verifiedteardownevidence' || request.userInfo.username == ${quotedAuthority}`,
+	`request.userInfo.username != ${quotedAuthority} || !(request.resource.resource in ['clusterleases', 'clusterinstances']) || request.subResource == 'status'`,
+	...["teardownReceipt", "teardownEvidence", "teardownAttemptId", "unboundReleaseVerifiedAt", "teardownAcknowledgement"].map(
+		(field) => unchangedStatusFieldExpression("clusterleases", field, authorityUsername),
+	),
+	...["creationManifest", "teardownIdentities"].map((field) =>
+		unchangedStatusFieldExpression("clusterinstances", field, authorityUsername),
+	),
+	...["binding", "clusterName", "phase", "connectTokenCreation"].map((field) =>
+		authorityCannotChangeStatusFieldExpression("clusterleases", field, authorityUsername),
+	),
+	...["binding", "leaseRef", "phase"].map((field) =>
+		authorityCannotChangeStatusFieldExpression("clusterinstances", field, authorityUsername),
+	),
+	"request.resource.resource != 'clusterleases' || request.operation == 'DELETE' || !has(object.status) || !has(object.status.connectTokenCreation) || object.status.connectTokenCreation.phase == 'closed' || (has(object.status.binding) && (has(object.status.connectTokenCreation.identity) == has(object.status.binding.connectToken)) && (!has(object.status.connectTokenCreation.identity) || object.status.connectTokenCreation.identity.apiVersion == object.status.binding.connectToken.apiVersion && object.status.connectTokenCreation.identity.kind == object.status.binding.connectToken.kind && object.status.connectTokenCreation.identity.name == object.status.binding.connectToken.name && object.status.connectTokenCreation.identity.uid == object.status.binding.connectToken.uid && (has(object.status.connectTokenCreation.identity.namespace) == has(object.status.binding.connectToken.namespace)) && (!has(object.status.connectTokenCreation.identity.namespace) || object.status.connectTokenCreation.identity.namespace == object.status.binding.connectToken.namespace)))",
+	`request.resource.resource != 'clusterleases' || request.userInfo.username == ${quotedAuthority} || request.operation == 'DELETE' || ((oldObject == null || !has(oldObject.status) || !has(oldObject.status.conditions) ? [] : oldObject.status.conditions.filter(c, c.type == 'AllocationAbsent')) == (!has(object.status) || !has(object.status.conditions) ? [] : object.status.conditions.filter(c, c.type == 'AllocationAbsent')))`,
+	"request.resource.resource != 'clusterleases' || request.operation != 'UPDATE' || !has(oldObject.metadata.finalizers) || !oldObject.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention') || (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'kobe.kunobi.ninja/teardown-receipt-retention')) || (has(oldObject.status) && has(oldObject.status.teardownAcknowledgement) && has(object.status) && has(object.status.teardownAcknowledgement) && object.status.teardownAcknowledgement == oldObject.status.teardownAcknowledgement)",
+].map(normalizeExpression);
+for (const expected of expectedAuthorityExpressions) {
+	invariant(
+		authorityExpressions.includes(expected),
+		`authority policy is missing the exact expression: ${expected}`,
+	);
+}
+invariant(
+	authorityExpressions.length === expectedAuthorityExpressions.length,
+	"authority policy contains unvalidated extra expressions",
+);
+const authorityPolicyBinding = objectNamed(
+	externalSplit,
+	"ValidatingAdmissionPolicyBinding",
+	authorityPolicyName,
+);
+invariant(
+	authorityPolicyBinding &&
+		(authorityPolicyBinding.spec as Record<string, unknown>).policyName ===
+			authorityPolicyName &&
+		JSON.stringify(
+			(authorityPolicyBinding.spec as Record<string, unknown>).validationActions,
+		) === JSON.stringify(["Deny"]),
+	"authority policy binding is missing or not Deny-only",
+);
+
+const firewallPolicy = objectNamed(
+	externalSplit,
+	"ValidatingAdmissionPolicy",
+	firewallPolicyName,
+);
+invariant(firewallPolicy, "split authority omitted its identity firewall");
+const firewallSpec = firewallPolicy.spec as Record<string, unknown>;
+invariant(
+	firewallSpec.failurePolicy === "Fail",
+	"authority identity firewall is not fail-closed",
+);
+const firewallExpressions = (
+	firewallSpec.validations as Record<string, unknown>[]
+).map((validation) => normalizeExpression(String(validation.expression)));
+const quotedControlPlane = JSON.stringify(controlPlaneUsername);
+const quotedAuthorityNamespace = JSON.stringify(authorityNamespace);
+const expectedFirewallExpressions = [
+	`request.userInfo.username != ${quotedControlPlane} || request.resource.resource in ['namespaces', 'clusterroles', 'clusterrolebindings'] || request.namespace != ${quotedAuthorityNamespace}`,
+	`request.userInfo.username != ${quotedControlPlane} || request.resource.resource != 'namespaces' || request.name != ${quotedAuthorityNamespace}`,
+	`request.userInfo.username != ${quotedControlPlane} || request.resource.group != 'rbac.authorization.k8s.io' || !(request.resource.resource in ['clusterroles', 'clusterrolebindings'])`,
+].map(normalizeExpression);
+invariant(
+	JSON.stringify(firewallExpressions) ===
+		JSON.stringify(expectedFirewallExpressions),
+	"identity firewall expressions drifted from the startup contract",
+);
+const firewallBinding = objectNamed(
+	externalSplit,
+	"ValidatingAdmissionPolicyBinding",
+	firewallPolicyName,
+);
+invariant(
+	firewallBinding &&
+		(firewallBinding.spec as Record<string, unknown>).policyName ===
+			firewallPolicyName &&
+		JSON.stringify(
+			(firewallBinding.spec as Record<string, unknown>).validationActions,
+		) === JSON.stringify(["Deny"]),
+	"identity firewall binding is missing or not Deny-only",
+);
+
+const authorityRole = objectNamed(
+	externalSplit,
+	"ClusterRole",
+	"kobe-teardown-authority",
+);
+invariant(authorityRole, "split authority omitted its dedicated ClusterRole");
+const authorityRules = authorityRole.rules as Record<string, unknown>[];
+const authorityRuleAllows = (resource: string, verbs: string[]): boolean =>
+	authorityRules.some(
+		(rule) =>
+			Array.isArray(rule.resources) &&
+			rule.resources.includes(resource) &&
+			Array.isArray(rule.verbs) &&
+			verbs.every((verb) => rule.verbs.includes(verb)),
+	);
+for (const [resource, verbs] of [
+	["clusterinstances", ["get", "list", "watch"]],
+	["clusterinstances/status", ["get", "patch", "update"]],
+	["clusterleases", ["get", "list", "watch"]],
+	["clusterleases/status", ["get", "patch", "update"]],
+	["sandboxleases", ["get", "list", "watch"]],
+	["verifiedteardownevidence", ["get", "list", "watch", "create"]],
+	["validatingadmissionpolicies", ["get"]],
+	["validatingadmissionpolicybindings", ["get"]],
+	["selfsubjectreviews", ["create"]],
+] as const) {
+	invariant(
+		authorityRuleAllows(resource, [...verbs]),
+		`teardown authority lacks ${verbs.join("/")} on ${resource}`,
+	);
+}
+const authorityRoleBinding = objectNamed(
+	externalSplit,
+	"ClusterRoleBinding",
+	"kobe-teardown-authority",
+);
+invariant(
+	authorityRoleBinding &&
+		(authorityRoleBinding.roleRef as Record<string, unknown>).name ===
+			"kobe-teardown-authority" &&
+		(authorityRoleBinding.subjects as Record<string, unknown>[]).some(
+			(subject) =>
+				subject.name === "kobe-teardown-authority" &&
+				subject.namespace === authorityNamespace,
+		),
+	"authority ClusterRole is not bound only to its dedicated identity",
+);
+const authorityLeaderRole = objectNamed(
+	externalSplit,
+	"Role",
+	"kobe-teardown-authority-leader-election",
+);
+const authorityLeaderBinding = objectNamed(
+	externalSplit,
+	"RoleBinding",
+	"kobe-teardown-authority-leader-election",
+);
+invariant(
+	authorityLeaderRole &&
+		metadata(authorityLeaderRole).namespace === authorityNamespace &&
+	authorityLeaderBinding &&
+		metadata(authorityLeaderBinding).namespace === authorityNamespace,
+	"authority leader election is not isolated in its dedicated namespace",
 );
 
 for (const [mode, documents] of [["external", externalSplit]] as const) {
