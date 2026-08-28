@@ -2,8 +2,8 @@
 //
 // The Helm harness pins the rendered object shape and exact CEL strings. This
 // test installs those rendered policies and RBAC into a disposable Kind
-// cluster, waits for Kubernetes to accept/type-check them, then proves the two
-// identities cannot cross the proof/lifecycle boundary.
+// cluster, waits for Kubernetes to finish type-checking them, then proves the
+// two identities cannot cross the proof/lifecycle boundary.
 
 const context = Bun.env.KOBE_SANDBOX_APISERVER_CONTEXT ?? Bun.argv[2];
 if (!context) {
@@ -130,8 +130,14 @@ function offTargetWarnings(warnings: unknown, expressions: string[]): string[] {
 	return fatal;
 }
 
-async function waitForAcceptedPolicy(name: string): Promise<void> {
+/// Wait for the API server's documented type-check completion signals.
+///
+/// ValidatingAdmissionPolicy does not promise an `Accepted=True` condition.
+/// The admission mutations below are the authoritative proof that the policy
+/// is active after its current generation has been type-checked.
+async function waitForTypeCheckedPolicy(name: string): Promise<void> {
 	const deadline = Date.now() + 60_000;
+	let lastObservation = "policy was not returned by the API server";
 	while (Date.now() < deadline) {
 		const result = await kubectl(
 			["get", "validatingadmissionpolicy", name, "-o", "json"],
@@ -139,26 +145,29 @@ async function waitForAcceptedPolicy(name: string): Promise<void> {
 		);
 		if (result.exitCode === 0) {
 			const policy = JSON.parse(result.stdout);
-			const warnings = policy.status?.typeChecking?.expressionWarnings;
-			const fatal = offTargetWarnings(warnings, policyExpressions(policy));
-			if (fatal.length > 0) {
-				throw new Error(`${name} type-check warnings: ${JSON.stringify(fatal)}`);
-			}
-			const accepted = policy.status?.conditions?.some(
-				(condition: Record<string, unknown>) =>
-					condition.type === "Accepted" && condition.status === "True",
-			);
+			lastObservation = JSON.stringify({
+				generation: policy.metadata?.generation,
+				status: policy.status,
+			});
 			if (
 				policy.status?.observedGeneration === policy.metadata?.generation &&
-				accepted &&
 				policy.status?.typeChecking !== undefined
 			) {
+				const warnings = policy.status.typeChecking.expressionWarnings;
+				const fatal = offTargetWarnings(warnings, policyExpressions(policy));
+				if (fatal.length > 0) {
+					throw new Error(`${name} type-check warnings: ${JSON.stringify(fatal)}`);
+				}
 				return;
 			}
+		} else {
+			lastObservation = result.stderr.trim() || result.stdout.trim();
 		}
 		await Bun.sleep(500);
 	}
-	throw new Error(`${name} did not become accepted and type-checked`);
+	throw new Error(
+		`${name} did not report completed type checking: ${lastObservation}`,
+	);
 }
 
 async function patchLeaseStatus(
@@ -226,8 +235,8 @@ await kubectl(["create", "namespace", authorityNamespace]);
 try {
 	await kubectl(["apply", "-f", "-"], { stdin: rendered.stdout });
 	await Promise.all([
-		waitForAcceptedPolicy(authorityPolicyName),
-		waitForAcceptedPolicy(firewallPolicyName),
+		waitForTypeCheckedPolicy(authorityPolicyName),
+		waitForTypeCheckedPolicy(firewallPolicyName),
 	]);
 
 	const lease = JSON.stringify({
